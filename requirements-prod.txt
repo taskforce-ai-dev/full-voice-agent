@@ -1,0 +1,33 @@
+# Core server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+
+# AI / LLM
+openai>=1.0.0
+
+# Telephony
+twilio>=9.0.0
+
+# Knowledge base / RAG
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
+
+# STT (future Media Streams)
+google-cloud-speech>=2.0.0
+
+# Gemini native SDK
+google-genai>=1.0.0
+
+# HTTP client
+httpx>=0.25.0
+
+# Form parsing (required for request.form() — Twilio webhook body parsing)
+python-multipart>=0.0.7
+
+# Utilities
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
+
+# PDF support for knowledge base (optional)
+PyPDF2>=3.0.0
