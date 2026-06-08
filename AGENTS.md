@@ -7,28 +7,18 @@
 
 ## KB Auto-Structuring Feature (Jun 2026)
 
-The Sentinel admin portal (`/admin/` → Knowledge Base page) now has an AI-powered KB structuring flow:
+Sentinel admin portal → Knowledge Base page has a 4-step AI structuring flow: pick agent + configure VPS target → paste/upload raw content → Claude structures it → publish live to agent.
 
-**How it works:**
-1. Admin selects an agent, configures its VPS target (base URL + KB_RELOAD_SECRET + filename).
-2. Paste raw text or upload a PDF — Claude infers the business vertical and rewrites it as a retrieval-optimized KB document (300–500-char paragraphs, explicit entity names, blank-line separation).
-3. Preview + edit the structured doc, compare vs current KB, then Publish → POSTs live to the agent's `/kb-reload` endpoint.
+**Key new endpoints (admin-auth required):**
+- `PUT /api/admin/agents/:agentId/kb-target` — set VPS base URL, secret, filename
+- `POST /api/admin/knowledge-base/structure` — Claude structures raw text, returns preview
+- `POST /api/admin/knowledge-base/publish` — snapshots current KB, saves new, pushes to agent
 
-**New API endpoints (all under `/api/admin/*`, require admin session):**
-- `GET  /api/admin/agents/:agentId/kb-target` — get VPS target config
-- `PUT  /api/admin/agents/:agentId/kb-target` — create/update VPS target (baseUrl, secret, filename)
-- `GET  /api/admin/agents/:agentId/kb-document` — get current structured KB + last 5 snapshots
-- `POST /api/admin/knowledge-base/structure` — preview-only: Claude structures raw text → `{structuredContent, businessType, sections, warnings}`
-- `POST /api/admin/knowledge-base/publish` — snapshots current doc, persists new content, POSTs to agent's `/kb-reload`
+**Schema additions:** `AgentKbTarget`, `AgentKbDocument`, `AgentKbSnapshot` models; `businessType`/`businessDescription` on `Agent`.
 
-**New Prisma models:** `AgentKbTarget`, `AgentKbDocument`, `AgentKbSnapshot`. New fields on `Agent`: `businessType`, `businessDescription`.
+**Required env var:** `ANTHROPIC_API_KEY` in `/opt/agent-dashboard/.env` — structuring returns 501 without it.
 
-**New env vars needed in `/opt/agent-dashboard/.env`:**
-- `ANTHROPIC_API_KEY=sk-ant-...` ← **must be added manually; structuring returns 501 without it**
-- `ANTHROPIC_MODEL=claude-sonnet-4-6` (optional, this is the default)
-
-**ChromaDB stale-chunk fix (deployed Jun 2026):**
-All 5 `knowledge_base.py` files now run `collection.delete(where={"source": filename})` before each upsert inside `initialize_kb()`. This prevents old chunks from accumulating in ChromaDB when KB content is updated. All 4 running agent containers were restarted to activate the fix.
+**ChromaDB fix:** All 5 `knowledge_base.py` files now delete-before-upsert in `initialize_kb()` to prevent stale chunk accumulation on KB updates.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 
@@ -49,6 +39,9 @@ MANDATORY at the start of EVERY session, before any code exploration:
 3. Only open raw source files when the graph points you to a specific file/symbol and
    you need exact line-level detail to edit it. Never read files just to understand
    structure — the graph already has that.
+
+Codex note: when the user types `/graphify`, use the `graphify` skill before doing
+anything else.
 
 After modifying any code file in a session, run `graphify update .` to keep the graph
 current (AST-only, no API cost).
