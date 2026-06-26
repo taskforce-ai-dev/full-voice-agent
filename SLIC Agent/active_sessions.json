@@ -1,0 +1,24 @@
+{
+  "+94711754668": {
+    "phone": "+94711754668",
+    "name": "Thiva",
+    "policy_no": "SLIC-2024-00117",
+    "vehicle": {
+      "make": "Toyota",
+      "model": "Land Cruiser Prado",
+      "reg_no": "CBA-1175",
+      "policy_item": 1
+    },
+    "assessor_dispatched_at": "2026-04-22T05:59:12.830951+00:00",
+    "assessor_eta_minutes": 12,
+    "claim_reference": "SLIC-CLM-20260422-ERAWXN",
+    "reg_no": "CBA-1175",
+    "assessor_name": "Ravi Kumar",
+    "last_call_sid": "",
+    "accident_description": "Galle Road, Colombo | None | rear bumper damaged, drivable",
+    "location": "Galle Road, Colombo",
+    "injuries": "None",
+    "vehicle_condition": "rear bumper damaged, drivable",
+    "expires_at": "2026-04-22T06:29:12.830951+00:00"
+  }
+}

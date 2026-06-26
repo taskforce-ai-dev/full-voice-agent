@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply Flico Asterisk SIP/RTP Docker firewall policy
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/asterisk-flico/ops/flico-sip-firewall-apply.sh --sources-file /opt/asterisk-flico/ops/allowed-sources.txt
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

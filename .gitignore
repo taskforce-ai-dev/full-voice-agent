@@ -59,3 +59,45 @@ htmlcov/
 # Misc
 *.bak
 *.tmp
+
+# --- Nested repos with their OWN git remotes (do NOT add as broken gitlinks) ---
+# These live here for editing convenience but are tracked in their own GitHub repos.
+# Committing them from this parent would record broken gitlinks (empty dirs on clone).
+# Taskforce_AI_Website/ -> ChrysFernando/Taskforce_AI_Website
+Taskforce_AI_Website/
+# Kavya/ -> thiva2k/kavya (its own repo)
+Kavya/
+# agent-dashboard/ -> ChrysFernando/Client-Portal (left as-is)
+agent-dashboard/
+
+# --- Third-party model download (HuggingFace, ~8 GB — never commit) ---
+SinhalaVITS-TTS-M2/
+
+# --- Node / build artifacts ---
+node_modules/
+.next/
+.vercel/
+
+# --- Graphify regenerable cache (keep graph.html / GRAPH_REPORT.md, drop cache) ---
+graphify-out/cache/
+
+# --- Claude Code local/personal settings (machine-specific cmds + live tokens) ---
+.claude/settings.local.json
+
+# --- Accidental mojibake "C:\Users\mrdar\.claude-mem" dirs claude-mem sprays ---
+# (real bytes aren't a literal colon, so match with a glob; capital-C avoids
+#  matching the legitimate external .claude-mem store)
+C*claude-mem/
+**/C*claude-mem/
+
+# --- Secrets / cloud credentials (NEVER commit) ---
+# GCP service-account keys (incl. the retired full-voice-agent key, ID a8a245fb...)
+full-voice-agent-*.json
+gcp-credentials.json
+gcp-credentials*.json
+*-service-account*.json
+*serviceaccount*.json
+service-account*.json
+# Catch-all for credential drops in any agent dir
+**/full-voice-agent-*.json
+**/gcp-credentials*.json

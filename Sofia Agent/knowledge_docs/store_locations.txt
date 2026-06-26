@@ -1,0 +1,1316 @@
+BuyAbans - Store Locations (Showroom Locator)
+==================================================
+
+Most showrooms are open 9:00 AM to 9:00 PM, seven days a week.
+
+Store: Abans Elite - Colombo 03
+  Address: No. 498, Galle Road, Colombo 03, COLOMBO 3 Sri Lanka
+  Phone: 0114512501, 0115775166
+
+Store: Abans Elite - Colombo 03 (Electronics)
+  Address: No. 498, Galle Road, Colombo 03, COLOMBO 3 Sri Lanka
+  Phone: 0115775200
+
+Store: Abans Elite - Rajagiriya
+  Address: No.249, Dudley Senanayake Road, Colombo 08, RAJAGIRIYA Sri Lanka
+  Phone: 0114410789, 0112676589
+
+Store: Abans Elite - Welisara
+  Address: No. 595, Negombo Road,, WELISARA Sri Lanka
+  Phone: 0112933516, 0115776057
+
+Store: Abans Elite - Katunayaka
+  Address: No. 614, Liyanagemulla, Seeduwa, KATUNAYAKE Sri Lanka
+  Phone: 0112265641, 0114830933
+
+Store: Abans Elite - Anuradhapura
+  Address: No.155, Main Street, Anuradhapura, ANURADHAPURA Sri Lanka
+  Phone: 0252226832, 0255776042
+
+Store: Abans Elite - Mount Lavinia
+  Address: No. 71, Galle Road, Mt. Lavinia, MOUNT LAVINIA Sri Lanka
+  Phone: 0115776055, 0115776056
+
+Store: Abans Elite - Kandy
+  Address: No.162, D S Senanayake Street, Kandy, KANDY Sri Lanka
+  Phone: 0812202401, 0812202400
+
+Store: Abans Elite - Malabe
+  Address: No.26, Metro Central Building, Aturugiriya Road, Malabe, MALABE Sri Lanka
+  Phone: 0112744830, 0115776066
+
+Store: Abans Elite - Maharagama
+  Address: No.134 C D, High Level Road, Maharagama, MAHARAGAMA Sri Lanka
+  Phone: 0112844985, 0115776068
+
+Store: Abans Elite - Kalutara
+  Address: No.443, Wettumakada Junction, Galle Road, Kalutara South, KALUTARA Sri Lanka
+  Phone: 0342223440, 0345776042
+
+Store: Abans Elite - Homagama
+  Address: No.94A, High Level Road, Homagama, HOMAGAMA Sri Lanka
+  Phone: 0112894620, 0112894148
+
+Store: Abans Elite - Gampaha
+  Address: No.2B, Holy Cross Road, Gampaha, GAMPAHA Sri Lanka
+  Phone: 0332230005, 0335776042
+
+Store: Abans Elite - Dalugama (Kelaniya)
+  Address: No.396, Kandy Elite, Dalugama, Kelaniya, DALUGAMA Sri Lanka
+  Phone: 0112918178, 0115776072
+
+Store: Abans Elite - Ratnapura
+  Address: No.188, Main Street, Ratnapura, RATNAPURA Sri Lanka
+  Phone: 0452231157, 0455776042
+
+Store: Abans Elite - Ratmalana
+  Address: No.95, Galle Road, Kaldemulla,, RATMALANA Sri Lanka
+  Phone: 0112605731, 0112605732
+
+Store: Abans Elite - Panadura
+  Address: No. 532 A,B, Galle Road, Panadura, PANADURA Sri Lanka
+  Phone: 0382238792, 0385776042
+
+Store: Abans Elite - Pelawatta
+  Address: No.384, Pannipitiya Road, Pelawatte, Battaramulla, PELAWATTA Sri Lanka
+  Phone: 0115776082, 0112784027
+
+Store: Abans Elite - Kadawatha
+  Address: No.120, Kandy Road, Kadawatha, KADAWATHA Sri Lanka
+  Phone: 0115404595, 0115776084
+
+Store: Abans Elite - Colombo City Centre
+  Address: CCC, Level 1, No.137, Sir James Pieris Mawatha, Colombo 02, COLOMBO 2 Sri Lanka
+  Phone: 0115776040, 0115776041
+
+Store: Abans Elite - Moratuwa
+  Address: No.495, Galle Road, Rawatawatte, Moratuwa, MORATUWA Sri Lanka
+  Phone: 0115776076, 0115776077
+
+Store: Abans Elite - Maharagama B
+  Address: No. 75, Cargills Food City Building, Dehiwela Road, Maharagama, MAHARAGAMA Sri Lanka
+  Phone: 0115776083, 0115776086
+
+Store: Abans Elite - Kurunegala
+  Address: No.171, Colombo Road, Kurunegala, KURUNEGALA Sri Lanka
+  Phone: 0375776677, 0375776678
+
+Store: Abans Elite - Gampola
+  Address: No.112B, Nuwara Eliya Road, Gampola, GAMPOLA Sri Lanka
+  Phone: 0815776044, 0815776045
+
+Store: Abans Elite - Kirindiwela
+  Address: No.8D, Hanwella Road, Kirindiwela, KIRINDIWELA Sri Lanka
+  Phone: 0332269720, 0335776045
+
+Store: Abans Elite - Jaffna
+  Address: No.420, Cargills Square,Hospital Road, Jaffna, JAFFNA Sri Lanka
+  Phone: 0215776040, 0215776041
+
+Store: Abans Elite - Aluthgama
+  Address: No.433, Wickramaratne Building, Depot Junctiion, Aluthgama, ALUTHGAMA Sri Lanka
+  Phone: 0345776044, 0345776045
+
+Store: Abans Elite - Thalawathugoda
+  Address: No. 606A, Pannipitiya Road, Thalawathugoda, TALAWATUGODA Sri Lanka
+  Phone: 0115776042, 0115776043
+
+Store: Abans Elite - Galle
+  Address: No.72, Old Matara Road, Pettigalawatte, Galle, GALLE Sri Lanka
+  Phone: 0915776040, 0915776041
+
+Store: Abans Vavuniya Unlimited
+  Address: No107 Kandy Road &nbsp;, VAVUNIYA Sri Lanka
+  Phone: 0775316500, 0743318007
+
+Store: Abans Elite - Nawala
+  Address: No.117, Nawala Road, Nugegoda, NAWALA Sri Lanka
+  Phone: 0115776090, 0115776091
+
+Store: Abans Matara A Limited
+  Address: Abans Showroom Matara-A,No:230,Anagarika Dharmapala Mw;,, MATARA Sri Lanka
+  Phone: 0717000428, 0412227354
+
+Store: Abans Elite - Seeduwa
+  Address: No.532, Negombo Road, Mukalangamuwa, Seeduwa, SEEDUWA Sri Lanka
+  Phone: 0115776093, 0115776081
+
+Store: Abans Elite - Badulla
+  Address: No.159, Kappetipola Rd, Badulla, BADULLA Sri Lanka
+
+Store: Buyabans Pickup point - Kolpity
+  Address: 498, Galle Road, COLOMBO 3 Sri Lanka
+  Phone: 0702345848, 0115775170
+
+Store: MINISO Bambalapitiya
+  Address: No.457, Galle Road, Bambalapitiya, COLOMBO 3 Sri Lanka
+  Phone: 0115940090, 0765840727
+
+Store: MINISO Colombo City Center
+  Address: Miniso 03rd Floor, 137, Sir James Peiris Mawatha, COLOMBO 2 Sri Lanka
+  Phone: 0769067992
+
+Store: MINISO One Galle Face
+  Address: 1A Central Road, One Galle Face, COLOMBO 2 Sri Lanka
+  Phone: 0752499106, 0752499106
+
+Store: Titan One Gall Face
+  Address: Level 3 – K14, One Gall Face Mall, COLOMBO 2 Sri Lanka
+  Phone: 0113401625, 0113401625
+
+Store: Titan Colombo City Center
+  Address: 137, Sir James Pieris Mawatha, COLOMBO 2 Sri Lanka
+  Phone: 0115776232, 0724470400
+
+Store: Titan Flagship Store
+  Address: Shop No. GS-03, Grand Stand Of Race course Promenade, Reid Avenue, COLOMBO 7 Sri Lanka
+  Phone: 0115576231, 0772220655
+
+Store: Abans Alawwa
+  Address: No:150, Main Street, ALAWWA Sri Lanka
+  Phone: 0764806651, 0705026719
+
+Store: Abans Malabe
+  Address: 837/2C, New Kandy Rd, MALABE Sri Lanka
+  Phone: 0716349052, 0750349052
+
+Store: Abans Kiribathgoda
+  Address: No.107/1, Kandy Road, Dalugama, KELANIYA Sri Lanka
+  Phone: 0115776125, 0112916777
+
+Store: Abans Yakkala Limited
+  Address: No: 20, Kandy Rd, Yakkala, GAMPAHA Sri Lanka
+  Phone: 0787453241, 0777883241
+
+Store: Abans Digana Limited - B
+  Address: No.27, New Town, Digana, Rajawella, DIGANA Sri Lanka
+  Phone: 0815776121, 0764375833
+
+Store: Abans Kandana Limited
+  Address: No. 04, Negombo Rd,, KANDANA Sri Lanka
+  Phone: 0112228616, 0114752732
+
+Store: Abans Nittambuwa Limited
+  Address: NO:24, KANDY RD, NITTAMBUWA Sri Lanka
+  Phone: 0773346344, 0335776102
+
+Store: Abans Avissawella Limited - B
+  Address: No. 89, Rathnapura Road, AVISSAWELLA Sri Lanka
+  Phone: 0756519518, 0714229362
+
+Store: Abans Gampaha Limited
+  Address: No 40, Colombo Road, GAMPAHA Sri Lanka
+  Phone: 0741672205, 0335776095
+
+Store: Abans Minuwangoda
+  Address: Hadirama, MINUWANGODA Sri Lanka
+  Phone: 0115776098, 0114752737
+
+Store: Abans Gampola Unlimited
+  Address: No. 30, Nuwara Eliya Road, GAMPOLA Sri Lanka
+  Phone: 0778329060, 0703790830
+
+Store: Abans Gelioya Limited
+  Address: No.374, Kandy Rd, GELIOYA Sri Lanka
+  Phone: 0773669224, 0773669224
+
+Store: Abans Bulathkohupitiya Limited
+  Address: No.22, Kegalle Rd,, BULATHKOHUPITIYA Sri Lanka
+  Phone: 0365776096, 0777294318
+
+Store: Mawanella Limited
+  Address: No. 150, Main Street,, MAWANELLA Sri Lanka
+  Phone: 0355776096, 0719323332
+
+Store: Abans Kurunegala - B
+  Address: No.21, Negambo Rd,, KURUNEGALA Sri Lanka
+  Phone: 0372224824, 03757776565
+
+Store: Abans Mobile Kurunegala - C
+  Address: No.80, Colombo Rd,, KURUNEGALA Sri Lanka
+  Phone: 0375776552, 0712282677
+
+Store: Abans Pannala
+  Address: No. 19, Kurunegala Road,, PANNALA Sri Lanka
+  Phone: 0375776600, 0768039795
+
+Store: Abans Peradeniya
+  Address: 360/7/C, Colombo Road, PERADENIYA Sri Lanka
+  Phone: 0714717262, 0711658165
+
+Store: Abans Mawathagama
+  Address: No. 56, Kandy Raod, MAWATHAGAMA Sri Lanka
+  Phone: 0375776666, 0760446453
+
+Store: Abans Pilimathalawa - B
+  Address: -, PILIMATALAWA Sri Lanka
+  Phone: 0815776115, 0715723299
+
+Store: Abans Kegalle Unlimited
+  Address: No. 369, Main Street,, KEGALLE Sri Lanka
+  Phone: 0352267499, 0777565340
+
+Store: Abans Mirigama Mobile
+  Address: No. 32, Giriulla Road,, MIRIGAMA Sri Lanka
+  Phone: 0774166411, 0758992383
+
+Store: Abans Mirigama Unlimited
+  Address: No. 08, Giriulla Road,, MIRIGAMA Sri Lanka
+  Phone: 0332276672, 0773972191
+
+Store: Abans Kolonnawa
+  Address: No.139, Kolonnawa Road,, KOLONNAWA Sri Lanka
+  Phone: 0115776104, 0752903935
+
+Store: Abans Athurugiriya Limited - B
+  Address: 126/1, Kaduwela Road, ATHURUGIRIYA Sri Lanka
+  Phone: 0115776116, 0753444777
+
+Store: Abans Dematagoda Limited
+  Address: No. 386, Baseline Road, Dematagoda, COLOMBO 9 Sri Lanka
+  Phone: 0773638282, 0757299135
+
+Store: Abans Pundaluoya Limited
+  Address: Kadathorapitiya Road,, PUNDALUOYA Sri Lanka
+  Phone: 0515776096, 0772986422
+
+Store: Abans Mulgampola
+  Address: No. 590, Peradeniya Road, Mulgampola, KANDY Sri Lanka
+  Phone: 0776647526, 0753600364
+
+Store: Abans Rajagiriya - HP
+  Address: -, RAJAGIRIYA Sri Lanka
+  Phone: 0112676589, 0779890072
+
+Store: Abans Kandana Unlimited - B
+  Address: 151/E, Negombo Rd,, KANDANA Sri Lanka
+  Phone: 0115776157, 0776000285
+
+Store: Abans Rideegama
+  Address: Kurunegala Rd, Rideegama, KURUNEGALA Sri Lanka
+  Phone: 0375776604, 0776782981
+
+Store: Abans Delgoda Limited
+  Address: 338/C/2, New Kandy Road,, DELGODA Sri Lanka
+  Phone: 0711086573, 0112403553
+
+Store: Abans Kadawatha Limited - B
+  Address: Main street, Kandy Road,, KADAWATHA Sri Lanka
+  Phone: 0112926280, 0115776126
+
+Store: Abans Veyangoda
+  Address: No. 192, Negambo Rd,, VEYANGODA Sri Lanka
+  Phone: 0759780130, 03322696025
+
+Store: Abans Hiripitiya Limited
+  Address: Kumbukgette Rd, Hiripitiya, Nikadalupotha, KURUNEGALA Sri Lanka
+  Phone: 0375776620, 0703916553
+
+Store: Abans Kuliyapitiya
+  Address: Madampe Rd,, KULIYAPITIYA Sri Lanka
+  Phone: 0775112063, 0375776655
+
+Store: Abans Mawanella Mobile - S
+  Address: No.150, Main Street, MAWANELLA Sri Lanka
+  Phone: 0719323332, 0786565817
+
+Store: Abans Kurunegala - C
+  Address: No.80, Colombo Road,, KURUNEGALA Sri Lanka
+  Phone: 0375776552, 0774677677
+
+Store: Abans Warakapola
+  Address: No. 04 Kandy Rd,, WARAKAPOLA Sri Lanka
+  Phone: 0718110789, 0719003400
+
+Store: Abans Nikaweratiya
+  Address: No. 69 Wasana Building , Puththalam Rd,, NIKAWERATIYA Sri Lanka
+  Phone: 0372260862, 0771018438
+
+Store: Abans Kandy Limited
+  Address: No. 111, Kotugodella Street,, KANDY Sri Lanka
+  Phone: 0777565655, 0815776120
+
+Store: Abans Theldeniya
+  Address: No 330/1,Mahiyanganaya Rd,, TELDENIYA Sri Lanka
+  Phone: 0817294982, 0763441542
+
+Store: Abans Polgahawela
+  Address: Sappuwatta, Sanasa Building, Dutugamunu Junction, POLGAHAWELA Sri Lanka
+  Phone: 0771434298, 0372241233
+
+Store: Abans Rikillagaskada
+  Address: Rohala Handiya, Rikillagaskada, NUWARA ELIYA Sri Lanka
+  Phone: 0759373163, 0114845097
+
+Store: Abans Kaduwela Limited
+  Address: NO: 482/7, Colombo Road,, KADUWELA Sri Lanka
+  Phone: 0115776103, 0772553864
+
+Store: Abans Kiribathgoda - B
+  Address: -, KIRIBATHGODA Sri Lanka
+  Phone: 0770612287, 0715612287
+
+Store: Abans Melsiripura Limited - B
+  Address: Abans showroom, Near The Fuel Mart, Dambulla RD,, MELSIRIPURA Sri Lanka
+  Phone: 0740061911, 0726801029
+
+Store: Abans Kegalle Limited - B
+  Address: No 337, Main Street,, KEGALLE Sri Lanka
+  Phone: 0352233410, 0714968040
+
+Store: Makola Unlimited
+  Address: 189/01, Main Street, Makola North,, MAKOLA Sri Lanka
+  Phone: 0112963044, 0718780658
+
+Store: Abans Menikhinna
+  Address: No. 46, Kandy Rd,, MENIKHINNA Sri Lanka
+  Phone: 0812376780, 0815776104
+
+Store: Abans Kotikawatta
+  Address: 275/2, Old Avissawella Rd,, KOTIKAWATTA Sri Lanka
+  Phone: 0783672372, 0753151151
+
+Store: Abans Kirindiwela
+  Address: No. 56, Radawane Rd,, KIRINDIWELA Sri Lanka
+  Phone: 0713875554, 0773731020
+
+Store: Abans Giriulla Limited
+  Address: No. 90, Negombo Rd, Giriulla, Kurunegala Sri Lanka
+  Phone: 0779981633, 0759981612
+
+Store: Abans Pussellawa
+  Address: No. 539, Nuwara Eliya Road,, PUSSELLAWA Sri Lanka
+  Phone: 0712855528, 0759136305
+
+Store: Abans Narammala
+  Address: No. 142/A, Negombo Rd,, NARAMMALA Sri Lanka
+  Phone: 0377294262, 0716064591
+
+Store: Abans Ragama
+  Address: No.10, Sisiriwardana Rd, Ragama, GAMPAHA Sri Lanka
+  Phone: 0112953593, 0114845117
+
+Store: Abans Ganemulla Limited
+  Address: No 191, Main Street,, GANEMULLA Sri Lanka
+  Phone: 0332260013, 0774365747
+
+Store: Abans Kobeigane
+  Address: No. 40, Main Street,, KOBEIGANE Sri Lanka
+  Phone: 0763499498, 0375776161
+
+Store: Abans Weliweriya Unlimited
+  Address: 416/25/B/1, Golden Building, Biyagama Rd,, WELIVERIYA Sri Lanka
+  Phone: 0759206764, 0750420801
+
+Store: Abans Weliweriya Limited
+  Address: No, 477/20, New Kandy Road,, WELIVERIYA Sri Lanka
+  Phone: 0703636858, 0703636858
+
+Store: Abans Mirigama Limited - 2
+  Address: No. 32, Giriulla Road, Mirigama, MIRIGAMA Sri Lanka
+  Phone: 0754007535, 0741710607
+
+Store: Abans Mattakkuliya
+  Address: No. 04, Kelaniganga Mills Road, Mattakkuliya, COLOMBO 15 Sri Lanka
+  Phone: 0115776132, 0750482848
+
+Store: Abans Kotahena
+  Address: No. 286, George R D Silva Mawatha, Kotahena, COLOMBO 13 Sri Lanka
+  Phone: 0112451062, 0759933721
+
+Store: Abans Wattala - 2
+  Address: No.464/1, Negombo Road,, WATTALA Sri Lanka
+  Phone: 0115776154, 0773883970
+
+Store: Negombo Limited
+  Address: No.103, ST. Joseph Street,, NEGOMBO Sri Lanka
+  Phone: 0315776095, 0312233929
+
+Store: Abans Nittambuwa - B
+  Address: No.487/1, Kandy Road,, NITTAMBUWA Sri Lanka
+  Phone: 0332296661, 0779777773
+
+Store: Abans Rambukkana
+  Address: No. 111/A, Kurunegala Road,, RAMBUKKANA Sri Lanka
+  Phone: 0704345625, 0714945722
+
+Store: Abans Elite Galle - B
+  Address: 142/144, Main Street,, GALLE Sri Lanka
+  Phone: 0917908087, 0917909078
+
+Store: Abans Agalawatta Limited
+  Address: No 29, Horana Road, AGALAWATTA Sri Lanka
+  Phone: 0716640012, 0347294071
+
+Store: Abans Galaha Limited
+  Address: No.81, Main Street,, GALAHA Sri Lanka
+  Phone: 0815776110, 0815776110
+
+Store: Abans Ahangama Limited
+  Address: No. 63, Ground Floor, Matara Road,, AHANGAMA Sri Lanka
+  Phone: 0714655503, 0917791310
+
+Store: Abans Akkareipattuwa Limited
+  Address: Kalmunai Road,, AKKARAIPATTU Sri Lanka
+  Phone: 0677284074, 0779204200
+
+Store: Abans Akuressa Limited
+  Address: Kamburupitiya Road,, AKURESSA Sri Lanka
+  Phone: 0760371885, 0417294808
+
+Store: Abans Aluthgama Unlimited
+  Address: No:- 355C, Galle Rd,, ALUTHGAMA Sri Lanka
+  Phone: 0773093393, 0347294822
+
+Store: Abans Ambalangoda Limited
+  Address: No:- 10, Galle Rd,, AMBALANGODA Sri Lanka
+  Phone: 0917791296, 0757285732
+
+Store: Abans Ambalanthota Unlimited
+  Address: No 25,, AMBALANTOTA Sri Lanka
+  Phone: 0762068758, 0477285541
+
+Store: Abans Ambalantota Limited
+  Address: No. 88, Main Street,, AMBALANTOTA Sri Lanka
+  Phone: 0778492313, 0457655569
+
+Store: Abans Ampara Limited
+  Address: Perera Building, D.S Senanayaga Street,, AMPARA Sri Lanka
+  Phone: 0632224775, 0777520903
+
+Store: Abans Angunukolapelessa Limited
+  Address: Hungama Rd,, ANGUNAKOLAPELESSA Sri Lanka
+  Phone: 0718432280, 0773854909
+
+Store: Abans Yatiyantota Limited
+  Address: No.45, Ruwanwella Road,, YATIYANTOTA Sri Lanka
+  Phone: 0773414138, 0367855697
+
+Store: Abans Yakkalamulla Limited
+  Address: Akuressa Road,, YAKKALAMULLA Sri Lanka
+  Phone: 0773355844, 0917791311
+
+Store: Abans Wennappuwa Unlimited
+  Address: No-15,Lunuwila Junction,Chilaw Road,, WENNAPPUWA Sri Lanka
+  Phone: 0774203390, 0317934559
+
+Store: Abans Wennappuwa Limited
+  Address: No 49,Colombo Road,, WENNAPPUWA Sri Lanka
+  Phone: 0778956181, 0312253197
+
+Store: Abans Wellawaya Unlimited
+  Address: No 161, Tissa Rd ,, WELLAWAYA Sri Lanka
+  Phone: 0762284562, 0557284163
+
+Store: Abans Wellawaya Mobile&nbsp;
+  Address: Hmi Mohommed Building Monaragala Road, WELLAWAYA Sri Lanka
+  Phone: 0716633737, 0557284934
+
+Store: Abans Wellawaya Limited
+  Address: H M I Mohomad Building Monaragala Road,, WELLAWAYA Sri Lanka
+  Phone: 0766900616, 0557284934
+
+Store: Abans Welimada Limited
+  Address: No 44 Nuwaraeliya Road, WELIMADA Sri Lanka
+  Phone: 0771762121, 0577286405
+
+Store: Abans Weligama Limited
+  Address: No 04. Samaraweera Please,, WELIGAMA Sri Lanka
+  Phone: 0769370378
+
+Store: Abans Anuradapura Limited
+  Address: No 514/A4, Mithripala Senanayak Mawath, New Bus Stand,, ANURADHAPURA Sri Lanka
+  Phone: 0714924578, 0714924578
+
+Store: Abans Anuradapura Unlimited
+  Address: No 213/5, Maithripala Senanayak Mawatha, Bank Town,, ANURADHAPURA Sri Lanka
+  Phone: 0777314708, 0777314708
+
+Store: Abans Aralaganwila Limited
+  Address: No 14/63,, ARALAGANWILA Sri Lanka
+  Phone: 0741773302, 0277644305
+
+Store: Abans Achchuveli Limited
+  Address: Main Street,, Achchuveli Sri Lanka
+  Phone: 0772846754, 0705070983
+
+Store: Abans Ettampitiya Limited
+  Address: Badulla Road,, ETTAMPITIYA Sri Lanka
+  Phone: 0557284927, 0756531798
+
+Store: Abans Wattegama 2 Limited
+  Address: No117,Panvila Rd,, WATTEGAMA Sri Lanka
+  Phone: 0777195880, 0815776111
+
+Store: Abans Wattala Limited
+  Address: No 114 A, Gemunu Palace, ., WATTALA Sri Lanka
+  Phone: 0774763081, 0779593081
+
+Store: Abans Wariyapola Limited
+  Address: No-95, Puttlam Road,, WARIYAPOLA Sri Lanka
+  Phone: 0710724986, 0377294019
+
+Store: Abans Wanduramba Unlimited
+  Address: No:- Wanduramba - Baddegama Rd,, WANDURAMBA Sri Lanka
+  Phone: 0917791318, 0771024610
+
+Store: Abans Walapane Limited
+  Address: No 10 Kandy Road, WALAPANE Sri Lanka
+  Phone: 0762441112, 0527285488
+
+Store: Abans Wadduwa Limited
+  Address: No:-577, Galle Rd,, WADDUWA Sri Lanka
+  Phone: 0387412934, 0716338800
+
+Store: Abans Veyangoda 01 Mobile&nbsp;
+  Address: 192,Negambo Rd,&nbsp;, VEYANGODA Sri Lanka
+  Phone: 0771246665, 03322696025
+
+Store: Abans Attidiya Limited
+  Address: No. 154C, Main Rd,, ATTIDIYA Sri Lanka
+  Phone: 0557284927, 0756531798
+
+Store: Abans Avissawella Unlimited
+  Address: No.69/1, Yatiyantota Road,, AVISSAWELLA Sri Lanka
+  Phone: 0711364636, 0367855708
+
+Store: Abans Badalkumbura Limited
+  Address: Buttala Road,, BADALKUMBURA Sri Lanka
+  Phone: 0766490604, 0557284923
+
+Store: Abans Baddegama Limited
+  Address: No:- 83D,Galle Rd,, BADDEGAMA Sri Lanka
+  Phone: 0777758984, 0777758984
+
+Store: Abans Badulla Limited
+  Address: No 40/1 , Darmadutha Road,, BADULLA Sri Lanka
+  Phone: 0712846256, 0712846256
+
+Store: Abans Badulla Unlimited
+  Address: No 32, Udayaraja Mawatha,, BADULLA Sri Lanka
+  Phone: 0714796833, 0719235529
+
+Store: Abans Bakamoona Limited
+  Address: Jayarathne Building, Main Street,, Bakamoona Sri Lanka
+  Phone: 0775849843, 0667628671
+
+Store: Abans Balangoda Limited
+  Address: No 1/41 Main Street,, BALANGODA Sri Lanka
+  Phone: 0719273381, 0457284659
+
+Store: Abans Urubokka Limited
+  Address: Main Street,, URUBOKKA Sri Lanka
+  Phone: 0767212003, 0114294453
+
+Store: Abans Uragasmanhandiya Limited
+  Address: Near The Hospital, Kosgoda-Uragaha Rd,, URAGAHA Sri Lanka
+  Phone: 0917791312, 0768010623
+
+Store: Abans Udugama B Limited
+  Address: Main Street, Neluwa Road,, UDUGAMA Sri Lanka
+  Phone: 0762350023, 0917791305
+
+Store: Abans Ududumbara Limited
+  Address: 46, Mediwaka Rd,, Udadumbara Sri Lanka
+  Phone: 0817294728, 0776405629
+
+Store: Abans Trincomalee Rc1 B Mobile&nbsp;
+  Address: No: 59, Central Road,, TRINCOMALEE Sri Lanka
+  Phone: 0765459710, 0267628312
+
+Store: Abans Trincomalee B Limited
+  Address: No: 59, Central Road,, TRINCOMALEE Sri Lanka
+  Phone: 0751470004, 0267628312
+
+Store: Abans Trincomalee&nbsp;Unlimited
+  Address: No:23, Mc Road ,, TRINCOMALEE Sri Lanka
+  Phone: 0764449830, 0267628317
+
+Store: Abans Tissamaharama Unlimited
+  Address: No 20, Main Street,, Tissamaharama Sri Lanka
+  Phone: 0772375543, 0704210373
+
+Store: Abans Tissamaharama Limited
+  Address: No:75, Main Street,, TISSAMAHARAMA Sri Lanka
+  Phone: 0719414701, 0472239801
+
+Store: Abans Thirunalvali Limited
+  Address: No 142, Palaly Road, ., Thirunelvely Sri Lanka
+  Phone: 0773599000, 0775541050
+
+Store: Abans Thanamalwila Limited
+  Address: Wellawaya Rd,, TANAMALWILA Sri Lanka
+  Phone: 0740777089, 0475776105
+
+Store: Abans Thambuttegama Unlimited
+  Address: No-72, Anuradhapura Road,, TAMBUTTEGAMA Sri Lanka
+  Phone: 0715404776, 0252276862
+
+Store: Abans Thambuththegama 2 Limited
+  Address: No-231, Anauradhapura Road,, TAMBUTTEGAMA Sri Lanka
+  Phone: 0714718484, 0257708363
+
+Store: Abans Tangalle Limited
+  Address: No 90/E,Main Street,, TANGALLA Sri Lanka
+  Phone: 0776358107, 0472241636
+
+Store: Abans Sooriyawewa Limited
+  Address: Hambanthota Road,, SOORIYAWEWA TOWN Sri Lanka
+  Phone: 0765786005, 0477285531
+
+Store: Abans Siyamblanduwa&nbsp;Limited
+  Address: Maine Street ,, SIYAMBALANDUWA Sri Lanka
+  Phone: 0557284933, 0701392125
+
+Store: Abans Ruwanwella Limited
+  Address: No.116, Main Street,, RUWANWELLA Sri Lanka
+  Phone: 0770498806, 0367855709
+
+Store: Abans Rathnapura B Limited
+  Address: 77/2/1, Sirimawo Bandaranayaka Mw ,, RATNAPURA Sri Lanka
+  Phone: 0714304227, 0452226434
+
+Store: Abans Rathnapura A Limited
+  Address: 01, Senanayake Mw ,, RATNAPURA Sri Lanka
+  Phone: 0718300550, 0452230976
+
+Store: Abans Balangoda Unlimited
+  Address: No 121, Main Street,, BALANGODA Sri Lanka
+  Phone: 0766893823, 0457284676
+
+Store: Abans Bandaragama Limited
+  Address: No 45, Horana Rd,, BANDARAGAMA Sri Lanka
+  Phone: 0383776022, 0777217448
+
+Store: Abans Bandarawela Limited
+  Address: No 86, Darmawijaya MW,, BANDARAWELA Sri Lanka
+  Phone: 0760401071, 0704040041
+
+Store: Abans Bandarawela Unlimited
+  Address: No: 80, Main Street,, BANDARAWELA Sri Lanka
+  Phone: 0773973609, 0575776152
+
+Store: Abans Bandarawela Unlimited Mobile
+  Address: No: 80, Main Street, BANDARAWELA Sri Lanka
+  Phone: 0770725925, 0457284676
+
+Store: Abans Batapola Limited
+  Address: Abans showroom,, BATAPOLA Sri Lanka
+  Phone: 0917791289, 0773532911
+
+Store: Abans Battaramulla Limited
+  Address: No 146, Main Street,, BATTARAMULLA Sri Lanka
+  Phone: 0787772155, 0112871633
+
+Store: Abans Batticaloa Limited
+  Address: No.263, Trincomalee Road,, BATTICALOA Sri Lanka
+  Phone: 0652227895, 0779628292
+
+Store: Abans Beliatta Limited -2
+  Address: No.40, Walasmulla Road, Beliatta, BELIATTA Sri Lanka
+  Phone: 0718466610, 0477285534
+
+Store: Abans Beruwela Limited
+  Address: No: 193/F, Galle Rd,, BERUWALA Sri Lanka
+  Phone: 0776283354, 0776283354
+
+Store: Abans Beruwela Unlimited
+  Address: No: 219, Galle Rd, Massala,, BERUWALA Sri Lanka
+  Phone: 0752696616, 0752696616
+
+Store: Abans Bibile Limited
+  Address: Malani Building, Badulla Rd,, BIBILE Sri Lanka
+  Phone: 0772013538, 05572284921
+
+Store: Abans Bibile Unlimited
+  Address: No. 55, Somasiri Building, Near the hospital,, BIBILE Sri Lanka
+  Phone: 0557284150, 0769358513
+
+Store: Abans Bingiriya Limited
+  Address: Kurunegala Road, Bowattha,, BINGIRIYA Sri Lanka
+  Phone: 0322245560, 0327294798
+
+Store: Abans Bogawanthalawa Limited - B
+  Address: No. 25, Main Street,, BOGAWANTALAWA Sri Lanka
+  Phone: 0774748701, 0527284213
+
+Store: Abans Boralesgamuwa Limited - B
+  Address: 227, Dehiwala Rd,, BORALESGAMUWA Sri Lanka
+  Phone: 0115776101, 0115776101
+
+Store: Abans Rakwana Limited
+  Address: No 16,Deniyaya Rd ,, RAKWANA Sri Lanka
+  Phone: 0703060999, 0457655568
+
+Store: Abans Ragala Limited
+  Address: No 85 Udupusellawa Rd, NUWARA ELIYA Sri Lanka
+  Phone: 0772769759, 0522265766
+
+Store: Abans Puttlam Unlimited
+  Address: No-10,Mannarama Road,, PUTTALAM Sri Lanka
+  Phone: 0777423817, 0322269405
+
+Store: Abans Puttlam Limited
+  Address: No:18 Mannar Road,, PUTTALAM Sri Lanka
+  Phone: 0756610788, 0327294146
+
+Store: Abans Puthukkudiyiruppu Unlimited
+  Address: Ward No 01, Paranthan Road,, PUTHUKUDIYIRUPPU Sri Lanka
+  Phone: 0762255692, 0770185692
+
+Store: Abans Pugoda Limited
+  Address: No 180/3/A, Main Street,, PUGODA Sri Lanka
+  Phone: 0772534118, 0719534118
+
+Store: Abans Polpithigama Limited
+  Address: Madagalla Road,, POLPITIGAMA Sri Lanka
+  Phone: 0772040806, 0377294791
+
+Store: Abans Polonnaruwa Limited
+  Address: No 13,Hospital Junction ,, POLONNARUWA Sri Lanka
+  Phone: 0760666714, 0277644316
+
+Store: Abans Pothuwil Limited
+  Address: Main Street, POTTUVIL Sri Lanka
+  Phone: 0718371122, 0752371128
+
+Store: Abans Bulathsinghala Limited
+  Address: No 137, Kalawallawa Rd,, BULATHSINHALA Sri Lanka
+  Phone: 0347294604, 0347294604
+
+Store: Abans Buttala Limited
+  Address: Madurapperuma Building, Raja Mw,, BUTTALA Sri Lanka
+  Phone: 0715222501, 0718461969
+
+Store: Abans Chankanai Limited
+  Address: No 221, Ponnalai Road,, CHANKANAI Sri Lanka
+  Phone: 0773763503, 0776949475
+
+Store: Abans Chawakachcheri Limited
+  Address: No.105, Kandy Road,, CHAVAKACHCHERI Sri Lanka
+  Phone: 0212270005, 0774522333
+
+Store: Abans Chenkalady Limited
+  Address: Main Street,, CHENKALADI Sri Lanka
+  Phone: 0657284897, 0775991182
+
+Store: Abans Chilaw Limited - C
+  Address: No 10, Bridge Street,, CHILAW Sri Lanka
+  Phone: 0777857536, 0322223980
+
+Store: Abans Chunnakam Limited
+  Address: K.K.S Road,, CHUNNAKAM Sri Lanka
+  Phone: 0772208242, 0768838242
+
+Store: Abans Dambulla Limited
+  Address: Sujatha Building, Kurunegala junction,, DAMBULLA Sri Lanka
+  Phone: 0760018303, 0667629689
+
+Store: Abans Dankotuwa Limited
+  Address: No-40, Negombo Road,, DANKOTUWA Sri Lanka
+  Phone: 0777126896, 0317934562
+
+Store: Abans Dehiattakandiya Limited
+  Address: No. 1/A, Rc1 New Town,, DEHIATTAKANDIYA Sri Lanka
+  Phone: 0272250444, 0277644310
+
+Store: Abans Point Pedro Limited
+  Address: 321a, Main Street,, POINT PEDRO Sri Lanka
+  Phone: 0771093730, 0761732099
+
+Store: Abans Pitigala Mobile Phone Showroom
+  Address: No 07, Main Street,, PITIGALA Sri Lanka
+  Phone: 0762669466, 0917791314
+
+Store: Abans Pitigala Limited
+  Address: No 07, Main Street,, PITIGALA Sri Lanka
+  Phone: 0715556050, 0917791306
+
+Store: Abans Pitabeddara Limited
+  Address: Medicare Building,Deniyaya Rd,, PITABEDDARA Sri Lanka
+  Phone: 0711817095, 0417294799
+
+Store: Abans Pelmadulla Rc1Mobile&nbsp;
+  Address: No38, Main Street, PELMADULLA Sri Lanka
+  Phone: 0716471327, 0452275587
+
+Store: Abans Pelmadulla Limited
+  Address: No38, Main Street, PELMADULLA Sri Lanka
+  Phone: 0714744401, 0452275587
+
+Store: Abans Passara Limited
+  Address: 268/A, Badalkumbura Rd,, PASSARA Sri Lanka
+  Phone: 0701615787, 0713023165
+
+Store: Abans Dehiattakandiya Unlimited
+  Address: No.11/A, New Town,, DEHIATTAKANDIYA Sri Lanka
+  Phone: 0277644307, 0775280503
+
+Store: Abans Dehiowita Unlimited
+  Address: No.5/A, Main Street,, DEHIOWITA Sri Lanka
+  Phone: 0761891261, 0367856093
+
+Store: Abans Deniyaya Limited
+  Address: No:146, Main Street,, DENIYAYA Sri Lanka
+  Phone: 0766785713, 0703017304
+
+Store: Abans Deraniyagala Limited
+  Address: Dehiowita Road,, DERANIYAGALA Sri Lanka
+  Phone: 0743698334, 0367855706
+
+Store: Abans Dikwella Limited
+  Address: No 63, Mahawela Road,, DIKWELLA Sri Lanka
+  Phone: 0713467688, 0412256306
+
+Store: Abans Divulapitiya Limited
+  Address: No.60b, Kurunegala Road,, DIVULAPITIYA Sri Lanka
+  Phone: 0773064541, 0317934565
+
+Store: Abans Ehaliyagoda Mobile - 2
+  Address: No.306/1/C, Main Street,, EHELIYAGODA Sri Lanka
+  Phone: 0768387386, 0367855687
+
+Store: Abans Eheliyagoda Limited
+  Address: Welagedara Building, Main Street,, EHELIYAGODA Sri Lanka
+  Phone: 0712074680, 0367856086
+
+Store: Abans Eheliyagoda Unlimited
+  Address: No. 306/1/C, Main Street,, EHELIYAGODA Sri Lanka
+  Phone: 0773436880, 0367856092
+
+Store: Abans Embilipitiya Limited
+  Address: No.238, Pallegama,, EMBILIPITIYA Sri Lanka
+  Phone: 0714786091, 0787145815
+
+Store: Abans Elpitiya - B
+  Address: No 15, Ambalangoda Road,, ELPITIYA Sri Lanka
+  Phone: 0778730731, 0917791309
+
+Store: Abans Embilipitiya Unlimited
+  Address: Nonagama Road,, EMBILIPITIYA Sri Lanka
+  Phone: 0711448199, 0477284258
+
+Store: Abans Eppawala - Mobile
+  Address: No.118/A, Thalawa Road,, EPPAWALA Sri Lanka
+  Phone: 0765997341, 0257708256
+
+Store: Abans Eppawala Limited
+  Address: No-118/A, Thalawa Road,, EPPAWALA Sri Lanka
+  Phone: 0769033393, 0257708256
+
+Store: Abans Galewela Limited - B
+  Address: No:193, Dambulla Road,, GALEWELA Sri Lanka
+  Phone: 0759448882, 0667629690
+
+Store: Abans Galle Limited
+  Address: No:- 04, Main street,, GALLE Sri Lanka
+  Phone: 0718108630, 0718108830
+
+Store: Abans Galgamuwa Limited
+  Address: No-195/4, Anuradhapura Road, Main Street,, GALGAMUWA Sri Lanka
+  Phone: 0768650055, 0377294453
+
+Store: Abans Padawiya Limited
+  Address: 387/B, Padavi, PADAVIYA Sri Lanka
+  Phone: 0701601749, 0779226518
+
+Store: Abans Nuwara Eliya B Limited
+  Address: No 39 Kandy Road, NUWARA ELIYA Sri Lanka
+  Phone: 0779878787, 0527285480
+
+Store: Abans Nuwara Eliya Limited
+  Address: No 36 Ramanadan Complex Park Road, NUWARA ELIYA Sri Lanka
+  Phone: 0777639186, 0522222383
+
+Store: Abans Nivithigala Limited Mobile
+  Address: New Shoping Complex , Rathnapura Rd,, Nivithigala Sri Lanka
+  Phone: 0718794194, 0457655587
+
+Store: Abans Nivithigala Limited
+  Address: New Shoping Complex , Rathnapura Rd,, NIVITIGALA Sri Lanka
+  Phone: 0702496008, 0452279988
+
+Store: Abans Neluwa Limited
+  Address: Abans Show Room A City Building Dellawa Rd, NIHILUWA Sri Lanka
+  Phone: 0782886842, 0917791316
+
+Store: Abans Nawalapitiya Limited
+  Address: No.62, Kotmale Road,, NAWALAPITIYA Sri Lanka
+  Phone: 0777066654, 0547285344
+
+Store: Abans Muttur Limited
+  Address: No: 74/1, Main Street,, MUTUR Sri Lanka
+  Phone: 0757303373, 0267628314
+
+Store: Abans Morawaka Limited
+  Address: Deniyaya Road,, MORAWAKA Sri Lanka
+  Phone: 0717525338, 0417294805
+
+Store: Abans Nattandiya Limited
+  Address: No-35,Marawila Road,, NATTANDIYA Sri Lanka
+  Phone: 0777423817, 0327294797
+
+Store: Abans Murukkan Limited
+  Address: Murunkan Junction Mannar Road ., MURUNKAN Sri Lanka
+  Phone: 0776749641, 0235776096
+
+Store: Abans Monaragala Unlimited
+  Address: 141/33, New Bus Stand,, MONARAGALA Sri Lanka
+  Phone: 0711631233, 0728277202
+
+Store: Abans Monaragala Limited
+  Address: 6/100, New Bus Stand Road,, MONARAGALA Sri Lanka
+  Phone: 0767410258, 0706010101
+
+Store: Abans Nugegoda Limited
+  Address: No 31, Nawala Road,, NUGEGODA Sri Lanka
+  Phone: 0776450350, 0112813217
+
+Store: Abans Negambo Unlimited
+  Address: No-296,Main Strrt, NEGOMBO Sri Lanka
+  Phone: 0772955576, 0715771551
+
+Store: Abans Mulliyavalai Limited
+  Address: Thanneeruttu, Mulliyawalai, ., MULLATIVU Sri Lanka
+  Phone: 0215776104, 0766618883
+
+Store: Abans Nelliady Limited
+  Address: Pointpedro Road,, NELYADI Sri Lanka
+  Phone: 0779554229, 0764595976
+
+Store: Abans Galnewa Limited - B
+  Address: No.17, New Town,, GALNEWA Sri Lanka
+  Phone: 0719310213, 0257708267
+
+Store: Abans Gampaha Elite HP - B
+  Address: 02 Holy Cross Road,, GAMPAHA Sri Lanka
+  Phone: 0777284738, 0337294794
+
+Store: Abans Gampola Limited
+  Address: No .11, Nuwaraeliya Rd,, GAMPOLA Sri Lanka
+  Phone: 0775501417, 0775501417
+
+Store: Abans Ginigathhena Limited - B
+  Address: Chamara Building, Nawalapitiya Road,, GINIGATHENA Sri Lanka
+  Phone: 0778940971, 0517285790
+
+Store: Abans Girandurukotte HP
+  Address: No.17, New Town,, GIRANDURUKOTTE Sri Lanka
+  Phone: 0277644313, 0727670671
+
+Store: Abans Godagama Limited
+  Address: No.157/A, Highlevel Road,, GODAGAMA Sri Lanka
+  Phone: 0715117909, 0112748233
+
+Store: Abans Godakawela Limited
+  Address: No. 91 ,Main Street,, GODAKAWELA Sri Lanka
+  Phone: 0752678993, 0457655564
+
+Store: Abans Godakawela Mobile
+  Address: No. 91, Main Street,, GODAKAWELA Sri Lanka
+  Phone: 0701396272, 0457655663
+
+Store: Abans Godakawela Unlimited
+  Address: No. 186, Main Street,, GODAKAWELA Sri Lanka
+  Phone: 0742732337, 0452240490
+
+Store: Abans Hakmana Limited
+  Address: No. 28 A, Beliatta Rd,, HAKMANA Sri Lanka
+  Phone: 0778458959, 0417294811
+
+Store: Abans Hambantota Limited
+  Address: No.33g, Thissa Rd,, HAMBANTOTA Sri Lanka
+  Phone: 0712346873, 0472222367
+
+Store: Abans Hanwella Limited
+  Address: No. 89, Main Street,, HANWELLA Sri Lanka
+  Phone: 0777957426, 0367855683
+
+Store: Abans Hanwella Unlimited
+  Address: No. 32, Desawatha Road,, HANWELLA Sri Lanka
+  Phone: 0773340909, 0773340909
+
+Store: Abans Haputhale Limited
+  Address: No. 48, Colombo Road,, HAPUTALE Sri Lanka
+  Phone: 0761031277, 0577286815
+
+Store: Abans Hatton Limited
+  Address: No.01, Circular Road,, HATTON Sri Lanka
+  Phone: 0777283238, 0512224940
+
+Store: Abans Hatton Unlimited
+  Address: No.36, Main Street,, HATTON Sri Lanka
+  Phone: 0776330902, 0517285809
+
+Store: Abans Hettipola Limited
+  Address: Opposite The Court, Kurunegala Road,, HETTIPOLA Sri Lanka
+  Phone: 0706499498, 0377294017
+
+Store: Abans Hikkaduwa Limited
+  Address: No: 151/A, Galle Rd,, HIKKADUWA Sri Lanka
+  Phone: 0917791301, 0769395928
+
+Store: Abans Hingurakgoda Limited
+  Address: No. 56, D.S.Senanayaka Street,, HINGURAKGODA Sri Lanka
+  Phone: 0761289058, 0277644306
+
+Store: Abans Hingurana Limited - B
+  Address: Muvangala road,, HINGURANA Sri Lanka
+  Phone: 0717919977, 0717919977
+
+Store: Abans Homagama Limited - B
+  Address: No. 22C, High Level Road,, HOMAGAMA Sri Lanka
+  Phone: 0771441149, 0759997444
+
+Store: Abans Horana Limited
+  Address: No. 65, Rathnapura Rd,, HORANA Sri Lanka
+  Phone: 0342261788, 0342261788
+
+Store: Abans Horana Unlimited
+  Address: No. 141 /b2, Panadura Rd,, HORANA Sri Lanka
+  Phone: 0347294256, 0347294256
+
+Store: Abans Ibbagamuwa Limited
+  Address: Dambulla Road, Dehelgamuwa Junction,, Ibbagamuwa Sri Lanka
+  Phone: 0762569971, 0762569971
+
+Store: Abans Ja-Ela Limited
+  Address: No-17, Negombo Rd,, JA-ELA Sri Lanka
+  Phone: 0112240224, 0776479579
+
+Store: Abans Jaffna Limited - A
+  Address: No. 182 , Stanly Road,, JAFFNA Sri Lanka
+  Phone: 0773179593, 0759179596
+
+Store: Abans Jaffna Limited - B
+  Address: No. 30, Manipay Road,, JAFFNA Sri Lanka
+  Phone: 0774676578, 0773633538
+
+Store: Abans Jaffna Unlimited
+  Address: No 23, Stanly Road,, JAFFNA Sri Lanka
+  Phone: 0762645555, 0764973222
+
+Store: Abans Kaduruwela Limited - B
+  Address: No. 399/01, Main Street,, KADURUWELA Sri Lanka
+  Phone: 0760208353, 0277644302
+
+Store: Abans Kaduwela Limited
+  Address: No. 518/1/1, Avissawella Rd,, KADUWELA Sri Lanka
+  Phone: 0753984985, 0714798552
+
+Store: Abans Kalawana Limited
+  Address: Mathugama Rd,, KALAWANA Sri Lanka
+  Phone: 0707116100, 0457284657
+
+Store: Abans Kaluwanchikudy Limited - B
+  Address: Main Street,, KALUWANCHIKUDI Sri Lanka
+  Phone: 0778424864, 0778424864
+
+Store: Abans Kalmunai Limited
+  Address: No. 3/2, Batticaloa Road,, KALMUNAI Sri Lanka
+  Phone: 0673339089, 0777912960
+
+Store: Abans Mahawewa Limited
+  Address: Chilaw Rd, ., MAHAWEWA Sri Lanka
+  Phone: 0776478350, 0327294707
+
+Store: Abans Middeniya Limited
+  Address: Abans Showroom,Hungama Rd,, MIDDENIYA Sri Lanka
+  Phone: 0477285527, 0767448100
+
+Store: Abans Melsiripura Unlimited
+  Address: Abans Showroom,Nanda Building ,Dambulla Road,&nbsp;, MELSIRIPURA Sri Lanka
+  Phone: 0740061911, 0726801029
+
+Store: Abans Medirigiriya Unlimited
+  Address: No 21 Main Street, MEDIRIGIRIYA Sri Lanka
+  Phone: 0779028370, 0277644309
+
+Store: Abans Medawachchiya Limited
+  Address: No 74 A Jaffna Road &nbsp;, MEDAWACHCHIYA Sri Lanka
+  Phone: 0774649218
+
+Store: Abans Mathugama Mobile
+  Address: No 29, Kalutara Road,, MATUGAMA Sri Lanka
+  Phone: 0717957136, 0347294476
+
+Store: Abans Mathugama B Limited
+  Address: No 29, Kalutara Road,, MATUGAMA Sri Lanka
+  Phone: 0777265032, 0347294817
+
+Store: Abans Matara B Limited Mobile
+  Address: No.32, Anagarika Dharmapala Mw, Kings Watta,, MATARA Sri Lanka
+  Phone: 0412232622, 0710741751
+
+Store: Abans Matara ;B Limited
+  Address: No.32, Anagarika Dharmapala Mw, Kings Watta, MATARA Sri Lanka
+  Phone: 0412232622, 0705051000
+
+Store: Abans Matale Unlimited
+  Address: 32, Kings Street,, MATALE Sri Lanka
+  Phone: 0773849688, 0665776152
+
+Store: Abans Matale Limited
+  Address: No,90, Raja Vidiya, MATALE Sri Lanka
+  Phone: 0759142394, 0662233464
+
+Store: Abans Marawila Limited
+  Address: Nattandiya Road, MARAWILA Sri Lanka
+  Phone: 0779638858, 0327294169
+
+Store: Abans Manipai Limited
+  Address: No 75, Jaffna Road,, MANIPAY Sri Lanka
+  Phone: 0773358560, 0761661193
+
+Store: Abans Maho Limited
+  Address: No-51, Main Street,, MAHO Sri Lanka
+  Phone: 0715497711, 0372275280
+
+Store: Abans Mahiyangana Unlimited
+  Address: No. 19, Kandy Road,, MAHIYANGANAYA Sri Lanka
+  Phone: 0557284932, 0762772811
+
+Store: Abans Mahiyangana Limited
+  Address: No:40,Kandy Rd, ., MAHIYANGANAYA Sri Lanka
+  Phone: 0557284914, 0759221961
+
+Store: Abans Kalmunai Unlimited
+  Address: No. 212, Batticaloa Road,, KALMUNAI Sri Lanka
+  Phone: 0759550942, 0777550942
+
+Store: Abans Kalutara Limited
+  Address: No: 205, Galle Rd,, KALUTARA Sri Lanka
+  Phone: 0347294196, 0777641876
+
+Store: Abans Kamburupitiya Limited
+  Address: Matara Rd,, KAMBURUPITIYA Sri Lanka
+  Phone: 0417294816, 0753434395
+
+Store: Abans Kandy City Center Mobile
+  Address: No.5, Level 2, Daladha Veediya,, KANDY Sri Lanka
+  Phone: 0812230888, 0770176479
+
+Store: Abans Karandeniya Limited
+  Address: Mahaedanda,, KARANDENIYA Sri Lanka
+  Phone: 0773467862, 0917791321
+
+Store: Abans Mahaoya Unlimited
+  Address: Vijayadunga Bulding, Mahaoya Sri Lanka
+  Phone: 0713454742, 0767354742
+
+Store: Abans Kuruwita Limited
+  Address: No.32, Main Street,, Kuruwita Sri Lanka
+  Phone: 0779227669, 0457655598
+
+Store: Abans Kotikawatte Limited
+  Address: No. 275/2, Avisawella Road,, KOTIKAWATTA Sri Lanka
+  Phone: 0783672372
+
+Store: Abans Kobeygane Unlimited
+  Address: No.40, Main Street, &nbsp;, KOBEIGANE Sri Lanka
+  Phone: 0763499498, 0375776161
+
+Store: Abans Kilinochchi Unlimited
+  Address: No.29, Dippot Road, Uthyanagar East,, KILINOCHCHI Sri Lanka
+  Phone: 0215776155, 0703223220
+
+Store: Abans Kilinochchi Limited
+  Address: Opposit Old Kachcheri, A9 Road,, KILINOCHCHI Sri Lanka
+  Phone: 0215776103, 0773343282
+
+Store: Abans Keppetipola Limited
+  Address: No Nuwaraeliya Rd, KEPPETIPOLA Sri Lanka
+  Phone: 0759455160, 0577286399
+
+Store: Abans Kekirawa Limited
+  Address: No 18 ,Main Street, KEKIRAWA Sri Lanka
+  Phone: 0766415481, 0713862235
+
+Store: Abans Karapitiya Unlimited
+  Address: No: 253, Labuduwa Rd,, GALLE Sri Lanka
+  Phone: 0912233505, 0753850077
+
+Store: Abans Kaththankudi Limited - B
+  Address: No. 320, New Kalmunai Road, Nochchimunai,, KATTANKUDI Sri Lanka
+  Phone: 0772326101, 0772326101
+
+Store: Abans Katugastota Limited - 3
+  Address: No. 89/A, New Town,, KATUGASTOTA Sri Lanka
+  Phone: 0757667766, 0812500806
+
+Store: Abans Kebithigollawa Limited
+  Address: Horowpathana Road,, Kabithigollawa Sri Lanka
+  Phone: 0777616651, 0711956059
+
+Store: Abans Kekirawa Limited - B
+  Address: No. 7A, Main Street,, KEKIRAWA Sri Lanka
+  Phone: 0711060481, 0770382672
+
+Store: Abans Kegalle Mobile - A
+  Address: No. 337, Main Street,, KEGALLE Sri Lanka
+  Phone: 0719275280, 0777375280
+
+Store: Abans Kegalle Mobile - B
+  Address: No. 369, Main Street,, KEGALLE Sri Lanka
+  Phone: 0714671090, 0721783290
+
+Store: Miniso Galle
+  Address: NO-72, OLD MATARA ROAD, PETTIGALAWATTA, GALLE Sri Lanka
+
+Store: Miniso Matara
+  Address: Anagarika Dharmapala Mawatha, MATARA Sri Lanka
+
+Store: Abans Kaduruwela Elite
+  Address: No.399/1,Main Sreet,, KADURUWELA Sri Lanka
+  Phone: 0277644301, 0277644302
+
+Store: Abans Elite - Havelock City
+  Address: No. 324/10-3/12,Havelock City Mall,Havelock Road,, COLOMBO 6 Sri Lanka
+  Phone: 0114845121, 0114845763
+
+Store: Abans Elite - Piliyandala
+  Address: No.70 , Moratuwa Road,, Piliyandala Sri Lanka
+
+Store: Abans Elite Vavuniya
+  Address: No.218, 220, Kandy Road,, Vauniya Sri Lanka
+
+Store: Abans Galle Mobile
+  Address: No – 144, Main Steet,, Galle Sri Lanka
+
+Store: Titan - Havelock City Mall
+  Address: 324-10 Havelock Road, Colombo 06 Sri Lanka
+
+Store: Hugo Boss - Colombo City Centre
+  Address: Sir James Peiris Mawatha, Colombo Sri Lanka
+  Phone: 0113776175, 0778258830
+
+Store: TITAN - Colombo City Centre
+  Address: 137, Sir James Pieris Mawatha, Colombo 02 Sri Lanka
+  Phone: 0113776171, 0702178532
+
+Store: MINISO Kollupitiya
+  Address: 498, GALLE ROAD, COLOMBO 3, COLPETTY Sri Lanka
+  Phone: 0115775252, 0762362925
+
+Store: MINISO Kiribathgoda
+  Address: 61 KANDY ROAD , KIRIBATHGODA, KIRIBATHGODA Sri Lanka
+  Phone: 0113776202, 0770612287
+
+Store: MIKU - MINISO Kurunagela
+  Address: Colombo Road, Kurunegala Sri Lanka
+  Phone: 0784847225
+
+Store: Miniso - Rathmalana
+  Address: No.95, galle road, Kaldemulla Ratmalana, Ratmalana Sri Lanka
+  Phone: 0112605731, 0785708706
+
+Store: Abans Seeduwa Rc1
+  Address: 390 Colombo Road, Seeduwa, SEEDUWA Sri Lanka
+  Phone: 0777002742, 0773551857
+
+Store: My Cart
+
+Store: Featured Brands
+
+For the latest store information, visit: https://buyabans.com/contactus/find-a-store
+Customer Support hours: 8am - 5pm

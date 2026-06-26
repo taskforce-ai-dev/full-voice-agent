@@ -1,0 +1,467 @@
+{
+  "accounts": {
+    "1042-8837-9201": {
+      "account_no": "1042-8837-9201",
+      "account_no_last4": "9201",
+      "account_holder": "Nimal Perera",
+      "company_name": null,
+      "account_type": "Current Account",
+      "is_business": false,
+      "branch": "Nugegoda",
+      "opened_date": "14 March 2019",
+      "verification": {
+        "nic": "901234567V",
+        "branch": "Nugegoda",
+        "dob": "12 April 1990",
+        "mothers_maiden_name": "Jayasinghe"
+      },
+      "summary": {
+        "opening_balance": 285000.00,
+        "closing_balance": 354217.00,
+        "statement_period": "01 April 2026 — 30 April 2026",
+        "internet_banking": true,
+        "mobile_banking": true,
+        "registered_mobile": "0771234567",
+        "registered_email": "nimal.perera@gmail.com"
+      },
+      "card": {
+        "number_masked": "**** **** **** 4412",
+        "card_type": "Visa Debit",
+        "expiry": "08/2027",
+        "status": "Active",
+        "daily_limit": 100000
+      },
+      "loans": [
+        {
+          "product_type": "Personal Loan",
+          "reference": "PL-2023-00441",
+          "original_amount": 500000,
+          "outstanding": 187500,
+          "monthly_payment": 15625,
+          "next_due_date": "05 May 2026",
+          "status": "Active"
+        }
+      ],
+      "standing_orders": [
+        {"payee": "Dialog Axiata", "amount": 1499, "execution_date": "1st of each month"},
+        {"payee": "Sanasa Life Insurance", "amount": 3200, "execution_date": "5th of each month"}
+      ],
+      "transactions": [
+        {"date": "01 Apr", "description": "Opening Balance", "dr_cr": null, "amount": 285000.00, "balance": 285000.00},
+        {"date": "07 Apr", "description": "POS — Keells Super Nugegoda", "dr_cr": "DR", "amount": 3450.00, "balance": 281550.00},
+        {"date": "08 Apr", "description": "ATM Withdrawal — Nugegoda Branch", "dr_cr": "DR", "amount": 10000.00, "balance": 271550.00},
+        {"date": "09 Apr", "description": "Bill Pay — Dialog Axiata (SO)", "dr_cr": "DR", "amount": 1499.00, "balance": 270051.00},
+        {"date": "10 Apr", "description": "Online Transfer Out — Sampath 7723", "dr_cr": "DR", "amount": 15000.00, "balance": 255051.00},
+        {"date": "11 Apr", "description": "POS — Laugfs Petrol, Nugegoda", "dr_cr": "DR", "amount": 4200.00, "balance": 250851.00},
+        {"date": "06 Apr", "description": "Standing Order — Sanasa Life Ins", "dr_cr": "DR", "amount": 3200.00, "balance": 247651.00},
+        {"date": "07 Apr", "description": "POS — Odel, Colombo 03", "dr_cr": "DR", "amount": 7800.00, "balance": 239851.00},
+        {"date": "08 Apr", "description": "ATM Withdrawal — Maharagama", "dr_cr": "DR", "amount": 5000.00, "balance": 234851.00},
+        {"date": "09 Apr", "description": "Bill Pay — CEB (Ceylon Electricity)", "dr_cr": "DR", "amount": 3870.00, "balance": 230981.00},
+        {"date": "10 Apr", "description": "Loan Repayment — PL-2023-00441", "dr_cr": "DR", "amount": 15625.00, "balance": 215356.00},
+        {"date": "11 Apr", "description": "POS — Cargills Food City, Nawala", "dr_cr": "DR", "amount": 2180.00, "balance": 213176.00},
+        {"date": "12 Apr", "description": "Online Transfer In — HNB 4491", "dr_cr": "CR", "amount": 25000.00, "balance": 238176.00},
+        {"date": "13 Apr", "description": "POS — Pizza Hut, Nugegoda", "dr_cr": "DR", "amount": 2450.00, "balance": 235726.00},
+        {"date": "14 Apr", "description": "ATM Withdrawal — Nugegoda Branch", "dr_cr": "DR", "amount": 10000.00, "balance": 225726.00},
+        {"date": "15 Apr", "description": "POS — Softlogic, One Galle Face", "dr_cr": "DR", "amount": 12500.00, "balance": 213226.00},
+        {"date": "16 Apr", "description": "Bill Pay — SLT Broadband", "dr_cr": "DR", "amount": 2199.00, "balance": 211027.00},
+        {"date": "17 Apr", "description": "Online Transfer Out — Commercial 8812", "dr_cr": "DR", "amount": 8000.00, "balance": 203027.00},
+        {"date": "18 Apr", "description": "POS — Keells Super, Rajagiriya", "dr_cr": "DR", "amount": 4750.00, "balance": 198277.00},
+        {"date": "19 Apr", "description": "ATM Withdrawal — Rajagiriya Branch", "dr_cr": "DR", "amount": 10000.00, "balance": 188277.00},
+        {"date": "20 Apr", "description": "POS — Laugfs Petrol, Rajagiriya", "dr_cr": "DR", "amount": 3800.00, "balance": 184477.00},
+        {"date": "21 Apr", "description": "Online Transfer In — BOC 3302", "dr_cr": "CR", "amount": 50000.00, "balance": 234477.00},
+        {"date": "22 Apr", "description": "POS — Bata, Liberty Plaza", "dr_cr": "DR", "amount": 3490.00, "balance": 230987.00},
+        {"date": "23 Apr", "description": "Salary Credit — ABC Exports (Pvt) Ltd", "dr_cr": "CR", "amount": 185000.00, "balance": 415987.00},
+        {"date": "24 Apr", "description": "POS — Cargills, Nawala", "dr_cr": "DR", "amount": 3120.00, "balance": 412867.00},
+        {"date": "25 Apr", "description": "Online Transfer Out — Sampath 7723", "dr_cr": "DR", "amount": 25000.00, "balance": 387867.00},
+        {"date": "26 Apr", "description": "ATM Withdrawal — Nugegoda Branch", "dr_cr": "DR", "amount": 20000.00, "balance": 367867.00},
+        {"date": "27 Apr", "description": "POS — Keells Super, Nugegoda", "dr_cr": "DR", "amount": 4350.00, "balance": 363517.00},
+        {"date": "28 Apr", "description": "Bill Pay — Lanka Hospitals OPD", "dr_cr": "DR", "amount": 5500.00, "balance": 358017.00},
+        {"date": "29 Apr", "description": "POS — Laugfs Petrol, Nawala", "dr_cr": "DR", "amount": 3800.00, "balance": 354217.00},
+        {"date": "30 Apr", "description": "Closing Balance", "dr_cr": null, "amount": null, "balance": 354217.00}
+      ]
+    },
+    "1098-5541-3367": {
+      "account_no": "1098-5541-3367",
+      "account_no_last4": "3367",
+      "account_holder": "Nimal Perera",
+      "company_name": "Perera Tech Solutions (Pvt) Ltd",
+      "account_type": "Business Current Account",
+      "is_business": true,
+      "branch": "Nugegoda",
+      "opened_date": "02 June 2022",
+      "verification": {
+        "nic": "901234567V",
+        "branch": "Nugegoda",
+        "dob": "12 April 1990",
+        "mothers_maiden_name": "Jayasinghe"
+      },
+      "summary": {
+        "opening_balance": 1250000.00,
+        "closing_balance": 1940955.00,
+        "statement_period": "01 April 2026 — 30 April 2026",
+        "internet_banking": true,
+        "mobile_banking": true,
+        "registered_mobile": "0771234567",
+        "registered_email": "accounts@pereratech.lk"
+      },
+      "card": {
+        "number_masked": "**** **** **** 6618",
+        "card_type": "Visa Business Debit",
+        "expiry": "05/2028",
+        "status": "Active",
+        "daily_limit": 300000
+      },
+      "loans": [
+        {
+          "product_type": "Business Term Loan",
+          "reference": "BTL-2023-00229",
+          "original_amount": 2000000,
+          "outstanding": 1340000,
+          "monthly_payment": 55000,
+          "next_due_date": "10 May 2026",
+          "status": "Active"
+        }
+      ],
+      "standing_orders": [
+        {"payee": "Office Rent — Nugegoda", "amount": 65000, "execution_date": "1st of each month"},
+        {"payee": "Dialog Corporate", "amount": 8500, "execution_date": "5th of each month"},
+        {"payee": "AWS Cloud Services (USD 180 est.)", "amount": 54900, "execution_date": "15th of each month"}
+      ],
+      "transactions": [
+        {"date": "01 Apr", "description": "Opening Balance", "dr_cr": null, "amount": 1250000.00, "balance": 1250000.00},
+        {"date": "07 Apr", "description": "Client Payment — Virtusa (Pvt) Ltd", "dr_cr": "CR", "amount": 420000.00, "balance": 1670000.00},
+        {"date": "08 Apr", "description": "Office Rent — Nugegoda (SO)", "dr_cr": "DR", "amount": 65000.00, "balance": 1605000.00},
+        {"date": "09 Apr", "description": "Payroll — March 2026 (Partial)", "dr_cr": "DR", "amount": 180000.00, "balance": 1425000.00},
+        {"date": "10 Apr", "description": "Payroll — March 2026 (Final)", "dr_cr": "DR", "amount": 145000.00, "balance": 1280000.00},
+        {"date": "11 Apr", "description": "Dialog Corporate Bill (SO)", "dr_cr": "DR", "amount": 8500.00, "balance": 1271500.00},
+        {"date": "06 Apr", "description": "POS — Laptop Parts, Borella", "dr_cr": "DR", "amount": 38000.00, "balance": 1233500.00},
+        {"date": "07 Apr", "description": "Client Payment — HNB IT Dept", "dr_cr": "CR", "amount": 325000.00, "balance": 1558500.00},
+        {"date": "08 Apr", "description": "Supplier Payment — SLT Enterprise", "dr_cr": "DR", "amount": 24000.00, "balance": 1534500.00},
+        {"date": "09 Apr", "description": "POS — Keells Horton Place (Office)", "dr_cr": "DR", "amount": 9200.00, "balance": 1525300.00},
+        {"date": "10 Apr", "description": "ATM Withdrawal — Nugegoda Branch", "dr_cr": "DR", "amount": 50000.00, "balance": 1475300.00},
+        {"date": "11 Apr", "description": "Business Term Loan EMI — BTL-2023-00229", "dr_cr": "DR", "amount": 55000.00, "balance": 1420300.00},
+        {"date": "12 Apr", "description": "POS — Office Supplies, Borella", "dr_cr": "DR", "amount": 12400.00, "balance": 1407900.00},
+        {"date": "13 Apr", "description": "Client Payment — Dialog Axiata IT", "dr_cr": "CR", "amount": 280000.00, "balance": 1687900.00},
+        {"date": "14 Apr", "description": "Payroll Advance — April", "dr_cr": "DR", "amount": 70000.00, "balance": 1617900.00},
+        {"date": "15 Apr", "description": "POS — Adobe Creative Cloud (USD 89)", "dr_cr": "DR", "amount": 27145.00, "balance": 1590755.00},
+        {"date": "16 Apr", "description": "Bill Pay — SLT Corporate Broadband", "dr_cr": "DR", "amount": 6500.00, "balance": 1584255.00},
+        {"date": "17 Apr", "description": "POS — Softlogic (Office Equipment)", "dr_cr": "DR", "amount": 44000.00, "balance": 1540255.00},
+        {"date": "18 Apr", "description": "Online Transfer Out — Sampath 9912", "dr_cr": "DR", "amount": 100000.00, "balance": 1440255.00},
+        {"date": "19 Apr", "description": "Client Payment — BOC IT Services", "dr_cr": "CR", "amount": 510000.00, "balance": 1950255.00},
+        {"date": "20 Apr", "description": "AWS Cloud Services (SO — USD 180)", "dr_cr": "DR", "amount": 54900.00, "balance": 1895355.00},
+        {"date": "21 Apr", "description": "POS — Dialog Business Centre", "dr_cr": "DR", "amount": 11000.00, "balance": 1884355.00},
+        {"date": "22 Apr", "description": "Supplier Payment — Lanka Printers", "dr_cr": "DR", "amount": 28500.00, "balance": 1855855.00},
+        {"date": "23 Apr", "description": "Payroll — April 2026 (Final)", "dr_cr": "DR", "amount": 325000.00, "balance": 1530855.00},
+        {"date": "24 Apr", "description": "Client Payment — Sampath Bank IT", "dr_cr": "CR", "amount": 390000.00, "balance": 1920855.00},
+        {"date": "25 Apr", "description": "POS — Laptop Battery, Borella", "dr_cr": "DR", "amount": 6800.00, "balance": 1914055.00},
+        {"date": "26 Apr", "description": "Bill Pay — CEB Commercial", "dr_cr": "DR", "amount": 14200.00, "balance": 1899855.00},
+        {"date": "27 Apr", "description": "Online Transfer Out — BOC 7712", "dr_cr": "DR", "amount": 200000.00, "balance": 1699855.00},
+        {"date": "28 Apr", "description": "POS — Prima Ceylon (Office Supplies)", "dr_cr": "DR", "amount": 8900.00, "balance": 1690955.00},
+        {"date": "29 Apr", "description": "Client Payment — Hatton National IT", "dr_cr": "CR", "amount": 250000.00, "balance": 1940955.00},
+        {"date": "30 Apr", "description": "Closing Balance", "dr_cr": null, "amount": null, "balance": 1940955.00}
+      ]
+    },
+    "2087-4412-6654": {
+      "account_no": "2087-4412-6654",
+      "account_no_last4": "6654",
+      "account_holder": "Dilani Wijesinghe",
+      "company_name": null,
+      "account_type": "Savings Account",
+      "is_business": false,
+      "branch": "Kandy",
+      "opened_date": "03 July 2021",
+      "verification": {
+        "nic": "198876543210",
+        "branch": "Kandy",
+        "dob": "28 November 1988",
+        "mothers_maiden_name": "Fernando"
+      },
+      "summary": {
+        "opening_balance": 115000.00,
+        "closing_balance": 106502.00,
+        "statement_period": "01 April 2026 — 30 April 2026",
+        "internet_banking": true,
+        "mobile_banking": false,
+        "registered_mobile": "0772345678",
+        "registered_email": "dilani.w@yahoo.com"
+      },
+      "card": {
+        "number_masked": "**** **** **** 7731",
+        "card_type": "Mastercard Debit",
+        "expiry": "11/2026",
+        "status": "Active",
+        "daily_limit": 50000
+      },
+      "loans": [],
+      "standing_orders": [
+        {"payee": "Dialog Axiata", "amount": 1099, "execution_date": "3rd of each month"},
+        {"payee": "LOLC Life Insurance", "amount": 2500, "execution_date": "10th of each month"}
+      ],
+      "transactions": [
+        {"date": "01 Apr", "description": "Opening Balance", "dr_cr": null, "amount": 115000.00, "balance": 115000.00},
+        {"date": "07 Apr", "description": "POS — Cargills Kandy City Centre", "dr_cr": "DR", "amount": 2890.00, "balance": 112110.00},
+        {"date": "08 Apr", "description": "ATM Withdrawal — Kandy Branch", "dr_cr": "DR", "amount": 10000.00, "balance": 102110.00},
+        {"date": "09 Apr", "description": "POS — Laugfs Petrol, Kandy", "dr_cr": "DR", "amount": 3200.00, "balance": 98910.00},
+        {"date": "10 Apr", "description": "Bill Pay — SLT Broadband Kandy", "dr_cr": "DR", "amount": 1699.00, "balance": 97211.00},
+        {"date": "06 Apr", "description": "Online Transfer Out — Peoples 9901", "dr_cr": "DR", "amount": 5000.00, "balance": 92211.00},
+        {"date": "07 Apr", "description": "POS — Arpico, Kandy", "dr_cr": "DR", "amount": 4150.00, "balance": 88061.00},
+        {"date": "08 Apr", "description": "ATM Withdrawal — Kandy City Centre", "dr_cr": "DR", "amount": 5000.00, "balance": 83061.00},
+        {"date": "09 Apr", "description": "Bill Pay — Dialog Axiata (SO)", "dr_cr": "DR", "amount": 1099.00, "balance": 81962.00},
+        {"date": "10 Apr", "description": "POS — KFC, Kandy", "dr_cr": "DR", "amount": 1450.00, "balance": 80512.00},
+        {"date": "11 Apr", "description": "Online Transfer In — Commercial 5521", "dr_cr": "CR", "amount": 20000.00, "balance": 100512.00},
+        {"date": "12 Apr", "description": "POS — Keells, Kandy City Centre", "dr_cr": "DR", "amount": 3780.00, "balance": 96732.00},
+        {"date": "13 Apr", "description": "ATM Withdrawal — Peradeniya Branch", "dr_cr": "DR", "amount": 5000.00, "balance": 91732.00},
+        {"date": "14 Apr", "description": "POS — Odel, Kandy", "dr_cr": "DR", "amount": 6200.00, "balance": 85532.00},
+        {"date": "15 Apr", "description": "Standing Order — LOLC Life Ins", "dr_cr": "DR", "amount": 2500.00, "balance": 83032.00},
+        {"date": "16 Apr", "description": "Bill Pay — LECO (Electricity)", "dr_cr": "DR", "amount": 2340.00, "balance": 80692.00},
+        {"date": "17 Apr", "description": "POS — Cargills, Kandy", "dr_cr": "DR", "amount": 1990.00, "balance": 78702.00},
+        {"date": "18 Apr", "description": "ATM Withdrawal — Kandy Branch", "dr_cr": "DR", "amount": 10000.00, "balance": 68702.00},
+        {"date": "19 Apr", "description": "Online Transfer In — BOC 7712", "dr_cr": "CR", "amount": 15000.00, "balance": 83702.00},
+        {"date": "20 Apr", "description": "POS — Laugfs Petrol, Peradeniya", "dr_cr": "DR", "amount": 2900.00, "balance": 80802.00},
+        {"date": "21 Apr", "description": "POS — Kandy City Centre Pharmacy", "dr_cr": "DR", "amount": 1780.00, "balance": 79022.00},
+        {"date": "22 Apr", "description": "ATM Withdrawal — Kandy City Centre", "dr_cr": "DR", "amount": 5000.00, "balance": 74022.00},
+        {"date": "23 Apr", "description": "Salary Credit — Ministry of Education", "dr_cr": "CR", "amount": 72000.00, "balance": 146022.00},
+        {"date": "24 Apr", "description": "POS — Cargills, Kandy City", "dr_cr": "DR", "amount": 2450.00, "balance": 143572.00},
+        {"date": "25 Apr", "description": "Online Transfer Out — Peoples 9901", "dr_cr": "DR", "amount": 10000.00, "balance": 133572.00},
+        {"date": "26 Apr", "description": "Bill Pay — Dialog Axiata", "dr_cr": "DR", "amount": 1490.00, "balance": 132082.00},
+        {"date": "27 Apr", "description": "ATM Withdrawal — Kandy Branch", "dr_cr": "DR", "amount": 20000.00, "balance": 112082.00},
+        {"date": "28 Apr", "description": "POS — Cargills, Kandy", "dr_cr": "DR", "amount": 2180.00, "balance": 109902.00},
+        {"date": "29 Apr", "description": "POS — Arpico, Kandy", "dr_cr": "DR", "amount": 3400.00, "balance": 106502.00},
+        {"date": "30 Apr", "description": "Closing Balance", "dr_cr": null, "amount": null, "balance": 106502.00}
+      ]
+    },
+    "3054-9960-1138": {
+      "account_no": "3054-9960-1138",
+      "account_no_last4": "1138",
+      "account_holder": "Ruwan Bandara",
+      "company_name": null,
+      "account_type": "Current Account",
+      "is_business": false,
+      "branch": "Galle",
+      "opened_date": "22 January 2017",
+      "verification": {
+        "nic": "197523456789",
+        "branch": "Galle",
+        "dob": "07 September 1975",
+        "mothers_maiden_name": "Seneviratne"
+      },
+      "summary": {
+        "opening_balance": 950000.00,
+        "closing_balance": 1084231.00,
+        "statement_period": "01 April 2026 — 30 April 2026",
+        "internet_banking": true,
+        "mobile_banking": true,
+        "registered_mobile": "0773456789",
+        "registered_email": "ruwan.bandara@sltnet.lk"
+      },
+      "card": {
+        "number_masked": "**** **** **** 2209",
+        "card_type": "Visa Debit",
+        "expiry": "03/2028",
+        "status": "Active",
+        "daily_limit": 250000
+      },
+      "loans": [
+        {
+          "product_type": "Housing Loan",
+          "reference": "HL-2018-00112",
+          "original_amount": 8500000,
+          "outstanding": 4230000,
+          "monthly_payment": 95000,
+          "next_due_date": "01 May 2026",
+          "status": "Active"
+        }
+      ],
+      "standing_orders": [
+        {"payee": "LECO (Electricity)", "amount": 6500, "execution_date": "2nd of each month"},
+        {"payee": "AIA Life Insurance", "amount": 12000, "execution_date": "7th of each month"}
+      ],
+      "transactions": [
+        {"date": "01 Apr", "description": "Opening Balance", "dr_cr": null, "amount": 950000.00, "balance": 950000.00},
+        {"date": "07 Apr", "description": "Supplier Payment — Lanka Tiles", "dr_cr": "DR", "amount": 87500.00, "balance": 862500.00},
+        {"date": "08 Apr", "description": "ATM Withdrawal — Galle Fort Branch", "dr_cr": "DR", "amount": 50000.00, "balance": 812500.00},
+        {"date": "09 Apr", "description": "POS — Cargills, Galle Town", "dr_cr": "DR", "amount": 8450.00, "balance": 804050.00},
+        {"date": "10 Apr", "description": "Bill Pay — LECO Industrial (SO)", "dr_cr": "DR", "amount": 6500.00, "balance": 797550.00},
+        {"date": "11 Apr", "description": "Online Transfer Out — HNB 2281", "dr_cr": "DR", "amount": 100000.00, "balance": 697550.00},
+        {"date": "06 Apr", "description": "POS — Laugfs Petrol, Galle", "dr_cr": "DR", "amount": 7200.00, "balance": 690350.00},
+        {"date": "07 Apr", "description": "Standing Order — AIA Life Ins", "dr_cr": "DR", "amount": 12000.00, "balance": 678350.00},
+        {"date": "08 Apr", "description": "ATM Withdrawal — Galle Branch", "dr_cr": "DR", "amount": 50000.00, "balance": 628350.00},
+        {"date": "09 Apr", "description": "POS — Odel, Majestic City Colombo", "dr_cr": "DR", "amount": 22500.00, "balance": 605850.00},
+        {"date": "10 Apr", "description": "Online Transfer Out — Peoples 4490", "dr_cr": "DR", "amount": 200000.00, "balance": 405850.00},
+        {"date": "11 Apr", "description": "POS — Keells, Galle", "dr_cr": "DR", "amount": 5900.00, "balance": 399950.00},
+        {"date": "12 Apr", "description": "Housing Loan EMI — HL-2018-00112", "dr_cr": "DR", "amount": 95000.00, "balance": 304950.00},
+        {"date": "13 Apr", "description": "ATM Withdrawal — Hikkaduwa Branch", "dr_cr": "DR", "amount": 30000.00, "balance": 274950.00},
+        {"date": "14 Apr", "description": "Bill Pay — SLT Broadband", "dr_cr": "DR", "amount": 3499.00, "balance": 271451.00},
+        {"date": "15 Apr", "description": "POS — Lanka Tiles, Galle", "dr_cr": "DR", "amount": 45000.00, "balance": 226451.00},
+        {"date": "16 Apr", "description": "Online Transfer In — Commercial 7712", "dr_cr": "CR", "amount": 500000.00, "balance": 726451.00},
+        {"date": "17 Apr", "description": "POS — Arpico, Galle", "dr_cr": "DR", "amount": 12000.00, "balance": 714451.00},
+        {"date": "18 Apr", "description": "ATM Withdrawal — Galle Fort", "dr_cr": "DR", "amount": 50000.00, "balance": 664451.00},
+        {"date": "19 Apr", "description": "Bill Pay — Dialog (Mobile)", "dr_cr": "DR", "amount": 4500.00, "balance": 659951.00},
+        {"date": "20 Apr", "description": "POS — Softlogic, Galle", "dr_cr": "DR", "amount": 18000.00, "balance": 641951.00},
+        {"date": "21 Apr", "description": "Online Transfer Out — Sampath 3312", "dr_cr": "DR", "amount": 100000.00, "balance": 541951.00},
+        {"date": "22 Apr", "description": "POS — Cargills, Galle Town", "dr_cr": "DR", "amount": 7200.00, "balance": 534751.00},
+        {"date": "23 Apr", "description": "ATM Withdrawal — Galle Branch", "dr_cr": "DR", "amount": 50000.00, "balance": 484751.00},
+        {"date": "24 Apr", "description": "Business Income Credit", "dr_cr": "CR", "amount": 950000.00, "balance": 1434751.00},
+        {"date": "25 Apr", "description": "POS — Laugfs, Galle", "dr_cr": "DR", "amount": 6800.00, "balance": 1427951.00},
+        {"date": "26 Apr", "description": "Online Transfer Out — BOC 9921", "dr_cr": "DR", "amount": 200000.00, "balance": 1227951.00},
+        {"date": "27 Apr", "description": "POS — Lanka Tiles, Galle", "dr_cr": "DR", "amount": 87500.00, "balance": 1140451.00},
+        {"date": "28 Apr", "description": "ATM Withdrawal — Galle Fort Branch", "dr_cr": "DR", "amount": 50000.00, "balance": 1090451.00},
+        {"date": "29 Apr", "description": "Bill Pay — CEB", "dr_cr": "DR", "amount": 6220.00, "balance": 1084231.00},
+        {"date": "30 Apr", "description": "Closing Balance", "dr_cr": null, "amount": null, "balance": 1084231.00}
+      ]
+    },
+    "4901-2233-4477": {
+      "account_no": "4901-2233-4477",
+      "account_no_last4": "4477",
+      "account_holder": "Amara Dissanayake",
+      "company_name": "Horizon Trading (Pvt) Ltd",
+      "account_type": "Business Current Account",
+      "is_business": true,
+      "branch": "Colombo 03",
+      "opened_date": "11 August 2020",
+      "verification": {
+        "nic": "198245678901",
+        "branch": "Colombo 03",
+        "dob": "15 June 1982",
+        "mothers_maiden_name": "Rajapaksa"
+      },
+      "summary": {
+        "opening_balance": 4800000.00,
+        "closing_balance": 5720400.00,
+        "statement_period": "01 April 2026 — 30 April 2026",
+        "internet_banking": true,
+        "mobile_banking": true,
+        "registered_mobile": "0774567890",
+        "registered_email": "accounts@horizontrading.lk"
+      },
+      "card": {
+        "number_masked": "**** **** **** 8823",
+        "card_type": "Visa Business Debit",
+        "expiry": "06/2027",
+        "status": "Active",
+        "daily_limit": 500000
+      },
+      "loans": [
+        {
+          "product_type": "Business Overdraft Facility",
+          "reference": "OD-2022-00890",
+          "original_amount": 3000000,
+          "outstanding": 0,
+          "monthly_payment": null,
+          "next_due_date": null,
+          "status": "Active — Unused"
+        }
+      ],
+      "standing_orders": [
+        {"payee": "CEB Industrial Tariff", "amount": 94300, "execution_date": "10th of each month"},
+        {"payee": "Warehouse Rent — Colombo 15", "amount": 220000, "execution_date": "1st of each month"}
+      ],
+      "transactions": [
+        {"date": "01 Apr", "description": "Opening Balance", "dr_cr": null, "amount": 4800000.00, "balance": 4800000.00},
+        {"date": "07 Apr", "description": "Supplier Payment — Brandix Apparel", "dr_cr": "DR", "amount": 380000.00, "balance": 4420000.00},
+        {"date": "08 Apr", "description": "Payroll — March 2026 (Partial)", "dr_cr": "DR", "amount": 620000.00, "balance": 3800000.00},
+        {"date": "09 Apr", "description": "Payroll — March 2026 (Final)", "dr_cr": "DR", "amount": 630000.00, "balance": 3170000.00},
+        {"date": "10 Apr", "description": "Rent — Warehouse Colombo 15 (SO)", "dr_cr": "DR", "amount": 220000.00, "balance": 2950000.00},
+        {"date": "11 Apr", "description": "Utility — CEB Industrial Tariff", "dr_cr": "DR", "amount": 94300.00, "balance": 2855700.00},
+        {"date": "06 Apr", "description": "Export Receipt — EUR 12,400 @ 360", "dr_cr": "CR", "amount": 4464000.00, "balance": 7319700.00},
+        {"date": "07 Apr", "description": "Supplier Payment — Mas Fabrics", "dr_cr": "DR", "amount": 480000.00, "balance": 6839700.00},
+        {"date": "08 Apr", "description": "Online Transfer Out — HNB 9910", "dr_cr": "DR", "amount": 200000.00, "balance": 6639700.00},
+        {"date": "09 Apr", "description": "POS — Prima Ceylon (Raw Materials)", "dr_cr": "DR", "amount": 125000.00, "balance": 6514700.00},
+        {"date": "10 Apr", "description": "Supplier Payment — DIMO Parts", "dr_cr": "DR", "amount": 89000.00, "balance": 6425700.00},
+        {"date": "11 Apr", "description": "Bill Pay — Dialog Corporate", "dr_cr": "DR", "amount": 22000.00, "balance": 6403700.00},
+        {"date": "12 Apr", "description": "POS — Laugfs Fuel Depot", "dr_cr": "DR", "amount": 38000.00, "balance": 6365700.00},
+        {"date": "13 Apr", "description": "Supplier Payment — Lanka Harness", "dr_cr": "DR", "amount": 267000.00, "balance": 6098700.00},
+        {"date": "14 Apr", "description": "Export Receipt — USD 8,200 @ 305", "dr_cr": "CR", "amount": 2501000.00, "balance": 8599700.00},
+        {"date": "15 Apr", "description": "Warehouse Rent — SO", "dr_cr": "DR", "amount": 220000.00, "balance": 8379700.00},
+        {"date": "16 Apr", "description": "CEB Industrial Tariff — SO", "dr_cr": "DR", "amount": 94300.00, "balance": 8285400.00},
+        {"date": "17 Apr", "description": "Supplier Payment — Brandix Apparel", "dr_cr": "DR", "amount": 410000.00, "balance": 7875400.00},
+        {"date": "18 Apr", "description": "Payroll Advance — April 2026", "dr_cr": "DR", "amount": 300000.00, "balance": 7575400.00},
+        {"date": "19 Apr", "description": "POS — Keells Horton Place (Office)", "dr_cr": "DR", "amount": 14500.00, "balance": 7560900.00},
+        {"date": "20 Apr", "description": "Online Transfer Out — Sampath 7723", "dr_cr": "DR", "amount": 1250000.00, "balance": 6310900.00},
+        {"date": "21 Apr", "description": "POS — Softlogic (Office Equipment)", "dr_cr": "DR", "amount": 88000.00, "balance": 6222900.00},
+        {"date": "22 Apr", "description": "Supplier Payment — Mas Fabrics", "dr_cr": "DR", "amount": 480000.00, "balance": 5742900.00},
+        {"date": "23 Apr", "description": "Payroll — April 2026 (Final)", "dr_cr": "DR", "amount": 950000.00, "balance": 4792900.00},
+        {"date": "24 Apr", "description": "Export Receipt — EUR 9,800 @ 360", "dr_cr": "CR", "amount": 3528000.00, "balance": 8320900.00},
+        {"date": "25 Apr", "description": "Supplier Payment — DIMO Parts", "dr_cr": "DR", "amount": 102000.00, "balance": 8218900.00},
+        {"date": "26 Apr", "description": "Bill Pay — SLT Corporate Broadband", "dr_cr": "DR", "amount": 18500.00, "balance": 8200400.00},
+        {"date": "27 Apr", "description": "POS — Prima Ceylon (Materials)", "dr_cr": "DR", "amount": 178000.00, "balance": 8022400.00},
+        {"date": "28 Apr", "description": "Online Transfer Out — BOC 4412", "dr_cr": "DR", "amount": 2000000.00, "balance": 6022400.00},
+        {"date": "29 Apr", "description": "Supplier Payment — Lanka Harness", "dr_cr": "DR", "amount": 302000.00, "balance": 5720400.00},
+        {"date": "30 Apr", "description": "Closing Balance", "dr_cr": null, "amount": null, "balance": 5720400.00}
+      ]
+    },
+    "5673-8800-2295": {
+      "account_no": "5673-8800-2295",
+      "account_no_last4": "2295",
+      "account_holder": "Sahan Mendis",
+      "company_name": "ByteNest Solutions (Pvt) Ltd",
+      "account_type": "Business Current Account",
+      "is_business": true,
+      "branch": "Colombo 07",
+      "opened_date": "05 February 2023",
+      "verification": {
+        "nic": "199312345670",
+        "branch": "Colombo 07",
+        "dob": "30 March 1993",
+        "mothers_maiden_name": "Gunawardena"
+      },
+      "summary": {
+        "opening_balance": 680000.00,
+        "closing_balance": 927607.00,
+        "statement_period": "01 April 2026 — 30 April 2026",
+        "internet_banking": true,
+        "mobile_banking": true,
+        "registered_mobile": "0775678901",
+        "registered_email": "finance@bytenest.lk"
+      },
+      "card": {
+        "number_masked": "**** **** **** 5509",
+        "card_type": "Mastercard Business Debit",
+        "expiry": "01/2027",
+        "status": "Active",
+        "daily_limit": 300000
+      },
+      "loans": [],
+      "standing_orders": [
+        {"payee": "Office Rent — Colombo 07", "amount": 85000, "execution_date": "1st of each month"},
+        {"payee": "AWS Cloud Services (USD 310 est.)", "amount": 94550, "execution_date": "15th of each month"}
+      ],
+      "transactions": [
+        {"date": "01 Apr", "description": "Opening Balance", "dr_cr": null, "amount": 680000.00, "balance": 680000.00},
+        {"date": "07 Apr", "description": "Client Payment — Hatton National Bank", "dr_cr": "CR", "amount": 330000.00, "balance": 1010000.00},
+        {"date": "08 Apr", "description": "Office Rent — Colombo 07 (SO)", "dr_cr": "DR", "amount": 85000.00, "balance": 925000.00},
+        {"date": "09 Apr", "description": "Payroll — March 2026 (Partial)", "dr_cr": "DR", "amount": 180000.00, "balance": 745000.00},
+        {"date": "10 Apr", "description": "Payroll — March 2026 (Final)", "dr_cr": "DR", "amount": 140000.00, "balance": 605000.00},
+        {"date": "11 Apr", "description": "POS — Dialog Business Centre", "dr_cr": "DR", "amount": 18500.00, "balance": 586500.00},
+        {"date": "06 Apr", "description": "Client Payment — Dialog Axiata", "dr_cr": "CR", "amount": 220000.00, "balance": 806500.00},
+        {"date": "07 Apr", "description": "POS — Adobe Creative Cloud (USD 89)", "dr_cr": "DR", "amount": 27145.00, "balance": 779355.00},
+        {"date": "08 Apr", "description": "POS — Keells, Colombo 07", "dr_cr": "DR", "amount": 6200.00, "balance": 773155.00},
+        {"date": "09 Apr", "description": "Bill Pay — SLT Office Broadband", "dr_cr": "DR", "amount": 4999.00, "balance": 768156.00},
+        {"date": "10 Apr", "description": "ATM Withdrawal — Colombo 07 Branch", "dr_cr": "DR", "amount": 30000.00, "balance": 738156.00},
+        {"date": "11 Apr", "description": "POS — Laptop Parts, Borella", "dr_cr": "DR", "amount": 42000.00, "balance": 696156.00},
+        {"date": "12 Apr", "description": "Online Transfer Out — Sampath 8812", "dr_cr": "DR", "amount": 50000.00, "balance": 646156.00},
+        {"date": "13 Apr", "description": "Client Payment — Virtusa (Pvt) Ltd", "dr_cr": "CR", "amount": 450000.00, "balance": 1096156.00},
+        {"date": "14 Apr", "description": "Payroll Advance — April", "dr_cr": "DR", "amount": 80000.00, "balance": 1016156.00},
+        {"date": "15 Apr", "description": "Bill Pay — Dialog Corporate", "dr_cr": "DR", "amount": 12400.00, "balance": 1003756.00},
+        {"date": "16 Apr", "description": "POS — HubSpot Subscription (USD 95)", "dr_cr": "DR", "amount": 28975.00, "balance": 974781.00},
+        {"date": "17 Apr", "description": "POS — Cargills, Colombo 07", "dr_cr": "DR", "amount": 5400.00, "balance": 969381.00},
+        {"date": "18 Apr", "description": "ATM Withdrawal — Colombo 07 Branch", "dr_cr": "DR", "amount": 25000.00, "balance": 944381.00},
+        {"date": "19 Apr", "description": "POS — Office Supplies, Borella", "dr_cr": "DR", "amount": 8900.00, "balance": 935481.00},
+        {"date": "20 Apr", "description": "AWS Cloud Services (SO — USD 310)", "dr_cr": "DR", "amount": 94550.00, "balance": 840931.00},
+        {"date": "21 Apr", "description": "POS — Dialog Business Centre", "dr_cr": "DR", "amount": 15200.00, "balance": 825731.00},
+        {"date": "22 Apr", "description": "Online Transfer Out — BOC 5512", "dr_cr": "DR", "amount": 100000.00, "balance": 725731.00},
+        {"date": "23 Apr", "description": "Payroll — April 2026 (Final)", "dr_cr": "DR", "amount": 175000.00, "balance": 550731.00},
+        {"date": "24 Apr", "description": "Client Payment — Lanka Hospitals", "dr_cr": "CR", "amount": 550000.00, "balance": 1100731.00},
+        {"date": "25 Apr", "description": "POS — Adobe Subscription (USD 55)", "dr_cr": "DR", "amount": 16775.00, "balance": 1083956.00},
+        {"date": "26 Apr", "description": "Bill Pay — SLT Broadband", "dr_cr": "DR", "amount": 4999.00, "balance": 1078957.00},
+        {"date": "27 Apr", "description": "POS — Supplier Payment — AWS (USD 310)", "dr_cr": "DR", "amount": 94550.00, "balance": 984407.00},
+        {"date": "28 Apr", "description": "Payroll — April (Bonus) — note: appears as DR in source", "dr_cr": "DR", "amount": 50000.00, "balance": 934407.00},
+        {"date": "29 Apr", "description": "POS — Keells, Colombo 07", "dr_cr": "DR", "amount": 6800.00, "balance": 927607.00},
+        {"date": "30 Apr", "description": "Closing Balance", "dr_cr": null, "amount": null, "balance": 927607.00}
+      ]
+    }
+  },
+  "_multi_account_holders": {
+    "Nimal Perera": ["1042-8837-9201", "1098-5541-3367"]
+  }
+}

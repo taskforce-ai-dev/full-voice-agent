@@ -1,0 +1,71 @@
+# ============================================================
+# Docker Compose -- KITCHENED' Voice Agent (Nira)
+# ============================================================
+# Runs the production server (server.py) behind Twilio
+# ConversationRelay with Claude streaming + ElevenLabs TTS.
+#
+# Usage:
+#   docker compose up -d          # start in background
+#   docker compose logs -f kitchened  # tail logs
+#   docker compose down           # stop and remove container
+# ============================================================
+
+services:
+  kitchened:
+    # -- Build from the Dockerfile in the project root ----------
+    build: .
+    container_name: kitchened-voice-agent
+
+    # -- Networking ---------------------------------------------
+    # Twilio webhooks hit port 8000; map host:container 1-to-1.
+    ports:
+      - "127.0.0.1:8020:8000"
+
+    # -- Secrets & configuration --------------------------------
+    # All API keys (Anthropic, ElevenLabs, Twilio, etc.)
+    # are loaded from .env -- never baked into the image.
+    env_file:
+      - .env
+
+    environment:
+      - DASHBOARD_API_URL=${DASHBOARD_API_URL:-}
+      - DASHBOARD_API_KEY=${DASHBOARD_API_KEY:-}
+      - DASHBOARD_AGENT_ID=${DASHBOARD_AGENT_ID:-kitchened}
+      - HUMAN_AGENT_PHONE=${HUMAN_AGENT_PHONE:-}
+
+    # -- Persistent volumes -------------------------------------
+    volumes:
+      # ChromaDB vector store -- survives container restarts so
+      # embeddings don't need to be regenerated each time.
+      - ./chroma_db:/app/chroma_db
+
+      # Knowledge documents -- mount as a bind so new/updated
+      # docs can be dropped in without rebuilding the image.
+      - ./knowledge_docs:/app/knowledge_docs
+
+    # -- Restart policy -----------------------------------------
+    # Always restart unless explicitly stopped with
+    # `docker compose stop` or `docker compose down`.
+    restart: unless-stopped
+
+    # -- Logging ------------------------------------------------
+    # Cap log size to prevent disk exhaustion on long-running
+    # deployments.  3 rotated files x 10 MB each = 30 MB max.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # -- Health check -------------------------------------------
+    # Hits the FastAPI /health endpoint every 30 s.
+    # The container is marked unhealthy after 3 consecutive
+    # failures (retries) with a 10 s timeout per probe.
+    # start_period gives the app 40 s to boot (model warm-up,
+    # ChromaDB init, etc.) before checks count as failures.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

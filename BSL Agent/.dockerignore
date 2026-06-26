@@ -1,0 +1,25 @@
+# Local secrets — injected at runtime via --env-file
+.env
+
+# Local development scripts
+test_voice*.py
+venv/
+.venv/
+
+# Caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Vector store (rebuilt on container startup from knowledge_docs/)
+chroma_db/
+
+# Project documentation (not needed at runtime)
+*.md
+*.pdf
+_phase0_*
+
+# Git
+.git/
+.gitignore

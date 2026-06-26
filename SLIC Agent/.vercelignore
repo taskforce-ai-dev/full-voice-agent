@@ -1,0 +1,13 @@
+*.py
+requirements*.txt
+Dockerfile
+docker-compose.yml
+nginx.conf
+deploy.sh
+chroma_db/
+knowledge_docs/
+*.json
+!vercel.json
+.env*
+__pycache__/
+*.pyc

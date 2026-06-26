@@ -187,64 +187,70 @@ def _stable_id(text: str, index: int) -> str:
 # Text chunking
 # ---------------------------------------------------------------------------
 
+def _split_oversized(para: str, chunk_size: int) -> List[str]:
+    """Split a single over-long paragraph into <= chunk_size pieces.
+
+    Forward-only (no backward overlap), so it cannot loop on a boundary the
+    way the old windowed splitter did. Prefers sentence boundaries, then word
+    boundaries, then a hard cut.
+    """
+    out: List[str] = []
+    start = 0
+    n = len(para)
+    while start < n:
+        end = start + chunk_size
+        if end >= n:
+            out.append(para[start:].strip())
+            break
+        window = para[start:end]
+        split_pos = -1
+        for pattern in (". ", "? ", "! "):
+            pos = window.rfind(pattern)
+            if pos != -1:
+                split_pos = pos + 1  # include the punctuation
+                break
+        if split_pos == -1:
+            split_pos = window.rfind(" ")
+        if split_pos == -1:
+            split_pos = chunk_size  # hard cut
+        out.append(para[start:start + split_pos].strip())
+        start = start + split_pos  # advance forward only
+    return [c for c in out if c]
+
+
 def chunk_text(
     text: str,
     chunk_size: int = 500,
-    overlap: int = 50,
+    overlap: int = 50,  # kept for signature compatibility; no longer used
 ) -> List[str]:
-    """Split *text* into overlapping chunks, respecting natural boundaries.
+    """Split *text* into chunks on paragraph boundaries.
 
-    Strategy (in order of preference):
-      1. Split on paragraph boundaries (double newlines).
-      2. Split on sentence boundaries (period / question-mark / exclamation-mark).
-      3. Split on word boundaries (whitespace).
+    Paragraphs (separated by blank lines) are the atomic unit: each is kept
+    whole so a self-contained record — e.g. one property listing — stays in a
+    single chunk. Small consecutive paragraphs are packed together up to
+    *chunk_size*; a paragraph longer than *chunk_size* is split on sentence /
+    word boundaries via :func:`_split_oversized`.
 
-    Each chunk is at most *chunk_size* characters long.  Consecutive chunks
-    share *overlap* trailing characters to preserve context across boundaries.
+    This replaces the previous overlapping-window splitter, which spiralled
+    into hundreds of tiny fragments on paragraph-separated content (the
+    backward `overlap` repeatedly re-found the same `\\n\\n` boundary).
     """
     if not text or not text.strip():
         return []
 
     text = text.strip()
-    if len(text) <= chunk_size:
-        return [text]
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
 
+    # One paragraph == one chunk. A self-contained record (e.g. a single
+    # property listing) stays whole and is never merged with a neighbour, so
+    # per-chunk metadata (type / zone) maps to exactly one listing. Only an
+    # over-long paragraph is split, on sentence / word boundaries.
     chunks: List[str] = []
-    start = 0
-
-    while start < len(text):
-        end = start + chunk_size
-
-        if end >= len(text):
-            chunks.append(text[start:].strip())
-            break
-
-        # Look for the best split point inside the window.
-        window = text[start:end]
-
-        # 1. Paragraph break
-        split_pos = window.rfind("\n\n")
-        if split_pos == -1:
-            # 2. Sentence break
-            for pattern in (". ", "? ", "! "):
-                split_pos = window.rfind(pattern)
-                if split_pos != -1:
-                    split_pos += 1  # include the punctuation
-                    break
-        if split_pos == -1:
-            # 3. Word break
-            split_pos = window.rfind(" ")
-        if split_pos == -1:
-            # Hard cut as last resort
-            split_pos = chunk_size
-
-        actual_end = start + split_pos
-        chunk = text[start:actual_end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        # Move forward, applying overlap
-        start = max(actual_end - overlap, start + 1)
+    for para in paragraphs:
+        if len(para) > chunk_size:
+            chunks.extend(_split_oversized(para, chunk_size))
+        else:
+            chunks.append(para)
 
     return chunks
 
@@ -316,6 +322,110 @@ def _read_file(path: str) -> Optional[str]:
 # Knowledge-base initialisation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Property type / zone tagging (for precise metadata-filtered retrieval)
+# ---------------------------------------------------------------------------
+
+# Colombo area names -> postal zone, so callers can say the neighbourhood.
+_AREA_TO_ZONE = {
+    "fort": "1", "galle face": "1",
+    "slave island": "2", "union place": "2",
+    "kollupitiya": "3", "kollupitya": "3", "colpetty": "3",
+    "bambalapitiya": "4",
+    "havelock town": "5", "havelock city": "5", "havelock": "5", "narahenpita": "5",
+    # Common STT mis-hearings of "Havelock" (Havelock Town/City).
+    "havoc town": "5", "havoc city": "5", "havoc": "5", "haverlock": "5",
+    "wellawatte": "6", "wellawatta": "6",
+    "cinnamon gardens": "7",
+    "borella": "8",
+    "maradana": "10",
+}
+
+_NUM_WORDS = {
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+}
+
+# Markers that mean a non-residential listing. Checked before house/apartment
+# so "house-type office space" classifies as commercial, not house.
+_COMMERCIAL_MARKERS = (
+    "office space", "commercial building", "commercial property",
+    "commercial house", "commercial space", "commercial unit",
+)
+
+
+def _classify_type(text_lower: str) -> str:
+    if any(m in text_lower for m in _COMMERCIAL_MARKERS):
+        return "commercial"
+    if "apartment" in text_lower:
+        return "apartment"
+    if "house" in text_lower or "villa" in text_lower or "bungalow" in text_lower:
+        return "house"
+    return "info"
+
+
+def _extract_metadata(text: str) -> Dict[str, object]:
+    """Derive ``{property_type, zone[, bedrooms]}`` for a single chunk.
+
+    Only chunks that are an actual listing (they start with
+    ``"Rodrigo Realtors has"``) get a real property type and zone. Descriptive
+    / intro chunks are tagged ``property_type="info"`` with an empty zone so
+    they never satisfy a type/zone filter.
+    """
+    body = text.strip()
+    meta: Dict[str, object] = {"property_type": "info", "zone": ""}
+    if not body.startswith("Rodrigo Realtors has"):
+        return meta
+    low = body.lower()
+    meta["property_type"] = _classify_type(low)
+    m = re.search(r"colombo\s+(\d{1,2})", low)
+    if m:
+        meta["zone"] = m.group(1)
+    bm = re.search(r"(\d+)\s*-\s*bedroom", low)
+    if bm:
+        meta["bedrooms"] = int(bm.group(1))
+    rm = re.search(r"\(ref:\s*(p\d+)\)", low)
+    if rm:
+        meta["property_id"] = rm.group(1).upper()
+    return meta
+
+
+def _parse_query_filters(query: str):
+    """Parse a caller utterance into ``(property_type | None, zone | None)``.
+
+    Used to build a ChromaDB ``where`` filter so retrieval is constrained to
+    the property type and Colombo zone the caller actually asked about.
+    """
+    low = query.lower()
+
+    ptype = None
+    if any(w in low for w in ("office", "commercial", "shop", "retail", "warehouse")):
+        ptype = "commercial"
+    elif "apartment" in low or "flat" in low:
+        ptype = "apartment"
+    elif "house" in low or "villa" in low or "bungalow" in low:
+        ptype = "house"
+
+    zone = None
+    # Tolerate common speech-to-text mis-spellings of "Colombo" -- the telephony
+    # STT frequently returns "Columbo", "Columbus" or "Colombus". Match the digit
+    # form first ("colombo 5"), then the spelled-out form ("colombo five").
+    m = re.search(r"col[ou]mb[ou]s?[\s\-]*(\d{1,2})", low)
+    if m:
+        zone = m.group(1)
+    else:
+        m2 = re.search(r"col[ou]mb[ou]s?[\s\-]+([a-z]+)", low)
+        if m2 and m2.group(1) in _NUM_WORDS:
+            zone = _NUM_WORDS[m2.group(1)]
+        else:
+            for area, z in _AREA_TO_ZONE.items():
+                if re.search(r"\b" + re.escape(area) + r"\b", low):
+                    zone = z
+                    break
+
+    return ptype, zone
+
+
 def initialize_kb(docs_directory: str = DEFAULT_DOCS_DIRECTORY) -> bool:
     """Scan *docs_directory*, chunk every supported file, embed, and upsert
     into ChromaDB.
@@ -362,7 +472,10 @@ def initialize_kb(docs_directory: str = DEFAULT_DOCS_DIRECTORY) -> bool:
 
         ids = [_stable_id(filename + chunk, i) for i, chunk in enumerate(chunks)]
         embeddings = _embed_texts(chunks)
-        metadatas = [{"source": filename, "chunk_index": i} for i in range(len(chunks))]
+        metadatas = [
+            {"source": filename, "chunk_index": i, **_extract_metadata(chunk)}
+            for i, chunk in enumerate(chunks)
+        ]
 
         # Only pass embeddings if they were successfully generated
         has_embeddings = embeddings and all(len(e) > 0 for e in embeddings)
@@ -395,7 +508,7 @@ def initialize_kb(docs_directory: str = DEFAULT_DOCS_DIRECTORY) -> bool:
 # Semantic retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve_context(query: str, n_results: int = 3) -> str:
+def retrieve_context(query: str, n_results: int = 6, sticky: Optional[Dict[str, object]] = None) -> str:
     """Run a semantic search against the knowledge base.
 
     Uses the LRU-cached ``_cached_embed_query`` so that repeated identical
@@ -414,17 +527,79 @@ def retrieve_context(query: str, n_results: int = 3) -> str:
         logger.error("Could not access collection '%s': %s", COLLECTION_NAME, exc)
         return ""
 
-    # Use the cached embedding path
-    query_embedding = _cached_embed_query(query)
+    # Build a metadata filter from the caller's intent (type + Colombo zone)
+    # so retrieval is constrained to matching listings instead of relying on
+    # embedding similarity alone (which mixes offices into apartment queries).
+    #
+    # STICKY CONSTRAINTS: a value the caller states THIS turn wins; otherwise we
+    # inherit the value remembered from earlier turns via *sticky*. This stops
+    # retrieval from losing "apartment" when a later utterance only names a zone
+    # (e.g. "I'd love Colombo 5"), which previously surfaced a house. Occupancy
+    # ("4 people") is deliberately NOT turned into a bedrooms filter -- every
+    # apartment in the KB is 3-4 bed, so that is handled in the system prompt.
+    turn_ptype, turn_zone = _parse_query_filters(query)
+    if sticky is not None:
+        ptype = turn_ptype if turn_ptype else sticky.get("property_type")
+        zone = turn_zone if turn_zone else sticky.get("zone")
+        if ptype:
+            sticky["property_type"] = ptype
+        if zone:
+            sticky["zone"] = zone
+    else:
+        ptype, zone = turn_ptype, turn_zone
+
+    # Keep the embedding query on-topic even when THIS utterance omitted the
+    # type/zone words, by appending any constraint carried over from an earlier
+    # turn (only when it was not restated this turn).
+    search_query = query
+    carried = []
+    if ptype and not turn_ptype:
+        carried.append(str(ptype))
+    if zone and not turn_zone:
+        carried.append(f"colombo {zone}")
+    if carried:
+        search_query = query + " " + " ".join(carried)
+
+    # Use the cached embedding path (embed exactly once, on the augmented text).
+    query_embedding = _cached_embed_query(search_query)
     if not query_embedding:
-        logger.warning("Query embedding failed for: %s", query)
+        logger.warning("Query embedding failed for: %s", search_query)
         return ""
 
-    try:
-        results = collection.query(
+    conds = []
+    if ptype:
+        conds.append({"property_type": ptype})
+    if zone:
+        conds.append({"zone": zone})
+    where = {"$and": conds} if len(conds) == 2 else (conds[0] if conds else None)
+
+    def _run(where_clause):
+        return collection.query(
             query_embeddings=[list(query_embedding)],
             n_results=n_results,
+            where=where_clause,
         )
+
+    def _empty(res):
+        return (
+            not res
+            or not res.get("documents")
+            or not res["documents"]
+            or not res["documents"][0]
+        )
+
+    try:
+        results = _run(where)
+        # Graceful degradation. If the precise filter found nothing:
+        #  - type+zone empty -> retry zone-only (other types in that zone).
+        #  - if a zone was requested and still empty, return empty (we honestly
+        #    have nothing in that zone) to preserve zone precision.
+        #  - if only a type was requested and empty, drop the filter.
+        if where is not None and _empty(results):
+            if ptype and zone:
+                results = _run({"zone": zone})
+            if _empty(results) and zone is None and ptype:
+                results = _run(None)
     except Exception as exc:
         logger.error("ChromaDB query failed: %s", exc)
         return ""

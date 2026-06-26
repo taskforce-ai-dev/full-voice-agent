@@ -1,0 +1,62 @@
+# ============================================================
+# Docker Compose — BSL Voice Agent (Bank of Sri Lanka)
+# ============================================================
+# Runs the production server (server.py) behind Twilio
+# ConversationRelay with Claude streaming + ElevenLabs TTS.
+#
+# Usage:
+#   docker compose up -d              # start in background
+#   docker compose logs -f bsl-agent  # tail logs
+#   docker compose down               # stop and remove container
+#
+# After any .env change, recreate (do NOT just restart):
+#   docker compose up -d --force-recreate bsl-agent
+# ============================================================
+
+services:
+  bsl-agent:
+    # -- Build from the Dockerfile in the project root ----------
+    build: .
+    container_name: bsl-agent
+
+    # -- Networking ---------------------------------------------
+    # 8002 chosen to avoid collisions: Kavya=8000, Sofia/SLIC=8001.
+    # nginx on the host proxies bsl.taskforceai.tech → 127.0.0.1:8002.
+    ports:
+      - "127.0.0.1:8002:8000"
+
+    # -- Secrets & configuration --------------------------------
+    # All API keys (Anthropic, ElevenLabs, Twilio, etc.) are
+    # loaded from .env — never baked into the image.
+    env_file:
+      - .env
+
+    # -- Persistent volumes -------------------------------------
+    volumes:
+      # ChromaDB vector store — survives container restarts so
+      # supplementary embeddings don't need to be regenerated.
+      - ./chroma_db:/app/chroma_db
+
+      # Knowledge documents — mount as a bind so new/updated
+      # docs can be dropped in without rebuilding the image.
+      - ./knowledge_docs:/app/knowledge_docs
+
+    # -- Restart policy -----------------------------------------
+    # Always restart unless explicitly stopped with
+    # `docker compose stop` or `docker compose down`.
+    restart: unless-stopped
+
+    # -- Logging ------------------------------------------------
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # -- Health check -------------------------------------------
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

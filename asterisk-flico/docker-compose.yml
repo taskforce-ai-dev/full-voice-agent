@@ -1,0 +1,28 @@
+services:
+  asterisk:
+    image: andrius/asterisk:20
+    container_name: flico-asterisk-pilot
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Colombo
+    ports:
+      - "0.0.0.0:5060:5060/udp"
+      - "0.0.0.0:10000-10199:10000-10199/udp"
+    networks:
+      - taskforceai-net
+    volumes:
+      - ./config/ari.conf:/etc/asterisk/ari.conf:ro
+      - ./config/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./config/http.conf:/etc/asterisk/http.conf:ro
+      - ./config/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./config/rtp.conf:/etc/asterisk/rtp.conf:ro
+      - ./sounds:/var/lib/asterisk/sounds/custom:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  taskforceai-net:
+    external: true

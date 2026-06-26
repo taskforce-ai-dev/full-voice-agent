@@ -1,0 +1,12 @@
+# graphify exclusions (gitignore semantics). Keeps `graphify update .` from
+# re-bloating the knowledge graph with generated/minified artifacts.
+
+# Compiled / minified Sentinel admin SPA bundles — generated build output, not
+# source. These injected ~2,900 junk nodes (asset_*.js) and pushed the graph
+# over the 5,000-node HTML-viz limit. The curated full rebuild excluded these.
+agent-dashboard/public/admin/
+agent-dashboard/admin-portal/admin/
+**/asset_*.js
+
+# macOS resource-fork junk that shipped inside the website zip (AppleDouble ._*)
+**/__MACOSX/

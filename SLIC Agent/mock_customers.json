@@ -1,0 +1,56 @@
+{
+  "+94711754668": {
+    "name": "Thiva",
+    "policy_no": "SLIC-2024-00117",
+    "vehicles": [
+      {"make": "Toyota", "model": "Land Cruiser Prado", "reg_no": "CBA-1175", "policy_item": 1},
+      {"make": "Honda", "model": "Civic", "reg_no": "CAR-4668", "policy_item": 2}
+    ]
+  },
+  "+94771234567": {
+    "name": "Chrys Fernando",
+    "policy_no": "SLIC-2024-00123",
+    "vehicles": [
+      {"make": "BMW", "model": "X5", "reg_no": "CAB-1234", "policy_item": 1},
+      {"make": "Toyota", "model": "Corolla", "reg_no": "KX-5678", "policy_item": 2}
+    ]
+  },
+  "+94772345678": {
+    "name": "Dilshan Perera",
+    "policy_no": "SLIC-2023-08842",
+    "vehicles": [
+      {"make": "Nissan", "model": "Leaf", "reg_no": "CAP-9988", "policy_item": 1}
+    ]
+  },
+  "+94763456789": {
+    "name": "Anushka Silva",
+    "policy_no": "SLIC-2024-01056",
+    "vehicles": [
+      {"make": "Suzuki", "model": "WagonR", "reg_no": "PB-3412", "policy_item": 1},
+      {"make": "Honda", "model": "Vezel", "reg_no": "CAK-7721", "policy_item": 2},
+      {"make": "Toyota", "model": "Hilux", "reg_no": "KL-2200", "policy_item": 3}
+    ]
+  },
+  "+94784567890": {
+    "name": "Roshan Jayawardena",
+    "policy_no": "SLIC-2022-07319",
+    "vehicles": [
+      {"make": "Mitsubishi", "model": "Montero", "reg_no": "CAA-5512", "policy_item": 1}
+    ]
+  },
+  "+94755678901": {
+    "name": "Maheshika Ratnayake",
+    "policy_no": "SLIC-2024-02201",
+    "vehicles": [
+      {"make": "Hyundai", "model": "Tucson", "reg_no": "CBB-3388", "policy_item": 1},
+      {"make": "Kia", "model": "Sportage", "reg_no": "CAQ-9911", "policy_item": 2}
+    ]
+  },
+  "+94777318567": {
+    "name": "Dushan Soza",
+    "policy_no": "SLIC-2024-03434",
+    "vehicles": [
+      {"make": "BYD", "model": "Sealion 6", "reg_no": "CCA-3434", "policy_item": 1}
+    ]
+  }
+}
