@@ -1,0 +1,42 @@
+# Pre-commit hooks for the Full Voice Agent monorepo (Python + Node).
+# Install:  pipx install pre-commit  &&  pre-commit install
+# Run all:  pre-commit run --all-files
+# See docs/PRECOMMIT.md for details.
+
+repos:
+  # --- General hygiene -------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+        args: ['--maxkb=5000']
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-yaml
+      - id: check-json
+
+  # --- Secret scanning (local pre-commit secret detection) -------------------
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  # --- Python lint + format --------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.0
+    hooks:
+      - id: ruff
+        args: ['--fix']
+      - id: ruff-format
+
+  # --- CLAUDE.md -> AGENTS.md drift guard ------------------------------------
+  - repo: local
+    hooks:
+      - id: agents-md-sync
+        name: agents-md-sync (CLAUDE.md -> AGENTS.md mirror)
+        entry: bash -c 'bash ops/sync-agent-docs.sh && git diff --exit-code --name-only -- "*/AGENTS.md"'
+        language: system
+        pass_filenames: false
+        always_run: true

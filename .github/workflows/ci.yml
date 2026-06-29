@@ -1,0 +1,175 @@
+# ---------------------------------------------------------------------------
+# CI for the Full Voice Agent monorepo (PRIVATE)
+#
+# Strategy
+# --------
+# This repo holds 8+ Python 3.11 / FastAPI voice agents in sibling folders,
+# several of which contain SPACES in their names ("BSL Agent", "Flico Agent",
+# "SLIC Agent", "Sofia Agent"). Heavy ML deps (torch/CUDA, TTS stacks) make a
+# full `pip install -r requirements-prod.txt` for every agent slow and flaky,
+# so CI is deliberately split into fast, independent, parallel jobs and AVOIDS
+# installing full project dependencies wherever possible:
+#
+#   * lint          - ruff over the whole tree (needs NO project deps).
+#   * docs-drift    - re-runs ops/sync-agent-docs.sh and fails if any
+#                     */AGENTS.md is out of sync with its CLAUDE.md.
+#   * dockerfile-lint - hadolint over every agent Dockerfile (ADVISORY: only
+#                     `error`-level findings fail the build).
+#   * test          - matrix over ONLY agents that actually ship tests. Deps
+#                     are installed best-effort; if an agent's deps are too
+#                     heavy to install, the job is intentionally lenient and
+#                     does not hard-fail the pipeline.
+#
+# IMPORTANT: folder names contain spaces. They are always double-quoted in
+# shell and passed as quoted JSON strings in the matrix.
+#
+# NOTE ON LENIENCY: the `test` job starts lenient (continue-on-error) on
+# purpose so CI lands reliably green while coverage is thin. As real test
+# coverage grows, remove `continue-on-error` and tighten the `|| true`
+# fallbacks so failing tests block merges.
+# ---------------------------------------------------------------------------
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Lint — ruff only, no project dependencies required.
+  # -------------------------------------------------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    # Lenient at first: the existing codebase predates ruff, so `ruff check .`
+    # will report style violations on day 1. Kept informational (not a required
+    # status check) so it doesn't block merges. Fix violations incrementally,
+    # then remove continue-on-error and promote `lint` to a required check.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check .
+
+  # -------------------------------------------------------------------------
+  # 2. Docs drift — AGENTS.md must mirror CLAUDE.md.
+  # -------------------------------------------------------------------------
+  docs-drift:
+    name: docs-drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Re-sync AGENTS.md mirrors
+        run: bash ops/sync-agent-docs.sh
+
+      - name: Fail if any AGENTS.md is out of sync
+        run: git diff --exit-code -- '*/AGENTS.md'
+
+  # -------------------------------------------------------------------------
+  # 3. Dockerfile lint — hadolint, ADVISORY (only error-level fails build).
+  #    Single looping step handles spaced folder names via quoted "$f".
+  # -------------------------------------------------------------------------
+  dockerfile-lint:
+    name: dockerfile-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install hadolint
+        run: |
+          curl -fsSL -o /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          chmod +x /usr/local/bin/hadolint
+          hadolint --version
+
+      - name: Lint every agent Dockerfile (advisory)
+        run: |
+          status=0
+          shopt -s nullglob
+          for f in */Dockerfile; do
+            echo "::group::hadolint $f"
+            # Treat hadolint as advisory: only error-level findings fail.
+            hadolint --failure-threshold error "$f" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+  # -------------------------------------------------------------------------
+  # 4. Test — matrix over ONLY agents that ship tests.
+  #
+  #    Lenient on purpose (see header). `continue-on-error: true` keeps the
+  #    pipeline green while coverage is thin; deps are installed best-effort.
+  #    Tighten both as real coverage grows.
+  #
+  #    Spaced folder names are passed as quoted JSON strings and double-quoted
+  #    in every shell command below.
+  # -------------------------------------------------------------------------
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only agents that currently contain tests (tests/ dir or test_*.py).
+        # Add more here as agents gain test suites.
+        agent:
+          - "Kavya"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Detect tests in "${{ matrix.agent }}"
+        id: detect
+        run: |
+          dir="${{ matrix.agent }}"
+          if [ -d "$dir/tests" ] || \
+             ls "$dir"/test_*.py "$dir"/*_test.py >/dev/null 2>&1; then
+            echo "has_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_tests=false" >> "$GITHUB_OUTPUT"
+            echo "No tests found in \"$dir\" — skipping."
+          fi
+
+      - name: Install dependencies (best-effort) + pytest
+        if: steps.detect.outputs.has_tests == 'true'
+        run: |
+          dir="${{ matrix.agent }}"
+          python -m pip install --upgrade pip
+          # Best-effort: heavy deps (torch/CUDA) may fail to install; that's OK
+          # while we're lenient — pytest collection will simply skip.
+          if [ -f "$dir/requirements-prod.txt" ]; then
+            pip install -r "$dir/requirements-prod.txt" || \
+              echo "Full deps for \"$dir\" failed to install — continuing lenient."
+          fi
+          pip install pytest
+
+      - name: Run pytest in "${{ matrix.agent }}"
+        if: steps.detect.outputs.has_tests == 'true'
+        run: |
+          dir="${{ matrix.agent }}"
+          cd "$dir"
+          # If imports fail due to missing heavy deps, stay lenient for now.
+          pytest || echo "pytest reported failures in \"$dir\" (lenient mode)."

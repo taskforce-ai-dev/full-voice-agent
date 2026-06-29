@@ -1,0 +1,163 @@
+# ============================================================================
+# Continuous Deployment — full-voice-agent monorepo
+# ----------------------------------------------------------------------------
+# MANUAL-TRIGGER BY DESIGN. This workflow touches PRODUCTION (single
+# DigitalOcean VPS, host 67.207.90.109). It is intentionally NOT run on every
+# push. You start a deploy from the Actions tab (or `gh workflow run`) and pick
+# which agent + which git ref/tag to roll out.
+#
+# PREREQUISITES (see docs/DEPLOYMENT.md — "Wiring the VPS" + "Required Secrets"):
+#   1. GitHub repo secrets must exist:  VPS_HOST, VPS_USER, VPS_SSH_KEY
+#      Until they are set, this workflow FAILS CLEARLY at the SSH step. That is
+#      expected for a fresh checkout — it is a TEMPLATE until wired.
+#   2. Each /opt/<agent-dir> on the VPS must be a *git checkout* of this
+#      monorepo (full clone or sparse-checkout), not a loose scp'd folder.
+#   3. .env files live ONLY on the VPS and are gitignored — git pull will not
+#      touch them. Never commit secrets into the repo.
+#
+# The OPERATOR-CONFIRM agent -> /opt path -> container mapping lives in the
+# remote `case` statement below AND in docs/DEPLOYMENT.md. Keep them in sync.
+# ============================================================================
+
+name: Deploy Agent (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent:
+        description: "Which agent to deploy"
+        required: true
+        type: choice
+        options:
+          - bsl
+          - flico
+          - hatton
+          - slic
+          - sofia
+          - kavya
+          - kitchened
+          - wor
+      ref:
+        description: "Git ref / tag / commit to deploy (e.g. main, flico-v1.0.0)"
+        required: true
+        type: string
+        default: "main"
+
+  # OPTIONAL secondary trigger. Pushing a per-agent baseline tag (e.g.
+  # bsl-v1.0.0, kavya-v1.2.3) will START this workflow, but the manual
+  # workflow_dispatch path above remains the PRIMARY documented flow. The deploy
+  # job is guarded so the tag-push path is a no-op unless an operator wires in an
+  # explicit mapping (it cannot know which agent a tag maps to without the same
+  # mapping table). For now, tag pushes simply surface a reminder in the log.
+  push:
+    tags:
+      - "*-v*"
+
+# Prevent two deploys racing onto the same box at once.
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+
+    # Only run the real deploy for the manual path. Tag pushes fall through to
+    # the "tag-reminder" job below instead of deploying blindly.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: Announce deploy target
+        run: |
+          echo "Agent : ${{ github.event.inputs.agent }}"
+          echo "Ref   : ${{ github.event.inputs.ref }}"
+          echo "Actor : ${{ github.actor }}"
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          # Pass the workflow inputs into the remote shell as env vars.
+          envs: AGENT,REF
+          script_stop: true
+          command_timeout: "20m"
+          script: |
+            set -euo pipefail
+
+            AGENT="${{ github.event.inputs.agent }}"
+            REF="${{ github.event.inputs.ref }}"
+
+            # ----------------------------------------------------------------
+            # OPERATOR: CONFIRM THIS MAPPING AGAINST THE VPS BEFORE FIRST USE.
+            # agent id  ->  /opt/<dir>  (must be a git checkout of this repo)
+            # Container names are validated later via `docker compose ps`.
+            # The directory names below are best-guess and MUST be verified with
+            #   ls -d /opt/*/
+            # on 67.207.90.109. Update both this case AND docs/DEPLOYMENT.md.
+            # ----------------------------------------------------------------
+            case "$AGENT" in
+              bsl)       OPT_DIR="/opt/bsl-agent" ;;
+              flico)     OPT_DIR="/opt/flico-agent" ;;
+              hatton)    OPT_DIR="/opt/hattonhills" ;;
+              slic)      OPT_DIR="/opt/slic-agent" ;;
+              sofia)     OPT_DIR="/opt/sofia-agent" ;;
+              kavya)     OPT_DIR="/opt/kavya" ;;
+              kitchened) OPT_DIR="/opt/kitchened" ;;
+              wor)       OPT_DIR="/opt/worldofrefrigerators" ;;
+              *)
+                echo "ERROR: unknown agent id '$AGENT'." >&2
+                exit 1
+                ;;
+            esac
+
+            echo "==> Target dir: $OPT_DIR  (ref: $REF)"
+
+            if [ ! -d "$OPT_DIR/.git" ]; then
+              echo "ERROR: $OPT_DIR is not a git checkout of this monorepo." >&2
+              echo "       See docs/DEPLOYMENT.md -> 'Wiring the VPS'." >&2
+              exit 1
+            fi
+
+            cd "$OPT_DIR"
+
+            echo "==> Fetching latest refs + tags"
+            git fetch --all --tags --prune
+
+            echo "==> Checking out '$REF'"
+            git checkout "$REF"
+
+            # Only fast-forward when on a branch; a detached tag/commit checkout
+            # has no upstream to pull from, so skip the pull in that case.
+            if git symbolic-ref -q HEAD >/dev/null; then
+              echo "==> On a branch; fast-forward pull"
+              git pull --ff-only
+            else
+              echo "==> Detached HEAD (tag/commit); skipping pull"
+            fi
+
+            echo "==> Deployed commit:"
+            git --no-pager log -1 --oneline
+
+            echo "==> Rebuilding + restarting containers"
+            # .env stays on the VPS (gitignored) and is read by compose as usual.
+            docker compose up -d --build --force-recreate
+
+            echo "==> Container status"
+            docker compose ps
+
+            echo "==> Done deploying $AGENT @ $REF"
+
+  tag-reminder:
+    name: Tag push (no auto-deploy)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' }}
+    steps:
+      - name: Explain that tag pushes do not auto-deploy
+        run: |
+          echo "Tag ${{ github.ref_name }} was pushed."
+          echo "Per design, production deploys are MANUAL."
+          echo "Run the deploy explicitly, e.g.:"
+          echo "  gh workflow run deploy.yml -f agent=<id> -f ref=${{ github.ref_name }}"

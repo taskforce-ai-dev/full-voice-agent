@@ -1,0 +1,33 @@
+# gitleaks configuration for thiva2k/full-voice-agent
+#
+# Extends the built-in gitleaks ruleset and adds a conservative allowlist
+# tuned to THIS repo to cut false positives. We intentionally do NOT
+# allowlist any real secret material (auth tokens, private keys, sk-* API
+# keys, etc.) — only non-secret identifiers and known-placeholder files.
+
+title = "full-voice-agent gitleaks config"
+
+[extend]
+# Keep all of gitleaks' default detection rules.
+useDefault = true
+
+[allowlist]
+description = "Repo-specific false-positive reductions (identifiers + placeholder/docs files)"
+
+# Paths excluded from scanning:
+paths = [
+  # Knowledge-graph output: full of content-hash strings that trip generic rules.
+  '''graphify-out/''',
+  # .env.example templates contain placeholder values, not live secrets.
+  '''.*\.env\.example$''',
+  # Docs that legitimately reference Twilio Account SIDs (ACxxxx...) as examples.
+  '''.*CLAUDE\.md$''',
+  '''.*AGENTS\.md$''',
+  '''.*BUILD_PLAN\.md$''',
+]
+
+# Regexes for non-secret values that should never count as a finding:
+regexes = [
+  # Twilio Account SID — a public account *identifier* (ACxxxx...), not a secret.
+  '''AC[0-9a-f]{32}''',
+]
