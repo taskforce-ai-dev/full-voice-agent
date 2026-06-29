@@ -105,6 +105,8 @@ that feeds the hotel agents over HTTPS. See the root `CLAUDE.md` for details —
 only `.env.example` (a key-less template) is committed. `.gitignore` also blocks GCP service-account
 JSON, credential drops, ChromaDB stores, model caches, and audio temp files. There are
 `pre-commit` hooks and a `gitleaks` config (`.gitleaks.toml`) to catch accidental secret commits.
+**Activate the hooks once per clone with `pre-commit install`** (see `docs/PRECOMMIT.md`) — until then
+they're configured but not running locally. The `secret-scan` CI workflow runs server-side regardless.
 
 **AI context files.** Each agent's source of truth for AI assistants is its `CLAUDE.md`; this is
 mirrored to an `AGENTS.md` (for Codex) via `ops/sync-agent-docs.sh`. Keep the root `CLAUDE.md` and

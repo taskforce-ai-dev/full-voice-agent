@@ -67,11 +67,18 @@ jobs:
     # the "tag-reminder" job below instead of deploying blindly.
     if: ${{ github.event_name == 'workflow_dispatch' }}
 
+    # Inputs are exposed as env vars (NOT interpolated into shell) so the
+    # free-form `ref` input cannot inject commands. Consumed by the SSH step's
+    # `envs: AGENT,REF` and by the steps below.
+    env:
+      AGENT: ${{ github.event.inputs.agent }}
+      REF: ${{ github.event.inputs.ref }}
+
     steps:
       - name: Announce deploy target
         run: |
-          echo "Agent : ${{ github.event.inputs.agent }}"
-          echo "Ref   : ${{ github.event.inputs.ref }}"
+          echo "Agent : $AGENT"
+          echo "Ref   : $REF"
           echo "Actor : ${{ github.actor }}"
 
       - name: Deploy over SSH
@@ -87,8 +94,9 @@ jobs:
           script: |
             set -euo pipefail
 
-            AGENT="${{ github.event.inputs.agent }}"
-            REF="${{ github.event.inputs.ref }}"
+            # AGENT / REF arrive as env vars via `envs: AGENT,REF` above — they
+            # are never interpolated into this script, so a crafted `ref` value
+            # cannot break out of quoting and execute commands on the VPS.
 
             # ----------------------------------------------------------------
             # OPERATOR: CONFIRM THIS MAPPING AGAINST THE VPS BEFORE FIRST USE.

@@ -90,14 +90,16 @@ jobs:
   dockerfile-lint:
     name: dockerfile-lint
     runs-on: ubuntu-latest
+    # Advisory: surfaces Dockerfile issues but must not block merges.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
       - name: Install hadolint
         run: |
-          curl -fsSL -o /usr/local/bin/hadolint \
+          sudo curl -fsSL -o /usr/local/bin/hadolint \
             https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
-          chmod +x /usr/local/bin/hadolint
+          sudo chmod +x /usr/local/bin/hadolint
           hadolint --version
 
       - name: Lint every agent Dockerfile (advisory)
