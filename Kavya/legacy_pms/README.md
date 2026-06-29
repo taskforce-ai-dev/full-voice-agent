@@ -1,0 +1,1 @@
+Frozen snapshot of the previous n8n-scraper + direct eZee PMS implementation. Replaced 2026-05-13 by new PMS (booking-pms.taskforceai.tech) integration. Keep for ≥2 weeks after new PMS is verified in production.

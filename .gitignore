@@ -65,10 +65,10 @@ htmlcov/
 # Committing them from this parent would record broken gitlinks (empty dirs on clone).
 # Taskforce_AI_Website/ -> ChrysFernando/Taskforce_AI_Website
 Taskforce_AI_Website/
-# Kavya/ -> thiva2k/kavya (its own repo)
-Kavya/
 # agent-dashboard/ -> ChrysFernando/Client-Portal (left as-is)
 agent-dashboard/
+# NOTE: Kavya/ is part of this monorepo (de-nested). Its own .gitignore + the
+# rules below keep its venv/.env/secrets out.
 
 # --- Third-party model download (HuggingFace, ~8 GB — never commit) ---
 SinhalaVITS-TTS-M2/
