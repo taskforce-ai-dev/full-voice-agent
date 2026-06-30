@@ -36,6 +36,7 @@ jobs:
       contents: write        # create the fix branch
       issues: write          # comment on the issue
       pull-requests: write   # open the draft PR
+      id-token: write        # claude-code-action@v1 needs OIDC
     steps:
       - uses: actions/checkout@v4
         with:
