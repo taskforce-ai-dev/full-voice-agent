@@ -1,8 +1,9 @@
 # Pre-commit Hooks
 
 This repo uses [pre-commit](https://pre-commit.com/) to run hygiene checks,
-secret scanning, Python lint/format, and a CLAUDE.md -> AGENTS.md drift guard
-before each commit. Config lives in `.pre-commit-config.yaml`.
+secret scanning, and a CLAUDE.md -> AGENTS.md drift guard before each commit.
+Config lives in `.pre-commit-config.yaml`. (Python lint via ruff runs in CI, not
+here — see below.)
 
 ## Install
 
@@ -42,8 +43,10 @@ pre-commit run gitleaks --all-files
   blocks files > 5 MB, merge-conflict markers, private keys, valid YAML/JSON.
 - **gitleaks** — scans staged changes for secrets before they are committed
   (we had a leak; this is the local guardrail).
-- **ruff** + **ruff-format** — Python lint (with `--fix`) and formatting,
-  using ruff's default rule set.
+- **ruff lint runs in CI, not here** — the codebase predates ruff and has
+  pre-existing violations, so ruff is kept out of the blocking pre-commit path
+  to avoid reformatting production code on commit. See `.github/workflows/ci.yml`
+  (advisory `lint` job); re-add it here after a cleanup pass.
 - **agents-md-sync** — runs `ops/sync-agent-docs.sh` (CLAUDE.md is the source
   of truth) and fails if any `*/AGENTS.md` is out of date, preventing
   CLAUDE.md / AGENTS.md drift.

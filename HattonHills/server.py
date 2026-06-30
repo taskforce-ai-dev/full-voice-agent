@@ -30,6 +30,16 @@ import base64
 import json
 import logging
 import os
+
+# --- Error tracking (Sentry): no-op unless SENTRY_DSN is set ---
+if os.getenv("SENTRY_DSN"):
+    import sentry_sdk
+
+    sentry_sdk.init(
+        dsn=os.getenv("SENTRY_DSN"),
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+        environment=os.getenv("SENTRY_ENV", "production"),
+    )
 import queue
 import re
 import threading

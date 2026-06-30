@@ -23,13 +23,12 @@ repos:
     hooks:
       - id: gitleaks
 
-  # --- Python lint + format --------------------------------------------------
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.0
-    hooks:
-      - id: ruff
-        args: ['--fix']
-      - id: ruff-format
+  # --- Python lint -----------------------------------------------------------
+  # ruff is intentionally NOT a blocking pre-commit hook: this codebase predates
+  # ruff and carries pre-existing violations, so a --fix/blocking hook would
+  # either reformat production code on commit or block every commit that touches
+  # a legacy file. Linting runs in CI (.github/workflows/ci.yml, advisory).
+  # Re-add ruff here after a dedicated cleanup pass makes the tree ruff-clean.
 
   # --- CLAUDE.md -> AGENTS.md drift guard ------------------------------------
   - repo: local

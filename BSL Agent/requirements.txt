@@ -33,3 +33,6 @@ PyPDF2>=3.0.0
 
 # Local testing audio playback
 pyaudio>=0.2.13
+
+# Error tracking (optional; activated by SENTRY_DSN)
+sentry-sdk>=2,<3

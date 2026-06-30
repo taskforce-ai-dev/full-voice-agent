@@ -35,7 +35,8 @@ After that the hooks run automatically on every `git commit`. See
   block (~5 MB / `--maxkb=5000`), merge-conflict markers, private keys, valid
   YAML/JSON.
 - **gitleaks** — scans staged changes for secrets (config in `.gitleaks.toml`).
-- **ruff** + **ruff-format** — Python lint (`--fix`) and formatting.
+- _(ruff lint is **not** a pre-commit hook on this pre-ruff codebase — it runs
+  in CI, advisory; see `.github/workflows/ci.yml`.)_
 - **agents-md-sync** — runs `ops/sync-agent-docs.sh` and fails if any
   `*/AGENTS.md` is out of date with its `CLAUDE.md`.
 

@@ -33,3 +33,6 @@ metaphone>=0.6
 
 # PDF support for knowledge base (optional)
 PyPDF2>=3.0.0
+
+# Error tracking (optional; activated by SENTRY_DSN)
+sentry-sdk>=2,<3
