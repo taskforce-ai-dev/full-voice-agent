@@ -27,7 +27,7 @@ httpx>=0.25.0
 python-multipart>=0.0.7
 
 # Utilities
-python-dotenv>=1.0.0
+python-dotenv>=1.2.2
 aiohttp>=3.9.0
 metaphone>=0.6
 
