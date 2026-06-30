@@ -5,6 +5,14 @@
 - To restart any agent container: `ssh root@67.207.90.109 "cd /opt/<agent-dir> && docker compose up -d --force-recreate <container-name>"`
 - Dashboard service: `systemctl restart agent-dashboard` (runs at `http://127.0.0.1:3100`)
 
+## Local API-key stash (gitignored — never commit values)
+
+Reusable secrets live in **`.env.n8n`** at the repo root (matched by `.env.*` in
+`.gitignore`, so never committed). Read values from there when a task needs them:
+- `N8N_API_KEY` — n8n public API (header `X-N8N-API-KEY`)
+- `SENTRY_API_TOKEN` — Sentry API (`Authorization: Bearer …`); also powers the Sentry→Claude auto-triage
+- `ANTHROPIC_API_KEY` — Anthropic key; also set as the GitHub Actions repo secret `ANTHROPIC_API_KEY` (used by `.github/workflows/sentry-autofix.yml`)
+
 ## Second VPS — Yanolja/eZee Booking Integration (Kavya's data source)
 
 There is a **second DigitalOcean droplet** separate from the voice-agent box.
