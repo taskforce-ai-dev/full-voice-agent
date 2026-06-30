@@ -25,7 +25,12 @@ subscription).
 2. Repo → **Settings → Secrets and variables → Actions → New repository secret**
    - Name: `ANTHROPIC_API_KEY`
    - Value: the key
-3. *(Optional alternative)* install the **Claude GitHub App** instead via `/install-github-app`; then the App provides auth and you can drop `anthropic_api_key` from the workflow.
+3. **Install the Claude GitHub App — REQUIRED** on `thiva2k/full-voice-agent`:
+   https://github.com/apps/claude (or run `/install-github-app` in Claude Code).
+   Without it the action fails with *"Claude Code is not installed on this
+   repository."* The App handles GitHub identity; the `ANTHROPIC_API_KEY` above
+   handles model access. (The workflow already grants `id-token: write` for the
+   action's OIDC.)
 
 ### 2. Connect Sentry to GitHub
 In Sentry → **Settings → Integrations → GitHub** → Install → grant access to
