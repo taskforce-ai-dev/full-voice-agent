@@ -1,0 +1,84 @@
+name: dep-audit
+
+# Scans each agent's pinned Python dependencies for known CVEs using pip-audit.
+#
+# ADVISORY (non-blocking) for now: every job uses `continue-on-error: true`, so a
+# vulnerable/yanked dependency surfaces in the logs and the job summary but does
+# NOT fail the workflow. This keeps the pipeline green-able while the existing
+# pinned deps are triaged. To ENFORCE later, remove the `continue-on-error: true`
+# line from the `audit` job (and optionally drop `|| true` if you add one) so a
+# discovered CVE fails the build.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly, Mondays at 06:00 UTC — catches newly disclosed CVEs against
+    # already-merged pinned deps even when no code changes.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dep-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: pip-audit (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    # ADVISORY: do not fail the workflow on findings yet. Tighten later by
+    # removing this line once the existing pinned advisories are resolved.
+    continue-on-error: true
+    strategy:
+      # Audit every agent dir independently; one vulnerable agent does not
+      # short-circuit the others.
+      fail-fast: false
+      matrix:
+        # Folder names with spaces are passed as quoted JSON strings.
+        dir:
+          - "BSL Agent"
+          - "Flico Agent"
+          - "HattonHills"
+          - "Kavya"
+          - "Kitchened"
+          - "SLIC Agent"
+          - "Sofia Agent"
+          - "WorldOfRefrigerators"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+
+      - name: Audit pinned dependencies
+        # Prefer requirements-prod.txt; fall back to requirements.txt when the
+        # prod file is absent (e.g. some agents ship only one of the two).
+        run: |
+          dir="${{ matrix.dir }}"
+          prod="$dir/requirements-prod.txt"
+          base="$dir/requirements.txt"
+
+          if [ -f "$prod" ]; then
+            req="$prod"
+          elif [ -f "$base" ]; then
+            req="$base"
+          else
+            echo "::warning::No requirements file found in '$dir' (looked for requirements-prod.txt and requirements.txt) — skipping."
+            exit 0
+          fi
+
+          echo "Auditing: $req"
+          pip-audit -r "$req"

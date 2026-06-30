@@ -1,0 +1,90 @@
+# Dependabot configuration for the Full Voice Agent monorepo.
+# Weekly update checks for Python (pip) per agent directory, the npm
+# dashboard, and GitHub Actions workflows. Each ecosystem caps open PRs at 5
+# and tags commit messages with a per-ecosystem prefix.
+# NOTE: Dependabot must also be enabled in repo Settings -> Code security
+# (security & analysis) for these update jobs to run.
+version: 2
+updates:
+  # ---- Python agents (pip) ----
+  - package-ecosystem: "pip"
+    directory: "/BSL Agent"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(pip)"
+
+  - package-ecosystem: "pip"
+    directory: "/Flico Agent"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(pip)"
+
+  - package-ecosystem: "pip"
+    directory: "/HattonHills"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(pip)"
+
+  - package-ecosystem: "pip"
+    directory: "/Kavya"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(pip)"
+
+  - package-ecosystem: "pip"
+    directory: "/Kitchened"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(pip)"
+
+  - package-ecosystem: "pip"
+    directory: "/SLIC Agent"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(pip)"
+
+  - package-ecosystem: "pip"
+    directory: "/Sofia Agent"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(pip)"
+
+  - package-ecosystem: "pip"
+    directory: "/WorldOfRefrigerators"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(pip)"
+
+  # ---- Node dashboard (npm) ----
+  - package-ecosystem: "npm"
+    directory: "/flico-dashboard"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(npm)"
+
+  # ---- GitHub Actions workflows ----
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(actions)"

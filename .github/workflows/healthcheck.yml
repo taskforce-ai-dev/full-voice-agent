@@ -1,0 +1,87 @@
+name: healthcheck
+
+# Scheduled uptime check for the public agent health endpoints.
+# Curls each reachable /health URL; the job FAILS (so GitHub emails the repo
+# owner) if any endpoint returns a non-2xx/3xx status or is unreachable.
+#
+# NOTE: GitHub Actions cron timing is best-effort. The 'schedule' trigger can
+# be delayed (often several minutes, occasionally more) during peak load, so
+# treat the ~20-minute cadence below as approximate, not guaranteed.
+#
+# URLs not yet reachable (add once DNS/health is live):
+#   (none — all recon URLs were reachable:true as of 2026-06-30)
+#
+# Recon caveats baked into the list below:
+#   - SLIC and Sofia are both configured to abans.taskforceai.tech. The live
+#     endpoint there currently serves the SLIC agent (Sofia was stopped at last
+#     check). Both are intentionally included so an outage of that host trips
+#     the alert; the duplicate host is expected.
+
+on:
+  schedule:
+    # Every ~20 minutes (best-effort; GitHub may delay scheduled runs).
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  healthcheck:
+    name: Curl agent health endpoints
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check all reachable agent /health URLs
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # agent|url pairs (only recon entries with reachable:true).
+          URLS=(
+            "BSL|https://bsl.taskforceai.tech/health"
+            "Flico|https://flico.taskforceai.tech/health"
+            "HattonHills|https://hattonhills.taskforceai.tech/health"
+            "Kavya|https://treehouse.taskforceai.tech/health"
+            "Kitchened|https://kitchened.taskforceai.tech/health"
+            "SLIC|https://abans.taskforceai.tech/health"
+            "Sofia|https://abans.taskforceai.tech/health"
+            "WorldOfRefrigerators|https://worldofrefrigerators.taskforceai.tech/health"
+          )
+
+          if [ "${#URLS[@]}" -eq 0 ]; then
+            echo "no health URLs configured yet"
+            exit 0
+          fi
+
+          failures=()
+          echo "Checking ${#URLS[@]} health endpoint(s)..."
+          echo "--------------------------------------------------"
+
+          for entry in "${URLS[@]}"; do
+            agent="${entry%%|*}"
+            url="${entry#*|}"
+
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$url")
+
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+              echo "OK    [$code] $agent -> $url"
+            else
+              # code is "000" when curl could not reach/resolve the host.
+              echo "FAIL  [$code] $agent -> $url"
+              failures+=("$agent ($code) $url")
+            fi
+          done
+
+          echo "--------------------------------------------------"
+
+          if [ "${#failures[@]}" -gt 0 ]; then
+            echo ""
+            echo "UNHEALTHY: ${#failures[@]} of ${#URLS[@]} endpoint(s) failed:"
+            for f in "${failures[@]}"; do
+              echo "  - $f"
+            done
+            exit 1
+          fi
+
+          echo "All ${#URLS[@]} endpoint(s) healthy."
