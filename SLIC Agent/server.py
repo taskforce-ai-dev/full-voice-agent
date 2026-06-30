@@ -35,7 +35,10 @@ if os.getenv("SENTRY_DSN"):
         dsn=os.getenv("SENTRY_DSN"),
         traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
         environment=os.getenv("SENTRY_ENV", "production"),
+        send_default_pii=os.getenv("SENTRY_SEND_PII", "false").lower() == "true",
+        enable_logs=os.getenv("SENTRY_ENABLE_LOGS", "true").lower() == "true",
     )
+    sentry_sdk.set_tag("agent", "slic")
 import xml.sax.saxutils
 from contextlib import asynccontextmanager
 from datetime import date, datetime
