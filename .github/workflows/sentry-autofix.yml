@@ -1,0 +1,76 @@
+# ============================================================================
+# Sentry -> Claude auto-triage (real-time, draft-PR, human-in-the-loop)
+# ----------------------------------------------------------------------------
+# Flow: a production error fires in Sentry -> Sentry's GitHub integration opens
+# an issue labeled `sentry` -> this workflow runs Claude, which reads the stack
+# trace + `agent` tag, finds the root cause, and opens a DRAFT pull request with
+# a minimal fix (or comments its diagnosis if it can't confidently fix it).
+#
+# NOTHING is deployed automatically. You review the draft PR, merge, then deploy
+# via .github/workflows/deploy.yml. Full setup: docs/SENTRY_AUTOMATION.md
+#
+# Prereqs (see the doc): ANTHROPIC_API_KEY repo secret + Sentry GitHub
+# integration with an alert that creates `sentry`-labeled issues in this repo.
+# ============================================================================
+
+name: Sentry Auto-Triage
+
+on:
+  issues:
+    types: [opened, labeled]
+
+# One run per issue (the integration may fire `opened` and `labeled`).
+concurrency:
+  group: sentry-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    # Only act on Sentry-created issues (labeled `sentry`).
+    if: contains(github.event.issue.labels.*.name, 'sentry')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the fix branch
+      issues: write          # comment on the issue
+      pull-requests: write   # open the draft PR
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude diagnose + draft PR
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            GitHub issue #${{ github.event.issue.number }} was auto-created by Sentry
+            (label `sentry`). Its body is a PRODUCTION error report: an exception, a
+            stack trace, and an `agent` tag naming which voice agent threw it.
+
+            This repo is a monorepo of voice agents. Map the `agent` tag to its folder:
+              bsl -> "BSL Agent"      flico -> "Flico Agent"   hatton -> "HattonHills"
+              slic -> "SLIC Agent"    sofia -> "Sofia Agent"   kavya  -> "Kavya"
+              kitchened -> "Kitchened"   wor -> "WorldOfRefrigerators"
+
+            Steps:
+            1. Read the issue body; extract the exception, stack trace, and `agent` tag.
+            2. Read that agent's CLAUDE.md first, then open ONLY the files the stack
+               trace points to. Do not explore or touch other agents.
+            3. Find the root cause and make a MINIMAL, targeted fix. Do not refactor,
+               do not change secrets/.env, do not deploy anything.
+            4. Open a DRAFT pull request with `gh pr create --draft`:
+                 branch: sentry-fix/issue-${{ github.event.issue.number }}
+                 title:  fix(<agent>): <short error summary>
+                 body:   root cause + the fix + the line "Closes #${{ github.event.issue.number }}"
+            5. If you are NOT confident (external API outage, data issue, ambiguous, or
+               needs human judgment), DO NOT open a PR. Instead comment on the issue with
+               your root-cause diagnosis and suggested next steps.
+
+            Be conservative: a wrong fix to a live call-handling agent is worse than no
+            fix. These handle banking (bsl), insurance (slic), and hotel bookings.
+          claude_args: |
+            --allowedTools "Bash,Read,Glob,Grep,Edit,Write"
+            --max-turns 15
+            --model claude-sonnet-4-6
