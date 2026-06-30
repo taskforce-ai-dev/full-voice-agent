@@ -35,11 +35,11 @@ In Sentry → **Settings → Integrations → GitHub** → Install → grant acc
 In Sentry → **Alerts → Create Alert → Issues** (an "issue alert"):
 - **When:** *A new issue is created* (fires once per unique error group, not per occurrence).
 - **Then:** *Create a new GitHub issue* → repository `thiva2k/full-voice-agent`.
-- Set the issue **label to `sentry`** (the workflow only acts on that label).
+- *(Optional)* set the issue **label to `sentry`** for easy filtering — **not required**.
 
-> If your Sentry plan's "Create GitHub issue" action can't set a label, tell me — I'll
-> add a tiny auto-label step (label any issue authored by the Sentry bot as `sentry`),
-> or switch the workflow's filter to the Sentry author instead of the label.
+> The workflow triggers on the Sentry app's authorship
+> (`github.event.issue.user.login == 'sentry[bot]'`) **or** a `sentry` label, so no
+> label configuration is needed for it to run on every Sentry-created issue.
 
 That's it. The next new error opens a `sentry` issue → the workflow runs → a draft PR appears.
 

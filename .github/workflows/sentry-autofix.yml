@@ -26,8 +26,11 @@ concurrency:
 
 jobs:
   triage:
-    # Only act on Sentry-created issues (labeled `sentry`).
-    if: contains(github.event.issue.labels.*.name, 'sentry')
+    # Act on Sentry-created issues: either the `sentry` label OR authored by the
+    # Sentry GitHub app (sentry[bot]). The label is optional — the Sentry alert
+    # action does not apply one by default, so the author check is the reliable
+    # trigger; the label path still works if you configure it.
+    if: ${{ contains(github.event.issue.labels.*.name, 'sentry') || github.event.issue.user.login == 'sentry[bot]' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write        # create the fix branch
