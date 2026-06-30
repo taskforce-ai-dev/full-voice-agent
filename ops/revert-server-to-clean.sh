@@ -33,6 +33,12 @@ set -uo pipefail
 BASE=/opt/.handover-baseline
 BACKUP=/opt/.revert-backup
 AGENTS="bsl-agent flico hatton-hills slic-agent kavya kitchened worldofrefrigerators sofia"
+# Optional: pass one or more /opt dir names as args to revert only those
+# (e.g. `bash revert-server-to-clean.sh kitchened` for a single-agent dry run).
+# A partial (per-agent) run skips the deploy-key removal + self-destruct, so it's
+# safe for dry runs; those only happen on a FULL revert (no args).
+PARTIAL=0
+if [ "$#" -gt 0 ]; then AGENTS="$*"; PARTIAL=1; fi
 
 container_for() {
   case "$1" in
@@ -74,8 +80,11 @@ for d in $AGENTS; do
   c="$(container_for "$d")"
   if docker ps -a --format '{{.Names}}' | grep -qx "$c"; then
     if [ "${SKIP_BUILD:-0}" = "1" ]; then
+      # Fast path: overlay the clean server.py and restart (restart preserves the
+      # copied file; a recreate would reload the old image). Note: leaves the
+      # now-unused sentry-sdk in the image — use the full rebuild for a pristine image.
       docker cp "$od/server.py" "$c:/app/server.py" >/dev/null 2>&1 || true
-      ( cd "$od" && docker compose up -d --force-recreate ) >/dev/null 2>&1
+      docker restart "$c" >/dev/null 2>&1
     else
       ( cd "$od" && docker compose up -d --build ) >/dev/null 2>&1
       docker image prune -f >/dev/null 2>&1
@@ -88,6 +97,16 @@ for d in $AGENTS; do
   fi
 done
 
+echo
+echo "Backups of the pre-revert files are in $BACKUP (delete once you've confirmed)."
+
+if [ "$PARTIAL" = "1" ]; then
+  echo "=== PARTIAL revert ($AGENTS): left deploy key + tooling staging in place. ==="
+  echo "=== DONE (partial). ==="
+  exit 0
+fi
+
+# --- full-revert-only steps below ---
 # Remove the GitHub Actions deploy key we added.
 AK=/root/.ssh/authorized_keys
 if [ -f "$AK" ] && grep -q 'gha-deploy-fva' "$AK"; then
@@ -95,8 +114,6 @@ if [ -f "$AK" ] && grep -q 'gha-deploy-fva' "$AK"; then
   echo "=== removed GitHub Actions deploy key from authorized_keys ==="
 fi
 
-echo
-echo "Backups of the pre-revert files are in $BACKUP (delete once you've confirmed)."
 if [ "${SELF_DESTRUCT:-0}" = "1" ]; then
   rm -rf "$BASE" "$BACKUP"
   echo "removed $BASE and $BACKUP"
