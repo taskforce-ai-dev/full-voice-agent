@@ -8,7 +8,7 @@ anthropic>=0.40.0
 openai>=1.0.0
 
 # Telephony
-twilio>=9.0.0
+twilio>=9.10.9
 
 # Knowledge base / RAG
 chromadb>=0.4.0
