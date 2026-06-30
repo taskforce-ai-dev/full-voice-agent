@@ -24,7 +24,7 @@ sentence-transformers>=2.2.0
 
 # Utilities
 python-dotenv>=1.0.0
-aiohttp>=3.9.0
+aiohttp>=3.14.1
 httpx>=0.25.0
 
 # PDF support for knowledge base (optional)
