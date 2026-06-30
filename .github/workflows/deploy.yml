@@ -1,22 +1,21 @@
 # ============================================================================
 # Continuous Deployment — full-voice-agent monorepo
 # ----------------------------------------------------------------------------
-# MANUAL-TRIGGER BY DESIGN. This workflow touches PRODUCTION (single
-# DigitalOcean VPS, host 67.207.90.109). It is intentionally NOT run on every
-# push. You start a deploy from the Actions tab (or `gh workflow run`) and pick
-# which agent + which git ref/tag to roll out.
+# MANUAL-TRIGGER BY DESIGN. Touches PRODUCTION (DigitalOcean VPS 67.207.90.109).
+# You start a deploy from the Actions tab (or `gh workflow run`) and pick which
+# agent + which git ref/tag to roll out.
 #
-# PREREQUISITES (see docs/DEPLOYMENT.md — "Wiring the VPS" + "Required Secrets"):
-#   1. GitHub repo secrets must exist:  VPS_HOST, VPS_USER, VPS_SSH_KEY
-#      Until they are set, this workflow FAILS CLEARLY at the SSH step. That is
-#      expected for a fresh checkout — it is a TEMPLATE until wired.
-#   2. Each /opt/<agent-dir> on the VPS must be a *git checkout* of this
-#      monorepo (full clone or sparse-checkout), not a loose scp'd folder.
-#   3. .env files live ONLY on the VPS and are gitignored — git pull will not
-#      touch them. Never commit secrets into the repo.
+# MODEL: the runner checks out this repo at <ref>, then RSYNCS the chosen
+# agent's source folder to its /opt/<dir> on the VPS (EXCLUDING .env and runtime
+# state — those stay on the box), then rebuilds + restarts that agent's
+# container. The VPS does NOT need git access; the runner is the source of truth.
 #
-# The OPERATOR-CONFIRM agent -> /opt path -> container mapping lives in the
-# remote `case` statement below AND in docs/DEPLOYMENT.md. Keep them in sync.
+# PREREQUISITES (already wired — see docs/DEPLOYMENT.md):
+#   Repo secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY  (set + validated)
+#
+# NOTE: `docker compose up -d --build` rebuilds the image, so a deploy restarts
+# the container and briefly interrupts any in-flight call on THAT agent. Deploy
+# during a quiet window. .env on the VPS is never touched (rsync excludes it).
 # ============================================================================
 
 name: Deploy Agent (manual)
@@ -43,17 +42,12 @@ on:
         type: string
         default: "main"
 
-  # OPTIONAL secondary trigger. Pushing a per-agent baseline tag (e.g.
-  # bsl-v1.0.0, kavya-v1.2.3) will START this workflow, but the manual
-  # workflow_dispatch path above remains the PRIMARY documented flow. The deploy
-  # job is guarded so the tag-push path is a no-op unless an operator wires in an
-  # explicit mapping (it cannot know which agent a tag maps to without the same
-  # mapping table). For now, tag pushes simply surface a reminder in the log.
+  # Pushing a per-agent tag (e.g. bsl-v1.0.0) only prints a reminder — it does
+  # NOT auto-deploy. Production deploys stay manual.
   push:
     tags:
       - "*-v*"
 
-# Prevent two deploys racing onto the same box at once.
 concurrency:
   group: deploy-vps
   cancel-in-progress: false
@@ -62,101 +56,80 @@ jobs:
   deploy:
     name: Deploy to VPS
     runs-on: ubuntu-latest
-
-    # Only run the real deploy for the manual path. Tag pushes fall through to
-    # the "tag-reminder" job below instead of deploying blindly.
     if: ${{ github.event_name == 'workflow_dispatch' }}
-
-    # Inputs are exposed as env vars (NOT interpolated into shell) so the
-    # free-form `ref` input cannot inject commands. Consumed by the SSH step's
-    # `envs: AGENT,REF` and by the steps below.
     env:
-      AGENT: ${{ github.event.inputs.agent }}
-      REF: ${{ github.event.inputs.ref }}
-
+      AGENT: ${{ inputs.agent }}
+      REF: ${{ inputs.ref }}
     steps:
-      - name: Announce deploy target
-        run: |
-          echo "Agent : $AGENT"
-          echo "Ref   : $REF"
-          echo "Actor : ${{ github.actor }}"
-
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Checkout repo at the requested ref
+        uses: actions/checkout@v4
         with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          # Pass the workflow inputs into the remote shell as env vars.
-          envs: AGENT,REF
-          script_stop: true
-          command_timeout: "20m"
-          script: |
-            set -euo pipefail
+          ref: ${{ inputs.ref }}
 
-            # AGENT / REF arrive as env vars via `envs: AGENT,REF` above — they
-            # are never interpolated into this script, so a crafted `ref` value
-            # cannot break out of quoting and execute commands on the VPS.
+      - name: Resolve agent -> source dir / VPS path / container
+        id: map
+        run: |
+          # Mapping verified against the live VPS (ls -d /opt/*/ + docker ps).
+          case "$AGENT" in
+            bsl)       SRC="BSL Agent";            OPT="/opt/bsl-agent";            CON="bsl-agent" ;;
+            flico)     SRC="Flico Agent";          OPT="/opt/flico";                CON="flico-voice-agent" ;;
+            hatton)    SRC="HattonHills";          OPT="/opt/hatton-hills";         CON="hatton-hills-voice-agent" ;;
+            slic)      SRC="SLIC Agent";           OPT="/opt/slic-agent";           CON="slic-voice-agent" ;;
+            sofia)     SRC="Sofia Agent";          OPT="/opt/sofia";                CON="sofia-voice-agent" ;;
+            kavya)     SRC="Kavya";                OPT="/opt/kavya";                CON="kavya-voice-agent" ;;
+            kitchened) SRC="Kitchened";            OPT="/opt/kitchened";            CON="kitchened-voice-agent" ;;
+            wor)       SRC="WorldOfRefrigerators"; OPT="/opt/worldofrefrigerators"; CON="wor-voice-agent" ;;
+            *) echo "Unknown agent id: $AGENT" >&2; exit 1 ;;
+          esac
+          { echo "src=$SRC"; echo "opt=$OPT"; echo "con=$CON"; } >> "$GITHUB_OUTPUT"
+          echo "Deploy '$AGENT'  [$SRC] -> $OPT  (container $CON)  @ $REF"
 
-            # ----------------------------------------------------------------
-            # OPERATOR: CONFIRM THIS MAPPING AGAINST THE VPS BEFORE FIRST USE.
-            # agent id  ->  /opt/<dir>  (must be a git checkout of this repo)
-            # Container names are validated later via `docker compose ps`.
-            # The directory names below are best-guess and MUST be verified with
-            #   ls -d /opt/*/
-            # on 67.207.90.109. Update both this case AND docs/DEPLOYMENT.md.
-            # ----------------------------------------------------------------
-            case "$AGENT" in
-              bsl)       OPT_DIR="/opt/bsl-agent" ;;
-              flico)     OPT_DIR="/opt/flico-agent" ;;
-              hatton)    OPT_DIR="/opt/hattonhills" ;;
-              slic)      OPT_DIR="/opt/slic-agent" ;;
-              sofia)     OPT_DIR="/opt/sofia-agent" ;;
-              kavya)     OPT_DIR="/opt/kavya" ;;
-              kitchened) OPT_DIR="/opt/kitchened" ;;
-              wor)       OPT_DIR="/opt/worldofrefrigerators" ;;
-              *)
-                echo "ERROR: unknown agent id '$AGENT'." >&2
-                exit 1
-                ;;
-            esac
+      - name: Set up SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-            echo "==> Target dir: $OPT_DIR  (ref: $REF)"
+      - name: Sync agent files to the VPS (preserves .env + runtime state)
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          SRC: ${{ steps.map.outputs.src }}
+          OPT: ${{ steps.map.outputs.opt }}
+        run: |
+          # No --delete: we overlay files and never remove VPS-only state.
+          # .env / runtime json / caches / venvs are excluded so live config and
+          # session state on the box are untouched.
+          rsync -az \
+            --exclude='.env' --exclude='.env.*' \
+            --exclude='.git/' --exclude='.github/' \
+            --exclude='venv/' --exclude='.venv/' --exclude='__pycache__/' \
+            --exclude='chroma_db/' --exclude='node_modules/' \
+            --exclude='*.log' --exclude='active_sessions.json' --exclude='*.bak' \
+            -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no" \
+            "$SRC/" "$VPS_USER@$VPS_HOST:$OPT/"
 
-            if [ ! -d "$OPT_DIR/.git" ]; then
-              echo "ERROR: $OPT_DIR is not a git checkout of this monorepo." >&2
-              echo "       See docs/DEPLOYMENT.md -> 'Wiring the VPS'." >&2
-              exit 1
-            fi
+      - name: Rebuild + restart the container
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          OPT: ${{ steps.map.outputs.opt }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" \
+            "set -e; cd \"$OPT\"; docker compose up -d --build; docker compose ps"
 
-            cd "$OPT_DIR"
-
-            echo "==> Fetching latest refs + tags"
-            git fetch --all --tags --prune
-
-            echo "==> Checking out '$REF'"
-            git checkout "$REF"
-
-            # Only fast-forward when on a branch; a detached tag/commit checkout
-            # has no upstream to pull from, so skip the pull in that case.
-            if git symbolic-ref -q HEAD >/dev/null; then
-              echo "==> On a branch; fast-forward pull"
-              git pull --ff-only
-            else
-              echo "==> Detached HEAD (tag/commit); skipping pull"
-            fi
-
-            echo "==> Deployed commit:"
-            git --no-pager log -1 --oneline
-
-            echo "==> Rebuilding + restarting containers"
-            # .env stays on the VPS (gitignored) and is read by compose as usual.
-            docker compose up -d --build --force-recreate
-
-            echo "==> Container status"
-            docker compose ps
-
-            echo "==> Done deploying $AGENT @ $REF"
+      - name: Health check
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          CON: ${{ steps.map.outputs.con }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" \
+            "docker ps --filter name=\"$CON\" --format '{{.Names}}  {{.Status}}'"
 
   tag-reminder:
     name: Tag push (no auto-deploy)
@@ -165,7 +138,6 @@ jobs:
     steps:
       - name: Explain that tag pushes do not auto-deploy
         run: |
-          echo "Tag ${{ github.ref_name }} was pushed."
-          echo "Per design, production deploys are MANUAL."
-          echo "Run the deploy explicitly, e.g.:"
+          echo "Tag ${{ github.ref_name }} was pushed. Production deploys are MANUAL by design."
+          echo "Run it explicitly, e.g.:"
           echo "  gh workflow run deploy.yml -f agent=<id> -f ref=${{ github.ref_name }}"
