@@ -1,0 +1,87 @@
+# ============================================================================
+# Auto-Deploy on push to main
+# ----------------------------------------------------------------------------
+# Every push to main that changes an agent's folder is deployed to PRODUCTION
+# automatically. For each changed agent it auto-chooses the mode:
+#   • fast  — only code / knowledge-docs changed  → hot-swap + restart (seconds)
+#   • build — requirements*.txt / Dockerfile / docker-compose.yml changed → rebuild
+#
+# THERE IS NO APPROVAL STEP. The human gate is the risk analysis + approval that
+# happens with Claude/Codex BEFORE the change is pushed. A basic syntax check
+# (py_compile of changed .py) blocks obviously-broken pushes from shipping.
+#
+# Deploys run through deploy.yml (the engine) via workflow_call. Only the agents
+# that actually changed are deployed; tooling/docs pushes deploy nothing.
+# ============================================================================
+
+name: Auto-Deploy on Push
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-deploy-main
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.d.outputs.matrix }}
+      has: ${{ steps.d.outputs.has }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: d
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if git rev-parse --quiet --verify "${BEFORE}^{commit}" >/dev/null 2>&1; then
+            CHANGED=$(git diff --name-only "$BEFORE" "$AFTER")
+          else
+            CHANGED=$(git diff --name-only "${AFTER}~1" "$AFTER" 2>/dev/null || true)
+          fi
+          echo "Changed files:"; printf '%s\n' "$CHANGED"
+          items=""
+          for entry in "BSL Agent:bsl" "Flico Agent:flico" "HattonHills:hatton" "SLIC Agent:slic" "Sofia Agent:sofia" "Kavya:kavya" "Kitchened:kitchened" "WorldOfRefrigerators:wor"; do
+            dir="${entry%%:*}"; id="${entry##*:}"
+            match=$(printf '%s\n' "$CHANGED" | grep -F "$dir/" || true)
+            [ -z "$match" ] && continue
+            # Safety: syntax-check any changed Python before shipping it.
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              case "$f" in
+                *.py) python3 -m py_compile "$f" || { echo "::error::Syntax error in $f — aborting deploy"; exit 1; } ;;
+              esac
+            done <<< "$match"
+            mode=fast
+            printf '%s\n' "$match" | grep -qE 'requirements.*\.txt|Dockerfile|docker-compose\.ya?ml' && mode=build
+            items="${items}{\"agent\":\"${id}\",\"mode\":\"${mode}\"},"
+            echo "-> will deploy ${id} (${mode})"
+          done
+          items="${items%,}"
+          if [ -z "$items" ]; then
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            echo "No agent folders changed — nothing to deploy."
+          else
+            echo "has=true" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[${items}]}" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: detect
+    if: ${{ needs.detect.outputs.has == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    uses: ./.github/workflows/deploy.yml
+    with:
+      agent: ${{ matrix.agent }}
+      ref: ${{ github.sha }}
+      mode: ${{ matrix.mode }}
+    secrets: inherit

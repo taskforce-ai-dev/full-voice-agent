@@ -3577,5 +3577,3 @@ if __name__ == "__main__":
         port=PORT,
         log_level="info",
     )
-
-# deploy-gate smoke test (safe no-op comment)

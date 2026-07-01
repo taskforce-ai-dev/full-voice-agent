@@ -2,9 +2,12 @@
 # Continuous Deployment — full-voice-agent monorepo  (SMART DEPLOY ENGINE)
 # ----------------------------------------------------------------------------
 # Touches PRODUCTION (DigitalOcean VPS 67.207.90.109). Two ways to run it:
-#   • workflow_dispatch  — you pick the agent + ref + mode from the Actions tab.
-#   • workflow_call      — invoked by deploy-gate.yml after you approve a push
-#                          by commenting `/deploy` on the auto-opened issue.
+#   • workflow_call      — invoked automatically by deploy-on-push.yml for each
+#                          agent changed in a push to main (mode auto-chosen).
+#   • workflow_dispatch  — manual: pick the agent + ref + mode from the Actions
+#                          tab (for redeploys / rollbacks without a code change).
+# The human gate is the in-session risk analysis + approval BEFORE the push;
+# there is no separate approval step in GitHub.
 #
 # MODE:
 #   fast  — rsync the agent's source to /opt/<dir>, hot-swap the changed .py
