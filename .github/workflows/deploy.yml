@@ -1,24 +1,24 @@
 # ============================================================================
-# Continuous Deployment — full-voice-agent monorepo
+# Continuous Deployment — full-voice-agent monorepo  (SMART DEPLOY ENGINE)
 # ----------------------------------------------------------------------------
-# MANUAL-TRIGGER BY DESIGN. Touches PRODUCTION (DigitalOcean VPS 67.207.90.109).
-# You start a deploy from the Actions tab (or `gh workflow run`) and pick which
-# agent + which git ref/tag to roll out.
+# Touches PRODUCTION (DigitalOcean VPS 67.207.90.109). Two ways to run it:
+#   • workflow_dispatch  — you pick the agent + ref + mode from the Actions tab.
+#   • workflow_call      — invoked by deploy-gate.yml after you approve a push
+#                          by commenting `/deploy` on the auto-opened issue.
 #
-# MODEL: the runner checks out this repo at <ref>, then RSYNCS the chosen
-# agent's source folder to its /opt/<dir> on the VPS (EXCLUDING .env and runtime
-# state — those stay on the box), then rebuilds + restarts that agent's
-# container. The VPS does NOT need git access; the runner is the source of truth.
+# MODE:
+#   fast  — rsync the agent's source to /opt/<dir>, hot-swap the changed .py
+#           files into the running container (docker cp) and `docker restart`.
+#           No image rebuild. ~seconds. Use for code / knowledge-doc edits.
+#   build — rsync + `docker compose up -d --build`. Use ONLY when
+#           requirements*.txt / Dockerfile / docker-compose.yml changed.
 #
-# PREREQUISITES (already wired — see docs/DEPLOYMENT.md):
-#   Repo secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY  (set + validated)
-#
-# NOTE: `docker compose up -d --build` rebuilds the image, so a deploy restarts
-# the container and briefly interrupts any in-flight call on THAT agent. Deploy
-# during a quiet window. .env on the VPS is never touched (rsync excludes it).
+# A deploy briefly interrupts in-flight calls on THAT agent (fast = a quick
+# restart; build = longer). .env and runtime state on the VPS are never touched
+# (rsync excludes them). Prereqs: repo secrets VPS_HOST, VPS_USER, VPS_SSH_KEY.
 # ============================================================================
 
-name: Deploy Agent (manual)
+name: Deploy Agent
 
 on:
   workflow_dispatch:
@@ -27,41 +27,42 @@ on:
         description: "Which agent to deploy"
         required: true
         type: choice
-        options:
-          - bsl
-          - flico
-          - hatton
-          - slic
-          - sofia
-          - kavya
-          - kitchened
-          - wor
+        options: [bsl, flico, hatton, slic, sofia, kavya, kitchened, wor]
       ref:
-        description: "Git ref / tag / commit to deploy (e.g. main, flico-v1.0.0)"
+        description: "Git ref / tag / commit to deploy"
         required: true
         type: string
         default: "main"
-
-  # Pushing a per-agent tag (e.g. bsl-v1.0.0) only prints a reminder — it does
-  # NOT auto-deploy. Production deploys stay manual.
-  push:
-    tags:
-      - "*-v*"
+      mode:
+        description: "fast (restart, no rebuild) or build (rebuild image)"
+        required: true
+        type: choice
+        options: [fast, build]
+        default: fast
+  workflow_call:
+    inputs:
+      agent: { required: true, type: string }
+      ref:   { required: true, type: string }
+      mode:  { required: true, type: string }
+    secrets:
+      VPS_HOST: { required: true }
+      VPS_USER: { required: true }
+      VPS_SSH_KEY: { required: true }
 
 concurrency:
-  group: deploy-vps
+  group: deploy-vps-${{ inputs.agent }}
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Deploy to VPS
+    name: Deploy ${{ inputs.agent }} (${{ inputs.mode }})
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' }}
     env:
       AGENT: ${{ inputs.agent }}
       REF: ${{ inputs.ref }}
+      MODE: ${{ inputs.mode }}
     steps:
-      - name: Checkout repo at the requested ref
+      - name: Checkout at ref
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
@@ -69,7 +70,6 @@ jobs:
       - name: Resolve agent -> source dir / VPS path / container
         id: map
         run: |
-          # Mapping verified against the live VPS (ls -d /opt/*/ + docker ps).
           case "$AGENT" in
             bsl)       SRC="BSL Agent";            OPT="/opt/bsl-agent";            CON="bsl-agent" ;;
             flico)     SRC="Flico Agent";          OPT="/opt/flico";                CON="flico-voice-agent" ;;
@@ -82,7 +82,7 @@ jobs:
             *) echo "Unknown agent id: $AGENT" >&2; exit 1 ;;
           esac
           { echo "src=$SRC"; echo "opt=$OPT"; echo "con=$CON"; } >> "$GITHUB_OUTPUT"
-          echo "Deploy '$AGENT'  [$SRC] -> $OPT  (container $CON)  @ $REF"
+          echo "Deploy '$AGENT' [$SRC] -> $OPT (container $CON) @ $REF  mode=$MODE"
 
       - name: Set up SSH
         env:
@@ -101,9 +101,6 @@ jobs:
           SRC: ${{ steps.map.outputs.src }}
           OPT: ${{ steps.map.outputs.opt }}
         run: |
-          # No --delete: we overlay files and never remove VPS-only state.
-          # .env / runtime json / caches / venvs are excluded so live config and
-          # session state on the box are untouched.
           rsync -az \
             --exclude='.env' --exclude='.env.*' \
             --exclude='.git/' --exclude='.github/' \
@@ -113,7 +110,26 @@ jobs:
             -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no" \
             "$SRC/" "$VPS_USER@$VPS_HOST:$OPT/"
 
-      - name: Rebuild + restart the container
+      - name: Apply — FAST (hot-swap code + restart, no rebuild)
+        if: ${{ inputs.mode == 'fast' }}
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          OPT: ${{ steps.map.outputs.opt }}
+          CON: ${{ steps.map.outputs.con }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" bash -s <<REMOTE
+          set -e
+          # Hot-swap every top-level .py into the running container, then restart.
+          # Works whether the compose bind-mounts code or bakes it into the image.
+          for f in "$OPT"/*.py; do
+            [ -f "\$f" ] && docker cp "\$f" "$CON:/app/\$(basename "\$f")"
+          done
+          docker restart "$CON"
+          REMOTE
+
+      - name: Apply — BUILD (rebuild image + restart)
+        if: ${{ inputs.mode == 'build' }}
         env:
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -128,16 +144,6 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           CON: ${{ steps.map.outputs.con }}
         run: |
+          sleep 5
           ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" \
             "docker ps --filter name=\"$CON\" --format '{{.Names}}  {{.Status}}'"
-
-  tag-reminder:
-    name: Tag push (no auto-deploy)
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' }}
-    steps:
-      - name: Explain that tag pushes do not auto-deploy
-        run: |
-          echo "Tag ${{ github.ref_name }} was pushed. Production deploys are MANUAL by design."
-          echo "Run it explicitly, e.g.:"
-          echo "  gh workflow run deploy.yml -f agent=<id> -f ref=${{ github.ref_name }}"
