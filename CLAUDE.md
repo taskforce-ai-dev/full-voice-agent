@@ -44,6 +44,54 @@ Pending operator actions (DO console): downsize the droplet, delete the
 `snapshot_before_resizing_20-05-2026` snapshot (~$2/mo), and raise the account
 spending limit (a low limit triggered a mid-month "account paused" email).
 
+## Cloud Dev Rig — 2nd droplet doubles as our dev environment (Jul 1 2026)
+
+The second droplet (`198.211.114.60`) now ALSO hosts the **cloud dev rig** where
+Claude Code / Codex do the editing, so local machines stay thin. It is fully
+**isolated from the booking system** (which still runs there — never disturb it):
+
+- Runs as an unprivileged **`dev`** user (`/home/dev`); cannot touch `/var/www`,
+  PM2, or nginx. Root only for installs.
+- Its own **nvm Node 24** (system Node 18 left untouched for the booking PM2
+  apps). **No Docker** on this box.
+- Installed for `dev`: Claude Code + Codex CLIs, `ruflo`, `graphify` (0.8.13 via
+  pipx — works natively here, **no WSL wrapper needed**), and the repo at
+  `/home/dev/full-voice-agent` (origin → GitHub over HTTPS via `gh auth`).
+- Migrated: user skills (Claude + Codex), plugins (claude-mem, superpowers,
+  vercel, frontend-design, agent-skills), MCP config (ruflo + account
+  connectors), the **claude-mem store** (`/home/dev/.claude-mem`, Chroma off),
+  and `.env.n8n`.
+- **Steer it:** `ssh dev@198.211.114.60` then `tmux new -A -s dev`; work in
+  `~/full-voice-agent` (run `claude`/`codex` from there so ruflo + workspace
+  trust load). `MCP_TIMEOUT=60000` is set for ruflo's slow (ONNX) startup.
+  (Claude Code Remote / the mobile app was evaluated but parked — tmux only.)
+
+## Deployment — AUTO-DEPLOY ON PUSH (Jul 1 2026)
+
+Pushing to `main` now **auto-deploys** each changed agent to prod
+(`67.207.90.109`) via `.github/workflows/deploy-on-push.yml` → `deploy.yml`:
+- **fast** (code / `knowledge_docs` only): rsync + hot-swap the `.py` into the
+  running container + `docker restart` (seconds, no rebuild).
+- **build** (`requirements*.txt` / `Dockerfile` / `docker-compose.yml` changed):
+  rsync + `docker compose up -d --build`.
+- Mode is auto-chosen per agent; only changed agents deploy; a `py_compile`
+  syntax gate blocks broken pushes; `.env` / runtime state on the VPS is never
+  touched. **No approval gate** — the human gate is the risk analysis BEFORE the
+  push. Manual redeploy / rollback: Actions tab → "Deploy Agent"
+  (workflow_dispatch) or
+  `gh workflow run deploy.yml -f agent=<id> -f ref=main -f mode=fast|build`.
+- **Sentry → Claude auto-triage** uses **Opus 4.8** (`claude-opus-4-8`),
+  draft-PR only, never deploys.
+
+## Handover — revert the prod server to clean (Jul 1 2026)
+
+`ops/revert-server-to-clean.sh` (also staged on the prod VPS at
+`/opt/revert-server-to-clean.sh`, with byte-exact pre-Sentry baselines in
+`/opt/.handover-baseline`) restores every agent's original code, strips Sentry
+code/sdk/env, and removes the GitHub Actions deploy key — leaving only the
+original agent code for handover. `SELF_DESTRUCT=1` also removes the staging and
+the script itself; passing a single agent id runs a safe dry run.
+
 ## KB Auto-Structuring Feature (Jun 2026)
 
 The Sentinel admin portal (`/admin/` → Knowledge Base page) now has an AI-powered KB structuring flow:
