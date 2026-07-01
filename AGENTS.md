@@ -41,6 +41,43 @@ restore with `systemctl enable --now browser-mirror.service ai-vision-browser.se
 Pending operator actions (DO console): downsize droplet, delete the
 `snapshot_before_resizing_20-05-2026` snapshot, raise the account spending limit.
 
+## Cloud Dev Rig — 2nd droplet doubles as our dev environment (Jul 1 2026)
+
+The second droplet (`198.211.114.60`) now ALSO hosts the **cloud dev rig** where
+Claude Code / Codex do the editing, so local machines stay thin. Fully
+**isolated from the booking system** (which still runs there — never disturb it):
+
+- Unprivileged **`dev`** user (`/home/dev`); cannot touch `/var/www`, PM2, nginx.
+- Its own **nvm Node 24** (system Node 18 left untouched for booking PM2). **No Docker.**
+- Installed for `dev`: Claude Code + Codex CLIs, `ruflo`, `graphify` (0.8.13 via
+  pipx — works natively, **no WSL wrapper needed**), repo at
+  `/home/dev/full-voice-agent` (origin → GitHub over HTTPS via `gh auth`).
+- Migrated: user skills (Claude + Codex), plugins, MCP config (ruflo + account
+  connectors), the **claude-mem store** (`/home/dev/.claude-mem`, Chroma off), `.env.n8n`.
+- **Steer it:** `ssh dev@198.211.114.60` then `tmux new -A -s dev`; work in
+  `~/full-voice-agent`. `MCP_TIMEOUT=60000` set for ruflo's slow ONNX startup.
+  (Claude Code Remote / mobile app parked — tmux only.)
+
+## Deployment — AUTO-DEPLOY ON PUSH (Jul 1 2026)
+
+Pushing to `main` **auto-deploys** each changed agent to prod (`67.207.90.109`)
+via `.github/workflows/deploy-on-push.yml` → `deploy.yml`:
+- **fast** (code / `knowledge_docs` only): rsync + hot-swap `.py` + `docker restart` (seconds).
+- **build** (`requirements*.txt` / `Dockerfile` / `docker-compose.yml`): rsync + `docker compose up -d --build`.
+- Mode auto-chosen per agent; only changed agents deploy; `py_compile` gate blocks
+  broken pushes; `.env`/runtime state never touched. **No approval gate** — the
+  human gate is the pre-push risk analysis. Manual: Actions → "Deploy Agent", or
+  `gh workflow run deploy.yml -f agent=<id> -f ref=main -f mode=fast|build`.
+- **Sentry → Claude auto-triage** uses **Opus 4.8** (`claude-opus-4-8`), draft-PR only.
+
+## Handover — revert the prod server to clean (Jul 1 2026)
+
+`ops/revert-server-to-clean.sh` (also on the prod VPS at
+`/opt/revert-server-to-clean.sh`, baselines in `/opt/.handover-baseline`) restores
+every agent's original pre-Sentry code, strips Sentry code/sdk/env, and removes the
+Actions deploy key. `SELF_DESTRUCT=1` also removes staging + the script; a single
+agent id = safe dry run.
+
 ## KB Auto-Structuring Feature (Jun 2026)
 
 Sentinel admin portal → Knowledge Base page has a 4-step AI structuring flow: pick agent + configure VPS target → paste/upload raw content → Claude structures it → publish live to agent.
