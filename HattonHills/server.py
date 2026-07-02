@@ -253,7 +253,7 @@ SLOW_RESPONSE_DELAY: float = 2.5
 SLOW_RESPONSE_FILLERS: dict[str, str] = {
     "en": "One moment please.",
     "ar": "لحظة من فضلك.",
-    "si": "à¶šà¶»à·”à¶¯à·à¶šà¶»à· à¶»à·à¶¯à·™à¶±à·Šà¶±.",
+    "si": "\u0D9A\u0DBB\u0DD4\u0DAF\u0DCF\u0D9A\u0DBB\u0DCF \u0DBB\u0DD0\u0DAF\u0DD9\u0DB1\u0DCA\u0DB1.",
     "ta": "à®¤à®¯à®µà¯à®šà¯†à®¯à¯à®¤à¯ à®•à®¾à®¤à¯à®¤à®¿à®°à¯à®™à¯à®•à®³à¯.",
 }
 
@@ -370,20 +370,20 @@ REPROMPT_MESSAGES: dict[str, list[str]] = {
     "si": [
         # "Hello, are you still there?"
         (
-            "à¶†à¶ºà·”à¶¶à·à·€à¶±à·Š, "
-            "à¶”à¶¶ à¶­à·€à¶¸à¶­à·Š "
-            "à·ƒà·’à¶§à·’à¶±à·Šà¶±à·šà¶¯?"
+            "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA, "
+            "\u0D94\u0DB6 \u0DAD\u0DC0\u0DB8\u0DAD\u0DCA "
+            "\u0DC3\u0DD2\u0DA7\u0DD2\u0DB1\u0DCA\u0DB1\u0DDA\u0DAF?"
         ),
         # Full welcome re-greet
         (
-            "à¶†à¶ºà·”à¶¶à·à·€à¶±à·Š! "
-            "Hatton Hills à·€à·™à¶­ "
-            "à·ƒà·à¶¯à¶»à¶ºà·™à¶±à·Š "
-            "à¶´à·’à·…à·’à¶œà¶±à·’à¶¸à·”. "
-            "à¶¸à¶§ à¶”à¶¶à¶§ "
-            "à¶šà·™à·ƒà·š "
-            "à¶‹à¶¯à·€à·Š "
-            "à¶šà·… à·„à·à¶šà·’à¶¯?"
+            "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
+            "Hatton Hills \u0DC0\u0DD9\u0DAD "
+            "\u0DC3\u0DCF\u0DAF\u0DBB\u0DBA\u0DD9\u0DB1\u0DCA "
+            "\u0DB4\u0DD2\u0DC5\u0DD2\u0D9C\u0DB1\u0DD2\u0DB8\u0DD4. "
+            "\u0DB8\u0DA7 \u0D94\u0DB6\u0DA7 "
+            "\u0D9A\u0DD9\u0DC3\u0DDA "
+            "\u0D8B\u0DAF\u0DC0\u0DCA "
+            "\u0D9A\u0DC5 \u0DC4\u0DD0\u0D9A\u0DD2\u0DAF?"
         ),
     ],
     "ta": [
@@ -1202,12 +1202,17 @@ async def voice_demo_incoming(request: Request) -> Response:
             lang = str(form.get("lang", "")).strip().lower()
         except Exception:
             lang = ""
-    if lang not in ("en", "ar", "ru", "si"):
+    # TEMP (2026-07-02): "si" intentionally excluded here — two Sinhala prompt
+    # strings (SLOW_RESPONSE_FILLERS / REPROMPT_MESSAGES) were found corrupted
+    # (mojibake) and have been fixed in source, but the demo's Sinhala option
+    # is held back pending a live test call before re-enabling. Re-add "si" to
+    # both tuples below (and to the dropdown in BookDemo.tsx) once verified.
+    if lang not in ("en", "ar", "ru"):
         lang = "en"
 
-    if lang in ("ar", "si"):
-        # Arabic / Sinhala — Media Streams (we own STT/TTS); ConversationRelay
-        # has no ar/si locale, so they ride the Media Streams path.
+    if lang == "ar":
+        # Arabic — Media Streams (we own STT/TTS); ConversationRelay has no ar
+        # locale, so it rides the Media Streams path.
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
