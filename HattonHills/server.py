@@ -254,7 +254,7 @@ SLOW_RESPONSE_FILLERS: dict[str, str] = {
     "en": "One moment please.",
     "ar": "لحظة من فضلك.",
     "si": "\u0D9A\u0DBB\u0DD4\u0DAF\u0DCF\u0D9A\u0DBB\u0DCF \u0DBB\u0DD0\u0DAF\u0DD9\u0DB1\u0DCA\u0DB1.",
-    "ta": "à®¤à®¯à®µà¯à®šà¯†à®¯à¯à®¤à¯ à®•à®¾à®¤à¯à®¤à®¿à®°à¯à®™à¯à®•à®³à¯.",
+    "ta": "\u0BA4\u0BAF\u0BB5\u0BC1\u0B9A\u0BC6\u0BAF\u0BCD\u0BA4\u0BC1 \u0B95\u0BBE\u0BA4\u0BCD\u0BA4\u0BBF\u0BB0\u0BC1\u0B99\u0BCD\u0B95\u0BB3\u0BCD.",
 }
 
 # ---------------------------------------------------------------------------
@@ -389,20 +389,20 @@ REPROMPT_MESSAGES: dict[str, list[str]] = {
     "ta": [
         # "Hello, are you still there?"
         (
-            "à®µà®£à®•à¯à®•à®®à¯, "
-            "à®¨à¯€à®™à¯à®•à®³à¯ "
-            "à®‡à®©à¯à®©à¯à®®à¯ "
-            "à®‡à®°à¯à®•à¯à®•à®¿à®±à¯€à®°à¯à®•à®³à®¾?"
+            "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD, "
+            "\u0BA8\u0BC0\u0B99\u0BCD\u0B95\u0BB3\u0BCD "
+            "\u0B87\u0BA9\u0BCD\u0BA9\u0BC1\u0BAE\u0BCD "
+            "\u0B87\u0BB0\u0BC1\u0B95\u0BCD\u0B95\u0BBF\u0BB1\u0BC0\u0BB0\u0BCD\u0B95\u0BB3\u0BBE?"
         ),
         # Full welcome re-greet
         (
-            "à®µà®£à®•à¯à®•à®®à¯! "
-            "Hatton Hills à®•à¯à®•à¯ "
-            "à®µà®°à®µà¯‡à®±à¯à®•à®¿à®±à¯‹à®®à¯. "
-            "à®¨à®¾à®©à¯ "
-            "à®‰à®™à¯à®•à®³à¯à®•à¯à®•à¯ "
-            "à®Žà®ªà¯à®ªà®Ÿà®¿ "
-            "à®‰à®¤à®µà®²à®¾à®®à¯?"
+            "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
+            "Hatton Hills \u0B95\u0BCD\u0B95\u0BC1 "
+            "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
+            "\u0BA8\u0BBE\u0BA9\u0BCD "
+            "\u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
+            "\u0B8E\u0BAA\u0BCD\u0BAA\u0B9F\u0BBF "
+            "\u0B89\u0BA4\u0BB5\u0BB2\u0BBE\u0BAE\u0BCD?"
         ),
     ],
 }
