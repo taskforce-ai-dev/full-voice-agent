@@ -1191,6 +1191,9 @@ async def voice_demo_incoming(request: Request) -> Response:
       - ``ar`` → Media Streams (``/ws/media-stream/ar``): Twilio ConversationRelay
         has no Arabic locale, so Arabic rides the Media Streams path where we own
         STT (``ar-SA``) and TTS (ElevenLabs multilingual), like the IVR "press 2" flow.
+      - ``si`` → Media Streams (``/ws/media-stream/si``): same reasoning as Arabic —
+        no Sinhala locale in ConversationRelay. STT via Azure (``si-LK``), TTS via
+        OpenAI ``gpt-4o-mini-tts`` (voice ``sage``).
     """
     host = request.headers.get("host", request.url.hostname or "localhost")
 
@@ -1202,17 +1205,15 @@ async def voice_demo_incoming(request: Request) -> Response:
             lang = str(form.get("lang", "")).strip().lower()
         except Exception:
             lang = ""
-    # TEMP (2026-07-02): "si" intentionally excluded here — two Sinhala prompt
-    # strings (SLOW_RESPONSE_FILLERS / REPROMPT_MESSAGES) were found corrupted
-    # (mojibake) and have been fixed in source, but the demo's Sinhala option
-    # is held back pending a live test call before re-enabling. Re-add "si" to
-    # both tuples below (and to the dropdown in BookDemo.tsx) once verified.
-    if lang not in ("en", "ar", "ru"):
+    # (2026-07-02: "si" was temporarily excluded here after a mojibake corruption
+    # was found in SLOW_RESPONSE_FILLERS/REPROMPT_MESSAGES["si"]; fixed in source
+    # same day. Re-enabled 2026-07-03 after the fix was smoke-tested.)
+    if lang not in ("en", "ar", "ru", "si"):
         lang = "en"
 
-    if lang == "ar":
-        # Arabic — Media Streams (we own STT/TTS); ConversationRelay has no ar
-        # locale, so it rides the Media Streams path.
+    if lang in ("ar", "si"):
+        # Arabic/Sinhala — Media Streams (we own STT/TTS); ConversationRelay has
+        # no ar/si locale, so both ride the Media Streams path.
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
