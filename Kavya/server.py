@@ -266,6 +266,12 @@ SLOW_RESPONSE_FILLERS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # IVR language configurations
 # ---------------------------------------------------------------------------
+# Set IVR_MENU_ENABLED=true to present the DTMF language menu on incoming
+# calls. Default "false": every call connects straight to the English
+# ConversationRelay agent (no "press 1/2/3" prompt). /voice/language-selected
+# stays wired either way, so re-enabling the menu needs no code change.
+IVR_MENU_ENABLED: bool = os.getenv("IVR_MENU_ENABLED", "false").lower() == "true"
+
 # Maps DTMF digit â†’ language code
 # Menu currently offers English (ConversationRelay) and Arabic (Media Streams).
 # Sinhala/Tamil remain fully implemented below but are not surfaced in the menu.
@@ -1011,8 +1017,9 @@ async def kb_reload(request: Request) -> dict:
 async def voice_incoming(request: Request) -> Response:
     """Twilio webhook for incoming phone calls.
 
-    Connects the caller straight to the English ConversationRelay agent â€”
-    no IVR / language menu.
+    By default (IVR_MENU_ENABLED unset/false) connects the caller straight to
+    the English ConversationRelay agent - no IVR / language menu. Set
+    IVR_MENU_ENABLED=true to present the DTMF language menu instead.
     """
     form = await request.form()
     host = request.headers.get("host", request.url.hostname or "localhost")
@@ -1039,19 +1046,23 @@ async def voice_incoming(request: Request) -> Response:
     en = LANGUAGE_CONFIGS["en"]
     cr = _build_conversation_relay_twiml(host, "en", en)
 
-    # IVR language menu: 1 = English (ConversationRelay), 2 = Arabic (Media
-    # Streams). If the caller presses nothing, fall through to the English
-    # agent (preserves prior straight-to-English behavior for silent callers).
-    gather = (
-        f'  <Gather numDigits="1" action="https://{host}/voice/language-selected"'
-        ' method="POST" timeout="6">\n'
-        '    <Say voice="Polly.Joanna">Welcome to Treehouse Chalets. '
-        'For English, press 1.</Say>\n'
-        '    <Say voice="Polly.Zeina">للغة العربية، اضغط اثنين.</Say>\n'
-        '    <Say voice="Google.si-LK-Standard-A" language="si-LK">'
-        'සිංහල සඳහා, තුන ඔබන්න.</Say>\n'
-        "  </Gather>\n"
-    )
+    # IVR language menu (IVR_MENU_ENABLED=true only): 1 = English
+    # (ConversationRelay), 2 = Arabic (Media Streams), 3 = Sinhala. If the
+    # caller presses nothing, fall through to the English agent. With the menu
+    # disabled (default) the <Gather> is omitted, so every call connects
+    # straight to the English agent below.
+    gather = ""
+    if IVR_MENU_ENABLED:
+        gather = (
+            f'  <Gather numDigits="1" action="https://{host}/voice/language-selected"'
+            ' method="POST" timeout="6">\n'
+            '    <Say voice="Polly.Joanna">Welcome to Treehouse Chalets. '
+            'For English, press 1.</Say>\n'
+            '    <Say voice="Polly.Zeina">للغة العربية، اضغط اثنين.</Say>\n'
+            '    <Say voice="Google.si-LK-Standard-A" language="si-LK">'
+            'සිංහල සඳහා, තුන ඔබන්න.</Say>\n'
+            "  </Gather>\n"
+        )
 
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -1063,8 +1074,12 @@ async def voice_incoming(request: Request) -> Response:
         "</Response>"
     )
 
-    logger.info("Incoming call from %s â€” presenting EN/AR/SI language menu",
-                request.headers.get("x-forwarded-for", "unknown"))
+    logger.info(
+        "Incoming call from %s - %s",
+        request.headers.get("x-forwarded-for", "unknown"),
+        "presenting EN/AR/SI language menu" if IVR_MENU_ENABLED
+        else "IVR menu disabled, connecting straight to English agent",
+    )
 
     return Response(content=twiml, media_type="application/xml")
 
