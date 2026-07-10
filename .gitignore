@@ -63,7 +63,7 @@ htmlcov/
 # --- Nested repos with their OWN git remotes (do NOT add as broken gitlinks) ---
 # These live here for editing convenience but are tracked in their own GitHub repos.
 # Committing them from this parent would record broken gitlinks (empty dirs on clone).
-# Taskforce_AI_Website/ -> ChrysFernando/Taskforce_AI_Website
+# Taskforce_AI_Website/ -> thiva2k/Taskforce_AI_Website (migrated 2026-07-10 off the taskforceai-sl org)
 Taskforce_AI_Website/
 # agent-dashboard/ -> ChrysFernando/Client-Portal (left as-is)
 agent-dashboard/
@@ -101,3 +101,7 @@ service-account*.json
 # Catch-all for credential drops in any agent dir
 **/full-voice-agent-*.json
 **/gcp-credentials*.json
+
+# MCP server config -- holds live API tokens in plaintext env blocks (Jul 2026: added
+# 5 Hostinger MCP servers here with a raw HOSTINGER_API_TOKEN)
+.mcp.json
