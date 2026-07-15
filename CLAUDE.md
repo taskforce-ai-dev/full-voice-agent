@@ -7,11 +7,14 @@
 
 ## Local API-key stash (gitignored — never commit values)
 
-Reusable secrets live in **`.env.n8n`** at the repo root (matched by `.env.*` in
-`.gitignore`, so never committed). Read values from there when a task needs them:
+Reusable secrets live in **`.env.secrets`** at the repo root (renamed Jul 2026 from
+`.env.n8n` — that name stopped making sense once it grew past n8n-only keys; matched
+by `.env.*` in `.gitignore`, so never committed). Read values from there when a task
+needs them:
 - `N8N_API_KEY` — n8n public API (header `X-N8N-API-KEY`)
 - `SENTRY_API_TOKEN` — Sentry API (`Authorization: Bearer …`); also powers the Sentry→Claude auto-triage
 - `ANTHROPIC_API_KEY` — Anthropic key; also set as the GitHub Actions repo secret `ANTHROPIC_API_KEY` (used by `.github/workflows/sentry-autofix.yml`)
+- `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` — Cloudflare API (`Authorization: Bearer $CLOUDFLARE_API_TOKEN`); scope unconfirmed, verify via `/accounts/{id}/tokens/verify` before assuming zone-write access
 
 ## Second VPS — Yanolja/eZee Booking Integration (Kavya's data source)
 
@@ -60,7 +63,7 @@ Claude Code / Codex do the editing, so local machines stay thin. It is fully
 - Migrated: user skills (Claude + Codex), plugins (claude-mem, superpowers,
   vercel, frontend-design, agent-skills), MCP config (ruflo + account
   connectors), the **claude-mem store** (`/home/dev/.claude-mem`, Chroma off),
-  and `.env.n8n`.
+  and `.env.secrets`.
 - **Steer it:** `ssh dev@198.211.114.60` then `tmux new -A -s dev`; work in
   `~/full-voice-agent` (run `claude`/`codex` from there so ruflo + workspace
   trust load). `MCP_TIMEOUT=60000` is set for ruflo's slow (ONNX) startup.
@@ -183,7 +186,10 @@ The marketing/demo website now lives in this repo at `Taskforce_AI_Website/`,
 brought in for future editing convenience.
 
 - **It is its own git repo** (nested `.git`), wired to its deploy remote
-  `git@github.com:ChrysFernando/Taskforce_AI_Website.git` (branch `main`).
+  `https://github.com/thiva2k/Taskforce_AI_Website.git` (branch `main`, private).
+  Migrated 2026-07-10 off the `taskforceai-sl` org repo (a third party there
+  holds org-owner rights; keeping deploy control on an account we fully own
+  avoids depending on their access).
   `full-voice-agent` does **not** track it — `Taskforce_AI_Website/` is in the
   parent `.gitignore` to avoid recording a broken gitlink. See that folder's own
   `CLAUDE.md` for app-level details.
@@ -289,6 +295,46 @@ Codex skills under `/home/thiva/.codex/skills` include the current claude-mem
 skills from plugin cache `13.4.2` plus Codex-specific skills such as `graphify`
 and `ui-ux-pro-max`. Use `mem-search` for previous-session lookup and follow its
 search → timeline → get_observations workflow.
+
+## n8n Post-Call Processor — WhatsApp JID rules (Jul 2026)
+
+The Treehouse Post-Call Processor (n8n workflow `lGCsV0DYRtPNXfsd` on
+`automation.taskforceai.tech`) sends booking confirmations via WasenderAPI,
+which requires `to` to be a WhatsApp JID (`94XXXXXXXXX@s.whatsapp.net`).
+This has broken twice; the fixed contract is:
+
+- **Phone normalization lives ONLY in the `to` expression** of the
+  "wa customer confirmation" node (strips non-digits, drops leading 0,
+  forces the `94` country code, appends `@s.whatsapp.net`). The OpenAI
+  extraction prompt is instructed to copy the phone digits from the
+  transcript VERBATIM — never re-add "include the country code" wording
+  there; the model garbles digits when asked to reformat (it once turned
+  `0711754668` into `947171754668`).
+- **`text` must be** `{{ $('Parse AI JSON').item.json.customer_whatsapp_message }}`.
+  A hand-edit once pasted the `to` normalization expression into `text`,
+  so guests received a raw JID string as their "confirmation".
+- Known-good workflow snapshot: `n8n-workflows/treehouse-post-call-processor.json`
+  (re-export after any intentional change; restore via PUT
+  `/api/v1/workflows/lGCsV0DYRtPNXfsd` with `name,nodes,connections,settings`).
+- **After ANY edit to this workflow, run**
+  `python3 n8n-workflows/smoke_test_postcall.py` — it replays the failing
+  local-format-number call shape end-to-end and asserts extraction +
+  JID + send. It delivers one real WhatsApp message to the test number
+  (94711754668) and one manager summary per run.
+- The WA nodes have `onError: continueRegularOutput`, so WA send failures
+  do NOT mark executions as errored — check the node output JSON for
+  `error` when debugging, not just the execution status.
+- **Sentry alerting (Jul 2026):** each WA node feeds an
+  `IF send failed — <node>` → `Sentry alert — <node>` pair that POSTs an
+  error event to the `full-voice-agent` Sentry project (org
+  `nutech-solutions`) via the DSN store endpoint whenever the WA node
+  output contains `error`. Events carry `logger:n8n.postcall`,
+  tags `agent:kavya` / `source:n8n` / `wa_node:<node>`, fingerprint
+  `n8n-wa-send-failure`, and `call_sid`/`caller_phone` in extra. Sentry's
+  "Notify via GitHub" rule then opens a repo issue, which triggers the
+  Claude auto-triage workflow. NOTE for triage: WA send failures are
+  fixed in the n8n workflow (this section + the snapshot JSON), NOT in
+  this repo's Python code.
 
 ## Claude Code / Codex Sync
 
