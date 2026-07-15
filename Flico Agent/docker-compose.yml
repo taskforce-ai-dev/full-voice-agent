@@ -38,19 +38,40 @@ services:
 
     environment:
       - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json
+      # -- Knowledge-base backend selector -----------------------
+      # sqlite = relational-semantic hybrid (kb/ package): strict SQL
+      #          filtering (zone/type/rent/beds) + in-memory MiniLM cosine.
+      # chroma = original ChromaDB RAG (knowledge_base_chroma.py).
+      # Both backends' files ship in the image and are mounted below, so
+      # flipping this value + `docker compose up -d --force-recreate flico`
+      # is an instant, no-rebuild rollback either way.
+      - KB_BACKEND=sqlite
 
     # -- Persistent volumes -------------------------------------
     volumes:
-      # ChromaDB vector store — survives container restarts so
-      # embeddings don't need to be regenerated each time.
+      # ChromaDB vector store — kept so a chroma rollback stays instant.
       - ./chroma_db:/app/chroma_db
 
-      # Knowledge documents — mount as a bind so new/updated
-      # docs can be dropped in without rebuilding the image.
+      # Knowledge documents — source prose the KB is built from; mount as a
+      # bind so new/updated docs can be dropped in without rebuilding.
       - ./knowledge_docs:/app/knowledge_docs
 
       # GCP service account credentials for Google Cloud STT
       - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+
+      # -- Application code --------------------------------------
+      # Bind-mounted so fast-mode deploys (rsync + restart) ship code
+      # changes — including the kb/ package — without an image rebuild.
+      # The Dockerfile also COPYies these, so the image is self-contained.
+      - ./server.py:/app/server.py
+      - ./knowledge_base.py:/app/knowledge_base.py
+      - ./knowledge_base_chroma.py:/app/knowledge_base_chroma.py
+      - ./knowledge_base_sqlite.py:/app/knowledge_base_sqlite.py
+      - ./kb:/app/kb
+      - ./media_transport.py:/app/media_transport.py
+      - ./post_call.py:/app/post_call.py
+      - ./asterisk_ari.py:/app/asterisk_ari.py
+      - ./asterisk_rtp.py:/app/asterisk_rtp.py
 
     # -- Restart policy -----------------------------------------
     # Always restart unless explicitly stopped with

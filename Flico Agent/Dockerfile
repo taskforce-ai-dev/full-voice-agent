@@ -48,6 +48,10 @@ RUN pip install --no-cache-dir -r requirements-prod.txt
 #   __pycache__/      — bytecode cache
 COPY server.py knowledge_base.py supabase_client.py ./
 COPY media_transport.py asterisk_ari.py asterisk_rtp.py ./
+# KB backends: knowledge_base.py is the dispatcher (copied above); these are the
+# two implementations it routes to, plus the SQLite-hybrid engine package.
+COPY knowledge_base_chroma.py knowledge_base_sqlite.py ./
+COPY kb/ ./kb/
 COPY knowledge_docs/ ./knowledge_docs/
 
 # --- Port --------------------------------------------------------------------
