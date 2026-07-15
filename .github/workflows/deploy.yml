@@ -125,8 +125,14 @@ jobs:
           set -e
           # Hot-swap every top-level .py into the running container, then restart.
           # Works whether the compose bind-mounts code or bakes it into the image.
+          # Bind-mounted files (e.g. server.py, knowledge_base.py) cannot be — and
+          # need not be — docker-cp'd: the mount already reflects the rsync'd change
+          # and the restart re-resolves it. So a failed cp is skipped, not fatal
+          # (previously an unlinkat "device or resource busy" aborted the whole deploy).
           for f in "$OPT"/*.py; do
-            [ -f "\$f" ] && docker cp "\$f" "$CON:/app/\$(basename "\$f")"
+            [ -f "\$f" ] || continue
+            docker cp "\$f" "$CON:/app/\$(basename "\$f")" 2>/dev/null \
+              || echo "  skip hot-swap (bind-mounted or busy): \$(basename "\$f")"
           done
           docker restart "$CON"
           REMOTE
