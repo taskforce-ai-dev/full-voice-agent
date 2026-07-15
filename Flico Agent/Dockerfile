@@ -36,6 +36,13 @@ WORKDIR /app
 # dependencies don't change — even if application code does.
 # requirements-prod.txt intentionally excludes pyaudio (needs PortAudio C lib,
 # only used in local demo) and azure-cognitiveservices-speech (backup TTS).
+# Install CPU-only torch FIRST from the PyTorch CPU index. This box has no GPU,
+# so the default PyPI torch — which bundles ~6GB of NVIDIA CUDA libraries
+# (cuDNN, cuBLAS, triton, cusparse) — is pure dead weight. Installing the CPU
+# build first means sentence-transformers sees torch already satisfied and never
+# pulls the CUDA wheel. Cuts the image from ~9GB to ~2.5GB with no runtime change
+# (MiniLM embeddings run on CPU regardless).
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 COPY requirements-prod.txt .
 RUN pip install --no-cache-dir -r requirements-prod.txt
 
