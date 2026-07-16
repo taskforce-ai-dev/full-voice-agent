@@ -75,10 +75,14 @@ class QueryParser:
         f.max_rent = QueryParser._max_rent(low)
 
         # Bedrooms only from an explicit "N-bed(room)" phrase. Bare "N people"
-        # is occupancy, never a bedroom filter.
-        bm = re.search(r"(\d+)\s*-?\s*(?:bed|bedroom|br|bd)s?\b", low)
+        # is occupancy, never a bedroom filter. The count may be a digit or a
+        # word: callers SAY "two bedroom", and STT transcribes it that way, so
+        # a digit-only match would silently never filter on a real call.
+        bm = re.search(r"\b(\d+|" + "|".join(_NUM_WORDS) + r")\s*-?\s*"
+                       r"(?:bed|bedroom|br|bd)s?\b", low)
         if bm:
-            f.min_bedrooms = int(bm.group(1))
+            tok = bm.group(1)
+            f.min_bedrooms = _NUM_WORDS[tok] if tok in _NUM_WORDS else int(tok)
 
         return utterance, f
 

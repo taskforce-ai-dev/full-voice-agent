@@ -39,6 +39,18 @@ def test_explicit_bedrooms_is_a_filter():
     assert f.min_bedrooms == 3
 
 
+def test_spoken_bedroom_count_is_a_filter():
+    # Callers say "two bedroom" and STT transcribes the word, not a digit.
+    # A digit-only match let a 2-bedroom request surface 1-bedroom units.
+    _, f = QueryParser.parse("i need a two bedroom apartment")
+    assert f.min_bedrooms == 2
+
+
+def test_spoken_occupancy_is_still_not_bedrooms():
+    _, f = QueryParser.parse("a place for the four of us")
+    assert f.min_bedrooms is None
+
+
 def test_rent_range_month():
     _, f = QueryParser.parse("apartment under 500k a month")
     assert f.max_rent == 500000.0
