@@ -28,6 +28,9 @@ class RealEstateKB:
     def get_count(self) -> int:
         return self.db.get_count()
 
+    def all_properties(self) -> List[Property]:
+        return [p for p, _ in self.db.query_properties(QueryFilters())]
+
     def _rank(self, query: str, candidates, n: Optional[int]) -> List[Property]:
         if not candidates:
             return []

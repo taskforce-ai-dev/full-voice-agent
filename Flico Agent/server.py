@@ -61,7 +61,7 @@ from openai import AsyncOpenAI
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
-from knowledge_base import retrieve_context, initialize_kb, prewarm, reload_kb_from_content
+from knowledge_base import retrieve_context, initialize_kb, prewarm, reload_kb_from_content, portfolio_facts
 from supabase_client import (
     record_call_start,
     record_call_end,
@@ -298,6 +298,26 @@ _SENTENCE_END = re.compile(r'(?<=[.!?\u0964\u0DF4])\s+')
 # System prompt
 # ---------------------------------------------------------------------------
 
+def _portfolio_facts_block() -> str:
+    """Portfolio claims derived from the live KB, or a safe fallback.
+
+    Never let a prompt-building fault break a live call: an agent with no
+    portfolio claims still works from the reference context.
+    """
+    try:
+        facts = portfolio_facts()
+    except Exception:
+        logger.exception("portfolio_facts failed; falling back to no claims")
+        facts = ""
+    if facts:
+        return facts
+    return ("PORTFOLIO FACTS:\n"
+            "- Describe ONLY properties that appear in the REFERENCE CONTEXT. If a "
+            "caller asks for something that is not there, say we do not have it. "
+            "Never state what the portfolio does or does not contain beyond what "
+            "the reference context shows.\n\n")
+
+
 def _build_system_prompt(lang: str = "en") -> str:
     today = date.today().isoformat()
 
@@ -373,6 +393,12 @@ def _build_system_prompt(lang: str = "en") -> str:
 
         + language_rules +
         handoff_rules +
+        # Generated from the live inventory every call. The portfolio facts used
+        # to be hard-coded here, went stale when the inventory changed, and made
+        # Fiona deny listings that retrieval had correctly handed her. Empty
+        # string when the backend cannot derive them -- saying nothing about the
+        # portfolio is safe; saying something stale is not.
+        _portfolio_facts_block() +
 
         "GREETING & CALLER DETAILS:\n"
         "- The opening greeting is already spoken automatically: 'You have reached "
@@ -423,19 +449,15 @@ def _build_system_prompt(lang: str = "en") -> str:
         "It is NOT the number of bedrooms they want. Do NOT map 'for N people' to "
         "an N-bedroom property. A family of four is very comfortable in a three-"
         "bedroom apartment.\n"
-        "- A comfortable rule of thumb is roughly two people per bedroom, so a "
-        "couple is well served by a one-bedroom home and a group of four by a "
-        "two-bedroom home.\n"
-        "- Our portfolio is one-bedroom and two-bedroom apartments and houses. A "
-        "one-bedroom suits one or two people; a two-bedroom is an excellent fit "
-        "for a couple or a small family of three or four. Present them that way "
-        "confidently rather than searching for an exact bedroom count.\n"
+        "- A comfortable rule of thumb is roughly two people per bedroom. Match "
+        "the group size to a real listing in the PORTFOLIO FACTS and REFERENCE "
+        "CONTEXT rather than searching for an exact bedroom count.\n"
         "- Only treat a number as a bedroom requirement when the caller explicitly "
         "says 'bedrooms' (e.g. 'I need two bedrooms').\n"
-        "- We do not currently have anything larger than two bedrooms. If a caller "
-        "asks for three or more, be honest that our largest is a two-bedroom, then "
-        "offer the closest suitable two-bedroom option FROM THE REFERENCE CONTEXT "
-        "-- never invent a larger unit.\n"
+        "- If a caller asks for a size we do not have, be honest and offer the "
+        "closest option FROM THE REFERENCE CONTEXT -- never invent a unit. The "
+        "sizes we actually have are stated in PORTFOLIO FACTS above; that block "
+        "is generated from the live inventory, so trust it over any assumption.\n"
         "- Always honour the property TYPE the caller asked for. If they asked for "
         "an apartment, keep recommending apartments; do not drift to a house just "
         "because it matches on area. If a listing you are about to mention is a "

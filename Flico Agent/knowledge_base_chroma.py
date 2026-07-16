@@ -676,6 +676,18 @@ def add_document(
 # Pre-warm (cold-start optimisation)
 # ---------------------------------------------------------------------------
 
+def portfolio_facts() -> str:
+    """Backend-contract parity with knowledge_base_sqlite.
+
+    Chroma stores prose chunks, not typed rows, so there is nothing to derive
+    literally-true portfolio claims FROM. Returning "" makes the prompt fall back
+    to "only describe what is in the reference context", which is honest. Do not
+    hand-write facts here -- hard-coded portfolio claims going stale is exactly
+    the bug this function exists to kill.
+    """
+    return ""
+
+
 def prewarm():
     """Pre-load ChromaDB client and embedding model to avoid cold-start latency.
 

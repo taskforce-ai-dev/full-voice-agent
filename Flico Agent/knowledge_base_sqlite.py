@@ -5,6 +5,7 @@ from typing import Optional
 
 from kb.config import DEFAULT_DOCS_DIRECTORY, DB_PATH
 from kb.engine import RealEstateKB
+from kb.facts import portfolio_facts as facts_from_rows
 from kb.migrate import parse_prose
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,19 @@ def reload_kb_from_content(content: str, filename: str = "flico_info.txt") -> bo
         logger.error("Failed to write KB file: %s", exc)
         return False
     return _load_from_text(content)
+
+
+def portfolio_facts() -> str:
+    """Literally-true statements about the live inventory, for the system prompt.
+
+    Returns "" on any fault: a prompt with no portfolio claims is safe, one with
+    stale claims is not.
+    """
+    try:
+        return facts_from_rows(_get_engine().all_properties())
+    except Exception as exc:
+        logger.error("portfolio_facts failed: %s", exc)
+        return ""
 
 
 def retrieve_context(query: str, n_results: Optional[int] = None,

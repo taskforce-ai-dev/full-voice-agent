@@ -16,19 +16,29 @@ ACTIVE_BACKEND = os.environ.get("KB_BACKEND", "chroma").strip().lower()
 
 if ACTIVE_BACKEND == "sqlite":
     from knowledge_base_sqlite import (
-        initialize_kb, prewarm, reload_kb_from_content, retrieve_context,
+        initialize_kb, portfolio_facts, prewarm, reload_kb_from_content,
+        retrieve_context,
     )
     logger.info("KB backend: sqlite (local-vector hybrid)")
 else:
     ACTIVE_BACKEND = "chroma"
     from knowledge_base_chroma import (
-        initialize_kb, prewarm, reload_kb_from_content, retrieve_context,
+        initialize_kb, portfolio_facts, prewarm, reload_kb_from_content,
+        retrieve_context,
     )
-    logger.info("KB backend: chroma (default)")
+    # Loud on purpose. The chroma path has NONE of the guarantees the sqlite
+    # backend is verified for: no exact bedroom match, no announced relaxation,
+    # no "zone is never dropped", no exhaustive filter proof. Flipping this env
+    # var silently discards every one of them.
+    logger.warning(
+        "KB backend: chroma -- DEGRADED. The verified retrieval semantics "
+        "(exact bedroom match, announced relaxation, zone never dropped) exist "
+        "only on KB_BACKEND=sqlite. Answers are not covered by the KB test suite."
+    )
 
 DEFAULT_DOCS_DIRECTORY = "knowledge_docs"
 
 __all__ = [
-    "initialize_kb", "prewarm", "reload_kb_from_content", "retrieve_context",
-    "DEFAULT_DOCS_DIRECTORY", "ACTIVE_BACKEND",
+    "initialize_kb", "portfolio_facts", "prewarm", "reload_kb_from_content",
+    "retrieve_context", "DEFAULT_DOCS_DIRECTORY", "ACTIVE_BACKEND",
 ]
