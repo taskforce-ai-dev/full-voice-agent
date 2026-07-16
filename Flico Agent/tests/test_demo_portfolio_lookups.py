@@ -11,10 +11,7 @@ import re
 import pytest
 
 from kb.migrate import parse_prose
-
-pytest.importorskip("sentence_transformers")
-
-from kb.engine import RealEstateKB  # noqa: E402  (needs the optional model)
+from tests.conftest import build_kb
 
 _KB_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "knowledge_docs", "flico_info.txt")
@@ -25,9 +22,7 @@ def kb(tmp_path_factory):
     with open(_KB_FILE, encoding="utf-8") as fh:
         rows, skipped, _ = parse_prose(fh.read())
     assert not skipped, f"KB prose failed to parse: {skipped}"
-    k = RealEstateKB(db_path=str(tmp_path_factory.mktemp("kb") / "demo.db"), preamble="")
-    k.add_properties(rows)
-    return k
+    return build_kb(tmp_path_factory.mktemp("kb") / "demo.db", rows)
 
 
 def _refs(kb, query):

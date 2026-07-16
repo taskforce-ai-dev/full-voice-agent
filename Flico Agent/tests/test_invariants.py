@@ -6,17 +6,15 @@ listing without a label, a listing outside the requested zone, or a silent
 substitution. These are properties, not examples: they are asserted over the
 whole reachable filter space rather than a few cases.
 
-Uses a zero-vector embedder so no model download is needed. Ranking only
-permutes, so it cannot affect any set-membership property asserted here.
+Uses the shared zero-vector embedder (tests/conftest.py) so no model download is
+needed. Ranking only permutes, so it cannot affect any property asserted here.
 """
 import itertools
 
-import numpy as np
 import pytest
 
-from kb import engine as kb_engine
-from kb.engine import RealEstateKB
 from kb.schema import Property, QueryFilters
+from tests.conftest import build_kb
 from tests.oracle import satisfies
 from tests.truth_table import TRUTH, rent_equivalence_grid
 
@@ -25,31 +23,16 @@ _BEDS_NOTE = "DIFFERENT number of bedrooms"
 _RENT_NOTE = "cost MORE than they asked"
 
 
-class _ZeroEmbedder:
-    def get_embeddings(self, texts):
-        return np.zeros((len(texts), 384), dtype=np.float32)
-
-    def get_embedding(self, text):
-        return np.zeros(384, dtype=np.float32)
-
-
 @pytest.fixture(scope="module")
 def store(tmp_path_factory):
-    original = kb_engine.EmbeddingEngine
-    kb_engine.EmbeddingEngine = _ZeroEmbedder
-    try:
-        k = RealEstateKB(db_path=str(tmp_path_factory.mktemp("inv") / "i.db"), preamble="")
-        k.add_properties([
-            Property(id=r["id"], transaction="rent", property_type=r["type"],
-                     zone=r["zone"], area="", bedrooms=r["beds"],
-                     bathrooms=float(r["baths"]), rent_amount=float(r["rent"]),
-                     rent_period="month", furnishing=r["furnishing"],
-                     floor_area_sqft=r["sqft"], description=r["id"])
-            for r in TRUTH
-        ])
-        yield k
-    finally:
-        kb_engine.EmbeddingEngine = original
+    return build_kb(tmp_path_factory.mktemp("inv") / "i.db", [
+        Property(id=r["id"], transaction="rent", property_type=r["type"],
+                 zone=r["zone"], area="", bedrooms=r["beds"],
+                 bathrooms=float(r["baths"]), rent_amount=float(r["rent"]),
+                 rent_period="month", furnishing=r["furnishing"],
+                 floor_area_sqft=r["sqft"], description=r["id"])
+        for r in TRUTH
+    ])
 
 
 def _filter_space():

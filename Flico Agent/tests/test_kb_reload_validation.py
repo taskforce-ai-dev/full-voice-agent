@@ -4,13 +4,8 @@ The admin portal POSTs KB content straight to a live agent, bypassing CI
 entirely. These assert the validator, so "a bad KB can never reach prod" is
 true through that path too -- not just through git.
 """
-import pytest
-
 from kb.migrate import parse_prose
-
-pytest.importorskip("sentence_transformers", reason="knowledge_base_sqlite loads the model")
-
-from knowledge_base_sqlite import _validate  # noqa: E402
+from knowledge_base_sqlite import _validate
 
 _GOOD = ("Rodrigo Realtors has a 1-bedroom, 1-bathroom furnished apartment for rent "
          "on Park Street in Colombo 2 (Slave Island), with a floor area of 620 square "

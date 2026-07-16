@@ -1,8 +1,7 @@
 import pytest
-from kb.engine import RealEstateKB
-from kb.schema import Property
 
-pytest.importorskip("sentence_transformers")
+from kb.schema import Property
+from tests.conftest import build_kb
 
 
 def _p(pid, ptype, zone, beds=3, desc="a lovely home", rent=500000.0, req=False, period="month"):
@@ -16,16 +15,22 @@ def _p(pid, ptype, zone, beds=3, desc="a lovely home", rent=500000.0, req=False,
 
 @pytest.fixture(scope="module")
 def kb(tmp_path_factory):
-    path = tmp_path_factory.mktemp("kb") / "e.db"
-    k = RealEstateKB(db_path=str(path), preamble="PREAMBLE.")
-    k.add_properties([
-        _p("P1", "apartment", 7, desc="bright apartment with a swimming pool and gym"),
-        _p("P2", "house", 7, desc="large family house with a garden"),
-        _p("P3", "apartment", 5, desc="cozy flat near the school"),
-        _p("P4", "apartment", 2, desc="luxury tower unit", req=True),
-        _p("P_TWO", "apartment", 7, beds=2, desc="compact two bedroom apartment"),
-    ])
-    return k
+    # Descriptions mirror real KB prose. The formatter emits a row's stored prose
+    # when it has any, so a fixture whose prose omits the rent tests a shape that
+    # migrate.py cannot produce: the parser only sets rent_on_request BECAUSE the
+    # prose said so, and _validate rejects a listing with neither rent nor an
+    # on-request marker. P4's prose must therefore state its rent, like a real one.
+    return build_kb(
+        tmp_path_factory.mktemp("kb") / "e.db",
+        [
+            _p("P1", "apartment", 7, desc="bright apartment with a swimming pool and gym"),
+            _p("P2", "house", 7, desc="large family house with a garden"),
+            _p("P3", "apartment", 5, desc="cozy flat near the school"),
+            _p("P4", "apartment", 2, req=True,
+               desc="luxury tower unit. The monthly rent is available on request."),
+            _p("P_TWO", "apartment", 7, beds=2, desc="compact two bedroom apartment"),
+        ],
+        preamble="PREAMBLE.")
 
 
 def test_type_and_zone_filter_excludes_other_types(kb):
