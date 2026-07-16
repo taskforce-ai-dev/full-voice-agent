@@ -179,6 +179,57 @@ Consequences worth knowing:
 
 `tests/test_demo_portfolio_lookups.py` asserts all of the above end-to-end
 against the real KB prose (needs sentence-transformers; skipped without it).
+
+### Jul 16 2026 — the KB filter is verified by EXHAUSTION, not by sampling
+
+Five bugs were found by spot-checking, then six more by enumeration. The root
+cause was never the individual bugs: the suite tested a hand-picked *diagonal* of
+a (filter dimension x semantic decision) matrix nobody had written down, so every
+dimension no one consciously decided kept its accidental default. Stickiness
+alone regressed twice (bedrooms, then budget) before this landed.
+
+**Do not fix a KB bug by adding one more example test.** Add the dimension to the
+grammar/oracle and let the sweep prove the whole space. The domain is finite:
+
+- `tests/truth_table.py` — the 12 rows as plain data, transcribed by hand.
+  **Imports nothing from `kb/`.** Regenerate + re-audit when real data lands.
+- `tests/oracle.py` — `satisfies()` written from the spec (documented in its
+  docstring), **not** from `database.py`. Testing the code against itself proves
+  nothing; the signed spec is what makes the oracle equal intent.
+- `tests/test_truth_crosscheck.py` — `migrate` == the audited table. One
+  assertion pins both the prose parser and the prose content.
+- `tests/test_exhaustive_filter.py` — every type x zone x beds x rent-bound (584).
+  Rent uses **equivalence classes**: SQL comparisons are monotone, so each
+  distinct rent +/-1 and the midpoints covers *every* real-valued threshold.
+- `tests/test_exhaustive_parser.py` — ~60k utterances from a grammar declared as
+  data, including STT mishearings and decoys that must parse to **nothing**
+  (occupancy "four people", sizes "under 1000 square feet", counts "more than 2
+  bedrooms"). Each decoy was a real bug.
+
+All of it runs on numpy+pydantic+pytest (no sentence-transformers) in ~20s, and
+**gates deploys**: `.github/workflows/deploy-on-push.yml` job `kb-verify` is
+required by `deploy`. `/kb-reload` bypasses CI entirely, so
+`knowledge_base_sqlite._validate` rejects a bad batch **before writing to disk**
+(writing first let a bad paste take effect on the next restart) and keeps the
+previous inventory.
+
+**Ranking may only ORDER the matched set, never truncate it.** `n_results=None`
+is the default end-to-end. It was 6 while the filter matched 9 for "under 300k",
+so prod silently hid three properties the caller qualified for — and the
+acceptance tests ran at 12, certifying a configuration prod never executed. If a
+real portfolio makes unbounded context too slow, cap it *deliberately* and know
+that the completeness guarantee weakens to "top-k of a correct set".
+
+**What is NOT guaranteed** (say this plainly, never oversell it):
+- What Fiona *says*. We prove she is handed a correct, complete, self-labelling
+  context; obeying the NOTEs is prompt-following, not proof.
+- **Tamil and Sinhala extract NO filters at all.** The parser is English regex;
+  those paths transcribe in native script, so type/zone/bedrooms all come back
+  `None` and retrieval falls back to unfiltered cosine over English prose. Two of
+  three languages are outside every guarantee here. Unresolved — needs a decision.
+- Utterances outside the declared grammar fall through to unfiltered ranking.
+- The oracle rests on one human audit of 12 rows. Verification relocates trust.
+- `KB_BACKEND=chroma` has none of these semantics.
 - Photo URLs from the demo sheet are deliberately NOT in the KB: this is a voice
   agent, the placeholders are fake, and the KB tells callers a salesperson shares
   photos on follow-up.
