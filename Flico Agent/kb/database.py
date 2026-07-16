@@ -103,6 +103,8 @@ class KBDatabase:
             conditions.append("property_type = ?"); params.append(filters.property_type)
         if filters.zone is not None:
             conditions.append("zone = ?"); params.append(filters.zone)
+        if filters.bedrooms is not None:
+            conditions.append("bedrooms = ?"); params.append(filters.bedrooms)
         if filters.min_bedrooms is not None:
             conditions.append("bedrooms >= ?"); params.append(filters.min_bedrooms)
         if filters.min_rent is not None:
@@ -110,7 +112,9 @@ class KBDatabase:
         if filters.max_rent is not None:
             # rent_on_request rows (NULL amount) survive a max_rent filter so
             # premium listings are still offered; the caller is told to ask.
-            conditions.append("(rent_amount <= ? OR rent_amount IS NULL)"); params.append(filters.max_rent)
+            op = "<" if filters.max_rent_exclusive else "<="
+            conditions.append(f"(rent_amount {op} ? OR rent_amount IS NULL)")
+            params.append(filters.max_rent)
 
         sql = "SELECT * FROM properties"
         if conditions:

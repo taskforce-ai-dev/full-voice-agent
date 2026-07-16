@@ -29,6 +29,12 @@ class QueryFilters(BaseModel):
     transaction: Optional[str] = None
     property_type: Optional[str] = None
     zone: Optional[int] = None
-    min_bedrooms: Optional[int] = None
+    bedrooms: Optional[int] = Field(
+        default=None, description="exact bedroom count: 'a two bedroom apartment'")
+    min_bedrooms: Optional[int] = Field(
+        default=None, description="bedroom floor: 'at least two bedrooms', '2+'")
     min_rent: Optional[float] = None
     max_rent: Optional[float] = None
+    max_rent_exclusive: bool = Field(
+        default=False,
+        description="'under 300k' excludes a 300k listing; 'up to 300k' includes it")
