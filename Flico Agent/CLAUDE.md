@@ -162,9 +162,23 @@ Consequences worth knowing:
   lease terms and availability, so the sqlite backend was silently starving the
   "tell the caller everything" prompt rule. Rows with no prose still fall back to
   the synthesized line.
-- Unlike the chroma backend, the sqlite backend **does** filter on bedrooms
-  (`min_bedrooms`, matched as `bedrooms >= N`) from an explicit "N-bed(room)"
-  phrase only. "N people" is still never a bedroom filter.
+- Unlike the chroma backend, the sqlite backend **does** filter on bedrooms, from
+  an explicit "N-bed(room)" phrase only — the count may be a digit or a word
+  ("two bedroom"), since STT transcribes what the caller says. A plain "two
+  bedroom" is an EXACT match (`bedrooms = 2`); only "at least 2" / "2 or more" /
+  "2+" is a floor (`min_bedrooms`). "N people" is still never a bedroom filter.
+  The count is sticky across turns like type and zone.
+- **The relaxation ladder never substitutes silently.** When the exact filter set
+  is empty it relaxes rent, then bedrooms, then property_type — and prepends a
+  `NOTE:` to the context naming what was given up, so the LLM cannot present a
+  house as the apartment that was asked for. Zone is never dropped. An exact
+  match carries no note. `kb/engine.py::_RELAXATIONS` is the whole ladder.
+- Rent: "under/below/less than" is exclusive, "up to/max/budget of" inclusive.
+  Ranges ("between 300k and 500k", "300k-500k") and floors ("over 300k") parse;
+  a scale unit is required there so "more than 2 bedrooms" is never read as money.
+
+`tests/test_demo_portfolio_lookups.py` asserts all of the above end-to-end
+against the real KB prose (needs sentence-transformers; skipped without it).
 - Photo URLs from the demo sheet are deliberately NOT in the KB: this is a voice
   agent, the placeholders are fake, and the KB tells callers a salesperson shares
   photos on follow-up.
