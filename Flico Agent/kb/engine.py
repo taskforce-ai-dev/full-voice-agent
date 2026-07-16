@@ -42,19 +42,49 @@ class RealEstateKB:
     # LLM a house for an apartment request with nothing marking it a mismatch.
     # The caller's ZONE is never dropped -- offering another area unasked was a
     # real production bug.
-    _RELAXATIONS = (
-        ("max_rent",
-         "NOTE: nothing matches the caller's stated budget. Every listing below "
-         "costs MORE than they asked for. Say so plainly before offering one."),
-        ("bedrooms",
-         "NOTE: nothing has the exact bedroom count the caller asked for. Every "
-         "listing below has a DIFFERENT number of bedrooms. State each one's real "
-         "bedroom count and acknowledge it is not what they asked for."),
-        ("property_type",
-         "NOTE: we have nothing of the property type the caller asked for. Every "
-         "listing below is a DIFFERENT property type. Never describe one as the "
-         "type they asked for -- say we have none, then offer these as alternatives."),
-    )
+    _RELAXATIONS = ("max_rent", "bedrooms", "property_type")
+
+    _RENT_NOTE = (
+        "NOTE: nothing matched the caller's budget together with everything else "
+        "they asked for. One or more listings below cost MORE than they asked "
+        "for -- check each listing's rent and say plainly when it is over budget.")
+    _BEDS_NOTE = (
+        "NOTE: nothing matched the exact bedroom count the caller asked for. One "
+        "or more listings below have a DIFFERENT number of bedrooms -- state each "
+        "listing's real bedroom count and never imply it matches.")
+    _TYPE_NOTE = (
+        "NOTE: we have nothing of the property type the caller asked for. The "
+        "listings below are a DIFFERENT property type -- say we have none of what "
+        "they asked for, then offer these as alternatives. Never describe one as "
+        "the type they asked for.")
+
+    @staticmethod
+    def _describe(original: QueryFilters, props: List[Property]) -> str:
+        """Describes what the RETURNED listings actually violate.
+
+        Deriving the note from which constraint the ladder dropped over-claims:
+        asking for a 1-bedroom house in Colombo 3 relaxes bedrooms and then type,
+        and returns a 1-bedroom apartment -- whose bedroom count is exactly right.
+        Telling the LLM otherwise is a lie, and a NOTE that cries wolf trains it
+        to ignore the NOTEs that matter. Notes state only real mismatches.
+        """
+        notes = []
+        if original.max_rent is not None and any(
+                p.rent_amount is not None and (
+                    p.rent_amount >= original.max_rent if original.max_rent_exclusive
+                    else p.rent_amount > original.max_rent)
+                for p in props):
+            notes.append(RealEstateKB._RENT_NOTE)
+        if ((original.bedrooms is not None
+             and any(p.bedrooms != original.bedrooms for p in props))
+                or (original.min_bedrooms is not None
+                    and any(p.bedrooms is None or p.bedrooms < original.min_bedrooms
+                            for p in props))):
+            notes.append(RealEstateKB._BEDS_NOTE)
+        if original.property_type is not None and any(
+                p.property_type != original.property_type for p in props):
+            notes.append(RealEstateKB._TYPE_NOTE)
+        return "\n".join(notes)
 
     def _candidates(self, filters: QueryFilters):
         rows = self.db.query_properties(filters)
@@ -62,8 +92,7 @@ class RealEstateKB:
             return rows, ""
 
         vals = filters.model_dump()
-        notes = []
-        for field, note in self._RELAXATIONS:
+        for field in self._RELAXATIONS:
             if field == "bedrooms":
                 if vals["bedrooms"] is None and vals["min_bedrooms"] is None:
                     continue
@@ -72,10 +101,9 @@ class RealEstateKB:
                 if vals[field] is None:
                     continue
                 vals[field] = None
-            notes.append(note)
             rows = self.db.query_properties(QueryFilters(**vals))
             if rows:
-                return rows, "\n".join(notes)
+                return rows, self._describe(filters, [p for p, _ in rows])
         return [], ""
 
     def retrieve(self, query: str, n_results: Optional[int] = None,
