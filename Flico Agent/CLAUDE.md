@@ -124,8 +124,8 @@ per turn). `bedrooms` is in metadata but deliberately NOT a filter — occupancy
   consultative real-estate **sales** persona (qualify -> build value -> handle
   objections -> advance to a viewing + lead capture), strictly KB-grounded.
 - New **OCCUPANCY vs BEDROOMS** rule: "N people/family/guests" = occupancy, never
-  a bedroom count (fixes the "4 people -> only 4-bedroom units" drift). Apartments
-  start at 3 bedrooms; agent states that floor as a benefit, never invents a 1-/2-bed.
+  a bedroom count (fixes the "4 people -> only 4-bedroom units" drift). The
+  bedroom-floor wording is portfolio-specific — see the Jul 16 2026 note below.
 - New **SALES APPROACH** block + honour-the-requested-property-TYPE rule (don't
   drift apartment->house on area match).
 - Rent must be read with its exact period ("per day" vs "per month" — e.g. P03 is
@@ -139,6 +139,35 @@ per turn). `bedrooms` is in metadata but deliberately NOT a filter — occupancy
   `knowledge_base.py`, so `docker compose up -d --force-recreate flico` ships code
   changes without an image rebuild. (`docker compose build` currently fails on the
   VPS with `No space left on device` — disk at ~89%, images ~56GB; unrelated to code.)
+
+### Jul 16 2026 — DEMO portfolio swap (P51–P62)
+
+`knowledge_docs/flico_info.txt` no longer holds the real 49-listing Rodrigo
+portfolio. It was replaced with **12 synthetic DEMO listings (P51–P62)** to
+exercise 1BR/2BR search: 3x 1BR apartment (P51–53), 3x 2BR apartment (P54–56),
+3x 1BR house (P57–59), 3x 2BR house (P60–62), across Colombo 2,3,5,6,7,8.
+**This data is not real inventory** — the source note says to replace every row
+with verified Google Sheet data before real production use. The real portfolio
+is recoverable from git history (the commit before this one).
+
+Consequences worth knowing:
+- The portfolio is now **1BR/2BR only, residential only**. The system prompt's
+  bedroom-floor and commercial/office claims were rewritten to match: Fiona used
+  to be told "our apartments start at three bedrooms" and "we do not currently
+  have any one-bedroom or two-bedroom apartments", which would have made her deny
+  the very listings this demo exists to test. If you restore the real KB, restore
+  those prompt lines too — prompt and KB must state the same portfolio facts.
+- `kb/formatter.py` now emits each row's stored prose (`description`) instead of a
+  synthesized one-liner. The old line dropped the street, amenities, bathrooms,
+  lease terms and availability, so the sqlite backend was silently starving the
+  "tell the caller everything" prompt rule. Rows with no prose still fall back to
+  the synthesized line.
+- Unlike the chroma backend, the sqlite backend **does** filter on bedrooms
+  (`min_bedrooms`, matched as `bedrooms >= N`) from an explicit "N-bed(room)"
+  phrase only. "N people" is still never a bedroom filter.
+- Photo URLs from the demo sheet are deliberately NOT in the KB: this is a voice
+  agent, the placeholders are fake, and the KB tells callers a salesperson shares
+  photos on follow-up.
 
 ## Server Endpoints
 

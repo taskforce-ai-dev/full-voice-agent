@@ -13,6 +13,12 @@ class ContextFormatter:
 
     @staticmethod
     def _line(p: Property) -> str:
+        # The stored prose is the fullest rendering of a listing: it carries the
+        # street, amenities, lease terms, bathrooms and availability that the
+        # normalized columns drop. Prefer it, and synthesize a line only for rows
+        # that have no prose.
+        if p.description:
+            return f"[{p.id}] {p.description}"
         loc = f"Colombo {p.zone}" if p.zone else (p.area or "")
         where = f" at {p.building}" if p.building else ""
         beds = f"{p.bedrooms}-bedroom " if p.bedrooms else ""
