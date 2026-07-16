@@ -1,0 +1,201 @@
+"""End-to-end answer accuracy eval — QA, NOT proof.
+
+The KB test suite proves what Fiona is HANDED: a correct, complete, self-labelling
+context. It cannot prove what she SAYS. An LLM can still misread a price or ignore
+a NOTE. This measures that, and it is monitoring, not a guarantee. Never quote its
+score as if it were the exhaustive proof.
+
+Replicates the production call shape exactly (server.py ~2483):
+    system  = _build_system_prompt(lang)
+    user    = "[Reference context: {retrieve_context(text, sticky)}]\n\nGuest: {text}"
+
+Each scenario is graded twice:
+  * mechanically  — invented ref codes, invented zones, type/bedroom claims that
+                    contradict the retrieved set. Deterministic, no judge needed.
+  * by a judge    — an independent Opus pass that only sees the context and the
+                    reply and hunts for contradictions.
+
+Run inside the flico container (it has the API key and the model):
+    docker exec flico-voice-agent python evals/answer_eval.py
+"""
+import json
+import os
+import random
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import anthropic  # noqa: E402
+
+import knowledge_base  # noqa: E402
+from knowledge_base import retrieve_context  # noqa: E402
+
+# Judge preference order. A stronger, independent judge is better, but the API
+# returns 529 under load -- an eval that silently drops scenarios on a transient
+# error reports a fake score, so retry hard and fall back rather than skip.
+JUDGE_MODELS = ["claude-opus-4-8", "claude-sonnet-4-6"]
+AGENT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+
+
+def _call(client, model, **kw):
+    last = None
+    for attempt in range(6):
+        try:
+            return client.messages.create(model=model, **kw)
+        except Exception as exc:  # 429/500/529 are all transient here
+            last = exc
+            time.sleep(min(2 ** attempt + random.random(), 30))
+    raise last
+
+
+def _judge_call(client, **kw):
+    last = None
+    for model in JUDGE_MODELS:
+        try:
+            return _call(client, model, **kw)
+        except Exception as exc:
+            last = exc
+    raise last
+
+# (id, turns, what a correct answer must respect)
+SCENARIOS = [
+    ("1br_apartment", ["I'm looking for a one bedroom apartment"],
+     "Must offer only 1-bedroom apartments (P51, P52 or P53). Must not offer a "
+     "2-bedroom or a house as if it were a 1-bedroom apartment."),
+    ("2br_house_c7", ["Do you have a two bedroom house in Colombo 7?"],
+     "Only P61 qualifies. Must not offer any other property as a 2-bedroom house "
+     "in Colombo 7."),
+    ("apartment_c8_none", ["I want an apartment in Colombo 8"],
+     "There are NO apartments in Colombo 8 -- only houses (P58, P62). Fiona MUST "
+     "say we have no apartments there. She may offer the houses only if she is "
+     "explicit that they are houses, not apartments."),
+    ("three_bedroom_none", ["I need a three bedroom apartment"],
+     "Nothing has 3 bedrooms; the largest is 2. Fiona must say so honestly and "
+     "must NOT invent a 3-bedroom listing."),
+    ("budget_too_low", ["I want a two bedroom apartment under 100,000 rupees"],
+     "No 2-bedroom apartment costs under 100k (cheapest is P54 at 280,000). She "
+     "must say nothing fits that budget rather than pretending one does."),
+    ("occupancy_not_bedrooms", ["I need a place for four people"],
+     "'Four people' is occupancy, NOT four bedrooms. She must not claim we have a "
+     "4-bedroom property, and must not say we have nothing for four people."),
+    ("price_accuracy", ["How much is the Park Street one bedroom?"],
+     "P51 on Park Street is Rs 180,000 per month. Any other figure is wrong."),
+    ("zone_not_covered", ["Do you have anything in Colombo 1?"],
+     "We have nothing in Colombo 1. She must say so and must not present another "
+     "area's listing as being in Colombo 1."),
+    ("sticky_budget", ["I want an apartment under 200,000",
+                       "what about Colombo 5?"],
+     "The only Colombo 5 apartment is P54 at 280,000, which is OVER the stated "
+     "200k budget. She must acknowledge it exceeds the budget, not present it as "
+     "if it fits."),
+    ("no_photos", ["Can you WhatsApp me the photos?"],
+     "Rodrigo Realtors does not send details or photos directly; a salesperson "
+     "follows up. She must not promise to send anything."),
+]
+
+_JUDGE_PROMPT = """You are auditing a real-estate voice agent for factual accuracy.
+
+You will see the REFERENCE CONTEXT the agent was given, the CALLER's words, the
+agent's REPLY, and the RULE the reply must respect.
+
+The context is the ONLY truth. Anything the agent states that is absent from it,
+or contradicts it, is a violation. Judge ONLY factual accuracy — not tone, not
+sales technique, not verbosity.
+
+A "NOTE:" line in the context means the listings do NOT fully match the request.
+Ignoring a NOTE and presenting a listing as if it matched IS a violation.
+
+Return STRICT JSON only:
+{"verdict": "PASS" | "FAIL", "violations": ["..."], "reasoning": "one sentence"}
+
+Return PASS with an empty list if the reply is factually consistent.
+
+=== REFERENCE CONTEXT ===
+{context}
+
+=== CALLER ===
+{caller}
+
+=== AGENT REPLY ===
+{reply}
+
+=== RULE ===
+{rule}
+"""
+
+
+def _mechanical(reply, context):
+    """Deterministic checks that need no judge."""
+    violations = []
+    ctx_refs = set(re.findall(r"\[(P\d+)\]", context))
+    for ref in set(re.findall(r"\bP\d{2}\b", reply)):
+        if ref not in ctx_refs:
+            violations.append(f"cited {ref}, which is not in the context")
+    # A price stated must exist in the context (digits form).
+    ctx_prices = set(re.findall(r"Rs\s*([\d,]+)", context))
+    ctx_nums = {p.replace(",", "") for p in ctx_prices}
+    for num in re.findall(r"(?:Rs\.?|rupees)\s*([\d,]{4,})", reply, re.I):
+        if num.replace(",", "") not in ctx_nums:
+            violations.append(f"quoted Rs {num}, which is not in the context")
+    return violations
+
+
+def _run(client, scenario):
+    sid, turns, rule = scenario
+    import server
+    system = server._build_system_prompt("en")
+    sticky, history, reply, context = {}, [], "", ""
+    for text in turns:
+        context = retrieve_context(text, sticky=sticky)
+        user = f"[Reference context: {context}]\n\nGuest: {text}" if context else text
+        history.append({"role": "user", "content": user})
+        resp = _call(client, AGENT_MODEL, max_tokens=600, system=system,
+                     messages=history)
+        reply = "".join(b.text for b in resp.content if b.type == "text")
+        history.append({"role": "assistant", "content": reply})
+    return context, turns[-1], reply, rule
+
+
+def main():
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    knowledge_base.initialize_kb("knowledge_docs")
+
+    results, failures = [], 0
+    for scenario in SCENARIOS:
+        sid = scenario[0]
+        context, caller, reply, rule = _run(client, scenario)
+
+        mech = _mechanical(reply, context)
+        judged = _judge_call(
+            client, max_tokens=500,
+            messages=[{"role": "user", "content": _JUDGE_PROMPT
+                       .replace("{context}", context).replace("{caller}", caller)
+                       .replace("{reply}", reply).replace("{rule}", rule)}])
+        raw = "".join(b.text for b in judged.content if b.type == "text")
+        try:
+            verdict = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
+        except Exception:
+            verdict = {"verdict": "FAIL", "violations": ["judge returned unparseable output"],
+                       "reasoning": raw[:200]}
+
+        bad = mech + verdict.get("violations", [])
+        ok = not bad and verdict.get("verdict") == "PASS"
+        failures += not ok
+        results.append({"id": sid, "pass": ok, "violations": bad,
+                        "reply": reply, "reasoning": verdict.get("reasoning", "")})
+        print(f"[{'PASS' if ok else 'FAIL'}] {sid}")
+        for v in bad:
+            print(f"        - {v}")
+        if not ok:
+            print(f"        reply: {reply[:220]}")
+
+    print(f"\n{len(SCENARIOS) - failures}/{len(SCENARIOS)} scenarios factually clean")
+    with open("/tmp/answer_eval.json", "w") as fh:
+        json.dump(results, fh, indent=2)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
