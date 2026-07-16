@@ -32,6 +32,9 @@ TYPE_FRAGMENTS = [
     ("bungalow", {"property_type": "house"}),
     ("office space", {"property_type": "commercial"}),
     ("warehouse", {"property_type": "commercial"}),  # contains "house"
+    ("land", {"property_type": "land"}),
+    ("bare land", {"property_type": "land"}),
+    ("plot", {"property_type": "land"}),
 ]
 
 ZONE_FRAGMENTS = [
