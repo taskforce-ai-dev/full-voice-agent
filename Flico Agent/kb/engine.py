@@ -28,7 +28,7 @@ class RealEstateKB:
     def get_count(self) -> int:
         return self.db.get_count()
 
-    def _rank(self, query: str, candidates, n: int) -> List[Property]:
+    def _rank(self, query: str, candidates, n: Optional[int]) -> List[Property]:
         if not candidates:
             return []
         qv = self.embedder.get_embedding(query)
@@ -78,7 +78,15 @@ class RealEstateKB:
                 return rows, "\n".join(notes)
         return [], ""
 
-    def retrieve(self, query: str, n_results: int = 6, sticky: Optional[dict] = None) -> str:
+    def retrieve(self, query: str, n_results: Optional[int] = None,
+                 sticky: Optional[dict] = None) -> str:
+        """n_results=None returns every row the SQL filter matched, ranked.
+
+        Truncating below the matched set silently hides listings the caller
+        qualifies for -- at the old default of 6, "anything under 300k" showed
+        6 of the 9 matches. The filter is the layer we can prove correct, so it,
+        not an arbitrary cap, decides what the caller is told about.
+        """
         semantic, filters = QueryParser.parse(query)
         if sticky is not None:
             filters = QueryParser.merge_sticky(filters, sticky)

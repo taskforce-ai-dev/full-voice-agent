@@ -9,16 +9,20 @@ _WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
 _TEXT_RENT = {"fifteen thousand": 15000.0}  # extend as needed; numeric Rs is primary
 
 
-def _classify(low: str) -> str:
+def _classify(low: str) -> Optional[str]:
+    # Mirrors QueryParser._classify_type -- same word-boundary rules, same
+    # vocabulary. A listing whose type cannot be read is REJECTED (None) rather
+    # than silently filed as an apartment: a misfiled row is invisible to the
+    # type filter forever, and the prose is hand-authored.
     if any(m in low for m in _COMMERCIAL_MARKERS):
         return "commercial"
-    if "apartment" in low or "flat" in low:
+    if re.search(r"\b(apartments?|flats?|penthouses?|condos?|condominiums?)\b", low):
         return "apartment"
-    if "house" in low or "villa" in low or "bungalow" in low:
+    if re.search(r"\b(houses?|town\s*houses?|villas?|bungalows?|annexe?s?)\b", low):
         return "house"
-    if "bare land" in low or "land" in low or "plot" in low:
+    if re.search(r"\b(lands?|plots?)\b", low):
         return "land"
-    return "apartment"
+    return None
 
 
 def _int(s: Optional[str]) -> Optional[int]:
@@ -31,6 +35,10 @@ def _parse_listing(para: str) -> Optional[Property]:
     if not ref:
         return None
     pid = ref.group(1).upper()
+
+    ptype = _classify(low)
+    if ptype is None:
+        return None  # unreadable type -> skipped, never guessed
 
     beds = re.search(r"(\d+)\s*-\s*bedroom", low)
     baths = re.search(r"(\d+)\s*-\s*bathroom", low)
@@ -76,7 +84,7 @@ def _parse_listing(para: str) -> Optional[Property]:
     lease = re.search(r"minimum lease of (\d+)\s*year", low)
 
     return Property(
-        id=pid, transaction="rent", property_type=_classify(low),
+        id=pid, transaction="rent", property_type=ptype,
         zone=_int(zone.group(1)) if zone else None,
         area=area.group(1).title() if area else "",
         building=bld.group(1).strip() if bld else None,

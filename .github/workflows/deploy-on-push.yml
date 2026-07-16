@@ -73,9 +73,48 @@ jobs:
             echo "matrix={\"include\":[${items}]}" >> "$GITHUB_OUTPUT"
           fi
 
-  deploy:
+  # Hard gate on the Flico KB. The retrieval filter decides which properties a
+  # caller is told about, so a regression here misinforms real people. The
+  # exhaustive parser/filter sweeps and the prose<->truth-table cross-check need
+  # only numpy+pydantic+pytest (no sentence-transformers), so this runs in well
+  # under a minute and can gate every deploy. Pushing to main deploys straight to
+  # production, so this MUST pass before the deploy job.
+  kb-verify:
     needs: detect
-    if: ${{ needs.detect.outputs.has == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: touched
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if git rev-parse --quiet --verify "${BEFORE}^{commit}" >/dev/null 2>&1; then
+            CHANGED=$(git diff --name-only "$BEFORE" "$AFTER")
+          else
+            CHANGED=$(git diff --name-only "${AFTER}~1" "$AFTER" 2>/dev/null || true)
+          fi
+          if printf '%s\n' "$CHANGED" | grep -qF 'Flico Agent/'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Flico Agent untouched — KB verification not required."
+          fi
+      - if: steps.touched.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - if: steps.touched.outputs.run == 'true'
+        run: pip install --quiet pytest numpy pydantic
+      - if: steps.touched.outputs.run == 'true'
+        working-directory: Flico Agent
+        # `python -m pytest` (not bare pytest) so CWD is importable and the
+        # tests/ oracle package resolves.
+        run: python -m pytest tests/ -q
+
+  deploy:
+    needs: [detect, kb-verify]
+    if: ${{ needs.detect.outputs.has == 'true' && needs.kb-verify.result == 'success' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.detect.outputs.matrix) }}

@@ -31,7 +31,11 @@ def kb(tmp_path_factory):
 
 
 def _refs(kb, query):
-    return sorted(set(re.findall(r"\[(P\d+)\]", kb.retrieve(query, n_results=12, sticky={}))))
+    # NO n_results: production (server.py) calls retrieve_context(text, sticky=...)
+    # and takes the default. These tests once passed at n_results=12 while prod ran
+    # at 6 and silently showed 6 of the 9 "under 300k" matches -- certifying a
+    # configuration prod never executed. Always assert at production parameters.
+    return sorted(set(re.findall(r"\[(P\d+)\]", kb.retrieve(query, sticky={}))))
 
 
 def test_all_twelve_demo_rows_present(kb):

@@ -27,13 +27,16 @@ _COMMERCIAL_MARKERS = (
 class QueryParser:
     @staticmethod
     def _classify_type(low: str) -> Optional[str]:
+        # Word boundaries are load-bearing. Bare substring matching read "Slave
+        # Island" (Colombo 2) and "Iceland Residence" as property_type=land, and
+        # "penthouse" -- which contains "house" -- as a house.
         if any(m in low for m in _COMMERCIAL_MARKERS):
             return "commercial"
-        if "apartment" in low or "flat" in low:
+        if re.search(r"\b(apartments?|flats?|penthouses?|condos?|condominiums?)\b", low):
             return "apartment"
-        if "house" in low or "villa" in low or "bungalow" in low:
+        if re.search(r"\b(houses?|town\s*houses?|villas?|bungalows?|annexe?s?)\b", low):
             return "house"
-        if "land" in low or "plot" in low or "bare land" in low:
+        if re.search(r"\b(lands?|plots?)\b", low):
             return "land"
         return None
 
@@ -54,14 +57,28 @@ class QueryParser:
                ("lakh", 100_000), ("k", 1_000), ("m", 1_000_000))
     _MONEY = r"(k|m|thousand|million|lakhs?)"
     _AMOUNT = r"(\d[\d,]*(?:\.\d+)?)"
+    # A figure followed by a SIZE or COUNT unit is not money. Without this,
+    # "under 1000 square feet" parsed as a rent ceiling of Rs 1,000,000.
+    _NOT_MONEY = re.compile(r"\s*(sq\b|sq\.|sqft|square|feet|foot|ft\b|perch|"
+                            r"bed|bd\b|br\b|bath|room|people|person)")
     # "between 300k and 500k", "from 300 to 500 thousand", "300k-500k"
     _RANGE_RE = re.compile(r"(?:between|from)?\s*(?:rs\.?\s*)?" + _AMOUNT + r"\s*"
                            + _MONEY + r"?\s*(?:and|to|until|-)\s*(?:rs\.?\s*)?"
                            + _AMOUNT + r"\s*" + _MONEY + r"?")
     # "over 300k" -- a scale unit is REQUIRED so "more than 2 bedrooms" can
     # never be read as a rent floor of 2,000.
-    _MIN_RE = re.compile(r"(?:over|above|more than|at least|minimum|starting"
+    # The negation lookbehinds are load-bearing: "not more than 300k" contains
+    # "more than 300k", so without them it set a rent FLOOR of 300k as well as
+    # the ceiling, and the query collapsed to rows costing exactly 300k.
+    _MIN_RE = re.compile(r"(?<!not )(?<!no )"
+                         r"(?:over|above|more than|at least|minimum|starting"
                          r"\s+(?:at|from))\s*(?:rs\.?\s*)?" + _AMOUNT + r"\s*" + _MONEY)
+    # Longer alternatives first. The floor regex accepted "minimum" while this
+    # one accepted only "max", so "maximum 300k" and "my budget is 300k" parsed
+    # to no ceiling at all -- the vocabularies were asymmetric by accident.
+    _MAX_RE = re.compile(r"(under|below|less than|not more than|no more than|"
+                         r"maximum|max|budget of|budget is|budget|up to|within)"
+                         r"\s*(?:rs\.?\s*)?" + _AMOUNT + r"\s*" + _MONEY + r"?")
 
     @staticmethod
     def _scale(val: float, unit: Optional[str]) -> float:
@@ -89,7 +106,7 @@ class QueryParser:
     @staticmethod
     def _min_rent(low: str) -> Optional[float]:
         m = QueryParser._MIN_RE.search(low)
-        if not m:
+        if not m or QueryParser._NOT_MONEY.match(low[m.end():]):
             return None
         return QueryParser._scale(float(m.group(1).replace(",", "")), m.group(2))
 
@@ -98,23 +115,11 @@ class QueryParser:
         """Returns (ceiling, exclusive). 'under 300k' must not offer a 300k
         listing; 'up to 300k' must. Treating both as <= puts a listing the
         caller ruled out at the top of the results."""
-        m = re.search(r"(under|below|less than|max|budget of|up to|no more than)"
-                      r"\s*(?:rs\.?\s*)?(\d[\d,]*(?:\.\d+)?)\s*"
-                      r"(k|m|thousand|million|lakhs?)?", low)
-        if not m:
+        m = QueryParser._MAX_RE.search(low)
+        if not m or QueryParser._NOT_MONEY.match(low[m.end():]):
             return None, False
         exclusive = m.group(1) in ("under", "below", "less than")
-        val = float(m.group(2).replace(",", ""))
-        unit = (m.group(3) or "").lower()
-        if unit in ("k", "thousand"):
-            val *= 1_000
-        elif unit in ("m", "million"):
-            val *= 1_000_000
-        elif unit.startswith("lakh"):
-            val *= 100_000
-        elif val < 10_000:
-            val *= 1_000
-        return val, exclusive
+        return QueryParser._scale(float(m.group(2).replace(",", "")), m.group(3)), exclusive
 
     @staticmethod
     def parse(utterance: str) -> Tuple[str, QueryFilters]:
@@ -164,10 +169,23 @@ class QueryParser:
                 filters.bedrooms = sticky["bedrooms"]
             elif sticky.get("min_bedrooms"):
                 filters.min_bedrooms = sticky["min_bedrooms"]
+        # A budget carries across turns for the same reason a bedroom count does:
+        # "an apartment under 200k" -> "what about Colombo 5?" must not start
+        # offering 280k units. A budget stated this turn overrides.
+        if filters.max_rent is None and sticky.get("max_rent"):
+            filters.max_rent = sticky["max_rent"]
+            filters.max_rent_exclusive = sticky.get("max_rent_exclusive", False)
+        if filters.min_rent is None and sticky.get("min_rent"):
+            filters.min_rent = sticky["min_rent"]
         if filters.property_type:
             sticky["property_type"] = filters.property_type
         if filters.zone:
             sticky["zone"] = filters.zone
+        if filters.max_rent:
+            sticky["max_rent"] = filters.max_rent
+            sticky["max_rent_exclusive"] = filters.max_rent_exclusive
+        if filters.min_rent:
+            sticky["min_rent"] = filters.min_rent
         if filters.bedrooms:
             sticky["bedrooms"] = filters.bedrooms
             sticky.pop("min_bedrooms", None)
