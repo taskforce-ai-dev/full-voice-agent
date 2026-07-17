@@ -221,15 +221,48 @@ real portfolio makes unbounded context too slow, cap it *deliberately* and know
 that the completeness guarantee weakens to "top-k of a correct set".
 
 **What is NOT guaranteed** (say this plainly, never oversell it):
-- What Fiona *says*. We prove she is handed a correct, complete, self-labelling
-  context; obeying the NOTEs is prompt-following, not proof.
-- **Tamil and Sinhala extract NO filters at all.** The parser is English regex;
-  those paths transcribe in native script, so type/zone/bedrooms all come back
-  `None` and retrieval falls back to unfiltered cosine over English prose. Two of
-  three languages are outside every guarantee here. Unresolved — needs a decision.
+
+- **What Fiona *says*.** We prove she is *handed* a correct, complete,
+  self-labelling context. Obeying it is prompt-following, not proof. Measured,
+  not assumed: `evals/answer_eval.py` (see below). It has already caught a real
+  invention — asked in Sinhala for the cheapest listing she named the right
+  property and rent, then called it "අසාත්මික රහිත" (allergen-free), a feature
+  from nowhere. Retrieval was perfect; the lie was in the translation.
+
+- **Tamil and Sinhala get NO filters.** The parser is English regex and those
+  paths transcribe in native script, so type/zone/bedrooms all come back `None`.
+  This is much less bad than it sounds *because* `n_results=None`: an unfiltered
+  query now returns the COMPLETE inventory (all 12), not 6 arbitrary rows as it
+  did before. Nothing is hidden from the LLM — but the LLM, not the provable SQL
+  layer, is doing the filtering. The honest guarantee for TA/SI is therefore
+  "provably complete context, unproven filtering", versus "provably correct
+  filtered set" for English.
+  **This does not scale.** At 12 rows, handing over the whole inventory is fine.
+  At the real ~49-row portfolio it is slow, expensive per turn, and eventually
+  forces truncation back — at which point TA/SI silently lose listings again. A
+  native-script vocabulary for the parser is the fix; it is NOT built, because it
+  needs vocabulary that must be verified by a speaker rather than guessed.
+  Sinhala terms vetted so far live in the `server.py` glossary; Tamil has none.
+
 - Utterances outside the declared grammar fall through to unfiltered ranking.
+  Same shape: complete context, LLM filters. An area outside `_AREA_TO_ZONE`
+  ("Nugegoda") yields no zone filter and the whole inventory, so only the
+  PORTFOLIO FACTS block stops a wrong answer. Covered by eval, not by proof.
+
 - The oracle rests on one human audit of 12 rows. Verification relocates trust.
 - `KB_BACKEND=chroma` has none of these semantics.
+
+### evals/answer_eval.py — QA, never quote it as proof
+
+Replicates the exact production call shape per language and grades each reply
+mechanically (invented refs/prices) plus with an LLM judge. Costs money and is
+nondeterministic, so it is NOT in CI. Run it before shipping a prompt or KB
+change:
+
+    docker exec flico-voice-agent python evals/answer_eval.py
+
+Run it MORE THAN ONCE. A single green run means nothing — the failure above only
+appeared on the third pass.
 - Photo URLs from the demo sheet are deliberately NOT in the KB: this is a voice
   agent, the placeholders are fake, and the KB tells callers a salesperson shares
   photos on follow-up.
