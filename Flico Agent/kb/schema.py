@@ -17,12 +17,28 @@ class Property(BaseModel):
     sale_price: Optional[float] = None
     furnishing: Optional[str] = Field(default=None, description="furnished | semi | unfurnished")
     floor_area_sqft: Optional[int] = None
+    land_perches: Optional[int] = None
     parking: Optional[int] = None
     deposit_months: Optional[int] = None
     advance_months: Optional[int] = None
     min_lease_months: Optional[int] = None
-    key_features: List[str] = Field(default_factory=list)
-    description: str = ""
+    street: Optional[str] = Field(
+        default=None, description="street or road, e.g. 'Park Street'")
+    available: str = Field(default="now", description="'now' | 'soon' | free text")
+    key_features: List[str] = Field(
+        default_factory=list,
+        description="amenities as DATA. These used to live only inside the prose, "
+                    "so they were invisible to any filter -- 'something with a "
+                    "pool' could never be answered structurally.")
+    commentary: str = Field(
+        default="",
+        description="human-authored colour for this listing, rendered verbatim "
+                    "into the prose. This is where personality lives -- never an "
+                    "LLM paraphrase, which would make the data probabilistic.")
+    description: str = Field(
+        default="",
+        description="the prose the LLM reads. GENERATED from the fields above by "
+                    "kb/prose.py -- a derived artifact, never the source of truth.")
 
 
 class QueryFilters(BaseModel):

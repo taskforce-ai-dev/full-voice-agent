@@ -1,0 +1,145 @@
+{
+  "_comment": [
+    "SOURCE OF TRUTH for the rental portfolio. Typed rows in, typed rows stored.",
+    "The prose the agent speaks from is GENERATED from this by kb/prose.py -- it is",
+    "a derived artifact. Nothing parses prose back into fields.",
+    "",
+    "Transcribed by hand from the agency's own pipe-delimited feed. That feed was",
+    "already structured; the old pipeline forced it into prose so a regex could",
+    "reconstruct the fields, which is where a whole class of bugs lived.",
+    "",
+    "DEMO DATA -- these 12 listings are synthetic (P51-P62). The source note",
+    "requires replacing every row with verified Google Sheet data before real",
+    "production use. Review changes as a PR diff: a changed rent is one line.",
+    "",
+    "Edits are gated: knowledge_base_sqlite._validate rejects a batch with an",
+    "unreadable type, no zone, or no rent, and keeps the previous inventory."
+  ],
+  "preamble_file": "flico_preamble.txt",
+  "listings": [
+    {
+      "id": "P51", "transaction": "rent", "property_type": "apartment",
+      "zone": 2, "area": "Slave Island", "street": "Park Street",
+      "bedrooms": 1, "bathrooms": 1, "floor_area_sqft": 620,
+      "rent_amount": 180000, "rent_period": "month", "furnishing": "furnished",
+      "available": "now", "deposit_months": 2, "advance_months": 1,
+      "min_lease_months": 12, "parking": 1,
+      "key_features": ["an air-conditioned room", "24-hour security", "hot water",
+                       "a lift", "a backup generator", "a balcony"]
+    },
+    {
+      "id": "P52", "transaction": "rent", "property_type": "apartment",
+      "zone": 3, "area": "Kollupitiya", "street": "Marine Drive",
+      "bedrooms": 1, "bathrooms": 1, "floor_area_sqft": 700,
+      "rent_amount": 220000, "rent_period": "month", "furnishing": "furnished",
+      "available": "now", "deposit_months": 2, "advance_months": 1,
+      "min_lease_months": 12, "parking": 1,
+      "key_features": ["an air-conditioned room", "a sea view", "24-hour security",
+                       "hot water", "a gymnasium", "a balcony"]
+    },
+    {
+      "id": "P53", "transaction": "rent", "property_type": "apartment",
+      "zone": 6, "area": "Wellawatte", "street": null,
+      "bedrooms": 1, "bathrooms": 1, "floor_area_sqft": 650,
+      "rent_amount": 150000, "rent_period": "month", "furnishing": "semi",
+      "available": "now", "deposit_months": 2, "advance_months": 1,
+      "min_lease_months": 12, "parking": 1,
+      "key_features": ["an air-conditioned room", "24-hour security", "hot water",
+                       "a lift", "mains water", "a balcony"],
+      "commentary": "It has a city view."
+    },
+    {
+      "id": "P54", "transaction": "rent", "property_type": "apartment",
+      "zone": 5, "area": "Havelock Town", "street": "Havelock Road",
+      "bedrooms": 2, "bathrooms": 2, "floor_area_sqft": 1100,
+      "rent_amount": 280000, "rent_period": "month", "furnishing": "furnished",
+      "available": "now", "deposit_months": 2, "advance_months": 1,
+      "min_lease_months": 12, "parking": 1,
+      "key_features": ["air-conditioned rooms", "a swimming pool", "24-hour security",
+                       "hot water", "a gymnasium", "a balcony"]
+    },
+    {
+      "id": "P55", "transaction": "rent", "property_type": "apartment",
+      "zone": 7, "area": "Cinnamon Gardens", "street": "Barnes Place",
+      "bedrooms": 2, "bathrooms": 2, "floor_area_sqft": 1250,
+      "rent_amount": 350000, "rent_period": "month", "furnishing": "semi",
+      "available": "now", "deposit_months": 3, "advance_months": 1,
+      "min_lease_months": 12, "parking": 1,
+      "key_features": ["air-conditioned rooms", "24-hour security", "hot water",
+                       "a lift", "a gymnasium", "a balcony"]
+    },
+    {
+      "id": "P56", "transaction": "rent", "property_type": "apartment",
+      "zone": 2, "area": "Slave Island", "street": "Union Place",
+      "bedrooms": 2, "bathrooms": 2, "floor_area_sqft": 1050,
+      "rent_amount": 300000, "rent_period": "month", "furnishing": "furnished",
+      "available": "now", "deposit_months": 2, "advance_months": 1,
+      "min_lease_months": 12, "parking": 1,
+      "key_features": ["air-conditioned rooms", "a swimming pool", "24-hour security",
+                       "a backup generator", "a gymnasium", "a balcony"]
+    },
+    {
+      "id": "P57", "transaction": "rent", "property_type": "house",
+      "zone": 5, "area": "Havelock Town", "street": "Kirula Lane",
+      "bedrooms": 1, "bathrooms": 1, "floor_area_sqft": 850, "land_perches": 6,
+      "rent_amount": 160000, "rent_period": "month", "furnishing": "furnished",
+      "available": "now", "deposit_months": 2, "advance_months": 1,
+      "min_lease_months": 12, "parking": 1,
+      "key_features": ["an air-conditioned room", "a private entrance", "hot water",
+                       "a small garden", "mains water", "a boundary wall"]
+    },
+    {
+      "id": "P58", "transaction": "rent", "property_type": "house",
+      "zone": 8, "area": "Borella", "street": "Cotta Road",
+      "bedrooms": 1, "bathrooms": 1, "floor_area_sqft": 900, "land_perches": 7,
+      "rent_amount": 140000, "rent_period": "month", "furnishing": "semi",
+      "available": "now", "deposit_months": 2, "advance_months": 1,
+      "min_lease_months": 12, "parking": 1,
+      "key_features": ["an air-conditioned room", "a private garden", "hot water",
+                       "mains water", "a home security system", "a boundary wall"]
+    },
+    {
+      "id": "P59", "transaction": "rent", "property_type": "house",
+      "zone": 6, "area": "Wellawatte", "street": "Hampden Lane",
+      "bedrooms": 1, "bathrooms": 1, "floor_area_sqft": 750, "land_perches": 5,
+      "rent_amount": 130000, "rent_period": "month", "furnishing": "unfurnished",
+      "available": "now", "deposit_months": 2, "advance_months": 1,
+      "min_lease_months": 12, "parking": 1,
+      "key_features": ["a private entrance", "hot water", "mains water",
+                       "a small courtyard", "a boundary wall", "separate electricity"],
+      "commentary": "It is an annex."
+    },
+    {
+      "id": "P60", "transaction": "rent", "property_type": "house",
+      "zone": 5, "area": "Havelock Town", "street": "Thimbirigasyaya Road",
+      "bedrooms": 2, "bathrooms": 2, "floor_area_sqft": 1600, "land_perches": 10,
+      "rent_amount": 260000, "rent_period": "month", "furnishing": "semi",
+      "available": "now", "deposit_months": 3, "advance_months": 1,
+      "min_lease_months": 12, "parking": 2,
+      "key_features": ["air-conditioned rooms", "a private garden", "hot water",
+                       "mains water", "a home security system", "a servant's toilet"],
+      "commentary": "It suits a family."
+    },
+    {
+      "id": "P61", "transaction": "rent", "property_type": "house",
+      "zone": 7, "area": "Cinnamon Gardens", "street": "Rosmead Place",
+      "bedrooms": 2, "bathrooms": 2, "floor_area_sqft": 1800, "land_perches": 12,
+      "rent_amount": 400000, "rent_period": "month", "furnishing": "furnished",
+      "available": "now", "deposit_months": 3, "advance_months": 1,
+      "min_lease_months": 12, "parking": 2,
+      "key_features": ["air-conditioned rooms", "a private garden", "hot water",
+                       "mains water", "a home security system", "a maid's toilet"],
+      "commentary": "It is a garden bungalow."
+    },
+    {
+      "id": "P62", "transaction": "rent", "property_type": "house",
+      "zone": 8, "area": "Borella", "street": "Castle Street",
+      "bedrooms": 2, "bathrooms": 2, "floor_area_sqft": 1500, "land_perches": 9,
+      "rent_amount": 220000, "rent_period": "month", "furnishing": "unfurnished",
+      "available": "now", "deposit_months": 2, "advance_months": 1,
+      "min_lease_months": 12, "parking": 2,
+      "key_features": ["air-conditioning provision", "a private garden", "hot water",
+                       "mains water", "a boundary wall", "separate electricity"]
+    }
+  ]
+}

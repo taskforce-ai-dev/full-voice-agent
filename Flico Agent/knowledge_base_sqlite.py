@@ -1,4 +1,5 @@
 """SQLite hybrid backend adapter — maps the KB contract onto kb.engine."""
+import json
 import logging
 import os
 from typing import Optional
@@ -7,6 +8,8 @@ from kb.config import DEFAULT_DOCS_DIRECTORY, DB_PATH
 from kb.engine import RealEstateKB
 from kb.facts import portfolio_facts as facts_from_rows
 from kb.migrate import parse_prose
+from kb.prose import render_all
+from kb.schema import Property
 
 logger = logging.getLogger(__name__)
 _engine: Optional[RealEstateKB] = None
@@ -62,7 +65,51 @@ def _load_from_text(text: str) -> bool:
     return True
 
 
+def _load_from_listings(path: str, docs_directory: str) -> bool:
+    """Load typed rows and GENERATE their prose.
+
+    This is the inverted pipeline: rows are the source, prose is derived. The old
+    path hand-authored prose and regex-parsed it back into rows, which is where
+    the type-vocabulary drift and the first-Rs-wins rent bug lived.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = json.load(fh)
+
+    rows = [Property(**r) for r in doc.get("listings", [])]
+    reason = _validate(rows, skipped=[])
+    if reason:
+        logger.error("listings.json REJECTED, keeping previous inventory: %s", reason)
+        return False
+    rows = render_all(rows)  # description is generated, never hand-written
+
+    preamble = ""
+    pre_name = doc.get("preamble_file")
+    if pre_name:
+        pre_path = os.path.join(docs_directory, pre_name)
+        if os.path.isfile(pre_path):
+            with open(pre_path, "r", encoding="utf-8") as fh:
+                preamble = fh.read().strip()
+        else:
+            logger.warning("preamble_file %s not found", pre_path)
+
+    engine = _get_engine()
+    engine.preamble = preamble
+    engine.add_properties(rows)
+    logger.info("SQLite KB loaded %d listings from %s (prose generated)",
+                engine.get_count(), os.path.basename(path))
+    return True
+
+
 def initialize_kb(docs_directory: str = DEFAULT_DOCS_DIRECTORY) -> bool:
+    # Structured source first. The prose file remains a fallback so a rollback to
+    # the previous KB is one file away and cannot be blocked by this code path.
+    listings = os.path.join(docs_directory, "listings.json")
+    if os.path.isfile(listings):
+        try:
+            return _load_from_listings(listings, docs_directory)
+        except Exception as exc:
+            logger.exception("listings.json failed to load (%s); falling back to prose", exc)
+
     path = os.path.join(docs_directory, "flico_info.txt")
     if not os.path.isfile(path):
         logger.warning("KB prose not found at %s", path)
