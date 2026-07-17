@@ -909,9 +909,24 @@ async def kb_reload(request: Request) -> dict:
         return {"ok": False, "error": "Empty content"}
     import asyncio
     loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, reload_kb_from_content, content, filename)
-    logger.info("KB reload triggered for '%s' (%d chars)", filename, len(content))
-    return {"ok": True, "message": f"KB reload started for {filename}"}
+    # AWAIT the reload and report what actually happened. This used to fire the
+    # executor and return {"ok": True, "message": "KB reload started"}
+    # unconditionally -- so a batch REJECTED by validation still told the admin
+    # portal "published". They would see success, the agent would keep serving the
+    # old inventory, and nobody would be told. A false success is worse than no
+    # validation at all: it is the one failure mode that guarantees nobody looks.
+    try:
+        ok = await loop.run_in_executor(None, reload_kb_from_content, content, filename)
+    except Exception:
+        logger.exception("KB reload raised for '%s'", filename)
+        return {"ok": False, "error": "KB reload failed; see agent logs."}
+    if not ok:
+        return {"ok": False,
+                "error": ("KB reload REJECTED by validation -- the previous "
+                          "inventory is still live and unchanged. The agent logs "
+                          "name the offending listing and reason.")}
+    logger.info("KB reloaded for '%s' (%d chars)", filename, len(content))
+    return {"ok": True, "message": f"KB reloaded for {filename}"}
 
 
 # ---------------------------------------------------------------------------
