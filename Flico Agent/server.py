@@ -209,6 +209,17 @@ else:
 MAX_TOKENS: int = 300
 MAX_HISTORY_MESSAGES: int = 20
 
+# Sampling temperature. This was previously UNSET, i.e. the provider default of
+# 1.0 -- maximum sampling variance for an agent whose entire job is reciting
+# facts from the reference context faithfully. Every invention we have measured
+# is a low-probability token winning: asked in Sinhala for the cheapest listing,
+# Fiona got the property and rent right and then called it "අසාත්මික රහිත"
+# (allergen-free) instead of "unfurnished". Lower temperature biases toward the
+# high-probability -- i.e. the grounded -- rendering.
+# Kept above 0 so she still sounds like a person rather than a lookup table.
+# Tune via env without a rebuild; see evals/answer_eval.py before changing it.
+LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+
 # ---------------------------------------------------------------------------
 # IVR language configurations
 # ---------------------------------------------------------------------------
@@ -1662,6 +1673,7 @@ class MediaStreamSession:
         stream = await self.client.chat.completions.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
+            temperature=LLM_TEMPERATURE,
             messages=messages,
             tools=None,
             stream=True,
@@ -1713,6 +1725,7 @@ class MediaStreamSession:
         config = {
             "system_instruction": self.system_prompt,
             "max_output_tokens": MAX_TOKENS,
+            "temperature": LLM_TEMPERATURE,
         }
 
         response = await self.gemini_client.aio.models.generate_content_stream(
@@ -1777,6 +1790,7 @@ class MediaStreamSession:
         async with self.anthropic_client.messages.stream(
             model=MODEL,
             max_tokens=MAX_TOKENS,
+            temperature=LLM_TEMPERATURE,
             # cache_control caches the system prefix for ~5 min,
             # cutting input tokens on the 2nd+ turn of every call.
             system=[{
@@ -2137,6 +2151,7 @@ async def _run_llm_streaming(
     stream = await client.chat.completions.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
+        temperature=LLM_TEMPERATURE,
         messages=messages,
         tools=None,
         stream=True,
@@ -2191,6 +2206,7 @@ async def _run_llm_streaming_gemini(
     config = {
         "system_instruction": system,
         "max_output_tokens": MAX_TOKENS,
+        "temperature": LLM_TEMPERATURE,
     }
 
     response = await gemini_client.aio.models.generate_content_stream(
@@ -2349,6 +2365,7 @@ async def _run_llm_streaming_claude(
     async with client.messages.stream(
         model=MODEL,
         max_tokens=MAX_TOKENS,
+        temperature=LLM_TEMPERATURE,
         # cache_control caches the system prefix for ~5 min,
         # cutting input tokens on the 2nd+ turn of every call.
         system=[{
