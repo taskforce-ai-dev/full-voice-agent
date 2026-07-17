@@ -46,6 +46,22 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 COPY requirements-prod.txt .
 RUN pip install --no-cache-dir -r requirements-prod.txt
 
+# --- Bake the embedding model into the image --------------------------------
+# The KB embeds with all-MiniLM-L6-v2. Without this, the model is downloaded from
+# the Hugging Face Hub on FIRST USE and cached only in the container's writable
+# layer -- so every rebuild produces a container that must re-fetch it at startup.
+# If the Hub is rate-limiting or down at that moment, initialize_kb() fails and
+# the agent goes live with NO LISTINGS. Baking it makes startup deterministic and
+# removes an external runtime dependency from a live phone line.
+RUN python -c "from sentence_transformers import SentenceTransformer; \
+SentenceTransformer('all-MiniLM-L6-v2')"
+
+# The model is now in the image, so never phone home for it. Unauthenticated Hub
+# requests are rate-limited, and a 429 on a metadata check can fail a load that
+# the local cache could have served perfectly well.
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
 # --- Application code --------------------------------------------------------
 # Only the files needed at runtime are copied. We deliberately exclude:
 #   .env              — secrets; injected at runtime via --env-file or orchestrator
