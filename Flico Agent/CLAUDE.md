@@ -240,9 +240,14 @@ that the completeness guarantee weakens to "top-k of a correct set".
   **This does not scale.** At 12 rows, handing over the whole inventory is fine.
   At the real ~49-row portfolio it is slow, expensive per turn, and eventually
   forces truncation back — at which point TA/SI silently lose listings again. A
-  native-script vocabulary for the parser is the fix; it is NOT built, because it
-  needs vocabulary that must be verified by a speaker rather than guessed.
-  Sinhala terms vetted so far live in the `server.py` glossary; Tamil has none.
+  native-script parser vocabulary is the fix. It is **researched but deliberately
+  not shipped**: see `docs/flico-tamil-sinhala-kb-vocabulary.md`, which has the
+  tables, per-entry confidence flags, the Indic-script `\b` problem, and the
+  substring traps (SI කාමර hiding inside නාන කාමර = two *bathrooms* → bedrooms=2;
+  TA ஒரு meaning both "one" and "a/an" → "a house in Colombo" → zone 1). Shipping
+  it unverified would make a measured-working path worse, so it needs a native
+  speaker and a week of raw STT transcripts first. Sinhala terms vetted so far
+  live in the `server.py` glossary; Tamil has none.
 
 - Utterances outside the declared grammar fall through to unfiltered ranking.
   Same shape: complete context, LLM filters. An area outside `_AREA_TO_ZONE`
