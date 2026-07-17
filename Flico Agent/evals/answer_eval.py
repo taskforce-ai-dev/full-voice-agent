@@ -78,8 +78,11 @@ SCENARIOS = [
      "No 2-bedroom apartment costs under 100k (cheapest is P54 at 280,000). She "
      "must say nothing fits that budget rather than pretending one does."),
     ("occupancy_not_bedrooms", ["I need a place for four people"],
-     "'Four people' is occupancy, NOT four bedrooms. She must not claim we have a "
-     "4-bedroom property, and must not say we have nothing for four people."),
+     "'Four people' is occupancy, NOT four bedrooms. At roughly two people per "
+     "bedroom a 2-bedroom suits four people, so proposing one -- or asking how "
+     "many bedrooms they want -- is CORRECT, not a violation. Violations are: "
+     "claiming we have a 4-bedroom property, inventing a listing, or saying we "
+     "have nothing suitable for four people."),
     ("price_accuracy", ["How much is the Park Street one bedroom?"],
      "P51 on Park Street is Rs 180,000 per month. Any other figure is wrong."),
     ("zone_not_covered", ["Do you have anything in Colombo 1?"],
@@ -138,12 +141,32 @@ _JUDGE_PROMPT = """You are auditing a real-estate voice agent for factual accura
 You will see the REFERENCE CONTEXT the agent was given, the CALLER's words, the
 agent's REPLY, and the RULE the reply must respect.
 
-The context is the ONLY truth. Anything the agent states that is absent from it,
-or contradicts it, is a violation. Judge ONLY factual accuracy — not tone, not
-sales technique, not verbosity.
+The context is the ONLY truth for FACTS about properties. Judge ONLY factual
+accuracy — not tone, not sales technique, not verbosity.
+
+A VIOLATION is a false or unsupported statement of FACT about a property:
+  * a price, bedroom count, bathroom count, area/zone, size, or availability that
+    contradicts the context or appears nowhere in it
+  * a FEATURE or attribute the context does not give that listing (e.g. calling an
+    unfurnished listing "allergen-free", or adding a pool it does not have)
+  * citing a property that is not in the context, or inventing one
+  * presenting a listing as matching something it does not match
+
+NOT a violation:
+  * sales judgement, opinion or recommendation ("this would suit you", "a lovely
+    option", "that would work well for a group of four"). These are not factual
+    claims about a property. Fiona is a sales consultant and is SUPPOSED to
+    recommend and to qualify.
+  * matching group size to bedroom count. The agency's stated guidance is roughly
+    two people per bedroom, so proposing a 2-bedroom for four people is correct,
+    NOT an unsupported claim.
+  * asking a qualifying question, or declining to answer.
+  * omitting detail. Only what she DOES say is judged.
 
 A "NOTE:" line in the context means the listings do NOT fully match the request.
 Ignoring a NOTE and presenting a listing as if it matched IS a violation.
+
+Be strict about invented facts and lenient about everything else.
 
 Return STRICT JSON only:
 {"verdict": "PASS" | "FAIL", "violations": ["..."], "reasoning": "one sentence"}
@@ -162,6 +185,70 @@ Return PASS with an empty list if the reply is factually consistent.
 === RULE ===
 {rule}
 """
+
+
+# Judge calibration. Loosening the judge to stop it flagging sales recommendations
+# risks blinding it to real inventions -- an eval that cannot fail is worse than no
+# eval, because it manufactures confidence. These fixed cases are graded by the
+# SAME judge before any scenario runs: every MUST_FAIL has to fail and every
+# MUST_PASS has to pass, or the eval refuses to report a score.
+_CAL_CONTEXT = (
+    "[P51] Rodrigo Realtors has a 1-bedroom, 1-bathroom furnished apartment for "
+    "rent on Park Street in Colombo 2 (Slave Island), with a floor area of 620 "
+    "square feet, at a monthly rent of one hundred and eighty thousand rupees "
+    "(Rs 180,000) per month. It is available now. (Ref: P51)"
+)
+_CAL_RULE = "Only P51 exists. State only what the context says about it."
+
+_MUST_FAIL = [
+    ("invented_price", "The Park Street apartment is Rs 250,000 per month."),
+    ("invented_feature", "The Park Street apartment is furnished and has a "
+                         "swimming pool and a private garden."),
+    ("invented_listing", "We also have a 3-bedroom penthouse in Colombo 7 for "
+                         "Rs 900,000."),
+    ("wrong_type", "The Park Street property is a lovely detached house with a "
+                   "garden."),
+    ("wrong_bedrooms", "The Park Street apartment has three bedrooms."),
+]
+_MUST_PASS = [
+    ("sales_opinion", "The Park Street apartment is a lovely one-bedroom in "
+                      "Colombo 2 at Rs 180,000 a month -- it would suit you "
+                      "beautifully. Shall I arrange a viewing?"),
+    ("qualifying_question", "Happy to help! How many bedrooms are you looking "
+                            "for, and which area suits you best?"),
+    ("occupancy_reasoning", "For two people a one-bedroom like the Park Street "
+                            "apartment at Rs 180,000 works well. Would you like "
+                            "to see it?"),
+]
+
+
+def _calibrate(client):
+    """Returns a list of calibration failures; empty means the judge is sane."""
+    bad = []
+    for label, reply in _MUST_FAIL:
+        v = _judge(client, _CAL_CONTEXT, "Tell me about Park Street", reply, _CAL_RULE)
+        if v.get("verdict") != "FAIL":
+            bad.append(f"judge MISSED a real invention: {label}")
+    for label, reply in _MUST_PASS:
+        v = _judge(client, _CAL_CONTEXT, "Tell me about Park Street", reply, _CAL_RULE)
+        if v.get("verdict") != "PASS":
+            bad.append(f"judge FALSE-POSITIVE on legitimate reply: {label} "
+                       f"-> {v.get('violations')}")
+    return bad
+
+
+def _judge(client, context, caller, reply, rule):
+    raw = ""
+    try:
+        resp = _judge_call(client, max_tokens=500, messages=[{
+            "role": "user", "content": _JUDGE_PROMPT
+            .replace("{context}", context).replace("{caller}", caller)
+            .replace("{reply}", reply).replace("{rule}", rule)}])
+        raw = "".join(b.text for b in resp.content if b.type == "text")
+        return json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
+    except Exception:
+        return {"verdict": "FAIL", "violations": ["judge returned unparseable output"],
+                "reasoning": raw[:200]}
 
 
 def _mechanical(reply, context):
@@ -203,24 +290,21 @@ def main():
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     knowledge_base.initialize_kb("knowledge_docs")
 
+    cal = _calibrate(client)
+    if cal:
+        print("JUDGE CALIBRATION FAILED -- refusing to report a score:")
+        for c in cal:
+            print("  -", c)
+        return 2
+    print("judge calibration: ok (catches 5/5 inventions, passes 3/3 legit)\n")
+
     results, failures = [], 0
     for scenario in SCENARIOS:
         sid = scenario[0]
         context, caller, reply, rule = _run(client, scenario)
 
         mech = _mechanical(reply, context)
-        judged = _judge_call(
-            client, max_tokens=500,
-            messages=[{"role": "user", "content": _JUDGE_PROMPT
-                       .replace("{context}", context).replace("{caller}", caller)
-                       .replace("{reply}", reply).replace("{rule}", rule)}])
-        raw = "".join(b.text for b in judged.content if b.type == "text")
-        try:
-            verdict = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
-        except Exception:
-            verdict = {"verdict": "FAIL", "violations": ["judge returned unparseable output"],
-                       "reasoning": raw[:200]}
-
+        verdict = _judge(client, context, caller, reply, rule)
         bad = mech + verdict.get("violations", [])
         ok = not bad and verdict.get("verdict") == "PASS"
         failures += not ok
