@@ -92,16 +92,39 @@ def _area_clause(p: Property) -> str:
     return " ".join(bits)
 
 
+def _money(n: int) -> str:
+    return f"{number_in_words(n)} rupees (Rs {n:,})"
+
+
 def _lease_clause(p: Property) -> str:
+    """Lease terms WITH the cash amounts pre-computed.
+
+    A real caller asks "how much is the deposit?" and wants a number. The prose
+    used to say only "a 2-month deposit", so answering required the LLM to
+    multiply -- and an LLM doing arithmetic on facts it is holding will produce a
+    confident figure whether or not it is right. Anything computable is computed
+    here, in code, where it is deterministic and testable. Fiona reads it; she
+    never has to do the maths.
+    """
+    # Only monthly rents have a meaningful deposit-in-rupees. A per-day rent with
+    # a "2-month deposit" is not 2 x the daily figure, so do not invent one.
+    monthly = int(p.rent_amount) if (p.rent_amount and p.rent_period == "month"
+                                     and not p.rent_on_request) else None
     terms = []
     if p.deposit_months:
-        terms.append(f"a {p.deposit_months}-month deposit")
+        term = f"a {p.deposit_months}-month deposit"
+        if monthly:
+            term += f" of {_money(p.deposit_months * monthly)}"
+        terms.append(term)
     if p.advance_months:
         # "1 months' advance" is wrong; "1 month advance" is how it is said here.
         # Keep the quote out of the f-string expression: nested same-type quotes
         # are PEP 701 (Python 3.12+) and production runs 3.11.
         plural = "s'" if p.advance_months > 1 else ""
-        terms.append(f"{p.advance_months} month{plural} advance")
+        term = f"{p.advance_months} month{plural} advance"
+        if monthly:
+            term += f" of {_money(p.advance_months * monthly)}"
+        terms.append(term)
     if p.min_lease_months:
         years = p.min_lease_months // 12
         terms.append(f"a minimum lease of {years} year" if years
@@ -112,7 +135,13 @@ def _lease_clause(p: Property) -> str:
     if p.parking:
         out += (f", with {number_in_words(p.parking)} parking "
                 f"space{'s' if p.parking > 1 else ''}")
-    return out + "."
+    out += "."
+
+    upfront = ((p.deposit_months or 0) + (p.advance_months or 0))
+    if monthly and upfront:
+        out += (f" The total payable before moving in is "
+                f"{_money(upfront * monthly)}.")
+    return out
 
 
 def render(p: Property) -> str:

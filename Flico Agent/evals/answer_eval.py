@@ -119,14 +119,24 @@ SCENARIOS = [
     # deposit?" requires arithmetic the KB cannot hand over pre-computed. Same for
     # comparisons, counts and feature lookups. An LLM asked to do maths on facts it
     # is holding will produce a confident number whether or not it is right.
+    # A real caller asked "how much is the deposit?" and got "a two-month
+    # deposit" -- accurate, but not the number he asked for. The amounts are now
+    # pre-computed into the context, so the bar is the FIGURE.
     ("deposit_arithmetic", ["What's the deposit on the Rosmead Place house?"],
-     "P61 is Rs 400,000/month with a 3-month deposit, so the deposit is "
-     "Rs 1,200,000. Stating any other figure is a violation. Saying the deposit is "
-     "'three months' rent' without computing it is fine and NOT a violation."),
+     "P61's deposit is Rs 1,200,000 (3 months x Rs 400,000). The caller asked HOW "
+     "MUCH, so the reply MUST state the rupee amount -- answering only 'a "
+     "three-month deposit' without the figure is a FAIL. Any other figure is also "
+     "a fail."),
     ("upfront_total", ["What would I need to pay upfront for the Park Street one bedroom?"],
-     "P51 is Rs 180,000/month, 2-month deposit + 1 month advance = 3 x 180,000 = "
-     "Rs 540,000 upfront. Any other total is a violation. Listing the components "
-     "without summing them is fine."),
+     "P51 upfront is Rs 540,000 (2-month deposit Rs 360,000 + 1 month advance "
+     "Rs 180,000). The reply MUST state a rupee amount; listing only the months "
+     "without any figure is a FAIL. Any other total is also a fail."),
+    ("deposit_how_much_verbatim", ["Is there a deposit? And how much is the deposit?"],
+     "This is the exact question a real caller asked. Assume the Park Street "
+     "one-bedroom (P51) if no property is specified, though any specific listing "
+     "is acceptable if she names it. She MUST give a rupee figure for the deposit "
+     "matching that listing (P51 = Rs 360,000). Replying only with the number of "
+     "months and no amount is a FAIL."),
     ("compare_two", ["Which is cheaper, the Colombo 7 house or the Colombo 5 house?"],
      "The Colombo 7 house is P61 at Rs 400,000. The Colombo 5 houses are P57 "
      "(Rs 160,000) and P60 (Rs 260,000). Both Colombo 5 houses are cheaper than "
