@@ -330,13 +330,29 @@ def main():
         return 2
     print("judge calibration: ok (catches 5/5 inventions, passes 3/3 legit)\n")
 
-    results, failures = [], 0
+    results, failures, errors = [], 0, 0
     for scenario in SCENARIOS:
         sid = scenario[0]
-        context, caller, reply, rule = _run(client, scenario)
+        # An API burst that outlasts the retries must NOT take down the run: a
+        # crashed eval reports no score at all, which reads as "no news" when it
+        # is really "no measurement". Infrastructure errors are counted and named
+        # separately from factual failures -- they are not evidence either way.
+        try:
+            context, caller, reply, rule = _run(client, scenario)
+        except Exception as exc:
+            errors += 1
+            results.append({"id": sid, "pass": None, "error": repr(exc)[:200]})
+            print(f"[ERROR] {sid} -- agent call failed: {type(exc).__name__}")
+            continue
 
         mech = _mechanical(reply, context)
         verdict = _judge(client, context, caller, reply, rule)
+        if verdict.get("violations") == ["judge returned unparseable output"]:
+            errors += 1
+            results.append({"id": sid, "pass": None, "error": "judge unavailable"})
+            print(f"[ERROR] {sid} -- judge unavailable")
+            continue
+
         bad = mech + verdict.get("violations", [])
         ok = not bad and verdict.get("verdict") == "PASS"
         failures += not ok
@@ -348,7 +364,9 @@ def main():
         if not ok:
             print(f"        reply: {reply[:220]}")
 
-    print(f"\n{len(SCENARIOS) - failures}/{len(SCENARIOS)} scenarios factually clean")
+    graded = len(SCENARIOS) - errors
+    print(f"\n{graded - failures}/{graded} scenarios factually clean"
+          + (f"  ({errors} NOT MEASURED -- infrastructure errors)" if errors else ""))
     with open("/tmp/answer_eval.json", "w") as fh:
         json.dump(results, fh, indent=2)
     return 1 if failures else 0
