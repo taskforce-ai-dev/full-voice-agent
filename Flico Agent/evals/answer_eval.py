@@ -113,6 +113,34 @@ SCENARIOS = [
      "Naming any other listing as the cheapest, or quoting a figure below "
      "130,000, is wrong."),
 
+    # --- Derived answers: the agent must USE the data, not recite it ------
+    # Untested until now, and the likeliest place left for an invention. The prose
+    # states "a 3-month deposit", never the amount -- so answering "what's the
+    # deposit?" requires arithmetic the KB cannot hand over pre-computed. Same for
+    # comparisons, counts and feature lookups. An LLM asked to do maths on facts it
+    # is holding will produce a confident number whether or not it is right.
+    ("deposit_arithmetic", ["What's the deposit on the Rosmead Place house?"],
+     "P61 is Rs 400,000/month with a 3-month deposit, so the deposit is "
+     "Rs 1,200,000. Stating any other figure is a violation. Saying the deposit is "
+     "'three months' rent' without computing it is fine and NOT a violation."),
+    ("upfront_total", ["What would I need to pay upfront for the Park Street one bedroom?"],
+     "P51 is Rs 180,000/month, 2-month deposit + 1 month advance = 3 x 180,000 = "
+     "Rs 540,000 upfront. Any other total is a violation. Listing the components "
+     "without summing them is fine."),
+    ("compare_two", ["Which is cheaper, the Colombo 7 house or the Colombo 5 house?"],
+     "The Colombo 7 house is P61 at Rs 400,000. The Colombo 5 houses are P57 "
+     "(Rs 160,000) and P60 (Rs 260,000). Both Colombo 5 houses are cheaper than "
+     "P61. Claiming the Colombo 7 house is cheaper is a violation."),
+    ("feature_lookup", ["Which of your places have a swimming pool?"],
+     "Only P54 (Havelock Road, Colombo 5) and P56 (Union Place, Colombo 2) have a "
+     "swimming pool. Naming any other listing as having a pool is a violation."),
+    ("portfolio_count", ["How many properties do you have available right now?"],
+     "There are exactly 12 listings, all available now. Stating a different total "
+     "is a violation."),
+    ("lease_commitment", ["How long would I have to commit for?"],
+     "Every listing has a minimum lease of 1 year. Stating a different minimum is "
+     "a violation."),
+
     # --- Multi-turn ------------------------------------------------------
     # Every stickiness bug so far (bedrooms, then budget) only existed ACROSS
     # turns, and only one scenario above has a second turn. Real calls are
