@@ -180,6 +180,48 @@ Consequences worth knowing:
 `tests/test_demo_portfolio_lookups.py` asserts all of the above end-to-end
 against the real KB prose (needs sentence-transformers; skipped without it).
 
+### Jul 17 2026 — the pipeline is INVERTED: rows are the source, prose is generated
+
+`knowledge_docs/listings.json` is the **source of truth**. `kb/prose.py` GENERATES
+each listing's paragraph from its fields. **Nothing parses prose back into
+fields** on this path — do not reintroduce that, it is the whole point.
+
+Why: the agency's data *arrives structured*. The old pipeline forced it into prose
+so `kb/migrate.py` could regex it back into rows — we destructured the data, then
+paid to reconstruct it. That round-trip is where the bugs lived (duplicated type
+vocabulary that drifted, first-`Rs`-wins rent matching, unknown types silently
+filed as apartments).
+
+- **Edit listings** in `listings.json`. Review is a PR diff — a changed rent is one
+  line. Rollback is `git revert`.
+- `flico_info.txt` is now a **fallback only**, kept so a rollback is one file away.
+  `initialize_kb` prefers `listings.json` and falls back on any failure.
+- `flico_preamble.txt` holds the non-listing prose (intro, AREAS COVERED, NEXT
+  STEPS).
+- `key_features` are **data** now. They used to exist only inside the paragraph
+  (`migrate.py` hardcoded `key_features=[]`), so no filter could ever see them —
+  "something with a pool" was unanswerable structurally. It no longer is.
+- `commentary` holds human-authored colour ("It is a garden bungalow"). That is
+  where personality belongs — **never** an LLM paraphrase.
+
+**No LLM in this pipeline.** The exhaustive proof is a statement about a FIXED row
+set; make row derivation probabilistic and all 584 filter cases verify against a
+moving target. An LLM belongs at import-time for genuinely messy documents only
+(a PDF) — emitting *rows, never prose*, with per-field source quotes, nulls that
+block publish rather than guesses, and a human reviewing **against the source**,
+not against the LLM's own output. Then it is frozen as data. Never re-run.
+
+`tests/test_prose_roundtrip.py` is the migration bridge: it renders every row and
+feeds it through the OLD `parse_prose`, asserting the fields survive and match the
+truth table. Two independent implementations agreeing is evidence; one agreeing
+with itself is not. **Delete it together with migrate.py's regex layer** once
+`/kb-reload` accepts structured rows.
+
+**Production runs Python 3.11; this dev box runs 3.12.** A PEP 701 f-string
+(nested same-type quotes) compiled here and was a SyntaxError there — which would
+have been a hard outage, since `kb/prose.py` is imported by `server.py`. Local
+`py_compile` will not save you. The `kb-verify` CI job pins 3.11 and caught it.
+
 ### Jul 16 2026 — the KB filter is verified by EXHAUSTION, not by sampling
 
 Five bugs were found by spot-checking, then six more by enumeration. The root
