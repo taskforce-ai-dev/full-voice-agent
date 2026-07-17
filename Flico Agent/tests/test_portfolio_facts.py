@@ -60,6 +60,39 @@ def test_facts_track_a_changed_inventory():
     assert 4 in {int(n) for n in re.findall(r"\d+", m.group(1))}
 
 
+def test_cheapest_and_dearest_are_computed_not_left_to_the_llm():
+    """Asked in Sinhala for the cheapest listing, Fiona named a Rs 150,000 unit
+    when a Rs 130,000 one exists -- she was scanning 12 listings and comparing.
+    Aggregations get computed here, like the deposit figures."""
+    out = portfolio_facts(_props())
+    lo = min(TRUTH, key=lambda r: r["rent"])
+    hi = max(TRUTH, key=lambda r: r["rent"])
+    assert f"CHEAPEST listing: {lo['id']} at Rs {lo['rent']:,}" in out
+    assert f"MOST EXPENSIVE: {hi['id']} at Rs {hi['rent']:,}" in out
+
+
+def test_cheapest_tracks_a_changed_inventory():
+    rows = TRUTH + [{"id": "P99", "type": "house", "zone": 4, "beds": 1,
+                     "baths": 1, "rent": 50000, "furnishing": "unfurnished",
+                     "sqft": 400}]
+    out = portfolio_facts(_props(rows))
+    assert "CHEAPEST listing: P99 at Rs 50,000" in out
+
+
+def test_no_cheapest_claim_for_a_single_listing():
+    """One listing is not 'the cheapest and the most expensive' -- that reads as
+    two options to a caller."""
+    out = portfolio_facts(_props(TRUTH[:1]))
+    assert "CHEAPEST" not in out
+
+
+def test_on_request_listings_are_not_ranked_by_price():
+    props = _props()
+    for p in props:
+        p.rent_on_request, p.rent_amount = True, None
+    assert "CHEAPEST" not in portfolio_facts(props)
+
+
 def test_never_claims_fixed_rent_when_some_are_on_request():
     props = _props()
     props[0].rent_on_request = True

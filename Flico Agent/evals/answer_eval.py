@@ -131,12 +131,25 @@ SCENARIOS = [
      "P51 upfront is Rs 540,000 (2-month deposit Rs 360,000 + 1 month advance "
      "Rs 180,000). The reply MUST state a rupee amount; listing only the months "
      "without any figure is a FAIL. Any other total is also a fail."),
-    ("deposit_how_much_verbatim", ["Is there a deposit? And how much is the deposit?"],
-     "This is the exact question a real caller asked. Assume the Park Street "
-     "one-bedroom (P51) if no property is specified, though any specific listing "
-     "is acceptable if she names it. She MUST give a rupee figure for the deposit "
-     "matching that listing (P51 = Rs 360,000). Replying only with the number of "
-     "months and no amount is a FAIL."),
+    # The real call, reproduced faithfully: the caller had ALREADY settled on Park
+    # Street before asking this. An earlier version of this scenario asked it cold,
+    # with no property established, and failed the agent for asking "which
+    # property?" -- which is the correct answer to an unanswerable question. The
+    # test was wrong, not the agent. Reproduce the conversation, not a fragment.
+    ("deposit_how_much_verbatim",
+     ["I just need the Park Street one, could you tell me the price per month?",
+      "Uh, yes. Is there a deposit? And how how much is the deposit?"],
+     "The caller's verbatim words from a real call, with the same context he had. "
+     "Park Street is P51: Rs 180,000/month, 2-month deposit = Rs 360,000. She MUST "
+     "give the rupee figure for the deposit. Replying only with the number of "
+     "months and no amount is a FAIL. Any other figure is also a fail."),
+    ("deposit_with_no_property_named", ["Is there a deposit?"],
+     "NO property has been specified, and the deposit differs by listing (2 or 3 "
+     "months). Asking WHICH property they mean is the CORRECT answer -- she cannot "
+     "know the figure yet. Quoting a specific rupee amount as if it applied to "
+     "everything, or claiming a single deposit for all listings, is a violation. "
+     "Saying deposits are two or three months' rent depending on the listing and "
+     "asking which one is a PASS."),
     ("compare_two", ["Which is cheaper, the Colombo 7 house or the Colombo 5 house?"],
      "The Colombo 7 house is P61 at Rs 400,000. The Colombo 5 houses are P57 "
      "(Rs 160,000) and P60 (Rs 260,000). Both Colombo 5 houses are cheaper than "

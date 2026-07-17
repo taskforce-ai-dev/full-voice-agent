@@ -29,6 +29,17 @@ def _word(n: int) -> str:
     return _NUM_WORD.get(n, str(n))
 
 
+def _describe(p: Property) -> str:
+    """Enough to identify a listing out loud, without repeating its whole prose."""
+    bits = []
+    if p.bedrooms:
+        bits.append(f"{_word(p.bedrooms)}-bedroom")
+    bits.append(p.property_type)
+    if p.zone:
+        bits.append(f"in Colombo {p.zone}")
+    return " ".join(bits)
+
+
 def portfolio_facts(props: List[Property]) -> str:
     """A block of literally-true statements about the current inventory.
 
@@ -66,6 +77,24 @@ def portfolio_facts(props: List[Property]) -> str:
             f"- Areas: Colombo {_join(zones)} only. If a caller names any other "
             f"area, tell them we have nothing there rather than offering another "
             f"area as if it were theirs.")
+    # Cheapest / dearest, computed. "What's the cheapest place you have?" makes the
+    # LLM scan every listing and compare -- an aggregation, not a lookup. It gets
+    # this right in English and got it WRONG in Sinhala, naming a Rs 150,000 unit
+    # as the cheapest when a Rs 130,000 one exists. Same lesson as the deposit
+    # figures: anything computable is computed here, never left to the model.
+    priced = [p for p in props if p.rent_amount and p.rent_period == "month"
+              and not p.rent_on_request]
+    if priced:
+        low = min(priced, key=lambda p: p.rent_amount)
+        high = max(priced, key=lambda p: p.rent_amount)
+        if low.id != high.id:
+            lines.append(
+                f"- CHEAPEST listing: {low.id} at Rs {int(low.rent_amount):,} per "
+                f"month ({_describe(low)}). MOST EXPENSIVE: {high.id} at "
+                f"Rs {int(high.rent_amount):,} per month ({_describe(high)}). If a "
+                f"caller asks for the cheapest or the most expensive, use these -- "
+                f"do NOT work it out yourself.")
+
     if on_request == 0:
         lines.append("- Every listing has a fixed, quoted monthly rent.")
     elif on_request == len(props):
