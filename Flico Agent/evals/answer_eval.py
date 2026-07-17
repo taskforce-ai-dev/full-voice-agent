@@ -113,6 +113,38 @@ SCENARIOS = [
      "Naming any other listing as the cheapest, or quoting a figure below "
      "130,000, is wrong."),
 
+    # --- Multi-turn ------------------------------------------------------
+    # Every stickiness bug so far (bedrooms, then budget) only existed ACROSS
+    # turns, and only one scenario above has a second turn. Real calls are
+    # conversations; this is where constraints get silently dropped.
+    ("turn_type_switch", ["I'm looking for an apartment",
+                          "actually, what houses do you have?"],
+     "The caller switched from apartments to houses. She must now offer HOUSES "
+     "(P57-P62), not keep pushing apartments. Offering an apartment as a house "
+     "is a violation."),
+    ("turn_bedroom_change", ["I want a two bedroom apartment",
+                             "actually just one bedroom is fine"],
+     "The caller changed to ONE bedroom. She must now offer 1-bedroom apartments "
+     "(P51, P52 or P53), not the 2-bedrooms from the first turn."),
+    ("turn_zone_then_budget", ["Do you have anything in Colombo 7?",
+                               "my budget is under 300,000"],
+     "Colombo 7 has only P55 (Rs 350,000) and P61 (Rs 400,000). NOTHING in "
+     "Colombo 7 is under 300,000. She must say so plainly. Presenting P55 or P61 "
+     "as being within a 300,000 budget is a violation; mentioning them while "
+     "clearly stating they exceed the budget is fine."),
+    ("turn_progressive_qualify", ["I'm looking for a place to rent",
+                                  "it's for me and my partner",
+                                  "somewhere in Colombo 6"],
+     "Colombo 6 has exactly P53 (1-bed apartment, Rs 150,000) and P59 (1-bed "
+     "house, Rs 130,000). Two people suit a 1-bedroom. She must offer only "
+     "Colombo 6 properties and must not invent one or place another area's "
+     "listing in Colombo 6."),
+    ("turn_downgrade_from_none", ["I need a three bedroom house",
+                                  "ok, what's the biggest you have then?"],
+     "Nothing has 3 bedrooms. The biggest houses are 2-bedroom (P60, P61, P62). "
+     "She must offer a real 2-bedroom and must not invent a 3-bedroom or claim "
+     "something larger exists."),
+
     # --- Tamil / Sinhala -------------------------------------------------
     # The parser is English-only, so these utterances extract NO filters and the
     # context is the COMPLETE inventory (all 12) rather than a filtered set.
