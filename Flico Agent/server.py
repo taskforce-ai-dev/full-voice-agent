@@ -333,7 +333,14 @@ def _build_system_prompt(lang: str = "en") -> str:
             "- NEVER use romanized Latin script for Tamil words.\n"
             "- NEVER respond in English unless the caller explicitly switches "
             "to English.\n"
-            "- Use proper Tamil grammar and a natural conversational tone.\n\n"
+            "- Use proper Tamil grammar and a natural conversational tone.\n"
+            "- TRANSLATE, NEVER EMBELLISH. The reference context is in English. "
+            "Render ONLY what it actually says. Do NOT add any feature, adjective "
+            "or descriptive word that is not in the reference context. If you are "
+            "unsure of the Tamil word for something in the context, describe it "
+            "plainly using words you are certain of, or leave it out entirely -- "
+            "NEVER substitute a different feature. Inventing an attribute while "
+            "translating is the same as lying to the caller about the property.\n\n"
         )
     elif lang == "si":
         language_rules = (
@@ -352,9 +359,24 @@ def _build_system_prompt(lang: str = "en") -> str:
             "    bedroom -> \u0DB1\u0DD2\u0DAF\u0DB1 \u0D9A\u0DCF\u0DB8\u0DBB\u0DBA    bathroom -> \u0DB1\u0DCF\u0DB1 \u0D9A\u0DCF\u0DB8\u0DBB\u0DBA\n"
             "    perches -> \u0DB4\u0DBB\u0DCA\u0DA0\u0DC3\u0DCA    square feet -> \u0DC0\u0DBB\u0DCA\u0D9C \u0D85\u0DA9\u0DD2\n"
             "    Rodrigo Realtors -> \u0DBB\u0DDC\u0DA9\u0DCA\u200D\u0DBB\u0DD2\u0D9C\u0DDD \u0DBB\u0DD2\u0DBA\u0DBD\u0DCA\u0DA7\u0DBB\u0DCA\u0DC3\n"
+            # Furnishing is on nearly every listing and was missing here, so the
+            # model improvised: it rendered "unfurnished" to a caller as
+            # "\u0D85\u0DC3\u0DCF\u0DAD\u0DCA\u0DB8\u0DD2\u0D9A \u0DBB\u0DC4\u0DD2\u0DAD" (allergen-free). Any attribute the KB states on
+            # every row needs a fixed term here, or it gets invented.
+            # \u0D9C\u0DD8\u0DC4 \u0DB7\u0DCF\u0DAB\u0DCA\u0DA9 = furniture; \u0DC3\u0DC4\u0DD2\u0DAD = with; \u0DBB\u0DC4\u0DD2\u0DAD = without.
+            "    furnished -> \u0D9C\u0DD8\u0DC4 \u0DB7\u0DCF\u0DAB\u0DCA\u0DA9 \u0DC3\u0DC4\u0DD2\u0DAD    "
+            "unfurnished -> \u0D9C\u0DD8\u0DC4 \u0DB7\u0DCF\u0DAB\u0DCA\u0DA9 \u0DBB\u0DC4\u0DD2\u0DAD\n"
+            "    semi-furnished -> \u0D85\u0DBB\u0DCA\u0DB0 \u0DC0\u0DC1\u0DBA\u0DD9\u0DB1\u0DCA \u0D9C\u0DD8\u0DC4 \u0DB7\u0DCF\u0DAB\u0DCA\u0DA9 \u0DC3\u0DC4\u0DD2\u0DAD\n"
             "- Write every number and price as Sinhala words, never digits.\n"
             "- The reference/knowledge material is in English; translate it "
             "into natural spoken Sinhala -- never copy English words verbatim.\n"
+            "- TRANSLATE, NEVER EMBELLISH. Render ONLY what the reference context "
+            "actually says. Do NOT add any feature, adjective or descriptive word "
+            "that is not in it. If you are unsure of the Sinhala word for "
+            "something in the context, describe it plainly using words you are "
+            "certain of, or leave it out entirely -- NEVER substitute a different "
+            "feature. Inventing an attribute while translating is the same as "
+            "lying to the caller about the property.\n"
             "- Use natural, colloquial spoken Sinhala (not formal/literary), "
             "polite and warm. Keep replies short -- they are spoken on a call.\n\n"
         )

@@ -93,6 +93,44 @@ SCENARIOS = [
     ("no_photos", ["Can you WhatsApp me the photos?"],
      "Rodrigo Realtors does not send details or photos directly; a salesperson "
      "follows up. She must not promise to send anything."),
+    # The parser cannot recognise every Sri Lankan place name, so an area outside
+    # the gazetteer yields zone=None and the context is UNFILTERED -- every
+    # listing, with no signal that none of them are where the caller asked. The
+    # PORTFOLIO FACTS block is the only thing standing between that and a wrong
+    # answer. These two prove whether it actually holds.
+    ("area_outside_colombo", ["Do you have anything in Nugegoda?"],
+     "Nugegoda is not in our portfolio (we cover Colombo 2, 3, 5, 6, 7, 8 only). "
+     "She must say we have nothing in Nugegoda. Offering a Colombo listing as if "
+     "it were in Nugegoda, or implying we cover Nugegoda, is a violation."),
+    ("zone_covered_but_empty", ["Anything in Bambalapitiya?"],
+     "Bambalapitiya is Colombo 4 and we have NO listings there. She must say so "
+     "rather than presenting another area's listing as being in Bambalapitiya."),
+    ("cheapest_overall", ["What's the cheapest place you have?"],
+     "The cheapest listing is P59 at Rs 130,000 (a 1-bedroom house in Colombo 6). "
+     "Naming any other listing as the cheapest, or quoting a figure below "
+     "130,000, is wrong."),
+
+    # --- Tamil / Sinhala -------------------------------------------------
+    # The parser is English-only, so these utterances extract NO filters and the
+    # context is the COMPLETE inventory (all 12) rather than a filtered set.
+    # Nothing is hidden -- but the LLM, not the SQL layer, is doing the filtering.
+    # That is the honest guarantee for these languages, and these measure it.
+    ("ta_2br_house_c7", ["கொழும்பு 7 இல் இரண்டு படுக்கையறை வீடு இருக்கிறதா?"],
+     "Tamil for 'is there a two bedroom house in Colombo 7?'. Only P61 qualifies "
+     "(2-bedroom house, Colombo 7, Rs 400,000). Presenting any other listing as a "
+     "2-bedroom house in Colombo 7 is a violation. The reply must be in Tamil.", "ta"),
+    ("ta_three_bedroom_none", ["மூன்று படுக்கையறை அபார்ட்மென்ட் வேண்டும்"],
+     "Tamil for 'I want a three bedroom apartment'. NOTHING in the inventory has "
+     "3 bedrooms; the largest is 2. Inventing a 3-bedroom listing is a violation. "
+     "The reply must be in Tamil.", "ta"),
+    ("si_apartment_c8_none", ["කොළඹ 8 වල මහල් නිවාසයක් තියෙනවද?"],
+     "Sinhala for 'is there an apartment in Colombo 8?'. There are NO apartments "
+     "in Colombo 8 -- only houses (P58, P62). Presenting a house as an apartment "
+     "is a violation. The reply must be in Sinhala.", "si"),
+    ("si_cheapest", ["ලාභම දේපළ මොකක්ද?"],
+     "Sinhala for 'what is the cheapest property?'. The cheapest is P59 at "
+     "Rs 130,000. Naming another listing as cheapest, or a figure below 130,000, "
+     "is a violation. The reply must be in Sinhala.", "si"),
 ]
 
 _JUDGE_PROMPT = """You are auditing a real-estate voice agent for factual accuracy.
@@ -143,9 +181,12 @@ def _mechanical(reply, context):
 
 
 def _run(client, scenario):
-    sid, turns, rule = scenario
+    sid, turns, rule = scenario[0], scenario[1], scenario[2]
+    lang = scenario[3] if len(scenario) > 3 else "en"
     import server
-    system = server._build_system_prompt("en")
+    # Per-language system prompt, exactly as the Media Streams / ConversationRelay
+    # handlers build it. Tamil and Sinhala get different LANGUAGE RULES blocks.
+    system = server._build_system_prompt(lang)
     sticky, history, reply, context = {}, [], "", ""
     for text in turns:
         context = retrieve_context(text, sticky=sticky)
