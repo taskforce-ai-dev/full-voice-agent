@@ -98,8 +98,10 @@ def _lease_clause(p: Property) -> str:
         terms.append(f"a {p.deposit_months}-month deposit")
     if p.advance_months:
         # "1 months' advance" is wrong; "1 month advance" is how it is said here.
-        terms.append(f"{p.advance_months} month{'s' if p.advance_months > 1 else ''}"
-                     f"{"'" if p.advance_months > 1 else ''} advance")
+        # Keep the quote out of the f-string expression: nested same-type quotes
+        # are PEP 701 (Python 3.12+) and production runs 3.11.
+        plural = "s'" if p.advance_months > 1 else ""
+        terms.append(f"{p.advance_months} month{plural} advance")
     if p.min_lease_months:
         years = p.min_lease_months // 12
         terms.append(f"a minimum lease of {years} year" if years
