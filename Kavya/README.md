@@ -1,6 +1,7 @@
-# Kavya — Treehouse Chalets Voice Agent
+# Kavya — Mosvold Boutique Hotels Voice Agent
 
-Kavya is a multilingual inbound phone agent for **Treehouse Chalets** (Belihuloya, Sri Lanka).
+Kavya is a multilingual inbound phone agent for **Mosvold Boutique Hotels** (Sri Lanka), which
+operates two properties: **Mosvold Villa** (Ahangama) and **Sundara by Mosvold** (Balapitiya).
 She handles reservations and guest queries over Twilio, answers from a ChromaDB knowledge base,
 and checks availability / takes bookings against **eZee Absolute PMS** via n8n webhooks.
 

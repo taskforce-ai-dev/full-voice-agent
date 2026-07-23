@@ -1,9 +1,19 @@
-"""Business logic on top of yanolja_client.
+"""Business logic on top of yanolja_client, for Mosvold Boutique Hotels.
 
-Mirrors the public API of kpms_service.py exactly. booking_api.py consumes:
-    derive_availability(check_in, check_out, num_adults, num_children, room_type_filter)
+Kavya serves TWO properties on one phone line: Mosvold Villa (Ahangama) and
+Sundara by Mosvold (Balapitiya). Room names overlap between them, so the property
+must be established before a room type is selected — see `resolve_property`,
+`_match_room_type` and the `property_name` argument below.
+
+This module NEVER emits a room rate. Mosvold publishes no rates; they exist only
+once dates are chosen and are served live by the external booking engine
+(BookingEye). Price questions go to reservations on RESERVATIONS_PHONE.
+
+Mirrors the public API of kpms_service.py. booking_api.py consumes:
+    derive_availability(check_in, check_out, num_adults, num_children,
+                        room_type_filter, property_name)
     book(check_in, check_out, room_type, guest_name, guest_email, guest_phone,
-         salutation, num_adults, num_children)
+         salutation, num_adults, num_children, property_name)
     lookup(reservation_no, guest_email, arrival_from, arrival_to)
     cancel(reservation_id)
 """
@@ -61,11 +71,105 @@ logger = logging.getLogger(__name__)
 
 CACHE_TTL_SECONDS = 60.0
 
-KAVYA_VOCAB = ("Mount Monarch", "Mount Luxe", "Sunrise Vista", "Eco Harmony", "Forest Escape Suite")
+# Reservations hotline — the only channel that can quote a price. Mosvold publishes
+# no rates anywhere; rates exist only once dates are chosen and are served live by
+# the external booking engine (BookingEye). This module therefore never emits a
+# numeric room rate.
+RESERVATIONS_PHONE = "+94 77 335 8800"
+
+# The two Mosvold properties. One phone line serves both, so the property is NEVER
+# implied — it must be established before a room type can be selected.
+PROPERTY_VILLA = "Mosvold Villa"
+PROPERTY_SUNDARA = "Sundara by Mosvold"
+
+PROPERTY_LOCATIONS = {
+    PROPERTY_VILLA: "Ahangama",
+    PROPERTY_SUNDARA: "Balapitiya",
+}
+
+# Room vocabulary, keyed by property. Room types differ per property and must never
+# be mixed up: "Deluxe Double Room" and "Deluxe Twin Room" exist at BOTH properties
+# under similar names, so a bare room request is ambiguous until the property is known.
+ROOM_TYPES_BY_PROPERTY: dict[str, tuple[str, ...]] = {
+    PROPERTY_VILLA: (
+        "Deluxe Double Room",
+        "Deluxe Twin Room",
+        "Family Suite",
+        "Founders Suite",
+    ),
+    PROPERTY_SUNDARA: (
+        "Deluxe Double Room with Garden View",
+        "Deluxe Double Room with Sea View",
+        "Deluxe Twin Room with Sea View",
+        "Beach Villa",
+        "Family Villa with Pool",
+    ),
+}
+
+# Flat canonical name -> owning property. Every canonical name is distinct across the
+# two properties, so this mapping is unambiguous; caller *phrasing* is what is not.
+ROOM_TYPE_PROPERTY: dict[str, str] = {
+    name: prop for prop, names in ROOM_TYPES_BY_PROPERTY.items() for name in names
+}
+
+ALL_ROOM_TYPES: tuple[str, ...] = tuple(ROOM_TYPE_PROPERTY)
+
+# Every name Kavya may speak, across both properties. Flat tuple, matching
+# kpms_service.KAVYA_VOCAB so the constant means the same shape in both modules.
+KAVYA_VOCAB: tuple[str, ...] = ALL_ROOM_TYPES
+
+# Words a caller may use for each property (name fragments and towns).
+# Bare "villa"/"the villa" are intentionally absent: matched as substrings they
+# resolve Sundara's "Beach Villa" and "Family Villa with Pool" to Mosvold Villa.
+# This mirrors tools.normalise_property so the two resolvers agree.
+_PROPERTY_ALIASES: dict[str, str] = {
+    "mosvold villa": PROPERTY_VILLA,
+    "ahangama": PROPERTY_VILLA,
+    "mosvold ahangama": PROPERTY_VILLA,
+    "sundara": PROPERTY_SUNDARA,
+    "sundara by mosvold": PROPERTY_SUNDARA,
+    "balapitiya": PROPERTY_SUNDARA,
+    "mosvold balapitiya": PROPERTY_SUNDARA,
+}
 
 
 class ServiceError(Exception):
     """Graceful business error."""
+
+
+def resolve_property(query: str) -> str | None:
+    """Map a caller's phrasing to one of the two canonical property names.
+
+    Returns None when the property cannot be established — callers MUST treat that
+    as "ask which property" rather than guessing, because room names collide."""
+    if not query:
+        return None
+    q = " ".join(str(query).strip().lower().split())
+    if not q:
+        return None
+    if q in _PROPERTY_ALIASES:
+        return _PROPERTY_ALIASES[q]
+    hits = {prop for alias, prop in _PROPERTY_ALIASES.items() if alias in q}
+    if len(hits) == 1:
+        return hits.pop()
+    return None
+
+
+def _property_prompt() -> str:
+    return (
+        "We have two properties and the room names differ between them: "
+        f"{PROPERTY_VILLA} in {PROPERTY_LOCATIONS[PROPERTY_VILLA]}, and "
+        f"{PROPERTY_SUNDARA} in {PROPERTY_LOCATIONS[PROPERTY_SUNDARA]}. "
+        "Which property is this booking for?"
+    )
+
+
+def _room_choice_prompt(property_name: str = "") -> str:
+    """Room options for one property, or the property question if none established."""
+    names = ROOM_TYPES_BY_PROPERTY.get(property_name)
+    if not names:
+        return _property_prompt()
+    return f"At {property_name} the room types are " + ", ".join(names) + "."
 
 
 # --------------------------------------------------------------------------- #
@@ -99,55 +203,88 @@ def _cache_invalidate(key: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def _norm(name: str) -> str:
+    """Lowercase + collapse whitespace. Deliberately does NOT strip trailing words:
+    'Family Suite', 'Founders Suite', 'Beach Villa' and 'Family Villa with Pool' are
+    whole room names at Mosvold, so suffix-trimming would corrupt them."""
     if not name:
         return ""
-    s = name.strip().lower()
-    for suffix in (" suite", " chalet"):
-        if s.endswith(suffix):
-            s = s[: -len(suffix)].rstrip()
-            break
-    return s
+    return " ".join(str(name).strip().lower().split())
 
 
 def _kavya_vocab_name(pms_name: str) -> str:
-    if not pms_name:
-        return ""
-    s = pms_name.strip()
-    low = s.lower()
-    for suffix in (" suite", " chalet"):
-        if low.endswith(suffix):
-            return s[: -len(suffix)].rstrip()
-    return s
+    return (pms_name or "").strip()
 
 
 def _display_name(rt: dict) -> str:
     """Canonical Kavya-vocab name. Match PMS name case-insensitively to vocab."""
     pms = (rt.get("name") or "").strip()
     pn = _norm(pms)
-    for v in KAVYA_VOCAB:
+    for v in ALL_ROOM_TYPES:
         if _norm(v) == pn:
             return v
     return _kavya_vocab_name(pms)
 
 
-def _match_room_type(query: str, room_types: list[dict]) -> dict | None:
-    """Match a Kavya-style query to a room type dict. Raises ServiceError on ambiguity."""
+def _property_of(rt: dict) -> str:
+    """Owning property for a PMS room-type dict.
+
+    Prefers an explicit property field if the booking backend supplies one; otherwise
+    derives it from the canonical room name. Returns "" when it cannot be established,
+    and callers must then ask the guest rather than assume."""
+    for key in ("propertyName", "property", "hotelName", "hotel"):
+        val = rt.get(key)
+        if isinstance(val, str):
+            resolved = resolve_property(val)
+            if resolved:
+                return resolved
+        elif isinstance(val, dict):
+            resolved = resolve_property(str(val.get("name") or ""))
+            if resolved:
+                return resolved
+    return ROOM_TYPE_PROPERTY.get(_display_name(rt), "")
+
+
+def _match_room_type(
+    query: str, room_types: list[dict], property_name: str = ""
+) -> dict | None:
+    """Match a Kavya-style query to a room type dict, scoped to one property.
+
+    `property_name` MUST be an established property: the same guest phrasing
+    ("deluxe double room") is valid at both Mosvold Villa and Sundara by Mosvold, so
+    matching across properties would silently pick the wrong hotel. When the property
+    is unknown the candidate pool is left unscoped and any cross-property collision
+    raises ServiceError instead of guessing.
+
+    Raises ServiceError on ambiguity."""
     if not query:
         return None
     qn = _norm(query)
     if not qn:
         return None
-    exact = [rt for rt in room_types if _norm(rt.get("name", "")) == qn]
+
+    if property_name:
+        candidates = [rt for rt in room_types if _property_of(rt) == property_name]
+    else:
+        candidates = list(room_types)
+
+    exact = [rt for rt in candidates if _norm(rt.get("name", "")) == qn]
     if len(exact) == 1:
         return exact[0]
     if len(exact) > 1:
         raise ServiceError(f"Multiple room types match '{query}'.")
     prefix = []
-    for rt in room_types:
+    for rt in candidates:
         n = _norm(rt.get("name", ""))
         if not n:
             continue
-        if n.startswith(qn) or qn.startswith(n):
+        # Only accept the query as an ABBREVIATION of a canonical name
+        # (n starts with qn). The reverse direction (qn starts with n) let a
+        # longer cross-property name — e.g. "Deluxe Double Room with Sea View"
+        # (Sundara) — collapse onto a shorter same-property name — "Deluxe
+        # Double Room" (Villa) — and silently book the wrong hotel. A query
+        # strictly longer than a canonical name is the other property's room or
+        # noise, never a same-property refinement, so it must not match here.
+        if n.startswith(qn):
             prefix.append(rt)
     if len(prefix) == 1:
         return prefix[0]
@@ -227,6 +364,7 @@ async def derive_availability(
     num_adults: int = 1,
     num_children: int = 0,
     room_type_filter: str = "",
+    property_name: str = "",
 ) -> dict:
     try:
         ci = _parse_date(check_in)
@@ -238,6 +376,18 @@ async def derive_availability(
 
     nights = (co - ci).days
 
+    # The property must be established BEFORE any room type is interpreted — room
+    # names overlap across the two properties.
+    # Fail closed: availability must be scoped to an established property, the
+    # same invariant book() enforces. Room names overlap across the two
+    # properties, so an unscoped availability answer can surface the wrong
+    # hotel's rooms. This makes the service layer enforce the property rule
+    # itself rather than trusting every caller (e.g. a direct booking_api call
+    # or a future tool path) to have validated it first.
+    resolved_property = resolve_property(property_name) if property_name else None
+    if not resolved_property:
+        return {"error": _property_prompt()}
+
     try:
         all_rooms = await _get_rooms_cached()
         avail_rooms = await _free_rooms_from_reservations(all_rooms, check_in, check_out)
@@ -245,24 +395,25 @@ async def derive_availability(
         logger.warning("Availability fetch failed: %s", exc)
         return {"error": "We couldn't check availability just now. Please try again in a moment."}
 
+    # resolved_property is guaranteed non-empty here (fail-closed guard above).
     room_types = _room_types_from_rooms(all_rooms)
+    scoped_types = [rt for rt in room_types if _property_of(rt) == resolved_property]
 
     if room_type_filter:
         try:
-            match = _match_room_type(room_type_filter, room_types)
+            match = _match_room_type(room_type_filter, room_types, resolved_property)
         except ServiceError:
             match = None
         if match is None:
             return {
                 "error": (
-                    f"We don't have a room type called '{room_type_filter}'. "
-                    "Please choose from Mount Monarch, Mount Luxe, Sunrise Vista, "
-                    "Eco Harmony, or Forest Escape Suite."
+                    f"We don't have a room type called '{room_type_filter}' at "
+                    f"{resolved_property}. " + _room_choice_prompt(resolved_property)
                 )
             }
         types_to_check = [match]
     else:
-        types_to_check = room_types
+        types_to_check = scoped_types
 
     # Which roomTypeIds appear in available rooms
     available_type_ids: set[Any] = set()
@@ -271,10 +422,12 @@ async def derive_availability(
         if rtid is not None:
             available_type_ids.add(rtid)
 
-    # PMS is consulted ONLY for availability and booking creation. Rates,
-    # capacity, and room descriptions come from the KB (hotel_info.txt) —
-    # the PMS data for those fields is unreliable. So we strip everything
-    # but the available flag and room name from the tool result.
+    # The booking backend is consulted ONLY for availability and booking creation.
+    # Room descriptions come from the KB. Rates are NEVER returned here: Mosvold
+    # publishes no rates, they are served live per check-in/check-out date by the
+    # external booking engine. Any figure emitted here would be fabricated — price
+    # questions go to reservations on RESERVATIONS_PHONE. So we strip everything but
+    # the available flag, the room name, and the owning property.
     out_rooms: list[dict] = []
     available_count = 0
     for rt in types_to_check:
@@ -285,6 +438,7 @@ async def derive_availability(
             available_count += 1
         out_rooms.append({
             "room_type_name": display_name,
+            "property": _property_of(rt),
             "available": is_available,
         })
 
@@ -292,9 +446,14 @@ async def derive_availability(
         "check_in": check_in,
         "check_out": check_out,
         "nights": nights,
-        "total_room_types": len(room_types),
+        "property": resolved_property,
+        "total_room_types": len(scoped_types),
         "available_room_types": available_count,
         "rooms": out_rooms,
+        "rates_note": (
+            "No rates are quoted here. Rates depend on the dates chosen and are "
+            f"confirmed by reservations on {RESERVATIONS_PHONE}."
+        ),
     }
 
 
@@ -312,6 +471,7 @@ async def book(
     salutation: str = "Mr",
     num_adults: int = 1,
     num_children: int = 0,
+    property_name: str = "",
 ) -> dict:
     try:
         ci = _parse_date(check_in)
@@ -326,6 +486,12 @@ async def book(
     if not (guest_name or "").strip() and not (guest_email or "").strip():
         return {"error": "We need a guest name to make the reservation."}
 
+    # A booking can never be created without knowing WHICH property: the same room
+    # name exists at both, so an unscoped match could book the wrong hotel.
+    resolved_property = resolve_property(property_name) if property_name else None
+    if not resolved_property:
+        return {"error": _property_prompt()}
+
     try:
         all_rooms = await _get_rooms_cached()
     except YanoljaError as exc:
@@ -334,28 +500,27 @@ async def book(
 
     room_types = _room_types_from_rooms(all_rooms)
     try:
-        rt_match = _match_room_type(room_type, room_types)
+        rt_match = _match_room_type(room_type, room_types, resolved_property)
     except ServiceError:
         rt_match = None
     if not rt_match:
         return {
             "error": (
-                f"We don't have a room type called '{room_type}'. "
-                "Please choose from Mount Monarch, Mount Luxe, Sunrise Vista, "
-                "Eco Harmony, or Forest Escape Suite."
+                f"We don't have a room type called '{room_type}' at "
+                f"{resolved_property}. " + _room_choice_prompt(resolved_property)
             )
         }
 
     type_id = rt_match.get("id")
     display_room_type = _display_name(rt_match)
 
-    # Capacity NOT enforced here: PMS maxOccupancy contradicts the KB
-    # (e.g. Mount Luxe is up to 5 in the KB, 2 in the PMS). The LLM uses
-    # the KB to decide pax fit before calling this tool.
+    # Capacity NOT enforced here: the booking backend's maxOccupancy is not a
+    # reliable source for these room types. The LLM uses the KB to decide pax fit
+    # before calling this tool.
 
-    rate = _to_decimal(rt_match.get("basePrice"))
-    rate_amt = _money(rate)
-    total_amt = _money(rate * Decimal(nights))
+    # NO rate is computed. Mosvold publishes no rates; a rate only exists once dates
+    # are chosen and is served live by the external booking engine, so any figure
+    # produced locally would be fabricated. Pricing goes to RESERVATIONS_PHONE.
 
     # Find a free room of this type
     try:
@@ -370,7 +535,8 @@ async def book(
     if not candidates:
         return {
             "error": (
-                f"Sorry, we have no {display_room_type} available for those dates. "
+                f"Sorry, we have no {display_room_type} available at {resolved_property} "
+                "for those dates. "
                 "Would you like to try different dates?"
             )
         }
@@ -426,11 +592,14 @@ async def book(
         "guest_name": guest_name,
         "check_in": check_in,
         "check_out": check_out,
+        "property": resolved_property,
         "room_type": display_room_type,
         "room_number": room.get("roomNumber", ""),
-        "rate_per_night_usd": rate_amt,
-        "total_usd": total_amt,
         "nights": nights,
+        "rates_note": (
+            "No rate is quoted here. The total depends on the dates and is confirmed "
+            f"by reservations on {RESERVATIONS_PHONE}."
+        ),
     }
 
 
@@ -445,6 +614,8 @@ def _augment(res: dict) -> dict:
     rt = res.get("roomType") or {}
     augmented["room_number"] = room.get("roomNumber", "")
     augmented["room_type_name"] = _display_name(rt) if rt else ""
+    # Always surface which property the booking is at — one line serves both.
+    augmented["property"] = _property_of(rt) if rt else ""
     return augmented
 
 

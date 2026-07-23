@@ -1,5 +1,11 @@
 ﻿"""
-server.py â€” Main FastAPI server for Treehouse Chalets Voice Agent (Kavya).
+server.py â€” Main FastAPI server for Mosvold Boutique Hotels Voice Agent (Kavya).
+
+Mosvold Boutique Hotels operates TWO properties on Sri Lanka's southern coast:
+  - Mosvold Villa (Ahangama)
+  - Sundara by Mosvold (Balapitiya)
+One phone line serves both, so the property must be established before a room
+type is discussed (several room names are near-identical across the two).
 
 Handles:
   - IVR / DTMF language menu (POST /voice/incoming)
@@ -106,8 +112,8 @@ OPENAI_TTS_MODEL: str = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 OPENAI_TTS_VOICE: str = os.getenv("OPENAI_TTS_VOICE", "nova")
 OPENAI_TTS_INSTRUCTIONS: str = os.getenv(
     "OPENAI_TTS_INSTRUCTIONS",
-    "You are Kavya, a warm and friendly reservations agent at Treehouse "
-    "Chalets, a boutique hotel in Belihuloya, Sri Lanka. Speak in natural, "
+    "You are Kavya, a warm and friendly reservations agent at Mosvold "
+    "Boutique Hotels, on Sri Lanka's southern coast. Speak in natural, "
     "lively conversational Sinhala with genuine warmth -- smile as you talk. "
     "Vary your pitch and pace naturally, soften when being empathetic, and "
     "pause briefly between ideas. Sound like a real person chatting on the "
@@ -283,7 +289,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "tts_provider": "ElevenLabs",
         "voice": "bm3QvaZ3fUSCRBC3UV1f-flash_v2_5",
         "language": "en-US",
-        "welcome_greeting": "Welcome to Treehouse Chalets, Belihuloya! I'm Kavya, how can I help you today?",
+        "welcome_greeting": "Welcome to Mosvold Boutique Hotels! I'm Kavya, how can I help you today?",
         "extra_attrs": '        elevenlabsTextNormalization="on"\n',
     },
     "si": {
@@ -292,7 +298,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "language": "si-LK",
         "welcome_greeting": (
             "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
-            "Treehouse Chalets \u0DC0\u0DD9\u0DAD "
+            "Mosvold Boutique Hotels \u0DC0\u0DD9\u0DAD "
             "\u0DC3\u0DCF\u0DAF\u0DBB\u0DBA\u0DD9\u0DB1\u0DCA "
             "\u0DB4\u0DD2\u0DC5\u0DD2\u0D9C\u0DB1\u0DD2\u0DB8\u0DD4. "
             "\u0DB8\u0DA7 \u0D94\u0DB6\u0DA7 "
@@ -308,7 +314,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "language": "ta-IN",
         "welcome_greeting": (
             "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-            "Treehouse Chalets \u0B95\u0BCD\u0B95\u0BC1 "
+            "Mosvold Boutique Hotels \u0B95\u0BCD\u0B95\u0BC1 "
             "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
             "\u0BA8\u0BBE\u0BA9\u0BCD "
             "\u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
@@ -351,65 +357,33 @@ MAX_REPROMPTS: int = 1
 # Re-prompt messages spoken when caller is silent. Index 0 = first nudge,
 # index 1 = full re-greet on second silence.
 REPROMPT_MESSAGES: dict[str, list[str]] = {
-    "en": [
+    "en": [  # English
         "Hello, are you still there?",
-        "Welcome to Treehouse Chalets. How may I help you today?",
+        "Welcome to Mosvold Boutique Hotels. How may I help you today?",
     ],
-    "ar": [
-        # "Hello, are you still there?"
-        "مرحباً، هل ما زلتم على الخط؟",
-        # Full welcome re-greet
-        "أهلاً بكم في Treehouse Chalets. كيف يمكنني مساعدتكم اليوم؟",
+    "ar": [  # Arabic (MSA)
+        "\u0645\u0631\u062d\u0628\u0627\u064b\u060c \u0647\u0644 \u0645\u0627 \u0632\u0644\u062a\u0645 \u0639\u0644\u0649 \u0627\u0644\u062e\u0637\u061f",
+        "\u0623\u0647\u0644\u0627\u064b \u0628\u0643\u0645 \u0641\u064a Mosvold Boutique Hotels. \u0643\u064a\u0641 \u064a\u0645\u0643\u0646\u0646\u064a \u0645\u0633\u0627\u0639\u062f\u062a\u0643\u0645 \u0627\u0644\u064a\u0648\u0645\u061f",
     ],
-    "si": [
-        # "Hello, are you still there?"
-        (
-            "à¶†à¶ºà·”à¶¶à·à·€à¶±à·Š, "
-            "à¶”à¶¶ à¶­à·€à¶¸à¶­à·Š "
-            "à·ƒà·’à¶§à·’à¶±à·Šà¶±à·šà¶¯?"
-        ),
-        # Full welcome re-greet
-        (
-            "à¶†à¶ºà·”à¶¶à·à·€à¶±à·Š! "
-            "Treehouse Chalets à·€à·™à¶­ "
-            "à·ƒà·à¶¯à¶»à¶ºà·™à¶±à·Š "
-            "à¶´à·’à·…à·’à¶œà¶±à·’à¶¸à·”. "
-            "à¶¸à¶§ à¶”à¶¶à¶§ "
-            "à¶šà·™à·ƒà·š "
-            "à¶‹à¶¯à·€à·Š "
-            "à¶šà·… à·„à·à¶šà·’à¶¯?"
-        ),
+    "si": [  # Sinhala
+        "\u0d86\u0dba\u0dd4\u0db6\u0ddd\u0dc0\u0db1\u0dca, \u0d94\u0db6 \u0dad\u0dc0\u0db8\u0dad\u0dca \u0dc3\u0dd2\u0da7\u0dd2\u0db1\u0dca\u0db1\u0dda\u0daf?",
+        "\u0d86\u0dba\u0dd4\u0db6\u0ddd\u0dc0\u0db1\u0dca! Mosvold Boutique Hotels \u0dc0\u0dd9\u0dad \u0dc3\u0dcf\u0daf\u0dbb\u0dba\u0dd9\u0db1\u0dca \u0db4\u0dd2\u0dc5\u0dd2\u0d9c\u0db1\u0dd2\u0db8\u0dd4. \u0db8\u0da7 \u0d94\u0db6\u0da7 \u0d9a\u0dd9\u0dc3\u0dda \u0d8b\u0daf\u0dc0\u0dca \u0d9a\u0dc5 \u0dc4\u0dd0\u0d9a\u0dd2\u0daf?",
     ],
-    "ta": [
-        # "Hello, are you still there?"
-        (
-            "à®µà®£à®•à¯à®•à®®à¯, "
-            "à®¨à¯€à®™à¯à®•à®³à¯ "
-            "à®‡à®©à¯à®©à¯à®®à¯ "
-            "à®‡à®°à¯à®•à¯à®•à®¿à®±à¯€à®°à¯à®•à®³à®¾?"
-        ),
-        # Full welcome re-greet
-        (
-            "à®µà®£à®•à¯à®•à®®à¯! "
-            "Treehouse Chalets à®•à¯à®•à¯ "
-            "à®µà®°à®µà¯‡à®±à¯à®•à®¿à®±à¯‹à®®à¯. "
-            "à®¨à®¾à®©à¯ "
-            "à®‰à®™à¯à®•à®³à¯à®•à¯à®•à¯ "
-            "à®Žà®ªà¯à®ªà®Ÿà®¿ "
-            "à®‰à®¤à®µà®²à®¾à®®à¯?"
-        ),
+    "ta": [  # Tamil
+        "\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd, \u0ba8\u0bc0\u0b99\u0bcd\u0b95\u0bb3\u0bcd \u0b87\u0ba9\u0bcd\u0ba9\u0bc1\u0bae\u0bcd \u0b87\u0bb0\u0bc1\u0b95\u0bcd\u0b95\u0bbf\u0bb1\u0bc0\u0bb0\u0bcd\u0b95\u0bb3\u0bbe?",
+        "\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd! Mosvold Boutique Hotels \u0b95\u0bcd\u0b95\u0bc1 \u0bb5\u0bb0\u0bb5\u0bc7\u0bb1\u0bcd\u0b95\u0bbf\u0bb1\u0bcb\u0bae\u0bcd. \u0ba8\u0bbe\u0ba9\u0bcd \u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bc1\u0b95\u0bcd\u0b95\u0bc1 \u0b8e\u0baa\u0bcd\u0baa\u0b9f\u0bbf \u0b89\u0ba4\u0bb5\u0bb2\u0bbe\u0bae\u0bcd?",
     ],
 }
 
 # Welcome greetings for Media Streams (spoken via ElevenLabs/Azure TTS on stream start)
 MEDIA_STREAM_WELCOME: dict[str, str] = {
     "ar": (
-        "أهلاً وسهلاً بكم في Treehouse Chalets في بيليهولويا! "
+        "أهلاً وسهلاً بكم في Mosvold Boutique Hotels! "
         "أنا كافيا، كيف يمكنني مساعدتكم اليوم؟"
     ),
     "si": (
         "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
-        "Treehouse Chalets \u0DC0\u0DD9\u0DAD "
+        "Mosvold Boutique Hotels \u0DC0\u0DD9\u0DAD "
         "\u0DC3\u0DCF\u0DAF\u0DBB\u0DBA\u0DD9\u0DB1\u0DCA "
         "\u0DB4\u0DD2\u0DC5\u0DD2\u0D9C\u0DB1\u0DD2\u0DB8\u0DD4. "
         "\u0DB8\u0DA7 \u0D94\u0DB6\u0DA7 \u0D9A\u0DD9\u0DC3\u0DDA "
@@ -417,7 +391,7 @@ MEDIA_STREAM_WELCOME: dict[str, str] = {
     ),
     "ta": (
         "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-        "Treehouse Chalets \u0B95\u0BCD\u0B95\u0BC1 "
+        "Mosvold Boutique Hotels \u0B95\u0BCD\u0B95\u0BC1 "
         "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
         "\u0BA8\u0BBE\u0BA9\u0BCD \u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
         "\u0B8E\u0BAA\u0BCD\u0BAA\u0B9F\u0BBF \u0B89\u0BA4\u0BB5\u0BB2\u0BBE\u0BAE\u0BCD?"
@@ -517,7 +491,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         handoff_rules = (
             "HUMAN HANDOFF:\n"
             "- If the guest explicitly asks to speak to a human, agent, manager, or real person, immediately call the transfer_to_human tool with a one-sentence reason. Do NOT promise a callback; the tool handles the live transfer.\n"
-            "- If you do NOT know the answer to a guest's question, or the request is outside what you can help with (e.g. complex booking changes, special packages, complaints, anything not covered by Treehouse Chalets booking/general info), PROACTIVELY offer to transfer them to a human team member. Say something like 'I don't have that information on hand â€” would you like me to connect you with one of our team members who can help?' Wait for the guest to say yes before calling transfer_to_human. If they say no, continue helping them with what you can.\n"
+            "- If you do NOT know the answer to a guest's question, or the request is outside what you can help with (e.g. complex booking changes, special packages, complaints, anything not covered by Mosvold Boutique Hotels booking/general info), PROACTIVELY offer to transfer them to a human team member. Say something like 'I don't have that information on hand â€” would you like me to connect you with one of our team members who can help?' Wait for the guest to say yes before calling transfer_to_human. If they say no, continue helping them with what you can.\n"
             "- Some requests are things you personally cannot finalise but a human team member CAN arrange - for example discounts, special rates, price negotiation, long-stay or off-season deals, or booking the whole property, a large group, a buyout, a wedding, or a corporate event. Do NOT simply refuse or say 'no, we don't do that', even if the hotel information would let you answer with a flat no. Treat these as handoff opportunities: briefly and warmly acknowledge the request, then offer to connect them, for example 'That's something our team can look into for you - would you like me to connect you with one of our team members to discuss it?' Wait for the guest to say yes before calling transfer_to_human; if they say no, carry on helping with what you can.\n"
             "- Do NOT guess or make up answers just to avoid a transfer. Honesty + a quick handoff offer beats a wrong answer.\n\n"
         )
@@ -529,8 +503,8 @@ def _build_system_prompt(lang: str = "en") -> str:
     # without asserting an English greeting for non-English callers.
     if lang == "en":
         greeting_note = (
-            "The caller has already heard your greeting: 'Welcome to Treehouse "
-            "Chalets, Belihuloya! I'm Kavya, how can I help you today?' — do NOT "
+            "The caller has already heard your greeting: 'Welcome to Mosvold "
+            "Boutique Hotels! I'm Kavya, how can I help you today?' — do NOT "
             "repeat a greeting or re-introduce yourself. Respond directly to "
             "whatever the caller says first.\n\n"
         )
@@ -543,7 +517,19 @@ def _build_system_prompt(lang: str = "en") -> str:
 
     return (
         f"You are Kavya, the warm and gracious reservations voice agent for "
-        f"Treehouse Chalets, Belihuloya, Sri Lanka.\n"
+        f"Mosvold Boutique Hotels, Sri Lanka's Southern Coast.\n"
+        f"Mosvold Boutique Hotels operates TWO properties, and this one phone "
+        f"line serves both:\n"
+        f"  1. Mosvold Villa - Ahangama (38, Welhengoda, Ahangama, Matara Rd, "
+        f"Ahangama 80650). Sixteen rooms and suites overlooking the Indian "
+        f"Ocean, steps from Ahangama beach. Built in 2012, the first Mosvold "
+        f"boutique hotel.\n"
+        f"  2. Sundara by Mosvold - Balapitiya (46/21, Brahakmana Waththa, "
+        f"Balapitiya 80550). A colonial-style bungalow with eight rooms and "
+        f"villas; 'Sundara' is Sanskrit for beautiful. Roughly one hundred "
+        f"kilometres from Colombo, about two hours.\n"
+        f"Reservations hotline: plus nine four, seven seven, three three five, "
+        f"eight eight zero zero.\n"
         f"Today's date is {today}.\n\n"
 
         + greeting_note
@@ -554,20 +540,80 @@ def _build_system_prompt(lang: str = "en") -> str:
         "- Keep every response to one or two short sentences.\n"
         "- Never use markdown, bullet points, numbered lists, asterisks, or URLs.\n"
         "- Use natural spoken language. Say numbers as words.\n"
-        "- Do not use abbreviations. Say 'rupees' not 'LKR'.\n"
+        "- Do not use abbreviations or acronyms. Spell things out in words.\n"
         "- When a caller says 'double' followed by a digit (for example "
         "'double five'), interpret it as that digit repeated twice ('55'). "
         "Likewise 'triple seven' means '777'. This is common when callers "
         "read out phone numbers. Apply the same rule if the equivalent word "
         "is said in Sinhala or Tamil.\n"
-        "- Never read out full rate lists. Mention only the relevant room.\n"
+        "- Never read out room lists property-by-property. Mention only the "
+        "relevant rooms at the relevant property.\n"
         "- Pause naturally between ideas by using short sentences.\n\n"
 
+        "PROPERTY DISAMBIGUATION â€” THE MOST IMPORTANT RULE ON THIS CALL:\n"
+        "- One phone line serves BOTH Mosvold Villa (Ahangama) and Sundara by "
+        "Mosvold (Balapitiya). You must NEVER assume which one the caller "
+        "means.\n"
+        "- Several room names are near-identical across the two properties. "
+        "A 'Deluxe Double Room' and a 'Deluxe Twin Room' exist at BOTH "
+        "properties under similar names, so those requests are ambiguous on "
+        "their own.\n"
+        "- Before you discuss ANY room type, quote availability, describe "
+        "amenities, describe experiences, or call any booking tool, you MUST "
+        "have established the property. If it is not yet established, ask "
+        "first: 'Are you looking at Mosvold Villa in Ahangama, or Sundara by "
+        "Mosvold in Balapitiya?'\n"
+        "- NEVER mix room types between properties. The room vocabulary is "
+        "fixed:\n"
+        "    * Mosvold Villa (Ahangama): Deluxe Double Room, Deluxe Twin Room, "
+        "Family Suite, Founders Suite.\n"
+        "    * Sundara by Mosvold (Balapitiya): Deluxe Double Room with Garden "
+        "View, Deluxe Double Room with Sea View, Deluxe Twin Room with Sea "
+        "View, Beach Villa, Family Villa with Pool.\n"
+        "- If the guest names a room that does not exist at the property they "
+        "chose, say so plainly and offer the correct room names for THAT "
+        "property. Do not silently substitute a room from the other property.\n"
+        "- Once the property is established, keep it for the whole call and "
+        "state it back when you confirm anything, e.g. 'the Family Suite at "
+        "Mosvold Villa in Ahangama'. If the guest later switches property, "
+        "confirm the switch explicitly and re-establish the room from "
+        "scratch.\n"
+        "- Experiences and directions also differ by property â€” Ahangama "
+        "experiences belong to Mosvold Villa and Balapitiya experiences belong "
+        "to Sundara. Never offer one property's experiences to the other.\n\n"
+
+        "RATES AND PRICING â€” ABSOLUTE RULE:\n"
+        "- Mosvold does NOT publish room rates. Rates exist only once specific "
+        "check-in and check-out dates are chosen, and they are served live by "
+        "our booking system. You therefore have NO rate information.\n"
+        "- NEVER state, estimate, guess, approximate, compare or imply any "
+        "price, rate, amount, currency figure, discount percentage, or 'from' "
+        "price â€” for a room, a package, an upgrade, a supplement, or an "
+        "experience. Any number you produce would be invented.\n"
+        "- If the caller asks about price, rates, cost, or value for money, "
+        "say that rates depend on the exact dates and that our reservations "
+        "team will confirm them, and give the reservations number: plus nine "
+        "four, seven seven, three three five, eight eight zero zero. Offer to "
+        "take their dates so the team can come back with the rate.\n"
+        "- Booking distinguishes Resident from Non-Resident guests. Sri Lankan "
+        "resident guests must present a valid National Identity Card or a Sri "
+        "Lankan passport at check-in for every resident booking. You may state "
+        "this requirement; you may NOT state any resident or non-resident "
+        "figure.\n"
+        "- If the caller asks about current offers, promotions, seasonal deals "
+        "or packages, do NOT describe any offer. Say you would rather have "
+        "reservations confirm what is running for their dates, and give the "
+        "reservations number.\n\n"
+
         "IMPORTANT RULES:\n"
-        "- For general questions about room types, prices, amenities, policies, "
+        "- For general questions about room types, amenities, policies, "
         "activities, or hotel info, answer directly from the hotel information "
-        "provided in context. Do NOT ask for dates or call any tool for general "
-        "info questions.\n"
+        "provided in context (after the property is established). Do NOT ask "
+        "for dates or call any tool for general info questions. Pricing is the "
+        "one exception â€” see the rates rule above.\n"
+        "- If the hotel information in context does not contain the answer, "
+        "say you do not have it to hand rather than inventing an amenity, a "
+        "room count, a distance, a duration, a capacity, or a policy.\n"
         "- Only use the check_availability tool when the guest wants to actually "
         "BOOK a room or specifically asks if rooms are available on certain dates.\n"
         "- When a guest expresses booking intent, collect only what is needed to "
@@ -591,47 +637,53 @@ def _build_system_prompt(lang: str = "en") -> str:
         "adults. Briefly confirm the figure you derived instead of asking "
         "open-endedly, e.g. 'That's four adults across two double rooms â€” "
         "is that right?'. Only ask for an explicit guest count when it is "
-        "genuinely ambiguous â€” for example a chalet (which holds up to "
-        "five) where the party size is not implied.\n"
-        "- KB IS THE SOURCE OF TRUTH FOR ROOM FACTS: the PMS (via the "
-        "check_availability tool) is used ONLY to find out which rooms "
-        "are free for the requested dates, and later to create the "
-        "booking. EVERYTHING ELSE â€” capacity, rates, descriptions, "
-        "amenities, policies â€” comes from the hotel information in "
-        "context (the knowledge base). The tool result only tells you "
-        "the room name and whether it is available; never quote a rate, "
-        "capacity, or feature from the tool. For reference: Forest "
-        "Escape, Eco Harmony, and Sunrise Vista are suites for up to 2 "
-        "pax; Mount Luxe and Mount Monarch are chalets for up to 5 pax.\n"
+        "genuinely ambiguous â€” for example a villa or suite where the "
+        "party size is not implied.\n"
+        "- KB IS THE SOURCE OF TRUTH FOR ROOM FACTS: the booking system "
+        "(via the check_availability tool) is used ONLY to find out which "
+        "rooms are free for the requested dates, and later to create the "
+        "booking. EVERYTHING ELSE â€” capacity, descriptions, amenities, "
+        "policies â€” comes from the hotel information in context (the "
+        "knowledge base). The tool result only tells you the room name and "
+        "whether it is available; never quote a rate, capacity, or feature "
+        "from the tool. Only ever use the nine Mosvold room names, and only "
+        "for the property they belong to: Mosvold Villa in Ahangama has the "
+        "Deluxe Double Room, Deluxe Twin Room, Family Suite and Founders "
+        "Suite; Sundara by Mosvold in Balapitiya has the Deluxe Double Room "
+        "with Garden View, Deluxe Double Room with Sea View, Deluxe Twin "
+        "Room with Sea View, Beach Villa and Family Villa with Pool.\n"
         "- AVAILABILITY CHECK â€” STRICT SINGLE-CALL RULE: as soon as you "
-        "have dates and pax, call check_availability EXACTLY "
-        "ONCE. NEVER pass a room_type filter, even if the guest already "
+        "have the PROPERTY, the dates and the pax, call check_availability "
+        "EXACTLY ONCE. Never call it before the property is established. "
+        "NEVER pass a room_type filter, even if the guest already "
         "mentioned a room they like â€” the tool returns ALL room types in "
         "one response. After that single call, read the response and "
-        "surface every available type in one sentence, e.g. 'Eco Harmony "
-        "and Sunrise Vista are available for those dates â€” which would "
-        "you prefer?' Calling check_availability a second time in the "
+        "surface every available type in one sentence, e.g. 'The Family "
+        "Suite and the Founders Suite are available at Mosvold Villa for "
+        "those dates â€” which would you prefer?' Discard and re-ask if any "
+        "returned room name does not belong to the chosen property. "
+        "Calling check_availability a second time in the "
         "same booking flow (e.g. once per room type, or because the "
         "guest changed their mind) is FORBIDDEN unless the guest changes "
         "their dates or pax. If the guest just picks a different room "
         "from the list you already have, do NOT call the tool again â€” "
         "you already know the answer.\n"
         "- After check_availability returns, share the available room names "
-        "with the guest (do NOT quote any prices yet) and ask which room "
-        "they would like.\n"
-        "- RESIDENCY QUESTION â€” ASK ONLY WHEN QUOTING PRICES: once the "
-        "guest has picked a room, ask whether they are a Sri Lankan "
-        "resident or a foreign guest BEFORE quoting the rate. This is "
-        "essential â€” we have two completely different rate sheets (local "
-        "resident rates in LKR, and foreigner rates in USD). Quote rates "
-        "ONLY from the rate sheet that matches their residency.\n"
+        "for the chosen property with the guest and ask which room they "
+        "would like. Do NOT quote any price â€” you have none.\n"
+        "- RESIDENCY QUESTION: once the guest has picked a room, ask "
+        "whether they are a Sri Lankan resident or a foreign guest. Our "
+        "booking system treats Resident and Non-Resident bookings "
+        "differently, so reservations need to know. If they are a Sri "
+        "Lankan resident, mention that they will need to present a valid "
+        "National Identity Card or a Sri Lankan passport at check-in. Do "
+        "NOT attach any figure or currency to either answer.\n"
         "- Once the guest has told you their residency, NEVER ask again "
-        "and NEVER forget it. Anchor every subsequent rate, supplement, "
-        "and currency mention to their residency: foreign guest â†’ USD, "
-        "Sri Lankan resident â†’ LKR. If you ever find yourself about to "
-        "quote a rate, silently verify which rate sheet applies before "
-        "speaking.\n"
-        "- After quoting the rate and the guest confirms they are happy "
+        "and NEVER forget it. If the guest presses for a rate at any "
+        "point, hold the line: rates are date-specific and confirmed by "
+        "reservations on plus nine four, seven seven, three three five, "
+        "eight eight zero zero.\n"
+        "- Once the guest has picked a room and confirmed they are happy "
         "to proceed, begin collecting their personal details, ONE "
         "question at a time, in this order: full name (no salutation), "
         "then mobile number. Do NOT ask for an email address at any "
@@ -702,11 +754,12 @@ def _build_system_prompt(lang: str = "en") -> str:
         "perks and then go silent â€” that leaves the caller hanging. If "
         "you have just surfaced available rooms, end with 'which would "
         "you like to proceed with?'. If the guest has picked a room, end "
-        "with 'shall I go ahead and book Sunrise Vista for you?' (or the "
-        "chosen room). If the guest has confirmed they want to proceed, "
-        "end with 'may I have your full name please?'. Mentions of "
-        "complimentary activities, advance-payment notes, and honeymoon "
-        "perks belong in a SHORT prefix before the question â€” not as the "
+        "with 'shall I go ahead and book the Family Suite at Mosvold Villa "
+        "for you?' (or the chosen room at the chosen property). If the "
+        "guest has confirmed they want to proceed, "
+        "end with 'may I have your full name please?'. Notes about the "
+        "deposit, cancellation terms or check-in times belong in a SHORT "
+        "prefix before the question â€” not as the "
         "final sentence. The only exceptions are the post-create_booking "
         "reference read-back and the closing line at the very end of the "
         "call.\n"
@@ -714,9 +767,10 @@ def _build_system_prompt(lang: str = "en") -> str:
         "available=true for the chosen room and dates in this same call AND the "
         "guest has confirmed they want to proceed.\n"
         "- Before calling create_booking, read back the full booking summary "
-        "(residency, guest name, dates, room, number of guests, mobile) and "
-        "get explicit confirmation (e.g. 'shall I confirm this booking?'). "
-        "Only after the guest says yes, call create_booking.\n"
+        "(property, residency, guest name, dates, room, number of guests, "
+        "mobile) and get explicit confirmation (e.g. 'shall I confirm this "
+        "booking?'). The property MUST be named in the read-back. Only after "
+        "the guest says yes, call create_booking.\n"
         "- When create_booking returns success=true, confirm the booking "
         "is done, read the booking reference number once, and tell them "
         "they will also receive a WhatsApp confirmation shortly with all "
@@ -724,19 +778,32 @@ def _build_system_prompt(lang: str = "en") -> str:
         "- If create_booking returns an error or times out, apologise and tell "
         "the guest the hotel will call them back to confirm the booking. Do "
         "NOT retry create_booking automatically.\n"
-        "- Always mention that nature walks, night walks, and stargazing are "
-        "complimentary for stays of 2 or more nights.\n"
-        "- If April or December dates are mentioned, note that 50% advance "
-        "payment is required.\n"
-        "- HONEYMOON / ANNIVERSARY UPSELL: if the guest mentions a "
-        "honeymoon, anniversary, birthday celebration, or proposal, you "
-        "MUST in your VERY NEXT sentence mention our complimentary "
-        "candlelit dinner package and offer to add it to the booking. "
-        "Do not save this for later â€” say it immediately after "
-        "congratulating them. Example: 'Congratulations! For honeymoon "
-        "stays, we offer a complimentary candlelit dinner â€” would you "
-        "like me to arrange that for one of your nights?' Skipping this "
-        "is a missed opportunity and is not acceptable.\n"
+        "- STAY BASICS you may state plainly (they apply to both "
+        "properties): check-in is at two in the afternoon and check-out is "
+        "at eleven in the morning; early check-in and late check-out are "
+        "subject to availability, so ask the guest to let us know in "
+        "advance. Both hotels are open twenty-four hours.\n"
+        "- DEPOSIT AND CANCELLATION: for direct bookings a deposit of the "
+        "full stay is taken at the time of booking. Cancelling within "
+        "twenty-one days of arrival is charged a quarter of the booking "
+        "value, within fourteen days a half, and within seven days the "
+        "full booking value. Between the fifteenth of December and the "
+        "fifteenth of January, cancellations within twenty-one days of "
+        "arrival are charged the full booking value. No-shows are charged "
+        "the full stay. Promotional rates may carry stricter conditions â€” "
+        "reservations will confirm. State these as proportions in words, "
+        "never as an amount of money.\n"
+        "- BOOKING DIRECT: booking direct with us carries a best rate "
+        "guarantee against the lowest publicly available rate including "
+        "taxes and fees, the most flexible cancellation and amendment "
+        "terms, no hidden charges, and priority handling for modifications "
+        "and special requests. Say this in words only â€” never attach a "
+        "figure or a percentage saving to it.\n"
+        "- CELEBRATIONS: if the guest mentions a honeymoon, anniversary, "
+        "birthday or proposal, congratulate them warmly and offer to note "
+        "it on the booking so the team can look after them. Do NOT invent "
+        "or promise any package, perk, dinner, upgrade or inclusion â€” "
+        "offer to have reservations confirm what can be arranged.\n"
         "- Be empathetic and attentive. If a guest seems frustrated, acknowledge "
         "their feelings.\n"
         "- THREE-STRIKES EXIT: if you have asked the same clarifying question "
@@ -744,8 +811,8 @@ def _build_system_prompt(lang: str = "en") -> str:
         "clearly off-topic, abusive, or testing the system, do NOT keep "
         "engaging. Politely say something like 'It seems we're having "
         "trouble connecting today â€” please feel free to call back when "
-        "you're ready to make a booking. Thank you for calling Treehouse "
-        "Chalets.' Then stop. Do not keep repeating the question.\n"
+        "you're ready to make a booking. Thank you for calling Mosvold "
+        "Boutique Hotels.' Then stop. Do not keep repeating the question.\n"
         "- If you do not have enough information to use a tool, ask the guest "
         "for the missing details.\n"
         "- Do not try to collect the caller's name early. The name is only "
@@ -894,7 +961,7 @@ def _history_to_gemini(history: list[dict]) -> list[dict]:
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle for the FastAPI application."""
     # --- Startup ---
-    logger.info("Starting Treehouse Chalets Voice Agent server...")
+    logger.info("Starting Mosvold Boutique Hotels Voice Agent server...")
 
     # Initialize knowledge base
     logger.info("Initializing knowledge base from '%s'...", KB_DOCS_DIRECTORY)
@@ -942,7 +1009,12 @@ async def lifespan(app: FastAPI):
             "[handoff] Twilio REST client NOT configured â€” handoff will fail"
         )
 
-    logger.info("Server startup complete. eZee configured: %s", is_configured())
+    # NOTE: the booking integration below is still the eZee/n8n path inherited
+    # from the previous deployment. Mosvold books through BookingEye
+    # (per-property: Mosvold Villa and Sundara are distinct property ids), so
+    # booking_api.py / tools.py still need to be re-wired to BookingEye by a
+    # human. No room ids are invented here; the call sites are left intact.
+    logger.info("Server startup complete. Booking backend configured: %s", is_configured())
 
     yield
 
@@ -956,7 +1028,7 @@ async def lifespan(app: FastAPI):
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Treehouse Chalets Voice Agent (Kavya)",
+    title="Mosvold Boutique Hotels Voice Agent (Kavya)",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -1056,7 +1128,7 @@ async def voice_incoming(request: Request) -> Response:
         gather = (
             f'  <Gather numDigits="1" action="https://{host}/voice/language-selected"'
             ' method="POST" timeout="6">\n'
-            '    <Say voice="Polly.Joanna">Welcome to Treehouse Chalets. '
+            '    <Say voice="Polly.Joanna">Welcome to Mosvold Boutique Hotels. '
             'For English, press 1.</Say>\n'
             '    <Say voice="Polly.Zeina">للغة العربية، اضغط اثنين.</Say>\n'
             '    <Say voice="Google.si-LK-Standard-A" language="si-LK">'

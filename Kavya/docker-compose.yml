@@ -1,5 +1,5 @@
 # ============================================================
-# Docker Compose — Kavya Voice Agent (Treehouse Chalets)
+# Docker Compose — Kavya Voice Agent (Mosvold Boutique Hotels)
 # ============================================================
 # Runs the production server (server.py) behind Twilio
 # ConversationRelay with Claude streaming + ElevenLabs TTS.

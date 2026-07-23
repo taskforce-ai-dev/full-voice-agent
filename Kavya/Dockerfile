@@ -1,5 +1,5 @@
 # =============================================================================
-# Dockerfile — Kavya Voice Agent (Treehouse Chalets)
+# Dockerfile — Kavya Voice Agent (Mosvold Boutique Hotels)
 # =============================================================================
 # Production image for the FastAPI voice agent.
 # Build:  docker build -t kavya-voice-agent .
