@@ -7,16 +7,19 @@
 -- Prefer mosvoldData.ts (the app-native seed) when possible; this SQL is the
 -- decoupled fallback for seeding a fresh DB without rebuilding the app.
 --
--- COLUMN CASING: the Sequelize model uses camelCase attributes and tableName
--- 'room_types' with NO `underscored: true`, so the physical columns are
--- `basePrice`, `maxOccupancy`, `isActive`, `createdAt`, `updatedAt`. Confirm with
+-- COLUMN CASING: the models declare camelCase attributes, but
+-- backend/src/config/database.ts sets a GLOBAL
+--   define: { timestamps: true, underscored: true }
+-- so the physical columns are snake_case: `base_price`, `max_occupancy`,
+-- `is_active`, `created_at`, `updated_at` (and in `rooms`: `room_number`,
+-- `room_type_id`, `housekeeping_status`). Confirm with
 --   SHOW COLUMNS FROM room_types;
--- before running, in case the target instance enabled underscored columns.
+-- before running, in case the target instance differs.
 --
 -- Room-type names MUST match Kavya's ROOM_TYPES_BY_PROPERTY byte-for-byte —
 -- property identity is derived from the name (this schema has no property column).
 
-INSERT INTO room_types (name, code, description, basePrice, maxOccupancy, isActive, createdAt, updatedAt) VALUES
+INSERT INTO room_types (name, code, description, base_price, max_occupancy, is_active, created_at, updated_at) VALUES
   -- Mosvold Villa (Ahangama)
   ('Deluxe Double Room',                  'MV-DDR', 'Mosvold Villa, Ahangama',   0, 2, 1, NOW(), NOW()),
   ('Deluxe Twin Room',                    'MV-DTR', 'Mosvold Villa, Ahangama',   0, 2, 1, NOW(), NOW()),
@@ -32,8 +35,8 @@ INSERT INTO room_types (name, code, description, basePrice, maxOccupancy, isActi
   ('Default Unmapped Room',               'DUR',    'Unmapped',                  0, 0, 1, NOW(), NOW());
 
 -- One bookable physical room per type (so availability is non-empty). Adjust the
--- roomTypeId sub-selects if your codes differ.
-INSERT INTO rooms (roomNumber, roomTypeId, floor, status, housekeepingStatus, createdAt, updatedAt) VALUES
+-- room_type_id sub-selects if your codes differ.
+INSERT INTO rooms (room_number, room_type_id, floor, status, housekeeping_status, created_at, updated_at) VALUES
   ('MV Deluxe Double 01',  (SELECT id FROM room_types WHERE code='MV-DDR'), 1, 'available', 'clean', NOW(), NOW()),
   ('MV Deluxe Twin 01',    (SELECT id FROM room_types WHERE code='MV-DTR'), 1, 'available', 'clean', NOW(), NOW()),
   ('MV Family Suite 01',   (SELECT id FROM room_types WHERE code='MV-FAM'), 1, 'available', 'clean', NOW(), NOW()),

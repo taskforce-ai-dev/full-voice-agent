@@ -19,9 +19,34 @@ BACKUP="/root/pms-pre-mosvold-${STAMP}.sql"
 [ -f "$SQL" ] || { echo "ERROR: missing $SQL" >&2; exit 1; }
 
 echo "== Database: $DB"
+
+# ---- Pre-flight: confirm the column casing before touching anything -------
+# The models use camelCase attributes but config/database.ts sets a global
+# `underscored: true`, so the real columns are snake_case. Verify rather than
+# assume — a mismatch here is what makes the migration fail halfway.
+echo
+echo "== Schema check:"
+COLS="$(mysql -N -B "$DB" -e "
+  SELECT COLUMN_NAME FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'room_types';")"
+printf '   room_types columns: %s\n' "$(echo "$COLS" | tr '\n' ' ')"
+
+MISSING=""
+for c in base_price max_occupancy is_active created_at updated_at; do
+  printf '%s\n' "$COLS" | grep -qx "$c" || MISSING="$MISSING $c"
+done
+if [ -n "$MISSING" ]; then
+  echo "ERROR: expected snake_case column(s) not found:$MISSING" >&2
+  echo "       This DB uses a different casing than the migration assumes." >&2
+  echo "       Run 'SHOW COLUMNS FROM room_types;' and adjust the .sql files." >&2
+  echo "       Nothing has been modified." >&2
+  exit 1
+fi
+echo "   OK — snake_case columns confirmed, no changes made yet."
+
 echo
 echo "== BEFORE:"
-mysql "$DB" -e "SELECT id, name, code, maxOccupancy FROM room_types ORDER BY id;"
+mysql "$DB" -e "SELECT id, name, code, base_price, max_occupancy FROM room_types ORDER BY id;"
 
 echo
 echo "== Backing up room_types, rooms, reservations -> $BACKUP"
@@ -35,13 +60,13 @@ mysql "$DB" < "$SQL"
 
 echo
 echo "== AFTER:"
-mysql "$DB" -e "SELECT id, name, code, maxOccupancy FROM room_types ORDER BY id;"
+mysql "$DB" -e "SELECT id, name, code, base_price, max_occupancy FROM room_types ORDER BY id;"
 
 echo
 echo "== Bookable rooms per type (any type showing 0 will report no availability):"
 mysql "$DB" -e "
   SELECT rt.name, COUNT(r.id) AS rooms
-  FROM room_types rt LEFT JOIN rooms r ON r.roomTypeId = rt.id
+  FROM room_types rt LEFT JOIN rooms r ON r.room_type_id = rt.id
   GROUP BY rt.id ORDER BY rt.id;"
 
 echo
