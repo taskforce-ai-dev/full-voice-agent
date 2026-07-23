@@ -1,4 +1,23 @@
-# Mosvold PMS — isolated demo instance runbook
+# Mosvold PMS — runbook
+
+> **STATUS 2026-07-23 — the isolated instance below was NOT used.**
+> Treehouse was confirmed retired, so the existing `yanolja_pms` database was
+> renamed in place instead (`apply_rename.sh` → `rename_to_mosvold.sql`).
+> That removed the need for a second DB, a second PM2 process on :5001, a new
+> vhost/DNS/cert, and any `YANOLJA_BASE_URL` override — `yanolja_client.py`
+> already defaults to `https://yanolja.taskforceai.tech/api`.
+>
+> Verified live through Kavya's own code path: 9 Mosvold room types, each
+> resolving to the correct property, no Treehouse names; per-property
+> availability correct; create/cancel round-trip succeeded at BOTH properties;
+> cross-property and wrong-property room requests refused. Backup of the
+> pre-rename state: `/root/pms-pre-mosvold-20260723-093933.sql`.
+> Roll back with `rollback_to_treehouse.sql` or that dump.
+>
+> The sections below are retained only for the case where Treehouse is revived
+> and Mosvold genuinely needs its own separate instance.
+
+## (Unused) isolated demo instance
 
 Goal: give the Mosvold Kavya demo its own booking backend, with **zero impact on
 the live Treehouse Kavya** that runs against the shared `yanolja_pms` database.
