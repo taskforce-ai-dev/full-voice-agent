@@ -4,22 +4,35 @@ import asyncio, json, sys, websockets
 URL = "wss://treehouse.taskforceai.tech/ws/conversation?lang=en"
 
 async def ask(ws, text, label):
+    """Send one guest turn and collect Kavya's reply.
+
+    A turn can produce MORE than one `last: true` message: before running a
+    tool she emits a filler ("Let me check that for you") with last=true, then
+    speaks the real answer once the tool returns. Stopping at the first
+    last=true therefore truncates the turn — it once reported a booking as
+    failed when the reservation had in fact been created. So after the first
+    complete utterance, keep listening on a short grace timeout and append
+    anything further.
+    """
     await ws.send(json.dumps({"type": "prompt", "voicePrompt": text}))
-    out = []
+    parts, out = [], []
+    timeout = 75
     try:
         while True:
-            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=75))
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
             if msg.get("type") == "text":
                 out.append(msg.get("token", ""))
                 if msg.get("last"):
-                    reply = "".join(out).strip()
-                    if reply:
-                        print(f"\nGUEST: {text}\nKAVYA: {reply}\n" + "-" * 70)
-                        return reply
+                    chunk = "".join(out).strip()
                     out = []
+                    if chunk:
+                        parts.append(chunk)
+                        timeout = 20   # grace window for a post-tool follow-up
     except asyncio.TimeoutError:
-        print(f"\nGUEST: {text}\nKAVYA: <timeout>\n" + "-" * 70)
-        return ""
+        pass
+    reply = " ".join(parts).strip()
+    print(f"\nGUEST: {text}\nKAVYA: {reply or '<timeout>'}\n" + "-" * 70)
+    return reply
 
 async def main():
     async with websockets.connect(URL, open_timeout=30) as ws:
