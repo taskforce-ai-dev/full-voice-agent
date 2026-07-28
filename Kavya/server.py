@@ -507,7 +507,7 @@ def _build_system_prompt(lang: str = "en") -> str:
 
     # Rates. Two mutually exclusive regimes, switched by DEMO_RATES_ENABLED
     # (see yanolja_service.DEMO_NIGHTLY_RATE_USD). Demo mode lets Kavya quote
-    # the indicative demo rate card for client demonstrations; the default-off
+    # the demo rate card for client demonstrations; the default-off
     # regime is the original "we publish no rates" behaviour. The KB carries
     # matching wording, so flip both together — the env var is the kill switch.
     if yanolja_service.DEMO_RATES_ENABLED:
@@ -519,9 +519,10 @@ def _build_system_prompt(lang: str = "en") -> str:
             "- You MAY quote the rates given in the hotel information in "
             "context, and the rate returned by the check_availability tool. "
             "Say figures as words, e.g. 'seven hundred US dollars'.\n"
-            "- ALWAYS frame a rate as indicative and confirmed on booking, "
-            "e.g. 'that's indicative for those dates and confirmed when we "
-            "book'. Never present a figure as a final invoice total.\n"
+            "- State rates plainly and confidently, e.g. 'the Deluxe Double "
+            "Room is seven hundred US dollars per room per night'. Do NOT "
+            "hedge, and do NOT call a rate indicative, approximate, "
+            "provisional or subject to change.\n"
             "- NEVER invent a rate for anything not priced in your context. If "
             "asked the price of an upgrade, supplement, experience, transfer, "
             "meal or package, say you do not have that figure to hand and offer "
@@ -568,19 +569,18 @@ def _build_system_prompt(lang: str = "en") -> str:
     # Claude follows the stricter one.
     if yanolja_service.DEMO_RATES_ENABLED:
         tool_rate_clause = (
-            "whether it is available and its indicative nightly rate; never "
+            "whether it is available and its nightly rate; never "
             "quote a capacity or feature"
         )
         avail_price_clause = (
-            "Give the indicative nightly rate alongside each available room "
-            "name, in US dollars per room per night."
+            "Whenever you do name a room, give its nightly rate with it, in "
+            "US dollars per room per night."
         )
         rate_press_clause = (
-            "- If the guest presses for a total, multiply the nightly rate by "
-            "the number of nights and give it as indicative, confirmed on "
-            "booking. For anything you have no figure for, offer reservations "
-            "on plus nine four, seven seven, three three five, eight eight "
-            "zero zero.\n"
+            "- If the guest asks for a total, multiply the nightly rate by "
+            "the number of nights and state it plainly. For anything you have "
+            "no figure for, offer reservations on plus nine four, seven seven, "
+            "three three five, eight eight zero zero.\n"
         )
     else:
         tool_rate_clause = (
@@ -732,10 +732,15 @@ def _build_system_prompt(lang: str = "en") -> str:
         "EXACTLY ONCE. Never call it before the property is established. "
         "NEVER pass a room_type filter, even if the guest already "
         "mentioned a room they like â€” the tool returns ALL room types in "
-        "one response. After that single call, read the response and "
-        "surface every available type in one sentence, e.g. 'The Family "
-        "Suite and the Founders Suite are available at Mosvold Villa for "
-        "those dates â€” which would you prefer?' Discard and re-ask if any "
+        "one response. After that single call, read the response. If the "
+        "guest has ALREADY named the room they want, just confirm THAT room "
+        "is free and move straight on to booking, e.g. 'The Deluxe Double "
+        "Room is available for those dates.' Do NOT re-list the other room "
+        "types and do NOT ask again which room they want. Only when the "
+        "guest has not yet chosen a room do you surface every available "
+        "type in one sentence, e.g. 'The Family Suite and the Founders "
+        "Suite are available at Mosvold Villa for those dates â€” which would "
+        "you prefer?' Discard and re-ask if any "
         "returned room name does not belong to the chosen property. "
         "Calling check_availability a second time in the "
         "same booking flow (e.g. once per room type, or because the "
@@ -743,9 +748,11 @@ def _build_system_prompt(lang: str = "en") -> str:
         "their dates or pax. If the guest just picks a different room "
         "from the list you already have, do NOT call the tool again â€” "
         "you already know the answer.\n"
-        "- After check_availability returns, share the available room names "
-        "for the chosen property with the guest and ask which room they "
-        f"would like. {avail_price_clause}\n"
+        "- NEVER re-ask a question the guest has already answered, and never "
+        "re-list options they have already chosen from. If they have named "
+        "their room, treat it as settled: confirm it is available and "
+        "proceed. Only ask which room they would like when they genuinely "
+        f"have not said. {avail_price_clause}\n"
         "- NEVER ask whether the guest is a Sri Lankan resident or a "
         "foreign guest. It is not required to complete a booking, so do "
         "not raise it and do not treat it as a step you are waiting on. "

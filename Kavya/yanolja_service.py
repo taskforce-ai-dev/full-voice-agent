@@ -116,7 +116,7 @@ ROOM_TYPE_PROPERTY: dict[str, str] = {
 ALL_ROOM_TYPES: tuple[str, ...] = tuple(ROOM_TYPE_PROPERTY)
 
 # --------------------------------------------------------------------------- #
-# DEMO RATES — indicative pricing for client demonstrations
+# DEMO RATES — demo pricing for client demonstrations
 # --------------------------------------------------------------------------- #
 # Mosvold publishes no real rate card. These figures are INVENTED for demos so
 # Kavya can quote a price and the PMS folio total is non-zero. They are NOT a
@@ -146,7 +146,7 @@ DEMO_NIGHTLY_RATE_USD: dict[str, int] = {
 
 
 def demo_rate_for(room_type_name: str) -> Optional[int]:
-    """Indicative USD nightly rate for a canonical room name, or None.
+    """Demo USD nightly rate for a canonical room name, or None.
 
     Returns None when demo rates are disabled or the name is unknown, so every
     caller degrades to the original no-rate behaviour rather than guessing.
@@ -466,7 +466,7 @@ async def derive_availability(
     # The booking backend is consulted ONLY for availability and booking creation.
     # Room descriptions come from the KB. We strip everything but the available
     # flag, the room name, and the owning property — plus, when DEMO_RATES_ENABLED
-    # is on, the indicative demo rate from DEMO_NIGHTLY_RATE_USD. The PMS itself
+    # is on, the demo rate from DEMO_NIGHTLY_RATE_USD. The PMS itself
     # is not the rate source; see the DEMO RATES block at the top of this module.
     out_rooms: list[dict] = []
     available_count = 0
@@ -490,8 +490,7 @@ async def derive_availability(
     if DEMO_RATES_ENABLED:
         rates_note = (
             "Rates are per room per night in US dollars, bed and breakfast, "
-            "including taxes. They are indicative for the dates given and are "
-            f"confirmed on booking. Reservations: {RESERVATIONS_PHONE}."
+            f"including taxes. Reservations: {RESERVATIONS_PHONE}."
         )
     else:
         rates_note = (
@@ -658,7 +657,9 @@ async def book(
         result["total_usd"] = rate * nights
         result["rates_note"] = (
             f"US dollars {rate} per room per night, bed and breakfast, including "
-            f"taxes. Total for {nights} night(s): US dollars {rate * nights}. "
+            f"taxes. Total for {nights} "
+            f"{'night' if nights == 1 else 'nights'}: "
+            f"US dollars {rate * nights}. "
             f"Reservations: {RESERVATIONS_PHONE}."
         )
     else:
