@@ -5,9 +5,9 @@ operates two properties: **Mosvold Villa** (Ahangama) and **Sundara by Mosvold**
 She handles reservations and guest queries over Twilio, answers from a ChromaDB knowledge base,
 and checks availability / takes bookings against **eZee Absolute PMS** via n8n webhooks.
 
-- **Languages:** IVR/DTMF menu — `1` English, `2` Arabic, `3` Sinhala (Tamil implemented but unlisted)
+- **Languages:** **English only** (since 2026-07-28). Sinhala and Arabic were removed from the IVR; their code paths (plus Tamil) are still in `server.py` but no DTMF digit routes to them and `/ws/media-stream/{si,ar}` refuses the connection.
 - **LLM:** configurable — Claude (default) / OpenAI / Gemini, with tool use
-- **Telephony/TTS:** Twilio; English → ConversationRelay + ElevenLabs, Arabic/Tamil → Media Streams + ElevenLabs, Sinhala → OpenAI `gpt-4o-mini-tts`
+- **Telephony/TTS:** Twilio; English → ConversationRelay + ElevenLabs. (Dormant: Arabic/Tamil → Media Streams + ElevenLabs, Sinhala → OpenAI `gpt-4o-mini-tts`)
 - **STT:** Google Cloud Speech (Media Streams paths)
 - **Server:** FastAPI / uvicorn — host port `127.0.0.1:8000`
 

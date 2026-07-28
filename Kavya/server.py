@@ -279,9 +279,12 @@ SLOW_RESPONSE_FILLERS: dict[str, str] = {
 IVR_MENU_ENABLED: bool = os.getenv("IVR_MENU_ENABLED", "false").lower() == "true"
 
 # Maps DTMF digit â†’ language code
-# Menu currently offers English (ConversationRelay) and Arabic (Media Streams).
-# Sinhala/Tamil remain fully implemented below but are not surfaced in the menu.
-DIGIT_TO_LANG: dict[str, str] = {"1": "en", "2": "ar", "3": "si"}
+# English-only line. Sinhala and Arabic were removed from the menu on
+# 2026-07-28; Sinhala/Tamil/Arabic code paths remain fully implemented below
+# but no digit routes to them. To re-expose one, add its digit here and a
+# matching <Say> prompt in /voice/incoming, and re-add it to the
+# ws_media_stream guard.
+DIGIT_TO_LANG: dict[str, str] = {"1": "en"}
 
 # Per-language ConversationRelay TwiML configuration
 LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
@@ -1115,10 +1118,11 @@ async def voice_incoming(request: Request) -> Response:
     cr = _build_conversation_relay_twiml(host, "en", en)
 
     # IVR language menu (IVR_MENU_ENABLED=true only): 1 = English
-    # (ConversationRelay), 2 = Arabic (Media Streams), 3 = Sinhala. If the
-    # caller presses nothing, fall through to the English agent. With the menu
-    # disabled (default) the <Gather> is omitted, so every call connects
-    # straight to the English agent below.
+    # (ConversationRelay). Sinhala and Arabic were removed on 2026-07-28, so
+    # English is the only option and any other digit falls back to it. With the
+    # menu disabled (the default) the <Gather> is omitted entirely and every
+    # call connects straight to the English agent below â€” which is the
+    # preferred setting now that there is only one language.
     gather = ""
     if IVR_MENU_ENABLED:
         gather = (
@@ -1126,9 +1130,6 @@ async def voice_incoming(request: Request) -> Response:
             ' method="POST" timeout="6">\n'
             '    <Say voice="Polly.Joanna">Welcome to Mosvold Boutique Hotels. '
             'For English, press 1.</Say>\n'
-            '    <Say voice="Polly.Zeina">للغة العربية، اضغط اثنين.</Say>\n'
-            '    <Say voice="Google.si-LK-Standard-A" language="si-LK">'
-            'සිංහල සඳහා, තුන ඔබන්න.</Say>\n'
             "  </Gather>\n"
         )
 
@@ -1145,7 +1146,7 @@ async def voice_incoming(request: Request) -> Response:
     logger.info(
         "Incoming call from %s - %s",
         request.headers.get("x-forwarded-for", "unknown"),
-        "presenting EN/AR/SI language menu" if IVR_MENU_ENABLED
+        "presenting English-only language menu" if IVR_MENU_ENABLED
         else "IVR menu disabled, connecting straight to English agent",
     )
 
@@ -1161,8 +1162,9 @@ async def voice_language_selected(request: Request) -> Response:
     """Handle the caller's DTMF language selection.
 
     English (1) â†’ ConversationRelay TwiML (ElevenLabs TTS, text-in/text-out).
-    Sinhala (2) / Tamil (3) â†’ Media Streams TwiML (Azure TTS, Google STT,
-    full audio control).
+    Every other digit falls back to English: DIGIT_TO_LANG maps only "1"
+    since Sinhala and Arabic were removed (2026-07-28). The Media Streams
+    branch below is kept for whenever a non-English language is re-added.
     """
     form = await request.form()
     digit = str(form.get("Digits", "1"))
@@ -1189,7 +1191,8 @@ async def voice_language_selected(request: Request) -> Response:
         )
         mode = "ConversationRelay"
     else:
-        # Sinhala / Tamil â€” Media Streams with Azure TTS + Google STT
+        # Non-English â€” Media Streams with Google STT + per-language TTS.
+        # Unreachable while DIGIT_TO_LANG is English-only; kept for re-enable.
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
@@ -3599,21 +3602,30 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
 
 
 # ---------------------------------------------------------------------------
-# WebSocket â€” Media Streams handler (Sinhala / Tamil)
+# WebSocket â€” Media Streams handler (non-English languages)
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/media-stream/{lang}")
 async def ws_media_stream(websocket: WebSocket, lang: str):
-    """Handle a Twilio Media Streams WebSocket session for Sinhala or Tamil.
+    """Handle a Twilio Media Streams WebSocket session for a non-English call.
 
     Language is encoded in the URL path (e.g. /ws/media-stream/si) so it
     is always present â€” avoids unreliable query-string passing by Twilio.
 
     Receives raw mulaw 8 kHz audio from Twilio, runs Google Cloud STT,
     sends Claude responses through Azure TTS back as mulaw audio.
+
+    Sinhala ("si") and Arabic ("ar") were removed from this guard on
+    2026-07-28 along with their IVR digits, so those paths now refuse the
+    connection instead of serving a call. Re-add them here to re-enable.
     """
-    if lang not in ("si", "ta", "ar"):
-        lang = "si"
+    if lang not in ("ta",):
+        logger.warning(
+            "Rejecting Media Streams connection for disabled language %r", lang
+        )
+        await websocket.accept()
+        await websocket.close(code=1008, reason="Language not available")
+        return
 
     anthropic_client = None
     openai_client = None
