@@ -20,10 +20,11 @@ Mirrors the public API of kpms_service.py. booking_api.py consumes:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any
+from typing import Any, Optional
 
 from yanolja_client import (
     YanoljaError,
@@ -113,6 +114,46 @@ ROOM_TYPE_PROPERTY: dict[str, str] = {
 }
 
 ALL_ROOM_TYPES: tuple[str, ...] = tuple(ROOM_TYPE_PROPERTY)
+
+# --------------------------------------------------------------------------- #
+# DEMO RATES — indicative pricing for client demonstrations
+# --------------------------------------------------------------------------- #
+# Mosvold publishes no real rate card. These figures are INVENTED for demos so
+# Kavya can quote a price and the PMS folio total is non-zero. They are NOT a
+# real rate card and must not be presented to actual guests as firm quotes.
+#
+# Kill switch: set DEMO_RATES_ENABLED=false and Kavya reverts to the original
+# "rates are date-dependent, reservations will confirm" behaviour — the numbers
+# below stop being surfaced in tool results and the system prompt re-forbids
+# quoting figures. Keep in sync with room_types.base_price in the PMS (see
+# ops/mosvold-pms/set_demo_rates.sql) or the folio total will disagree with
+# what Kavya says on the call.
+DEMO_RATES_ENABLED: bool = os.getenv("DEMO_RATES_ENABLED", "true").lower() == "true"
+
+DEMO_NIGHTLY_RATE_USD: dict[str, int] = {
+    # Mosvold Villa (Ahangama)
+    "Deluxe Double Room": 700,
+    "Deluxe Twin Room": 700,
+    "Family Suite": 820,
+    "Founders Suite": 900,
+    # Sundara by Mosvold (Balapitiya)
+    "Deluxe Double Room with Garden View": 700,
+    "Deluxe Double Room with Sea View": 760,
+    "Deluxe Twin Room with Sea View": 760,
+    "Beach Villa": 880,
+    "Family Villa with Pool": 900,
+}
+
+
+def demo_rate_for(room_type_name: str) -> Optional[int]:
+    """Indicative USD nightly rate for a canonical room name, or None.
+
+    Returns None when demo rates are disabled or the name is unknown, so every
+    caller degrades to the original no-rate behaviour rather than guessing.
+    """
+    if not DEMO_RATES_ENABLED:
+        return None
+    return DEMO_NIGHTLY_RATE_USD.get(room_type_name)
 
 # Every name Kavya may speak, across both properties. Flat tuple, matching
 # kpms_service.KAVYA_VOCAB so the constant means the same shape in both modules.
@@ -423,11 +464,10 @@ async def derive_availability(
             available_type_ids.add(rtid)
 
     # The booking backend is consulted ONLY for availability and booking creation.
-    # Room descriptions come from the KB. Rates are NEVER returned here: Mosvold
-    # publishes no rates, they are served live per check-in/check-out date by the
-    # external booking engine. Any figure emitted here would be fabricated — price
-    # questions go to reservations on RESERVATIONS_PHONE. So we strip everything but
-    # the available flag, the room name, and the owning property.
+    # Room descriptions come from the KB. We strip everything but the available
+    # flag, the room name, and the owning property — plus, when DEMO_RATES_ENABLED
+    # is on, the indicative demo rate from DEMO_NIGHTLY_RATE_USD. The PMS itself
+    # is not the rate source; see the DEMO RATES block at the top of this module.
     out_rooms: list[dict] = []
     available_count = 0
     for rt in types_to_check:
@@ -436,11 +476,28 @@ async def derive_availability(
         is_available = type_id in available_type_ids
         if is_available:
             available_count += 1
-        out_rooms.append({
+        room_entry = {
             "room_type_name": display_name,
             "property": _property_of(rt),
             "available": is_available,
-        })
+        }
+        rate = demo_rate_for(display_name)
+        if rate is not None:
+            room_entry["rate_per_night_usd"] = rate
+            room_entry["total_usd"] = rate * nights
+        out_rooms.append(room_entry)
+
+    if DEMO_RATES_ENABLED:
+        rates_note = (
+            "Rates are per room per night in US dollars, bed and breakfast, "
+            "including taxes. They are indicative for the dates given and are "
+            f"confirmed on booking. Reservations: {RESERVATIONS_PHONE}."
+        )
+    else:
+        rates_note = (
+            "No rates are quoted here. Rates depend on the dates chosen and are "
+            f"confirmed by reservations on {RESERVATIONS_PHONE}."
+        )
 
     return {
         "check_in": check_in,
@@ -450,10 +507,7 @@ async def derive_availability(
         "total_room_types": len(scoped_types),
         "available_room_types": available_count,
         "rooms": out_rooms,
-        "rates_note": (
-            "No rates are quoted here. Rates depend on the dates chosen and are "
-            f"confirmed by reservations on {RESERVATIONS_PHONE}."
-        ),
+        "rates_note": rates_note,
     }
 
 
@@ -586,7 +640,7 @@ async def book(
     # Invalidate rooms cache so next call sees fresh status
     _cache_invalidate("rooms")
 
-    return {
+    result = {
         "success": True,
         "booking_reference": str(booking_ref),
         "guest_name": guest_name,
@@ -596,11 +650,24 @@ async def book(
         "room_type": display_room_type,
         "room_number": room.get("roomNumber", ""),
         "nights": nights,
-        "rates_note": (
+    }
+
+    rate = demo_rate_for(display_room_type)
+    if rate is not None:
+        result["rate_per_night_usd"] = rate
+        result["total_usd"] = rate * nights
+        result["rates_note"] = (
+            f"US dollars {rate} per room per night, bed and breakfast, including "
+            f"taxes. Total for {nights} night(s): US dollars {rate * nights}. "
+            f"Reservations: {RESERVATIONS_PHONE}."
+        )
+    else:
+        result["rates_note"] = (
             "No rate is quoted here. The total depends on the dates and is confirmed "
             f"by reservations on {RESERVATIONS_PHONE}."
-        ),
-    }
+        )
+
+    return result
 
 
 # --------------------------------------------------------------------------- #

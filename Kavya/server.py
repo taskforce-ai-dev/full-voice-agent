@@ -72,6 +72,10 @@ from twilio.rest import Client as TwilioRestClient
 from knowledge_base import retrieve_context, initialize_kb, prewarm, reload_kb_from_content
 from tools import get_tools, get_tools_openai, get_tools_gemini, execute_tool
 from booking_api import close_session, is_configured
+# Imported for DEMO_RATES_ENABLED so the system prompt and the tool results
+# agree on whether rates may be quoted. Already loaded transitively via
+# booking_api; the explicit import keeps the single source of truth visible.
+import yanolja_service
 from post_call import process_post_call_data
 
 try:
@@ -501,6 +505,95 @@ def _build_system_prompt(lang: str = "en") -> str:
     else:
         handoff_rules = ""
 
+    # Rates. Two mutually exclusive regimes, switched by DEMO_RATES_ENABLED
+    # (see yanolja_service.DEMO_NIGHTLY_RATE_USD). Demo mode lets Kavya quote
+    # the indicative demo rate card for client demonstrations; the default-off
+    # regime is the original "we publish no rates" behaviour. The KB carries
+    # matching wording, so flip both together — the env var is the kill switch.
+    if yanolja_service.DEMO_RATES_ENABLED:
+        rates_rules = (
+            "RATES AND PRICING:\n"
+            "- Rates are per room, per night, in US dollars, bed and breakfast, "
+            "including taxes. Always say the currency and say 'per room per "
+            "night' so the guest is not confused.\n"
+            "- You MAY quote the rates given in the hotel information in "
+            "context, and the rate returned by the check_availability tool. "
+            "Say figures as words, e.g. 'seven hundred US dollars'.\n"
+            "- ALWAYS frame a rate as indicative and confirmed on booking, "
+            "e.g. 'that's indicative for those dates and confirmed when we "
+            "book'. Never present a figure as a final invoice total.\n"
+            "- NEVER invent a rate for anything not priced in your context. If "
+            "asked the price of an upgrade, supplement, experience, transfer, "
+            "meal or package, say you do not have that figure to hand and offer "
+            "the reservations number: plus nine four, seven seven, three three "
+            "five, eight eight zero zero.\n"
+            "- Do NOT ask whether the guest is a Sri Lankan resident or a "
+            "foreign guest, and do NOT quote a separate resident rate. If the "
+            "guest raises residency, confirm that resident guests present a "
+            "valid National Identity Card or Sri Lankan passport at check-in.\n"
+            "- For discounts, negotiated rates, long-stay or off-season deals, "
+            "do NOT invent a number â€” treat it as a handoff opportunity.\n\n"
+        )
+    else:
+        rates_rules = (
+            "RATES AND PRICING â€” ABSOLUTE RULE:\n"
+            "- Mosvold does NOT publish room rates. Rates exist only once "
+            "specific check-in and check-out dates are chosen, and they are "
+            "served live by our booking system. You therefore have NO rate "
+            "information.\n"
+            "- NEVER state, estimate, guess, approximate, compare or imply any "
+            "price, rate, amount, currency figure, discount percentage, or "
+            "'from' price â€” for a room, a package, an upgrade, a supplement, "
+            "or an experience. Any number you produce would be invented.\n"
+            "- If the caller asks about price, rates, cost, or value for money, "
+            "say that rates depend on the exact dates and that our reservations "
+            "team will confirm them, and give the reservations number: plus "
+            "nine four, seven seven, three three five, eight eight zero zero. "
+            "Offer to take their dates so the team can come back with the "
+            "rate.\n"
+            "- Do NOT ask whether the guest is a Sri Lankan resident or a "
+            "foreign guest. It is not needed to make a booking. If the guest "
+            "raises it themselves, you may confirm that Sri Lankan resident "
+            "guests present a valid National Identity Card or a Sri Lankan "
+            "passport at check-in, but you may NOT state any resident or "
+            "non-resident figure.\n"
+            "- If the caller asks about current offers, promotions, seasonal "
+            "deals or packages, do NOT describe any offer. Say you would rather "
+            "have reservations confirm what is running for their dates, and "
+            "give the reservations number.\n\n"
+        )
+
+    # Three inline clauses elsewhere in the prompt also assert "you have no
+    # rate". They must switch with the regime above or they contradict it and
+    # Claude follows the stricter one.
+    if yanolja_service.DEMO_RATES_ENABLED:
+        tool_rate_clause = (
+            "whether it is available and its indicative nightly rate; never "
+            "quote a capacity or feature"
+        )
+        avail_price_clause = (
+            "Give the indicative nightly rate alongside each available room "
+            "name, in US dollars per room per night."
+        )
+        rate_press_clause = (
+            "- If the guest presses for a total, multiply the nightly rate by "
+            "the number of nights and give it as indicative, confirmed on "
+            "booking. For anything you have no figure for, offer reservations "
+            "on plus nine four, seven seven, three three five, eight eight "
+            "zero zero.\n"
+        )
+    else:
+        tool_rate_clause = (
+            "whether it is available; never quote a rate, capacity, or feature"
+        )
+        avail_price_clause = "Do NOT quote any price â€” you have none."
+        rate_press_clause = (
+            "- If the guest presses for a rate at any "
+            "point, hold the line: rates are date-specific and confirmed by "
+            "reservations on plus nine four, seven seven, three three five, "
+            "eight eight zero zero.\n"
+        )
+
     # The welcome greeting is delivered by Twilio (English ConversationRelay) or
     # spoken on stream start (Media Streams). Tell Claude not to repeat it,
     # without asserting an English greeting for non-English callers.
@@ -585,28 +678,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         "experiences belong to Mosvold Villa and Balapitiya experiences belong "
         "to Sundara. Never offer one property's experiences to the other.\n\n"
 
-        "RATES AND PRICING â€” ABSOLUTE RULE:\n"
-        "- Mosvold does NOT publish room rates. Rates exist only once specific "
-        "check-in and check-out dates are chosen, and they are served live by "
-        "our booking system. You therefore have NO rate information.\n"
-        "- NEVER state, estimate, guess, approximate, compare or imply any "
-        "price, rate, amount, currency figure, discount percentage, or 'from' "
-        "price â€” for a room, a package, an upgrade, a supplement, or an "
-        "experience. Any number you produce would be invented.\n"
-        "- If the caller asks about price, rates, cost, or value for money, "
-        "say that rates depend on the exact dates and that our reservations "
-        "team will confirm them, and give the reservations number: plus nine "
-        "four, seven seven, three three five, eight eight zero zero. Offer to "
-        "take their dates so the team can come back with the rate.\n"
-        "- Do NOT ask whether the guest is a Sri Lankan resident or a foreign "
-        "guest. It is not needed to make a booking. If the guest raises it "
-        "themselves, you may confirm that Sri Lankan resident guests present a "
-        "valid National Identity Card or a Sri Lankan passport at check-in, "
-        "but you may NOT state any resident or non-resident figure.\n"
-        "- If the caller asks about current offers, promotions, seasonal deals "
-        "or packages, do NOT describe any offer. Say you would rather have "
-        "reservations confirm what is running for their dates, and give the "
-        "reservations number.\n\n"
+        + rates_rules +
 
         "IMPORTANT RULES:\n"
         "- For general questions about room types, amenities, policies, "
@@ -648,7 +720,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         "booking. EVERYTHING ELSE â€” capacity, descriptions, amenities, "
         "policies â€” comes from the hotel information in context (the "
         "knowledge base). The tool result only tells you the room name and "
-        "whether it is available; never quote a rate, capacity, or feature "
+        f"{tool_rate_clause} "
         "from the tool. Only ever use the nine Mosvold room names, and only "
         "for the property they belong to: Mosvold Villa in Ahangama has the "
         "Deluxe Double Room, Deluxe Twin Room, Family Suite and Founders "
@@ -673,15 +745,12 @@ def _build_system_prompt(lang: str = "en") -> str:
         "you already know the answer.\n"
         "- After check_availability returns, share the available room names "
         "for the chosen property with the guest and ask which room they "
-        "would like. Do NOT quote any price â€” you have none.\n"
+        f"would like. {avail_price_clause}\n"
         "- NEVER ask whether the guest is a Sri Lankan resident or a "
         "foreign guest. It is not required to complete a booking, so do "
         "not raise it and do not treat it as a step you are waiting on. "
         "If the guest volunteers it, simply note it and carry on.\n"
-        "- If the guest presses for a rate at any "
-        "point, hold the line: rates are date-specific and confirmed by "
-        "reservations on plus nine four, seven seven, three three five, "
-        "eight eight zero zero.\n"
+        + rate_press_clause +
         "- Once the guest has picked a room and confirmed they are happy "
         "to proceed, begin collecting their personal details, ONE "
         "question at a time, in this order: full name (no salutation), "
