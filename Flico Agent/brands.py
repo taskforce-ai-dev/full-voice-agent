@@ -1,53 +1,68 @@
-"""Brand registry — one agent process serves more than one storefront.
+"""Entry-point registry — one agency, two ways in.
 
-"rodrigo" is the real client on the real phone number. "starproperties" is the
-website Book-a-Demo persona; it shares this server, the retrieval engine and the
-synthetic demo portfolio, but presents a different agency and agent name and has
-NO human consultant to transfer to.
+There is exactly ONE brand now: **Star Properties**, agent **Amaya**. The
+earlier two-brand setup (Rodrigo Realtors on the phone, Star Properties on the
+website demo) was collapsed on the operator's instruction: "forget the
+branding, the only brand is star properties."
 
-The brand key MUST equal the `id` of the matching agent in the website's
-BookDemo.tsx — that id is what Twilio forwards and what Hatton's DEMO_AGENT_HOSTS
-routes on. It was briefly "startproperty" here while the live site already said
-"starproperties", and the mismatch sent every demo call to the hotel agent.
+What is still genuinely different is the **entry point**, and only in one
+respect -- whether a human can be reached:
 
-DEFAULT_BRAND is load-bearing: every pre-existing call site passes only `lang`,
-so the default is what keeps the live phone line byte-identical.
+  starproperties        the live inbound phone line. HUMAN_AGENT_PHONE is
+                        configured, so transfer_to_human is a real capability.
+  starproperties_demo   the website Book-a-Demo call. Nobody is standing behind
+                        it, so the agent must never offer a handoff it cannot
+                        perform.
+
+Both greet as Star Properties and both speak as Amaya. `transfer` is the ONLY
+field that differs, and it is a property of the entry point, not of the brand.
+
+DEFAULT_BRAND is load-bearing: every call site that passes only `lang` resolves
+to the phone entry point, which is the one real callers use.
+
+`starproperties` here is also the agent `id` in the website's BookDemo.tsx and
+the key in Hatton's DEMO_AGENT_HOSTS. Those must agree -- a mismatch between
+this key and the live site's id sent every demo call to the wrong agent on
+2026-07-30. Fetch the website repo and read the live id before changing it.
 
 This module imports NOTHING. The deploy-gating CI job installs only
 pytest/numpy/pydantic and cannot import server, so keeping the registry
 dependency-free is what puts it under the gate.
 """
 
+_AGENCY = "Star Properties"
+_AGENT = "Amaya"
+_GREETING_EN = (
+    "Thank you for calling Star Properties — this is Amaya. "
+    "How can I help you today?"
+)
+
 BRANDS: dict[str, dict] = {
-    "rodrigo": {
-        "agency": "Rodrigo Realtors",
-        "agent": "Fiona",
+    "starproperties": {
+        "agency": _AGENCY,
+        "agent": _AGENT,
+        # Live phone line: HUMAN_AGENT_PHONE is set, so the handoff is real.
         "transfer": True,
         "greeting": {
             # Must stay identical to LANGUAGE_CONFIGS["en"]["welcome_greeting"]
-            # in server.py — test_rodrigo_greeting_matches_language_config pins it.
-            "en": (
-                "You have reached Rodrigo Realtors — you are speaking with "
-                "our virtual property consultant. How can I help you today?"
-            ),
+            # in server.py -- test_phone_greeting_matches_language_config pins it.
+            "en": _GREETING_EN,
         },
     },
-    "starproperties": {
-        "agency": "Star Properties",
-        "agent": "Amaya",
+    "starproperties_demo": {
+        "agency": _AGENCY,
+        "agent": _AGENT,
+        # Website demo: no human behind it. Never offer a transfer.
         "transfer": False,
         "greeting": {
-            "en": (
-                "Thank you for calling Star Properties — this is Amaya. "
-                "How can I help you today?"
-            ),
+            "en": _GREETING_EN,
         },
     },
 }
 
-DEFAULT_BRAND: str = "rodrigo"
+DEFAULT_BRAND: str = "starproperties"
 
 
 def resolve_brand(brand: str | None) -> dict:
-    """Return the brand config, falling back to the default for anything unknown."""
+    """Return the entry-point config, falling back to the default for anything unknown."""
     return BRANDS.get((brand or "").strip().lower(), BRANDS[DEFAULT_BRAND])

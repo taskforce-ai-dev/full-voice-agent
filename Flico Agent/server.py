@@ -119,14 +119,14 @@ STT_PROVIDER: str = os.getenv("STT_PROVIDER", "google").lower()
 # active Sinhala path; resolvable via the shared docker network if revived).
 SINHALA_TTS_URL: str = os.getenv("SINHALA_TTS_URL", "http://sinhala-tts:8000")
 
-# OpenAI gpt-4o-mini-tts -- Fiona's Sinhala voice. Natural prosody, streams
+# OpenAI gpt-4o-mini-tts -- Amaya's Sinhala voice. Natural prosody, streams
 # fast, and handles code-switched English far better than Azure or VITS.
 OPENAI_TTS_URL: str = "https://api.openai.com/v1/audio/speech"
 OPENAI_TTS_MODEL: str = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 OPENAI_TTS_VOICE: str = os.getenv("OPENAI_TTS_VOICE", "nova")
 OPENAI_TTS_INSTRUCTIONS: str = os.getenv(
     "OPENAI_TTS_INSTRUCTIONS",
-    "You are Fiona, a warm and personable young Sri Lankan property consultant "
+    "You are Amaya, a warm and personable young Sri Lankan property consultant "
     "at a real estate agency. Speak in natural, lively conversational "
     "Sinhala with genuine warmth and enthusiasm — smile as you talk. Vary "
     "your pitch and pace naturally: rise with excitement when describing "
@@ -147,7 +147,7 @@ PUBLIC_HOSTNAME: str = os.getenv("PUBLIC_HOSTNAME", "flico.taskforceai.tech").st
 TRANSFER_TOOL: dict = {
     "name": "transfer_to_human",
     "description": (
-        "Transfer the live phone call to a human Rodrigo Realtors consultant. "
+        "Transfer the live phone call to a human Star Properties consultant. "
         "Call this ONLY when the caller explicitly asks to speak to a human, agent, "
         "consultant, manager, or real person, or agrees to be connected to one. Do "
         "not use it for routine property questions you can answer yourself."
@@ -226,7 +226,7 @@ MAX_HISTORY_MESSAGES: int = 20
 # 1.0 -- maximum sampling variance for an agent whose entire job is reciting
 # facts from the reference context faithfully. Every invention we have measured
 # is a low-probability token winning: asked in Sinhala for the cheapest listing,
-# Fiona got the property and rent right and then called it "අසාත්මික රහිත"
+# Amaya got the property and rent right and then called it "අසාත්මික රහිත"
 # (allergen-free) instead of "unfurnished". Lower temperature biases toward the
 # high-probability -- i.e. the grounded -- rendering.
 # Kept above 0 so she still sounds like a person rather than a lookup table.
@@ -245,7 +245,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "tts_provider": "ElevenLabs",
         "voice": "bm3QvaZ3fUSCRBC3UV1f-flash_v2_5",
         "language": "en-US",
-        "welcome_greeting": "You have reached Rodrigo Realtors — you are speaking with our virtual property consultant. How can I help you today?",
+        "welcome_greeting": "Thank you for calling Star Properties — this is Amaya. How can I help you today?",
         "extra_attrs": '        elevenlabsTextNormalization="on"\n',
     },
     "ta": {
@@ -254,7 +254,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "language": "ta-IN",
         "welcome_greeting": (
             "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-            "Rodrigo Realtors \u0B95\u0BCD\u0B95\u0BC1 "
+            "Star Properties \u0B95\u0BCD\u0B95\u0BC1 "
             "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
             "\u0BA8\u0BBE\u0BA9\u0BCD "
             "\u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
@@ -269,7 +269,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "voice": "sinhala-vits",
         "language": "si-LK",
         "welcome_greeting": (
-            "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! \u0D94\u0DB6 Rodrigo Realtors \u0DC0\u0DD9\u0DAD \u0DC3\u0DB8\u0DCA\u0DB6\u0DB1\u0DCA\u0DB0 \u0DC0\u0DD3 \u0DC3\u0DD2\u0DA7\u0DD3. "
+            "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! \u0D94\u0DB6 Star Properties \u0DC0\u0DD9\u0DAD \u0DC3\u0DB8\u0DCA\u0DB6\u0DB1\u0DCA\u0DB0 \u0DC0\u0DD3 \u0DC3\u0DD2\u0DA7\u0DD3. "
             "\u0DB8\u0DB8 \u0DC6\u0DD2\u0DBA\u0DDD\u0DB1\u0DCF, \u0D94\u0DB6\u0D9C\u0DDA \u0D85\u0DAD\u0DAE\u0DCA\u200D\u0DBA \u0DB4\u0DCF\u0DBB\u0DD2\u0DB7\u0DDD\u0D9C\u0DD2\u0D9A \u0DC3\u0DDA\u0DC0\u0DCF \u0DC3\u0DC4\u0DCF\u0DBA\u0DD2\u0D9A\u0DCF\u0DC0. "
             "\u0DB8\u0DB8 \u0D94\u0DB6\u0DA7 \u0D85\u0DAF \u0D9A\u0DD9\u0DC3\u0DDA \u0D8B\u0DAF\u0DC0\u0DCA \u0D9A\u0DC5 \u0DC4\u0DD0\u0D9A\u0DD2\u0DAF?"
         ),
@@ -286,7 +286,7 @@ ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/str
 # Azure voice per language code
 AZURE_VOICES: dict[str, tuple[str, str]] = {
     "ta": ("ta-LK", "ta-LK-SaranyaNeural"),   # female voice
-    "si": ("si-LK", "si-LK-ThiliniNeural"),   # female voice (Fiona)
+    "si": ("si-LK", "si-LK-ThiliniNeural"),   # female voice (Amaya)
 }
 
 # Google STT primary + alternative languages per lang code
@@ -302,10 +302,10 @@ ENDPOINTING_SILENCE: float = 1.5
 
 # Welcome greetings for Media Streams (spoken via TTS on stream start)
 MEDIA_STREAM_WELCOME: dict[str, str] = {
-    "en": "You have reached Rodrigo Realtors. How can I help you today?",
+    "en": "You have reached Star Properties. How can I help you today?",
     "ta": (
         "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-        "Rodrigo Realtors \u0B95\u0BCD\u0B95\u0BC1 "
+        "Star Properties \u0B95\u0BCD\u0B95\u0BC1 "
         "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
         "\u0BA8\u0BBE\u0BA9\u0BCD \u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
         "\u0B8E\u0BAA\u0BCD\u0BAA\u0B9F\u0BBF \u0B89\u0BA4\u0BB5\u0BB2\u0BBE\u0BAE\u0BCD?"
@@ -387,7 +387,7 @@ def _build_system_prompt(lang: str = "en", brand: str = DEFAULT_BRAND) -> str:
             "    apartment -> \u0DB8\u0DC4\u0DBD\u0DCA \u0DB1\u0DD2\u0DC0\u0DCF\u0DC3\u0DBA    commercial property -> \u0DC0\u0DCF\u0DAB\u0DD2\u0DA2 \u0DAF\u0DDA\u0DB4\u0DC5\n"
             "    bedroom -> \u0DB1\u0DD2\u0DAF\u0DB1 \u0D9A\u0DCF\u0DB8\u0DBB\u0DBA    bathroom -> \u0DB1\u0DCF\u0DB1 \u0D9A\u0DCF\u0DB8\u0DBB\u0DBA\n"
             "    perches -> \u0DB4\u0DBB\u0DCA\u0DA0\u0DC3\u0DCA    square feet -> \u0DC0\u0DBB\u0DCA\u0D9C \u0D85\u0DA9\u0DD2\n"
-            "    Rodrigo Realtors -> \u0DBB\u0DDC\u0DA9\u0DCA\u200D\u0DBB\u0DD2\u0D9C\u0DDD \u0DBB\u0DD2\u0DBA\u0DBD\u0DCA\u0DA7\u0DBB\u0DCA\u0DC3\n"
+            "    Star Properties -> say the agency name in English; do NOT transliterate it\n"
             # Furnishing is on nearly every listing and was missing here, so the
             # model improvised: it rendered "unfurnished" to a caller as
             # "\u0D85\u0DC3\u0DCF\u0DAD\u0DCA\u0DB8\u0DD2\u0D9A \u0DBB\u0DC4\u0DD2\u0DAD" (allergen-free). Any attribute the KB states on
@@ -446,7 +446,7 @@ def _build_system_prompt(lang: str = "en", brand: str = DEFAULT_BRAND) -> str:
         handoff_rules +
         # Generated from the live inventory every call. The portfolio facts used
         # to be hard-coded here, went stale when the inventory changed, and made
-        # Fiona deny listings that retrieval had correctly handed her. Empty
+        # Amaya deny listings that retrieval had correctly handed her. Empty
         # string when the backend cannot derive them -- saying nothing about the
         # portfolio is safe; saying something stale is not.
         _portfolio_facts_block(agency) +
@@ -1063,7 +1063,10 @@ async def voice_demo_incoming(request: Request) -> Response:
     config = LANGUAGE_CONFIGS["en"]
     cr = _build_conversation_relay_twiml(
         host, "en", config,
-        brand="starproperties",
+        # The DEMO entry point: same agency and agent, but no human behind it,
+        # so transfer_to_human must never be offered. The phone line uses the
+        # default entry point, which keeps the handoff.
+        brand="starproperties_demo",
         voice=CR_VOICE_STARPROPERTIES or None,
     )
     twiml = (
@@ -2363,7 +2366,7 @@ async def _transfer_to_human(
     try:
         await websocket.send_text(json.dumps({
             "type": "text",
-            "token": "Connecting you to a Rodrigo Realtors consultant now. Please hold.",
+            "token": "Connecting you to a Star Properties consultant now. Please hold.",
             "last": True,
         }))
     except Exception:
@@ -2403,7 +2406,7 @@ async def voice_whisper(request: Request) -> Response:
     safe = (reason or "Incoming caller.").replace("&", " and ").replace("<", "").replace(">", "")
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        f'<Response><Say>Incoming Rodrigo Realtors caller. {safe}. Connecting now.</Say></Response>'
+        f'<Response><Say>Incoming Star Properties caller. {safe}. Connecting now.</Say></Response>'
     )
     return Response(content=twiml, media_type="application/xml")
 
@@ -2421,8 +2424,8 @@ async def voice_dial_result(request: Request) -> Response:
     else:
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Response><Say>Sorry, no consultant was available right now. A Rodrigo '
-            'Realtors consultant will follow up with you shortly. Goodbye.</Say><Hangup/></Response>'
+            '<Response><Say>Sorry, no consultant was available right now. A Star '
+            'Properties consultant will follow up with you shortly. Goodbye.</Say><Hangup/></Response>'
         )
     return Response(content=twiml, media_type="application/xml")
 

@@ -35,8 +35,11 @@ def test_demo_incoming_passes_brand_on_the_websocket_url(client):
     # ws_conversation needs the brand, and Twilio re-sends connect params on
     # neither a redirected webhook nor the WebSocket handshake — so it must
     # ride the query string.
+    # Assert the DEMO key specifically: "starproperties" is a prefix of
+    # "starproperties_demo", so a substring check would pass even if the demo
+    # were wired to the phone entry point and silently regained the handoff.
     r = client.post("/voice/demo-incoming", data={"lang": "en"})
-    assert "brand=starproperties" in r.text
+    assert "brand=starproperties_demo" in r.text
 
 
 def test_demo_incoming_escapes_the_query_ampersand(client):
@@ -77,22 +80,24 @@ def test_demo_incoming_twiml_is_well_formed_xml(client):
 
 def test_phone_ivr_is_untouched(client):
     # The real client's inbound path (English-only ConversationRelay, no IVR
-    # menu -- that's pre-existing, unrelated to this task) must keep behaving
-    # exactly as before and must never carry the demo's branding.
+    # menu -- that's pre-existing, unrelated to this task) must keep working.
+    # Since the brand collapse it brands as Star Properties like everything
+    # else; what makes it the PHONE path is that it keeps the human handoff.
     r = client.post("/voice/incoming")
     assert r.status_code == 200
     assert "<ConversationRelay" in r.text
-    assert "Star Properties" not in r.text
-    assert "Amaya" not in r.text
+    assert "Star Properties" in r.text
+    assert "brand=starproperties_demo" not in r.text
 
 
-def test_relay_twiml_defaults_to_rodrigo(client):
-    # Existing callers pass three positional args; they must keep Rodrigo.
+def test_relay_twiml_defaults_to_the_phone_entry_point(client):
+    # Existing callers pass three positional args; they must resolve to the
+    # phone entry point, which is the one that keeps transfer_to_human.
     out = server._build_conversation_relay_twiml(
         "example.test", "en", server.LANGUAGE_CONFIGS["en"])
-    assert "Rodrigo Realtors" in out
-    assert "Star Properties" not in out
-    assert "brand=rodrigo" in out
+    assert "Star Properties" in out
+    assert "brand=starproperties" in out
+    assert "brand=starproperties_demo" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -103,22 +108,23 @@ def test_relay_twiml_defaults_to_rodrigo(client):
 # suite drives it.
 # ---------------------------------------------------------------------------
 
-def test_tools_for_rodrigo_includes_transfer(client):
-    assert server._tools_for("en", "rodrigo") == [server.TRANSFER_TOOL]
+def test_tools_for_phone_includes_transfer(client):
+    assert server._tools_for("en", "starproperties") == [server.TRANSFER_TOOL]
 
 
-def test_tools_for_no_brand_arg_defaults_to_rodrigo_with_transfer(client):
-    # A phone call with no brand query param must still resolve to Rodrigo
-    # with the transfer tool enabled.
+def test_tools_for_no_brand_arg_defaults_to_phone_with_transfer(client):
+    # A phone call with no brand query param must resolve to the phone entry
+    # point with the transfer tool enabled -- HUMAN_AGENT_PHONE is configured
+    # in production, so this handoff is real and must not be lost.
     assert server._tools_for("en") == [server.TRANSFER_TOOL]
 
 
-def test_tools_for_starproperties_has_no_transfer(client):
-    assert server._tools_for("en", "starproperties") == []
+def test_tools_for_demo_has_no_transfer(client):
+    assert server._tools_for("en", "starproperties_demo") == []
 
 
-def test_tools_for_non_english_has_no_transfer_regardless_of_brand(client):
-    for brand in ("rodrigo", "starproperties"):
+def test_tools_for_non_english_has_no_transfer_regardless_of_entry_point(client):
+    for brand in ("starproperties", "starproperties_demo"):
         assert server._tools_for("ta", brand) == []
         assert server._tools_for("si", brand) == []
 
@@ -128,17 +134,16 @@ def test_tools_for_non_english_has_no_transfer_regardless_of_brand(client):
 # this fix, `_build_conversation_relay_twiml` picked the brand's greeting via
 # `resolve_brand()` (which normalizes with .strip().lower()) but embedded the
 # WebSocket `brand=` value via a separate exact-match check (`brand in
-# BRANDS`), so "StartProperty" would render Amaya's greeting while the URL
-# still said "brand=rodrigo" -- a session briefed as Amaya that would then
-# resolve as Rodrigo, transfer tool included.
+# BRANDS`), so a mixed-case value would render one entry point's greeting while
+# the URL named another -- a session briefed as the demo that would then resolve
+# as the phone line, transfer tool included.
 # ---------------------------------------------------------------------------
 
-def test_mixed_case_brand_greeting_and_url_agree(client):
+def test_mixed_case_entry_point_greeting_and_url_agree(client):
     out = server._build_conversation_relay_twiml(
         "example.test", "en", server.LANGUAGE_CONFIGS["en"],
-        brand="StarProperties",
+        brand="StarProperties_Demo",
     )
     assert "Amaya" in out
     assert "Star Properties" in out
-    assert "brand=starproperties" in out
-    assert "brand=rodrigo" not in out
+    assert "brand=starproperties_demo" in out

@@ -1,65 +1,81 @@
-"""The brand registry: one agent process, more than one storefront.
+"""The entry-point registry: one agency, two ways in.
 
 Imports `brands` only — never `server`. The deploy gate installs just
 pytest/numpy/pydantic, so a test that imports server is skipped there and
 cannot protect anything.
+
+There is one brand now (Star Properties / Amaya). What differs between entry
+points is whether a human can be reached: the phone line has HUMAN_AGENT_PHONE
+configured, the website demo has nobody behind it.
 """
 import pytest
 
 import brands
 
-
-def test_default_brand_is_rodrigo():
-    # Rodrigo is the real client on the real phone number. If the default ever
-    # changes, that number silently rebrands.
-    assert brands.DEFAULT_BRAND == "rodrigo"
+PHONE = "starproperties"
+DEMO = "starproperties_demo"
 
 
-def test_rodrigo_identity():
-    b = brands.BRANDS["rodrigo"]
-    assert b["agency"] == "Rodrigo Realtors"
-    assert b["agent"] == "Fiona"
+def test_default_is_the_phone_entry_point():
+    # Every call site that passes only `lang` resolves here, and that is the
+    # one real inbound callers use. If the default flips to the demo entry
+    # point, the live line silently loses its human handoff.
+    assert brands.DEFAULT_BRAND == PHONE
 
 
-def test_starproperties_identity():
-    b = brands.BRANDS["starproperties"]
+def test_exactly_two_entry_points():
+    assert set(brands.BRANDS) == {PHONE, DEMO}
+
+
+@pytest.mark.parametrize("key", [PHONE, DEMO])
+def test_both_entry_points_are_star_properties(key):
+    # The whole point of the collapse: one agency, one agent name, both ways in.
+    b = brands.BRANDS[key]
     assert b["agency"] == "Star Properties"
     assert b["agent"] == "Amaya"
 
 
-@pytest.mark.parametrize("brand,expected", [("rodrigo", True), ("starproperties", False)])
-def test_transfer_flag(brand, expected):
-    # Amaya has no human consultant behind her; she must not offer a transfer.
-    assert brands.BRANDS[brand]["transfer"] is expected
+def test_no_trace_of_the_retired_brand():
+    blob = repr(brands.BRANDS)
+    assert "Rodrigo" not in blob
+    assert "Fiona" not in blob
 
 
-def test_every_brand_has_an_english_greeting():
-    # _build_system_prompt falls back to ["en"], so its absence is a KeyError
-    # at call time on a live call.
+@pytest.mark.parametrize("key,expected", [(PHONE, True), (DEMO, False)])
+def test_transfer_is_a_property_of_the_entry_point(key, expected):
+    # The demo has no consultant standing behind it; it must never offer a
+    # handoff it cannot perform. The phone line must keep the one it has.
+    assert brands.BRANDS[key]["transfer"] is expected
+
+
+def test_the_two_entry_points_differ_only_in_transfer():
+    phone = dict(brands.BRANDS[PHONE])
+    demo = dict(brands.BRANDS[DEMO])
+    assert phone.pop("transfer") != demo.pop("transfer")
+    assert phone == demo
+
+
+def test_every_entry_point_has_an_english_greeting():
     for name, b in brands.BRANDS.items():
         assert b["greeting"]["en"].strip(), name
 
 
-def test_every_brand_greeting_names_its_own_agency():
-    # A greeting naming the wrong agency is the exact bug this registry exists
-    # to prevent.
+def test_every_greeting_names_its_own_agency():
     for name, b in brands.BRANDS.items():
         assert b["agency"] in b["greeting"]["en"], name
 
 
-def test_every_brand_declares_all_keys():
+def test_every_entry_point_declares_all_keys():
     for name, b in brands.BRANDS.items():
         assert set(b) == {"agency", "agent", "transfer", "greeting"}, name
 
 
 @pytest.mark.parametrize("value", ["nope", "", "   ", None, "RODRIGO"])
-def test_resolve_brand_falls_back_or_normalizes(value):
-    got = brands.resolve_brand(value)
-    if value and value.strip().lower() in brands.BRANDS:
-        assert got is brands.BRANDS[value.strip().lower()]
-    else:
-        assert got is brands.BRANDS[brands.DEFAULT_BRAND]
+def test_resolve_falls_back_to_the_default(value):
+    assert brands.resolve_brand(value) is brands.BRANDS[brands.DEFAULT_BRAND]
 
 
-def test_resolve_brand_returns_the_starproperties_config():
-    assert brands.resolve_brand("starproperties") is brands.BRANDS["starproperties"]
+@pytest.mark.parametrize(
+    "value", [PHONE, DEMO, "  STARPROPERTIES  ", "StarProperties_Demo"])
+def test_resolve_normalizes_case_and_whitespace(value):
+    assert brands.resolve_brand(value) is brands.BRANDS[value.strip().lower()]
