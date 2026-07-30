@@ -39,7 +39,7 @@ def test_prose_is_generated_not_hand_written(fresh):
     for p in fresh.all_properties():
         assert p.description, f"{p.id} has no prose"
         assert f"(Ref: {p.id})" in p.description
-        assert p.description.startswith("Rodrigo Realtors has")
+        assert p.description.startswith("Star Properties has")
 
 
 # Transcribed from the frozen feed (knowledge_docs/_source_feed_2026-07-30.txt),
@@ -68,7 +68,7 @@ def test_amenities_are_data_now_not_only_prose(fresh):
 
 def test_preamble_is_loaded_from_its_own_file(fresh):
     kbs.initialize_kb(_DOCS)
-    assert "Rodrigo Realtors" in fresh.preamble
+    assert "Star Properties" in fresh.preamble
     assert "AREAS COVERED" in fresh.preamble
     # The preamble must never contain listing paragraphs -- those are generated.
     assert "(Ref: P" not in fresh.preamble

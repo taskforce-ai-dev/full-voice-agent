@@ -2,7 +2,7 @@
 
 The prompt once hard-coded "our apartments start at three bedrooms" and "we do
 not currently have any one-bedroom or two-bedroom apartments". When the inventory
-was swapped, Fiona confidently denied the very listings retrieval handed her.
+was swapped, Amaya confidently denied the very listings retrieval handed her.
 These tests prove the generated block tracks the data, and -- crucially -- that
 it says nothing at all when it cannot know.
 
@@ -56,7 +56,7 @@ def test_zones_match_the_inventory_exactly():
 
 def test_facts_track_a_changed_inventory():
     """The whole point: add a 6-bedroom listing in a new zone and the claims move
-    with it. Under the old hard-coded prompt, Fiona would have denied it."""
+    with it. Under the old hard-coded prompt, Amaya would have denied it."""
     rows = TRUTH + [{"id": "P99", "type": "house", "zone": 9, "beds": 6,
                      "baths": 6, "rent": 900000, "period": "month",
                      "furnishing": "furnished", "sqft": 6000}]
@@ -68,7 +68,7 @@ def test_facts_track_a_changed_inventory():
 
 
 def test_cheapest_and_dearest_are_computed_not_left_to_the_llm():
-    """Asked in Sinhala for the cheapest listing, Fiona named a Rs 150,000 unit
+    """Asked in Sinhala for the cheapest listing, Amaya named a Rs 150,000 unit
     when a Rs 130,000 one exists -- she was scanning the listings and comparing.
     Aggregations get computed here, like the deposit figures."""
     out = portfolio_facts(_props())
@@ -133,16 +133,16 @@ def test_all_fixed_is_only_claimed_when_true():
 
 
 def test_agency_name_is_parameterized_not_hardcoded():
-    # Rodrigo Realtors is the safety-net default for direct callers, but
-    # server.py always passes the active brand's agency explicitly -- a demo
-    # brand's prompt must never contain the real client's agency name.
-    out = portfolio_facts(_props(), agency="Star Properties")
-    assert "Star Properties" in out
-    assert "Rodrigo Realtors" not in out
+    # The agency must come from the caller, not a literal baked into the facts
+    # text. Probe with a name that appears nowhere in the codebase: if the
+    # parameter were ignored, the default would leak through instead.
+    out = portfolio_facts(_props(), agency="Probe Lettings Ltd")
+    assert "Probe Lettings Ltd" in out
+    assert "Star Properties" not in out
 
 
-def test_default_agency_is_still_rodrigo_realtors():
-    assert "Rodrigo Realtors" in portfolio_facts(_props())
+def test_default_agency_is_still_star_properties():
+    assert "Star Properties" in portfolio_facts(_props())
 
 
 def test_claims_are_consistent_with_the_live_structured_kb():

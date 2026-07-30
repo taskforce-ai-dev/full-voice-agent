@@ -35,7 +35,10 @@ def test_every_field_matches_truth():
         assert got.rent_amount == want["rent"], want["id"]
         assert got.furnishing == want["furnishing"], want["id"]
         assert got.floor_area_sqft == want["sqft"], want["id"]
-        assert got.rent_period == "month", want["id"]
+        # Not hardcoded "month": P03 is priced per DAY, and price-on-request
+        # rows carry no period at all. Quoting a per-day rate as monthly, or
+        # inventing a period for a POR listing, are both wrong answers.
+        assert got.rent_period == want["period"], want["id"]
         assert got.transaction == "rent", want["id"]
 
 

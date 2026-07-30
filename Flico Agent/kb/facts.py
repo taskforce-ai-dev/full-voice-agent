@@ -3,7 +3,7 @@
 The system prompt used to hard-code what the portfolio contains ("our apartments
 start at three bedrooms", "we do not currently have any one-bedroom or two-
 bedroom apartments"). When the inventory changed, those lines became confident
-lies and Fiona denied listings that retrieval had correctly handed her. The facts
+lies and Amaya denied listings that retrieval had correctly handed her. The facts
 and the rows must come from ONE source, so they are derived here.
 
 Keep this cheap: it runs per call, over a dozen-ish rows.
@@ -40,13 +40,13 @@ def _describe(p: Property) -> str:
     return " ".join(bits)
 
 
-def portfolio_facts(props: List[Property] = None, *, agency: str = "Rodrigo Realtors") -> str:
+def portfolio_facts(props: List[Property] = None, *, agency: str = "Star Properties") -> str:
     """A block of literally-true statements about the current inventory.
 
     Returns "" for an empty inventory: saying nothing is always safer than
     asserting something false about what we have.
 
-    `agency` names whichever storefront is calling (Rodrigo Realtors or a demo
+    `agency` names whichever storefront is calling (Star Properties or a demo
     brand like Start Property); the default is only a safety net for direct
     callers -- server.py always passes it explicitly.
     """

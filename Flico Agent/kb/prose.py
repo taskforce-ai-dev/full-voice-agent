@@ -15,7 +15,7 @@ this template by hand. That is also what lets the OLD parser verify this generat
 during migration -- see tests/test_prose_roundtrip.py.
 
 Uniform structure across listings is a feature, not a defect. This paragraph is
-Fiona's grounding context, not words a caller hears: she rephrases per turn, per
+Amaya's grounding context, not words a caller hears: she rephrases per turn, per
 language, per caller. Uniformity makes her extraction more reliable (the rent is
 always in the same place) and makes embeddings comparable across listings. Per
 listing personality belongs in `commentary`, which is human-authored data.
@@ -75,7 +75,7 @@ def _oxford(items: List[str]) -> str:
 
 def _rent_clause(p: Property) -> str:
     if p.rent_on_request or p.rent_amount is None:
-        return ("The monthly rent is available on request -- a Rodrigo Realtors "
+        return ("The monthly rent is available on request -- a Star Properties "
                 "consultant will share it on follow-up.")
     period = p.rent_period or "month"
     words = number_in_words(int(p.rent_amount))
@@ -103,7 +103,7 @@ def _lease_clause(p: Property) -> str:
     used to say only "a 2-month deposit", so answering required the LLM to
     multiply -- and an LLM doing arithmetic on facts it is holding will produce a
     confident figure whether or not it is right. Anything computable is computed
-    here, in code, where it is deterministic and testable. Fiona reads it; she
+    here, in code, where it is deterministic and testable. Amaya reads it; she
     never has to do the maths.
     """
     # Only monthly rents have a meaningful deposit-in-rupees. A per-day rent with
@@ -168,7 +168,7 @@ def render(p: Property) -> str:
     elif p.area:
         where = f"{where} in {p.area}".strip()
 
-    head = (f"Rodrigo Realtors has a {beds}{baths}{furnish}{kind} "
+    head = (f"Star Properties has a {beds}{baths}{furnish}{kind} "
             f"for {p.transaction} {where}").rstrip()
     area = _area_clause(p)
     if area:

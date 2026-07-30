@@ -7,7 +7,7 @@ true through that path too -- not just through git.
 from kb.migrate import parse_prose
 from knowledge_base_sqlite import _validate
 
-_GOOD = ("Rodrigo Realtors has a 1-bedroom, 1-bathroom furnished apartment for rent "
+_GOOD = ("Star Properties has a 1-bedroom, 1-bathroom furnished apartment for rent "
          "on Park Street in Colombo 2 (Slave Island), with a floor area of 620 square "
          "feet, at a monthly rent of one hundred and eighty thousand rupees "
          "(Rs 180,000) per month. (Ref: P51)")
@@ -42,7 +42,7 @@ def test_duplicate_ids_rejected():
 
 
 def test_unreadable_type_is_skipped_not_guessed():
-    # "Rodrigo Realtors has a ..." with no recognisable type word must not be
+    # "Star Properties has a ..." with no recognisable type word must not be
     # silently filed as an apartment.
     text = _GOOD.replace("apartment", "thingamajig")
     rows, skipped, _ = parse_prose(text)

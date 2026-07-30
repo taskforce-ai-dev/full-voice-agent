@@ -26,7 +26,7 @@ class ContextFormatter:
         area = f", {p.floor_area_sqft} sq ft" if p.floor_area_sqft else ""
         feats = f" Features: {', '.join(p.key_features)}." if p.key_features else ""
         return (
-            f"[{p.id}] Rodrigo Realtors has a {beds}{furnish}{p.property_type} "
+            f"[{p.id}] Star Properties has a {beds}{furnish}{p.property_type} "
             f"for {p.transaction}{where} in {loc}{area}. {ContextFormatter._rent(p)}.{feats}"
         )
 

@@ -105,7 +105,7 @@ def parse_prose(text: str) -> Tuple[List[Property], List[str], str]:
     paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     rows, skipped, preamble_parts = [], [], []
     for para in paras:
-        if para.startswith("Rodrigo Realtors has"):
+        if para.startswith("Star Properties has"):
             prop = _parse_listing(para)
             if prop:
                 rows.append(prop)

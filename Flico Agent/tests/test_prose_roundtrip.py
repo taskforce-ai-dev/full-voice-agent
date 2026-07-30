@@ -80,7 +80,7 @@ def test_generated_prose_parses_back_to_the_same_fields(row):
 
 @pytest.mark.parametrize("row", ROWS, ids=[r.id for r in ROWS])
 def test_prose_carries_the_voice_critical_detail(row):
-    """The paragraph is what Fiona speaks from. The formatter emits it verbatim,
+    """The paragraph is what Amaya speaks from. The formatter emits it verbatim,
     so anything missing here is invisible to the caller."""
     prose = render(row)
     assert f"(Ref: {row.id})" in prose
