@@ -113,8 +113,8 @@ def test_agency_name_is_parameterized_not_hardcoded():
     # Rodrigo Realtors is the safety-net default for direct callers, but
     # server.py always passes the active brand's agency explicitly -- a demo
     # brand's prompt must never contain the real client's agency name.
-    out = portfolio_facts(_props(), agency="Start Property")
-    assert "Start Property" in out
+    out = portfolio_facts(_props(), agency="Star Properties")
+    assert "Star Properties" in out
     assert "Rodrigo Realtors" not in out
 
 

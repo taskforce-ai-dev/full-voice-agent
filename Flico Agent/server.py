@@ -90,10 +90,10 @@ ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID: str = os.getenv("ELEVENLABS_VOICE_ID", "")
-# Distinct ConversationRelay voice for the Start Property demo persona, so the
+# Distinct ConversationRelay voice for the Star Properties demo persona, so the
 # two demos on the website do not sound like the same person. Falls back to the
 # language default when unset.
-CR_VOICE_STARTPROPERTY: str = os.getenv("CR_VOICE_STARTPROPERTY", "").strip()
+CR_VOICE_STARPROPERTIES: str = os.getenv("CR_VOICE_STARPROPERTIES", "").strip()
 ELEVENLABS_VOICE_SPEED: float = float(os.getenv("ELEVENLABS_VOICE_SPEED", "1.0"))
 ELEVENLABS_MODEL_MULTILINGUAL: str = "eleven_multilingual_v2"
 ELEVENLABS_MODEL_TURBO: str = "eleven_turbo_v2_5"
@@ -1052,9 +1052,9 @@ async def voice_language_selected(request: Request) -> Response:
 
 @app.api_route("/voice/demo-incoming", methods=["GET", "POST"])
 async def voice_demo_incoming(request: Request) -> Response:
-    """Website Book-a-Demo entry -- Start Property (Amaya), English, no IVR.
+    """Website Book-a-Demo entry -- Star Properties (Amaya), English, no IVR.
 
-    Hatton's shared TwiML app <Redirect>s here for agent id 'startproperty'.
+    Hatton's shared TwiML app <Redirect>s here for agent id 'starproperties'.
     Unlike the phone IVR there is no <Gather>: the demo card declares
     langs: ['en'], so everything collapses to English ConversationRelay.
     """
@@ -1063,8 +1063,8 @@ async def voice_demo_incoming(request: Request) -> Response:
     config = LANGUAGE_CONFIGS["en"]
     cr = _build_conversation_relay_twiml(
         host, "en", config,
-        brand="startproperty",
-        voice=CR_VOICE_STARTPROPERTY or None,
+        brand="starproperties",
+        voice=CR_VOICE_STARPROPERTIES or None,
     )
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -1074,7 +1074,7 @@ async def voice_demo_incoming(request: Request) -> Response:
         "  </Connect>\n"
         "</Response>"
     )
-    logger.info("Demo incoming call from %s -- Start Property (en)",
+    logger.info("Demo incoming call from %s -- Star Properties (en)",
                 request.headers.get("x-forwarded-for", "unknown"))
     return Response(content=twiml, media_type="application/xml")
 

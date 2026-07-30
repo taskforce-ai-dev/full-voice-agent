@@ -273,10 +273,10 @@ DEMO_AGENT_HOSTS: dict[str, str] = {
     "kitchened": os.getenv("DEMO_HOST_KITCHENED", "kitchened.taskforceai.tech"),
     "worldofrefrigerators": os.getenv(
         "DEMO_HOST_WOR", "worldofrefrigerators.taskforceai.tech"),
-    # Start Property (Amaya) is served by the Rodrigo Realtors agent, whose
+    # Star Properties (Amaya) is served by the Rodrigo Realtors agent, whose
     # deployment is still named "flico" for historical reasons.
-    "startproperty": os.getenv(
-        "DEMO_HOST_STARTPROPERTY", "flico.taskforceai.tech"),
+    "starproperties": os.getenv(
+        "DEMO_HOST_STARPROPERTIES", "flico.taskforceai.tech"),
 }
 
 # Per-language ConversationRelay TwiML configuration

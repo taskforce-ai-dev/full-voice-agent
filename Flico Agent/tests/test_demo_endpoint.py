@@ -24,9 +24,9 @@ def test_demo_incoming_returns_conversation_relay(client):
     assert "<ConversationRelay" in r.text
 
 
-def test_demo_incoming_brands_as_startproperty(client):
+def test_demo_incoming_brands_as_starproperties(client):
     r = client.post("/voice/demo-incoming", data={"lang": "en"})
-    assert "Start Property" in r.text
+    assert "Star Properties" in r.text
     assert "Amaya" in r.text
     assert "Rodrigo Realtors" not in r.text
 
@@ -36,7 +36,7 @@ def test_demo_incoming_passes_brand_on_the_websocket_url(client):
     # neither a redirected webhook nor the WebSocket handshake — so it must
     # ride the query string.
     r = client.post("/voice/demo-incoming", data={"lang": "en"})
-    assert "brand=startproperty" in r.text
+    assert "brand=starproperties" in r.text
 
 
 def test_demo_incoming_escapes_the_query_ampersand(client):
@@ -60,7 +60,7 @@ def test_demo_incoming_is_always_english_regardless_of_input(client):
 def test_demo_incoming_accepts_get_query_params(client):
     r = client.get("/voice/demo-incoming?lang=en")
     assert r.status_code == 200
-    assert "Start Property" in r.text
+    assert "Star Properties" in r.text
 
 
 def test_demo_incoming_twiml_is_well_formed_xml(client):
@@ -82,7 +82,7 @@ def test_phone_ivr_is_untouched(client):
     r = client.post("/voice/incoming")
     assert r.status_code == 200
     assert "<ConversationRelay" in r.text
-    assert "Start Property" not in r.text
+    assert "Star Properties" not in r.text
     assert "Amaya" not in r.text
 
 
@@ -91,7 +91,7 @@ def test_relay_twiml_defaults_to_rodrigo(client):
     out = server._build_conversation_relay_twiml(
         "example.test", "en", server.LANGUAGE_CONFIGS["en"])
     assert "Rodrigo Realtors" in out
-    assert "Start Property" not in out
+    assert "Star Properties" not in out
     assert "brand=rodrigo" in out
 
 
@@ -113,12 +113,12 @@ def test_tools_for_no_brand_arg_defaults_to_rodrigo_with_transfer(client):
     assert server._tools_for("en") == [server.TRANSFER_TOOL]
 
 
-def test_tools_for_startproperty_has_no_transfer(client):
-    assert server._tools_for("en", "startproperty") == []
+def test_tools_for_starproperties_has_no_transfer(client):
+    assert server._tools_for("en", "starproperties") == []
 
 
 def test_tools_for_non_english_has_no_transfer_regardless_of_brand(client):
-    for brand in ("rodrigo", "startproperty"):
+    for brand in ("rodrigo", "starproperties"):
         assert server._tools_for("ta", brand) == []
         assert server._tools_for("si", brand) == []
 
@@ -136,9 +136,9 @@ def test_tools_for_non_english_has_no_transfer_regardless_of_brand(client):
 def test_mixed_case_brand_greeting_and_url_agree(client):
     out = server._build_conversation_relay_twiml(
         "example.test", "en", server.LANGUAGE_CONFIGS["en"],
-        brand="StartProperty",
+        brand="StarProperties",
     )
     assert "Amaya" in out
-    assert "Start Property" in out
-    assert "brand=startproperty" in out
+    assert "Star Properties" in out
+    assert "brand=starproperties" in out
     assert "brand=rodrigo" not in out

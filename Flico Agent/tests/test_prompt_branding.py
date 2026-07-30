@@ -38,19 +38,19 @@ def test_rodrigo_prompt_still_names_the_agency_and_agent():
     assert "Fiona" in out
 
 
-def test_startproperty_replaces_the_agency_and_agent_name():
-    out = server._build_system_prompt("en", "startproperty")
-    assert "Start Property" in out
+def test_starproperties_replaces_the_agency_and_agent_name():
+    out = server._build_system_prompt("en", "starproperties")
+    assert "Star Properties" in out
     assert "Amaya" in out
     assert "Rodrigo Realtors" not in out
     assert "Fiona" not in out
 
 
-def test_startproperty_greeting_echo_matches_the_spoken_greeting():
+def test_starproperties_greeting_echo_matches_the_spoken_greeting():
     # The prompt says the greeting was "already spoken". If it names different
     # words than Twilio speaks, the agent is briefed on what the caller never heard.
-    out = server._build_system_prompt("en", "startproperty")
-    assert brands.BRANDS["startproperty"]["greeting"]["en"] in out
+    out = server._build_system_prompt("en", "starproperties")
+    assert brands.BRANDS["starproperties"]["greeting"]["en"] in out
 
 
 def test_rodrigo_greeting_echo_matches_the_spoken_greeting():
@@ -69,10 +69,10 @@ def test_unknown_brand_falls_back_to_default():
     assert server._build_system_prompt("en", "nope") == server._build_system_prompt("en")
 
 
-def test_startproperty_prompt_omits_the_handoff_offer():
+def test_starproperties_prompt_omits_the_handoff_offer():
     # transfer_to_human appears only inside the handoff block (server.py:406,411),
     # which must not be emitted for a brand with transfer=False.
-    assert "transfer_to_human" not in server._build_system_prompt("en", "startproperty")
+    assert "transfer_to_human" not in server._build_system_prompt("en", "starproperties")
 
 
 def test_rodrigo_prompt_keeps_the_handoff_offer():
@@ -86,12 +86,12 @@ def test_only_brand_tokens_differ():
     # Anchoring after this phrase is what makes the comparison clean. The
     # prompt is assembled persona -> language_rules -> handoff_rules ->
     # portfolio_facts -> GREETING -> anchor -> shared guidance, so both the
-    # handoff block (absent for startproperty) and the greeting (worded
+    # handoff block (absent for starproperties) and the greeting (worded
     # differently per brand, not just name-swapped) fall BEFORE the anchor and
     # need no special handling.
     anchor = "NEVER ask for the caller's name or phone number at the start"
     rod = server._build_system_prompt("en")
-    sp = server._build_system_prompt("en", "startproperty")
-    normalized = sp.replace("Start Property", "Rodrigo Realtors").replace("Amaya", "Fiona")
+    sp = server._build_system_prompt("en", "starproperties")
+    normalized = sp.replace("Star Properties", "Rodrigo Realtors").replace("Amaya", "Fiona")
     assert anchor in rod and anchor in normalized
     assert normalized.split(anchor, 1)[1] == rod.split(anchor, 1)[1]

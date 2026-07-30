@@ -21,13 +21,13 @@ def test_rodrigo_identity():
     assert b["agent"] == "Fiona"
 
 
-def test_startproperty_identity():
-    b = brands.BRANDS["startproperty"]
-    assert b["agency"] == "Start Property"
+def test_starproperties_identity():
+    b = brands.BRANDS["starproperties"]
+    assert b["agency"] == "Star Properties"
     assert b["agent"] == "Amaya"
 
 
-@pytest.mark.parametrize("brand,expected", [("rodrigo", True), ("startproperty", False)])
+@pytest.mark.parametrize("brand,expected", [("rodrigo", True), ("starproperties", False)])
 def test_transfer_flag(brand, expected):
     # Amaya has no human consultant behind her; she must not offer a transfer.
     assert brands.BRANDS[brand]["transfer"] is expected
@@ -61,5 +61,5 @@ def test_resolve_brand_falls_back_or_normalizes(value):
         assert got is brands.BRANDS[brands.DEFAULT_BRAND]
 
 
-def test_resolve_brand_returns_the_startproperty_config():
-    assert brands.resolve_brand("startproperty") is brands.BRANDS["startproperty"]
+def test_resolve_brand_returns_the_starproperties_config():
+    assert brands.resolve_brand("starproperties") is brands.BRANDS["starproperties"]
