@@ -72,7 +72,7 @@ from post_call import process_realestate_post_call
 from media_transport import MediaTransport, TwilioMediaTransport
 from asterisk_ari import AsteriskAriClient
 from asterisk_rtp import AsteriskRtpTransport, RtpPortAllocator
-from brands import BRANDS, DEFAULT_BRAND, resolve_brand
+from brands import DEFAULT_BRAND, resolve_brand
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -310,14 +310,15 @@ _SENTENCE_END = re.compile(r'(?<=[.!?\u0964\u0DF4])\s+')
 # System prompt
 # ---------------------------------------------------------------------------
 
-def _portfolio_facts_block() -> str:
+def _portfolio_facts_block(agency: str) -> str:
     """Portfolio claims derived from the live KB, or a safe fallback.
 
     Never let a prompt-building fault break a live call: an agent with no
-    portfolio claims still works from the reference context.
+    portfolio claims still works from the reference context. `agency` is
+    forwarded so the generated facts name the brand actually calling.
     """
     try:
-        facts = portfolio_facts()
+        facts = portfolio_facts(agency=agency)
     except Exception:
         logger.exception("portfolio_facts failed; falling back to no claims")
         facts = ""
@@ -436,13 +437,7 @@ def _build_system_prompt(lang: str = "en", brand: str = DEFAULT_BRAND) -> str:
         # Fiona deny listings that retrieval had correctly handed her. Empty
         # string when the backend cannot derive them -- saying nothing about the
         # portfolio is safe; saying something stale is not.
-        #
-        # kb/facts.py hardcodes the default brand's agency name in its generated
-        # text (outside server.py, out of scope to edit here), so swap it for the
-        # active brand's agency. A no-op for the default brand -- the replacement
-        # target equals the replacement value -- so this cannot change the
-        # Rodrigo prompt.
-        _portfolio_facts_block().replace(BRANDS[DEFAULT_BRAND]["agency"], agency) +
+        _portfolio_facts_block(agency) +
 
         "GREETING & CALLER DETAILS:\n"
         f"- The opening greeting is already spoken automatically: '{greeting}' "

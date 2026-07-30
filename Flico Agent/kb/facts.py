@@ -40,11 +40,15 @@ def _describe(p: Property) -> str:
     return " ".join(bits)
 
 
-def portfolio_facts(props: List[Property]) -> str:
+def portfolio_facts(props: List[Property] = None, *, agency: str = "Rodrigo Realtors") -> str:
     """A block of literally-true statements about the current inventory.
 
     Returns "" for an empty inventory: saying nothing is always safer than
     asserting something false about what we have.
+
+    `agency` names whichever storefront is calling (Rodrigo Realtors or a demo
+    brand like Start Property); the default is only a safety net for direct
+    callers -- server.py always passes it explicitly.
     """
     if not props:
         return ""
@@ -60,7 +64,7 @@ def portfolio_facts(props: List[Property]) -> str:
 
     lines = [
         "PORTFOLIO FACTS (generated from the live knowledge base -- these are the "
-        "ONLY properties Rodrigo Realtors has right now; never contradict them "
+        f"ONLY properties {agency} has right now; never contradict them "
         "and never invent a property outside them):",
         f"- We currently have {len(props)} listing(s) for rent: {breakdown}.",
     ]
