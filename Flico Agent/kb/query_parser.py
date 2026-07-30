@@ -17,28 +17,59 @@ _AREA_TO_ZONE = {
 }
 _NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
               "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
-_COMMERCIAL_MARKERS = (
-    "office space", "commercial building", "commercial property",
-    "commercial house", "commercial space", "commercial unit", "office", "shop",
-    "retail", "warehouse",
-)
+# Commercial vocabulary, tiered by evidential strength. Word boundaries are
+# load-bearing everywhere in this classifier: bare substring matching read
+# "Slave Island" and "Iceland Residence" as property_type=land, "penthouse" as
+# a house, and -- the live bug this replaces -- "shopping district", "workshop",
+# and "police officer" as commercial property.
+#
+# STRONG phrases name the product itself ("office space", "commercial
+# building"). They outrank everything, including an explicit residential noun:
+# "commercial house" is not a house, and a commercial listing's prose may
+# mention the "sea-facing apartments" next door in its commentary.
+#
+# WEAK single words ("office", "shop", "retail", "warehouse") routinely
+# describe a caller's SURROUNDINGS ("a flat near my office", "a house close to
+# the shops"), so they classify commercial only when the utterance names no
+# explicit residential or land type. A caller who said "apartment" gets an
+# apartment, whatever else the sentence mentions.
+_COMMERCIAL_STRONG_RE = re.compile(
+    r"\b(?:office\s+spaces?|commercial\s+"
+    r"(?:buildings?|propert(?:y|ies)|houses?|spaces?|units?))\b")
+_COMMERCIAL_WEAK_RE = re.compile(r"\b(?:offices?|shops?|retail|warehouses?)\b")
+_APARTMENT_RE = re.compile(r"\b(?:apartments?|flats?|penthouses?|condos?|condominiums?)\b")
+_HOUSE_RE = re.compile(r"\b(?:houses?|town\s*houses?|villas?|bungalows?|annexe?s?)\b")
+_LAND_RE = re.compile(r"\b(?:lands?|plots?)\b")
+
+
+def classify_type(low: str) -> Optional[str]:
+    """The ONE property-type classifier -- caller utterances (QueryParser) and
+    listing prose (kb.migrate._classify) both resolve through this function, so
+    the two vocabularies can never drift apart again. Precedence:
+
+      1. strong commercial phrase   -> commercial
+      2. explicit residential noun  -> apartment / house
+      3. explicit land noun         -> land
+      4. weak commercial marker     -> commercial
+      5. nothing recognised         -> None (unfiltered, never guessed)
+    """
+    if _COMMERCIAL_STRONG_RE.search(low):
+        return "commercial"
+    if _APARTMENT_RE.search(low):
+        return "apartment"
+    if _HOUSE_RE.search(low):
+        return "house"
+    if _LAND_RE.search(low):
+        return "land"
+    if _COMMERCIAL_WEAK_RE.search(low):
+        return "commercial"
+    return None
 
 
 class QueryParser:
     @staticmethod
     def _classify_type(low: str) -> Optional[str]:
-        # Word boundaries are load-bearing. Bare substring matching read "Slave
-        # Island" (Colombo 2) and "Iceland Residence" as property_type=land, and
-        # "penthouse" -- which contains "house" -- as a house.
-        if any(m in low for m in _COMMERCIAL_MARKERS):
-            return "commercial"
-        if re.search(r"\b(apartments?|flats?|penthouses?|condos?|condominiums?)\b", low):
-            return "apartment"
-        if re.search(r"\b(houses?|town\s*houses?|villas?|bungalows?|annexe?s?)\b", low):
-            return "house"
-        if re.search(r"\b(lands?|plots?)\b", low):
-            return "land"
-        return None
+        return classify_type(low)
 
     @staticmethod
     def _zone(low: str) -> Optional[int]:

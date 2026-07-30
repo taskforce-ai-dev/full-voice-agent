@@ -1,7 +1,7 @@
 import re
 from typing import List, Optional, Tuple
 
-from kb.query_parser import _COMMERCIAL_MARKERS
+from kb.query_parser import classify_type
 from kb.schema import Property
 
 _WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
@@ -10,19 +10,14 @@ _TEXT_RENT = {"fifteen thousand": 15000.0}  # extend as needed; numeric Rs is pr
 
 
 def _classify(low: str) -> Optional[str]:
-    # Mirrors QueryParser._classify_type -- same word-boundary rules, same
-    # vocabulary. A listing whose type cannot be read is REJECTED (None) rather
-    # than silently filed as an apartment: a misfiled row is invisible to the
-    # type filter forever, and the prose is hand-authored.
-    if any(m in low for m in _COMMERCIAL_MARKERS):
-        return "commercial"
-    if re.search(r"\b(apartments?|flats?|penthouses?|condos?|condominiums?)\b", low):
-        return "apartment"
-    if re.search(r"\b(houses?|town\s*houses?|villas?|bungalows?|annexe?s?)\b", low):
-        return "house"
-    if re.search(r"\b(lands?|plots?)\b", low):
-        return "land"
-    return None
+    # Delegates to kb.query_parser.classify_type -- ONE vocabulary, one set of
+    # word-boundary and precedence rules, shared with the utterance parser so
+    # the two can never drift apart (this used to be a hand-kept mirror, and
+    # both sides carried the same bare-substring bug: commentary mentioning
+    # "central offices" reclassified an apartment as commercial). A listing
+    # whose type cannot be read is REJECTED (None) rather than silently filed
+    # as an apartment: a misfiled row is invisible to the type filter forever.
+    return classify_type(low)
 
 
 def _int(s: Optional[str]) -> Optional[int]:

@@ -7,8 +7,10 @@ composed expectation. The five shipped bugs and four latent ones were all
 down, so an undecided default becomes a test failure instead of a phone call.
 
 Includes the decoys that must contribute NOTHING: occupancy ("four people"),
-sizes ("under 1000 square feet"), and counts ("more than 2 bedrooms"). Each of
-those was a real bug.
+sizes ("under 1000 square feet"), counts ("more than 2 bedrooms"), and words
+that merely CONTAIN a commercial marker ("shopping", "workshop", "officer",
+"shopfront"). Each of those was a real bug -- the last class classified "a two
+bedroom apartment near the shopping district" as commercial property.
 """
 import itertools
 
@@ -32,6 +34,28 @@ TYPE_FRAGMENTS = [
     ("bungalow", {"property_type": "house"}),
     ("office space", {"property_type": "commercial"}),
     ("warehouse", {"property_type": "commercial"}),  # contains "house"
+    # Bare commercial markers, singular and plural, must still classify.
+    ("office", {"property_type": "commercial"}),
+    ("offices", {"property_type": "commercial"}),
+    ("shop", {"property_type": "commercial"}),
+    ("shops", {"property_type": "commercial"}),
+    ("retail space", {"property_type": "commercial"}),
+    ("commercial building", {"property_type": "commercial"}),
+    ("commercial property", {"property_type": "commercial"}),
+    # PRECEDENCE, encoded: a multi-word commercial phrase names the product and
+    # outranks any residential noun it contains or sits beside -- "commercial
+    # house" is not a house. An explicit residential noun in turn outranks a
+    # bare marker, which is how callers describe surroundings, not the ask.
+    ("commercial house", {"property_type": "commercial"}),
+    ("office space with a shop front", {"property_type": "commercial"}),
+    ("apartment in a commercial building", {"property_type": "commercial"}),
+    ("apartment near my office", {"property_type": "apartment"}),
+    ("house close to the shops", {"property_type": "house"}),
+    ("plot near the shops", {"property_type": "land"}),
+    # Decoys: commercial markers hiding inside longer words contribute NOTHING.
+    # "shopping" once matched "shop" and turned an apartment ask commercial.
+    ("workshop", {}),
+    ("place with a shopfront", {}),
     ("land", {"property_type": "land"}),
     ("bare land", {"property_type": "land"}),
     ("plot", {"property_type": "land"}),
@@ -56,6 +80,12 @@ ZONE_FRAGMENTS = [
     # must stay type-free, not classify as property_type=land.
     ("in slave island", {"zone": 2}),
     ("in union place", {"zone": 2}),
+    # Decoys: "shopping" contains "shop" -- a location mention must contribute
+    # neither a zone nor, crucially, a property type. This composes with every
+    # residential type fragment, proving "apartment ... near the shopping
+    # district" stays an apartment.
+    ("near the shopping district", {}),
+    ("near the shopping mall", {}),
 ]
 
 BEDROOM_FRAGMENTS = [
@@ -75,6 +105,8 @@ BEDROOM_FRAGMENTS = [
     ("for four people", {}),
     ("for the two of us", {}),
     ("for a family of five", {}),
+    # "officer" contains "office"; who the home is for is not a property type.
+    ("for a police officer", {}),
 ]
 
 RENT_FRAGMENTS = [
