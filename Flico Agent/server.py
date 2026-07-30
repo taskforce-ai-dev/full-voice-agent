@@ -163,6 +163,14 @@ TRANSFER_TOOL: dict = {
         "required": ["reason"],
     },
 }
+
+
+def _tools_for(lang: str, brand: str = DEFAULT_BRAND) -> list[dict]:
+    """Tools available to a session. Brands with no human consultant behind
+    them (transfer=False) must never be offered the handoff tool."""
+    return [TRANSFER_TOOL] if (lang == "en" and resolve_brand(brand)["transfer"]) else []
+
+
 CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -1088,7 +1096,13 @@ def _build_conversation_relay_twiml(
     # XML-escape in case the greeting contains special characters
     greeting = xml.sax.saxutils.escape(greeting_text)
     ws_voice = voice or config["voice"]
-    brand_key = brand if brand in BRANDS else DEFAULT_BRAND
+    # Derive the key from the already-resolved brand dict (identity lookup)
+    # rather than re-checking `brand in BRANDS`, which does an exact-match
+    # comparison while resolve_brand() normalizes with .strip().lower(). Two
+    # separate normalizations of the same input must never be allowed to
+    # disagree -- a mixed-case brand like "StartProperty" would otherwise
+    # render Amaya's greeting while the URL still said "brand=rodrigo".
+    brand_key = next((k for k, v in BRANDS.items() if v is _brand), DEFAULT_BRAND)
 
     return (
         f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}&amp;brand={brand_key}"\n'
@@ -2513,10 +2527,9 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", brand: str = D
     sticky_filters: dict = {}
     system_prompt: str = _build_system_prompt(lang, brand)
     # Amaya has no human consultant behind her -- never offer a transfer that
-    # cannot be performed.
-    tools: list[dict] = (
-        [TRANSFER_TOOL] if (lang == "en" and _brand["transfer"]) else []
-    )
+    # cannot be performed. Decision lives in _tools_for() so it has exactly
+    # one implementation, directly covered by tests/test_demo_endpoint.py.
+    tools: list[dict] = _tools_for(lang, brand)
     call_sid: str = "unknown"
     from_number: str | None = None
     # Clean transcript (no KB-context prefix) used for dashboard persistence.

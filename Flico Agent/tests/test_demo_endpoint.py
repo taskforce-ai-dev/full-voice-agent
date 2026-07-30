@@ -46,8 +46,10 @@ def test_demo_incoming_escapes_the_query_ampersand(client):
     assert "?lang=en&brand=" not in r.text
 
 
-def test_demo_incoming_collapses_unknown_lang_to_english(client):
-    # The demo card declares langs: ['en'] only.
+def test_demo_incoming_is_always_english_regardless_of_input(client):
+    # voice_demo_incoming hardcodes "en" and never reads a lang field -- there
+    # is no branching here to collapse. This pins that guarantee so a future
+    # change that *added* lang branching to this endpoint would be caught.
     for lang in ("", "ta", "si", "zz"):
         r = client.post("/voice/demo-incoming", data={"lang": lang})
         assert r.status_code == 200, lang
@@ -91,3 +93,52 @@ def test_relay_twiml_defaults_to_rodrigo(client):
     assert "Rodrigo Realtors" in out
     assert "Start Property" not in out
     assert "brand=rodrigo" in out
+
+
+# ---------------------------------------------------------------------------
+# _tools_for -- the safety property of the whole feature: Amaya has no human
+# consultant behind her, so she must never be handed the transfer tool. This
+# is the load-bearing test; it does not go through websocket_connect because
+# ws_conversation blocks on messages after accept() and nothing else in this
+# suite drives it.
+# ---------------------------------------------------------------------------
+
+def test_tools_for_rodrigo_includes_transfer(client):
+    assert server._tools_for("en", "rodrigo") == [server.TRANSFER_TOOL]
+
+
+def test_tools_for_no_brand_arg_defaults_to_rodrigo_with_transfer(client):
+    # A phone call with no brand query param must still resolve to Rodrigo
+    # with the transfer tool enabled.
+    assert server._tools_for("en") == [server.TRANSFER_TOOL]
+
+
+def test_tools_for_startproperty_has_no_transfer(client):
+    assert server._tools_for("en", "startproperty") == []
+
+
+def test_tools_for_non_english_has_no_transfer_regardless_of_brand(client):
+    for brand in ("rodrigo", "startproperty"):
+        assert server._tools_for("ta", brand) == []
+        assert server._tools_for("si", brand) == []
+
+
+# ---------------------------------------------------------------------------
+# A mixed-case brand must resolve identically everywhere it is used. Before
+# this fix, `_build_conversation_relay_twiml` picked the brand's greeting via
+# `resolve_brand()` (which normalizes with .strip().lower()) but embedded the
+# WebSocket `brand=` value via a separate exact-match check (`brand in
+# BRANDS`), so "StartProperty" would render Amaya's greeting while the URL
+# still said "brand=rodrigo" -- a session briefed as Amaya that would then
+# resolve as Rodrigo, transfer tool included.
+# ---------------------------------------------------------------------------
+
+def test_mixed_case_brand_greeting_and_url_agree(client):
+    out = server._build_conversation_relay_twiml(
+        "example.test", "en", server.LANGUAGE_CONFIGS["en"],
+        brand="StartProperty",
+    )
+    assert "Amaya" in out
+    assert "Start Property" in out
+    assert "brand=startproperty" in out
+    assert "brand=rodrigo" not in out
