@@ -64,6 +64,11 @@ services:
       # changes — including the kb/ package — without an image rebuild.
       # The Dockerfile also COPYies these, so the image is self-contained.
       - ./server.py:/app/server.py
+      # brands.py MUST be mounted. Fast deploys docker-cp changed .py files into
+      # the running container, which works until the container is recreated --
+      # then an unmounted file reverts to whatever the image holds, and
+      # server.py's `from brands import ...` fails, crash-looping the agent.
+      - ./brands.py:/app/brands.py
       - ./knowledge_base.py:/app/knowledge_base.py
       - ./knowledge_base_chroma.py:/app/knowledge_base_chroma.py
       - ./knowledge_base_sqlite.py:/app/knowledge_base_sqlite.py
