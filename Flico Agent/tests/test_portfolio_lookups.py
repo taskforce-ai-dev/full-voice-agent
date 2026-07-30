@@ -144,8 +144,8 @@ def test_by_price_300k_to_500k(kb):
      dict(property_type="house", zone=7, bedrooms=2)),
     ("a one bedroom in Colombo 6",
      dict(zone=6, bedrooms=1)),
-    ("a one bedroom apartment under 100k",
-     dict(property_type="apartment", bedrooms=1, max_rent=100000, max_rent_exclusive=True)),
+    ("a one bedroom apartment under 200k",
+     dict(property_type="apartment", bedrooms=1, max_rent=200000, max_rent_exclusive=True)),
 ])
 def test_combined_constraints(kb, query, constraints):
     assert _refs(kb, query) == expected_ids(TRUTH, **constraints)
