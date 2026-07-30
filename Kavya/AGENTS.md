@@ -4,7 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Kavya is a multilingual AI voice agent for **Treehouse Chalets** (Belihuloya, Sri Lanka). Handles inbound phone calls via Twilio, uses a configurable LLM (Claude by default, or OpenAI / Gemini) for conversation and tool use, integrates with eZee Absolute PMS via n8n webhooks + browser extension for availability/booking, and grounds answers in a ChromaDB-based RAG knowledge base.
+Kavya is an AI voice agent for **Hatton Hills** — a luxury boutique eco retreat in an eight-acre private forest in Sri Lanka's central hill country. Handles inbound phone calls via Twilio, uses a configurable LLM (Claude by default, or OpenAI / Gemini) for conversation and tool use, integrates with the **Yanolja PMS** for availability/booking, and grounds answers in a ChromaDB-based RAG knowledge base.
+
+> **Hatton Hills is an INVENTED property for client demonstrations.** The rate card (USD 700–1,400 per room per night, half board), the room descriptions and the reservations number (+94 77 220 4400) are all fictional.
+
+**Brand lineage — read this before trusting any older section below.** This agent has been rebranded twice and the change history further down still describes the earlier states: it was **Treehouse Chalets** (Belihuloya) until Jul 2026, then **Mosvold Boutique Hotels** (two properties, Ahangama + Balapitiya) from 2026-07-20, then **Hatton Hills** (single property) from 2026-07-30. Sections written before v0.20 may name Treehouse or Mosvold, cite the old room types, the old reservations number, or claim rates are never quoted. **v0.20 is authoritative.**
+
+**Single property.** Hatton Hills has exactly five room types, all distinct: Forest Escape Suite, Eco Harmony Suite, Sunrise Vista Premium Suite (each up to 2 guests), Mount Luxe Chalet, Mount Monarch Chalet (each up to 5 guests). Kavya must NEVER ask which property or location the caller means. The two-property disambiguation machinery from the Mosvold era is retained but inert — see v0.20.
 
 The agent persona is **Kavya** — a reservations agent. **As of 2026-07-28 the line is English only**: Sinhala and Arabic were removed from the IVR — `DIGIT_TO_LANG = {"1": "en"}`, the Arabic/Sinhala `<Say>` prompts are gone from `/voice/incoming`, and `/ws/media-stream/{lang}` now accepts only `ta` (so `si`/`ar` connections are refused). The Sinhala/Arabic/Tamil TTS, STT, prompt and filler code below all remain in place and dormant; re-enable by restoring the digit, the `<Say>`, and the guard entry. Sinhala TTS now uses **OpenAI `gpt-4o-mini-tts`** (voice `nova`) as of v0.16 (was Azure `si-LK-SameeraNeural`). Tamil is fully implemented in code (Media Streams path below) but is still **NOT surfaced in the menu** — add `"4": "ta"` (and a `<Say>` prompt) to expose it.
 
@@ -457,6 +463,80 @@ This section documents the major changes made to the project since initial devel
 **Deploy note:** `server.py` is baked into the image via Dockerfile `COPY` (only `chroma_db` is volume-mounted), so code changes require `docker compose up -d --build kavya` — `--force-recreate` alone does NOT pick up a new `server.py`.
 
 **How to test:** call the number → press 3 → speak Sinhala. No-phone smoke test: `POST Digits=3` to `/voice/language-selected` returns `<Stream …/ws/media-stream/si>`; `GET/POST /voice/incoming` renders the Sinhala `<Say>`. Verified `gpt-4o-mini-tts` access with the production key (Sinhala sample → HTTP 200, ~285 KB PCM). Rollback backup: `/opt/kavya/server.py.bak.sinhala-20260623-120351`.
+
+### v0.20 — Rebrand to Hatton Hills (single property) + data-security answers
+**Reason:** A demo property was needed that Kavya could quote confident luxury prices for, without
+the two-property disambiguation friction of the Mosvold setup. Hatton Hills already existed in this
+monorepo as a separate agent (`../HattonHills/`) with an established identity and exactly five room
+types, so that identity was reused rather than inventing a conflicting one.
+
+**Hatton Hills is invented.** Rates, descriptions and the reservations number (+94 77 220 4400) are
+all fictional, for client demonstrations.
+
+**Room types and rates** (USD per room per night, half board, taxes included):
+Forest Escape Suite 700 (2 pax) · Eco Harmony Suite 800 (2) · Sunrise Vista Premium Suite 950 (2) ·
+Mount Luxe Chalet 1,150 (5) · Mount Monarch Chalet 1,400 (5, the only plunge pool, single unit).
+
+**SINGLE-PROPERTY MODE — the load-bearing change.** The Mosvold code was deliberately *fail-closed*:
+room names collided across the two properties, so `resolve_property()` returned `None` to force an
+"ask which property" turn, and the `property` tool argument was REQUIRED. Left as-is, that would
+have **blocked every booking** — the model would ask a question with no valid answer. So:
+- `yanolja_service.resolve_property()` and `tools.normalise_property()` now ALWAYS resolve to
+  `"Hatton Hills"`, never `None`. Return type narrowed `str | None` → `str`.
+- The `if property_name else None` short-circuits wrapping those calls in `derive_availability()` and
+  `book()` were REMOVED — they would have re-introduced the `None` and failed closed anyway.
+- `property` removed from every tool's `required` array; schema description tells the model not to ask.
+- `_property_required_error()` kept but **unreachable**; ditto the `property_name is None` guards in
+  `execute_tool`. Retained as the restore point for a second property.
+- `yanolja_service._property_of()` no longer falls back to `resolve_property()` on a PMS-supplied
+  property field. Now that the resolver always resolves, that fallback would launder ANY string into
+  a match and drag the retired ex-Mosvold room types and the `Default Unmapped Room` fallback back
+  into availability. It now derives **solely** from the canonical room name and returns `""` for
+  anything unrecognised — that `""` is what filters those rows out, so it is load-bearing.
+- `_match_room_type()` gained a final fallback for a query that EXTENDS a canonical name
+  ("mount monarch chalet with plunge pool" → "Mount Monarch Chalet"). That direction was previously
+  forbidden because a longer cross-property name could collapse onto a shorter same-property one;
+  with one property and five non-prefixing names the hazard is gone.
+- `post_call._normalize_property_and_room()` no longer NULLs `room_preference` when `property` is
+  unresolved — it forces `"Hatton Hills"`. The old behaviour would have silently dropped the room
+  from most Google Sheet rows, since nothing asks the guest for a property any more.
+
+**PMS.** `ops/hattonhills-pms/rename_to_hattonhills.sql` rebrands `yanolja_pms` in place by UPDATE
+only (no INSERT/DELETE, so reservation FKs survive): renames types ids 1–5, spreads all 9 rooms
+across them (2 each except Mount Monarch's 1), renumbers rooms to `HH-*`, and retires ids 7–10
+(`is_active=0`, neutral names). Type 6 (`DUR`) untouched. Needs **root** on `198.211.114.60` — the
+`dev` user has no MySQL grant and the PMS REST API has no room-type write endpoint.
+`ops/hattonhills-pms/verify_live.py` checks the result through Kavya's own code path.
+
+**ORDERING GOTCHA:** the SQL must be applied BEFORE the code deploys. Until it runs, the PMS holds
+Mosvold names, `_property_of()` returns `""` for all of them, and **availability returns zero room
+types** — Kavya truthfully reports no rooms. Verified: `verify_live.py` fails exactly this way
+pre-migration.
+
+**Data security answers (new prompt section).** Hotel prospects evaluating the system ask about data
+security and are easily spooked, so Kavya now answers it confidently instead of deflecting to a
+handoff. Added a `DATA SECURITY` block to `_build_system_prompt` plus matching KB paragraphs:
+encryption in transit and at rest; **role-based access control** — only **Mr. Chrys** and **Rakesh**
+can access sensitive data, no other TaskForce AI employee can, no shared admin account; **Rakesh**
+leads data security and is a cybersecurity major; the hotel owns its data and it is never sold or
+shared. Kavya must also admit plainly to being an AI agent built by TaskForce AI, and is explicitly
+forbidden from inventing certifications, audits, compliance standards or data-centre locations —
+naming a fabricated SOC 2 / ISO 27001 to a hotel's IT reviewer is worse than having none to cite.
+
+**Also in this change:**
+- Global **one-question-at-a-time** rule promoted into `VOICE RULES` (it previously sat only inside
+  the booking-details section, so compound clarification/handoff questions produced ambiguous
+  `"Yes."` answers and forced re-asks).
+- Fixed **114 mojibake em-dashes** (`â€"`) in `server.py` — pre-existing encoding damage that the
+  LLM was reading verbatim in its system prompt.
+- Reservations number changed everywhere to +94 77 220 4400, including all six spelled-out
+  ("plus nine four, seven seven, two two zero, four four zero zero") renderings.
+- `kpms_service.py` is **dead code** — nothing imports it, so it was left Mosvold-era.
+
+**Rollback:** SQL `REVERT` block in `rename_to_hattonhills.sql`, plus backups in
+`/home/dev/backups/kavya-kb/` (`hotel_info.txt.pre-hattonhills-20260730`,
+`server.py.pre-hattonhills-20260730`). Reverting the database alone is not enough — the KB,
+`yanolja_service.py`, `tools.py`, `server.py` and `post_call.py` all changed together.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 

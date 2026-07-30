@@ -1,10 +1,10 @@
 """
 post_call.py -- Post-call data extraction and n8n webhook integration.
 
-Kavya is the reservations agent for Mosvold Boutique Hotels, which operates two
-properties on Sri Lanka's Southern Coast: Mosvold Villa (Ahangama) and Sundara
-by Mosvold (Balapitiya). One phone line serves both, so the extraction records
-which property a call was about alongside the room preference.
+Kavya is the reservations agent for Hatton Hills, a single luxury boutique eco
+retreat in Sri Lanka's central hill country with five room types. The extraction
+still records a `property` field (always "Hatton Hills") so the Google Sheet
+column shape is unchanged.
 
 After a call ends:
   1. Uses LLM to extract structured booking details from the full transcript.
@@ -44,17 +44,15 @@ EXTRACTION_MAX_TOKENS: int = 2000
 # ---------------------------------------------------------------------------
 # Extraction prompt
 # ---------------------------------------------------------------------------
-EXTRACTION_SYSTEM_PROMPT: str = """You are a data extraction assistant for Mosvold Boutique Hotels in Sri Lanka. The group operates TWO properties on the Southern Coast, and one phone line serves both:
-- "Mosvold Villa" in Ahangama
-- "Sundara by Mosvold" in Balapitiya
+EXTRACTION_SYSTEM_PROMPT: str = """You are a data extraction assistant for Hatton Hills, a luxury boutique eco retreat in Sri Lanka's central hill country. It is a SINGLE property.
 
-Analyze a phone call transcript between the group's reservations agent (Kavya) and a caller. The call may be in English, Sinhala, Tamil, or Arabic.
+Analyze a phone call transcript between the retreat's reservations agent (Kavya) and a caller. The call may be in English, Sinhala, Tamil, or Arabic.
 
 Extract ALL available information and return ONLY a valid JSON object. No markdown code fences, no explanation — just the raw JSON.
 
 {
   "guest_name": "caller's name or null",
-  "property": "'Mosvold Villa' or 'Sundara by Mosvold', or null if the caller never established which property",
+  "property": "always 'Hatton Hills' — there is only one property",
   "num_guests": "e.g. '2 adults, 1 child (age 5)' or null",
   "check_in": "YYYY-MM-DD or null",
   "check_out": "YYYY-MM-DD or null",
@@ -66,12 +64,10 @@ Extract ALL available information and return ONLY a valid JSON object. No markdo
 }
 
 CRITICAL RULES FOR property AND room_preference:
-- The two properties have DIFFERENT room types. Never mix them up.
-- Mosvold Villa (Ahangama) room types: Deluxe Double Room, Deluxe Twin Room, Family Suite, Founders Suite.
-- Sundara by Mosvold (Balapitiya) room types: Deluxe Double Room with Garden View, Deluxe Double Room with Sea View, Deluxe Twin Room with Sea View, Beach Villa, Family Villa with Pool.
-- "Deluxe Double Room" and "Deluxe Twin Room" exist at BOTH properties under similar names, so a room name alone is AMBIGUOUS. Only record room_preference together with the property it belongs to.
-- If the transcript never establishes the property, set "property" to null and set "room_preference" to null as well — do NOT guess a property from a room name.
-- Record room_preference using the exact room-type name for the identified property, and nothing else.
+- "property" is always "Hatton Hills". There is only one property, so never write anything else and never write null.
+- The five room types are: Forest Escape Suite, Eco Harmony Suite, Sunrise Vista Premium Suite (each up to 2 guests), Mount Luxe Chalet, Mount Monarch Chalet (each up to 5 guests).
+- Record room_preference using one of those exact five names, and nothing else. If the guest described a room loosely ("the one with the pool"), map it to the correct full name (that is the Mount Monarch Chalet).
+- If the guest never indicated a room, set room_preference to null.
 
 CRITICAL RULES FOR call_outcome — pick the BEST match:
 - "booking_confirmed" = guest confirmed a booking during the call
@@ -90,10 +86,10 @@ RULES FOR dates:
 
 RULES FOR summary:
 - ALWAYS provide a summary, even for short calls.
-- Name the property when it was established. Example: "Guest asked about a Founders Suite at Mosvold Villa for 2 adults. Kavya described the suite and referred the guest to reservations for pricing."
-- Another example: "Guest enquired about the Family Villa with Pool at Sundara by Mosvold but did not give dates."
+- Example: "Guest asked about the Mount Monarch Chalet for 2 adults from 12 to 14 August. Kavya confirmed availability at one thousand four hundred US dollars per night and the guest asked to be called back."
+- Another example: "Guest enquired about the Eco Harmony Suite but did not give dates."
 - Write in English regardless of transcript language.
-- Mosvold publishes no room rates; they are quoted live per date. Never write a price figure into the summary or any other field. If the caller asked about price, just record that they asked and that they were directed to reservations.
+- Rates ARE quoted on these calls (US dollars per room per night, half board). You may record a rate in availability_result or summary if the agent stated one. Never invent a figure that was not said.
 
 RULES FOR follow_up_needed:
 - "Yes" if: guest showed interest but didn't book, said they'd call back, asked to receive info, or conversation dropped before resolution.
@@ -108,68 +104,38 @@ EXTRACTION_USER_TEMPLATE: str = "Transcript:\n\n{transcript}"
 # ---------------------------------------------------------------------------
 # Property / room vocabulary
 #
-# One phone line serves both properties, and the room types differ per
-# property. "Deluxe Double Room" and "Deluxe Twin Room" exist at BOTH under
-# similar names, so a room name on its own is ambiguous — the property must be
-# established before a room can be attributed.
+# SINGLE-PROPERTY MODE (2026-07-30). Hatton Hills is the only property and all
+# five room names are distinct, so a room name is never ambiguous and nothing
+# needs to be dropped for want of a property.
 # ---------------------------------------------------------------------------
-PROPERTY_MOSVOLD_VILLA: str = "Mosvold Villa"
-PROPERTY_SUNDARA: str = "Sundara by Mosvold"
+PROPERTY_HATTON: str = "Hatton Hills"
 
 ROOM_TYPES_BY_PROPERTY: dict[str, tuple[str, ...]] = {
-    PROPERTY_MOSVOLD_VILLA: (
-        "Deluxe Double Room",
-        "Deluxe Twin Room",
-        "Family Suite",
-        "Founders Suite",
-    ),
-    PROPERTY_SUNDARA: (
-        "Deluxe Double Room with Garden View",
-        "Deluxe Double Room with Sea View",
-        "Deluxe Twin Room with Sea View",
-        "Beach Villa",
-        "Family Villa with Pool",
+    PROPERTY_HATTON: (
+        "Forest Escape Suite",
+        "Eco Harmony Suite",
+        "Sunrise Vista Premium Suite",
+        "Mount Luxe Chalet",
+        "Mount Monarch Chalet",
     ),
 }
 
 
 def _normalize_property_and_room(result: dict[str, Any]) -> dict[str, Any]:
-    """Enforce that a room preference is only recorded with a known property.
+    """Normalise the extracted property to the single canonical name.
 
-    Mutates and returns ``result``. If the property was never established, the
-    room preference is dropped rather than guessed, because the same room name
-    can refer to a different room at each property.
+    Mutates and returns ``result``. Always sets ``property`` to "Hatton Hills":
+    it is the only property, so whatever the extraction model wrote (or omitted)
+    it can only have meant this one.
+
+    Note what this deliberately no longer does: it used to NULL out
+    ``room_preference`` whenever the property was unresolved, because a bare
+    "Deluxe Double Room" could belong to either Mosvold property. Keeping that
+    behaviour here would now silently drop the room from every Google Sheet row
+    where the model left ``property`` null — which is most of them, since nothing
+    on the call asks the guest to name a property any more.
     """
-    prop = result.get("property")
-    if isinstance(prop, str):
-        prop_clean = prop.strip()
-        match = next(
-            (
-                known
-                for known in ROOM_TYPES_BY_PROPERTY
-                if known.lower() == prop_clean.lower()
-            ),
-            None,
-        )
-        # Tolerate the shorthand callers and models often use.
-        if match is None and prop_clean:
-            lowered = prop_clean.lower()
-            if "sundara" in lowered or "balapitiya" in lowered:
-                match = PROPERTY_SUNDARA
-            elif "ahangama" in lowered or "villa" in lowered:
-                match = PROPERTY_MOSVOLD_VILLA
-        result["property"] = match
-        prop = match
-    else:
-        result["property"] = None
-        prop = None
-
-    if not prop and result.get("room_preference"):
-        logger.info(
-            "Dropping room_preference %r — property was never established on the call",
-            result.get("room_preference"),
-        )
-        result["room_preference"] = None
+    result["property"] = PROPERTY_HATTON
     return result
 
 
@@ -322,8 +288,8 @@ async def extract_booking_details(
         return empty
 
 
-RETRY_PROMPT: str = """Extract these fields from the Mosvold Boutique Hotels call transcript as a short JSON object. Use null for missing fields.
-Fields: guest_name, property ('Mosvold Villa' in Ahangama or 'Sundara by Mosvold' in Balapitiya), num_guests, check_in (YYYY-MM-DD), check_out (YYYY-MM-DD), room_preference, availability_result, call_outcome (booking_inquiry/general_inquiry/booking_confirmed/callback_requested/dropped), follow_up_needed (Yes/No), summary (1 sentence English).
+RETRY_PROMPT: str = """Extract these fields from the Hatton Hills call transcript as a short JSON object. Use null for missing fields.
+Fields: guest_name, property (always 'Hatton Hills'), num_guests, check_in (YYYY-MM-DD), check_out (YYYY-MM-DD), room_preference, availability_result, call_outcome (booking_inquiry/general_inquiry/booking_confirmed/callback_requested/dropped), follow_up_needed (Yes/No), summary (1 sentence English).
 Room types differ per property and similar names exist at both, so a room name alone is ambiguous: if the property is not established, set both property and room_preference to null. Never write a price figure into any field.
 Return ONLY valid JSON, no markdown."""
 

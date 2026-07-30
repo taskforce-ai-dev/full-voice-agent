@@ -1,13 +1,22 @@
-"""Business logic on top of yanolja_client, for Mosvold Boutique Hotels.
+"""Business logic on top of yanolja_client, for Hatton Hills.
 
-Kavya serves TWO properties on one phone line: Mosvold Villa (Ahangama) and
-Sundara by Mosvold (Balapitiya). Room names overlap between them, so the property
-must be established before a room type is selected — see `resolve_property`,
-`_match_room_type` and the `property_name` argument below.
+Kavya serves ONE property: Hatton Hills, a luxury boutique eco retreat in Sri
+Lanka's central hill country. It has exactly five room types, all distinct, so
+nothing about a room request is ambiguous and the guest is NEVER asked which
+property they mean.
 
-This module NEVER emits a room rate. Mosvold publishes no rates; they exist only
-once dates are chosen and are served live by the external booking engine
-(BookingEye). Price questions go to reservations on RESERVATIONS_PHONE.
+SINGLE-PROPERTY MODE (2026-07-30). This module used to serve two Mosvold
+properties whose room names collided, so it was deliberately fail-closed: the
+property had to be established before a room could be matched, and
+`resolve_property` returned None to force an "ask which property" turn. That
+protection is now inert by construction — `resolve_property` always resolves to
+PROPERTY_HATTON, because with one property there is no wrong hotel to pick. The
+`property_name` plumbing is retained end to end (booking_api and tools still
+thread it) so a second property can be reintroduced by restoring the alias map
+and letting `resolve_property` return None again. Do not delete it.
+
+This module DOES emit room rates while DEMO_RATES_ENABLED is true — see
+DEMO_NIGHTLY_RATE_USD below. Those figures are invented for demonstrations.
 
 Mirrors the public API of kpms_service.py. booking_api.py consumes:
     derive_availability(check_in, check_out, num_adults, num_children,
@@ -72,43 +81,34 @@ logger = logging.getLogger(__name__)
 
 CACHE_TTL_SECONDS = 60.0
 
-# Reservations hotline — the only channel that can quote a price. Mosvold publishes
-# no rates anywhere; rates exist only once dates are chosen and are served live by
-# the external booking engine (BookingEye). This module therefore never emits a
-# numeric room rate.
-RESERVATIONS_PHONE = "+94 77 335 8800"
+# Reservations hotline — for anything the agent cannot answer or quote itself.
+RESERVATIONS_PHONE = "+94 77 220 4400"
 
-# The two Mosvold properties. One phone line serves both, so the property is NEVER
-# implied — it must be established before a room type can be selected.
-PROPERTY_VILLA = "Mosvold Villa"
-PROPERTY_SUNDARA = "Sundara by Mosvold"
+# The single property. Retained as a keyed structure (rather than flattened) so a
+# second property can be reintroduced without reshaping every consumer.
+PROPERTY_HATTON = "Hatton Hills"
 
 PROPERTY_LOCATIONS = {
-    PROPERTY_VILLA: "Ahangama",
-    PROPERTY_SUNDARA: "Balapitiya",
+    PROPERTY_HATTON: "Central Province hill country",
 }
 
-# Room vocabulary, keyed by property. Room types differ per property and must never
-# be mixed up: "Deluxe Double Room" and "Deluxe Twin Room" exist at BOTH properties
-# under similar names, so a bare room request is ambiguous until the property is known.
+# Room vocabulary, keyed by property. All five names are distinct and none is a
+# prefix of another, so a room request needs no property context to disambiguate.
+# These strings are the single source of property identity in the PMS schema (it
+# has no property column) and MUST match room_types.name there byte-for-byte —
+# see ops/hattonhills-pms/rename_to_hattonhills.sql.
 ROOM_TYPES_BY_PROPERTY: dict[str, tuple[str, ...]] = {
-    PROPERTY_VILLA: (
-        "Deluxe Double Room",
-        "Deluxe Twin Room",
-        "Family Suite",
-        "Founders Suite",
-    ),
-    PROPERTY_SUNDARA: (
-        "Deluxe Double Room with Garden View",
-        "Deluxe Double Room with Sea View",
-        "Deluxe Twin Room with Sea View",
-        "Beach Villa",
-        "Family Villa with Pool",
+    PROPERTY_HATTON: (
+        "Forest Escape Suite",
+        "Eco Harmony Suite",
+        "Sunrise Vista Premium Suite",
+        "Mount Luxe Chalet",
+        "Mount Monarch Chalet",
     ),
 }
 
-# Flat canonical name -> owning property. Every canonical name is distinct across the
-# two properties, so this mapping is unambiguous; caller *phrasing* is what is not.
+# Flat canonical name -> owning property. Trivially unambiguous with one property;
+# kept so `_property_of` and `_match_room_type` keep working unchanged.
 ROOM_TYPE_PROPERTY: dict[str, str] = {
     name: prop for prop, names in ROOM_TYPES_BY_PROPERTY.items() for name in names
 }
@@ -118,30 +118,28 @@ ALL_ROOM_TYPES: tuple[str, ...] = tuple(ROOM_TYPE_PROPERTY)
 # --------------------------------------------------------------------------- #
 # DEMO RATES — demo pricing for client demonstrations
 # --------------------------------------------------------------------------- #
-# Mosvold publishes no real rate card. These figures are INVENTED for demos so
-# Kavya can quote a price and the PMS folio total is non-zero. They are NOT a
-# real rate card and must not be presented to actual guests as firm quotes.
+# Hatton Hills is an INVENTED demo property, so this whole rate card is invented
+# too. It exists so Kavya can quote a confident price on a demo call and the PMS
+# folio total is non-zero. It is not a real rate card.
 #
-# Kill switch: set DEMO_RATES_ENABLED=false and Kavya reverts to the original
-# "rates are date-dependent, reservations will confirm" behaviour — the numbers
-# below stop being surfaced in tool results and the system prompt re-forbids
-# quoting figures. Keep in sync with room_types.base_price in the PMS (see
-# ops/mosvold-pms/set_demo_rates.sql) or the folio total will disagree with
-# what Kavya says on the call.
+# Currency: US dollars, per room per night, half board (breakfast and dinner),
+# taxes included. A luxury ladder: 700 entry suite -> 1400 flagship chalet.
+#
+# Kill switch: set DEMO_RATES_ENABLED=false and Kavya reverts to "rates are
+# date-dependent, reservations will confirm" behaviour — the numbers below stop
+# being surfaced in tool results and the system prompt re-forbids quoting
+# figures. Keep in sync with room_types.base_price in the PMS (see
+# ops/hattonhills-pms/rename_to_hattonhills.sql) or the folio total will
+# disagree with what Kavya says on the call.
 DEMO_RATES_ENABLED: bool = os.getenv("DEMO_RATES_ENABLED", "true").lower() == "true"
 
 DEMO_NIGHTLY_RATE_USD: dict[str, int] = {
-    # Mosvold Villa (Ahangama)
-    "Deluxe Double Room": 700,
-    "Deluxe Twin Room": 700,
-    "Family Suite": 820,
-    "Founders Suite": 900,
-    # Sundara by Mosvold (Balapitiya)
-    "Deluxe Double Room with Garden View": 700,
-    "Deluxe Double Room with Sea View": 760,
-    "Deluxe Twin Room with Sea View": 760,
-    "Beach Villa": 880,
-    "Family Villa with Pool": 900,
+    # Hatton Hills — suites sleep 2, chalets sleep 5.
+    "Forest Escape Suite": 700,
+    "Eco Harmony Suite": 800,
+    "Sunrise Vista Premium Suite": 950,
+    "Mount Luxe Chalet": 1150,
+    "Mount Monarch Chalet": 1400,
 }
 
 
@@ -155,22 +153,18 @@ def demo_rate_for(room_type_name: str) -> Optional[int]:
         return None
     return DEMO_NIGHTLY_RATE_USD.get(room_type_name)
 
-# Every name Kavya may speak, across both properties. Flat tuple, matching
-# kpms_service.KAVYA_VOCAB so the constant means the same shape in both modules.
+# Every name Kavya may speak. Flat tuple, matching kpms_service.KAVYA_VOCAB so the
+# constant means the same shape in both modules.
 KAVYA_VOCAB: tuple[str, ...] = ALL_ROOM_TYPES
 
-# Words a caller may use for each property (name fragments and towns).
-# Bare "villa"/"the villa" are intentionally absent: matched as substrings they
-# resolve Sundara's "Beach Villa" and "Family Villa with Pool" to Mosvold Villa.
-# This mirrors tools.normalise_property so the two resolvers agree.
+# Words a caller may use for the property (name fragments and locality).
+# Only used to recognise an explicit mention; resolution no longer depends on it
+# because `resolve_property` falls back to the single property regardless.
 _PROPERTY_ALIASES: dict[str, str] = {
-    "mosvold villa": PROPERTY_VILLA,
-    "ahangama": PROPERTY_VILLA,
-    "mosvold ahangama": PROPERTY_VILLA,
-    "sundara": PROPERTY_SUNDARA,
-    "sundara by mosvold": PROPERTY_SUNDARA,
-    "balapitiya": PROPERTY_SUNDARA,
-    "mosvold balapitiya": PROPERTY_SUNDARA,
+    "hatton hills": PROPERTY_HATTON,
+    "hatton": PROPERTY_HATTON,
+    "hatton hills resort": PROPERTY_HATTON,
+    "hill country": PROPERTY_HATTON,
 }
 
 
@@ -178,30 +172,36 @@ class ServiceError(Exception):
     """Graceful business error."""
 
 
-def resolve_property(query: str) -> str | None:
-    """Map a caller's phrasing to one of the two canonical property names.
+def resolve_property(query: str) -> str:
+    """Resolve a caller's phrasing to the canonical property name.
 
-    Returns None when the property cannot be established — callers MUST treat that
-    as "ask which property" rather than guessing, because room names collide."""
-    if not query:
-        return None
-    q = " ".join(str(query).strip().lower().split())
-    if not q:
-        return None
-    if q in _PROPERTY_ALIASES:
-        return _PROPERTY_ALIASES[q]
-    hits = {prop for alias, prop in _PROPERTY_ALIASES.items() if alias in q}
-    if len(hits) == 1:
-        return hits.pop()
-    return None
+    SINGLE-PROPERTY MODE: always returns PROPERTY_HATTON and never None. Hatton
+    Hills is the only property, so there is no wrong hotel to route to and
+    nothing to fail closed on. The alias map is consulted only so an explicit
+    mention still round-trips; anything unrecognised — including "" and None —
+    resolves to the one property rather than triggering an "ask which property"
+    turn that the guest could not meaningfully answer.
+
+    If a second property is ever added, restore the alias-miss branch to return
+    None and re-widen the return type to `str | None`; every caller already
+    handles a falsy result."""
+    if query:
+        q = " ".join(str(query).strip().lower().split())
+        if q in _PROPERTY_ALIASES:
+            return _PROPERTY_ALIASES[q]
+        hits = {prop for alias, prop in _PROPERTY_ALIASES.items() if alias in q}
+        if len(hits) == 1:
+            return hits.pop()
+    return PROPERTY_HATTON
 
 
 def _property_prompt() -> str:
+    """Never asks the guest to choose — there is only one property. Retained
+    because `_room_choice_prompt` falls back to it for an unknown property."""
     return (
-        "We have two properties and the room names differ between them: "
-        f"{PROPERTY_VILLA} in {PROPERTY_LOCATIONS[PROPERTY_VILLA]}, and "
-        f"{PROPERTY_SUNDARA} in {PROPERTY_LOCATIONS[PROPERTY_SUNDARA]}. "
-        "Which property is this booking for?"
+        f"{PROPERTY_HATTON} has five room types: "
+        + ", ".join(ROOM_TYPES_BY_PROPERTY[PROPERTY_HATTON])
+        + ". Which one would you like?"
     )
 
 
@@ -245,8 +245,9 @@ def _cache_invalidate(key: str) -> None:
 
 def _norm(name: str) -> str:
     """Lowercase + collapse whitespace. Deliberately does NOT strip trailing words:
-    'Family Suite', 'Founders Suite', 'Beach Villa' and 'Family Villa with Pool' are
-    whole room names at Mosvold, so suffix-trimming would corrupt them."""
+    'Suite' and 'Chalet' are part of the whole room name at Hatton Hills (e.g.
+    'Forest Escape Suite', 'Mount Monarch Chalet'), so suffix-trimming would
+    corrupt them and 'Mount Luxe'/'Mount Monarch' would stop being distinct."""
     if not name:
         return ""
     return " ".join(str(name).strip().lower().split())
@@ -267,21 +268,18 @@ def _display_name(rt: dict) -> str:
 
 
 def _property_of(rt: dict) -> str:
-    """Owning property for a PMS room-type dict.
+    """Owning property for a PMS room-type dict, or "" if it is not one of ours.
 
-    Prefers an explicit property field if the booking backend supplies one; otherwise
-    derives it from the canonical room name. Returns "" when it cannot be established,
-    and callers must then ask the guest rather than assume."""
-    for key in ("propertyName", "property", "hotelName", "hotel"):
-        val = rt.get(key)
-        if isinstance(val, str):
-            resolved = resolve_property(val)
-            if resolved:
-                return resolved
-        elif isinstance(val, dict):
-            resolved = resolve_property(str(val.get("name") or ""))
-            if resolved:
-                return resolved
+    Derived SOLELY from the canonical room name via ROOM_TYPE_PROPERTY. It must
+    NOT fall back to `resolve_property` on a PMS-supplied property field: that
+    function now always returns PROPERTY_HATTON (single-property mode), so any
+    non-empty string would be laundered into a match and room types that are not
+    part of the Hatton Hills catalogue — the 'Default Unmapped Room' fallback and
+    the retired ex-Mosvold types still present in the database — would be pulled
+    back into availability and could be quoted or booked.
+
+    Returning "" for anything unrecognised is what keeps those rows filtered out
+    of `derive_availability`, so this is load-bearing, not defensive."""
     return ROOM_TYPE_PROPERTY.get(_display_name(rt), "")
 
 
@@ -290,11 +288,9 @@ def _match_room_type(
 ) -> dict | None:
     """Match a Kavya-style query to a room type dict, scoped to one property.
 
-    `property_name` MUST be an established property: the same guest phrasing
-    ("deluxe double room") is valid at both Mosvold Villa and Sundara by Mosvold, so
-    matching across properties would silently pick the wrong hotel. When the property
-    is unknown the candidate pool is left unscoped and any cross-property collision
-    raises ServiceError instead of guessing.
+    `property_name` scopes the candidate pool. In single-property mode it is
+    always "Hatton Hills" and the scoping is a no-op, but it is kept so a second
+    property can be reintroduced without touching this function.
 
     Raises ServiceError on ambiguity."""
     if not query:
@@ -318,18 +314,31 @@ def _match_room_type(
         n = _norm(rt.get("name", ""))
         if not n:
             continue
-        # Only accept the query as an ABBREVIATION of a canonical name
-        # (n starts with qn). The reverse direction (qn starts with n) let a
-        # longer cross-property name — e.g. "Deluxe Double Room with Sea View"
-        # (Sundara) — collapse onto a shorter same-property name — "Deluxe
-        # Double Room" (Villa) — and silently book the wrong hotel. A query
-        # strictly longer than a canonical name is the other property's room or
-        # noise, never a same-property refinement, so it must not match here.
+        # Accept the query as an ABBREVIATION of a canonical name (n starts with
+        # qn), e.g. "mount monarch" -> "Mount Monarch Chalet".
         if n.startswith(qn):
             prefix.append(rt)
     if len(prefix) == 1:
         return prefix[0]
     if len(prefix) > 1:
+        raise ServiceError(f"Multiple room types match '{query}'.")
+
+    # Final fallback: the query EXTENDS a canonical name (qn starts with n), e.g.
+    # "mount monarch chalet with plunge pool" -> "Mount Monarch Chalet". This
+    # direction was previously forbidden because a longer cross-property name
+    # ("Deluxe Double Room with Sea View") could collapse onto a shorter
+    # same-property one ("Deluxe Double Room") and silently book the wrong hotel.
+    # With a single property there is no wrong hotel to reach, and all five names
+    # are distinct with none a prefix of another, so the collapse hazard is gone —
+    # while guests describing a room more fully than its catalogue name is common.
+    # Reinstate the restriction if a second property is ever added.
+    extends = [
+        rt for rt in candidates
+        if (n := _norm(rt.get("name", ""))) and qn.startswith(n)
+    ]
+    if len(extends) == 1:
+        return extends[0]
+    if len(extends) > 1:
         raise ServiceError(f"Multiple room types match '{query}'.")
     return None
 
@@ -417,17 +426,13 @@ async def derive_availability(
 
     nights = (co - ci).days
 
-    # The property must be established BEFORE any room type is interpreted — room
-    # names overlap across the two properties.
-    # Fail closed: availability must be scoped to an established property, the
-    # same invariant book() enforces. Room names overlap across the two
-    # properties, so an unscoped availability answer can surface the wrong
-    # hotel's rooms. This makes the service layer enforce the property rule
-    # itself rather than trusting every caller (e.g. a direct booking_api call
-    # or a future tool path) to have validated it first.
-    resolved_property = resolve_property(property_name) if property_name else None
-    if not resolved_property:
-        return {"error": _property_prompt()}
+    # Single-property mode: this always resolves to Hatton Hills, including when
+    # the caller passed nothing. Note the missing `if property_name else None`
+    # guard that used to wrap this call — with one property, an absent property
+    # argument is normal (nothing asks the guest for it any more), so short-
+    # circuiting to None would have made every availability check fail closed
+    # with an unanswerable "which property?" prompt.
+    resolved_property = resolve_property(property_name)
 
     try:
         all_rooms = await _get_rooms_cached()
@@ -489,8 +494,9 @@ async def derive_availability(
 
     if DEMO_RATES_ENABLED:
         rates_note = (
-            "Rates are per room per night in US dollars, bed and breakfast, "
-            f"including taxes. Reservations: {RESERVATIONS_PHONE}."
+            "Rates are per room per night in US dollars, half board "
+            f"(breakfast and dinner), including taxes. "
+            f"Reservations: {RESERVATIONS_PHONE}."
         )
     else:
         rates_note = (
@@ -539,11 +545,9 @@ async def book(
     if not (guest_name or "").strip() and not (guest_email or "").strip():
         return {"error": "We need a guest name to make the reservation."}
 
-    # A booking can never be created without knowing WHICH property: the same room
-    # name exists at both, so an unscoped match could book the wrong hotel.
-    resolved_property = resolve_property(property_name) if property_name else None
-    if not resolved_property:
-        return {"error": _property_prompt()}
+    # Single-property mode: always resolves to Hatton Hills, even with no
+    # property argument. See the matching note in derive_availability().
+    resolved_property = resolve_property(property_name)
 
     try:
         all_rooms = await _get_rooms_cached()
@@ -571,9 +575,10 @@ async def book(
     # reliable source for these room types. The LLM uses the KB to decide pax fit
     # before calling this tool.
 
-    # NO rate is computed. Mosvold publishes no rates; a rate only exists once dates
-    # are chosen and is served live by the external booking engine, so any figure
-    # produced locally would be fabricated. Pricing goes to RESERVATIONS_PHONE.
+    # The rate is attached further down from DEMO_NIGHTLY_RATE_USD (see the
+    # rates_note / total_usd block), not derived from the PMS. While
+    # DEMO_RATES_ENABLED is false no figure is emitted at all and pricing goes to
+    # RESERVATIONS_PHONE.
 
     # Find a free room of this type
     try:
@@ -656,7 +661,7 @@ async def book(
         result["rate_per_night_usd"] = rate
         result["total_usd"] = rate * nights
         result["rates_note"] = (
-            f"US dollars {rate} per room per night, bed and breakfast, including "
+            f"US dollars {rate} per room per night, half board, including "
             f"taxes. Total for {nights} "
             f"{'night' if nights == 1 else 'nights'}: "
             f"US dollars {rate * nights}. "

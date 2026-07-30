@@ -1,11 +1,10 @@
-﻿"""
-server.py â€” Main FastAPI server for Mosvold Boutique Hotels Voice Agent (Kavya).
+"""
+server.py — Main FastAPI server for Hatton Hills Voice Agent (Kavya).
 
-Mosvold Boutique Hotels operates TWO properties on Sri Lanka's southern coast:
-  - Mosvold Villa (Ahangama)
-  - Sundara by Mosvold (Balapitiya)
-One phone line serves both, so the property must be established before a room
-type is discussed (several room names are near-identical across the two).
+Hatton Hills is a SINGLE property: a luxury boutique eco retreat in an
+eight-acre private forest in Sri Lanka's central hill country, with exactly five
+room types. The two-property (Mosvold) disambiguation machinery was collapsed to
+single-property mode on 2026-07-30 — see yanolja_service.resolve_property.
 
 Handles:
   - IVR / DTMF language menu (POST /voice/incoming)
@@ -116,8 +115,8 @@ OPENAI_TTS_MODEL: str = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 OPENAI_TTS_VOICE: str = os.getenv("OPENAI_TTS_VOICE", "nova")
 OPENAI_TTS_INSTRUCTIONS: str = os.getenv(
     "OPENAI_TTS_INSTRUCTIONS",
-    "You are Kavya, a warm and friendly reservations agent at Mosvold "
-    "Boutique Hotels, on Sri Lanka's southern coast. Speak in natural, "
+    "You are Kavya, a warm and friendly reservations agent at Hatton "
+    "Hills, in Sri Lanka's central hill country. Speak in natural, "
     "lively conversational Sinhala with genuine warmth -- smile as you talk. "
     "Vary your pitch and pace naturally, soften when being empathetic, and "
     "pause briefly between ideas. Sound like a real person chatting on the "
@@ -134,7 +133,7 @@ TWILIO_AUTH_TOKEN: str = os.getenv("TWILIO_AUTH_TOKEN", "")
 HUMAN_AGENT_PHONE: str = os.getenv("HUMAN_AGENT_PHONE", "").strip()
 PUBLIC_HOSTNAME: str = os.getenv("PUBLIC_HOSTNAME", "voice.taskforceai.tech").strip()
 
-# Twilio REST client singleton â€” used for Path B human handoff
+# Twilio REST client singleton — used for Path B human handoff
 # (client.calls(sid).update(twiml=...)) to bypass the unreliable
 # ConversationRelay {"type":"end"} + HandoffData flow.
 _twilio_client: TwilioRestClient | None = None
@@ -176,7 +175,7 @@ except ImportError:
     google_genai = None  # type: ignore[assignment]
     genai_types = None  # type: ignore[assignment]
     GOOGLE_GENAI_AVAILABLE = False
-    logger.warning("google-genai not installed â€” native Gemini provider unavailable")
+    logger.warning("google-genai not installed — native Gemini provider unavailable")
 
 # ---------------------------------------------------------------------------
 # Optional: Google Cloud Speech (Media Streams STT)
@@ -187,7 +186,7 @@ try:
 except ImportError:
     google_speech = None  # type: ignore[assignment]
     GOOGLE_STT_AVAILABLE = False
-    logger.warning("google-cloud-speech not installed â€” Media Streams STT unavailable")
+    logger.warning("google-cloud-speech not installed — Media Streams STT unavailable")
 
 # ---------------------------------------------------------------------------
 # Optional: Azure Speech (alternative Media Streams STT, selected via STT_PROVIDER)
@@ -198,7 +197,7 @@ try:
 except ImportError:
     azure_speech = None  # type: ignore[assignment]
     AZURE_STT_AVAILABLE = False
-    logger.warning("azure-cognitiveservices-speech not installed â€” Azure STT provider unavailable")
+    logger.warning("azure-cognitiveservices-speech not installed — Azure STT provider unavailable")
 
 # audioop decodes Twilio mulaw â†’ PCM16 for Azure's push stream and for audio
 # dumps. Stdlib through Python 3.12; removed in 3.13 (use the audioop-lts shim).
@@ -206,7 +205,7 @@ try:
     import audioop
 except ImportError:  # pragma: no cover
     audioop = None  # type: ignore[assignment]
-    logger.warning("audioop unavailable (Python 3.13+) â€” Azure STT and audio dump need audioop-lts")
+    logger.warning("audioop unavailable (Python 3.13+) — Azure STT and audio dump need audioop-lts")
 
 # ---------------------------------------------------------------------------
 # LLM configuration
@@ -221,7 +220,7 @@ MAX_TOKENS: int = 300
 MAX_HISTORY_MESSAGES: int = 60
 MAX_TOOL_ROUNDS: int = 5
 
-# Caller phone lookup â€” populated by HTTP handlers, consumed by WebSocket handlers
+# Caller phone lookup — populated by HTTP handlers, consumed by WebSocket handlers
 _call_phone: dict[str, str] = {}  # CallSid -> caller phone number
 
 # ---------------------------------------------------------------------------
@@ -238,7 +237,7 @@ DEFAULT_FILLER: str = "Let me check that for you."
 # Backchannel filter: short non-semantic utterances that callers emit while
 # thinking ("um", "uh", "hmm"). Twilio's STT fires these as full prompts and
 # without filtering, Kavya would jump in mid-thought, derailing the call.
-# We deliberately do NOT include "ok", "yeah", "yes", "no", "right" â€” those
+# We deliberately do NOT include "ok", "yeah", "yes", "no", "right" — those
 # are genuine answers in this booking flow.
 BACKCHANNEL_TOKENS: set[str] = {
     "um", "uh", "uhm", "umm", "uhh", "erm", "er",
@@ -249,10 +248,10 @@ BACKCHANNEL_TOKENS: set[str] = {
 
 
 def _is_backchannel(text: str) -> bool:
-    """True if the utterance is purely thinking-noise â€” should be ignored
+    """True if the utterance is purely thinking-noise — should be ignored
     so the caller keeps the turn. Strips punctuation and lowercases."""
     # Digit-bearing utterances are real content (phone numbers, dates,
-    # room counts, etc.) â€” never treat them as backchannel.
+    # room counts, etc.) — never treat them as backchannel.
     if any(c.isdigit() for c in text):
         return False
     cleaned = "".join(c for c in text.lower() if c.isalpha() or c.isspace()).strip()
@@ -263,7 +262,7 @@ def _is_backchannel(text: str) -> bool:
     return cleaned in BACKCHANNEL_TOKENS
 
 # Sent when the LLM hasn't returned its first token within SLOW_RESPONSE_DELAY
-# seconds â€” covers Anthropic 429 retries and other network latency so the
+# seconds — covers Anthropic 429 retries and other network latency so the
 # guest doesn't think the line dropped and re-speak (which corrupts slot-filling).
 SLOW_RESPONSE_DELAY: float = 2.5
 SLOW_RESPONSE_FILLERS: dict[str, str] = {
@@ -296,7 +295,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "tts_provider": "ElevenLabs",
         "voice": "bm3QvaZ3fUSCRBC3UV1f-flash_v2_5",
         "language": "en-US",
-        "welcome_greeting": "Welcome to Mosvold Boutique Hotels! I'm Kavya, how can I help you today?",
+        "welcome_greeting": "Welcome to Hatton Hills! I'm Kavya, how can I help you today?",
         "extra_attrs": '        elevenlabsTextNormalization="on"\n',
     },
     "si": {
@@ -305,7 +304,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "language": "si-LK",
         "welcome_greeting": (
             "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
-            "Mosvold Boutique Hotels \u0DC0\u0DD9\u0DAD "
+            "Hatton Hills \u0DC0\u0DD9\u0DAD "
             "\u0DC3\u0DCF\u0DAF\u0DBB\u0DBA\u0DD9\u0DB1\u0DCA "
             "\u0DB4\u0DD2\u0DC5\u0DD2\u0D9C\u0DB1\u0DD2\u0DB8\u0DD4. "
             "\u0DB8\u0DA7 \u0D94\u0DB6\u0DA7 "
@@ -321,7 +320,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "language": "ta-IN",
         "welcome_greeting": (
             "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-            "Mosvold Boutique Hotels \u0B95\u0BCD\u0B95\u0BC1 "
+            "Hatton Hills \u0B95\u0BCD\u0B95\u0BC1 "
             "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
             "\u0BA8\u0BBE\u0BA9\u0BCD "
             "\u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
@@ -333,7 +332,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Media Streams â€” Azure TTS + Google STT (Sinhala / Tamil)
+# Media Streams — Azure TTS + Google STT (Sinhala / Tamil)
 # ---------------------------------------------------------------------------
 AZURE_TTS_URL = "https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
 ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
@@ -366,31 +365,31 @@ MAX_REPROMPTS: int = 1
 REPROMPT_MESSAGES: dict[str, list[str]] = {
     "en": [  # English
         "Hello, are you still there?",
-        "Welcome to Mosvold Boutique Hotels. How may I help you today?",
+        "Welcome to Hatton Hills. How may I help you today?",
     ],
     "ar": [  # Arabic (MSA)
         "\u0645\u0631\u062d\u0628\u0627\u064b\u060c \u0647\u0644 \u0645\u0627 \u0632\u0644\u062a\u0645 \u0639\u0644\u0649 \u0627\u0644\u062e\u0637\u061f",
-        "\u0623\u0647\u0644\u0627\u064b \u0628\u0643\u0645 \u0641\u064a Mosvold Boutique Hotels. \u0643\u064a\u0641 \u064a\u0645\u0643\u0646\u0646\u064a \u0645\u0633\u0627\u0639\u062f\u062a\u0643\u0645 \u0627\u0644\u064a\u0648\u0645\u061f",
+        "\u0623\u0647\u0644\u0627\u064b \u0628\u0643\u0645 \u0641\u064a Hatton Hills. \u0643\u064a\u0641 \u064a\u0645\u0643\u0646\u0646\u064a \u0645\u0633\u0627\u0639\u062f\u062a\u0643\u0645 \u0627\u0644\u064a\u0648\u0645\u061f",
     ],
     "si": [  # Sinhala
         "\u0d86\u0dba\u0dd4\u0db6\u0ddd\u0dc0\u0db1\u0dca, \u0d94\u0db6 \u0dad\u0dc0\u0db8\u0dad\u0dca \u0dc3\u0dd2\u0da7\u0dd2\u0db1\u0dca\u0db1\u0dda\u0daf?",
-        "\u0d86\u0dba\u0dd4\u0db6\u0ddd\u0dc0\u0db1\u0dca! Mosvold Boutique Hotels \u0dc0\u0dd9\u0dad \u0dc3\u0dcf\u0daf\u0dbb\u0dba\u0dd9\u0db1\u0dca \u0db4\u0dd2\u0dc5\u0dd2\u0d9c\u0db1\u0dd2\u0db8\u0dd4. \u0db8\u0da7 \u0d94\u0db6\u0da7 \u0d9a\u0dd9\u0dc3\u0dda \u0d8b\u0daf\u0dc0\u0dca \u0d9a\u0dc5 \u0dc4\u0dd0\u0d9a\u0dd2\u0daf?",
+        "\u0d86\u0dba\u0dd4\u0db6\u0ddd\u0dc0\u0db1\u0dca! Hatton Hills \u0dc0\u0dd9\u0dad \u0dc3\u0dcf\u0daf\u0dbb\u0dba\u0dd9\u0db1\u0dca \u0db4\u0dd2\u0dc5\u0dd2\u0d9c\u0db1\u0dd2\u0db8\u0dd4. \u0db8\u0da7 \u0d94\u0db6\u0da7 \u0d9a\u0dd9\u0dc3\u0dda \u0d8b\u0daf\u0dc0\u0dca \u0d9a\u0dc5 \u0dc4\u0dd0\u0d9a\u0dd2\u0daf?",
     ],
     "ta": [  # Tamil
         "\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd, \u0ba8\u0bc0\u0b99\u0bcd\u0b95\u0bb3\u0bcd \u0b87\u0ba9\u0bcd\u0ba9\u0bc1\u0bae\u0bcd \u0b87\u0bb0\u0bc1\u0b95\u0bcd\u0b95\u0bbf\u0bb1\u0bc0\u0bb0\u0bcd\u0b95\u0bb3\u0bbe?",
-        "\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd! Mosvold Boutique Hotels \u0b95\u0bcd\u0b95\u0bc1 \u0bb5\u0bb0\u0bb5\u0bc7\u0bb1\u0bcd\u0b95\u0bbf\u0bb1\u0bcb\u0bae\u0bcd. \u0ba8\u0bbe\u0ba9\u0bcd \u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bc1\u0b95\u0bcd\u0b95\u0bc1 \u0b8e\u0baa\u0bcd\u0baa\u0b9f\u0bbf \u0b89\u0ba4\u0bb5\u0bb2\u0bbe\u0bae\u0bcd?",
+        "\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd! Hatton Hills \u0b95\u0bcd\u0b95\u0bc1 \u0bb5\u0bb0\u0bb5\u0bc7\u0bb1\u0bcd\u0b95\u0bbf\u0bb1\u0bcb\u0bae\u0bcd. \u0ba8\u0bbe\u0ba9\u0bcd \u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bc1\u0b95\u0bcd\u0b95\u0bc1 \u0b8e\u0baa\u0bcd\u0baa\u0b9f\u0bbf \u0b89\u0ba4\u0bb5\u0bb2\u0bbe\u0bae\u0bcd?",
     ],
 }
 
 # Welcome greetings for Media Streams (spoken via ElevenLabs/Azure TTS on stream start)
 MEDIA_STREAM_WELCOME: dict[str, str] = {
     "ar": (
-        "أهلاً وسهلاً بكم في Mosvold Boutique Hotels! "
+        "أهلاً وسهلاً بكم في Hatton Hills! "
         "أنا كافيا، كيف يمكنني مساعدتكم اليوم؟"
     ),
     "si": (
         "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
-        "Mosvold Boutique Hotels \u0DC0\u0DD9\u0DAD "
+        "Hatton Hills \u0DC0\u0DD9\u0DAD "
         "\u0DC3\u0DCF\u0DAF\u0DBB\u0DBA\u0DD9\u0DB1\u0DCA "
         "\u0DB4\u0DD2\u0DC5\u0DD2\u0D9C\u0DB1\u0DD2\u0DB8\u0DD4. "
         "\u0DB8\u0DA7 \u0D94\u0DB6\u0DA7 \u0D9A\u0DD9\u0DC3\u0DDA "
@@ -398,7 +397,7 @@ MEDIA_STREAM_WELCOME: dict[str, str] = {
     ),
     "ta": (
         "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-        "Mosvold Boutique Hotels \u0B95\u0BCD\u0B95\u0BC1 "
+        "Hatton Hills \u0B95\u0BCD\u0B95\u0BC1 "
         "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
         "\u0BA8\u0BBE\u0BA9\u0BCD \u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
         "\u0B8E\u0BAA\u0BCD\u0BAA\u0B9F\u0BBF \u0B89\u0BA4\u0BB5\u0BB2\u0BBE\u0BAE\u0BCD?"
@@ -441,7 +440,7 @@ def _build_system_prompt(lang: str = "en") -> str:
     """Build the system prompt for Claude, tailored to the caller's language.
 
     The language is determined by the IVR DTMF selection, so Claude does not
-    need to auto-detect â€” it responds exclusively in the chosen language.
+    need to auto-detect — it responds exclusively in the chosen language.
     """
     today = date.today().isoformat()
 
@@ -498,7 +497,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         handoff_rules = (
             "HUMAN HANDOFF:\n"
             "- If the guest explicitly asks to speak to a human, agent, manager, or real person, immediately call the transfer_to_human tool with a one-sentence reason. Do NOT promise a callback; the tool handles the live transfer.\n"
-            "- If you do NOT know the answer to a guest's question, or the request is outside what you can help with (e.g. complex booking changes, special packages, complaints, anything not covered by Mosvold Boutique Hotels booking/general info), PROACTIVELY offer to transfer them to a human team member. Say something like 'I don't have that information on hand â€” would you like me to connect you with one of our team members who can help?' Wait for the guest to say yes before calling transfer_to_human. If they say no, continue helping them with what you can.\n"
+            "- If you do NOT know the answer to a guest's question, or the request is outside what you can help with (e.g. complex booking changes, special packages, complaints, anything not covered by Hatton Hills booking/general info), PROACTIVELY offer to transfer them to a human team member. Say something like 'I don't have that information on hand — would you like me to connect you with one of our team members who can help?' Wait for the guest to say yes before calling transfer_to_human. If they say no, continue helping them with what you can.\n"
             "- Some requests are things you personally cannot finalise but a human team member CAN arrange - for example discounts, special rates, price negotiation, long-stay or off-season deals, or booking the whole property, a large group, a buyout, a wedding, or a corporate event. Do NOT simply refuse or say 'no, we don't do that', even if the hotel information would let you answer with a flat no. Treat these as handoff opportunities: briefly and warmly acknowledge the request, then offer to connect them, for example 'That's something our team can look into for you - would you like me to connect you with one of our team members to discuss it?' Wait for the guest to say yes before calling transfer_to_human; if they say no, carry on helping with what you can.\n"
             "- Do NOT guess or make up answers just to avoid a transfer. Honesty + a quick handoff offer beats a wrong answer.\n\n"
         )
@@ -513,43 +512,45 @@ def _build_system_prompt(lang: str = "en") -> str:
     if yanolja_service.DEMO_RATES_ENABLED:
         rates_rules = (
             "RATES AND PRICING:\n"
-            "- Rates are per room, per night, in US dollars, bed and breakfast, "
-            "including taxes. Always say the currency and say 'per room per "
-            "night' so the guest is not confused.\n"
+            "- Rates are per room, per night, in US dollars, half board "
+            "(breakfast and dinner included), including taxes. Always say the "
+            "currency and say 'per room per night' so the guest is not "
+            "confused.\n"
             "- You MAY quote the rates given in the hotel information in "
             "context, and the rate returned by the check_availability tool. "
-            "Say figures as words, e.g. 'seven hundred US dollars'.\n"
-            "- State rates plainly and confidently, e.g. 'the Deluxe Double "
-            "Room is seven hundred US dollars per room per night'. Do NOT "
+            "Say figures as words, e.g. 'seven hundred US dollars' and 'one "
+            "thousand four hundred US dollars'.\n"
+            "- State rates plainly and confidently, e.g. 'the Forest Escape "
+            "Suite is seven hundred US dollars per room per night'. Do NOT "
             "hedge, and do NOT call a rate indicative, approximate, "
             "provisional or subject to change.\n"
             "- NEVER invent a rate for anything not priced in your context. If "
             "asked the price of an upgrade, supplement, experience, transfer, "
-            "meal or package, say you do not have that figure to hand and offer "
-            "the reservations number: plus nine four, seven seven, three three "
-            "five, eight eight zero zero.\n"
+            "meal or package that is not listed, say you do not have that "
+            "figure to hand and offer the reservations number: plus nine four, "
+            "seven seven, two two zero, four four zero zero.\n"
             "- Do NOT ask whether the guest is a Sri Lankan resident or a "
-            "foreign guest, and do NOT quote a separate resident rate. If the "
-            "guest raises residency, confirm that resident guests present a "
-            "valid National Identity Card or Sri Lankan passport at check-in.\n"
+            "foreign guest, and do NOT quote a separate resident rate — there "
+            "is no separate resident rate at Hatton Hills.\n"
             "- For discounts, negotiated rates, long-stay or off-season deals, "
-            "do NOT invent a number â€” treat it as a handoff opportunity.\n\n"
+            "do NOT invent a number — treat it as a handoff opportunity.\n\n"
         )
     else:
         rates_rules = (
-            "RATES AND PRICING â€” ABSOLUTE RULE:\n"
-            "- Mosvold does NOT publish room rates. Rates exist only once "
+            "RATES AND PRICING — ABSOLUTE RULE:\n"
+            "- Hatton Hills rate quoting is disabled in this configuration. Rates "
+            "exist only once "
             "specific check-in and check-out dates are chosen, and they are "
             "served live by our booking system. You therefore have NO rate "
             "information.\n"
             "- NEVER state, estimate, guess, approximate, compare or imply any "
             "price, rate, amount, currency figure, discount percentage, or "
-            "'from' price â€” for a room, a package, an upgrade, a supplement, "
+            "'from' price — for a room, a package, an upgrade, a supplement, "
             "or an experience. Any number you produce would be invented.\n"
             "- If the caller asks about price, rates, cost, or value for money, "
             "say that rates depend on the exact dates and that our reservations "
             "team will confirm them, and give the reservations number: plus "
-            "nine four, seven seven, three three five, eight eight zero zero. "
+            "nine four, seven seven, two two zero, four four zero zero. "
             "Offer to take their dates so the team can come back with the "
             "rate.\n"
             "- Do NOT ask whether the guest is a Sri Lankan resident or a "
@@ -580,18 +581,18 @@ def _build_system_prompt(lang: str = "en") -> str:
             "- If the guest asks for a total, multiply the nightly rate by "
             "the number of nights and state it plainly. For anything you have "
             "no figure for, offer reservations on plus nine four, seven seven, "
-            "three three five, eight eight zero zero.\n"
+            "two two zero, four four zero zero.\n"
         )
     else:
         tool_rate_clause = (
             "whether it is available; never quote a rate, capacity, or feature"
         )
-        avail_price_clause = "Do NOT quote any price â€” you have none."
+        avail_price_clause = "Do NOT quote any price — you have none."
         rate_press_clause = (
             "- If the guest presses for a rate at any "
             "point, hold the line: rates are date-specific and confirmed by "
-            "reservations on plus nine four, seven seven, three three five, "
-            "eight eight zero zero.\n"
+            "reservations on plus nine four, seven seven, two two zero, "
+            "four four zero zero.\n"
         )
 
     # The welcome greeting is delivered by Twilio (English ConversationRelay) or
@@ -599,8 +600,8 @@ def _build_system_prompt(lang: str = "en") -> str:
     # without asserting an English greeting for non-English callers.
     if lang == "en":
         greeting_note = (
-            "The caller has already heard your greeting: 'Welcome to Mosvold "
-            "Boutique Hotels! I'm Kavya, how can I help you today?' — do NOT "
+            "The caller has already heard your greeting: 'Welcome to Hatton "
+            "Hills! I'm Kavya, how can I help you today?' — do NOT "
             "repeat a greeting or re-introduce yourself. Respond directly to "
             "whatever the caller says first.\n\n"
         )
@@ -613,19 +614,19 @@ def _build_system_prompt(lang: str = "en") -> str:
 
     return (
         f"You are Kavya, the warm and gracious reservations voice agent for "
-        f"Mosvold Boutique Hotels, Sri Lanka's Southern Coast.\n"
-        f"Mosvold Boutique Hotels operates TWO properties, and this one phone "
-        f"line serves both:\n"
-        f"  1. Mosvold Villa - Ahangama (38, Welhengoda, Ahangama, Matara Rd, "
-        f"Ahangama 80650). Sixteen rooms and suites overlooking the Indian "
-        f"Ocean, steps from Ahangama beach. Built in 2012, the first Mosvold "
-        f"boutique hotel.\n"
-        f"  2. Sundara by Mosvold - Balapitiya (46/21, Brahakmana Waththa, "
-        f"Balapitiya 80550). A colonial-style bungalow with eight rooms and "
-        f"villas; 'Sundara' is Sanskrit for beautiful. Roughly one hundred "
-        f"kilometres from Colombo, about two hours.\n"
-        f"Reservations hotline: plus nine four, seven seven, three three five, "
-        f"eight eight zero zero.\n"
+        f"Hatton Hills, a luxury boutique eco retreat set in an eight-acre "
+        f"private forest in Sri Lanka's central hill country.\n"
+        f"Hatton Hills is a SINGLE property. There is no second hotel, no other "
+        f"branch and no other location, so never ask the caller which property "
+        f"or which location they mean.\n"
+        f"It has exactly five room types: the Forest Escape Suite, the Eco "
+        f"Harmony Suite and the Sunrise Vista Premium Suite each sleep up to two "
+        f"guests; the Mount Luxe Chalet and the Mount Monarch Chalet each sleep "
+        f"up to five guests. The Mount Monarch Chalet is the flagship and the "
+        f"only one with a private plunge pool.\n"
+        f"Every stay is half board, with breakfast and dinner included.\n"
+        f"Reservations hotline: plus nine four, seven seven, two two zero, four "
+        f"four zero zero.\n"
         f"Today's date is {today}.\n\n"
 
         + greeting_note
@@ -642,50 +643,78 @@ def _build_system_prompt(lang: str = "en") -> str:
         "Likewise 'triple seven' means '777'. This is common when callers "
         "read out phone numbers. Apply the same rule if the equivalent word "
         "is said in Sinhala or Tamil.\n"
-        "- Never read out room lists property-by-property. Mention only the "
-        "relevant rooms at the relevant property.\n"
-        "- Pause naturally between ideas by using short sentences.\n\n"
+        "- Pause naturally between ideas by using short sentences.\n"
+        "- Ask ONE question at a time. Never combine two questions in a single "
+        "turn (for example a clarification AND an offer to transfer), because "
+        "the guest's 'yes' then answers only one of them and you have to ask "
+        "again. Ask the more important one, wait for the answer, then ask the "
+        "next.\n\n"
 
-        "PROPERTY DISAMBIGUATION â€” THE MOST IMPORTANT RULE ON THIS CALL:\n"
-        "- One phone line serves BOTH Mosvold Villa (Ahangama) and Sundara by "
-        "Mosvold (Balapitiya). You must NEVER assume which one the caller "
-        "means.\n"
-        "- Several room names are near-identical across the two properties. "
-        "A 'Deluxe Double Room' and a 'Deluxe Twin Room' exist at BOTH "
-        "properties under similar names, so those requests are ambiguous on "
-        "their own.\n"
-        "- Before you discuss ANY room type, quote availability, describe "
-        "amenities, describe experiences, or call any booking tool, you MUST "
-        "have established the property. If it is not yet established, ask "
-        "first: 'Are you looking at Mosvold Villa in Ahangama, or Sundara by "
-        "Mosvold in Balapitiya?'\n"
-        "- NEVER mix room types between properties. The room vocabulary is "
-        "fixed:\n"
-        "    * Mosvold Villa (Ahangama): Deluxe Double Room, Deluxe Twin Room, "
-        "Family Suite, Founders Suite.\n"
-        "    * Sundara by Mosvold (Balapitiya): Deluxe Double Room with Garden "
-        "View, Deluxe Double Room with Sea View, Deluxe Twin Room with Sea "
-        "View, Beach Villa, Family Villa with Pool.\n"
-        "- If the guest names a room that does not exist at the property they "
-        "chose, say so plainly and offer the correct room names for THAT "
-        "property. Do not silently substitute a room from the other property.\n"
-        "- Once the property is established, keep it for the whole call and "
-        "state it back when you confirm anything, e.g. 'the Family Suite at "
-        "Mosvold Villa in Ahangama'. If the guest later switches property, "
-        "confirm the switch explicitly and re-establish the room from "
-        "scratch.\n"
-        "- Experiences and directions also differ by property â€” Ahangama "
-        "experiences belong to Mosvold Villa and Balapitiya experiences belong "
-        "to Sundara. Never offer one property's experiences to the other.\n\n"
+        "THE ROOM TYPES AT HATTON HILLS:\n"
+        "- There is ONE property. Never ask which property, which hotel or "
+        "which location the guest means, and never mention any other hotel.\n"
+        "- The room vocabulary is fixed and there are exactly five:\n"
+        "    * Forest Escape Suite - up to two guests.\n"
+        "    * Eco Harmony Suite - up to two guests.\n"
+        "    * Sunrise Vista Premium Suite - up to two guests.\n"
+        "    * Mount Luxe Chalet - up to five guests.\n"
+        "    * Mount Monarch Chalet - up to five guests, with a private plunge "
+        "pool. There is only one of these.\n"
+        "- Always use the FULL room name when you confirm or book, for example "
+        "'the Mount Monarch Chalet', not 'the Monarch'. Booking needs the exact "
+        "name.\n"
+        "- If a guest asks for a room type that does not exist here, say so "
+        "plainly and offer the closest of the five. Never invent a room type.\n"
+        "- If a guest asks for a 'double room', explain that every room is a "
+        "private standalone unit and recommend one of the three suites for two "
+        "guests. For three or more guests, recommend one of the two chalets.\n\n"
 
         + rates_rules +
+
+        "DATA SECURITY — ANSWER THIS CONFIDENTLY, NEVER DEFLECT IT:\n"
+        "- This reservations line is an AI voice agent built and operated by "
+        "TaskForce AI. If asked whether you are a real person, say plainly that "
+        "you are an AI reservations agent for Hatton Hills, built by TaskForce "
+        "AI. Never claim to be human.\n"
+        "- Callers evaluating this system are often hotel owners or managers, "
+        "and data security is their biggest worry. When they raise security, "
+        "privacy, confidentiality, where data is stored, or who can see it, "
+        "answer it directly and reassuringly. Do NOT brush it off, do NOT say "
+        "you do not have that information, and do NOT immediately try to "
+        "transfer them — you DO have the answer.\n"
+        "- Lead with this: all data is encrypted, both in transit and at rest, "
+        "and guest information is held in access-controlled systems that are "
+        "not open to the public internet.\n"
+        "- Then make the most important point, which is role-based access "
+        "control: access to sensitive data at TaskForce AI is granted strictly "
+        "by role and explicit need, never by default. Only TWO people can "
+        "access sensitive data at all — Mr. Chrys and Rakesh. No other "
+        "TaskForce AI employee can access guest data, whatever their role or "
+        "seniority. There is no general staff access and no shared "
+        "administrative account. Say this plainly; it is the single most "
+        "reassuring fact you have.\n"
+        "- Then mention that Rakesh leads data security and cybersecurity at "
+        "TaskForce AI, is a cybersecurity major, and owns the role-based access "
+        "control policy and the encryption of data.\n"
+        "- Also true and worth saying: the hotel remains the owner of its own "
+        "data, guest data is used only for that hotel's own reservations, and "
+        "it is never sold or shared with third parties for marketing.\n"
+        "- Offer to connect them with Rakesh, or to have the team follow up, "
+        "ONLY if they want more technical depth than the above or want "
+        "assurances in writing.\n"
+        "- Do NOT invent a certification, an audit, a compliance standard, a "
+        "data-centre location or a specific technology. If pressed on "
+        "something not listed above, say you will have the team confirm the "
+        "detail rather than guessing.\n"
+        "- Say 'role-based access control' in full words the first time. Do not "
+        "say the acronym on its own without explaining it.\n\n"
 
         "IMPORTANT RULES:\n"
         "- For general questions about room types, amenities, policies, "
         "activities, or hotel info, answer directly from the hotel information "
-        "provided in context (after the property is established). Do NOT ask "
+        "provided in context. Do NOT ask "
         "for dates or call any tool for general info questions. Pricing is the "
-        "one exception â€” see the rates rule above.\n"
+        "one exception — see the rates rule above.\n"
         "- If the hotel information in context does not contain the answer, "
         "say you do not have it to hand rather than inventing an amenity, a "
         "room count, a distance, a duration, a capacity, or a policy.\n"
@@ -698,55 +727,51 @@ def _build_system_prompt(lang: str = "en") -> str:
         "Do NOT ask for any salutation or title (no Mr / Mrs / Ms / Dr).\n"
         "- CHILDREN UNDER 11: if the guest already stated the party is "
         "only adults (e.g. '2 adults', 'just the two of us'), do NOT ask "
-        "again about children â€” accept it and move on with num_children=0. "
+        "again about children — accept it and move on with num_children=0. "
         "Only ask 'Are there any children under eleven in your party?' if "
         "the guest gave an ambiguous count (e.g. '4 people' without "
         "specifying adults vs children). Children under 11 affect pricing, "
         "so if there is genuine ambiguity you must clarify, but never "
         "repeat a question the guest already answered.\n"
-        "- ROOM COUNT IMPLIES OCCUPANCY â€” DO NOT ASK FOR A HEADCOUNT YOU "
+        "- ROOM COUNT IMPLIES OCCUPANCY — DO NOT ASK FOR A HEADCOUNT YOU "
         "CAN ALREADY WORK OUT: a 'double room' means double occupancy, i.e. "
         "two guests. If the guest states a number of rooms by occupancy "
         "(e.g. 'two double rooms'), infer the total guests yourself rather "
-        "than asking 'how many guests in total' â€” two double rooms is four "
+        "than asking 'how many guests in total' — two double rooms is four "
         "adults. Briefly confirm the figure you derived instead of asking "
-        "open-endedly, e.g. 'That's four adults across two double rooms â€” "
+        "open-endedly, e.g. 'That's four adults across two double rooms — "
         "is that right?'. Only ask for an explicit guest count when it is "
-        "genuinely ambiguous â€” for example a villa or suite where the "
+        "genuinely ambiguous — for example a villa or suite where the "
         "party size is not implied.\n"
         "- KB IS THE SOURCE OF TRUTH FOR ROOM FACTS: the booking system "
         "(via the check_availability tool) is used ONLY to find out which "
         "rooms are free for the requested dates, and later to create the "
-        "booking. EVERYTHING ELSE â€” capacity, descriptions, amenities, "
-        "policies â€” comes from the hotel information in context (the "
+        "booking. EVERYTHING ELSE — capacity, descriptions, amenities, "
+        "policies — comes from the hotel information in context (the "
         "knowledge base). The tool result only tells you the room name and "
         f"{tool_rate_clause} "
-        "from the tool. Only ever use the nine Mosvold room names, and only "
-        "for the property they belong to: Mosvold Villa in Ahangama has the "
-        "Deluxe Double Room, Deluxe Twin Room, Family Suite and Founders "
-        "Suite; Sundara by Mosvold in Balapitiya has the Deluxe Double Room "
-        "with Garden View, Deluxe Double Room with Sea View, Deluxe Twin "
-        "Room with Sea View, Beach Villa and Family Villa with Pool.\n"
-        "- AVAILABILITY CHECK â€” STRICT SINGLE-CALL RULE: as soon as you "
-        "have the PROPERTY, the dates and the pax, call check_availability "
-        "EXACTLY ONCE. Never call it before the property is established. "
+        "from the tool. Only ever use the five Hatton Hills room names: "
+        "Forest Escape Suite, Eco Harmony Suite, Sunrise Vista Premium "
+        "Suite, Mount Luxe Chalet and Mount Monarch Chalet.\n"
+        "- AVAILABILITY CHECK — STRICT SINGLE-CALL RULE: as soon as you "
+        "have the dates and the pax, call check_availability "
+        "EXACTLY ONCE. "
         "NEVER pass a room_type filter, even if the guest already "
-        "mentioned a room they like â€” the tool returns ALL room types in "
+        "mentioned a room they like — the tool returns ALL room types in "
         "one response. After that single call, read the response. If the "
         "guest has ALREADY named the room they want, just confirm THAT room "
-        "is free and move straight on to booking, e.g. 'The Deluxe Double "
-        "Room is available for those dates.' Do NOT re-list the other room "
+        "is free and move straight on to booking, e.g. 'The Mount Monarch "
+        "Chalet is available for those dates.' Do NOT re-list the other room "
         "types and do NOT ask again which room they want. Only when the "
         "guest has not yet chosen a room do you surface every available "
-        "type in one sentence, e.g. 'The Family Suite and the Founders "
-        "Suite are available at Mosvold Villa for those dates â€” which would "
-        "you prefer?' Discard and re-ask if any "
-        "returned room name does not belong to the chosen property. "
+        "type in one sentence, e.g. 'The Forest Escape Suite and the Eco "
+        "Harmony Suite are available for those dates — which would "
+        "you prefer?' "
         "Calling check_availability a second time in the "
         "same booking flow (e.g. once per room type, or because the "
         "guest changed their mind) is FORBIDDEN unless the guest changes "
         "their dates or pax. If the guest just picks a different room "
-        "from the list you already have, do NOT call the tool again â€” "
+        "from the list you already have, do NOT call the tool again — "
         "you already know the answer.\n"
         "- NEVER re-ask a question the guest has already answered, and never "
         "re-list options they have already chosen from. If they have named "
@@ -762,7 +787,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         "to proceed, begin collecting their personal details, ONE "
         "question at a time, in this order: full name (no salutation), "
         "then mobile number. Do NOT ask for an email address at any "
-        "point â€” we do not collect email.\n"
+        "point — we do not collect email.\n"
         "- For full name: you MUST capture BOTH a first name AND a last name "
         "(surname / family name) as two SEPARATE tokens before proceeding. "
         "Ask 'May I have your full name please?'. When the guest replies, "
@@ -779,7 +804,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         "name, say: 'Hello, I couldn't hear your first name, can you repeat "
         "it again?'\n"
         "    * If the audio was unclear or garbled for either part, re-ask "
-        "specifically for the missing one using the exact phrasing above â€” "
+        "specifically for the missing one using the exact phrasing above — "
         "name the missing part (first name OR last name), do not ask for "
         "the 'full name' again generically.\n"
         "  Do NOT proceed to the mobile number, do NOT read back the booking "
@@ -793,26 +818,26 @@ def _build_system_prompt(lang: str = "en") -> str:
         "(name, mobile, dates, room, pax), do NOT silently "
         "replace it if they say a different value later in the same call. "
         "Instead, explicitly confirm the change: 'I have your name as Chris "
-        "Fernando â€” did you mean to change it to TJ Pereira?' Only update "
+        "Fernando — did you mean to change it to TJ Pereira?' Only update "
         "the slot after the guest confirms the change. This prevents "
         "telephony lag or repeated speech from corrupting the booking.\n"
         "- SLOT DISAMBIGUATION RULE: match the guest's answer to the slot you "
         "just asked about. If you asked for the mobile number and the guest "
-        "replies with letters/words (a name), do NOT overwrite the name â€” say "
-        "'Sorry, I was asking for your mobile number â€” could you say the "
+        "replies with letters/words (a name), do NOT overwrite the name — say "
+        "'Sorry, I was asking for your mobile number — could you say the "
         "digits please?' If you asked for a name and the guest replies with "
         "digits, ask for the name again. If the guest repeats themselves "
         "(e.g. says 'pardon' or restates the same answer), treat it as a "
-        "repeat, not a new value â€” confirm what you already captured.\n"
+        "repeat, not a new value — confirm what you already captured.\n"
         "- For mobile number: NEVER ask the guest for a country code. "
-        "Assume +94 by default â€” accept whatever digits they say (with or "
+        "Assume +94 by default — accept whatever digits they say (with or "
         "without a leading zero) and silently treat it as a +94 number. "
         "Only if the guest has made clear they are calling from outside "
         "Sri Lanka, ask which country they are calling from and "
         "you add the country code yourself based on that country. Under no "
         "circumstances should you ask the caller to dictate the country "
         "code digits. If the number you heard sounds incomplete, only ask "
-        "them to repeat the local number â€” never the country code.\n"
+        "them to repeat the local number — never the country code.\n"
         "- DIGIT SHORTHAND: guests often use shortcuts when dictating "
         "numbers. 'double [digit]' means that digit TWICE (e.g. "
         "'double six' = 66, 'double oh' = 00). 'triple [digit]' means "
@@ -826,15 +851,15 @@ def _build_system_prompt(lang: str = "en") -> str:
         "confirmed (create_booking has returned success). Every reply must "
         "drive the conversation forward by asking the next thing you need. "
         "Never finish a turn with a statement, an upsell, or a list of "
-        "perks and then go silent â€” that leaves the caller hanging. If "
+        "perks and then go silent — that leaves the caller hanging. If "
         "you have just surfaced available rooms, end with 'which would "
         "you like to proceed with?'. If the guest has picked a room, end "
-        "with 'shall I go ahead and book the Family Suite at Mosvold Villa "
-        "for you?' (or the chosen room at the chosen property). If the "
+        "with 'shall I go ahead and book the Mount Monarch Chalet "
+        "for you?' (or whichever room the guest chose). If the "
         "guest has confirmed they want to proceed, "
         "end with 'may I have your full name please?'. Notes about the "
         "deposit, cancellation terms or check-in times belong in a SHORT "
-        "prefix before the question â€” not as the "
+        "prefix before the question — not as the "
         "final sentence. The only exceptions are the post-create_booking "
         "reference read-back and the closing line at the very end of the "
         "call.\n"
@@ -865,19 +890,19 @@ def _build_system_prompt(lang: str = "en") -> str:
         "full booking value. Between the fifteenth of December and the "
         "fifteenth of January, cancellations within twenty-one days of "
         "arrival are charged the full booking value. No-shows are charged "
-        "the full stay. Promotional rates may carry stricter conditions â€” "
+        "the full stay. Promotional rates may carry stricter conditions — "
         "reservations will confirm. State these as proportions in words, "
         "never as an amount of money.\n"
         "- BOOKING DIRECT: booking direct with us carries a best rate "
         "guarantee against the lowest publicly available rate including "
         "taxes and fees, the most flexible cancellation and amendment "
         "terms, no hidden charges, and priority handling for modifications "
-        "and special requests. Say this in words only â€” never attach a "
+        "and special requests. Say this in words only — never attach a "
         "figure or a percentage saving to it.\n"
         "- CELEBRATIONS: if the guest mentions a honeymoon, anniversary, "
         "birthday or proposal, congratulate them warmly and offer to note "
         "it on the booking so the team can look after them. Do NOT invent "
-        "or promise any package, perk, dinner, upgrade or inclusion â€” "
+        "or promise any package, perk, dinner, upgrade or inclusion — "
         "offer to have reservations confirm what can be arranged.\n"
         "- Be empathetic and attentive. If a guest seems frustrated, acknowledge "
         "their feelings.\n"
@@ -885,9 +910,9 @@ def _build_system_prompt(lang: str = "en") -> str:
         "three turns in a row without making progress, OR the caller is "
         "clearly off-topic, abusive, or testing the system, do NOT keep "
         "engaging. Politely say something like 'It seems we're having "
-        "trouble connecting today â€” please feel free to call back when "
-        "you're ready to make a booking. Thank you for calling Mosvold "
-        "Boutique Hotels.' Then stop. Do not keep repeating the question.\n"
+        "trouble connecting today — please feel free to call back when "
+        "you're ready to make a booking. Thank you for calling Hatton "
+        "Hills.' Then stop. Do not keep repeating the question.\n"
         "- If you do not have enough information to use a tool, ask the guest "
         "for the missing details.\n"
         "- Do not try to collect the caller's name early. The name is only "
@@ -898,7 +923,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         "them, briefly acknowledge (e.g. 'Thanks, I'll note that down') "
         "but DO NOT skip the dates / pax steps. When you "
         "later reach the personal-details step, refer to what they "
-        "already told you â€” do NOT silently re-ask the same question as "
+        "already told you — do NOT silently re-ask the same question as "
         "if you had never heard the answer. Confirm: 'Just to confirm, "
         "your name is Chris Fernando, correct?' This makes the call feel "
         "human, not robotic.\n"
@@ -1036,7 +1061,7 @@ def _history_to_gemini(history: list[dict]) -> list[dict]:
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle for the FastAPI application."""
     # --- Startup ---
-    logger.info("Starting Mosvold Boutique Hotels Voice Agent server...")
+    logger.info("Starting Hatton Hills Voice Agent server...")
 
     # Initialize knowledge base
     logger.info("Initializing knowledge base from '%s'...", KB_DOCS_DIRECTORY)
@@ -1044,7 +1069,7 @@ async def lifespan(app: FastAPI):
     if kb_ok:
         logger.info("Knowledge base initialized successfully.")
     else:
-        logger.warning("Knowledge base initialization failed â€” continuing without KB.")
+        logger.warning("Knowledge base initialization failed — continuing without KB.")
 
     # Pre-warm embeddings model to reduce first-query latency
     prewarm()
@@ -1062,7 +1087,7 @@ async def lifespan(app: FastAPI):
         logger.error("Cannot create LLM client: %s", exc)
 
     if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
-        logger.warning("ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID not set â€” "
+        logger.warning("ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID not set — "
                        "ConversationRelay TTS will not work in production.")
 
     if HUMAN_AGENT_PHONE:
@@ -1081,14 +1106,13 @@ async def lifespan(app: FastAPI):
         )
     else:
         logger.warning(
-            "[handoff] Twilio REST client NOT configured â€” handoff will fail"
+            "[handoff] Twilio REST client NOT configured — handoff will fail"
         )
 
-    # NOTE: the booking integration below is still the eZee/n8n path inherited
-    # from the previous deployment. Mosvold books through BookingEye
-    # (per-property: Mosvold Villa and Sundara are distinct property ids), so
-    # booking_api.py / tools.py still need to be re-wired to BookingEye by a
-    # human. No room ids are invented here; the call sites are left intact.
+    # NOTE: bookings go to the Yanolja PMS via booking_api -> yanolja_service ->
+    # yanolja_client. Hatton Hills is an invented demo property, so there is no
+    # real upstream booking engine to re-wire; the PMS IS the source of truth
+    # (see ops/hattonhills-pms/).
     logger.info("Server startup complete. Booking backend configured: %s", is_configured())
 
     yield
@@ -1103,7 +1127,7 @@ async def lifespan(app: FastAPI):
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Mosvold Boutique Hotels Voice Agent (Kavya)",
+    title="Hatton Hills Voice Agent (Kavya)",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -1197,14 +1221,14 @@ async def voice_incoming(request: Request) -> Response:
     # (ConversationRelay). Sinhala and Arabic were removed on 2026-07-28, so
     # English is the only option and any other digit falls back to it. With the
     # menu disabled (the default) the <Gather> is omitted entirely and every
-    # call connects straight to the English agent below â€” which is the
+    # call connects straight to the English agent below — which is the
     # preferred setting now that there is only one language.
     gather = ""
     if IVR_MENU_ENABLED:
         gather = (
             f'  <Gather numDigits="1" action="https://{host}/voice/language-selected"'
             ' method="POST" timeout="6">\n'
-            '    <Say voice="Polly.Joanna">Welcome to Mosvold Boutique Hotels. '
+            '    <Say voice="Polly.Joanna">Welcome to Hatton Hills. '
             'For English, press 1.</Say>\n'
             "  </Gather>\n"
         )
@@ -1254,7 +1278,7 @@ async def voice_language_selected(request: Request) -> Response:
         _call_phone[sel_call_sid] = sel_caller_phone
 
     if lang == "en":
-        # English â€” ConversationRelay with ElevenLabs
+        # English — ConversationRelay with ElevenLabs
         config = LANGUAGE_CONFIGS["en"]
         cr_tag = _build_conversation_relay_twiml(host, "en", config)
         twiml = (
@@ -1267,7 +1291,7 @@ async def voice_language_selected(request: Request) -> Response:
         )
         mode = "ConversationRelay"
     else:
-        # Non-English â€” Media Streams with Google STT + per-language TTS.
+        # Non-English — Media Streams with Google STT + per-language TTS.
         # Unreachable while DIGIT_TO_LANG is English-only; kept for re-enable.
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -1280,7 +1304,7 @@ async def voice_language_selected(request: Request) -> Response:
         mode = "Media Streams"
 
     logger.info(
-        "Language selected: %s (digit: %s) â€” returning %s TwiML",
+        "Language selected: %s (digit: %s) — returning %s TwiML",
         lang, digit, mode,
     )
     return Response(content=twiml, media_type="application/xml")
@@ -1324,7 +1348,7 @@ async def relay_action(request: Request) -> Response:
                 if isinstance(parsed, dict):
                     handoff = parsed
                 elif isinstance(parsed, str):
-                    # Double-encoded â€” try one more parse
+                    # Double-encoded — try one more parse
                     try:
                         inner = json.loads(parsed)
                         if isinstance(inner, dict):
@@ -1341,7 +1365,7 @@ async def relay_action(request: Request) -> Response:
     if handoff.get("action") == "transfer_to_human" and HUMAN_AGENT_PHONE:
         reason = handoff.get("reason", "Caller requested assistance.")
         caller_phone = handoff.get("caller_phone", "")
-        # Legacy Path A fallback â€” dashboard event is now sent from
+        # Legacy Path A fallback — dashboard event is now sent from
         # ws_conversation when the REST-based Path B handoff fires. We keep
         # this endpoint to return Dial TwiML on the off-chance Twilio ever
         # delivers HandoffData via the relay-end callback again.
@@ -1363,7 +1387,7 @@ async def relay_action(request: Request) -> Response:
         return Response(content=twiml, media_type="application/xml")
 
     logger.info(
-        "[handoff] relay-action with no transfer (call_sid=%s, action=%r) â€” hanging up",
+        "[handoff] relay-action with no transfer (call_sid=%s, action=%r) — hanging up",
         call_sid, handoff.get("action"),
     )
     return Response(
@@ -1522,7 +1546,7 @@ def _trim_history(history: list[dict], max_messages: int = MAX_HISTORY_MESSAGES)
 
 
 # ---------------------------------------------------------------------------
-# Google Cloud STT â€” streaming (background thread, Media Streams only)
+# Google Cloud STT — streaming (background thread, Media Streams only)
 # ---------------------------------------------------------------------------
 
 class GoogleSTTStream:
@@ -1544,7 +1568,7 @@ class GoogleSTTStream:
 
     def start(self):
         if not GOOGLE_STT_AVAILABLE:
-            logger.error("Cannot start STT â€” google-cloud-speech not installed")
+            logger.error("Cannot start STT — google-cloud-speech not installed")
             return
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -1580,7 +1604,7 @@ class GoogleSTTStream:
             except Exception as exc:
                 if not self._running:
                     break
-                logger.warning("STT stream ended (%s) â€” restarting...", exc, exc_info=True)
+                logger.warning("STT stream ended (%s) — restarting...", exc, exc_info=True)
 
     def _run_one_stream(self):
         client = google_speech.SpeechClient()
@@ -1603,7 +1627,7 @@ class GoogleSTTStream:
                 yield google_speech.StreamingRecognizeRequest(audio_content=chunk)
 
         responses = client.streaming_recognize(config=config, requests=request_gen())
-        logger.info("STT gRPC stream connected â€” waiting for speech...")
+        logger.info("STT gRPC stream connected — waiting for speech...")
         for response in responses:
             if not self._running:
                 break
@@ -1621,14 +1645,14 @@ class GoogleSTTStream:
 
 
 class AzureSTTStream:
-    """Streams audio to Azure Speech-to-Text â€” drop-in alternative to GoogleSTTStream.
+    """Streams audio to Azure Speech-to-Text — drop-in alternative to GoogleSTTStream.
 
     Mirrors the same interface (start/stop/feed + on_final_result / on_interim_result
     callbacks fired from background threads) so it swaps in via the STT_PROVIDER env var.
 
     Twilio delivers mulaw 8 kHz; Azure's PushAudioInputStream wants PCM, so each fed
     chunk is decoded mulaw â†’ PCM16 (audioop) before being written. Uses a fixed
-    language per call (si-LK / ta-IN) â€” for a Sinhala-only line that tends to beat
+    language per call (si-LK / ta-IN) — for a Sinhala-only line that tends to beat
     Google's alternative_language_codes code-switching, which was part of why Google
     rarely committed a final result for conversational Sinhala. Azure fires its own
     `recognized` (final) events, so the 1.5 s interim-endpointing fallback still
@@ -1646,13 +1670,13 @@ class AzureSTTStream:
 
     def start(self):
         if not AZURE_STT_AVAILABLE:
-            logger.error("Cannot start Azure STT â€” azure-cognitiveservices-speech not installed")
+            logger.error("Cannot start Azure STT — azure-cognitiveservices-speech not installed")
             return
         if audioop is None:
-            logger.error("Cannot start Azure STT â€” audioop unavailable (install audioop-lts on 3.13+)")
+            logger.error("Cannot start Azure STT — audioop unavailable (install audioop-lts on 3.13+)")
             return
         if not AZURE_SPEECH_KEY:
-            logger.error("Cannot start Azure STT â€” AZURE_SPEECH_KEY not set")
+            logger.error("Cannot start Azure STT — AZURE_SPEECH_KEY not set")
             return
 
         primary = STT_PRIMARY.get(self._lang, "si-LK")
@@ -1660,7 +1684,7 @@ class AzureSTTStream:
             subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION,
         )
         speech_config.speech_recognition_language = primary
-        # 8 kHz / 16-bit / mono PCM â€” what mulaw decodes to.
+        # 8 kHz / 16-bit / mono PCM — what mulaw decodes to.
         fmt = azure_speech.audio.AudioStreamFormat(
             samples_per_second=8000, bits_per_sample=16, channels=1,
         )
@@ -1732,7 +1756,7 @@ def _make_stt(on_final_result: Any, on_interim_result: Any, lang: str):
     if STT_PROVIDER == "azure":
         if AZURE_STT_AVAILABLE and audioop is not None:
             return AzureSTTStream(on_final_result, on_interim_result, lang)
-        logger.error("STT_PROVIDER=azure but Azure STT unavailable â€” falling back to Google")
+        logger.error("STT_PROVIDER=azure but Azure STT unavailable — falling back to Google")
     return GoogleSTTStream(on_final_result, on_interim_result, lang)
 
 
@@ -1822,7 +1846,7 @@ class MediaStreamSession:
                     self.call_start_time = datetime.now().isoformat()
                     _dashboard_call_started(self.call_sid, self.caller_phone, self.lang, self.call_start_time)
                     logger.info(
-                        "Media stream started â€” Call: %s, Stream: %s, lang: %s, phone: %s",
+                        "Media stream started — Call: %s, Stream: %s, lang: %s, phone: %s",
                         self.call_sid, self.stream_sid, self.lang, self.caller_phone,
                     )
                     asyncio.ensure_future(
@@ -1841,18 +1865,18 @@ class MediaStreamSession:
                     logger.info("Mark received [%s]: %s", self.call_sid, mark_name)
                     if mark_name == "tts_done":
                         self._is_speaking = False
-                        logger.info("TTS done â€” listening for guest speech [%s]", self.call_sid)
-                        # Agent just finished speaking â€” arm the no-speech nudge.
+                        logger.info("TTS done — listening for guest speech [%s]", self.call_sid)
+                        # Agent just finished speaking — arm the no-speech nudge.
                         self._schedule_reprompt()
 
                 elif event == "stop":
-                    logger.info("Media stream stopped â€” Call: %s", self.call_sid)
+                    logger.info("Media stream stopped — Call: %s", self.call_sid)
                     break
 
         except WebSocketDisconnect:
-            logger.info("Media stream disconnected â€” Call: %s", self.call_sid)
+            logger.info("Media stream disconnected — Call: %s", self.call_sid)
         except Exception:
-            logger.exception("Media stream error â€” Call: %s", self.call_sid)
+            logger.exception("Media stream error — Call: %s", self.call_sid)
         finally:
             self._cancel_reprompt()
             if self._stt:
@@ -1862,7 +1886,7 @@ class MediaStreamSession:
                 self._endpointing_handle.cancel()
             call_end_time = datetime.now().isoformat()
             logger.info(
-                "Media stream session ended â€” Call: %s, history: %d, transcript: %d msgs",
+                "Media stream session ended — Call: %s, history: %d, transcript: %d msgs",
                 self.call_sid, len(self.history), len(self.full_transcript),
             )
             if self.full_transcript:
@@ -1887,7 +1911,7 @@ class MediaStreamSession:
     def _on_stt_result(self, transcript: str):
         """Called from STT thread on FINAL results."""
         logger.info("STT final result [%s]: %r (speaking=%s)", self.call_sid, transcript, self._is_speaking)
-        self._latest_interim = ""  # clear â€” final supersedes interim
+        self._latest_interim = ""  # clear — final supersedes interim
         if self._event_loop is None:
             return
         if self._is_speaking:
@@ -1940,7 +1964,7 @@ class MediaStreamSession:
         if not self._audio_dump:
             return
         if audioop is None:
-            logger.warning("Cannot write audio dump â€” audioop unavailable")
+            logger.warning("Cannot write audio dump — audioop unavailable")
             self._audio_dump.clear()
             return
         try:
@@ -1980,7 +2004,7 @@ class MediaStreamSession:
             if self._reprompt_count >= MAX_REPROMPTS:
                 return
             if self._is_speaking:
-                # Agent is talking â€” re-arm after it finishes.
+                # Agent is talking — re-arm after it finishes.
                 self._schedule_reprompt()
                 return
             messages = REPROMPT_MESSAGES.get(self.lang, REPROMPT_MESSAGES["en"])
@@ -1998,7 +2022,7 @@ class MediaStreamSession:
     # â”€â”€ Endpointing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _accumulate_transcript(self, text: str):
-        # Caller is speaking â€” cancel any pending silence nudge and reset
+        # Caller is speaking — cancel any pending silence nudge and reset
         # the re-prompt counter so future silences start fresh.
         self._cancel_reprompt()
         self._reprompt_count = 0
@@ -2016,7 +2040,7 @@ class MediaStreamSession:
 
     async def _set_transcript_interim(self, text: str):
         """Overwrite (not append) pending transcript with latest interim; reset timer."""
-        # Caller is speaking â€” cancel any pending silence nudge and reset
+        # Caller is speaking — cancel any pending silence nudge and reset
         # the re-prompt counter.
         self._cancel_reprompt()
         self._reprompt_count = 0
@@ -2184,7 +2208,7 @@ class MediaStreamSession:
 
                 continue
 
-            # No tools â€” flush remaining sentence buffer
+            # No tools — flush remaining sentence buffer
             remaining = sentence_buffer.strip()
             if remaining:
                 tts_tasks.append(
@@ -2262,7 +2286,7 @@ class MediaStreamSession:
                         function_calls.append({"name": fc.name, "args": args})
 
             logger.info(
-                "Gemini round %d [%s] â€” text=%d chars, tools=%d, finish=%s",
+                "Gemini round %d [%s] — text=%d chars, tools=%d, finish=%s",
                 round_idx + 1, self.call_sid, len(text_content),
                 len(function_calls), finish_reason,
             )
@@ -2319,7 +2343,7 @@ class MediaStreamSession:
 
                 continue
 
-            # No tools â€” flush remaining sentence buffer
+            # No tools — flush remaining sentence buffer
             remaining = sentence_buffer.strip()
             if remaining:
                 tts_tasks.append(
@@ -2462,7 +2486,7 @@ class MediaStreamSession:
                 self.history.append({"role": "user", "content": tool_results})
                 continue
 
-            # No tools â€” flush remaining sentence buffer
+            # No tools — flush remaining sentence buffer
             remaining = sentence_buffer.strip()
             if remaining:
                 tts_tasks.append(
@@ -2506,7 +2530,7 @@ class MediaStreamSession:
         Must only be called from _speak (lock already held).
         """
         if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
-            logger.warning("ElevenLabs not configured â€” skipping TTS")
+            logger.warning("ElevenLabs not configured — skipping TTS")
             return
 
         self._is_speaking = True
@@ -2581,7 +2605,7 @@ class MediaStreamSession:
         Must only be called from _speak (lock already held).
         """
         if not AZURE_SPEECH_KEY:
-            logger.warning("AZURE_SPEECH_KEY not set â€” skipping TTS")
+            logger.warning("AZURE_SPEECH_KEY not set — skipping TTS")
             return
 
         self._is_speaking = True
@@ -2648,7 +2672,7 @@ class MediaStreamSession:
         """
         text = text.strip()
         if not OPENAI_API_KEY:
-            logger.warning("OPENAI_API_KEY not set â€” skipping TTS")
+            logger.warning("OPENAI_API_KEY not set — skipping TTS")
             return
         if not text:
             return
@@ -2688,7 +2712,7 @@ class MediaStreamSession:
                             break
                         if not chunk:
                             continue
-                        # PCM is 2 bytes/sample â€” keep sample alignment.
+                        # PCM is 2 bytes/sample — keep sample alignment.
                         data = pcm_tail + chunk
                         if len(data) % 2:
                             data, pcm_tail = data[:-1], data[-1:]
@@ -2951,12 +2975,12 @@ async def _run_llm_streaming_gemini(
                     )
                 if part.function_call:
                     fc = part.function_call
-                    # Convert args to dict â€” may be a proto MapComposite
+                    # Convert args to dict — may be a proto MapComposite
                     args = dict(fc.args) if fc.args else {}
                     function_calls.append({"name": fc.name, "args": args})
 
         logger.info(
-            "Gemini round %d done â€” text=%d chars, tools=%d, finish=%s",
+            "Gemini round %d done — text=%d chars, tools=%d, finish=%s",
             round_idx + 1, len(text_content), len(function_calls), finish_reason,
         )
 
@@ -3021,7 +3045,7 @@ async def _run_llm_streaming_gemini(
             text_content = ""
             continue
 
-        # No tool calls â€” done
+        # No tool calls — done
         await websocket.send_text(
             json.dumps({"type": "text", "token": "", "last": True})
         )
@@ -3101,7 +3125,7 @@ async def _run_llm_streaming_claude(
         except (WebSocketDisconnect, RuntimeError) as exc:
             ws_closed = True
             logger.warning(
-                "WebSocket closed mid-stream (%s) â€” draining Claude silently",
+                "WebSocket closed mid-stream (%s) — draining Claude silently",
                 type(exc).__name__,
             )
 
@@ -3256,7 +3280,7 @@ async def _run_llm_streaming_claude(
 
 
 # ---------------------------------------------------------------------------
-# WebSocket â€” ConversationRelay handler
+# WebSocket — ConversationRelay handler
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/conversation")
@@ -3278,7 +3302,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
         lang = "en"
 
     await websocket.accept()
-    logger.info("WebSocket connection accepted â€” language: %s", lang)
+    logger.info("WebSocket connection accepted — language: %s", lang)
 
     # -- Per-session state --
     conversation_history: list[dict] = []
@@ -3305,7 +3329,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
         else:
             openai_client = _get_client()
     except RuntimeError:
-        logger.error("LLM client not available â€” closing WebSocket")
+        logger.error("LLM client not available — closing WebSocket")
         await websocket.close(code=1011, reason="Server configuration error")
         return
 
@@ -3368,7 +3392,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
             # ---------------------------------------------------------------
             if msg_type == "setup":
                 call_sid = message.get("callSid", "unknown")
-                # Prefer the `from` field on the ConversationRelay setup message â€”
+                # Prefer the `from` field on the ConversationRelay setup message —
                 # it's authoritative and avoids a race with the /voice/incoming
                 # HTTP handler populating `_call_phone`.
                 caller_phone = (
@@ -3379,7 +3403,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                 _call_phone.pop(call_sid, None)
                 _dashboard_call_started(call_sid, caller_phone, lang, call_start_time)
                 logger.info(
-                    "Session setup â€” CallSid: %s, StreamSid: %s, Phone: %s",
+                    "Session setup — CallSid: %s, StreamSid: %s, Phone: %s",
                     call_sid,
                     message.get("streamSid", "n/a"),
                     caller_phone,
@@ -3387,22 +3411,22 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                 # Session state is already initialized above.
                 # Log any additional setup metadata.
                 logger.info(
-                    "Session ready â€” system prompt length: %d chars, tools: %d",
+                    "Session ready — system prompt length: %d chars, tools: %d",
                     len(system_prompt),
                     len(tools),
                 )
                 _schedule_reprompt()
 
             # ---------------------------------------------------------------
-            # PROMPT â€” user speech transcribed
+            # PROMPT — user speech transcribed
             # ---------------------------------------------------------------
             elif msg_type == "prompt":
                 user_text = message.get("voicePrompt", "").strip()
                 if not user_text:
-                    logger.debug("Empty voicePrompt received â€” ignoring")
+                    logger.debug("Empty voicePrompt received — ignoring")
                     continue
 
-                # Caller spoke â€” cancel any pending silence nudge and reset
+                # Caller spoke — cancel any pending silence nudge and reset
                 # the re-prompt counter.
                 _cancel_reprompt()
                 reprompt_count = 0
@@ -3477,7 +3501,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                             continue
                         _content = _hist_msg.get("content")
                         if not isinstance(_content, list):
-                            # First non-tool user message â€” stop scanning
+                            # First non-tool user message — stop scanning
                             break
                         _found_tool_result = False
                         for _block in _content:
@@ -3541,12 +3565,12 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                         tw = _get_twilio_client()
                         if tw is None:
                             logger.error(
-                                "[handoff] cannot transfer â€” TWILIO_ACCOUNT_SID/"
+                                "[handoff] cannot transfer — TWILIO_ACCOUNT_SID/"
                                 "AUTH_TOKEN not configured; ending call"
                             )
                         elif not HUMAN_AGENT_PHONE:
                             logger.error(
-                                "[handoff] cannot transfer â€” HUMAN_AGENT_PHONE "
+                                "[handoff] cannot transfer — HUMAN_AGENT_PHONE "
                                 "not set; ending call"
                             )
                         else:
@@ -3563,7 +3587,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                                 '</Response>'
                             )
                             try:
-                                # Twilio REST client is sync â€” run in executor
+                                # Twilio REST client is sync — run in executor
                                 # to avoid blocking the event loop.
                                 loop = asyncio.get_event_loop()
                                 await loop.run_in_executor(
@@ -3606,7 +3630,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                     ):
                         full_transcript.append({"role": "assistant", "text": last_assistant})
                     logger.info(
-                        "WebSocket disconnected during Claude streaming [%s] â€” "
+                        "WebSocket disconnected during Claude streaming [%s] — "
                         "captured %d chars of partial response",
                         call_sid, len(last_assistant),
                     )
@@ -3633,11 +3657,11 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                 logger.info("DTMF received [%s]: %s", call_sid, digit)
 
             # ---------------------------------------------------------------
-            # INTERRUPT â€” user interrupted agent speech
+            # INTERRUPT — user interrupted agent speech
             # ---------------------------------------------------------------
             elif msg_type == "interrupt":
                 logger.info(
-                    "Speech interrupted by guest [%s] â€” utteranceUntilInterrupt: '%s'",
+                    "Speech interrupted by guest [%s] — utteranceUntilInterrupt: '%s'",
                     call_sid,
                     message.get("utteranceUntilInterrupt", ""),
                 )
@@ -3649,14 +3673,14 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                 logger.debug("Unhandled message type '%s' [%s]: %s", msg_type, call_sid, raw[:200])
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected â€” CallSid: %s", call_sid)
+        logger.info("WebSocket disconnected — CallSid: %s", call_sid)
     except Exception:
         logger.exception("Unexpected error in WebSocket handler [%s]", call_sid)
     finally:
         _cancel_reprompt()
         call_end_time = datetime.now().isoformat()
         logger.info(
-            "Session ended â€” CallSid: %s, history: %d msgs, transcript: %d msgs",
+            "Session ended — CallSid: %s, history: %d msgs, transcript: %d msgs",
             call_sid, len(conversation_history), len(full_transcript),
         )
         if full_transcript:
@@ -3678,7 +3702,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
 
 
 # ---------------------------------------------------------------------------
-# WebSocket â€” Media Streams handler (non-English languages)
+# WebSocket — Media Streams handler (non-English languages)
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/media-stream/{lang}")
@@ -3686,7 +3710,7 @@ async def ws_media_stream(websocket: WebSocket, lang: str):
     """Handle a Twilio Media Streams WebSocket session for a non-English call.
 
     Language is encoded in the URL path (e.g. /ws/media-stream/si) so it
-    is always present â€” avoids unreliable query-string passing by Twilio.
+    is always present — avoids unreliable query-string passing by Twilio.
 
     Receives raw mulaw 8 kHz audio from Twilio, runs Google Cloud STT,
     sends Claude responses through Azure TTS back as mulaw audio.
@@ -3714,7 +3738,7 @@ async def ws_media_stream(websocket: WebSocket, lang: str):
         else:
             openai_client = _get_client()
     except RuntimeError:
-        logger.error("LLM client unavailable â€” closing Media Streams WebSocket")
+        logger.error("LLM client unavailable — closing Media Streams WebSocket")
         await websocket.accept()
         await websocket.close(code=1011, reason="Server configuration error")
         return

@@ -9,12 +9,11 @@ is preserved so tools.py and server.py need no changes. Extra fields
 introduced by the new PMS (rate_per_night_usd, total_usd, room_number)
 are additive -- old consumers that ignore unknown keys keep working.
 
-Mosvold runs TWO properties off one phone line (Mosvold Villa, Ahangama and
-Sundara by Mosvold, Balapitiya) and room names overlap between them, so
-check_availability() and create_booking() take a `property_name` and forward
-it to yanolja_service. It is defaulted ("") purely to preserve the public
-surface -- callers SHOULD always pass it. yanolja_service fails closed on a
-missing/unresolvable property rather than guessing a hotel.
+Hatton Hills is a SINGLE property with five distinct room types, so
+check_availability() and create_booking() still take a `property_name` and
+forward it to yanolja_service, but it no longer needs to be supplied: an empty
+value resolves to "Hatton Hills". The parameter is retained so a second property
+can be reintroduced without changing this layer's public surface.
 """
 from __future__ import annotations
 
@@ -89,7 +88,7 @@ async def check_availability(
     guest_name: str = "",
     guest_phone: str = "",
     guest_email: str = "",
-    property_name: str = "",   # Mosvold Villa | Sundara by Mosvold
+    property_name: str = "",   # "Hatton Hills" (single property; may be empty)
 ) -> dict[str, Any]:
     if not is_configured():
         return dict(_UNAVAILABLE)
@@ -122,7 +121,7 @@ async def create_booking(
     num_children: int = 0,
     rate_type: str = "BB",
     room_name: str = "",
-    property_name: str = "",   # Mosvold Villa | Sundara by Mosvold
+    property_name: str = "",   # "Hatton Hills" (single property; may be empty)
 ) -> dict[str, Any]:
     if not is_configured():
         return dict(_UNAVAILABLE)
