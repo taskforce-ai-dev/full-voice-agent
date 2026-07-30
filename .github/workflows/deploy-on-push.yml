@@ -56,7 +56,12 @@ jobs:
             while IFS= read -r f; do
               [ -z "$f" ] && continue
               case "$f" in
-                *.py) python3 -m py_compile "$f" || { echo "::error::Syntax error in $f — aborting deploy"; exit 1; } ;;
+                # A renamed or deleted file still appears in CHANGED but is not
+                # on disk. Compiling it aborted a deploy on 2026-07-30 with
+                # "No such file or directory" after a test file was git mv'd.
+                # Only syntax-check files that still exist.
+                *.py) [ -f "$f" ] || continue
+                      python3 -m py_compile "$f" || { echo "::error::Syntax error in $f — aborting deploy"; exit 1; } ;;
               esac
             done <<< "$match"
             mode=fast
