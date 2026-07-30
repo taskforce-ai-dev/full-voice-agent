@@ -265,6 +265,20 @@ SLOW_RESPONSE_FILLERS: dict[str, str] = {
 # Sinhala/Tamil remain fully implemented below but are not surfaced in the menu.
 DIGIT_TO_LANG: dict[str, str] = {"1": "en", "2": "ar"}
 
+# Website demo routing: BookDemo.tsx agent ids → that agent's public host.
+# All demos mint tokens for one shared TwiML app whose voiceUrl is THIS
+# server's /voice/demo-incoming; non-Hatton agents are <Redirect>ed to their
+# own /voice/demo-incoming (see voice_demo_incoming). 'hatton' stays local.
+DEMO_AGENT_HOSTS: dict[str, str] = {
+    "kitchened": os.getenv("DEMO_HOST_KITCHENED", "kitchened.taskforceai.tech"),
+    "worldofrefrigerators": os.getenv(
+        "DEMO_HOST_WOR", "worldofrefrigerators.taskforceai.tech"),
+    # Start Property (Amaya) is served by the Rodrigo Realtors agent, whose
+    # deployment is still named "flico" for historical reasons.
+    "startproperty": os.getenv(
+        "DEMO_HOST_STARTPROPERTY", "flico.taskforceai.tech"),
+}
+
 # Per-language ConversationRelay TwiML configuration
 LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
     "en": {
@@ -1197,19 +1211,39 @@ async def voice_demo_incoming(request: Request) -> Response:
     """
     host = request.headers.get("host", request.url.hostname or "localhost")
 
-    # lang can arrive as a query param (GET) or form field (POST). Default en.
+    # lang/agent can arrive as query params (GET) or form fields (POST).
     lang = (request.query_params.get("lang") or "").strip().lower()
-    if not lang and request.method == "POST":
+    agent = (request.query_params.get("agent") or "").strip().lower()
+    if request.method == "POST" and not (lang and agent):
         try:
             form = await request.form()
-            lang = str(form.get("lang", "")).strip().lower()
+            lang = lang or str(form.get("lang", "")).strip().lower()
+            agent = agent or str(form.get("agent", "")).strip().lower()
         except Exception:
-            lang = ""
+            pass
     # (2026-07-02: "si" was temporarily excluded here after a mojibake corruption
     # was found in SLOW_RESPONSE_FILLERS/REPROMPT_MESSAGES["si"]; fixed in source
     # same day. Re-enabled 2026-07-03 after the fix was smoke-tested.)
     if lang not in ("en", "ar", "ru", "si"):
         lang = "en"
+
+    # All three website demo agents share ONE TwiML app whose voiceUrl points
+    # here, and the site passes the chosen agent via Device.connect params
+    # (Twilio forwards them as POST fields on this FIRST webhook only). For a
+    # non-Hatton agent, hand the call to that agent's own demo endpoint with a
+    # <Redirect> — lang goes in the query string because Twilio does NOT
+    # re-send custom connect params on redirected webhooks.
+    other = DEMO_AGENT_HOSTS.get(agent)
+    if other and other != host:
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<Response>\n"
+            f'  <Redirect method="POST">https://{other}/voice/demo-incoming?lang={lang}</Redirect>\n'
+            "</Response>"
+        )
+        logger.info("Demo incoming call from %s — redirecting to agent %r (%s)",
+                    request.headers.get("x-forwarded-for", "unknown"), agent, other)
+        return Response(content=twiml, media_type="application/xml")
 
     if lang in ("ar", "si"):
         # Arabic/Sinhala — Media Streams (we own STT/TTS); ConversationRelay has
