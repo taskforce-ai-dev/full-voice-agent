@@ -79,8 +79,18 @@ DEFAULT_BRAND = "rodrigo"
 
 Each entry carries agency name, agent name, per-language welcome greeting, and a
 `transfer` flag. `_build_system_prompt(lang, brand=DEFAULT_BRAND)` substitutes the names
-into the 9 `Rodrigo Realtors` and 2 `Fiona` occurrences currently hardcoded in that
-function.
+into the **9 substitution sites** inside the returned prompt — `server.py:416` (`Fiona`)
+and `417, 438, 445, 526, 580, 584, 587, 594` (`Rodrigo Realtors`).
+
+Two other occurrences are deliberately **out of scope**: line 372 is a Sinhala
+transliteration glossary entry reached only on the `si` branch (this demo is English
+only), and line 431 is a code comment.
+
+**The greeting echo at line 437–439 must be derived from the brand's greeting, not
+duplicated.** That block tells the agent *"The opening greeting is already spoken
+automatically: '…'. Do NOT repeat it."* If it keeps naming Rodrigo while Twilio actually
+speaks the Start Property greeting, Amaya is briefed on words the caller never heard.
+Build it by interpolating `BRANDS[brand]` so the two can never drift.
 
 **The default argument is the safety property.** Every existing call site keeps passing
 only `lang`, so the phone IVR produces a byte-identical prompt for Rodrigo. A real
@@ -137,12 +147,22 @@ demos on the same page should not sound like the same person.
 
 ### 6. Card correction (`BookDemo.tsx`)
 
-The shipped `trainedOn` list over-promises against the portfolio. It advertises
-*"Houses, apartments & commercial units"* and *"Furnished / unfurnished options"*, but
-the 12 demo rows are residential-only and every one is `furnished`. `Flico Agent/CLAUDE.md`
-warns about exactly this class of mismatch: when prompt and KB disagree about what the
-portfolio contains, the agent denies listings that retrieval correctly handed it. Trim
-both bullets to match reality.
+The shipped `trainedOn` list has exactly one false claim: *"Houses, apartments &
+commercial units"*. The 12 demo rows are residential-only — 6 apartments, 6 houses, no
+commercial. Change that bullet to "Houses & apartments".
+
+The other bullets check out against the data and stay as-is. In particular *"Furnished /
+unfurnished options"* is accurate: furnishing splits `furnished: 6, semi: 4,
+unfurnished: 2`. Likewise `deposit_months`, `min_lease_months`, `advance_months`,
+`floor_area_sqft`, `key_features` and `available` all exist as fields, so the rates,
+lease-terms, size/amenities and availability bullets are all backed.
+
+`Flico Agent/CLAUDE.md` warns about exactly this class of mismatch: when prompt and KB
+disagree about what the portfolio contains, the agent denies listings that retrieval
+correctly handed it. Note the prompt side of this is already safe — `kb/facts.py::portfolio_facts()`
+*generates* the PORTFOLIO FACTS block from the live inventory, and
+`tests/test_portfolio_facts.py` proves it tracks the data and stays silent when it
+cannot know. Only the hand-written website card can drift.
 
 ## Non-goals
 
@@ -152,6 +172,23 @@ both bullets to match reality.
 - No cleanup of the legacy "Flico" naming (module docstring, FastAPI title, directory
   name). Real but out of scope; it would touch deploy paths and container names.
 - No Tamil/Sinhala/Arabic support for this demo.
+
+## Global constraints
+
+- **Prod runs Python 3.11; this dev box runs 3.12.3.** No PEP 701 f-strings — never nest
+  same-type quotes inside an f-string (`f"{d["k"]}"` compiles here and is a SyntaxError
+  there). Use `f'{d["k"]}'` as the existing code does. `server.py` imports `kb/prose.py`,
+  so a SyntaxError is a hard outage, and local `py_compile` will not catch it. The
+  `kb-verify` CI job pins 3.11 and is what caught this last time.
+- **`kb-verify` gates deploy.** `.github/workflows/deploy-on-push.yml` runs
+  `python -m pytest tests/ -q` (Python 3.11, `pytest numpy pydantic`) from the
+  `Flico Agent` working directory on any change under `Flico Agent/`, and the `deploy`
+  job requires it to pass. Every task touching that directory must leave the suite green.
+- **Run pytest as `python -m pytest`**, not bare `pytest`, so CWD is importable and the
+  `tests/` oracle package resolves.
+- Never fix a KB filter bug by adding one more example test — add the dimension to the
+  grammar/oracle and let the sweep prove the space. (Not expected in this plan, which
+  touches no filter logic.)
 
 ## Testing
 
