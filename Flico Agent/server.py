@@ -72,6 +72,7 @@ from post_call import process_realestate_post_call
 from media_transport import MediaTransport, TwilioMediaTransport
 from asterisk_ari import AsteriskAriClient
 from asterisk_rtp import AsteriskRtpTransport, RtpPortAllocator
+from brands import BRANDS, DEFAULT_BRAND, resolve_brand
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -329,8 +330,12 @@ def _portfolio_facts_block() -> str:
             "the reference context shows.\n\n")
 
 
-def _build_system_prompt(lang: str = "en") -> str:
+def _build_system_prompt(lang: str = "en", brand: str = DEFAULT_BRAND) -> str:
     today = date.today().isoformat()
+    _brand = resolve_brand(brand)
+    agency = _brand["agency"]
+    agent_name = _brand["agent"]
+    greeting = _brand["greeting"].get(lang) or _brand["greeting"]["en"]
 
     if lang == "ta":
         language_rules = (
@@ -399,7 +404,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         )
 
     handoff_rules = ""
-    if lang == "en":
+    if lang == "en" and _brand["transfer"]:
         handoff_rules = (
             "HUMAN HANDOFF:\n"
             "- If the caller explicitly asks to speak to a human, agent, consultant, "
@@ -413,8 +418,8 @@ def _build_system_prompt(lang: str = "en") -> str:
         )
 
     return (
-        f"You are Fiona, a warm, confident, top-performing SALES consultant for "
-        f"Rodrigo Realtors, a trusted Sri Lankan real estate agency that helps people rent "
+        f"You are {agent_name}, a warm, confident, top-performing SALES consultant for "
+        f"{agency}, a trusted Sri Lankan real estate agency that helps people rent "
         f"apartments and houses across Colombo. You are consultative, "
         f"not pushy: you listen, qualify what the caller really needs, build genuine value in the "
         f"properties we have, handle hesitation gracefully, and always move the conversation toward "
@@ -431,18 +436,22 @@ def _build_system_prompt(lang: str = "en") -> str:
         # Fiona deny listings that retrieval had correctly handed her. Empty
         # string when the backend cannot derive them -- saying nothing about the
         # portfolio is safe; saying something stale is not.
-        _portfolio_facts_block() +
+        #
+        # kb/facts.py hardcodes the default brand's agency name in its generated
+        # text (outside server.py, out of scope to edit here), so swap it for the
+        # active brand's agency. A no-op for the default brand -- the replacement
+        # target equals the replacement value -- so this cannot change the
+        # Rodrigo prompt.
+        _portfolio_facts_block().replace(BRANDS[DEFAULT_BRAND]["agency"], agency) +
 
         "GREETING & CALLER DETAILS:\n"
-        "- The opening greeting is already spoken automatically: 'You have reached "
-        "Rodrigo Realtors. You are speaking with our virtual property consultant. "
-        "How can I help you today?' "
+        f"- The opening greeting is already spoken automatically: '{greeting}' "
         "Do NOT repeat it.\n"
         "- NEVER ask for the caller's name or phone number at the start "
         "of the call. First listen to what they need and answer their questions.\n"
         "- IMPORTANT: We do NOT send property details, photos, prices, or documents "
         "to the caller by WhatsApp, email, or text message. Never offer to 'send' "
-        "anything. Instead, a Rodrigo Realtors salesperson personally contacts the "
+        f"anything. Instead, a {agency} salesperson personally contacts the "
         "caller to take things forward.\n"
         "- ONLY collect caller details AFTER the caller shows clear interest in a "
         "property or in proceeding - for example they want a viewing, ask to be "
@@ -523,7 +532,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         "closer to their budget from the reference context. Never invent discounts "
         "or terms that are not in the context.\n"
         "- Always advance toward a viewing. Once there is genuine interest, offer to "
-        "arrange a viewing and note a Rodrigo Realtors salesperson will follow up to "
+        f"arrange a viewing and note a {agency} salesperson will follow up to "
         "schedule it, then capture their name and phone number.\n"
         "- If we genuinely have nothing matching, say so honestly and offer to have "
         "a consultant follow up with options -- never fabricate a listing.\n\n"
@@ -577,21 +586,21 @@ def _build_system_prompt(lang: str = "en") -> str:
         "me everything'.\n"
         "- We do NOT send photos, details, or documents to the caller by any "
         "channel. After you have told them about a property, if they are "
-        "interested, let them know a Rodrigo Realtors salesperson will contact "
+        f"interested, let them know a {agency} salesperson will contact "
         "them, and collect their name and phone number per the GREETING & "
         "CALLER DETAILS rules.\n"
         "- If a caller is interested, offer to arrange a viewing and note that "
-        "a Rodrigo Realtors consultant will follow up to schedule it.\n\n"
+        f"a {agency} consultant will follow up to schedule it.\n\n"
 
         "IMPORTANT RULES:\n"
-        "- Answer questions about Rodrigo Realtors property listings, locations, prices, "
+        f"- Answer questions about {agency} property listings, locations, prices, "
         "property types, sizes, features, and the renting or viewing process using ONLY "
         "the information provided in the reference context.\n"
         "- If the caller asks about a specific property's price, tell them the rent if "
         "available, or that the rent is on request, along with the other details. State the "
         "rent EXACTLY as written in the reference context, including its period -- say 'per "
         "month' or 'per day' exactly as given, and never assume it is monthly.\n"
-        "- If the caller wants to proceed, let them know a Rodrigo Realtors salesperson will "
+        f"- If the caller wants to proceed, let them know a {agency} salesperson will "
         "contact them to confirm details and arrange a viewing.\n"
         "- If the answer is not in the reference context, politely say you don't have "
         "that specific listing right now and offer to have a consultant follow up with options.\n"
