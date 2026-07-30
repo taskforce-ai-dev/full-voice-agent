@@ -214,8 +214,17 @@ Consequences worth knowing:
 
 `tests/test_portfolio_lookups.py` (renamed from test_demo_portfolio_lookups.py
 once the demo portfolio was replaced by the real 60-row inventory) asserts all
-of the above end-to-end against the real KB prose (needs sentence-transformers;
-skipped without it).
+of the above end-to-end against the real KB prose. Its expectations are computed
+from `tests/truth_table.py` via `tests/oracle.py::expected_ids`, not hardcoded —
+the old hardcoded ID lists all went stale the moment the portfolio changed.
+
+> **It does NOT need sentence-transformers, and it DOES gate deploys.** This doc
+> claimed the opposite for months. `tests/conftest.py::build_kb` monkeypatches
+> the embedder before `RealEstateKB.__init__` runs, and the real library is only
+> imported lazily inside that constructor — so the file runs fine in the
+> `pytest numpy pydantic`-only CI environment, and a failure here blocks
+> `kb-verify` and therefore every deploy. Verified 2026-07-30 in an isolated
+> venv: 37/37 in under a second.
 
 ### Jul 17 2026 — the pipeline is INVERTED: rows are the source, prose is generated
 
