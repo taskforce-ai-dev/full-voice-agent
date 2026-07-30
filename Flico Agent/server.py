@@ -123,7 +123,7 @@ OPENAI_TTS_INSTRUCTIONS: str = os.getenv(
     "OPENAI_TTS_INSTRUCTIONS",
     "You are Fiona, a warm and personable young Sri Lankan property consultant "
     "at a real estate agency. Speak in natural, lively conversational "
-    "Sinhala with genuine warmth and enthusiasm â€” smile as you talk. Vary "
+    "Sinhala with genuine warmth and enthusiasm — smile as you talk. Vary "
     "your pitch and pace naturally: rise with excitement when describing "
     "properties, soften when being empathetic, and pause briefly between ideas. "
     "Sound like a real person chatting on the phone, not a robot reading text. "
@@ -232,7 +232,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "tts_provider": "ElevenLabs",
         "voice": "bm3QvaZ3fUSCRBC3UV1f-flash_v2_5",
         "language": "en-US",
-        "welcome_greeting": "You have reached Rodrigo Realtors â€” you are speaking with our virtual property consultant. How can I help you today?",
+        "welcome_greeting": "You have reached Rodrigo Realtors — you are speaking with our virtual property consultant. How can I help you today?",
         "extra_attrs": '        elevenlabsTextNormalization="on"\n',
     },
     "ta": {
@@ -1265,7 +1265,7 @@ class GoogleSTTStream:
 
 
 class AzureSTTStream:
-    """Streams audio to Azure Speech-to-Text â€” drop-in alternative to GoogleSTTStream."""
+    """Streams audio to Azure Speech-to-Text — drop-in alternative to GoogleSTTStream."""
 
     def __init__(self, on_final_result: Any, on_interim_result: Any = None, lang: str = "si"):
         self._on_final = on_final_result
@@ -1278,13 +1278,13 @@ class AzureSTTStream:
 
     def start(self):
         if not AZURE_STT_AVAILABLE:
-            logger.error("Cannot start Azure STT â€” azure-cognitiveservices-speech not installed")
+            logger.error("Cannot start Azure STT — azure-cognitiveservices-speech not installed")
             return
         if audioop is None:
-            logger.error("Cannot start Azure STT â€” audioop unavailable")
+            logger.error("Cannot start Azure STT — audioop unavailable")
             return
         if not AZURE_SPEECH_KEY:
-            logger.error("Cannot start Azure STT â€” AZURE_SPEECH_KEY not set")
+            logger.error("Cannot start Azure STT — AZURE_SPEECH_KEY not set")
             return
 
         primary = STT_PRIMARY.get(self._lang, "si-LK")
@@ -1359,7 +1359,7 @@ def _make_stt(on_final_result: Any, on_interim_result: Any, lang: str):
     if STT_PROVIDER == "azure":
         if AZURE_STT_AVAILABLE and audioop is not None:
             return AzureSTTStream(on_final_result, on_interim_result, lang)
-        logger.error("STT_PROVIDER=azure but Azure STT unavailable â€” falling back to Google")
+        logger.error("STT_PROVIDER=azure but Azure STT unavailable — falling back to Google")
     return GoogleSTTStream(on_final_result, on_interim_result, lang)
 
 
