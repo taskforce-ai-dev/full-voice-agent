@@ -2,14 +2,34 @@
 
 ## What This Is
 
-Fiona is a multilingual AI voice agent for **Flico** (flico.lk), Sri Lanka's trusted technology and electronics retailer. Handles inbound phone calls via Twilio, uses a configurable LLM (Claude, OpenAI, or Gemini) for conversation, and grounds answers in a ChromaDB-based RAG knowledge base about Flico products, services, and policies.
+**The directory name is wrong and so was this paragraph.** This is NOT the Flico
+electronics retailer. It is a **real-estate** voice agent. The "Flico" naming
+survives only in the directory, the FastAPI title, the deploy path
+(`/opt/flico`), the container (`flico-voice-agent`) and the hostname
+(`flico.taskforceai.tech`) — renaming those touches deploy wiring, so they stay.
 
-The agent persona is **Fiona** — a warm, trilingual (English, Tamil, Sinhala) customer service agent. Language is selected via IVR/DTMF menu (press 1/2/3) at call start.
+This one process serves **two storefronts**, selected by a `brand` parameter
+(see `brands.py`):
 
-Fiona is an **informational agent only** — no booking tools, no external APIs. She answers queries about products, prices, store locations, delivery, and policies using the knowledge base.
+| Brand key | Agency | Agent | Reached via | Human transfer |
+|---|---|---|---|---|
+| `rodrigo` (default) | Rodrigo Realtors | Fiona | the live inbound phone line — **a paying customer** | yes |
+| `starproperties` | Star Properties | Amaya | the website Book-a-Demo card | **no** |
+
+Both share one retrieval engine and one synthetic 12-row rental portfolio
+(`knowledge_docs/listings.json`). Answers are grounded in that KB; there are no
+booking tools. `DEFAULT_BRAND = "rodrigo"` is load-bearing — every call site that
+passes only `lang` resolves to the paying customer's persona.
+
+> **The brand key is not free-form.** It MUST equal the agent `id` in the
+> website's `BookDemo.tsx`, because that id is what Twilio forwards and what
+> Hatton's `DEMO_AGENT_HOSTS` routes on. On 2026-07-30 this backend was built
+> against `startproperty` while the live site already said `starproperties`, and
+> every demo call silently fell through to the Hatton Hills hotel agent. **Fetch
+> the website repo and read the live `id` before touching brand routing.**
 
 **Single server mode:**
-- `server.py` — Production server (IVR DTMF menu: English -> ConversationRelay+ElevenLabs, Tamil -> Media Streams+ElevenLabs multilingual, Sinhala -> Media Streams+OpenAI `gpt-4o-mini-tts`)
+- `server.py` — Production server (ConversationRelay for phone + demo; Media Streams handlers retained for Tamil/Sinhala but no longer routed to from the phone line)
 
 ## Project File Map
 
@@ -73,18 +93,33 @@ Copy `.env.example` to `.env`. Key groups:
 
 ## Architecture
 
-### IVR Flow
+### Call flow — the phone IVR is GONE (verified 2026-07-30)
+
+`/voice/incoming` has **no `<Gather>` and no DTMF menu**. Its docstring reads
+"English only -- no IVR/language menu" and it connects every inbound call
+straight to the English ConversationRelay:
+
 ```
-Incoming call
-  -> POST /voice/incoming (returns TwiML with <Gather> DTMF menu: 1=EN, 2=TA, 3=SI)
-  -> Caller presses 1, 2, or 3 (no digit within timeout -> Redirect, defaults to EN)
-  -> POST /voice/language-selected
-  -> English: ConversationRelay WebSocket /ws/conversation?lang=en
-  -> Tamil:   Media Streams WebSocket /ws/media-stream/ta
-  -> Sinhala: Media Streams WebSocket /ws/media-stream/si
+Incoming phone call
+  -> POST /voice/incoming
+  -> <Connect><ConversationRelay …/ws/conversation?lang=en&brand=rodrigo>
 ```
 
-DIGIT map (`DIGIT_TO_LANG` in `server.py`): `1`->`en`, `2`->`ta`, `3`->`si`.
+```
+Website Book-a-Demo call (Star Properties)
+  -> Hatton's shared TwiML app <Redirect>s here on agent id 'starproperties'
+  -> POST /voice/demo-incoming
+  -> <Connect><ConversationRelay …/ws/conversation?lang=en&brand=starproperties>
+```
+
+The Tamil/Sinhala Media Streams handlers (`/ws/media-stream/{lang}`) still
+exist and still work, but **nothing routes a phone caller to them** now that
+the menu is gone.
+
+> This section previously described a `<Gather>` menu with press 1/2/3 and a
+> `DIGIT_TO_LANG` map. That was removed from the code and the doc was not
+> updated. On 2026-07-30 the stale text caused a test to be written asserting a
+> `<Gather>` that does not exist. If you change the routing, change this too.
 
 ### TTS / STT routing by language
 | Lang | Digit | Transport          | STT (Google)        | TTS                                     |
@@ -316,8 +351,9 @@ appeared on the third pass.
 
 ## Server Endpoints
 
-- `POST /voice/incoming` — Returns TwiML with `<Gather>` DTMF language menu (1=EN, 2=TA, 3=SI)
-- `POST /voice/language-selected` — Routes to ConversationRelay (EN) or Media Streams (TA, SI)
+- `POST /voice/incoming` — Live phone line. **No IVR/`<Gather>`** — connects straight to English ConversationRelay as brand `rodrigo`.
+- `GET|POST /voice/demo-incoming` — Website Book-a-Demo entry. English only, brand `starproperties` (Amaya). Hatton's shared TwiML app `<Redirect>`s here for agent id `starproperties`. Optional distinct voice via `CR_VOICE_STARPROPERTIES`.
+- `POST /voice/language-selected` — Routes to ConversationRelay (EN) or Media Streams (TA, SI). Retained, but the phone line no longer reaches it.
 - `WebSocket /ws/conversation` — English ConversationRelay
 - `WebSocket /ws/media-stream/{lang}` — Tamil/Sinhala Media Streams (Google STT + TTS); `{lang}` is `ta` or `si`
 - `GET /health` — Health check
