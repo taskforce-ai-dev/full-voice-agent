@@ -13,8 +13,8 @@ import itertools
 
 import pytest
 
-from kb.schema import Property, QueryFilters
-from tests.conftest import build_kb
+from kb.schema import QueryFilters
+from tests.conftest import build_kb, truth_property
 from tests.oracle import satisfies
 from tests.truth_table import TRUTH, rent_equivalence_grid
 
@@ -25,14 +25,10 @@ _RENT_NOTE = "cost MORE than they asked"
 
 @pytest.fixture(scope="module")
 def store(tmp_path_factory):
-    return build_kb(tmp_path_factory.mktemp("inv") / "i.db", [
-        Property(id=r["id"], transaction="rent", property_type=r["type"],
-                 zone=r["zone"], area="", bedrooms=r["beds"],
-                 bathrooms=float(r["baths"]), rent_amount=float(r["rent"]),
-                 rent_period="month", furnishing=r["furnishing"],
-                 floor_area_sqft=r["sqft"], description=r["id"])
-        for r in TRUTH
-    ])
+    # truth_property honours the real portfolio's nulls (POR rents, bed-less
+    # commercial rows) -- the invariants must hold over those too.
+    return build_kb(tmp_path_factory.mktemp("inv") / "i.db",
+                    [truth_property(r) for r in TRUTH])
 
 
 def _filter_space():
@@ -40,7 +36,7 @@ def _filter_space():
     for ptype, zone, beds, rent in itertools.product(
             [None, "apartment", "house", "commercial", "land"],
             [None] + list(range(1, 11)),
-            [None, 1, 2, 3],
+            [None, 1, 2, 3, 4, 5, 6],
             [None] + [float(r) for r in rents]):
         yield QueryFilters(property_type=ptype, zone=zone, bedrooms=beds,
                            max_rent=rent, max_rent_exclusive=True)

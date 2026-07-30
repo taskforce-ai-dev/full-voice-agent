@@ -48,6 +48,25 @@ def zero_embedder():
         kb_engine.EmbeddingEngine = original
 
 
+def truth_property(r):
+    """Build a Property from a truth-table row, honouring its nulls.
+
+    rent=None means price-on-request (rent_on_request=True, no period);
+    beds/baths=None mean the feed states no count (commercial rows);
+    furnishing=None means the feed's furnishing column was '-'.
+    """
+    from kb.schema import Property
+    return Property(
+        id=r["id"], transaction="rent", property_type=r["type"],
+        zone=r["zone"], area="", bedrooms=r["beds"],
+        bathrooms=float(r["baths"]) if r["baths"] is not None else None,
+        rent_amount=float(r["rent"]) if r["rent"] is not None else None,
+        rent_period=r.get("period") if r["rent"] is not None else None,
+        rent_on_request=r["rent"] is None,
+        furnishing=r["furnishing"],
+        floor_area_sqft=r["sqft"], description=r["id"])
+
+
 def build_kb(db_path, props, preamble=""):
     with zero_embedder():
         kb = kb_engine.RealEstateKB(db_path=str(db_path), preamble=preamble)
