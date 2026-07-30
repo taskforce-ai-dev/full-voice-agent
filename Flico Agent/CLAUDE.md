@@ -212,8 +212,10 @@ Consequences worth knowing:
   Ranges ("between 300k and 500k", "300k-500k") and floors ("over 300k") parse;
   a scale unit is required there so "more than 2 bedrooms" is never read as money.
 
-`tests/test_demo_portfolio_lookups.py` asserts all of the above end-to-end
-against the real KB prose (needs sentence-transformers; skipped without it).
+`tests/test_portfolio_lookups.py` (renamed from test_demo_portfolio_lookups.py
+once the demo portfolio was replaced by the real 60-row inventory) asserts all
+of the above end-to-end against the real KB prose (needs sentence-transformers;
+skipped without it).
 
 ### Jul 17 2026 — the pipeline is INVERTED: rows are the source, prose is generated
 
