@@ -6,6 +6,10 @@ from kb.schema import Property
 
 _WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
              "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+# Built FROM _WORD_NUM so the two cannot drift. The parking pattern used to
+# hard-code "one|two|three|four", so kb/prose.py rendering "ten parking spaces"
+# (P33 has ten) was unreadable on the way back -- the map already knew "ten".
+_NUM_WORDS_RE = "|".join(sorted(_WORD_NUM, key=len, reverse=True))
 _TEXT_RENT = {"fifteen thousand": 15000.0}  # extend as needed; numeric Rs is primary
 
 
@@ -68,7 +72,7 @@ def _parse_listing(para: str) -> Optional[Property]:
         elif "per month" in low or "monthly rent" in low:
             rent_period = "month"
 
-    pk = re.search(r"(one|two|three|four|\d+)\s+(?:covered\s+)?parking", low)
+    pk = re.search(rf"({_NUM_WORDS_RE}|\d+)\s+(?:covered\s+)?parking", low)
     parking = None
     if pk:
         tok = pk.group(1)

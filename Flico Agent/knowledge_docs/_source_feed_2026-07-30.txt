@@ -1,0 +1,84 @@
+SOURCE FEED — pasted by the operator 2026-07-30. FROZEN. Do not edit.
+This is the import source of truth for knowledge_docs/listings.json.
+Photo URLs are deliberately NOT imported (voice agent; a salesperson sends photos on follow-up).
+
+Operator rulings at import time:
+  - P01 DROPPED: its two stated prices disagree (title Rs.170,000/mo vs price field
+    Rs.150,000/mo) and 750,000 sq.ft. on 60 perches is physically implausible.
+  - P04 EXCLUDED: marked "Rented", not available.
+
+Format: PXX | building/code | location | type BR/BA | size | price | furnishing | availability | terms (deposit/advance/lease/parking) | features
+
+P01 | Office for rent in Colombo 3 for Rs. 170,000 (Per Month) + f | Colombo 3 | Office space 10BA | 750000 sq.ft. / 60 perches land | Rs. 150,000  ($ 600) Per Month | - | For Urgent Rent | dep 3 Months, adv 6 Months, min 2 Years, 10p | 24 Hour Security, Internet, 3 Phase Electricity, Central AC, Backup Generator, Fire Detection
+P02 | Havelock City - Furnished | Colombo 5 | Apartment 3BR/2BA | 1442 sq.ft. | POR | Furnished | Available now | dep 2 Months, adv 3 Months, min 1 Years, 1p | AC Rooms, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs, Internet
+P03 | 3 Bedroom apartment for rent off Galle Rd near Majestic City | Adamaly Place, Colombo 4 | Apartment 3BR/3BA | 1300 sq.ft. | Rs. 15,000 Per Day | Furnished | Available Now | dep 3 Months, adv 3 Months, min 1 Years, 1p | AC Rooms, 24 Hour Security, Hot Water, Landline Tel, Garage, Balcony
+P04 | Cinnamon Life | Glennie Street, Colombo 2 | Apartment 5BR/5BA | 4000 sq.ft. | POR | Unfurnished | Rented | - | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs
+P05 | Luxury House / 4 Bedrooms / For Rent / Colombo 3 / Fully | Colombo 3 | House 4BR/4BA | 12000 sq.ft. / 32 perches land | POR | Furnished | Available Now | - | AC Rooms, Luxury Specs, Hot Water, Mainline Water, 3 Phase Electricity, Home Security System
+P06 | Altair | Altair Avenue, Colombo 2 | Apartment 4BR/4BA | 2286 sq.ft. | POR | Furnished | Available Now | - | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Luxury Specs, Internet
+P07 | One Galle Face | Galle Face Drive, Colombo 1 | Apartment 4BR/3BA | 2745 sq.ft. | POR | Furnished | Available Now | - | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs
+P08 | 4 Bedrooms / House / Colombo 7 / For Rent / $1800 / EK- | Gregory's Place, Colombo 7 | House 4BR/3BA | 2000 sq.ft. | POR | Unfurnished | Available Now | - | AC Rooms, Luxury Specs, Hot Water, Mainline Water, Home Security System, Roof Top Garden
+P09 | One Galle Face | Galle Face Center Road, Colombo 1 | Apartment 4BR/3BA | 3477 sq.ft. | POR | Semi-furnished | Available Now | - | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs
+P10 | One Galle Face | Galle Face Center Road, Colombo 1 | Apartment 4BR/3BA | 3500 sq.ft. | POR | Unfurnished | Available Now | - | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs
+P11 | Capitol Twin Peaks | Staple Street, Colombo 2 | Apartment 3BR/2BA | 1000 sq.ft. | POR | Unfurnished | Available Now | - | AC Rooms, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs, Internet
+P12 | Altair | Altair Avenue, Colombo 2 | Apartment 3BR/3BA | 2096 sq.ft. | POR | Furnished | Available Now | - | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs
+P13 | 447 Luna | luna, Colombo 2 | Apartment 3BR/3BA | 1690 sq.ft. | POR | Furnished | Available Now | 1p | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs
+P14 | Trillium Residencies | Elvitigala Mawatha, Colombo 8 | Apartment 3BR/2BA | 1840 sq.ft. | POR | Furnished | Available Now | 1p | AC Rooms, Swimming Pool, 24 Hour Security, Luxury Specs, Internet, Hot Water
+P15 | 606 The Address | 606 A2, Colombo 3 | Apartment 3BR/3BA | 2138 sq.ft. | Rs. 600,000  ($ 2,000) Per Month | Unfurnished | Available Now | 1p | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs
+P16 | 4 Bedroom Luxury House with Swimming Pool & Garden / For Re | Maurice Place, Colombo 5 | House 4BR/4BA | 6500 sq.ft. | Rs. 1,100,000 Per Month | Unfurnished | Available Now | 3p | AC Rooms, Swimming Pool, Brand New, Luxury Specs, Hot Water, Mainline Water
+P17 | The Grand | Ward Place, Colombo 7 | Apartment 3BR/2BA | 1423 sq.ft. | POR | Furnished | Available Now | 1p | AC Rooms, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs, Internet
+P18 | Luxury Furnished Apartment For Rent Seylan Residenc | Colombo 3 | Apartment 3BR/3BA | 2600 sq.ft. | Rs. 775,000 Per Month | Furnished | Available Now | - | AC Rooms, Swimming Pool, 24 Hour Security, Gym, Theatre, Jogging Track
+P19 | Shangri La Furnished Apartment for Rent- A39980 | Shangri La, Colombo 2 | Apartment 4BR/3BA | 2750 sq.ft. | Rs. 2,645,000  ($ 8,500) Per Month | Furnished | Available Now | - | AC Rooms, Beachfront / Sea View, 24 Hour Security, 3 Phase Electricity, Maid's Room, Maid's Toilet
+P20 | Iceland Residence Furnished Apartment for Rent - A38087 | Iceland Residence, Colombo 3 | Apartment 4BR/4BA | 2500 sq.ft. | Rs. 1,200,000  ($ 4,000) Per Month | Furnished | Available Now | - | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, 3 Phase Electricity, Gym
+P21 | Capitol Twinpeaks - Furnished Apartment for Rent- A51044 | Capitol Twin Peak, Colombo 2 | Apartment 3BR/3BA | 1275 sq.ft. | Rs. 625,000  ($ 2,000) Per Month | Furnished | Available Now | - | AC Rooms, Swimming Pool, 24 Hour Security, 3 Phase Electricity, Waterfront / Riverside, Gym
+P22 | 4 Bedroom House for Rent in Colombo 5, R4838 | Colombo 5 | House 4BR/4BA | 4500 sq.ft. / 25 perches land | Rs. 1,128,000  ($ 3,500) Per Month | Furnished | Available Now | dep None, 3p | AC Rooms, Swimming Pool, 24 Hour Security, Luxury Specs, Hot Water, Mainline Water
+P23 | 3 bedroom fully furnished direct sea view apartment availabl | Galle Road, Colombo 1 | Apartment 3BR/3BA | 2300 sq.ft. | Rs. 750,000 Per Month | Furnished | Available Now | dep 4 Months, adv 8 Months, min 1 Years, 1p | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Luxury Specs, Cable/Sat TV
+P24 | Victoria Park Mansion Furnished Penthouse for Rent- A12444 | Anagarika Dharmapala Mawatha, Colombo 7 | Apartment 4BR/4BA | 3800 sq.ft. | Rs. 1,200,000  ($ 3,750) Per Month | Furnished | Available Now | - | AC Rooms, Swimming Pool, 24 Hour Security, 3 Phase Electricity, Gym, Maid's Room
+P25 | Altair Furnished Apartment for Rent- A48888 | Altair, Colombo 2 | Apartment 4BR/4BA | 2321 sq.ft. | Rs. 1,260,030  ($ 4,000) Per Month | Furnished | Available Now | - | AC Rooms, 24 Hour Security, 3 Phase Electricity, Maid's Room, Maid's Toilet
+P26 | Metro Homes | Colombo 2 | Apartment 3BR/2BA | 1200 sq.ft. | Rs. 150,000 Per Month | Unfurnished | Available soon | 1p | -
+P27 | Apartment for rent - The Grand | Colombo 7 | Apartment 3BR/2BA | 1428 sq.ft. | POR | Furnished | Available Now | 2p | Swimming Pool, Brand New, Luxury Specs, Hot Water, Gym, Balcony
+P28 | Commercial Property for Rent in Colombo 05 (A6066) | Colombo 5 | Building 4BA | 6000 sq.ft. / 15 perches land | Rs. 600,000 Per Month | - | Available Now | dep None, min None | -
+P29 | 7,928 Sq.ft Commercial House for Rent - CP46215 | Maligawatte Road , Colombo 10 | Office space 2BA | 7928 sq.ft. | Rs. 1,000,000 Per Month | - | Available Now | - | On-Site Parking
+P30 | (NCR634) Commercial Property for Rent in Colombo 03 | Colombo 3 | Building - | 1050 sq.ft. | Rs. 125,000 Per Month | - | Available Now | - | -
+P31 | 5 BR House for Rent in Colombo 8. - PDH318 | Colombo 8 | House 5BR/2BA | 3100 sq.ft. | Rs. 250,000 Per Month | - | Available Now | - | -
+P32 | Apartment For Rent In Colombo 7 ( File No 677b/26) | Colombo 7 | Apartment 3BR/2BA | 1460 sq.ft. | Rs. 250,000 Per Month | - | Available Now | - | -
+P33 | 33,100 Sq.ft Commercial Building for Rent - CP18542 | Off hunupitiya road, Colombo 2 | Building 10BA | 33100 sq.ft. | Rs. 6,000,000 Per Month | - | Available Now | 10p | Central AC, Backup Generator, On-Site Parking, Lifts
+P34 | 1600 sqft Office Space for Rent - Colombo 03 | pentrieve gardens, Colombo 3 | Office space 2BA | 1600 sq.ft. | Rs. 200,000  ($ 700) Per Month | - | Available Now | adv 6 Months, min 1 Years, 2p | 3 Phase Electricity, On-Site Parking
+P35 | Colombo 03 Commercial Space For Rent (NK11310) | Colombo 3 | Office space - | 4500 sq.ft. | Rs. 750,000 Per Month | - | Available Now | - | 24 Hour Security, Central AC, On-Site Parking, Lifts, Grade a Facilities
+P36 | 1400 sq ft house type office space for rent in col. 05 (Kiru | Colombo 5 | Office space 1BA | 1400 sq.ft. | Rs. 195,000 Per Month | - | Available Now | dep 6 Months, min 1 Years, 1p | 3 Phase Electricity, Fire Detection, On-Site Parking
+P37 | Legends Tower - 03 Bedroom Furnished Apartment for Rent in C | Colombo 7 | Apartment 3BR/2BA | 1950 sq.ft. | Rs. 576,000 Per Month | Furnished | Available Now | dep None, min None | -
+P38 | 03 Bedroom Semi Furnished Apartment for Rent in Colombo 03 | Colombo 3 | Apartment 3BR/3BA | 2400 sq.ft. | Rs. 500,000 Per Month | Semi-furnished | Available Now | dep None, min None | -
+P39 | Colombo 06 Fully Furnished Apartment for Short-Term Rental. | Pereira Lane , Wellawatte, Colombo 6 | Apartment 3BR/2BA | 1100 sq.ft. | POR | Furnished | Available Now | - | AC Rooms, Cable/Sat TV, Lp Gas, Attached Toilets, Garbage Removal
+P40 | Skelton Road | Skelton Road, Colombo 5 | House 5BR/4BA | 5000 sq.ft. | POR | Unfurnished | Available Now | 2p | AC Rooms, Luxury Specs, Hot Water, Mainline Water, 3 Phase Electricity, Home Security System
+P41 | 4 Bedroom House For Rent / Colombo 5 / Fully Furnished | Colombo 5 | House 4BR/4BA | 5500 sq.ft. / 22 perches land | POR | Furnished | Available Now | 2p | AC Rooms, Brand New, Luxury Specs, Hot Water, Mainline Water, 3 Phase Electricity
+P42 | 3 Bedroom House For Rent in Colombo 5, Jawatta Avenue | Colombo 5 | House 3BR/3BA | 5500 sq.ft. / 28 perches land | POR | Furnished | Available Now | 2p | AC Rooms, Luxury Specs, Hot Water, Mainline Water, 3 Phase Electricity, Home Security System
+P43 | 3 Bedroom Apartment at Altair - Straight Tower - Top Floor | Staple Street, Colombo 2 | Apartment 3BR/2BA | 1627 sq.ft. | POR | Furnished | Available Now | 1p | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Luxury Specs, Internet
+P44 | 3 Bedroom Penthouse Apartment For Rent in Skyline Residencie | Magazine Road, Colombo 8 | Apartment 3BR/3BA | 3100 sq.ft. | Rs. 300,000 Per Month | Semi-furnished | Available Now | 2p | AC Rooms, Swimming Pool, 24 Hour Security, Luxury Specs, Internet, Hot Water
+P45 | 4 Bedroom Apartment For Rent in The Grand, Colombo 7 | Ward Place, Colombo 7 | Apartment 4BR/3BA | 2686 sq.ft. | POR | Furnished | Available Now | 2p | AC Rooms, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs, Internet
+P46 | 3 Bedroom Apartment For Rent in One Galle Face - West Tower | Galle Face Drive, Colombo 1 | Apartment 3BR/3BA | 2271 sq.ft. | POR | Furnished | Available Now | - | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs
+P47 | 3 Bedroom Apartment For Rent in Empire Residencies | Braybrooke Place, Colombo 2 | Apartment 3BR/3BA | 2200 sq.ft. | POR | Furnished | Available Now | 1p | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Luxury Specs, Internet
+P48 | 3 Bedroom Apartment at Altair - Straight Tower | Altair Avenue, Colombo 2 | Apartment 3BR/2BA | 1627 sq.ft. | POR | Furnished | Available Now | 1p | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Luxury Specs, Internet
+P49 | Trizen - Tower 1 | Braybrooke Place, Colombo 2 | Apartment 3BR/2BA | 1020 sq.ft. | POR | Furnished | Available Now | 1p | AC Rooms, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs, Internet
+P50 | 606 The Address | Galle Road, Colombo 3 | Apartment 3BR/3BA | 2550 sq.ft. | POR | Furnished | Available Now | - | AC Rooms, Beachfront / Sea View, Swimming Pool, 24 Hour Security, Brand New, Luxury Specs
+P51 | [DEMO] Park Street One Bedroom Apartment | Park Street, Colombo 2 | Apartment 1BR/1BA | 620 sq.ft. | Rs. 180,000 Per Month | Furnished | Available Now | dep 2 Months, adv 1 Month, min 1 Year, 1p | AC Room, 24 Hour Security, Hot Water, Lift, Backup Generator, Balcony
+P52 | [DEMO] Marine Drive One Bedroom Apartment | Marine Drive, Colombo 3 | Apartment 1BR/1BA | 700 sq.ft. | Rs. 220,000 Per Month | Furnished | Available Now | dep 2 Months, adv 1 Month, min 1 Year, 1p | AC Room, Sea View, 24 Hour Security, Hot Water, Gym, Balcony
+P53 | [DEMO] Wellawatte City View One Bedroom Apartment | Wellawatte, Colombo 6 | Apartment 1BR/1BA | 650 sq.ft. | Rs. 150,000 Per Month | Semi-furnished | Available Now | dep 2 Months, adv 1 Month, min 1 Year, 1p | AC Room, 24 Hour Security, Hot Water, Lift, Mainline Water, Balcony
+P54 | [DEMO] Havelock Gardens Two Bedroom Apartment | Havelock Road, Colombo 5 | Apartment 2BR/2BA | 1100 sq.ft. | Rs. 280,000 Per Month | Furnished | Available Now | dep 2 Months, adv 1 Month, min 1 Year, 1p | AC Rooms, Swimming Pool, 24 Hour Security, Hot Water, Gym, Balcony
+P55 | [DEMO] Cinnamon Gardens Two Bedroom Apartment | Barnes Place, Colombo 7 | Apartment 2BR/2BA | 1250 sq.ft. | Rs. 350,000 Per Month | Semi-furnished | Available Now | dep 3 Months, adv 1 Month, min 1 Year, 1p | AC Rooms, 24 Hour Security, Hot Water, Lift, Gym, Balcony
+P56 | [DEMO] Union Place Two Bedroom Apartment | Union Place, Colombo 2 | Apartment 2BR/2BA | 1050 sq.ft. | Rs. 300,000 Per Month | Furnished | Available Now | dep 2 Months, adv 1 Month, min 1 Year, 1p | AC Rooms, Swimming Pool, 24 Hour Security, Backup Generator, Gym, Balcony
+P57 | [DEMO] Kirula Lane Compact One Bedroom House | Kirula Lane, Colombo 5 | House 1BR/1BA | 850 sq.ft. / 6 perches land | Rs. 160,000 Per Month | Furnished | Available Now | dep 2 Months, adv 1 Month, min 1 Year, 1p | AC Room, Private Entrance, Hot Water, Small Garden, Mainline Water, Boundary Wall
+P58 | [DEMO] Borella Garden One Bedroom Cottage | Cotta Road, Colombo 8 | House 1BR/1BA | 900 sq.ft. / 7 perches land | Rs. 140,000 Per Month | Semi-furnished | Available Now | dep 2 Months, adv 1 Month, min 1 Year, 1p | AC Room, Private Garden, Hot Water, Mainline Water, Home Security System, Boundary Wall
+P59 | [DEMO] Wellawatte One Bedroom Annex House | Hampden Lane, Colombo 6 | House 1BR/1BA | 750 sq.ft. / 5 perches land | Rs. 130,000 Per Month | Unfurnished | Available Now | dep 2 Months, adv 1 Month, min 1 Year, 1p | Private Entrance, Hot Water, Mainline Water, Small Courtyard, Boundary Wall, Separate Electricity
+P60 | [DEMO] Colombo 5 Two Bedroom Family House | Thimbirigasyaya Road, Colombo 5 | House 2BR/2BA | 1600 sq.ft. / 10 perches land | Rs. 260,000 Per Month | Semi-furnished | Available Now | dep 3 Months, adv 1 Month, min 1 Year, 2p | AC Rooms, Private Garden, Hot Water, Mainline Water, Home Security System, Servant Toilet
+P61 | [DEMO] Colombo 7 Two Bedroom Garden Bungalow | Rosmead Place, Colombo 7 | House 2BR/2BA | 1800 sq.ft. / 12 perches land | Rs. 400,000 Per Month | Furnished | Available Now | dep 3 Months, adv 1 Month, min 1 Year, 2p | AC Rooms, Private Garden, Hot Water, Mainline Water, Home Security System, Maid's Toilet
+P62 | [DEMO] Colombo 8 Two Bedroom House | Castle Street, Colombo 8 | House 2BR/2BA | 1500 sq.ft. / 9 perches land | Rs. 220,000 Per Month | Unfurnished | Available Now | dep 2 Months, adv 1 Month, min 1 Year, 2p | AC Provision, Private Garden, Hot Water, Mainline Water, Boundary Wall, Separate Electricity
+
+NEIGHBOURHOOD CONTEXT
+C1 Fort/Galle Face - corporate hub, sea views, premium
+C2 Slave Island/Union Place/Park Street - luxury towers, central offices, restaurants and easy city access
+C3 Kollupitiya/Marine Drive - embassies, sea-facing apartments, business districts and premium city living
+C4 Bambalapitiya - central, schools
+C5 Havelock Town/Narahenpita/Thimbirigasyaya/Kirula Lane - family-friendly residential areas, Havelock City, schools, hospitals and shopping
+C6 Wellawatte/Hampden Lane - beach proximity, strong transport links, shopping and restaurants
+C7 Cinnamon Gardens/Barnes Place/Rosmead Place - prestigious, leafy, close to embassies and leading schools
+C8 Borella/Cotta Road/Castle Street - established urban residential areas near hospitals, schools and major roads
+C10 Maradana - commercial

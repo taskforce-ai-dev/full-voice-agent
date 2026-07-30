@@ -129,12 +129,22 @@ def _lease_clause(p: Property) -> str:
         years = p.min_lease_months // 12
         terms.append(f"a minimum lease of {years} year" if years
                      else f"a minimum lease of {p.min_lease_months} months")
-    if not terms:
-        return ""
-    out = f"Lease terms are {_oxford(terms)}"
+    # Parking must survive a row with NO lease terms. This used to `return ""`
+    # before the parking clause was reached, so 18 of the 60 real listings
+    # recorded parking that the agent was never told about -- the caller asks
+    # "is there parking?" and a property with three spaces answers as if it has
+    # none. Parking is a property fact, not a lease term.
+    park = ""
     if p.parking:
-        out += (f", with {number_in_words(p.parking)} parking "
-                f"space{'s' if p.parking > 1 else ''}")
+        plural = "s" if p.parking > 1 else ""
+        park = f"{number_in_words(p.parking)} parking space{plural}"
+
+    if not terms:
+        return f"It has {park}." if park else ""
+
+    out = f"Lease terms are {_oxford(terms)}"
+    if park:
+        out += f", with {park}"
     out += "."
 
     upfront = ((p.deposit_months or 0) + (p.advance_months or 0))
