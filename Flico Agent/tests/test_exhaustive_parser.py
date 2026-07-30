@@ -56,6 +56,19 @@ TYPE_FRAGMENTS = [
     # "shopping" once matched "shop" and turned an apartment ask commercial.
     ("workshop", {}),
     ("place with a shopfront", {}),
+    # PROXIMITY governance: a bare marker under a proximity phrase describes
+    # the neighbourhood, not the ask -- it must contribute nothing, leaving
+    # the parse unfiltered (complete inventory) rather than commercial
+    # (which would hide every home from a renter).
+    ("somewhere close to shops and restaurants", {}),
+    ("place walking distance to shops", {}),
+    ("place next to the shop", {}),
+    ("place with shops nearby", {}),
+    ("somewhere near restaurants, cafes and shops", {}),
+    # ...but proximity AFTER the marker does not disarm a product ask, and a
+    # strong phrase keeps outranking a governed weak marker.
+    ("shop close to the station", {"property_type": "commercial"}),
+    ("office space near the shops", {"property_type": "commercial"}),
     ("land", {"property_type": "land"}),
     ("bare land", {"property_type": "land"}),
     ("plot", {"property_type": "land"}),
@@ -86,6 +99,11 @@ ZONE_FRAGMENTS = [
     # district" stays an apartment.
     ("near the shopping district", {}),
     ("near the shopping mall", {}),
+    # The proximity guard suppresses commercial-type inference ONLY -- a
+    # proximity-governed zone or area name must still parse to its zone.
+    ("near colombo 7", {"zone": 7}),
+    ("close to wellawatte", {"zone": 6}),
+    ("walking distance to borella", {"zone": 8}),
 ]
 
 BEDROOM_FRAGMENTS = [

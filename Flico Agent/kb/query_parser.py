@@ -33,6 +33,19 @@ _NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
 # the shops"), so they classify commercial only when the utterance names no
 # explicit residential or land type. A caller who said "apartment" gets an
 # apartment, whatever else the sentence mentions.
+#
+# Even with nothing explicit named, a weak marker GOVERNED by a proximity
+# phrase is the neighbourhood, not the ask: "somewhere close to shops and
+# restaurants" is a renter describing surroundings, and filtering commercial
+# there would hide every home from them. A governed marker contributes
+# nothing; if that leaves no signal the parse is None (unfiltered), which with
+# n_results=None hands the LLM the complete inventory -- the safe failure.
+# Proximity governs THROUGH a short coordinated list ("near restaurants,
+# cafes and shops") but never across more than four words, so "near the
+# beach, I want a shop" keeps its product reading. A proximity phrase AFTER
+# the marker does not disarm it ("a shop close to the station" is still a
+# commercial ask) -- only the trailing adverbs "nearby" / "close by" /
+# "next door" / "within walking distance" do.
 _COMMERCIAL_STRONG_RE = re.compile(
     r"\b(?:office\s+spaces?|commercial\s+"
     r"(?:buildings?|propert(?:y|ies)|houses?|spaces?|units?))\b")
@@ -41,17 +54,42 @@ _APARTMENT_RE = re.compile(r"\b(?:apartments?|flats?|penthouses?|condos?|condomi
 _HOUSE_RE = re.compile(r"\b(?:houses?|town\s*houses?|villas?|bungalows?|annexe?s?)\b")
 _LAND_RE = re.compile(r"\b(?:lands?|plots?)\b")
 
+_PROXIMITY_HEAD = (
+    r"\b(?:near(?:\s+to)?|closer?\s+to|next\s+to|beside|opposite|"
+    r"adjacent\s+to|across\s+from|(?:within\s+)?walking\s+distance\s+"
+    r"(?:to|from|of)|a\s+short\s+walk\s+(?:to|from)|around\s+the\s+corner\s+"
+    r"from|\w+\s+minutes?\s+(?:to|from)|steps\s+from|surrounded\s+by)"
+)
+# Anchored at the end of the text PRECEDING a weak marker: proximity phrase,
+# then at most four filler words (articles, adjectives, a coordinated list).
+_PROXIMITY_BEFORE_RE = re.compile(_PROXIMITY_HEAD + r"(?:[\s,]+\w+){0,4}[\s,]+$")
+# Anchored at the start of the text FOLLOWING a weak marker.
+_PROXIMITY_AFTER_RE = re.compile(
+    r"^(?:[\s,]+\w+){0,2}?[\s,]+(?:nearby|close\s+by|next\s+door|"
+    r"within\s+walking\s+distance)\b")
+
+
+def _weak_commercial_ask(low: str) -> bool:
+    """True only if some bare commercial marker is NOT proximity-governed."""
+    for m in _COMMERCIAL_WEAK_RE.finditer(low):
+        if (_PROXIMITY_BEFORE_RE.search(low[:m.start()])
+                or _PROXIMITY_AFTER_RE.match(low[m.end():])):
+            continue  # surroundings, not the product
+        return True
+    return False
+
 
 def classify_type(low: str) -> Optional[str]:
     """The ONE property-type classifier -- caller utterances (QueryParser) and
     listing prose (kb.migrate._classify) both resolve through this function, so
     the two vocabularies can never drift apart again. Precedence:
 
-      1. strong commercial phrase   -> commercial
-      2. explicit residential noun  -> apartment / house
-      3. explicit land noun         -> land
-      4. weak commercial marker     -> commercial
-      5. nothing recognised         -> None (unfiltered, never guessed)
+      1. strong commercial phrase            -> commercial
+      2. explicit residential noun           -> apartment / house
+      3. explicit land noun                  -> land
+      4. weak marker, NOT proximity-governed -> commercial
+      5. nothing recognised (or only
+         proximity-governed weak markers)    -> None (unfiltered, never guessed)
     """
     if _COMMERCIAL_STRONG_RE.search(low):
         return "commercial"
@@ -61,7 +99,7 @@ def classify_type(low: str) -> Optional[str]:
         return "house"
     if _LAND_RE.search(low):
         return "land"
-    if _COMMERCIAL_WEAK_RE.search(low):
+    if _weak_commercial_ask(low):
         return "commercial"
     return None
 
