@@ -10,3 +10,8 @@ agent-dashboard/admin-portal/admin/
 
 # macOS resource-fork junk that shipped inside the website zip (AppleDouble ._*)
 **/__MACOSX/
+
+# Firecrawl scrape caches (root, Kavya/, SLIC Agent/) — captured third-party web
+# content used as KB source material, not project source. Injected ~267 nodes
+# into the code graph on the 2026-07-30 AST update.
+**/.firecrawl/
