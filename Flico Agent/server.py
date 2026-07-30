@@ -72,7 +72,7 @@ from post_call import process_realestate_post_call
 from media_transport import MediaTransport, TwilioMediaTransport
 from asterisk_ari import AsteriskAriClient
 from asterisk_rtp import AsteriskRtpTransport, RtpPortAllocator
-from brands import DEFAULT_BRAND, resolve_brand
+from brands import BRANDS, DEFAULT_BRAND, resolve_brand
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -90,6 +90,10 @@ ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID: str = os.getenv("ELEVENLABS_VOICE_ID", "")
+# Distinct ConversationRelay voice for the Start Property demo persona, so the
+# two demos on the website do not sound like the same person. Falls back to the
+# language default when unset.
+CR_VOICE_STARTPROPERTY: str = os.getenv("CR_VOICE_STARTPROPERTY", "").strip()
 ELEVENLABS_VOICE_SPEED: float = float(os.getenv("ELEVENLABS_VOICE_SPEED", "1.0"))
 ELEVENLABS_MODEL_MULTILINGUAL: str = "eleven_multilingual_v2"
 ELEVENLABS_MODEL_TURBO: str = "eleven_turbo_v2_5"
@@ -1038,18 +1042,58 @@ async def voice_language_selected(request: Request) -> Response:
     return Response(content=twiml, media_type="application/xml")
 
 
+@app.api_route("/voice/demo-incoming", methods=["GET", "POST"])
+async def voice_demo_incoming(request: Request) -> Response:
+    """Website Book-a-Demo entry -- Start Property (Amaya), English, no IVR.
+
+    Hatton's shared TwiML app <Redirect>s here for agent id 'startproperty'.
+    Unlike the phone IVR there is no <Gather>: the demo card declares
+    langs: ['en'], so everything collapses to English ConversationRelay.
+    """
+    host = request.headers.get("host", request.url.hostname or "localhost")
+
+    config = LANGUAGE_CONFIGS["en"]
+    cr = _build_conversation_relay_twiml(
+        host, "en", config,
+        brand="startproperty",
+        voice=CR_VOICE_STARTPROPERTY or None,
+    )
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        "  <Connect>\n"
+        f"    {cr}\n"
+        "  </Connect>\n"
+        "</Response>"
+    )
+    logger.info("Demo incoming call from %s -- Start Property (en)",
+                request.headers.get("x-forwarded-for", "unknown"))
+    return Response(content=twiml, media_type="application/xml")
+
+
 def _build_conversation_relay_twiml(
-    host: str, lang: str, config: dict[str, str]
+    host: str, lang: str, config: dict[str, str],
+    brand: str = DEFAULT_BRAND, voice: str | None = None,
 ) -> str:
-    """Build the <ConversationRelay> XML tag for the given language config."""
+    """Build the <ConversationRelay> XML tag for the given language config.
+
+    `brand` rides the WebSocket query string because Twilio re-sends
+    Device.connect params on neither a redirected webhook nor the WebSocket
+    handshake. `voice` overrides the language default so a second brand can
+    sound like a different person.
+    """
     extra = config["extra_attrs"]
-    # XML-escape the welcome greeting in case it contains special characters
-    greeting = xml.sax.saxutils.escape(config["welcome_greeting"])
+    _brand = resolve_brand(brand)
+    greeting_text = _brand["greeting"].get(lang) or config["welcome_greeting"]
+    # XML-escape in case the greeting contains special characters
+    greeting = xml.sax.saxutils.escape(greeting_text)
+    ws_voice = voice or config["voice"]
+    brand_key = brand if brand in BRANDS else DEFAULT_BRAND
 
     return (
-        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}"\n'
+        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}&amp;brand={brand_key}"\n'
         f'        ttsProvider="{config["tts_provider"]}"\n'
-        f'        voice="{config["voice"]}"\n'
+        f'        voice="{ws_voice}"\n'
         f'{extra}'
         f'        language="{config["language"]}"\n'
         f'        transcriptionProvider="google"\n'
@@ -2440,7 +2484,7 @@ async def _run_llm_streaming_claude(
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/conversation")
-async def ws_conversation(websocket: WebSocket, lang: str = "en"):
+async def ws_conversation(websocket: WebSocket, lang: str = "en", brand: str = DEFAULT_BRAND):
     """Handle a Twilio ConversationRelay WebSocket session.
 
     The ``lang`` query parameter is set by the IVR routing and determines
@@ -2458,15 +2502,21 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
         lang = "en"
 
     await websocket.accept()
-    logger.info("WebSocket connection accepted -- language: %s", lang)
+    _brand = resolve_brand(brand)
+    logger.info("WebSocket connection accepted -- language: %s, brand: %s",
+                lang, _brand["agency"])
 
     # -- Per-session state --
     conversation_history: list[dict] = []
     # Sticky retrieval constraints (property_type / zone) carried across turns so
     # KB retrieval keeps "apartment" even when a later utterance only names a zone.
     sticky_filters: dict = {}
-    system_prompt: str = _build_system_prompt(lang)
-    tools: list[dict] = [TRANSFER_TOOL] if lang == "en" else []
+    system_prompt: str = _build_system_prompt(lang, brand)
+    # Amaya has no human consultant behind her -- never offer a transfer that
+    # cannot be performed.
+    tools: list[dict] = (
+        [TRANSFER_TOOL] if (lang == "en" and _brand["transfer"]) else []
+    )
     call_sid: str = "unknown"
     from_number: str | None = None
     # Clean transcript (no KB-context prefix) used for dashboard persistence.
