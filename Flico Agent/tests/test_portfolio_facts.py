@@ -109,6 +109,19 @@ def test_all_on_request_is_stated_as_such():
     assert "Every listing's rent is quoted on request" in portfolio_facts(props)
 
 
+def test_agency_name_is_parameterized_not_hardcoded():
+    # Rodrigo Realtors is the safety-net default for direct callers, but
+    # server.py always passes the active brand's agency explicitly -- a demo
+    # brand's prompt must never contain the real client's agency name.
+    out = portfolio_facts(_props(), agency="Start Property")
+    assert "Start Property" in out
+    assert "Rodrigo Realtors" not in out
+
+
+def test_default_agency_is_still_rodrigo_realtors():
+    assert "Rodrigo Realtors" in portfolio_facts(_props())
+
+
 def test_claims_are_consistent_with_the_live_prose_kb():
     """Ties the generated block to the real KB file via the audited truth table,
     so a KB edit that contradicts the prompt fails CI."""

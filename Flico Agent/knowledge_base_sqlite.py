@@ -143,14 +143,15 @@ def reload_kb_from_content(content: str, filename: str = "flico_info.txt") -> bo
     return _load_from_text(content)
 
 
-def portfolio_facts() -> str:
+def portfolio_facts(agency: str = "Rodrigo Realtors") -> str:
     """Literally-true statements about the live inventory, for the system prompt.
 
     Returns "" on any fault: a prompt with no portfolio claims is safe, one with
-    stale claims is not.
+    stale claims is not. `agency` is forwarded to kb.facts.portfolio_facts so
+    the generated text names whichever brand is calling.
     """
     try:
-        return facts_from_rows(_get_engine().all_properties())
+        return facts_from_rows(_get_engine().all_properties(), agency=agency)
     except Exception as exc:
         logger.error("portfolio_facts failed: %s", exc)
         return ""

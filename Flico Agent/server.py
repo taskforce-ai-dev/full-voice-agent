@@ -72,6 +72,7 @@ from post_call import process_realestate_post_call
 from media_transport import MediaTransport, TwilioMediaTransport
 from asterisk_ari import AsteriskAriClient
 from asterisk_rtp import AsteriskRtpTransport, RtpPortAllocator
+from brands import BRANDS, DEFAULT_BRAND, resolve_brand
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -89,6 +90,10 @@ ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID: str = os.getenv("ELEVENLABS_VOICE_ID", "")
+# Distinct ConversationRelay voice for the Start Property demo persona, so the
+# two demos on the website do not sound like the same person. Falls back to the
+# language default when unset.
+CR_VOICE_STARTPROPERTY: str = os.getenv("CR_VOICE_STARTPROPERTY", "").strip()
 ELEVENLABS_VOICE_SPEED: float = float(os.getenv("ELEVENLABS_VOICE_SPEED", "1.0"))
 ELEVENLABS_MODEL_MULTILINGUAL: str = "eleven_multilingual_v2"
 ELEVENLABS_MODEL_TURBO: str = "eleven_turbo_v2_5"
@@ -123,7 +128,7 @@ OPENAI_TTS_INSTRUCTIONS: str = os.getenv(
     "OPENAI_TTS_INSTRUCTIONS",
     "You are Fiona, a warm and personable young Sri Lankan property consultant "
     "at a real estate agency. Speak in natural, lively conversational "
-    "Sinhala with genuine warmth and enthusiasm â€” smile as you talk. Vary "
+    "Sinhala with genuine warmth and enthusiasm — smile as you talk. Vary "
     "your pitch and pace naturally: rise with excitement when describing "
     "properties, soften when being empathetic, and pause briefly between ideas. "
     "Sound like a real person chatting on the phone, not a robot reading text. "
@@ -158,6 +163,14 @@ TRANSFER_TOOL: dict = {
         "required": ["reason"],
     },
 }
+
+
+def _tools_for(lang: str, brand: str = DEFAULT_BRAND) -> list[dict]:
+    """Tools available to a session. Brands with no human consultant behind
+    them (transfer=False) must never be offered the handoff tool."""
+    return [TRANSFER_TOOL] if (lang == "en" and resolve_brand(brand)["transfer"]) else []
+
+
 CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -232,7 +245,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "tts_provider": "ElevenLabs",
         "voice": "bm3QvaZ3fUSCRBC3UV1f-flash_v2_5",
         "language": "en-US",
-        "welcome_greeting": "You have reached Rodrigo Realtors â€” you are speaking with our virtual property consultant. How can I help you today?",
+        "welcome_greeting": "You have reached Rodrigo Realtors — you are speaking with our virtual property consultant. How can I help you today?",
         "extra_attrs": '        elevenlabsTextNormalization="on"\n',
     },
     "ta": {
@@ -309,14 +322,15 @@ _SENTENCE_END = re.compile(r'(?<=[.!?\u0964\u0DF4])\s+')
 # System prompt
 # ---------------------------------------------------------------------------
 
-def _portfolio_facts_block() -> str:
+def _portfolio_facts_block(agency: str) -> str:
     """Portfolio claims derived from the live KB, or a safe fallback.
 
     Never let a prompt-building fault break a live call: an agent with no
-    portfolio claims still works from the reference context.
+    portfolio claims still works from the reference context. `agency` is
+    forwarded so the generated facts name the brand actually calling.
     """
     try:
-        facts = portfolio_facts()
+        facts = portfolio_facts(agency=agency)
     except Exception:
         logger.exception("portfolio_facts failed; falling back to no claims")
         facts = ""
@@ -329,8 +343,12 @@ def _portfolio_facts_block() -> str:
             "the reference context shows.\n\n")
 
 
-def _build_system_prompt(lang: str = "en") -> str:
+def _build_system_prompt(lang: str = "en", brand: str = DEFAULT_BRAND) -> str:
     today = date.today().isoformat()
+    _brand = resolve_brand(brand)
+    agency = _brand["agency"]
+    agent_name = _brand["agent"]
+    greeting = _brand["greeting"].get(lang) or _brand["greeting"]["en"]
 
     if lang == "ta":
         language_rules = (
@@ -399,7 +417,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         )
 
     handoff_rules = ""
-    if lang == "en":
+    if lang == "en" and _brand["transfer"]:
         handoff_rules = (
             "HUMAN HANDOFF:\n"
             "- If the caller explicitly asks to speak to a human, agent, consultant, "
@@ -413,8 +431,8 @@ def _build_system_prompt(lang: str = "en") -> str:
         )
 
     return (
-        f"You are Fiona, a warm, confident, top-performing SALES consultant for "
-        f"Rodrigo Realtors, a trusted Sri Lankan real estate agency that helps people rent "
+        f"You are {agent_name}, a warm, confident, top-performing SALES consultant for "
+        f"{agency}, a trusted Sri Lankan real estate agency that helps people rent "
         f"apartments and houses across Colombo. You are consultative, "
         f"not pushy: you listen, qualify what the caller really needs, build genuine value in the "
         f"properties we have, handle hesitation gracefully, and always move the conversation toward "
@@ -431,18 +449,16 @@ def _build_system_prompt(lang: str = "en") -> str:
         # Fiona deny listings that retrieval had correctly handed her. Empty
         # string when the backend cannot derive them -- saying nothing about the
         # portfolio is safe; saying something stale is not.
-        _portfolio_facts_block() +
+        _portfolio_facts_block(agency) +
 
         "GREETING & CALLER DETAILS:\n"
-        "- The opening greeting is already spoken automatically: 'You have reached "
-        "Rodrigo Realtors. You are speaking with our virtual property consultant. "
-        "How can I help you today?' "
+        f"- The opening greeting is already spoken automatically: '{greeting}' "
         "Do NOT repeat it.\n"
         "- NEVER ask for the caller's name or phone number at the start "
         "of the call. First listen to what they need and answer their questions.\n"
         "- IMPORTANT: We do NOT send property details, photos, prices, or documents "
         "to the caller by WhatsApp, email, or text message. Never offer to 'send' "
-        "anything. Instead, a Rodrigo Realtors salesperson personally contacts the "
+        f"anything. Instead, a {agency} salesperson personally contacts the "
         "caller to take things forward.\n"
         "- ONLY collect caller details AFTER the caller shows clear interest in a "
         "property or in proceeding - for example they want a viewing, ask to be "
@@ -523,7 +539,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         "closer to their budget from the reference context. Never invent discounts "
         "or terms that are not in the context.\n"
         "- Always advance toward a viewing. Once there is genuine interest, offer to "
-        "arrange a viewing and note a Rodrigo Realtors salesperson will follow up to "
+        f"arrange a viewing and note a {agency} salesperson will follow up to "
         "schedule it, then capture their name and phone number.\n"
         "- If we genuinely have nothing matching, say so honestly and offer to have "
         "a consultant follow up with options -- never fabricate a listing.\n\n"
@@ -577,21 +593,21 @@ def _build_system_prompt(lang: str = "en") -> str:
         "me everything'.\n"
         "- We do NOT send photos, details, or documents to the caller by any "
         "channel. After you have told them about a property, if they are "
-        "interested, let them know a Rodrigo Realtors salesperson will contact "
+        f"interested, let them know a {agency} salesperson will contact "
         "them, and collect their name and phone number per the GREETING & "
         "CALLER DETAILS rules.\n"
         "- If a caller is interested, offer to arrange a viewing and note that "
-        "a Rodrigo Realtors consultant will follow up to schedule it.\n\n"
+        f"a {agency} consultant will follow up to schedule it.\n\n"
 
         "IMPORTANT RULES:\n"
-        "- Answer questions about Rodrigo Realtors property listings, locations, prices, "
+        f"- Answer questions about {agency} property listings, locations, prices, "
         "property types, sizes, features, and the renting or viewing process using ONLY "
         "the information provided in the reference context.\n"
         "- If the caller asks about a specific property's price, tell them the rent if "
         "available, or that the rent is on request, along with the other details. State the "
         "rent EXACTLY as written in the reference context, including its period -- say 'per "
         "month' or 'per day' exactly as given, and never assume it is monthly.\n"
-        "- If the caller wants to proceed, let them know a Rodrigo Realtors salesperson will "
+        f"- If the caller wants to proceed, let them know a {agency} salesperson will "
         "contact them to confirm details and arrange a viewing.\n"
         "- If the answer is not in the reference context, politely say you don't have "
         "that specific listing right now and offer to have a consultant follow up with options.\n"
@@ -1034,18 +1050,64 @@ async def voice_language_selected(request: Request) -> Response:
     return Response(content=twiml, media_type="application/xml")
 
 
+@app.api_route("/voice/demo-incoming", methods=["GET", "POST"])
+async def voice_demo_incoming(request: Request) -> Response:
+    """Website Book-a-Demo entry -- Start Property (Amaya), English, no IVR.
+
+    Hatton's shared TwiML app <Redirect>s here for agent id 'startproperty'.
+    Unlike the phone IVR there is no <Gather>: the demo card declares
+    langs: ['en'], so everything collapses to English ConversationRelay.
+    """
+    host = request.headers.get("host", request.url.hostname or "localhost")
+
+    config = LANGUAGE_CONFIGS["en"]
+    cr = _build_conversation_relay_twiml(
+        host, "en", config,
+        brand="startproperty",
+        voice=CR_VOICE_STARTPROPERTY or None,
+    )
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        "  <Connect>\n"
+        f"    {cr}\n"
+        "  </Connect>\n"
+        "</Response>"
+    )
+    logger.info("Demo incoming call from %s -- Start Property (en)",
+                request.headers.get("x-forwarded-for", "unknown"))
+    return Response(content=twiml, media_type="application/xml")
+
+
 def _build_conversation_relay_twiml(
-    host: str, lang: str, config: dict[str, str]
+    host: str, lang: str, config: dict[str, str],
+    brand: str = DEFAULT_BRAND, voice: str | None = None,
 ) -> str:
-    """Build the <ConversationRelay> XML tag for the given language config."""
+    """Build the <ConversationRelay> XML tag for the given language config.
+
+    `brand` rides the WebSocket query string because Twilio re-sends
+    Device.connect params on neither a redirected webhook nor the WebSocket
+    handshake. `voice` overrides the language default so a second brand can
+    sound like a different person.
+    """
     extra = config["extra_attrs"]
-    # XML-escape the welcome greeting in case it contains special characters
-    greeting = xml.sax.saxutils.escape(config["welcome_greeting"])
+    _brand = resolve_brand(brand)
+    greeting_text = _brand["greeting"].get(lang) or config["welcome_greeting"]
+    # XML-escape in case the greeting contains special characters
+    greeting = xml.sax.saxutils.escape(greeting_text)
+    ws_voice = voice or config["voice"]
+    # Derive the key from the already-resolved brand dict (identity lookup)
+    # rather than re-checking `brand in BRANDS`, which does an exact-match
+    # comparison while resolve_brand() normalizes with .strip().lower(). Two
+    # separate normalizations of the same input must never be allowed to
+    # disagree -- a mixed-case brand like "StartProperty" would otherwise
+    # render Amaya's greeting while the URL still said "brand=rodrigo".
+    brand_key = next((k for k, v in BRANDS.items() if v is _brand), DEFAULT_BRAND)
 
     return (
-        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}"\n'
+        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}&amp;brand={brand_key}"\n'
         f'        ttsProvider="{config["tts_provider"]}"\n'
-        f'        voice="{config["voice"]}"\n'
+        f'        voice="{ws_voice}"\n'
         f'{extra}'
         f'        language="{config["language"]}"\n'
         f'        transcriptionProvider="google"\n'
@@ -1265,7 +1327,7 @@ class GoogleSTTStream:
 
 
 class AzureSTTStream:
-    """Streams audio to Azure Speech-to-Text â€” drop-in alternative to GoogleSTTStream."""
+    """Streams audio to Azure Speech-to-Text — drop-in alternative to GoogleSTTStream."""
 
     def __init__(self, on_final_result: Any, on_interim_result: Any = None, lang: str = "si"):
         self._on_final = on_final_result
@@ -1278,13 +1340,13 @@ class AzureSTTStream:
 
     def start(self):
         if not AZURE_STT_AVAILABLE:
-            logger.error("Cannot start Azure STT â€” azure-cognitiveservices-speech not installed")
+            logger.error("Cannot start Azure STT — azure-cognitiveservices-speech not installed")
             return
         if audioop is None:
-            logger.error("Cannot start Azure STT â€” audioop unavailable")
+            logger.error("Cannot start Azure STT — audioop unavailable")
             return
         if not AZURE_SPEECH_KEY:
-            logger.error("Cannot start Azure STT â€” AZURE_SPEECH_KEY not set")
+            logger.error("Cannot start Azure STT — AZURE_SPEECH_KEY not set")
             return
 
         primary = STT_PRIMARY.get(self._lang, "si-LK")
@@ -1359,7 +1421,7 @@ def _make_stt(on_final_result: Any, on_interim_result: Any, lang: str):
     if STT_PROVIDER == "azure":
         if AZURE_STT_AVAILABLE and audioop is not None:
             return AzureSTTStream(on_final_result, on_interim_result, lang)
-        logger.error("STT_PROVIDER=azure but Azure STT unavailable â€” falling back to Google")
+        logger.error("STT_PROVIDER=azure but Azure STT unavailable — falling back to Google")
     return GoogleSTTStream(on_final_result, on_interim_result, lang)
 
 
@@ -2436,7 +2498,7 @@ async def _run_llm_streaming_claude(
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/conversation")
-async def ws_conversation(websocket: WebSocket, lang: str = "en"):
+async def ws_conversation(websocket: WebSocket, lang: str = "en", brand: str = DEFAULT_BRAND):
     """Handle a Twilio ConversationRelay WebSocket session.
 
     The ``lang`` query parameter is set by the IVR routing and determines
@@ -2454,15 +2516,20 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
         lang = "en"
 
     await websocket.accept()
-    logger.info("WebSocket connection accepted -- language: %s", lang)
+    _brand = resolve_brand(brand)
+    logger.info("WebSocket connection accepted -- language: %s, brand: %s",
+                lang, _brand["agency"])
 
     # -- Per-session state --
     conversation_history: list[dict] = []
     # Sticky retrieval constraints (property_type / zone) carried across turns so
     # KB retrieval keeps "apartment" even when a later utterance only names a zone.
     sticky_filters: dict = {}
-    system_prompt: str = _build_system_prompt(lang)
-    tools: list[dict] = [TRANSFER_TOOL] if lang == "en" else []
+    system_prompt: str = _build_system_prompt(lang, brand)
+    # Amaya has no human consultant behind her -- never offer a transfer that
+    # cannot be performed. Decision lives in _tools_for() so it has exactly
+    # one implementation, directly covered by tests/test_demo_endpoint.py.
+    tools: list[dict] = _tools_for(lang, brand)
     call_sid: str = "unknown"
     from_number: str | None = None
     # Clean transcript (no KB-context prefix) used for dashboard persistence.
