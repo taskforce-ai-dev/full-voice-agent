@@ -138,6 +138,37 @@ ELEVENLABS_MODEL_TURBO: str = "eleven_turbo_v2_5"
 TWILIO_ACCOUNT_SID: str = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN: str = os.getenv("TWILIO_AUTH_TOKEN", "")
 HUMAN_AGENT_PHONE: str = os.getenv("HUMAN_AGENT_PHONE", "").strip()
+
+# Seconds to let the human agent's phone ring before giving up and falling back
+# to the WhatsApp failsafe.
+#
+# Was hard-coded to 20. On 2026-07-31 four of six transfers to a Sri Lankan
+# mobile came back status=no-answer, duration=0, unbilled — Twilio placed the
+# call and the carrier accepted it, but nobody picked up inside the window. The
+# config was byte-identical on the calls that DID connect, so this is answer-side
+# latency, not routing. 20s is tight for an international leg to a mobile:
+# carrier setup can eat 5-8s of it, leaving barely a dozen seconds of audible
+# ringing — often less than one full ring cycle at the handset.
+#
+# Twilio allows up to 600. Keep it comfortably under the caller's patience: the
+# guest is holding music-free silence while this runs.
+HANDOFF_DIAL_TIMEOUT: int = int(os.getenv("HANDOFF_DIAL_TIMEOUT", "40"))
+
+# Caller ID presented to the human agent when a call is transferred.
+#
+# WHY THIS EXISTS: <Dial> with no callerId makes Twilio pass through the
+# ORIGINAL caller's number. On 2026-07-31 that meant outbound legs to the
+# manager's Sri Lankan mobile were presented as coming FROM another Sri Lankan
+# mobile that the Twilio account does not own. Twilio accepts this, but the
+# destination carrier commonly filters it as caller-ID spoofing, so the handset
+# never rings — Twilio reports status=no-answer with duration=0 while the
+# manager sees nothing. Every transfer then fell through to the WhatsApp
+# failsafe.
+#
+# Setting this to a number the Twilio account OWNS makes the leg deliverable.
+# Leave unset to fall back to the Twilio number the guest dialled (captured per
+# call from the inbound `To`), which is always account-owned.
+TWILIO_CALLER_ID: str = os.getenv("TWILIO_CALLER_ID", "").strip()
 PUBLIC_HOSTNAME: str = os.getenv("PUBLIC_HOSTNAME", "voice.taskforceai.tech").strip()
 
 # Twilio REST client singleton — used for Path B human handoff
@@ -230,6 +261,22 @@ MAX_TOOL_ROUNDS: int = 5
 # Caller phone lookup — populated by HTTP handlers, consumed by WebSocket handlers
 _call_phone: dict[str, str] = {}  # CallSid -> caller phone number
 
+
+def _transfer_caller_id(call_sid: str) -> str:
+    """Caller ID for the outbound transfer leg, or "" for Twilio's default.
+
+    DEFAULTS TO "" — i.e. Twilio passes the GUEST's number through, which is the
+    long-standing behaviour and is deliberately preserved: the manager sees who
+    is actually calling and can ring them back directly. That is a feature, not
+    an accident, so do not "fix" it by defaulting to an owned number.
+
+    Set TWILIO_CALLER_ID only if a destination carrier starts filtering the
+    pass-through as caller-ID spoofing (symptom: Twilio reports
+    status=no-answer, duration=0, and the handset never rings). It is an escape
+    hatch, not the normal configuration.
+    """
+    return TWILIO_CALLER_ID
+
 # Handoff carry-over — populated when a live transfer to a human is dispatched,
 # read back by the recovery ConversationRelay session if the human never picked
 # up. The relay session that follows a failed dial is a brand-new WebSocket with
@@ -238,6 +285,21 @@ _call_phone: dict[str, str] = {}  # CallSid -> caller phone number
 # CallSid -> {reason, caller_phone, transcript, dial_status, notified}
 _handoff_state: dict[str, dict] = {}
 _HANDOFF_STATE_MAX = 200  # bound the dict; abandoned calls never clean up
+
+
+def _safe_client(factory):
+    """Build an LLM client, returning None instead of raising.
+
+    The client getters raise when their API key is unset. That is the right
+    behaviour on the conversation path — no key means no call — but on the
+    post-call bookkeeping path it would throw away the record entirely. Here a
+    missing client just degrades the summary, so swallow and continue.
+    """
+    try:
+        return factory()
+    except Exception:
+        logger.warning("LLM client unavailable for post-call summary", exc_info=True)
+        return None
 
 
 def _remember_handoff(call_sid: str, **fields) -> None:
@@ -260,6 +322,28 @@ TOOL_FILLERS: dict[str, str] = {
     "notify_human_handover": "Let me pass your details to our team now.",
 }
 DEFAULT_FILLER: str = "Let me check that for you."
+
+
+def _join_turn(accumulated: str, new_text: str) -> str:
+    """Append one tool-round's text to the running response, with a separator.
+
+    A plain `+=` runs the rounds together in the TRANSCRIPT: the model's
+    pre-tool line and its post-tool line arrive as separate streaming rounds,
+    so "…right away." + "I'm transferring…" became
+    "…right away.I'm transferring…". The spoken audio is unaffected (each round
+    is streamed to Twilio on its own), but the mangled string is what gets
+    logged and shipped to the Google Sheet call log.
+
+    Only inserts a space when both sides are non-empty and the boundary isn't
+    already whitespace, so it never introduces a leading/double space.
+    """
+    if not new_text:
+        return accumulated
+    if not accumulated:
+        return new_text
+    if accumulated[-1].isspace() or new_text[0].isspace():
+        return accumulated + new_text
+    return accumulated + " " + new_text
 
 # Backchannel filter: short non-semantic utterances that callers emit while
 # thinking ("um", "uh", "hmm"). Twilio's STT fires these as full prompts and
@@ -1571,10 +1655,14 @@ async def relay_action(request: Request) -> Response:
             "[handoff] dialing human %s for call %s (reason=%r)",
             HUMAN_AGENT_PHONE, call_sid, reason,
         )
+        # Same owned-number caller ID as the live Path B transfer — see
+        # TWILIO_CALLER_ID.
+        _cid = _transfer_caller_id(call_sid)
+        _cid_attr = f' callerId="{html_escape(_cid)}"' if _cid else ""
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
-            f'  <Dial action="{dial_action_url}" method="POST" timeout="20" answerOnBridge="true">\n'
+            f'  <Dial action="{dial_action_url}" method="POST" timeout="{HANDOFF_DIAL_TIMEOUT}"{_cid_attr} answerOnBridge="true">\n'
             f'    <Number url="{whisper_url}">{HUMAN_AGENT_PHONE}</Number>\n'
             "  </Dial>\n"
             "</Response>"
@@ -1616,7 +1704,58 @@ async def dial_result(request: Request) -> Response:
     logger.info("[handoff] dial-result status=%s call_sid=%s", status, call_sid)
     if status in ("completed", "answered"):
         # Human took the call — no failsafe needed, drop the carry-over.
-        _handoff_state.pop(call_sid, None)
+        state = _handoff_state.pop(call_sid, {})
+        # This is the end of the line for this call, so THIS is where the
+        # post-call record gets written. The ConversationRelay session
+        # deliberately skipped it (transfer_initiated) because at that point we
+        # did not yet know whether the human would pick up; without emitting it
+        # here, a successfully transferred call would leave no row at all.
+        transcript = state.get("transcript") or []
+        if transcript:
+            # Bookkeeping must never break the call. This handler's job is to
+            # return TwiML; if building an LLM client or scheduling the task
+            # fails, log it and still hang up cleanly rather than 500 at Twilio.
+            try:
+                asyncio.create_task(
+                    process_post_call_data(
+                        call_sid=call_sid,
+                        lang=state.get("lang", "en"),
+                        caller_phone=state.get("caller_phone", "unknown"),
+                        full_transcript=transcript,
+                        call_start_time=state.get(
+                            "call_start_time", datetime.now().isoformat()
+                        ),
+                        call_end_time=datetime.now().isoformat(),
+                        llm_provider=LLM_PROVIDER,
+                        # Only the active provider's client is built, and a
+                        # failure yields None rather than aborting: post_call
+                        # degrades to a transcript-only record, which still
+                        # reaches the sheet. Losing the row entirely because a
+                        # key is unset would be the worse outcome.
+                        anthropic_client=(
+                            _safe_client(_get_anthropic_client)
+                            if LLM_PROVIDER == "claude" else None
+                        ),
+                        openai_client=(
+                            _safe_client(_get_client)
+                            if LLM_PROVIDER == "openai" else None
+                        ),
+                        gemini_client=(
+                            _safe_client(_get_gemini_client)
+                            if LLM_PROVIDER == "gemini" else None
+                        ),
+                        model=MODEL,
+                    )
+                )
+                logger.info(
+                    "[handoff] human answered for %s — post-call emitted (%d turns)",
+                    call_sid, len(transcript),
+                )
+            except Exception:
+                logger.exception(
+                    "[handoff] post-call dispatch failed for %s — hanging up anyway",
+                    call_sid,
+                )
         return Response(
             content='<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
             media_type="application/xml",
@@ -3035,7 +3174,7 @@ async def _run_llm_streaming(
                             tool_calls_data[idx]["arguments"] += tc_delta.function.arguments
 
         # Accumulate text across rounds
-        full_response_text += text_content
+        full_response_text = _join_turn(full_response_text, text_content)
 
         # -- Handle tool calls --
         if tool_calls_data:
@@ -3193,7 +3332,7 @@ async def _run_llm_streaming_gemini(
             round_idx + 1, len(text_content), len(function_calls), finish_reason,
         )
 
-        full_response_text += text_content
+        full_response_text = _join_turn(full_response_text, text_content)
 
         if function_calls:
             logger.info(
@@ -3401,7 +3540,7 @@ async def _run_llm_streaming_claude(
                         tool_json = ""
 
         _cancel_slow()
-        full_response_text += text_content
+        full_response_text = _join_turn(full_response_text, text_content)
 
         # -- Handle tool calls --
         if tool_use_blocks:
@@ -3488,6 +3627,65 @@ async def _run_llm_streaming_claude(
     return full_response_text
 
 
+async def _stream_llm_turn(
+    *,
+    system: str,
+    conversation_history: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    websocket: WebSocket,
+    lang: str,
+    anthropic_client: Any,
+    gemini_client: Any,
+    openai_client: Any,
+) -> str:
+    """Stream one agent turn over the ConversationRelay socket.
+
+    Extracted so the normal prompt path and the handover-failsafe opening turn
+    dispatch on LLM_PROVIDER identically — a second inline copy of this branch
+    would silently drift the moment one provider's signature changed.
+    """
+    if LLM_PROVIDER == "claude":
+        return await _run_llm_streaming_claude(
+            client=anthropic_client,
+            system=system,
+            conversation_history=conversation_history,
+            tools=tools,
+            websocket=websocket,
+            lang=lang,
+        )
+    if LLM_PROVIDER == "gemini":
+        return await _run_llm_streaming_gemini(
+            gemini_client=gemini_client,
+            system=system,
+            conversation_history=conversation_history,
+            tools=tools,
+            websocket=websocket,
+        )
+    return await _run_llm_streaming(
+        client=openai_client,
+        system=system,
+        conversation_history=conversation_history,
+        tools=tools,
+        websocket=websocket,
+    )
+
+
+# The synthetic turn that makes Kavya OPEN the failsafe conversation instead of
+# waiting for the guest. Twilio speaks the apology greeting, then
+# ConversationRelay simply waits for guest speech — so without this the guest
+# hears the greeting and then silence, and has to say something ("Okay") before
+# Kavya asks anything. Observed live on 2026-07-31: 13 s of dead air.
+#
+# This is NOT added to full_transcript: the guest never said it, so it must not
+# appear in the call log or the Google Sheet.
+_FAILSAFE_KICKOFF: str = (
+    "[SYSTEM: The guest has just heard the apology message and is waiting in "
+    "silence. Speak first, right now. Do NOT greet them again and do NOT "
+    "repeat the apology. Go straight to STEP 1 of your steps — ask for, or "
+    "confirm, their name — in one short sentence.]"
+)
+
+
 # ---------------------------------------------------------------------------
 # WebSocket — ConversationRelay handler
 # ---------------------------------------------------------------------------
@@ -3546,6 +3744,11 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
     caller_phone: str = "unknown"
     full_transcript: list[dict[str, str]] = []
     call_start_time: str = datetime.now().isoformat()
+    # Set when this session ends because we handed the caller to a human. The
+    # call is NOT over at that point — it either continues on the human's leg or
+    # comes back as the failsafe session — so post-call processing is deferred
+    # rather than run here. See the `finally` block.
+    transfer_initiated: bool = False
 
     anthropic_client = None
     openai_client = None
@@ -3671,7 +3874,50 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                     len(system_prompt),
                     len(tools),
                 )
-                _schedule_reprompt()
+
+                if is_failsafe:
+                    # Open the conversation ourselves. Twilio has just spoken the
+                    # apology greeting and ConversationRelay now waits for guest
+                    # speech, so without this the guest sits in silence until they
+                    # say something unprompted. The kickoff turn is seeded into
+                    # conversation_history (the model needs it) but deliberately
+                    # NOT into full_transcript (the guest never said it).
+                    conversation_history.append(
+                        {"role": "user", "content": _FAILSAFE_KICKOFF}
+                    )
+                    try:
+                        opening = await _stream_llm_turn(
+                            system=system_prompt,
+                            conversation_history=conversation_history,
+                            # NO TOOLS on the opening turn. This turn exists only
+                            # to break the silence and ask for the name. With the
+                            # handover tool in reach the model can — and in tests
+                            # did — fire notify_human_handover immediately, paging
+                            # the manager before it has the guest's name or
+                            # number, and again after. All three providers accept
+                            # an empty list (NOT_GIVEN / None).
+                            tools=[],
+                            websocket=websocket,
+                            lang=lang,
+                            anthropic_client=anthropic_client,
+                            gemini_client=gemini_client,
+                            openai_client=openai_client,
+                        )
+                        logger.info("Agent [%s] (failsafe opening): %s",
+                                    call_sid, opening[:200])
+                        if opening:
+                            full_transcript.append(
+                                {"role": "assistant", "text": opening}
+                            )
+                    except WebSocketDisconnect:
+                        raise
+                    except Exception:
+                        # Never let the opening turn kill the session — the guest
+                        # can still speak first and the reprompt below covers it.
+                        logger.exception("[handover] failsafe opening turn failed")
+                    _schedule_reprompt()
+                else:
+                    _schedule_reprompt()
 
             # ---------------------------------------------------------------
             # PROMPT — user speech transcribed
@@ -3717,31 +3963,16 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                 # Stream LLM response
                 tools_for_session = tools if lang == "en" else [t for t in tools if t.get("name") != "transfer_to_human"]
                 try:
-                    if LLM_PROVIDER == "claude":
-                        response_text = await _run_llm_streaming_claude(
-                            client=anthropic_client,
-                            system=system_prompt,
-                            conversation_history=conversation_history,
-                            tools=tools_for_session,
-                            websocket=websocket,
-                            lang=lang,
-                        )
-                    elif LLM_PROVIDER == "gemini":
-                        response_text = await _run_llm_streaming_gemini(
-                            gemini_client=gemini_client,
-                            system=system_prompt,
-                            conversation_history=conversation_history,
-                            tools=tools_for_session,
-                            websocket=websocket,
-                        )
-                    else:
-                        response_text = await _run_llm_streaming(
-                            client=openai_client,
-                            system=system_prompt,
-                            conversation_history=conversation_history,
-                            tools=tools_for_session,
-                            websocket=websocket,
-                        )
+                    response_text = await _stream_llm_turn(
+                        system=system_prompt,
+                        conversation_history=conversation_history,
+                        tools=tools_for_session,
+                        websocket=websocket,
+                        lang=lang,
+                        anthropic_client=anthropic_client,
+                        gemini_client=gemini_client,
+                        openai_client=openai_client,
+                    )
                     logger.info("Agent [%s]: %s", call_sid, response_text[:200])
                     if response_text:
                         full_transcript.append({"role": "assistant", "text": response_text})
@@ -3793,12 +4024,17 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                         # Stash everything the failsafe session will need if the
                         # human never picks up. Must happen BEFORE the REST
                         # update — after it, this WebSocket is on borrowed time.
+                        transfer_initiated = True
                         _remember_handoff(
                             call_sid,
                             reason=pending_transfer_reason,
                             caller_phone=caller_phone,
                             transcript=list(full_transcript),
                             notified=False,
+                            # Carried so whichever leg finishes the call can emit
+                            # a post-call record covering the whole conversation.
+                            call_start_time=call_start_time,
+                            lang=lang,
                         )
                         # Path B: bypass the ConversationRelay {"type":"end"} +
                         # HandoffData handshake (Twilio kept failing it with
@@ -3849,11 +4085,21 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                             from urllib.parse import quote as _quote
                             host = PUBLIC_HOSTNAME
                             reason_q = _quote(pending_transfer_reason)
+                            # Present a number we own. Without this Twilio passes
+                            # the guest's own number through as caller ID, and the
+                            # destination carrier filters the leg as spoofing so
+                            # the agent's handset never rings.
+                            _cid = _transfer_caller_id(call_sid)
+                            _cid_attr = f' callerId="{html_escape(_cid)}"' if _cid else ""
+                            logger.info(
+                                "[handoff] dialing %s for %s with callerId=%s",
+                                HUMAN_AGENT_PHONE, call_sid, _cid or "(pass-through)",
+                            )
                             twiml = (
                                 '<?xml version="1.0" encoding="UTF-8"?>'
                                 '<Response>'
                                 '<Say voice="Polly.Joanna">Connecting you now. Please hold.</Say>'
-                                f'<Dial action="https://{host}/voice/dial-result" method="POST" timeout="20" answerOnBridge="true">'
+                                f'<Dial action="https://{host}/voice/dial-result" method="POST" timeout="{HANDOFF_DIAL_TIMEOUT}"{_cid_attr} answerOnBridge="true">'
                                 f'<Number url="https://{host}/voice/whisper?reason={reason_q}">{HUMAN_AGENT_PHONE}</Number>'
                                 '</Dial>'
                                 '</Response>'
@@ -3970,7 +4216,24 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                         full_transcript=full_transcript,
                     )
                 )
-        if full_transcript:
+        if transfer_initiated:
+            # Do NOT emit a post-call record here. This session is ending only
+            # because the caller is being handed to a human — the conversation
+            # continues on another leg, so anything written now describes a
+            # truncated call. Live on 2026-07-31 this produced a spurious
+            # "dropped" row in the Google Sheet at transfer time, followed by a
+            # second, correct "callback_requested" row once the failsafe session
+            # finished: two rows for one call, the first one misleading.
+            #
+            # The record is emitted instead by whichever leg actually ends the
+            # call: /voice/dial-result when the human answers, or this same
+            # `finally` on the failsafe session (is_failsafe, transfer_initiated
+            # False) when they don't.
+            logger.info(
+                "[handoff] post-call deferred for %s — caller handed to a human",
+                call_sid,
+            )
+        elif full_transcript:
             asyncio.create_task(
                 process_post_call_data(
                     call_sid=call_sid,

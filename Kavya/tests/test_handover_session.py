@@ -137,6 +137,14 @@ def test_failsafe_session_collects_details_and_messages_the_manager(n8n):
     async def fake_llm(*, client, system, conversation_history, tools, websocket, lang):
         seen["system"] = system
         seen["tools"] = [t["name"] for t in tools]
+        # A model can only call a tool it was actually offered. The failsafe
+        # session now runs an OPENING turn (to break the silence before the
+        # guest speaks) with tools=[], so honour that here — a stub that fires
+        # the tool regardless of `tools` would report a double-send that cannot
+        # happen in production. This still catches the real regression: offer
+        # the notify tool on the opening turn and this fires twice.
+        if "notify_human_handover" not in seen["tools"]:
+            return "May I have your name please?"
         # This is what the model does once it has the name and the number.
         seen["tool_result"] = await tools_mod.execute_tool("notify_human_handover", {
             "customer_name": "Chanya",
@@ -195,6 +203,13 @@ def test_safety_net_does_not_double_send_after_a_successful_tool_call(n8n):
     _seed_carry_over()
 
     async def fake_llm(**kwargs):
+        # Only fire when the tool is actually on offer — the failsafe opening
+        # turn deliberately runs with tools=[]. See the note in the happy-path
+        # test above.
+        if not any(
+            t["name"] == "notify_human_handover" for t in kwargs.get("tools", [])
+        ):
+            return "May I have your name please?"
         await tools_mod.execute_tool("notify_human_handover", {
             "customer_name": "Chanya",
             "customer_whatsapp": "94771234567",
