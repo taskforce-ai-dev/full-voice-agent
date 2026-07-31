@@ -51,7 +51,16 @@ RUN pip install --no-cache-dir -r requirements-prod.txt
 #   venv/             — local virtualenv
 #   chroma_db/        — ephemeral vector store, rebuilt on startup from knowledge_docs/
 #   __pycache__/      — bytecode cache
-COPY server.py media_stream_server.py tools.py booking_api.py post_call.py knowledge_base.py yanolja_client.py yanolja_service.py dashboard_client.py ./
+# WARNING: this is an explicit ALLOWLIST, not a glob. A new module that
+# server.py or tools.py imports MUST be added here or the image will not
+# contain it. Fast-mode deploys hide the mistake — they `docker cp` the .py
+# straight into the running container, so prod keeps working while the image
+# stays broken — and the next BUILD-mode deploy then crashes on import.
+# That is exactly how handover.py took prod down on 2026-07-31
+# (ModuleNotFoundError: No module named 'handover'), having been added in the
+# 2026-07-30 handover-failsafe work and only ever hot-swapped in.
+# If you add a module, add it here in the SAME commit.
+COPY server.py media_stream_server.py tools.py booking_api.py post_call.py knowledge_base.py yanolja_client.py yanolja_service.py dashboard_client.py handover.py ./
 COPY knowledge_docs/ ./knowledge_docs/
 
 # --- Port --------------------------------------------------------------------
