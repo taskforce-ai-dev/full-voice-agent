@@ -48,13 +48,6 @@ def test_transfer_is_a_property_of_the_entry_point(key, expected):
     assert brands.BRANDS[key]["transfer"] is expected
 
 
-def test_the_two_entry_points_differ_only_in_transfer():
-    phone = dict(brands.BRANDS[PHONE])
-    demo = dict(brands.BRANDS[DEMO])
-    assert phone.pop("transfer") != demo.pop("transfer")
-    assert phone == demo
-
-
 def test_every_entry_point_has_an_english_greeting():
     for name, b in brands.BRANDS.items():
         assert b["greeting"]["en"].strip(), name
@@ -67,7 +60,7 @@ def test_every_greeting_names_its_own_agency():
 
 def test_every_entry_point_declares_all_keys():
     for name, b in brands.BRANDS.items():
-        assert set(b) == {"agency", "agent", "transfer", "greeting"}, name
+        assert set(b) == {"agency", "agent", "transfer", "post_call", "greeting"}, name
 
 
 @pytest.mark.parametrize("value", ["nope", "", "   ", None, "RODRIGO"])
@@ -79,3 +72,20 @@ def test_resolve_falls_back_to_the_default(value):
     "value", [PHONE, DEMO, "  STARPROPERTIES  ", "StarProperties_Demo"])
 def test_resolve_normalizes_case_and_whitespace(value):
     assert brands.resolve_brand(value) is brands.BRANDS[value.strip().lower()]
+
+
+@pytest.mark.parametrize("key,expected", [(PHONE, True), (DEMO, False)])
+def test_post_call_is_a_property_of_the_entry_point(key, expected):
+    # The post-call webhook drives the "Real Estate Post-Call Processor" n8n
+    # workflow, which WhatsApps the caller AND a manager and appends a Google
+    # Sheet row. A website demo click must not send real messages to real
+    # numbers; a real phone lead still should.
+    assert brands.BRANDS[key]["post_call"] is expected
+
+
+def test_the_two_entry_points_differ_only_in_transfer_and_post_call():
+    phone = dict(brands.BRANDS[PHONE])
+    demo = dict(brands.BRANDS[DEMO])
+    for flag in ("transfer", "post_call"):
+        assert phone.pop(flag) != demo.pop(flag), flag
+    assert phone == demo

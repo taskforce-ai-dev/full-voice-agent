@@ -43,6 +43,9 @@ BRANDS: dict[str, dict] = {
         "agent": _AGENT,
         # Live phone line: HUMAN_AGENT_PHONE is set, so the handoff is real.
         "transfer": True,
+        # Real leads: fire the post-call webhook (Google Sheet row + the
+        # WhatsApp sends in the "Real Estate Post-Call Processor" workflow).
+        "post_call": True,
         "greeting": {
             # Must stay identical to LANGUAGE_CONFIGS["en"]["welcome_greeting"]
             # in server.py -- test_phone_greeting_matches_language_config pins it.
@@ -54,6 +57,12 @@ BRANDS: dict[str, dict] = {
         "agent": _AGENT,
         # Website demo: no human behind it. Never offer a transfer.
         "transfer": False,
+        # No post-call webhook for demo calls (operator, 2026-07-31: "turn off
+        # the whatsapp message ... from the demo page"). Every website demo call
+        # was firing the Real Estate Post-Call Processor, which WhatsApps the
+        # caller and a manager and appends a Google Sheet row -- real messages to
+        # real numbers for a browser click. The phone line keeps all of it.
+        "post_call": False,
         "greeting": {
             "en": _GREETING_EN,
         },

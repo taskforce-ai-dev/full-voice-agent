@@ -2735,8 +2735,11 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", brand: str = D
                 summary=summary,
             )
 
-            # Real-estate lead post-call -> n8n -> Google Sheet (fire-and-forget).
-            if transcript:
+            # Real-estate lead post-call -> n8n -> Google Sheet + WhatsApp
+            # (fire-and-forget). Gated on the ENTRY POINT: the website demo must
+            # not send WhatsApp to a caller and a manager just because someone
+            # clicked Call on a web page. Real phone leads still do.
+            if transcript and _brand["post_call"]:
                 asyncio.create_task(
                     process_realestate_post_call(
                         call_sid=call_sid,
@@ -2747,9 +2750,17 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", brand: str = D
                         started_at=session_started_at,
                     )
                 )
+            elif transcript:
+                logger.info(
+                    "[post-call] skipped for %s (entry point %r has post_call=False)",
+                    call_sid, brand)
 
-            # Fire automation webhook only when we have a way to reach the caller.
-            if phone or email:
+            # Fire automation webhook only when we have a way to reach the
+            # caller -- and never from the demo entry point, for the same reason
+            # as the post-call webhook above. Inert today (AUTOMATION_WEBHOOK_URL
+            # is unset in production), gated so configuring it later cannot
+            # silently start messaging people who clicked Call on a web page.
+            if (phone or email) and _brand["post_call"]:
                 ended_at = datetime.now(timezone.utc)
                 duration = None
                 if session_started_at is not None:
