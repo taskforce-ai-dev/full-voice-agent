@@ -69,6 +69,12 @@ services:
       # then an unmounted file reverts to whatever the image holds, and
       # server.py's `from brands import ...` fails, crash-looping the agent.
       - ./brands.py:/app/brands.py
+      # evals/ likewise. `docker exec ... python evals/answer_eval.py` runs the
+      # container's copy, so without this mount the eval silently grades against
+      # whatever rubric was baked into the image -- which is exactly what
+      # happened on 2026-07-31: a regenerated rubric sat on disk while three
+      # runs scored the agent against the retired 12-row one.
+      - ./evals:/app/evals
       - ./knowledge_base.py:/app/knowledge_base.py
       - ./knowledge_base_chroma.py:/app/knowledge_base_chroma.py
       - ./knowledge_base_sqlite.py:/app/knowledge_base_sqlite.py
