@@ -92,3 +92,38 @@ def test_on_request_listing_surfaces(kb):
     out = kb.retrieve("apartment in colombo 2")
     assert "[P4]" in out
     assert "on request" in out.lower()
+
+
+# --- POR rows under a stated budget --------------------------------------
+# POR rows deliberately survive a rent ceiling (kb/database.py) so the caller
+# still hears about them. Production bug 2026-07-30: with nothing marking the
+# price unknown, the LLM presented a POR listing as being under the caller's
+# budget. The engine must label that context, exactly as it labels relaxations.
+
+def test_por_under_a_budget_is_flagged_unknown(kb):
+    out = kb.retrieve("an apartment in colombo 2 under 600,000")
+    assert "[P4]" in out  # still surfaces -- inclusion semantics unchanged
+    assert "ON REQUEST" in out and "NEVER present" in out
+    assert "P4" in out.split("[P4]")[0]  # the note names the listing
+
+
+def test_no_por_note_without_a_stated_budget(kb):
+    out = kb.retrieve("apartment in colombo 2")
+    assert "[P4]" in out
+    assert "NEVER present" not in out
+
+
+def test_no_por_note_when_every_match_is_priced(kb):
+    out = kb.retrieve("an apartment in colombo 5 under 600,000")
+    assert "[P3]" in out
+    assert "NEVER present" not in out
+
+
+def test_por_note_fires_on_a_sticky_budget(kb):
+    # The production shape: budget stated turn 1, zone turn 2. The carried
+    # ceiling must still flag the POR row it let through.
+    sticky = {}
+    kb.retrieve("an apartment under 600,000", sticky=sticky)
+    out = kb.retrieve("what about colombo 2?", sticky=sticky)
+    assert "[P4]" in out
+    assert "ON REQUEST" in out and "NEVER present" in out

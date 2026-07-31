@@ -61,6 +61,21 @@ class RealEstateKB:
         "they asked for, then offer these as alternatives. Never describe one as "
         "the type they asked for.")
 
+    # POR rows deliberately survive a rent ceiling (kb/database.py: rent_amount
+    # <= ? OR rent_amount IS NULL) so a budget-conscious caller still hears
+    # about them. That inclusion is honest only if the LLM cannot then present
+    # an UNKNOWN price as fitting the stated budget -- which is exactly what
+    # happened in production (P02, "on request", offered as being under 200k).
+    # Same design as the relaxation NOTEs: label the context, don't trust the
+    # prompt. This is not a relaxation -- it fires on exact matches too, which
+    # is why it lives in retrieve() and not in _candidates()/_describe().
+    _POR_NOTE = (
+        "NOTE: the caller stated a budget, but the rent for {ids} is ON REQUEST "
+        "-- it is UNKNOWN and may be above their budget. NEVER present {them} as "
+        "fitting, meeting or being under the budget, and never estimate a "
+        "figure. Offer {them} only as price-on-request, to be confirmed by a "
+        "consultant on follow-up.")
+
     @staticmethod
     def _describe(original: QueryFilters, props: List[Property]) -> str:
         """Describes what the RETURNED listings actually violate.
@@ -122,6 +137,14 @@ class RealEstateKB:
         if sticky is not None:
             filters = QueryParser.merge_sticky(filters, sticky)
         candidates, note = self._candidates(filters)
+        if filters.max_rent is not None:
+            por = sorted(p.id for p, _ in candidates
+                         if p.rent_on_request or p.rent_amount is None)
+            if por:
+                por_note = self._POR_NOTE.format(
+                    ids=", ".join(por),
+                    them="it" if len(por) == 1 else "them")
+                note = note + "\n" + por_note if note else por_note
         body = ContextFormatter.format(self._rank(semantic, candidates, n_results))
         if body and note:
             body = note + "\n\n" + body
