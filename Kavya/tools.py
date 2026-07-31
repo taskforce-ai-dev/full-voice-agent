@@ -203,6 +203,81 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Failsafe handover tool
+#
+# Not part of TOOL_DEFINITIONS: it is offered ONLY in the recovery session that
+# runs after a human agent failed to pick up the transferred call. Exposing it
+# during a normal call would let Kavya promise a callback instead of doing the
+# live transfer.
+# ---------------------------------------------------------------------------
+
+HANDOVER_TOOL_DEFINITION: dict[str, Any] = {
+    "name": "notify_human_handover",
+    "description": (
+        "Send the guest's callback details to the property manager on WhatsApp. "
+        "Call this ONCE, only in the recovery conversation that follows a failed "
+        "transfer to a human, and only after you have the guest's name AND the "
+        "WhatsApp number they want to be called back on. After this returns "
+        "successfully, tell the guest a team member will call them back shortly."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "customer_name": {
+                "type": "string",
+                "description": "The guest's name as they gave it (first name is enough).",
+            },
+            "customer_whatsapp": {
+                "type": "string",
+                "description": (
+                    "The guest's WhatsApp / callback number, digits only as the "
+                    "guest said them (e.g. '0771234567' or '94771234567'). Do not "
+                    "invent a number - confirm it with the guest first."
+                ),
+            },
+            "call_summary": {
+                "type": "string",
+                "description": (
+                    "Two or three sentences for the manager: what the guest wanted, "
+                    "any dates, guest count and room type discussed, and exactly why "
+                    "they asked for a human."
+                ),
+            },
+        },
+        "required": ["customer_name", "customer_whatsapp", "call_summary"],
+    },
+}
+
+
+def get_handover_tools(fmt: str = "claude") -> list[dict[str, Any]]:
+    """Return ONLY the failsafe handover tool, in the given provider format.
+
+    `fmt` is one of "claude" (Anthropic), "openai", or "gemini". Unlike
+    `get_tools()`, this does not depend on the booking API being configured -
+    notifying the manager must work even when the PMS integration is down.
+    """
+    tool = HANDOVER_TOOL_DEFINITION
+    if fmt == "openai":
+        return [{
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"],
+            },
+        }]
+    if fmt == "gemini":
+        return [{
+            "function_declarations": [{
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"],
+            }],
+        }]
+    return [tool]
+
+
+# ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
 
@@ -317,6 +392,43 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     elif tool_name == "transfer_to_human":
         reason = (tool_input.get("reason") or "").strip() or "Caller requested human assistance."
         return json.dumps({"status": "transferring", "reason": reason})
+
+    elif tool_name == "notify_human_handover":
+        from handover import handover_context, send_handover_notification
+
+        ctx = handover_context.get() or {}
+        outcome = await send_handover_notification(
+            call_sid=ctx.get("call_sid", ""),
+            customer_name=tool_input.get("customer_name", ""),
+            customer_whatsapp=tool_input.get("customer_whatsapp", ""),
+            call_summary=tool_input.get("call_summary", ""),
+            human_agent_whatsapp=ctx.get("human_agent_whatsapp", ""),
+        )
+        if outcome.get("ok"):
+            # Let the session skip its end-of-call safety net.
+            ctx["notified"] = True
+            return json.dumps({
+                "status": "sent",
+                "message": (
+                    "The manager has been messaged. Tell the guest a team member "
+                    "will call them back shortly."
+                ),
+            })
+        if outcome.get("error") == "missing_customer_whatsapp":
+            return json.dumps({
+                "status": "invalid_number",
+                "message": (
+                    "That number was not usable. Ask the guest to repeat their "
+                    "WhatsApp number digit by digit, then call this tool again."
+                ),
+            })
+        return json.dumps({
+            "status": "failed",
+            "message": (
+                "The message could not be sent right now, but the details are "
+                "recorded. Reassure the guest that the team will call them back."
+            ),
+        })
 
     else:
         logger.error("Unknown tool requested: %s", tool_name)

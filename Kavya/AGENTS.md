@@ -458,6 +458,64 @@ This section documents the major changes made to the project since initial devel
 
 **How to test:** call the number → press 3 → speak Sinhala. No-phone smoke test: `POST Digits=3` to `/voice/language-selected` returns `<Stream …/ws/media-stream/si>`; `GET/POST /voice/incoming` renders the Sinhala `<Say>`. Verified `gpt-4o-mini-tts` access with the production key (Sinhala sample → HTTP 200, ~285 KB PCM). Rollback backup: `/opt/kavya/server.py.bak.sinhala-20260623-120351`.
 
+### v0.17 — Handover failsafe: WhatsApp the manager when the human doesn't pick up
+**Problem:** `transfer_to_human` dials `HUMAN_AGENT_PHONE` with a 20 s timeout. If
+nobody answered, `/voice/dial-result` dropped the caller back into Kavya with a bare
+"Sorry, no agent was available" and **nobody was told the call had happened** — the
+guest's request evaporated.
+
+**New behaviour:** an unanswered dial re-enters Kavya in *failsafe mode*. She confirms
+(or asks for) the guest's name and WhatsApp number, POSTs them to n8n, and tells the
+guest a team member will call back. n8n WhatsApps the property manager.
+
+**Changes:**
+- New `handover.py` — payload assembly, phone normalisation, and the n8n POST.
+  `normalize_whatsapp()` strips punctuation, converts local trunk form
+  (`0771234567`) and bare NSN (`771234567`) to `94771234567`, and leaves genuine
+  international numbers alone. Numbers are sent as **bare digits, no
+  `@s.whatsapp.net`** — the n8n workflow owns JID formatting.
+  Config: `N8N_HANDOVER_WEBHOOK` (default `/webhook/kavya-handover`),
+  `WHATSAPP_COUNTRY_CODE` (default `94`).
+- `tools.py` — new `notify_human_handover` tool (`customer_name`,
+  `customer_whatsapp`, `call_summary`). Deliberately **NOT** in `TOOL_DEFINITIONS`:
+  it is offered only in the failsafe session via `get_handover_tools(fmt)`, so a
+  normal call can never promise a callback instead of transferring. `call_sid` and
+  `human_agent_whatsapp` reach the handler through a `ContextVar`
+  (`handover.handover_context`), not tool arguments — `execute_tool()` has no call
+  context and threading one through every provider's streaming loop was not worth it.
+- `server.py`:
+  - `_handoff_state` (+ `_remember_handoff`, capped at 200 entries) carries
+    `reason` / `caller_phone` / `transcript` across the relay restart. The failsafe
+    session is a **brand-new WebSocket with empty history**, so without this Kavya
+    would not know the guest's name or what they wanted.
+  - `/voice/dial-result`: answered → `<Hangup/>` + drop carry-over; anything else →
+    `<Connect><ConversationRelay …?lang=en&amp;mode=handover_failsafe>` with the
+    apology greeting. `_build_conversation_relay_twiml()` gained a `mode` arg (the
+    `&` **must** be XML-escaped or Twilio rejects the TwiML).
+  - `ws_conversation(…, mode="")`: in failsafe mode swaps in
+    `_build_handoff_failsafe_prompt()` (prior transcript inlined, caller ID offered
+    as the default WhatsApp number), restricts tools to the notify tool, seeds
+    `full_transcript` with the pre-transfer turns so the call log stays continuous,
+    and skips KB retrieval.
+  - **Safety net:** if the failsafe session ends without a successful tool call
+    (guest hung up), `_notify_handover_fallback()` messages the manager anyway using
+    the caller ID and a transcript-derived summary. It skips only when there is no
+    number at all — a notification the manager can't act on is noise.
+- Failsafe is English/ConversationRelay only; that's the only path with a live
+  transfer to fail.
+
+**n8n side:** workflow `YmeWVEUR54A8o8Tb` "Kavya — Handover WhatsApp Notify (No
+Answer)" on `automation.taskforceai.tech` (webhook → Set → WasenderAPI → respond).
+It reads `$json.body.*`. WasenderAPI accepts the bare-digit `to` here and resolves
+the JID itself (verified: `msgId 67653931`, `jid 94711754668`).
+
+**How to test:** `pytest tests/test_handover.py tests/test_handover_server.py
+tests/test_handover_session.py` (52 tests, no network — the n8n POST is stubbed at
+the aiohttp boundary). Live webhook check: POST the sample payload to
+`https://automation.taskforceai.tech/webhook/kavya-handover` — this delivers a real
+WhatsApp to `HUMAN_AGENT_PHONE`. Full call test: ask Kavya for a human, let the
+agent phone ring out, then give her a name and number.
+
 ## graphify — GRAPH-FIRST, ALWAYS
 
 This sub-project is part of the shared graphify knowledge graph at `../graphify-out/`

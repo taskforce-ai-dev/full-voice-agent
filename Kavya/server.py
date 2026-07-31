@@ -64,9 +64,16 @@ from fastapi.responses import Response
 from twilio.rest import Client as TwilioRestClient
 
 from knowledge_base import retrieve_context, initialize_kb, prewarm, reload_kb_from_content
-from tools import get_tools, get_tools_openai, get_tools_gemini, execute_tool
+from tools import (
+    get_tools,
+    get_tools_openai,
+    get_tools_gemini,
+    get_handover_tools,
+    execute_tool,
+)
 from booking_api import close_session, is_configured
 from post_call import process_post_call_data
+from handover import handover_context, send_handover_notification
 
 try:
     import dashboard_client
@@ -214,6 +221,25 @@ MAX_TOOL_ROUNDS: int = 5
 # Caller phone lookup â€” populated by HTTP handlers, consumed by WebSocket handlers
 _call_phone: dict[str, str] = {}  # CallSid -> caller phone number
 
+# Handoff carry-over â€” populated when a live transfer to a human is dispatched,
+# read back by the recovery ConversationRelay session if the human never picked
+# up. The relay session that follows a failed dial is a brand-new WebSocket with
+# empty history, so everything Kavya needs to run the failsafe (what the guest
+# wanted, their name if given, the number they called from) has to survive here.
+# CallSid -> {reason, caller_phone, transcript, dial_status, notified}
+_handoff_state: dict[str, dict] = {}
+_HANDOFF_STATE_MAX = 200  # bound the dict; abandoned calls never clean up
+
+
+def _remember_handoff(call_sid: str, **fields) -> None:
+    """Record/merge handoff carry-over for a call, evicting the oldest entries."""
+    if not call_sid or call_sid == "unknown":
+        return
+    entry = _handoff_state.setdefault(call_sid, {})
+    entry.update(fields)
+    while len(_handoff_state) > _HANDOFF_STATE_MAX:
+        _handoff_state.pop(next(iter(_handoff_state)), None)
+
 # ---------------------------------------------------------------------------
 # Filler messages sent while tools execute
 # ---------------------------------------------------------------------------
@@ -222,6 +248,7 @@ TOOL_FILLERS: dict[str, str] = {
     "create_booking": "I'm creating your reservation now.",
     "retrieve_booking": "Let me look up that booking for you.",
     "cancel_booking": "Let me process that cancellation.",
+    "notify_human_handover": "Let me pass your details to our team now.",
 }
 DEFAULT_FILLER: str = "Let me check that for you."
 
@@ -768,6 +795,162 @@ def _build_system_prompt(lang: str = "en") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Failsafe handover â€” fallback notification
+# ---------------------------------------------------------------------------
+
+async def _notify_handover_fallback(
+    *,
+    call_sid: str,
+    state: dict,
+    caller_phone: str,
+    full_transcript: list[dict[str, str]],
+) -> None:
+    """Notify the manager after a failsafe session ended without a tool call.
+
+    Runs when the guest hung up before giving their details. We fall back to
+    the number they called from and a transcript-derived summary. If we have no
+    number at all there is nothing actionable to send, so we skip.
+    """
+    number = (state.get("caller_phone") or caller_phone or "").strip()
+    if not number or number == "unknown":
+        logger.warning(
+            "[handover] failsafe ended with no details and no caller ID [%s] "
+            "â€” manager NOT notified", call_sid,
+        )
+        return
+
+    reason = (state.get("reason") or "").strip() or "Guest asked to speak to a human."
+    summary = (
+        f"Guest hung up before leaving callback details. {reason} "
+        f"The human agent did not answer the transfer "
+        f"(dial status: {state.get('dial_status', 'unknown')}). "
+        f"Number below is the caller ID they rang from."
+    )
+    tail = _format_handoff_transcript(full_transcript, limit=8)
+    if tail:
+        summary = f"{summary}\n\nLast exchanges:\n{tail}"
+
+    outcome = await send_handover_notification(
+        call_sid=call_sid,
+        customer_name=state.get("customer_name") or "Unknown",
+        customer_whatsapp=number,
+        call_summary=summary,
+        human_agent_whatsapp=state.get("human_agent_whatsapp") or HUMAN_AGENT_PHONE,
+    )
+    logger.info(
+        "[handover] fallback notification for %s â€” ok=%s",
+        call_sid, outcome.get("ok"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Failsafe handover prompt (recovery session after an unanswered transfer)
+# ---------------------------------------------------------------------------
+
+# Spoken by Twilio as the ConversationRelay welcomeGreeting when the caller is
+# dropped back into Kavya. It must set up the details request immediately â€”
+# the guest has just sat through twenty seconds of ringing.
+HANDOFF_FAILSAFE_GREETING: str = (
+    "Sorry about that, our team member could not pick up right now. "
+    "Let me take your details so they can call you straight back."
+)
+
+
+def _format_handoff_transcript(transcript: list[dict[str, str]], limit: int = 24) -> str:
+    """Render the last few turns of the pre-transfer call for the recovery prompt."""
+    lines: list[str] = []
+    for entry in transcript[-limit:]:
+        who = "Guest" if entry.get("role") == "user" else "Kavya"
+        text = (entry.get("text") or "").strip()
+        if text:
+            lines.append(f"{who}: {text}")
+    return "\n".join(lines)
+
+
+def _build_handoff_failsafe_prompt(state: dict) -> str:
+    """System prompt for the recovery session after a human failed to answer.
+
+    Kavya has exactly one job here: get a name and a WhatsApp number, send them
+    to the manager, and promise the callback. Everything else is a distraction.
+    """
+    today = date.today().isoformat()
+    reason = (state.get("reason") or "").strip() or "The guest asked to speak to a human."
+    caller_phone = (state.get("caller_phone") or "").strip()
+    transcript = _format_handoff_transcript(state.get("transcript") or [])
+
+    if caller_phone and caller_phone != "unknown":
+        number_rules = (
+            f"- The guest is calling from {caller_phone}. Offer that number "
+            "first: 'Can our team reach you on WhatsApp on the number you're "
+            "calling from?' If they say yes, use exactly that number. If they "
+            "want a different number, take the one they give you.\n"
+        )
+    else:
+        number_rules = (
+            "- We do NOT have the guest's number. Ask for the WhatsApp number "
+            "they want to be called back on, and read it back to confirm.\n"
+        )
+
+    context_block = (
+        f"WHAT HAPPENED EARLIER ON THIS CALL:\n{transcript}\n\n"
+        if transcript
+        else ""
+    )
+
+    return (
+        f"You are Kavya, the warm and gracious reservations voice agent for "
+        f"Treehouse Chalets, Belihuloya, Sri Lanka.\n"
+        f"Today's date is {today}.\n\n"
+
+        "SITUATION: you already spoke with this guest on this same call. You "
+        "tried to transfer them to a human team member, the team member did "
+        "NOT pick up, and the guest is now back with you. They asked for a "
+        f"human because: {reason}\n\n"
+
+        + context_block +
+
+        "YOUR ONLY JOB NOW is to take the guest's callback details and send "
+        "them to the property manager. Do NOT restart the booking "
+        "conversation, do NOT re-answer earlier questions, and do NOT try to "
+        "transfer them again.\n\n"
+
+        "The guest has already heard: 'Sorry about that, our team member could "
+        "not pick up right now. Let me take your details so they can call you "
+        "straight back.' Do NOT repeat that or re-introduce yourself.\n\n"
+
+        "STEPS â€” ask ONE question at a time:\n"
+        "1. NAME. If the guest already gave their name earlier on this call "
+        "(see above), do NOT ask again â€” just confirm it: 'I have your name "
+        "as Chanya, is that right?'. Only ask 'May I have your name please?' "
+        "if you genuinely do not have it. A first name is enough here.\n"
+        "2. WHATSAPP NUMBER.\n"
+        + number_rules +
+        "3. Once you have BOTH the name and the number, call the "
+        "notify_human_handover tool. Write the call_summary for the manager: "
+        "what the guest wanted, any dates, guest count and room type "
+        "mentioned, and why they asked for a human.\n"
+        "4. After the tool succeeds, tell the guest that you have passed their "
+        "details to the team and someone will call them back shortly. Then ask "
+        "if there is anything else you can help with while they wait.\n\n"
+
+        "IF THE GUEST REFUSES to give a number, tell them they can call back "
+        "any time and thank them. Do not push more than once.\n\n"
+
+        "VOICE RULES (you are speaking on a phone call, not writing text):\n"
+        "- Keep every response to one or two short sentences.\n"
+        "- Never use markdown, bullet points, numbered lists, asterisks, or URLs.\n"
+        "- Use natural spoken language. Say numbers as words.\n"
+        "- When the guest says 'double' followed by a digit (for example "
+        "'double five'), interpret it as that digit repeated twice ('55'). "
+        "Likewise 'triple seven' means '777'. This is common when callers read "
+        "out phone numbers.\n"
+        "- Read the number back to the guest before you send it, so a "
+        "mis-heard digit gets corrected.\n"
+        "- Apologise once, warmly, and then move on. Do not keep apologising.\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # LLM client (module-level singletons)
 # ---------------------------------------------------------------------------
 _anthropic_client: AsyncAnthropic | None = None
@@ -1245,22 +1428,30 @@ async def dial_result(request: Request) -> Response:
     """
     form = await request.form()
     status = form.get("DialCallStatus", "")
+    call_sid = form.get("CallSid", "")
     host = request.url.hostname
-    logger.info("[handoff] dial-result status=%s", status)
+    logger.info("[handoff] dial-result status=%s call_sid=%s", status, call_sid)
     if status in ("completed", "answered"):
+        # Human took the call â€” no failsafe needed, drop the carry-over.
+        _handoff_state.pop(call_sid, None)
         return Response(
             content='<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
             media_type="application/xml",
         )
 
-    # No answer / busy / failed / canceled â†’ recover into Kavya with a
-    # one-off greeting. We build the ConversationRelay TwiML by reusing the
-    # standard helper but swapping in the apology greeting.
-    recovery_config = dict(LANGUAGE_CONFIGS["en"])
-    recovery_config["welcome_greeting"] = (
-        "Sorry, no agent was available. I'm Kavya, how can I help?"
+    # No answer / busy / failed / canceled â†’ the failsafe. Recover into Kavya
+    # in handover mode: she collects the guest's name and WhatsApp number and
+    # messages the property manager instead of leaving the guest stranded.
+    _remember_handoff(call_sid, dial_status=status)
+    logger.info(
+        "[handoff] human did not answer (%s) for %s â€” entering failsafe",
+        status, call_sid,
     )
-    cr_tag = _build_conversation_relay_twiml(host, "en", recovery_config)
+    recovery_config = dict(LANGUAGE_CONFIGS["en"])
+    recovery_config["welcome_greeting"] = HANDOFF_FAILSAFE_GREETING
+    cr_tag = _build_conversation_relay_twiml(
+        host, "en", recovery_config, mode="handover_failsafe",
+    )
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         "<Response>\n"
@@ -1273,15 +1464,21 @@ async def dial_result(request: Request) -> Response:
 
 
 def _build_conversation_relay_twiml(
-    host: str, lang: str, config: dict[str, str]
+    host: str, lang: str, config: dict[str, str], mode: str = ""
 ) -> str:
-    """Build the <ConversationRelay> XML tag for the given language config."""
+    """Build the <ConversationRelay> XML tag for the given language config.
+
+    `mode` is appended to the WebSocket URL so the session handler knows it is
+    a recovery session (currently only "handover_failsafe") rather than a fresh
+    call â€” the WebSocket carries no other signal of how it was started.
+    """
     extra = config["extra_attrs"]
     # XML-escape the welcome greeting in case it contains special characters
     greeting = xml.sax.saxutils.escape(config["welcome_greeting"])
+    mode_qs = f"&amp;mode={url_quote(mode)}" if mode else ""
 
     return (
-        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}"\n'
+        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}{mode_qs}"\n'
         f'        ttsProvider="{config["tts_provider"]}"\n'
         f'        voice="{config["voice"]}"\n'
         f'{extra}'
@@ -3113,11 +3310,15 @@ async def _run_llm_streaming_claude(
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/conversation")
-async def ws_conversation(websocket: WebSocket, lang: str = "en"):
+async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""):
     """Handle a Twilio ConversationRelay WebSocket session.
 
     The ``lang`` query parameter is set by the IVR routing and determines
     which language-specific system prompt Claude receives.
+
+    ``mode="handover_failsafe"`` marks the recovery session Twilio opens after a
+    human agent failed to answer a transferred call: Kavya drops the booking
+    flow and instead collects the guest's callback details for the manager.
 
     Message types from Twilio:
       - "setup"   : Session initialization (call metadata).
@@ -3130,8 +3331,15 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
     if lang not in LANGUAGE_CONFIGS:
         lang = "en"
 
+    # The failsafe only exists on the English ConversationRelay path â€” that is
+    # the only path with a live transfer to fail in the first place.
+    is_failsafe: bool = mode == "handover_failsafe" and lang == "en"
+
     await websocket.accept()
-    logger.info("WebSocket connection accepted â€” language: %s", lang)
+    logger.info(
+        "WebSocket connection accepted â€” language: %s%s",
+        lang, " (handover failsafe)" if is_failsafe else "",
+    )
 
     # -- Per-session state --
     conversation_history: list[dict] = []
@@ -3142,6 +3350,15 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
         tools: list[dict] = get_tools_gemini()
     else:
         tools: list[dict] = get_tools_openai()
+    if is_failsafe:
+        # Only the notify tool. Leaving check_availability/create_booking in
+        # reach would let Kavya wander back into the booking flow instead of
+        # taking the callback details.
+        tools = get_handover_tools(
+            "claude" if LLM_PROVIDER == "claude"
+            else "gemini" if LLM_PROVIDER == "gemini"
+            else "openai"
+        )
     call_sid: str = "unknown"
     caller_phone: str = "unknown"
     full_transcript: list[dict[str, str]] = []
@@ -3237,6 +3454,33 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                     message.get("streamSid", "n/a"),
                     caller_phone,
                 )
+
+                if is_failsafe:
+                    # Rebuild Kavya's context from the pre-transfer leg of this
+                    # same call: the WebSocket is new, but the guest is not.
+                    handoff_state = _handoff_state.setdefault(call_sid, {})
+                    if caller_phone and caller_phone != "unknown":
+                        handoff_state.setdefault("caller_phone", caller_phone)
+                    else:
+                        caller_phone = handoff_state.get("caller_phone") or caller_phone
+                    system_prompt = _build_handoff_failsafe_prompt(handoff_state)
+                    # Carry the pre-transfer transcript into the post-call
+                    # record so the call log shows one continuous conversation.
+                    prior = handoff_state.get("transcript") or []
+                    if prior and not full_transcript:
+                        full_transcript.extend(prior)
+                    handoff_state["call_sid"] = call_sid
+                    handoff_state["human_agent_whatsapp"] = HUMAN_AGENT_PHONE
+                    handoff_state.setdefault("notified", False)
+                    # Give the notify_human_handover handler the call metadata
+                    # it cannot receive as a tool argument.
+                    handover_context.set(handoff_state)
+                    logger.info(
+                        "[handover] failsafe session ready [%s] â€” prior turns: %d, "
+                        "caller_phone=%s, dial_status=%s",
+                        call_sid, len(prior), caller_phone,
+                        handoff_state.get("dial_status", "n/a"),
+                    )
                 # Session state is already initialized above.
                 # Log any additional setup metadata.
                 logger.info(
@@ -3263,12 +3507,18 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                 logger.info("Guest [%s]: %s", call_sid, user_text)
                 full_transcript.append({"role": "user", "text": user_text})
 
-                # Retrieve KB context for this utterance
-                try:
-                    kb_context = retrieve_context(user_text)
-                except Exception:
-                    logger.exception("KB retrieval failed")
+                # Retrieve KB context for this utterance. Skipped in the
+                # failsafe session â€” Kavya is only taking a name and a phone
+                # number there, so hotel facts are noise (and an embedding
+                # lookup per turn the guest has to wait through).
+                if is_failsafe:
                     kb_context = ""
+                else:
+                    try:
+                        kb_context = retrieve_context(user_text)
+                    except Exception:
+                        logger.exception("KB retrieval failed")
+                        kb_context = ""
 
                 # Inject KB context into the user message (not the system prompt)
                 if kb_context and kb_context != "No knowledge base loaded. Answering from general knowledge.":
@@ -3356,6 +3606,16 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
                         logger.info(
                             "[handoff] transfer_to_human signal detected [%s] reason=%r",
                             call_sid, pending_transfer_reason,
+                        )
+                        # Stash everything the failsafe session will need if the
+                        # human never picks up. Must happen BEFORE the REST
+                        # update â€” after it, this WebSocket is on borrowed time.
+                        _remember_handoff(
+                            call_sid,
+                            reason=pending_transfer_reason,
+                            caller_phone=caller_phone,
+                            transcript=list(full_transcript),
+                            notified=False,
                         )
                         # Path B: bypass the ConversationRelay {"type":"end"} +
                         # HandoffData handshake (Twilio kept failing it with
@@ -3512,6 +3772,21 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
             "Session ended â€” CallSid: %s, history: %d msgs, transcript: %d msgs",
             call_sid, len(conversation_history), len(full_transcript),
         )
+        if is_failsafe:
+            # Last line of defence: the guest hung up (or the line dropped)
+            # before Kavya could send the details. Notify the manager anyway
+            # with whatever we have â€” a callback to the number they rang from
+            # beats the manager never hearing about the call at all.
+            state = _handoff_state.pop(call_sid, {})
+            if not state.get("notified"):
+                asyncio.create_task(
+                    _notify_handover_fallback(
+                        call_sid=call_sid,
+                        state=state,
+                        caller_phone=caller_phone,
+                        full_transcript=full_transcript,
+                    )
+                )
         if full_transcript:
             asyncio.create_task(
                 process_post_call_data(
