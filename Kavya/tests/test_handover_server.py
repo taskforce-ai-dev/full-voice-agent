@@ -153,6 +153,19 @@ def test_prompt_survives_a_completely_empty_carry_over():
     assert "asked to speak to a human" in prompt
 
 
+def test_prompt_forbids_an_extra_confirmation_round_trip():
+    """Regression: a read-back-the-number rule made Kavya re-confirm a number the
+    guest had already agreed to, so she never called the tool and the guest's
+    name was lost to the hang-up fallback."""
+    prompt = server._build_handoff_failsafe_prompt({"caller_phone": "+94771234567"})
+    assert "MOMENT you have a name and a number" in prompt
+    assert "Do NOT ask for one more confirmation first" in prompt
+    assert "NEVER ask the same question twice" in prompt
+    # Read-back applies only to numbers the guest actually dictated.
+    assert "If the guest DICTATED a number" in prompt
+    assert "ALREADY\nconfirmed" in prompt or "ALREADY confirmed" in prompt.replace("\n", " ")
+
+
 def test_prompt_does_not_reopen_the_booking_flow():
     prompt = server._build_handoff_failsafe_prompt({"caller_phone": "+94771234567"})
     assert "Do NOT restart the booking" in prompt
