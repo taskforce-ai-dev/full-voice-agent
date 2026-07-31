@@ -60,3 +60,47 @@ def test_embedding_roundtrip(db):
     _, got = db.query_properties(QueryFilters())[0]
     assert got.dtype == np.float32
     assert np.allclose(got, v)
+
+
+def test_availability_survives_the_db_roundtrip(db):
+    """The table used to have no `available` column at all, so every listing
+    came back claiming the schema default "now" -- including the one listing
+    that is only available soon. The prose carried the truth, but the
+    portfolio-facts aggregation (built from these round-tripped rows) was
+    structurally blind to it."""
+    p = _prop("P1")
+    p.available = "soon"
+    db.insert_properties_batch([(p, _vec()), (_prop("P2"), _vec())])
+    got = {q.id: q.available for q, _ in db.query_properties(QueryFilters())}
+    assert got == {"P1": "soon", "P2": "now"}
+
+
+def test_terms_survive_the_db_roundtrip(db):
+    p = _prop("P1")
+    p.deposit_months, p.advance_months, p.min_lease_months = 2, 1, 12
+    db.insert_properties_batch([(p, _vec()), (_prop("P2"), _vec())])
+    got = {q.id: q for q, _ in db.query_properties(QueryFilters())}
+    assert (got["P1"].deposit_months, got["P1"].advance_months,
+            got["P1"].min_lease_months) == (2, 1, 12)
+    # Unstated terms must come back as "not recorded", never a number.
+    assert got["P2"].deposit_months is None
+    assert got["P2"].advance_months is None
+    assert got["P2"].min_lease_months is None
+
+
+def test_a_pre_migration_db_file_gains_the_available_column(tmp_path):
+    """data/ persists across restarts, so existing DB files predate the
+    column. Opening one must migrate it in place; failing the insert would
+    silently drop the structured source and fall back to the prose pipeline."""
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    # Build a DB, then drop the column to simulate a file created before it.
+    KBDatabase(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE properties DROP COLUMN available")
+    db = KBDatabase(path)  # re-open: must add the column back
+    p = _prop("P1")
+    p.available = "soon"
+    db.insert_properties_batch([(p, _vec())])
+    got, _ = db.query_properties(QueryFilters())[0]
+    assert got.available == "soon"

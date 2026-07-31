@@ -105,6 +105,35 @@ TYPES = sorted({r["type"] for r in TRUTH})
 BEDROOMS = sorted({r["beds"] for r in TRUTH if r["beds"] is not None})
 RENTS = sorted({r["rent"] for r in TRUTH if r["rent"] is not None})
 
+# Tenancy terms, transcribed BY HAND from the feed's terms column on
+# 2026-07-31 (same frozen feed, same independence rule: nothing here comes
+# from kb/ or listings.json). A row absent from a dict states NO figure for
+# that field -- the feed shows "-", or an explicit "dep None" / "min None".
+# Absence means "not recorded", never zero: the agency feed simply carried no
+# terms for those listings. deposit/advance are in months as stated; the feed
+# states minimum lease in years ("min 1 Years"), recorded here in MONTHS.
+DEPOSIT_MONTHS = {
+    "P02": 2, "P03": 3, "P23": 4, "P36": 6,
+    "P51": 2, "P52": 2, "P53": 2, "P54": 2, "P55": 3, "P56": 2,
+    "P57": 2, "P58": 2, "P59": 2, "P60": 3, "P61": 3, "P62": 2,
+}
+ADVANCE_MONTHS = {
+    "P02": 3, "P03": 3, "P23": 8, "P34": 6,
+    "P51": 1, "P52": 1, "P53": 1, "P54": 1, "P55": 1, "P56": 1,
+    "P57": 1, "P58": 1, "P59": 1, "P60": 1, "P61": 1, "P62": 1,
+}
+MIN_LEASE_MONTHS = {
+    "P02": 12, "P03": 12, "P23": 12, "P34": 12, "P36": 12,
+    "P51": 12, "P52": 12, "P53": 12, "P54": 12, "P55": 12, "P56": 12,
+    "P57": 12, "P58": 12, "P59": 12, "P60": 12, "P61": 12, "P62": 12,
+}
+
+# Availability: the feed marks every row "Available Now" EXCEPT these.
+# P26 (Metro Homes, Colombo 2) is "Available soon" -- so "all 60 are available
+# right now" is a false claim, and any consumer counting what is available NOW
+# must exclude the ids listed here.
+AVAILABLE_NOT_NOW = {"P26": "soon"}
+
 
 def rent_equivalence_grid():
     """Every threshold worth testing.

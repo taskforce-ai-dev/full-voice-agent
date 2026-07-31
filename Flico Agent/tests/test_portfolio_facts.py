@@ -14,7 +14,8 @@ import re
 
 from kb.facts import portfolio_facts
 from tests.conftest import truth_property
-from tests.truth_table import TRUTH
+from tests.truth_table import (AVAILABLE_NOT_NOW, ADVANCE_MONTHS,
+                               DEPOSIT_MONTHS, MIN_LEASE_MONTHS, TRUTH)
 
 _MONTHLY_PRICED = [r for r in TRUTH
                    if r["rent"] is not None and r["period"] == "month"]
@@ -130,6 +131,80 @@ def test_all_on_request_is_stated_as_such():
 
 def test_all_fixed_is_only_claimed_when_true():
     assert "Every listing has a fixed" in portfolio_facts(_props(_MONTHLY_PRICED))
+
+
+def test_terms_coverage_is_counted_not_left_to_the_llm():
+    """Asked "is there a deposit?" with no property named, Amaya answered "for
+    most of our properties, yes" -- 44 of 60 record NO deposit. The block never
+    stated the coverage, so she extrapolated from whatever sample she held.
+    Anything countable is counted here; expectations derive from the audited
+    terms tables, never hardcoded."""
+    out = portfolio_facts(_props())
+    n = len(TRUTH)
+    assert (f"{len(DEPOSIT_MONTHS)} of {n} state a deposit, "
+            f"{len(ADVANCE_MONTHS)} an advance, "
+            f"{len(MIN_LEASE_MONTHS)} a minimum lease") in out
+    assert "consultant confirms terms" in out
+
+
+def test_terms_line_tracks_a_changed_inventory():
+    props = _props()
+    for p in props:
+        p.deposit_months, p.advance_months, p.min_lease_months = 2, 1, 12
+    out = portfolio_facts(props)
+    # Full coverage carries no overgeneralisation trap: no warning line.
+    assert "state a deposit" not in out
+
+
+def test_zero_terms_coverage_is_still_stated_as_a_count():
+    props = _props()
+    for p in props:
+        p.deposit_months = p.advance_months = p.min_lease_months = None
+    out = portfolio_facts(props)
+    assert f"0 of {len(TRUTH)} state a deposit" in out
+
+
+def test_availability_split_is_computed_not_left_to_the_llm():
+    """Amaya told a caller all 60 properties are available right now; P26 is
+    only available soon. The block's own headline count fed that answer, so
+    the block must carry the split itself."""
+    out = portfolio_facts(_props())
+    n = len(TRUTH)
+    n_now = n - len(AVAILABLE_NOT_NOW)
+    assert f"{n_now} of {n} listings are available right now" in out
+    for pid, when in AVAILABLE_NOT_NOW.items():
+        assert pid in out and f"available {when}" in out
+
+
+def test_all_available_now_needs_no_availability_line():
+    props = _props()
+    for p in props:
+        p.available = "now"
+    assert "available right now" not in portfolio_facts(props)
+
+
+def test_many_unavailable_listings_are_counted_not_enumerated():
+    # Naming each exception is only useful while they are few; past that the
+    # block would bloat every single turn.
+    props = _props()
+    for p in props:
+        p.available = "now"
+    for p in props[:10]:
+        p.available = "soon"
+    out = portfolio_facts(props)
+    assert f"{len(props) - 10} of {len(props)} listings are available right now" in out
+    assert "P02 (" not in out
+
+
+def test_uncounted_attributes_get_the_generalisation_guard():
+    """The open class: parking (35/60 recorded), furnishing (51/60) and any
+    future attribute carry the same trap as the deposit. One guard line covers
+    what no one thought to count."""
+    out = portfolio_facts(_props())
+    assert "Never characterise the portfolio as a whole" in out
+    assert "parking, furnishing" in out
+    # The empty inventory still says nothing at all.
+    assert portfolio_facts([]) == ""
 
 
 def test_agency_name_is_parameterized_not_hardcoded():

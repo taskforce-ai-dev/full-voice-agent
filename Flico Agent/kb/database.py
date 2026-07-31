@@ -12,7 +12,7 @@ _COLUMNS = [
     "bedrooms", "bathrooms", "rent_amount", "rent_period", "rent_on_request",
     "sale_price", "furnishing", "floor_area_sqft", "parking",
     "deposit_months", "advance_months", "min_lease_months",
-    "key_features", "description",
+    "available", "key_features", "description",
 ]
 
 
@@ -48,11 +48,24 @@ class KBDatabase:
                     deposit_months INTEGER,
                     advance_months INTEGER,
                     min_lease_months INTEGER,
+                    available TEXT NOT NULL DEFAULT 'now',
                     key_features TEXT,
                     description TEXT NOT NULL,
                     embedding BLOB NOT NULL
                 )
             """)
+            # The table used to drop `available` entirely, so every Property
+            # came back from the DB claiming to be available "now" (the schema
+            # default) -- including the one listing that is only available
+            # soon. The per-listing prose carried the truth, but any structured
+            # consumer (the portfolio facts block) was blind to it. Existing DB
+            # files predate the column; data/ persists across restarts, so
+            # migrate in place rather than fail the batch insert and silently
+            # fall back to the prose pipeline.
+            have = {r[1] for r in conn.execute("PRAGMA table_info(properties)")}
+            if "available" not in have:
+                conn.execute("ALTER TABLE properties ADD COLUMN "
+                             "available TEXT NOT NULL DEFAULT 'now'")
             conn.execute('CREATE INDEX IF NOT EXISTS idx_txn ON properties("transaction")')
             conn.execute("CREATE INDEX IF NOT EXISTS idx_type ON properties(property_type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_zone ON properties(zone)")
@@ -67,7 +80,7 @@ class KBDatabase:
             p.bedrooms, p.bathrooms, p.rent_amount, p.rent_period, int(p.rent_on_request),
             p.sale_price, p.furnishing, p.floor_area_sqft, p.parking,
             p.deposit_months, p.advance_months, p.min_lease_months,
-            json.dumps(p.key_features), p.description,
+            p.available, json.dumps(p.key_features), p.description,
             embedding.astype(np.float32).tobytes(),
         )
 
@@ -135,6 +148,7 @@ class KBDatabase:
                     floor_area_sqft=row["floor_area_sqft"], parking=row["parking"],
                     deposit_months=row["deposit_months"], advance_months=row["advance_months"],
                     min_lease_months=row["min_lease_months"],
+                    available=row["available"] or "now",
                     key_features=json.loads(row["key_features"] or "[]"),
                     description=row["description"],
                 )

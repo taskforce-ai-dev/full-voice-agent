@@ -54,8 +54,14 @@ def truth_property(r):
     rent=None means price-on-request (rent_on_request=True, no period);
     beds/baths=None mean the feed states no count (commercial rows);
     furnishing=None means the feed's furnishing column was '-'.
+    Terms and availability come from the truth table's hand-audited exception
+    tables, so TRUTH-built props carry the same "not recorded" nulls (and the
+    one available-soon row) as the live KB -- the portfolio-facts coverage
+    counts are only testable if the test props mirror them.
     """
     from kb.schema import Property
+    from tests.truth_table import (AVAILABLE_NOT_NOW, ADVANCE_MONTHS,
+                                   DEPOSIT_MONTHS, MIN_LEASE_MONTHS)
     return Property(
         id=r["id"], transaction="rent", property_type=r["type"],
         zone=r["zone"], area="", bedrooms=r["beds"],
@@ -64,7 +70,12 @@ def truth_property(r):
         rent_period=r.get("period") if r["rent"] is not None else None,
         rent_on_request=r["rent"] is None,
         furnishing=r["furnishing"],
-        floor_area_sqft=r["sqft"], description=r["id"])
+        floor_area_sqft=r["sqft"],
+        deposit_months=DEPOSIT_MONTHS.get(r["id"]),
+        advance_months=ADVANCE_MONTHS.get(r["id"]),
+        min_lease_months=MIN_LEASE_MONTHS.get(r["id"]),
+        available=AVAILABLE_NOT_NOW.get(r["id"], "now"),
+        description=r["id"])
 
 
 def build_kb(db_path, props, preamble=""):

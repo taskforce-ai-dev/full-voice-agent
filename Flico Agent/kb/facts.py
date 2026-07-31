@@ -107,4 +107,44 @@ def portfolio_facts(props: List[Property] = None, *, agency: str = "Star Propert
     else:
         lines.append(f"- {len(props) - on_request} listing(s) have a fixed quoted "
                      f"rent; {on_request} are quoted on request.")
+
+    # Coverage counts, computed. Without them the model generalises from
+    # whatever sample it happens to be holding: asked "is there a deposit?"
+    # with no property named, it said "for most of our properties, yes" when
+    # only 16 of 60 record one. Same lesson as the rent split above -- anything
+    # countable is counted here, never left to the model.
+    n = len(props)
+    dep = sum(1 for p in props if p.deposit_months is not None)
+    adv = sum(1 for p in props if p.advance_months is not None)
+    lease = sum(1 for p in props if p.min_lease_months is not None)
+    if min(dep, adv, lease) < n:
+        lines.append(
+            f"- Tenancy terms are recorded per listing, not portfolio-wide: "
+            f"{dep} of {n} state a deposit, {adv} an advance, {lease} a minimum "
+            f"lease; the rest state none. Never say a deposit or advance applies "
+            f"to 'most' or 'all' of our properties. Give a named listing's own "
+            f"stated terms, or say a consultant confirms terms for that property.")
+
+    # "Available now" is a per-listing fact the block itself must qualify:
+    # its own headline count ("we have 60 listings for rent") was echoed back
+    # to a caller as sixty available RIGHT NOW when one is only available soon.
+    not_now = [p for p in props if (p.available or "now").strip().lower() != "now"]
+    if not_now:
+        n_now = n - len(not_now)
+        if len(not_now) <= 3:
+            detail = "; ".join(f"{p.id} ({_describe(p)}) is available "
+                               f"{p.available}" for p in not_now)
+            lines.append(f"- {n_now} of {n} listings are available right now; "
+                         f"{detail}. Do not describe all {n} as available now.")
+        else:
+            lines.append(f"- {n_now} of {n} listings are available right now; "
+                         f"{len(not_now)} are not yet available -- check each "
+                         f"listing's stated availability.")
+
+    # The open class: any attribute NOT counted above carries the same trap.
+    lines.append(
+        "- Never characterise the portfolio as a whole ('most', 'usually', "
+        "'all of our properties') on any point these facts do not count -- "
+        "parking, furnishing, features and the like are recorded per listing "
+        "only. Name specific matching listings instead.")
     return "\n".join(lines) + "\n\n"

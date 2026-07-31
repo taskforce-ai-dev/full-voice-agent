@@ -109,3 +109,19 @@ def test_retrieval_from_the_structured_source_matches_the_tables(fresh):
     refs = sorted(set(re.findall(
         r"\[(P\d+)\]", kbs.retrieve_context("a two bedroom house", sticky={}))))
     assert refs == ["P60", "P61", "P62"]
+
+
+def test_terms_and_availability_match_the_audited_tables(fresh):
+    """Pins what the live pipeline SERVES (listings.json -> importer -> DB
+    round-trip) to the truth table's hand-audited terms/availability columns.
+    The portfolio-facts coverage counts (16 deposits, 59 available now) are
+    computed from these very rows, so a feed edit or a column silently dropped
+    by the DB again fails here, not on a live call."""
+    from tests.truth_table import (ADVANCE_MONTHS, AVAILABLE_NOT_NOW,
+                                   DEPOSIT_MONTHS, MIN_LEASE_MONTHS)
+    kbs.initialize_kb(_DOCS)
+    for p in fresh.all_properties():
+        assert p.deposit_months == DEPOSIT_MONTHS.get(p.id), p.id
+        assert p.advance_months == ADVANCE_MONTHS.get(p.id), p.id
+        assert p.min_lease_months == MIN_LEASE_MONTHS.get(p.id), p.id
+        assert p.available == AVAILABLE_NOT_NOW.get(p.id, "now"), p.id
