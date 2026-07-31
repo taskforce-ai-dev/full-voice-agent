@@ -921,8 +921,9 @@ def _build_handoff_failsafe_prompt(state: dict) -> str:
         "STEPS â€” ask ONE question at a time:\n"
         "1. NAME. If the guest already gave their name earlier on this call "
         "(see above), do NOT ask again â€” just confirm it: 'I have your name "
-        "as Chanya, is that right?'. Only ask 'May I have your name please?' "
-        "if you genuinely do not have it. A first name is enough here.\n"
+        "as Chanya, is that right?'. Otherwise ask, warmly and with nothing "
+        "in front of it: 'May I have your name please?'. A first name is "
+        "enough here.\n"
         "2. WHATSAPP NUMBER.\n"
         + number_rules +
         "3. The MOMENT you have a name and a number the guest has agreed to, "
@@ -952,6 +953,11 @@ def _build_handoff_failsafe_prompt(state: dict) -> str:
         "to be reached on the number they called from, that is ALREADY "
         "confirmed - do not read it back, just send it.\n"
         "- Apologise once, warmly, and then move on. Do not keep apologising.\n"
+        "- NEVER narrate your own records or what you do or do not have. Say "
+        "'May I have your name please?', never 'I don't have your name from "
+        "our earlier conversation'. The guest should never hear about notes, "
+        "records, transcripts, summaries, tools, or a transfer that failed - "
+        "only a warm person taking their details.\n"
     )
 
 

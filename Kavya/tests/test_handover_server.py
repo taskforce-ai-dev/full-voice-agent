@@ -166,6 +166,17 @@ def test_prompt_forbids_an_extra_confirmation_round_trip():
     assert "ALREADY\nconfirmed" in prompt or "ALREADY confirmed" in prompt.replace("\n", " ")
 
 
+def test_prompt_forbids_narrating_internal_state():
+    """Regression: on a live call Kavya opened with "I don't have your name from
+    our earlier conversation - may I have your name please?", leaking what she
+    did and did not have on record."""
+    prompt = server._build_handoff_failsafe_prompt({"caller_phone": "+94771234567"})
+    assert "NEVER narrate your own records" in prompt
+    assert "never 'I don't have your name" in prompt
+    # The step-1 wording must not invite the model to explain the condition.
+    assert "if you genuinely do not have it" not in prompt
+
+
 def test_prompt_does_not_reopen_the_booking_flow():
     prompt = server._build_handoff_failsafe_prompt({"caller_phone": "+94771234567"})
     assert "Do NOT restart the booking" in prompt
