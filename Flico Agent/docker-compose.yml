@@ -75,6 +75,12 @@ services:
       # happened on 2026-07-31: a regenerated rubric sat on disk while three
       # runs scored the agent against the retired 12-row one.
       - ./evals:/app/evals
+      # tests/ too: the eval DERIVES its rubric from tests/truth_table.py (the
+      # hand-audited oracle) rather than hardcoding portfolio facts, so the
+      # container needs it importable. Without it the eval aborts loudly, which
+      # is correct -- a rubric that silently invents its own facts is how the
+      # last one went stale.
+      - ./tests:/app/tests
       - ./knowledge_base.py:/app/knowledge_base.py
       - ./knowledge_base_chroma.py:/app/knowledge_base_chroma.py
       - ./knowledge_base_sqlite.py:/app/knowledge_base_sqlite.py
