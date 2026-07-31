@@ -281,6 +281,29 @@ This has broken twice; the fixed contract is:
   fixed in the n8n workflow (this section + the snapshot JSON), NOT in
   this repo's Python code.
 
+## n8n Kavya Handover Notify — unanswered human transfer (Jul 2026)
+
+When Kavya transfers a caller to `HUMAN_AGENT_PHONE` and nobody picks up, the
+voice agent collects the guest's name + WhatsApp number and POSTs them to n8n
+workflow **`YmeWVEUR54A8o8Tb`** ("Kavya — Handover WhatsApp Notify (No Answer)")
+at `/webhook/kavya-handover`, which WhatsApps the property manager via
+WasenderAPI. See `Kavya/CLAUDE.md` v0.17 for the agent-side design.
+
+- Payload keys: `call_sid`, `customer_name`, `customer_whatsapp`, `call_summary`,
+  `human_agent_whatsapp`, `timestamp`. The workflow reads them off `$json.body.*`.
+- **Numbers are sent as bare digits** (`94771234567`) — normalisation lives in
+  `Kavya/handover.py::normalize_whatsapp`. Unlike the post-call processor above,
+  this workflow does NOT append `@s.whatsapp.net`; WasenderAPI's
+  `/api/send-message` resolves the JID itself for this call shape (verified live).
+  If sends ever start 422-ing on `to`, append the JID suffix in *Build Message*
+  rather than changing the agent payload.
+- Known-good snapshot: `n8n-workflows/kavya-handover-whatsapp.json` (the
+  WasenderAPI bearer token is scrubbed — copy it from the n8n UI before any
+  restore). Restore via PUT `/api/v1/workflows/YmeWVEUR54A8o8Tb` with
+  `name,nodes,connections,settings`.
+- The agent never blocks on this webhook failing: `send_handover_notification`
+  swallows every error, and Kavya still promises the guest a callback.
+
 ## Claude Code / Codex Sync
 
 This repo is maintained with both Claude Code and Codex. Keep `CLAUDE.md` and

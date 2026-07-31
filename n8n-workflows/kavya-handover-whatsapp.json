@@ -1,0 +1,153 @@
+{
+  "name": "Kavya — Handover WhatsApp Notify (No Answer)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Kavya Handover → WhatsApp\n\nFires ONLY when the human agent doesn't answer.\nThe Voice Agent collects the guest's name + WhatsApp,\nthen POSTs the payload here → we WhatsApp the human agent.\n\n**Before use:**\n1. Replace `YOUR_WASENDER_TOKEN` in the *Send WhatsApp* node.\n2. Activate the workflow, then use the **Production** webhook URL in the Voice Agent.\n3. (Optional) Hardcode the human number in *Build Message* if it's always the same.\n\n**Expected POST body:**\n```\n{\n  \"customer_name\": \"Chanya\",\n  \"customer_whatsapp\": \"94771234567\",\n  \"call_summary\": \"...\",\n  \"human_agent_whatsapp\": \"94770000000\",\n  \"timestamp\": \"2026-07-31T08:30:00Z\"\n}\n```",
+        "height": 420,
+        "width": 380
+      },
+      "id": "ca4a1bda-84d5-4bd0-9c5c-a878863fddf5",
+      "name": "README",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        -48
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "kavya-handover",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a367cd1c-9eb5-4f3f-97a7-d30b3ffc4fd2",
+      "name": "Webhook - Handover",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        464,
+        192
+      ],
+      "webhookId": "kavya-handover"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1000000-0000-4000-8000-000000000101",
+              "name": "human_agent_whatsapp",
+              "value": "={{ $json.body.human_agent_whatsapp }}",
+              "type": "string"
+            },
+            {
+              "id": "f1000000-0000-4000-8000-000000000102",
+              "name": "whatsapp_message",
+              "value": "=🔔 *Missed Call — Guest Wants a Callback*\n\nA guest asked to speak with you, but the call wasn't answered. They've left their details:\n\n👤 Name: {{ $json.body.customer_name }}\n📱 WhatsApp: {{ $json.body.customer_whatsapp }}\n🕐 {{ $json.body.timestamp }}\n\n📋 *Call Summary:*\n{{ $json.body.call_summary }}\n\nPlease reach out to them directly. 🙏\n— Kavya · Treehouse",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "637ea20a-eb91-4193-bd3e-59b9e33cfcfa",
+      "name": "Build Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        688,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.wasenderapi.com/api/send-message",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer <WASENDER_TOKEN — see n8n UI>"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ to: $json.human_agent_whatsapp, text: $json.whatsapp_message }) }}",
+        "options": {}
+      },
+      "id": "176f363c-f2c0-4dd8-b867-03a8606173de",
+      "name": "Send WhatsApp to Human Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        912,
+        192
+      ],
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true }) }}",
+        "options": {}
+      },
+      "id": "17d96dbf-c2a9-4a76-b83b-3fd6c29694e8",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        192
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook - Handover": {
+      "main": [
+        [
+          {
+            "node": "Build Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Message": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp to Human Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp to Human Agent": {
+      "main": [
+        [
+          {
+            "node": "Respond 200 OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
