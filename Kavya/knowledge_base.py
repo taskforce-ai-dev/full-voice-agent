@@ -221,20 +221,38 @@ def chunk_text(
         # Look for the best split point inside the window.
         window = text[start:end]
 
+        # A split point very close to the window start would emit a
+        # degenerate fragment consisting of little more than the previous
+        # chunk's overlap tail.  That happens whenever the only paragraph
+        # break in the window falls inside the overlap region -- the result
+        # is a ~50-character sentence tail that carries no usable meaning
+        # yet still competes for retrieval slots.  Reject such candidates
+        # and fall through to the next split strategy.
+        min_split = chunk_size // 4
+
+        split_pos = -1
+
         # 1. Paragraph break
-        split_pos = window.rfind("\n\n")
+        pos = window.rfind("\n\n")
+        if pos >= min_split:
+            split_pos = pos
+
+        # 2. Sentence break
         if split_pos == -1:
-            # 2. Sentence break
             for pattern in (". ", "? ", "! "):
-                split_pos = window.rfind(pattern)
-                if split_pos != -1:
-                    split_pos += 1  # include the punctuation
+                pos = window.rfind(pattern)
+                if pos >= min_split:
+                    split_pos = pos + 1  # include the punctuation
                     break
+
+        # 3. Word break
         if split_pos == -1:
-            # 3. Word break
-            split_pos = window.rfind(" ")
+            pos = window.rfind(" ")
+            if pos >= min_split:
+                split_pos = pos
+
+        # 4. Hard cut as last resort
         if split_pos == -1:
-            # Hard cut as last resort
             split_pos = chunk_size
 
         actual_end = start + split_pos
@@ -242,8 +260,15 @@ def chunk_text(
         if chunk:
             chunks.append(chunk)
 
-        # Move forward, applying overlap
-        start = max(actual_end - overlap, start + 1)
+        # Move forward, applying overlap.  If the overlap would not advance
+        # the window (split point at or before *overlap*), drop the overlap
+        # instead of inching forward one character at a time — otherwise the
+        # loop re-finds the same split point and emits a long run of
+        # shrinking, degenerate tail fragments.
+        next_start = actual_end - overlap
+        if next_start <= start:
+            next_start = max(actual_end, start + 1)
+        start = next_start
 
     return chunks
 

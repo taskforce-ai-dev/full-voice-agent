@@ -32,7 +32,7 @@ FAKE_ENDED = "2026-05-23T05:00:42Z"
 FAKE_DURATION = 42
 
 FAKE_TRANSCRIPT = [
-    {"role": "assistant", "text": "Hello, this is Kavya from Treehouse Chalets."},
+    {"role": "assistant", "text": "Hello, this is Kavya from Mosvold Boutique Hotels."},
     {"role": "user", "text": "Hi, I want to check availability for next weekend."},
     {"role": "assistant", "text": "Sure, let me check that for you."},
 ]
@@ -42,11 +42,11 @@ FAKE_EXTRACTED = {
     "num_guests": "2",
     "check_in": "2026-05-30",
     "check_out": "2026-06-01",
-    "room_preference": "Mount Monarch",
+    "room_preference": "Founders Suite",
     "availability_result": "Available",
     "call_outcome": "booking_inquiry",
     "follow_up_needed": "No",
-    "summary": "Guest inquired about availability for next weekend; quoted rates.",
+    "summary": "Guest inquired about availability at Mosvold Villa for next weekend.",
 }
 
 

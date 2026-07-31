@@ -1,6 +1,11 @@
 """
 post_call.py -- Post-call data extraction and n8n webhook integration.
 
+Kavya is the reservations agent for Hatton Hills, a single luxury boutique eco
+retreat in Sri Lanka's central hill country with five room types. The extraction
+still records a `property` field (always "Hatton Hills") so the Google Sheet
+column shape is unchanged.
+
 After a call ends:
   1. Uses LLM to extract structured booking details from the full transcript.
   2. POSTs structured data + transcript to an n8n webhook.
@@ -39,26 +44,35 @@ EXTRACTION_MAX_TOKENS: int = 2000
 # ---------------------------------------------------------------------------
 # Extraction prompt
 # ---------------------------------------------------------------------------
-EXTRACTION_SYSTEM_PROMPT: str = """You are a data extraction assistant for a hotel called Treehouse Chalets in Sri Lanka. Analyze a phone call transcript between the hotel's reservations agent (Kavya) and a caller. The call may be in English, Sinhala, or Tamil.
+EXTRACTION_SYSTEM_PROMPT: str = """You are a data extraction assistant for Hatton Hills, a luxury boutique eco retreat in Sri Lanka's central hill country. It is a SINGLE property.
+
+Analyze a phone call transcript between the retreat's reservations agent (Kavya) and a caller. The call may be in English, Sinhala, Tamil, or Arabic.
 
 Extract ALL available information and return ONLY a valid JSON object. No markdown code fences, no explanation — just the raw JSON.
 
 {
   "guest_name": "caller's name or null",
+  "property": "always 'Hatton Hills' — there is only one property",
   "num_guests": "e.g. '2 adults, 1 child (age 5)' or null",
   "check_in": "YYYY-MM-DD or null",
   "check_out": "YYYY-MM-DD or null",
-  "room_preference": "room type name or null",
+  "room_preference": "room type name or null — see the room rules below",
   "availability_result": "brief result of availability check, or null if not checked",
   "call_outcome": "see rules below",
   "follow_up_needed": "Yes or No",
   "summary": "1-2 sentence English summary of the entire call"
 }
 
+CRITICAL RULES FOR property AND room_preference:
+- "property" is always "Hatton Hills". There is only one property, so never write anything else and never write null.
+- The five room types are: Forest Escape Suite, Eco Harmony Suite, Sunrise Vista Premium Suite (each up to 2 guests), Mount Luxe Chalet, Mount Monarch Chalet (each up to 5 guests).
+- Record room_preference using one of those exact five names, and nothing else. If the guest described a room loosely ("the one with the pool"), map it to the correct full name (that is the Mount Monarch Chalet).
+- If the guest never indicated a room, set room_preference to null.
+
 CRITICAL RULES FOR call_outcome — pick the BEST match:
 - "booking_confirmed" = guest confirmed a booking during the call
 - "booking_inquiry" = guest asked about booking/availability for specific dates (even if no tool was called)
-- "general_inquiry" = guest only asked general questions (rates, amenities, directions, policies) without mentioning specific dates
+- "general_inquiry" = guest only asked general questions (pricing, amenities, directions, policies, experiences) without mentioning specific dates
 - "callback_requested" = guest said they would call back, or asked to be called back
 - "no_availability" = availability was checked but no rooms were available
 - "dropped" = conversation ended abruptly or seems incomplete (very short, mid-sentence)
@@ -72,8 +86,10 @@ RULES FOR dates:
 
 RULES FOR summary:
 - ALWAYS provide a summary, even for short calls.
-- Summarize what the guest wanted and what happened. Example: "Guest asked about room rates for 2 adults. Kavya provided pricing for Forest Escape Suite and Eco Harmony."
+- Example: "Guest asked about the Mount Monarch Chalet for 2 adults from 12 to 14 August. Kavya confirmed availability at one thousand four hundred US dollars per night and the guest asked to be called back."
+- Another example: "Guest enquired about the Eco Harmony Suite but did not give dates."
 - Write in English regardless of transcript language.
+- Rates ARE quoted on these calls (US dollars per room per night, half board). You may record a rate in availability_result or summary if the agent stated one. Never invent a figure that was not said.
 
 RULES FOR follow_up_needed:
 - "Yes" if: guest showed interest but didn't book, said they'd call back, asked to receive info, or conversation dropped before resolution.
@@ -84,6 +100,43 @@ If a field was genuinely not discussed at all, use null.
 Return ONLY the JSON object."""
 
 EXTRACTION_USER_TEMPLATE: str = "Transcript:\n\n{transcript}"
+
+# ---------------------------------------------------------------------------
+# Property / room vocabulary
+#
+# SINGLE-PROPERTY MODE (2026-07-30). Hatton Hills is the only property and all
+# five room names are distinct, so a room name is never ambiguous and nothing
+# needs to be dropped for want of a property.
+# ---------------------------------------------------------------------------
+PROPERTY_HATTON: str = "Hatton Hills"
+
+ROOM_TYPES_BY_PROPERTY: dict[str, tuple[str, ...]] = {
+    PROPERTY_HATTON: (
+        "Forest Escape Suite",
+        "Eco Harmony Suite",
+        "Sunrise Vista Premium Suite",
+        "Mount Luxe Chalet",
+        "Mount Monarch Chalet",
+    ),
+}
+
+
+def _normalize_property_and_room(result: dict[str, Any]) -> dict[str, Any]:
+    """Normalise the extracted property to the single canonical name.
+
+    Mutates and returns ``result``. Always sets ``property`` to "Hatton Hills":
+    it is the only property, so whatever the extraction model wrote (or omitted)
+    it can only have meant this one.
+
+    Note what this deliberately no longer does: it used to NULL out
+    ``room_preference`` whenever the property was unresolved, because a bare
+    "Deluxe Double Room" could belong to either Mosvold property. Keeping that
+    behaviour here would now silently drop the room from every Google Sheet row
+    where the model left ``property`` null — which is most of them, since nothing
+    on the call asks the guest to name a property any more.
+    """
+    result["property"] = PROPERTY_HATTON
+    return result
 
 
 def _clean_json_response(text: str) -> str:
@@ -176,6 +229,7 @@ async def extract_booking_details(
     """
     empty: dict[str, Any] = {
         "guest_name": None,
+        "property": None,
         "num_guests": None,
         "check_in": None,
         "check_out": None,
@@ -208,7 +262,7 @@ async def extract_booking_details(
         for key in empty:
             if key not in result:
                 result[key] = empty[key]
-        return result
+        return _normalize_property_and_room(result)
 
     except json.JSONDecodeError as exc:
         logger.error("Failed to parse LLM extraction JSON (attempt 1): %s", exc)
@@ -223,7 +277,7 @@ async def extract_booking_details(
                 for key in empty:
                     if key not in retry_result:
                         retry_result[key] = empty[key]
-                return retry_result
+                return _normalize_property_and_room(retry_result)
         except Exception as retry_exc:
             logger.error("Retry extraction also failed: %s", retry_exc)
         empty["_extraction_error"] = f"json_parse: {exc}"
@@ -234,8 +288,9 @@ async def extract_booking_details(
         return empty
 
 
-RETRY_PROMPT: str = """Extract these fields from the hotel call transcript as a short JSON object. Use null for missing fields.
-Fields: guest_name, num_guests, check_in (YYYY-MM-DD), check_out (YYYY-MM-DD), room_preference, availability_result, call_outcome (booking_inquiry/general_inquiry/booking_confirmed/callback_requested/dropped), follow_up_needed (Yes/No), summary (1 sentence English).
+RETRY_PROMPT: str = """Extract these fields from the Hatton Hills call transcript as a short JSON object. Use null for missing fields.
+Fields: guest_name, property (always 'Hatton Hills'), num_guests, check_in (YYYY-MM-DD), check_out (YYYY-MM-DD), room_preference, availability_result, call_outcome (booking_inquiry/general_inquiry/booking_confirmed/callback_requested/dropped), follow_up_needed (Yes/No), summary (1 sentence English).
+Room types differ per property and similar names exist at both, so a room name alone is ambiguous: if the property is not established, set both property and room_preference to null. Never write a price figure into any field.
 Return ONLY valid JSON, no markdown."""
 
 
@@ -362,7 +417,7 @@ async def process_post_call_data(
             )
 
         # Build the payload
-        lang_names = {"en": "English", "si": "Sinhala", "ta": "Tamil"}
+        lang_names = {"en": "English", "si": "Sinhala", "ta": "Tamil", "ar": "Arabic"}
         payload: dict[str, Any] = {
             "timestamp": call_start_time,
             "call_end_time": call_end_time,

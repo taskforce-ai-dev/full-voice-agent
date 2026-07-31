@@ -4,10 +4,22 @@ All derivation, matching, validation, and customer-facing error shaping lives
 here. The thin HTTP layer in kpms_client.py is the ONLY way this module talks
 to the PMS — never reach around it.
 
+Mosvold Boutique Hotels operates TWO properties — Mosvold Villa (Ahangama) and
+Sundara by Mosvold (Balapitiya). Several room names are similar across the two
+(e.g. "Deluxe Double Room" at the Villa vs "Deluxe Double Room with Sea View" at
+Sundara), so the property MUST be established before a room type is resolved.
+`_resolve_room_request()` enforces that and raises ServiceError with a
+clarifying question when the request is ambiguous.
+
+Room rates are NOT published by Mosvold — they are quoted live per check-in /
+check-out date by the external BookingEye engine. This module therefore never
+returns a rate figure to the caller; it returns PRICING_MESSAGE instead.
+
 Public API consumed by tools.py:
-    derive_availability(check_in, check_out, num_adults, num_children, room_type_filter)
+    derive_availability(check_in, check_out, num_adults, num_children,
+                        room_type_filter, property_name)
     book(check_in, check_out, room_type, guest_name, guest_email, guest_phone,
-         salutation, num_adults, num_children)
+         salutation, num_adults, num_children, property_name)
     lookup(reservation_no, guest_email, arrival_from, arrival_to)
     cancel(reservation_id)
 """
@@ -45,17 +57,77 @@ CACHE_TTL_SECONDS = 60.0
 SOURCE_TAG = "voice_agent"
 BLOCKING_STATUSES: frozenset[str] = frozenset({"pending", "active"})
 
-# Always present these rooms to callers using Kavya's vocabulary, regardless
-# of what the PMS calls them (which may include "Suite"/"Chalet" suffixes).
-_DISPLAY_NAMES: dict[str, str] = {
-    "rt_fifi_monarch": "Mount Monarch",
-    "rt_fifi_luxe": "Mount Luxe",
-    "rt_fifi_sunrise": "Sunrise Vista",
-    "rt_fifi_eco": "Eco Harmony",
-    "rt_fifi_forest": "Forest Escape Suite",
+# Reservations hotline — the single line that serves BOTH properties.
+RESERVATIONS_PHONE = "+94 77 335 8800"
+
+# Mosvold publishes no room rates anywhere; a rate only exists once dates are
+# chosen and is served live by the external BookingEye engine. Never quote a
+# figure — hand pricing questions to reservations.
+PRICING_MESSAGE = (
+    "Room rates are quoted live for your exact dates, so I can't give a figure here. "
+    f"Please call our reservations team on {RESERVATIONS_PHONE} for pricing."
+)
+
+# --- Properties ------------------------------------------------------------ #
+
+PROPERTY_VILLA = "Mosvold Villa"
+PROPERTY_SUNDARA = "Sundara by Mosvold"
+
+PROPERTY_LOCATIONS: dict[str, str] = {
+    PROPERTY_VILLA: "Ahangama",
+    PROPERTY_SUNDARA: "Balapitiya",
 }
 
-KAVYA_VOCAB = ("Mount Monarch", "Mount Luxe", "Sunrise Vista", "Eco Harmony", "Forest Escape Suite")
+# Free-text hints a caller (or the LLM) may use for each property.
+_PROPERTY_ALIASES: dict[str, str] = {
+    "mosvold villa": PROPERTY_VILLA,
+    "villa": PROPERTY_VILLA,
+    "the villa": PROPERTY_VILLA,
+    "ahangama": PROPERTY_VILLA,
+    "mosvold villa ahangama": PROPERTY_VILLA,
+    "sundara": PROPERTY_SUNDARA,
+    "sundara by mosvold": PROPERTY_SUNDARA,
+    "balapitiya": PROPERTY_SUNDARA,
+    "sundara by mosvold balapitiya": PROPERTY_SUNDARA,
+}
+
+# --- Room vocabulary ------------------------------------------------------- #
+# Room types differ per property and must NEVER be mixed up. "Deluxe Double
+# Room" and "Deluxe Twin Room" exist at both properties under similar names, so
+# every lookup is property-scoped.
+
+ROOM_TYPES_BY_PROPERTY: dict[str, tuple[str, ...]] = {
+    PROPERTY_VILLA: (
+        "Deluxe Double Room",
+        "Deluxe Twin Room",
+        "Family Suite",
+        "Founders Suite",
+    ),
+    PROPERTY_SUNDARA: (
+        "Deluxe Double Room with Garden View",
+        "Deluxe Double Room with Sea View",
+        "Deluxe Twin Room with Sea View",
+        "Beach Villa",
+        "Family Villa with Pool",
+    ),
+}
+
+# Canonical display name -> owning property.
+ROOM_TYPE_PROPERTY: dict[str, str] = {
+    room: prop
+    for prop, rooms in ROOM_TYPES_BY_PROPERTY.items()
+    for room in rooms
+}
+
+# Every name Kavya may speak, across both properties.
+KAVYA_VOCAB: tuple[str, ...] = tuple(ROOM_TYPE_PROPERTY)
+
+# INTEGRATION GAP: Mosvold books through BookingEye, not eZee/kPMS, so there is
+# no known typeId -> display-name mapping. Deliberately left empty rather than
+# populated with invented IDs; _display_name_for_type() falls back to matching
+# the PMS-reported name against the canonical vocabulary above. Populate this
+# table once the real BookingEye/PMS room identifiers are available.
+_DISPLAY_NAMES: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -97,42 +169,144 @@ def _cache_set(key: str, value: Any, ttl: float = CACHE_TTL_SECONDS) -> None:
 # --------------------------------------------------------------------------- #
 
 def _norm(name: str) -> str:
-    """Lowercase, strip, drop a trailing ' suite' or ' chalet' token."""
+    """Lowercase, trim, collapse internal whitespace.
+
+    No suffix stripping: at Mosvold the trailing token is meaningful
+    ("Family Suite" vs "Family Villa with Pool", "Beach Villa"), and dropping
+    it would collide room types across the two properties.
+    """
     if not name:
         return ""
-    s = name.strip().lower()
-    for suffix in (" suite", " chalet"):
-        if s.endswith(suffix):
-            s = s[: -len(suffix)].rstrip()
-            break
-    return s
+    return " ".join(name.strip().lower().split())
+
+
+def _property_options_sentence() -> str:
+    return (
+        f"{PROPERTY_VILLA} in {PROPERTY_LOCATIONS[PROPERTY_VILLA]} or "
+        f"{PROPERTY_SUNDARA} in {PROPERTY_LOCATIONS[PROPERTY_SUNDARA]}"
+    )
+
+
+def _room_options_sentence(property_name: str = "") -> str:
+    """Human-readable room list, scoped to a property when we know it."""
+    if property_name and property_name in ROOM_TYPES_BY_PROPERTY:
+        rooms = ROOM_TYPES_BY_PROPERTY[property_name]
+        return f"At {property_name} we have: " + ", ".join(rooms) + "."
+    parts = []
+    for prop, rooms in ROOM_TYPES_BY_PROPERTY.items():
+        parts.append(f"At {prop} in {PROPERTY_LOCATIONS[prop]}: " + ", ".join(rooms) + ".")
+    return " ".join(parts)
+
+
+def _resolve_property(property_name: str) -> str:
+    """Normalize a free-text property hint to a canonical property name.
+
+    Returns "" when nothing was supplied. Raises ServiceError when the hint is
+    supplied but unrecognised — we never guess which hotel the caller means.
+    """
+    raw = (property_name or "").strip()
+    if not raw:
+        return ""
+    pn = _norm(raw)
+    if pn in _PROPERTY_ALIASES:
+        return _PROPERTY_ALIASES[pn]
+    # Substring fallback. If the hint points at both hotels we ask rather than
+    # guess — sending a guest to the wrong property is worse than one question.
+    hits = {canonical for alias, canonical in _PROPERTY_ALIASES.items() if alias in pn}
+    if len(hits) == 1:
+        return hits.pop()
+    raise ServiceError(
+        f"I couldn't tell which hotel '{raw}' refers to. "
+        f"We have {_property_options_sentence()}. Which one would you like?"
+    )
+
+
+def _resolve_room_request(room_type: str, property_name: str = "") -> tuple[str, str]:
+    """Resolve (room_type, property) to a canonical (room name, property) pair.
+
+    The property is established FIRST. Any request that could refer to a room at
+    both properties raises ServiceError asking which hotel, because the same
+    words mean different rooms at Mosvold Villa and Sundara.
+    """
+    prop = _resolve_property(property_name)
+
+    qn = _norm(room_type)
+    if not qn:
+        if prop:
+            raise ServiceError(
+                f"Which room would you like at {prop}? {_room_options_sentence(prop)}"
+            )
+        raise ServiceError(
+            "Which of our hotels would you like to stay at — "
+            f"{_property_options_sentence()}?"
+        )
+
+    pool = ROOM_TYPES_BY_PROPERTY[prop] if prop else KAVYA_VOCAB
+    candidates = [
+        room for room in pool
+        if _norm(room).startswith(qn) or qn.startswith(_norm(room))
+    ]
+
+    if not candidates:
+        raise ServiceError(
+            f"We don't have a room called '{room_type}'. {_room_options_sentence(prop)}"
+        )
+
+    # Ambiguous across properties -> must pin the hotel down before the room.
+    if not prop and len({ROOM_TYPE_PROPERTY[r] for r in candidates}) > 1:
+        raise ServiceError(
+            f"Both of our hotels have a room like that. Is that for "
+            f"{_property_options_sentence()}?"
+        )
+
+    exact = [r for r in candidates if _norm(r) == qn]
+    if len(exact) == 1:
+        return exact[0], ROOM_TYPE_PROPERTY[exact[0]]
+    if len(candidates) == 1:
+        return candidates[0], ROOM_TYPE_PROPERTY[candidates[0]]
+
+    raise ServiceError(
+        "Which one did you mean — " + ", ".join(candidates) + "?"
+    )
 
 
 def _kavya_vocab_name(pms_name: str) -> str:
-    """Strip ' Suite' / ' Chalet' (case-insensitive) — fallback when typeId unknown.
+    """Map a PMS-reported name onto the canonical Mosvold vocabulary.
 
-    NOTE: When you have the typeId, prefer _display_name_for_type() which uses
-    the explicit _DISPLAY_NAMES table (Forest Escape Suite keeps its Suite).
+    Falls back to the PMS name unchanged when there is no confident match, so
+    we never rename a room into something Mosvold doesn't offer.
     """
     if not pms_name:
         return ""
-    s = pms_name.strip()
-    low = s.lower()
-    for suffix in (" suite", " chalet"):
-        if low.endswith(suffix):
-            return s[: -len(suffix)].rstrip()
-    return s
+    n = _norm(pms_name)
+    for room in KAVYA_VOCAB:
+        if _norm(room) == n:
+            return room
+    return pms_name.strip()
 
 
 def _display_name_for_type(type_id: str, pms_name: str = "") -> str:
-    """Map a typeId to the canonical Kavya-vocab display name."""
+    """Map a typeId to the canonical Kavya-vocab display name.
+
+    _DISPLAY_NAMES is empty until the real BookingEye/PMS room identifiers are
+    wired up, so this normally falls through to name-based matching.
+    """
     if type_id in _DISPLAY_NAMES:
         return _DISPLAY_NAMES[type_id]
     return _kavya_vocab_name(pms_name)
 
 
+def _property_for_display_name(display_name: str) -> str:
+    """Which Mosvold property a resolved display name belongs to ("" if unknown)."""
+    return ROOM_TYPE_PROPERTY.get(display_name, "")
+
+
 def _match_room_type(query: str, room_types: list[dict]) -> dict | None:
-    """Match a Kavya-style query to a PMS room type. Raises ServiceError on ambiguity."""
+    """Match a canonical Mosvold room name to a PMS room type.
+
+    Callers should pass a name already resolved by _resolve_room_request() so
+    that the property is unambiguous. Raises ServiceError on ambiguity.
+    """
     if not query:
         return None
     qn = _norm(query)
@@ -174,6 +348,9 @@ async def _get_property_id() -> str:
     if not isinstance(props, list) or not props:
         raise ServiceError("No properties configured in the PMS.")
     if len(props) > 1:
+        # Mosvold runs two properties (Mosvold Villa, Sundara by Mosvold). The
+        # booking backend must be pinned to one of them per deployment until
+        # per-property routing is wired up.
         raise ServiceError(
             "Multiple properties found; set KPMS_PROPERTY_ID to choose one."
         )
@@ -352,6 +529,7 @@ async def derive_availability(
     num_adults: int = 1,
     num_children: int = 0,
     room_type_filter: str = "",
+    property_name: str = "",
 ) -> dict:
     try:
         ci = _parse_date(check_in)
@@ -363,6 +541,13 @@ async def derive_availability(
 
     nights = (co - ci).days
 
+    # Establish the property before anything room-specific. A bare property hint
+    # with no room type is fine here — it just scopes the answer.
+    try:
+        resolved_property = _resolve_property(property_name)
+    except ServiceError as exc:
+        return {"error": str(exc)}
+
     try:
         property_id = await _get_property_id()
         room_types = await _get_room_types_cached()
@@ -373,19 +558,25 @@ async def derive_availability(
         logger.warning("Availability fetch failed: %s", exc)
         return {"error": "We couldn't check availability just now. Please try again in a moment."}
 
-    # Optional filter
+    # Optional filter — resolve to a canonical Mosvold room name first so the
+    # property is never guessed.
     filter_match: dict | None = None
     if room_type_filter:
         try:
-            filter_match = _match_room_type(room_type_filter, room_types)
+            canonical_room, resolved_property = _resolve_room_request(
+                room_type_filter, resolved_property
+            )
+        except ServiceError as exc:
+            return {"error": str(exc)}
+        try:
+            filter_match = _match_room_type(canonical_room, room_types)
         except ServiceError:
             filter_match = None
         if filter_match is None:
             return {
                 "error": (
-                    f"We don't have a room type called '{room_type_filter}'. "
-                    "Please choose from Mount Monarch, Mount Luxe, Sunrise Vista, "
-                    "Eco Harmony, or Forest Escape Suite."
+                    f"I couldn't find {canonical_room} in our booking system just now. "
+                    f"Please call reservations on {RESERVATIONS_PHONE} and we'll help you directly."
                 )
             }
         types_to_check = [filter_match]
@@ -412,13 +603,13 @@ async def derive_availability(
     for rt in types_to_check:
         type_id = rt.get("id", "")
         candidate_rooms = rooms_by_type.get(type_id, [])
-        rate = _to_decimal(rt.get("baseRate"))
-        total = _money(rate * Decimal(nights))
-        # Capacity is informational only. The KB (hotel_info.txt) is the
-        # source of truth for room capacities — kPMS data contradicts it
-        # (chalets reported as 2, suites as 5). Same approach as yanolja_service.
+        # NOTE: any baseRate the PMS carries is NOT a Mosvold published rate.
+        # Mosvold publishes none — BookingEye quotes them live per date — so no
+        # rate figure is ever surfaced to the caller. See PRICING_MESSAGE.
+        # Capacity is informational only; the KB is the source of truth.
         capacity = int(rt.get("capacity") or 0)
         display_name = _display_name_for_type(type_id, rt.get("name", ""))
+        room_property = _property_for_display_name(display_name)
 
         # For each candidate room, fetch reservations once
         room_reservations: dict[str, list[tuple[date, date]]] = {}
@@ -466,10 +657,9 @@ async def derive_availability(
         entry: dict[str, Any] = {
             "room_type_id": type_id,
             "room_type_name": display_name,
+            "property": room_property,
             "available": is_available,
             "nights": nights,
-            "rate_per_night_usd": _money(rate),
-            "total_usd": total,
             "capacity": capacity,
         }
         if not is_available and unavailable:
@@ -480,9 +670,11 @@ async def derive_availability(
         "check_in": check_in,
         "check_out": check_out,
         "nights": nights,
+        "property": resolved_property,
         "total_room_types": len(room_types),
         "available_room_types": available_count,
         "rooms": out_rooms,
+        "pricing": PRICING_MESSAGE,
     }
 
 
@@ -500,6 +692,7 @@ async def book(
     salutation: str = "Mr",
     num_adults: int = 1,
     num_children: int = 0,
+    property_name: str = "",
 ) -> dict:
     try:
         ci = _parse_date(check_in)
@@ -514,6 +707,13 @@ async def book(
     if not (guest_name or "").strip() and not (guest_email or "").strip():
         return {"error": "We need a guest name to make the reservation."}
 
+    # Property FIRST, then the room. Booking the right room name at the wrong
+    # hotel is the failure mode this guards against.
+    try:
+        canonical_room, resolved_property = _resolve_room_request(room_type, property_name)
+    except ServiceError as exc:
+        return {"error": str(exc)}
+
     try:
         property_id = await _get_property_id()
         room_types = await _get_room_types_cached()
@@ -521,41 +721,44 @@ async def book(
         return {"error": str(exc)}
     except KpmsError as exc:
         logger.warning("Setup fetch failed during book: %s", exc)
-        return {"error": "We couldn't complete the booking just now. Please try again in a moment or call the hotel directly."}
+        return {"error": "We couldn't complete the booking just now. Please try again in a moment, or call our reservations team on " + RESERVATIONS_PHONE + "."}
 
     try:
-        rt_match = _match_room_type(room_type, room_types)
+        rt_match = _match_room_type(canonical_room, room_types)
     except ServiceError:
         rt_match = None
     if not rt_match:
         return {
             "error": (
-                f"We don't have a room type called '{room_type}'. "
-                "Please choose from Mount Monarch, Mount Luxe, Sunrise Vista, "
-                "Eco Harmony, or Forest Escape Suite."
+                f"I couldn't find {canonical_room} at {resolved_property} in our booking "
+                f"system just now. Please call reservations on {RESERVATIONS_PHONE} "
+                "and we'll take care of it directly."
             )
         }
 
     type_id = rt_match.get("id", "")
-    # Capacity check NOT enforced here: kPMS capacity contradicts the KB
-    # (chalets reported as 2, suites as 5). KB/LLM enforces capacity instead.
+    # Capacity check NOT enforced here: PMS capacity contradicts the KB.
+    # KB/LLM enforces capacity instead.
+    #
+    # PRICING: the `total` written to the PMS below is derived from whatever
+    # baseRate the PMS carries. It is bookkeeping for the PMS record only and is
+    # deliberately NOT returned to the caller — Mosvold's real rates come live
+    # from BookingEye per date. See the leftover note about BookingEye wiring.
     rate = _to_decimal(rt_match.get("baseRate"))
     total_dec = rate * Decimal(nights)
-    total_amt = _money(total_dec)
-    rate_amt = _money(rate)
-    display_room_type = _display_name_for_type(type_id, rt_match.get("name", ""))
+    display_room_type = _display_name_for_type(type_id, rt_match.get("name", "")) or canonical_room
 
     # Allocate room
     try:
         room = await _allocate_room(property_id, type_id, ci, co)
     except KpmsError as exc:
         logger.warning("Room allocation failed: %s", exc)
-        return {"error": "We couldn't complete the booking just now. Please try again in a moment or call the hotel directly."}
+        return {"error": "We couldn't complete the booking just now. Please try again in a moment, or call our reservations team on " + RESERVATIONS_PHONE + "."}
     if room is None:
         return {
             "error": (
-                f"Sorry, we have no {display_room_type} available for those dates. "
-                "Would you like to try different dates?"
+                f"Sorry, we have no {display_room_type} available at {resolved_property} "
+                "for those dates. Would you like to try different dates?"
             )
         }
 
@@ -564,12 +767,12 @@ async def book(
         guest = await _find_or_create_guest(guest_name, guest_email, guest_phone, salutation)
     except KpmsError as exc:
         logger.warning("Guest upsert failed: %s", exc)
-        return {"error": "We couldn't complete the booking just now. Please try again in a moment or call the hotel directly."}
+        return {"error": "We couldn't complete the booking just now. Please try again in a moment, or call our reservations team on " + RESERVATIONS_PHONE + "."}
 
     guest_id = guest.get("id")
     if not guest_id:
         logger.warning("Guest record missing id: %s", guest)
-        return {"error": "We couldn't complete the booking just now. Please try again in a moment or call the hotel directly."}
+        return {"error": "We couldn't complete the booking just now. Please try again in a moment, or call our reservations team on " + RESERVATIONS_PHONE + "."}
 
     payload: dict[str, Any] = {
         "guestId": guest_id,
@@ -596,12 +799,12 @@ async def book(
         created = await create_reservation(payload)
     except KpmsError as exc:
         logger.warning("Reservation create failed: %s", exc)
-        return {"error": "We couldn't complete the booking just now. Please try again in a moment or call the hotel directly."}
+        return {"error": "We couldn't complete the booking just now. Please try again in a moment, or call our reservations team on " + RESERVATIONS_PHONE + "."}
 
     booking_ref = created.get("id") if isinstance(created, dict) else None
     if not booking_ref:
         logger.warning("Reservation response missing id: %s", created)
-        return {"error": "We couldn't complete the booking just now. Please try again in a moment or call the hotel directly."}
+        return {"error": "We couldn't complete the booking just now. Please try again in a moment, or call our reservations team on " + RESERVATIONS_PHONE + "."}
 
     return {
         "success": True,
@@ -609,11 +812,11 @@ async def book(
         "guest_name": guest_name,
         "check_in": check_in,
         "check_out": check_out,
+        "property": resolved_property,
         "room_type": display_room_type,
         "room_number": room.get("number", ""),
-        "rate_per_night_usd": rate_amt,
-        "total_usd": total_amt,
         "nights": nights,
+        "pricing": PRICING_MESSAGE,
     }
 
 
@@ -629,7 +832,11 @@ def _augment_reservation(res: dict, room_types: list[dict], rooms: list[dict]) -
     augmented = dict(res)
     augmented["booking_reference"] = res.get("id", "")
     augmented["room_number"] = room.get("number", "")
-    augmented["room_type_name"] = _display_name_for_type(type_id, rt.get("name", ""))
+    display_name = _display_name_for_type(type_id, rt.get("name", ""))
+    augmented["room_type_name"] = display_name
+    # Which Mosvold property the room belongs to — "" when the PMS name doesn't
+    # map onto the known Mosvold vocabulary. Never guessed.
+    augmented["property"] = _property_for_display_name(display_name)
     return augmented
 
 
@@ -760,7 +967,7 @@ async def cancel(reservation_id: str) -> dict:
         if getattr(exc, "status", None) == 404:
             return {"error": "We couldn't find a booking with that reference. Please double-check the number."}
         logger.warning("Cancel pre-check failed for %s: %s", rid, exc)
-        return {"error": "We couldn't cancel that booking just now. Please try again or call the hotel directly."}
+        return {"error": "We couldn't cancel that booking just now. Please try again, or call our reservations team on " + RESERVATIONS_PHONE + "."}
 
     if isinstance(existing, dict) and existing.get("status") == "cancelled":
         return {"success": True, "booking_reference": rid, "status": "cancelled", "already_cancelled": True}
@@ -771,7 +978,7 @@ async def cancel(reservation_id: str) -> dict:
         if getattr(exc, "status", None) == 404:
             return {"error": "We couldn't find a booking with that reference. Please double-check the number."}
         logger.warning("Cancel failed for %s: %s", rid, exc)
-        return {"error": "We couldn't cancel that booking just now. Please try again or call the hotel directly."}
+        return {"error": "We couldn't cancel that booking just now. Please try again, or call our reservations team on " + RESERVATIONS_PHONE + "."}
 
     # Verify the status actually flipped; if not, re-fetch to be sure.
     if isinstance(updated, dict) and updated.get("status") == "cancelled":
@@ -781,10 +988,10 @@ async def cancel(reservation_id: str) -> dict:
         confirm = await get_reservation(rid)
     except KpmsError as exc:
         logger.warning("Cancel verify failed for %s: %s", rid, exc)
-        return {"error": "Cancellation submitted but we couldn't confirm it. Please call the hotel to verify."}
+        return {"error": "Cancellation submitted but we couldn't confirm it. Please call our reservations team on " + RESERVATIONS_PHONE + " to verify."}
 
     if isinstance(confirm, dict) and confirm.get("status") == "cancelled":
         return {"success": True, "booking_reference": rid, "status": "cancelled"}
 
     logger.warning("Cancel did not flip status for %s; final: %s", rid, confirm)
-    return {"error": "Cancellation submitted but the booking is still showing active. Please call the hotel to confirm."}
+    return {"error": "Cancellation submitted but the booking is still showing active. Please call our reservations team on " + RESERVATIONS_PHONE + " to confirm."}

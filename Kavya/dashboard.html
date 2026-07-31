@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Treehouse Chalets — Call Analytics</title>
+    <title>Mosvold Boutique Hotels — Call Analytics</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -74,9 +74,8 @@
 <aside class="sidebar">
     <div class="px-5 py-5 border-b border-white/10">
         <div class="flex items-center gap-2.5">
-            <img src="TreeHouse Logo.webp" alt="Treehouse Chalets" style="width:48px;height:48px;object-fit:contain;border-radius:6px;flex-shrink:0;background:#c8bfb0;">
             <div>
-                <div style="font-size:13px;font-weight:700;color:#F1F5F9;line-height:1.2">Treehouse Chalets</div>
+                <div style="font-size:13px;font-weight:700;color:#F1F5F9;line-height:1.2">Mosvold Boutique Hotels</div>
                 <div style="font-size:10px;color:#64748B;font-weight:500;letter-spacing:0.04em">ANALYTICS</div>
             </div>
         </div>
@@ -231,26 +230,26 @@
 const SHEET_ID = '17aUyUY2SWwf7SwiWPhK1S7SJbdyP3VBswqCOnBsmOtQ';
 
 const SAMPLE_DATA = [
-    { timestamp: "2026-04-08 09:15", language: "English", guest_name: "Sarah Mitchell", check_in: "2026-04-20", check_out: "2026-04-22", room_preference: "Eco Harmony", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Guest booked Eco Harmony for 2 nights (Apr 20-22). Confirmed with advance payment." },
-    { timestamp: "2026-04-08 10:30", language: "Sinhala", guest_name: "Nuwan Perera", check_in: "2026-04-25", check_out: "2026-04-27", room_preference: "Mount Monarch", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Family inquired about Mount Monarch. Interested but wants to confirm with spouse." },
-    { timestamp: "2026-04-07 14:20", language: "English", guest_name: "James Cooper", check_in: "2026-05-10", check_out: "2026-05-13", room_preference: "Forest Escape Suite", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "UK tourist booked Forest Escape Suite for 3 nights. Asked about birding tours." },
+    { timestamp: "2026-04-08 09:15", language: "English", guest_name: "Sarah Mitchell", check_in: "2026-04-20", check_out: "2026-04-22", room_preference: "Deluxe Double Room with Sea View", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Guest booked a Deluxe Double Room with Sea View at Sundara for 2 nights (Apr 20-22). Confirmed with advance payment." },
+    { timestamp: "2026-04-08 10:30", language: "Sinhala", guest_name: "Nuwan Perera", check_in: "2026-04-25", check_out: "2026-04-27", room_preference: "Family Suite", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Family inquired about the Family Suite at Mosvold Villa. Interested but wants to confirm with spouse." },
+    { timestamp: "2026-04-07 14:20", language: "English", guest_name: "James Cooper", check_in: "2026-05-10", check_out: "2026-05-13", room_preference: "Beach Villa", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "UK tourist booked the Beach Villa at Sundara for 3 nights. Asked about surf lessons." },
     { timestamp: "2026-04-07 11:05", language: "Tamil", guest_name: null, room_preference: null, call_outcome: "general_inquiry", follow_up_needed: "No", summary: "Caller asked about room rates and meal plans." },
-    { timestamp: "2026-04-07 16:45", language: "English", guest_name: "Emma Watson", check_in: "2026-04-15", room_preference: "Sunrise Vista", call_outcome: "no_availability", follow_up_needed: "Yes", summary: "Australian family wanted Sunrise Vista for Easter. Fully booked." },
-    { timestamp: "2026-04-06 09:30", language: "Sinhala", guest_name: "Dinesh Fernando", room_preference: "Eco Harmony", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Local couple booked Eco Harmony for 1 night." },
-    { timestamp: "2026-04-06 13:15", language: "English", guest_name: "Priya Sharma", room_preference: "Mount Luxe", call_outcome: "callback_requested", follow_up_needed: "Yes", summary: "Group of 6 planning May Day trip. Will call back." },
-    { timestamp: "2026-04-06 15:40", language: "Tamil", guest_name: "Karthik Rajan", room_preference: "Mount Monarch", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Family asked about Mount Monarch. Interested in Junior Naturalists program." },
-    { timestamp: "2026-04-05 10:00", language: "English", guest_name: "Michael Brown", check_in: "2026-06-15", room_preference: "Forest Escape Suite", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "American couple booked 5-night stay. Interested in Jeep Safari." },
+    { timestamp: "2026-04-07 16:45", language: "English", guest_name: "Emma Watson", check_in: "2026-04-15", room_preference: "Founders Suite", call_outcome: "no_availability", follow_up_needed: "Yes", summary: "Australian family wanted the Founders Suite at Mosvold Villa for Easter. Fully booked." },
+    { timestamp: "2026-04-06 09:30", language: "Sinhala", guest_name: "Dinesh Fernando", room_preference: "Deluxe Double Room", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Local couple booked a Deluxe Double Room at Mosvold Villa for 1 night." },
+    { timestamp: "2026-04-06 13:15", language: "English", guest_name: "Priya Sharma", room_preference: "Family Villa with Pool", call_outcome: "callback_requested", follow_up_needed: "Yes", summary: "Group of 6 planning May Day trip at Sundara. Will call back." },
+    { timestamp: "2026-04-06 15:40", language: "Tamil", guest_name: "Karthik Rajan", room_preference: "Family Villa with Pool", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Family asked about the Family Villa with Pool at Sundara. Travelling with young children." },
+    { timestamp: "2026-04-05 10:00", language: "English", guest_name: "Michael Brown", check_in: "2026-06-15", room_preference: "Beach Villa", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "American couple booked a 5-night stay at Sundara. Interested in the Madu River boat safari." },
     { timestamp: "2026-04-05 12:30", language: "Sinhala", guest_name: null, room_preference: null, call_outcome: "dropped", follow_up_needed: "Yes", summary: "Call dropped after initial greeting." },
-    { timestamp: "2026-04-04 08:45", language: "English", guest_name: "Anoma Wijesekara", room_preference: "Sunrise Vista", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Anniversary couple booked Sunrise Vista Premium Suite." },
-    { timestamp: "2026-04-04 11:20", language: "English", guest_name: "Ravi Kumar", room_preference: "Mount Luxe", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Group inquiry for Mount Luxe Chalet. Will confirm." },
-    { timestamp: "2026-04-03 09:00", language: "Tamil", guest_name: "Lakshmi Devi", room_preference: "Eco Harmony", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Tamil family booked Eco Harmony Suite. Child under 5 stays free." },
-    { timestamp: "2026-04-03 14:50", language: "English", guest_name: "Oliver Smith", room_preference: null, call_outcome: "general_inquiry", follow_up_needed: "No", summary: "UK caller asked about cancellation policy and birdwatching." },
-    { timestamp: "2026-04-02 10:15", language: "Sinhala", guest_name: "Chaminda Bandara", room_preference: "Mount Monarch", call_outcome: "no_availability", follow_up_needed: "Yes", summary: "Group wanted Mount Monarch for Sinhala New Year. Fully booked." },
-    { timestamp: "2026-04-02 16:00", language: "English", guest_name: "Sophie Clark", check_in: "2026-07-01", room_preference: "Sunrise Vista", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Australian couple booked Sunrise Vista for July." },
-    { timestamp: "2026-04-01 09:45", language: "English", guest_name: "Arjun Jayawardena", room_preference: "Mount Luxe", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Family planning April holiday. Asking about child rates." },
+    { timestamp: "2026-04-04 08:45", language: "English", guest_name: "Anoma Wijesekara", room_preference: "Founders Suite", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Anniversary couple booked the Founders Suite at Mosvold Villa." },
+    { timestamp: "2026-04-04 11:20", language: "English", guest_name: "Ravi Kumar", room_preference: "Deluxe Twin Room", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Group inquiry for Deluxe Twin Rooms at Mosvold Villa. Will confirm." },
+    { timestamp: "2026-04-03 09:00", language: "Tamil", guest_name: "Lakshmi Devi", room_preference: "Deluxe Double Room with Garden View", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Tamil family booked a Deluxe Double Room with Garden View at Sundara. Asked about the child policy." },
+    { timestamp: "2026-04-03 14:50", language: "English", guest_name: "Oliver Smith", room_preference: null, call_outcome: "general_inquiry", follow_up_needed: "No", summary: "UK caller asked about cancellation policy and airport transfers." },
+    { timestamp: "2026-04-02 10:15", language: "Sinhala", guest_name: "Chaminda Bandara", room_preference: "Deluxe Twin Room with Sea View", call_outcome: "no_availability", follow_up_needed: "Yes", summary: "Group wanted Deluxe Twin Rooms with Sea View at Sundara for Sinhala New Year. Fully booked." },
+    { timestamp: "2026-04-02 16:00", language: "English", guest_name: "Sophie Clark", check_in: "2026-07-01", room_preference: "Deluxe Double Room with Sea View", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Australian couple booked a Deluxe Double Room with Sea View at Sundara for July." },
+    { timestamp: "2026-04-01 09:45", language: "English", guest_name: "Arjun Jayawardena", room_preference: "Deluxe Twin Room with Sea View", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Family planning April holiday at Sundara. Asking about the child policy." },
     { timestamp: "2026-04-01 13:30", language: "Tamil", guest_name: null, room_preference: null, call_outcome: "general_inquiry", follow_up_needed: "No", summary: "Caller asked about directions from Colombo." },
-    { timestamp: "2026-03-31 11:00", language: "Sinhala", guest_name: "Samantha Wijeratne", room_preference: "Forest Escape Suite", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Couple booked Forest Escape Suite for Sinhala New Year." },
-    { timestamp: "2026-03-30 15:20", language: "English", guest_name: "David Chen", check_in: "2026-05-20", room_preference: "Mount Monarch", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "US couple booked Mount Monarch (5 nights) for honeymoon." }
+    { timestamp: "2026-03-31 11:00", language: "Sinhala", guest_name: "Samantha Wijeratne", room_preference: "Family Suite", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Couple booked the Family Suite at Mosvold Villa for Sinhala New Year." },
+    { timestamp: "2026-03-30 15:20", language: "English", guest_name: "David Chen", check_in: "2026-05-20", room_preference: "Founders Suite", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "US couple booked the Founders Suite at Mosvold Villa (5 nights) for honeymoon." }
 ];
 
 // ====================================================================

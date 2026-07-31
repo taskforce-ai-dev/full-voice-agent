@@ -35,3 +35,8 @@ pyaudio>=0.2.13
 
 # Error tracking (optional; activated by SENTRY_DSN)
 sentry-sdk>=2,<3
+
+# Offline unit tests (tests/) — pytest-asyncio is needed for the async
+# yanolja_service availability/booking tests.
+pytest>=8
+pytest-asyncio>=0.23

@@ -96,7 +96,7 @@ TOOL_FILLERS: dict[str, str] = {
 }
 DEFAULT_FILLER: str = "Let me check that for you."
 
-WELCOME_GREETING = "Welcome to Treehouse Chalets! How may I help you today?"
+WELCOME_GREETING = "Welcome to Mosvold Boutique Hotels! How may I help you today?"
 
 # ── Pronunciation rewriting (romanized Sinhala → phonetic hints) ──────────
 # ElevenLabs doesn't know these are Sinhala — rewrite to phonetic spelling
@@ -142,8 +142,12 @@ SINHALA_PRONUNCIATION: dict[str, str] = {
     "Thuna":        "too nah",
     "Hathara":      "hah tah rah",
     "Passa":        "pahs sah",
-    # Place name
-    "Belihuloya":   "beh li hoo loh yah",
+    # Place / brand names
+    "Ahangama":     "ah hahn gah mah",
+    "Balapitiya":   "bah lah pi ti yah",
+    "Welhengoda":   "wel hen goh dah",
+    "Mosvold":      "moss vold",
+    "Sundara":      "soon dah rah",
 }
 
 # Pre-compile pronunciation regex for speed
@@ -244,7 +248,9 @@ def _build_system_prompt() -> str:
     today = date.today().isoformat()
     return (
         f"You are Kavya, the warm and gracious reservations voice agent for "
-        f"Treehouse Chalets, Belihuloya, Sri Lanka.\n"
+        f"Mosvold Boutique Hotels on Sri Lanka's Southern Coast. The group has "
+        f"two properties: Mosvold Villa in Ahangama and Sundara by Mosvold in "
+        f"Balapitiya. Never mix up their room types or details.\n"
         f"Today's date is {today}.\n\n"
 
         "LANGUAGE RULES:\n"

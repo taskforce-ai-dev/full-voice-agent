@@ -1,8 +1,35 @@
 """
-Claude tool definitions for the hotel voice agent.
+Claude tool definitions for the Hatton Hills voice agent (Kavya).
 
 Defines the tool schemas that Claude uses for function calling and
-dispatches tool invocations to the booking API (n8n webhook integration).
+dispatches tool invocations to the booking API (booking_api -> yanolja_service).
+
+Hatton Hills is a SINGLE property — a luxury boutique eco retreat in Sri Lanka's
+central hill country, reservations line +94 77 220 4400. It has exactly five room
+types, all distinct:
+
+  * Forest Escape Suite            (up to 2 guests)
+  * Eco Harmony Suite              (up to 2 guests)
+  * Sunrise Vista Premium Suite    (up to 2 guests)
+  * Mount Luxe Chalet              (up to 5 guests)
+  * Mount Monarch Chalet           (up to 5 guests)
+
+Rates ARE published and the agent quotes them: US dollars per room per night,
+half board, taxes included. The figures live in
+yanolja_service.DEMO_NIGHTLY_RATE_USD and are invented for demonstrations.
+
+SINGLE-PROPERTY MODE (2026-07-30). This module previously served two Mosvold
+properties whose room names collided, so the `property` argument was REQUIRED and
+dispatch failed closed with an "ask which property" error when it was missing.
+Both of those are now gone: `property` is optional and `normalise_property`
+always resolves to PROPERTY_HATTON. Leaving either in place would have made the
+model ask a "which property?" question that has no valid answer, blocking every
+booking. `_property_required_error` is kept but is unreachable.
+
+The `property_name` plumbing itself is retained end to end (execute_tool ->
+booking_api.check_availability / create_booking -> yanolja_service) so a second
+property can be reintroduced by restoring the alias map, making `property`
+required again, and letting `normalise_property` return None. Do not delete it.
 """
 
 import json
@@ -20,23 +47,139 @@ from booking_api import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Property / room vocabulary
+# ---------------------------------------------------------------------------
+
+PROPERTY_HATTON = "Hatton Hills"
+
+PROPERTIES: tuple[str, ...] = (PROPERTY_HATTON,)
+
+# The five Hatton Hills room types. All distinct, none a prefix of another, so a
+# room request is never ambiguous. These strings must match
+# yanolja_service.ROOM_TYPES_BY_PROPERTY and room_types.name in the PMS
+# byte-for-byte — see ops/hattonhills-pms/rename_to_hattonhills.sql.
+ROOM_TYPES_BY_PROPERTY: dict[str, tuple[str, ...]] = {
+    PROPERTY_HATTON: (
+        "Forest Escape Suite",
+        "Eco Harmony Suite",
+        "Sunrise Vista Premium Suite",
+        "Mount Luxe Chalet",
+        "Mount Monarch Chalet",
+    ),
+}
+
+RESERVATIONS_PHONE = "+94 77 220 4400"
+
+# Recognised mentions of the property. Resolution does not depend on this map —
+# `normalise_property` falls back to the single property for anything unmatched.
+_PROPERTY_ALIASES: dict[str, str] = {
+    "hatton hills": PROPERTY_HATTON,
+    "hatton": PROPERTY_HATTON,
+    "hatton hills resort": PROPERTY_HATTON,
+    "hill country": PROPERTY_HATTON,
+}
+
+
+def normalise_property(value: str | None) -> str:
+    """Resolve a caller/LLM-supplied property string to the canonical name.
+
+    SINGLE-PROPERTY MODE: always returns PROPERTY_HATTON and never None. Hatton
+    Hills is the only property, so a missing or unrecognised value is not an
+    error — it is the normal case, because nothing asks the guest which property
+    they mean. Returning None here would fail the tool call closed on a question
+    the guest cannot answer.
+
+    Mirrors yanolja_service.resolve_property; keep the two in agreement."""
+    if value:
+        key = " ".join(str(value).lower().replace("-", " ").split()).strip(" .,")
+        if key in _PROPERTY_ALIASES:
+            return _PROPERTY_ALIASES[key]
+        hits = {p for alias, p in _PROPERTY_ALIASES.items() if alias in key}
+        if len(hits) == 1:
+            return hits.pop()
+    return PROPERTY_HATTON
+
+
+def _property_required_error(raw_value: str | None) -> str:
+    """JSON error telling the model to establish the property first.
+
+    UNREACHABLE in single-property mode: `normalise_property` never returns a
+    falsy value, so no dispatch path can reach this. Retained only so the
+    two-property behaviour can be restored without rewriting dispatch."""
+    logger.info("Tool call blocked — property not established (got %r)", raw_value)
+    return json.dumps(
+        {
+            "error": "property_not_established",
+            "message": (
+                "Which property the guest wants was not established. Ask the "
+                "guest which property they mean, then call this tool again."
+            ),
+            "valid_properties": list(PROPERTIES),
+        }
+    )
+
+
+def _room_type_error(property_name: str, room_type: str) -> str:
+    """JSON error for a room type that does not belong to the given property."""
+    logger.info(
+        "Tool call blocked — room type %r is not offered at %s", room_type, property_name
+    )
+    return json.dumps(
+        {
+            "error": "room_type_not_at_property",
+            "message": (
+                f"'{room_type}' is not a room type at {property_name}. Confirm the "
+                "property and the room with the guest before booking."
+            ),
+            "property": property_name,
+            "valid_room_types": list(ROOM_TYPES_BY_PROPERTY[property_name]),
+        }
+    )
+
+
+def _matches_room_type(property_name: str, room_type: str) -> bool:
+    """True when room_type names a room offered at property_name."""
+    wanted = " ".join(str(room_type).lower().split())
+    if not wanted:
+        return False
+    return any(
+        wanted == candidate.lower() for candidate in ROOM_TYPES_BY_PROPERTY[property_name]
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool definitions (Claude function-calling schema)
 # ---------------------------------------------------------------------------
+
+_PROPERTY_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "enum": list(PROPERTIES),
+    "description": (
+        "The property, always 'Hatton Hills'. OPTIONAL — Hatton Hills is the only "
+        "property, so this defaults correctly when omitted. Do NOT ask the guest "
+        "which property or which location they mean; there is only one."
+    ),
+}
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "check_availability",
         "description": (
-            "Check room availability at the hotel for a given date range. "
+            "Check room availability at Hatton Hills for a given date range. "
+            "Hatton Hills is the only property, so do NOT ask the guest which "
+            "property or location they mean; 'property' is optional. "
             "Call this EXACTLY ONCE per booking inquiry — it returns results "
             "for ALL room types in a single response. Do NOT filter by "
             "room_type and do NOT call this multiple times in a row. The "
             "guest's room preference is irrelevant at availability check "
-            "time; surface all available types from the single response."
+            "time; surface all available types from the single response. "
+            "The result includes the nightly rate in US dollars for each "
+            "available room type — you MAY quote those figures to the guest."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
+                "property": _PROPERTY_SCHEMA,
                 "check_in": {
                     "type": "string",
                     "description": "Check-in date in YYYY-MM-DD format.",
@@ -57,7 +200,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "rate_type": {
                     "type": "string",
-                    "description": "Rate plan code, e.g. 'BB' (Bed & Breakfast).",
+                    "description": "Rate plan code. Hatton Hills is half board; 'HB'.",
                     "default": "BB",
                 },
                 "salutation": {
@@ -74,18 +217,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "description": "Guest phone number with country code.",
                 },
             },
+            # 'property' deliberately NOT required — single-property mode.
             "required": ["check_in", "check_out"],
         },
     },
     {
         "name": "create_booking",
         "description": (
-            "Create a new hotel reservation. Use ONLY after confirming "
-            "availability and getting explicit confirmation from the guest."
+            "Create a new reservation at Hatton Hills. Use ONLY after "
+            "confirming availability and getting explicit confirmation from "
+            "the guest. Hatton Hills is the only property and 'property' is "
+            "optional. The room_type must be one of the five Hatton Hills room "
+            "types."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
+                "property": _PROPERTY_SCHEMA,
                 "check_in": {
                     "type": "string",
                     "description": "Check-in date in YYYY-MM-DD format.",
@@ -96,7 +244,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "room_type": {
                     "type": "string",
-                    "description": "Human-readable room type name, e.g. 'Mount Luxe' or 'Forest Escape Suite'.",
+                    "description": (
+                        "Human-readable room type name. One of the five Hatton "
+                        "Hills room types: 'Forest Escape Suite', 'Eco Harmony "
+                        "Suite', 'Sunrise Vista Premium Suite' (each up to 2 "
+                        "guests), 'Mount Luxe Chalet', 'Mount Monarch Chalet' "
+                        "(each up to 5 guests). Use the full name exactly."
+                    ),
                 },
                 "guest_name": {
                     "type": "string",
@@ -123,7 +277,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "rate_type": {
                     "type": "string",
-                    "description": "Rate plan code, e.g. 'BB' (Bed & Breakfast).",
+                    "description": "Rate plan code. Hatton Hills is half board; 'HB'.",
                     "default": "BB",
                 },
                 "room_name": {
@@ -131,13 +285,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "description": "Specific room name within the room type; defaults to room_type if omitted.",
                 },
             },
+            # 'property' deliberately NOT required — single-property mode.
             "required": ["check_in", "check_out", "room_type", "guest_name"],
         },
     },
     {
         "name": "retrieve_booking",
         "description": (
-            "Look up an existing hotel reservation. Use when a guest asks "
+            "Look up an existing reservation at Hatton Hills. Use "
+            "when a guest asks "
             "about their booking status, wants to check reservation details, "
             "or provides a confirmation number. Can search by reservation "
             "number, email, or date range."
@@ -330,7 +486,17 @@ def get_tools_gemini() -> list[dict[str, Any]]:
 
 
 async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
-    """Dispatch a tool call to the corresponding eZee API function.
+    """Dispatch a tool call to the corresponding booking API function.
+
+    SINGLE-PROPERTY MODE: `normalise_property` always resolves to "Hatton Hills",
+    so the `property_name is None` guards below are unreachable. They are kept as
+    the restore point for reintroducing a second property, and cost nothing.
+
+    `create_booking` still validates the room type against the property's
+    catalogue via `_matches_room_type`, and that check remains strict (exact
+    name match): booking a guest into the wrong room type is worse than
+    rejecting the call and making the model retry with the full name, which
+    `_room_type_error` supplies.
 
     Parameters
     ----------
@@ -346,7 +512,14 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     """
     logger.info("Executing tool '%s' with input: %s", tool_name, tool_input)
 
+    property_name: str | None = None
+
     if tool_name == "check_availability":
+        property_name = normalise_property(tool_input.get("property"))
+        if property_name is None:
+            return _property_required_error(tool_input.get("property"))
+        logger.info("check_availability for property: %s", property_name)
+
         result = await check_availability(
             check_in=tool_input["check_in"],
             check_out=tool_input["check_out"],
@@ -359,9 +532,21 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
             guest_name=tool_input.get("guest_name"),
             guest_phone=tool_input.get("guest_phone"),
             guest_email=tool_input.get("guest_email"),
+            property_name=property_name,
         )
 
     elif tool_name == "create_booking":
+        property_name = normalise_property(tool_input.get("property"))
+        if property_name is None:
+            return _property_required_error(tool_input.get("property"))
+
+        requested_room = (tool_input.get("room_type") or "").strip()
+        if not _matches_room_type(property_name, requested_room):
+            return _room_type_error(property_name, requested_room)
+        logger.info(
+            "create_booking for property: %s, room type: %s", property_name, requested_room
+        )
+
         result = await create_booking(
             check_in=tool_input["check_in"],
             check_out=tool_input["check_out"],
@@ -374,6 +559,7 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
             num_children=tool_input.get("num_children", 0),
             rate_type=tool_input.get("rate_type", "BB"),
             room_name=tool_input.get("room_name", ""),
+            property_name=property_name,
         )
 
     elif tool_name == "retrieve_booking":
@@ -433,6 +619,13 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     else:
         logger.error("Unknown tool requested: %s", tool_name)
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+    # Echo the resolved property back so the model keeps the two properties
+    # apart when it reads the result. This is presentation only -- the actual
+    # scoping happens upstream: property_name is forwarded into
+    # check_availability/create_booking, which pass it to yanolja_service.
+    if property_name and isinstance(result, dict):
+        result = {**result, "property": property_name}
 
     logger.info("Tool '%s' returned: %s", tool_name, result)
     return json.dumps(result)

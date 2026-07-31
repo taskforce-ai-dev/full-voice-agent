@@ -256,11 +256,45 @@ MANDATORY at the start of EVERY session, before any code exploration:
    you need exact line-level detail to edit it. Never read files just to understand
    structure — the graph already has that.
 
-After modifying any code file in a session, run **`python ops/graphify-update-wsl.py`**
-(from the repo root, with the Windows store Python that has graphify) to keep the graph
-current — AST-only, no API cost. Do NOT run bare `graphify update .` on this WSL/UNC
-checkout: it aborts on the normcase bug and re-bloats the graph with admin build
-artifacts. Add `--force` when the node count legitimately drops.
+After modifying any code file in a session, refresh the graph — AST-only, no API cost.
+**Which command depends on which machine you are on:**
+
+- **On the cloud dev rig (`198.211.114.60`, native Linux, graphify 0.8.13 via pipx):**
+  run plain **`graphify update .`** from the repo root. The WSL wrapper is NOT needed —
+  the normcase bug is specific to `\\wsl.localhost\` UNC paths, and the repo-root
+  `.graphifyignore` handles the admin-bundle exclusions (verified 2026-07-30: the
+  Sentinel admin SPA stayed out).
+- **On the Windows/WSL UNC checkout:** run **`python ops/graphify-update-wsl.py`**.
+  Bare `graphify update .` aborts there on the normcase bug.
+
+Add `--force` when the node count legitimately drops.
+
+> **Three gotchas learned the hard way on 2026-07-30 — read before updating:**
+>
+> 1. **The graph now exceeds the HTML-viz limit.** AST re-extraction produces far
+>    finer-grained nodes than the Jun 18 curated LLM build did: the graph went
+>    3,411 → **7,345 nodes / 10,191 edges / 568 communities**. The viz limit is 5,000, so
+>    a plain `graphify update .` **silently deletes `graph.html`** and only prints a
+>    skip notice. Regenerate it with
+>    `GRAPHIFY_VIZ_NODE_LIMIT=9000 graphify cluster-only .`
+>    (rebuilds report + viz from the existing `graph.json`; no re-extraction, no API cost).
+> 2. **NEVER delete `graph.json` to force a clean rebuild.** It holds the INFERRED
+>    semantic layer from the Jun 18 LLM build — ~1,790 edges (`rationale_for` 1,678,
+>    `semantically_similar_to` 66, `conceptually_related_to` 48) that cost real API spend.
+>    An AST-only rebuild cannot recreate them. `update` merges AST re-extraction into the
+>    existing graph and preserves them; a from-scratch build does not.
+> 3. **`.graphifyignore` additions do NOT retroactively remove existing nodes.**
+>    `update` compares topology and refuses to rewrite for pure removals — it reports
+>    "No code-graph topology changes detected; outputs left untouched" even with `--force`
+>    and even after `rm -rf graphify-out/cache`. Newly excluded paths stop being
+>    *extracted* immediately but their nodes linger until some other change triggers a
+>    genuine rebuild. Consequence: **`.firecrawl/` scrape caches contributed 328 stale
+>    nodes** that are still in the graph despite now being excluded. Harmless noise
+>    (4.5%); they will drop on the next real topology change.
+
+Rebuild the full graph (`/graphify .`) only when large new areas of the codebase appear
+that `graphify update` cannot pick up — and budget for it, since it re-runs the LLM
+semantic pass.
 
 Rebuild the full graph (`/graphify .`) only when large new areas of the codebase appear
 that `graphify update` cannot pick up.

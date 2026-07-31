@@ -8,6 +8,12 @@ The public surface (function names, signatures, and return-dict shapes)
 is preserved so tools.py and server.py need no changes. Extra fields
 introduced by the new PMS (rate_per_night_usd, total_usd, room_number)
 are additive -- old consumers that ignore unknown keys keep working.
+
+Hatton Hills is a SINGLE property with five distinct room types, so
+check_availability() and create_booking() still take a `property_name` and
+forward it to yanolja_service, but it no longer needs to be supplied: an empty
+value resolves to "Hatton Hills". The parameter is retained so a second property
+can be reintroduced without changing this layer's public surface.
 """
 from __future__ import annotations
 
@@ -82,6 +88,7 @@ async def check_availability(
     guest_name: str = "",
     guest_phone: str = "",
     guest_email: str = "",
+    property_name: str = "",   # "Hatton Hills" (single property; may be empty)
 ) -> dict[str, Any]:
     if not is_configured():
         return dict(_UNAVAILABLE)
@@ -92,6 +99,7 @@ async def check_availability(
             num_adults=num_adults,
             num_children=num_children,
             room_type_filter=room_type or "",
+            property_name=property_name or "",
         )
     except yanolja_client.YanoljaError as exc:
         logger.warning("Yanolja availability check failed: %s", exc)
@@ -113,6 +121,7 @@ async def create_booking(
     num_children: int = 0,
     rate_type: str = "BB",
     room_name: str = "",
+    property_name: str = "",   # "Hatton Hills" (single property; may be empty)
 ) -> dict[str, Any]:
     if not is_configured():
         return dict(_UNAVAILABLE)
@@ -127,6 +136,7 @@ async def create_booking(
             salutation=salutation,
             num_adults=num_adults,
             num_children=num_children,
+            property_name=property_name or "",
         )
     except yanolja_client.YanoljaError as exc:
         logger.warning("Yanolja booking failed: %s", exc)
