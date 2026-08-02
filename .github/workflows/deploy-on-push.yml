@@ -122,6 +122,16 @@ jobs:
     if: ${{ needs.detect.outputs.has == 'true' && needs.kb-verify.result == 'success' }}
     strategy:
       fail-fast: false
+      # Deploys run ON the production VPS: `build` mode rebuilds the Docker
+      # image there, competing for CPU/RAM/disk with the agents answering live
+      # calls. On 2026-08-02 a batch touching all 8 agents fanned out at once;
+      # the box was starved and the SSH sessions died mid-`exporting layers`
+      # ("client_loop: send disconnect: Broken pipe", exit 255), failing 3 of
+      # the 8 deploys. The agents stayed up — a build dies before the container
+      # swap — but the failures masked a real dependency conflict in a fourth.
+      # Two at a time keeps a batch survivable. Raise only after builds move
+      # off the production host.
+      max-parallel: 2
       matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
     uses: ./.github/workflows/deploy.yml
     with:
