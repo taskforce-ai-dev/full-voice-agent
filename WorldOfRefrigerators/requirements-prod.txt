@@ -29,7 +29,7 @@ google-genai>=2.15.0
 httpx>=0.25.0
 
 # Form parsing (required for request.form() — Twilio webhook body parsing)
-python-multipart>=0.0.7
+python-multipart>=0.0.32
 
 # Utilities
 python-dotenv>=1.0.0
