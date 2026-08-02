@@ -30,4 +30,9 @@ paths = [
 regexes = [
   # Twilio Account SID — a public account *identifier* (ACxxxx...), not a secret.
   '''AC[0-9a-f]{32}''',
+  # Test-fixture idempotency keys in the (now-deleted)
+  # Kavya/tests/ezee_bridge/test_production_composition.py. These are literal
+  # placeholder strings, not secrets, but they trip generic-api-key on
+  # full-history scans. Matches ONLY these exact fixture literals.
+  '''(cancel|reconcile)-idempotency-key-\d+''',
 ]
