@@ -21,7 +21,7 @@ google-cloud-speech>=2.0.0
 google-genai>=2.15.0
 
 # HTTP client
-httpx>=0.25.0
+httpx>=0.28.1
 
 # Form parsing (required for request.form() — Twilio webhook body parsing)
 python-multipart>=0.0.7
