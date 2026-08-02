@@ -10,7 +10,7 @@ anthropic>=0.40.0
 twilio>=9.0.0
 
 # Azure Speech (TTS/STT — production and local testing)
-azure-cognitiveservices-speech>=1.35.0
+azure-cognitiveservices-speech>=1.51.1
 
 # Google Cloud Speech-to-Text (required for Media Streams STT)
 google-cloud-speech>=2.0.0
