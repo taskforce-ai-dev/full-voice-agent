@@ -1,8 +1,17 @@
 # Onboarding — read this before your first commit
 
-Welcome. This repo runs **live phone agents that answer real customer calls**.
-That single fact shapes every rule below. Please read this end to end once — it
-takes five minutes and it will stop you from having a bad first week.
+Welcome. This repo builds **phone agents that answer real customer calls**. That
+single fact shapes every rule below. Please read this end to end once — it takes
+five minutes and it will stop you from having a bad first week.
+
+> **Current status (Aug 2026): no agent is live for a client yet.** The fleet is
+> deployed and healthy, but it is not taking customer traffic. So today a bad
+> merge costs you a rebuild, not a dropped call.
+>
+> The rules below are written for the day that changes, which is soon and may
+> not come with an announcement. Build the habits now, while mistakes are cheap
+> — nobody develops good deploy discipline during their first real incident.
+> **If you are ever unsure whether an agent is live, assume it is.**
 
 `CONTRIBUTING.md` is the full reference. This page is the part you need on day one.
 
