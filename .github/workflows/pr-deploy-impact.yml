@@ -2,8 +2,8 @@
 # PR Deploy Impact — tell the reviewer what merging will ship
 # ----------------------------------------------------------------------------
 # Merging a PR to main deploys to PRODUCTION via deploy-on-push.yml. On the free
-# GitHub plan nothing enforces review, so the reviewer's go/no-go IS the gate.
-# This workflow makes that call an informed one: every PR gets a sticky comment
+# plan nothing enforces review, so the reviewer's go/no-go IS the gate. This
+# workflow makes that call an informed one: every PR gets a sticky comment
 # naming the agents that will deploy on merge, the mode each will use, and
 # whether calls get interrupted.
 #
@@ -12,18 +12,37 @@
 # change them here too — a comment that under-reports the blast radius is worse
 # than no comment at all.
 #
-# This workflow only reports. It never deploys and touches no secrets.
+# ---------------------------------------------------------------------------
+# WHY pull_request_target, AND WHY IT IS SAFE HERE
+# ---------------------------------------------------------------------------
+# Dependabot opens most of the PRs in this repo, and many of them bump an agent's
+# requirements*.txt — which means a `build` deploy: full rebuild + restart of a
+# live voice agent. Those are the PRs where this comment matters MOST.
+#
+# GitHub hands Dependabot-triggered `pull_request` runs a READ-ONLY token, so a
+# `pull_request` workflow cannot post a comment on them (403). `pull_request_target`
+# runs in the context of the base branch and gets a writable token, so it can.
+#
+# pull_request_target is normally dangerous because the usual pattern — check out
+# the PR head and then build/test/execute it — runs untrusted code with a
+# privileged token. THIS WORKFLOW NEVER CHECKS OUT PR CODE AT ALL. It reads the
+# changed-file list from the REST API and does string matching on filenames. No
+# actions/checkout, no dependency install, no script from the PR is executed.
+#
+# If you ever add `actions/checkout` to this file, you MUST move it back to
+# `pull_request` or you will have created a repo-takeover vector.
+#
+# Permissions are the minimum needed to comment. No deploy, no VPS secrets.
 # ============================================================================
 
 name: PR Deploy Impact
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
     branches: [main]
 
 permissions:
-  contents: read
   pull-requests: write
 
 concurrency:
@@ -32,25 +51,18 @@ concurrency:
 
 jobs:
   impact:
-    # Fork PRs get a read-only token and cannot be commented on from here.
-    # Team members push branches to this repo, so this is the normal path.
-    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-
       - id: detect
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
 
-          # Diff from the merge base so we describe what this PR ADDS to main,
-          # not everything main has moved on by since the branch was cut.
-          BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
-          CHANGED=$(git diff --name-only "$BASE" "$HEAD_SHA")
+          # Changed files straight from the API — no checkout, no PR code on disk.
+          CHANGED=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
           echo "Changed files:"; printf '%s\n' "$CHANGED"
 
           : > rows.md
@@ -112,7 +124,8 @@ jobs:
               echo
               if [ "$BUILD_ANY" = "true" ]; then
                 echo '**Heads up:** at least one agent is in `build` mode — a full image'
-                echo 'rebuild, so the outage window is minutes rather than seconds.'
+                echo 'rebuild, so the outage window is minutes rather than seconds. Dependency'
+                echo 'bumps land here: a routine-looking version PR is a production rebuild.'
                 echo
               fi
             else
