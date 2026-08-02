@@ -2,14 +2,34 @@
 
 ## What This Is
 
-Fiona is a multilingual AI voice agent for **Flico** (flico.lk), Sri Lanka's trusted technology and electronics retailer. Handles inbound phone calls via Twilio, uses a configurable LLM (Claude, OpenAI, or Gemini) for conversation, and grounds answers in a ChromaDB-based RAG knowledge base about Flico products, services, and policies.
+**The directory name is wrong and so was this paragraph.** This is NOT the Flico
+electronics retailer. It is a **real-estate** voice agent. The "Flico" naming
+survives only in the directory, the FastAPI title, the deploy path
+(`/opt/flico`), the container (`flico-voice-agent`) and the hostname
+(`flico.taskforceai.tech`) — renaming those touches deploy wiring, so they stay.
 
-The agent persona is **Fiona** — a warm, trilingual (English, Tamil, Sinhala) customer service agent. Language is selected via IVR/DTMF menu (press 1/2/3) at call start.
+This one process serves **two storefronts**, selected by a `brand` parameter
+(see `brands.py`):
 
-Fiona is an **informational agent only** — no booking tools, no external APIs. She answers queries about products, prices, store locations, delivery, and policies using the knowledge base.
+| Brand key | Agency | Agent | Reached via | Human transfer |
+|---|---|---|---|---|
+| `rodrigo` (default) | Rodrigo Realtors | Fiona | the live inbound phone line — **a paying customer** | yes |
+| `starproperties` | Star Properties | Amaya | the website Book-a-Demo card | **no** |
+
+Both share one retrieval engine and one synthetic 12-row rental portfolio
+(`knowledge_docs/listings.json`). Answers are grounded in that KB; there are no
+booking tools. `DEFAULT_BRAND = "rodrigo"` is load-bearing — every call site that
+passes only `lang` resolves to the paying customer's persona.
+
+> **The brand key is not free-form.** It MUST equal the agent `id` in the
+> website's `BookDemo.tsx`, because that id is what Twilio forwards and what
+> Hatton's `DEMO_AGENT_HOSTS` routes on. On 2026-07-30 this backend was built
+> against `startproperty` while the live site already said `starproperties`, and
+> every demo call silently fell through to the Hatton Hills hotel agent. **Fetch
+> the website repo and read the live `id` before touching brand routing.**
 
 **Single server mode:**
-- `server.py` — Production server (IVR DTMF menu: English -> ConversationRelay+ElevenLabs, Tamil -> Media Streams+ElevenLabs multilingual, Sinhala -> Media Streams+OpenAI `gpt-4o-mini-tts`)
+- `server.py` — Production server (ConversationRelay for phone + demo; Media Streams handlers retained for Tamil/Sinhala but no longer routed to from the phone line)
 
 ## Project File Map
 
@@ -73,18 +93,33 @@ Copy `.env.example` to `.env`. Key groups:
 
 ## Architecture
 
-### IVR Flow
+### Call flow — the phone IVR is GONE (verified 2026-07-30)
+
+`/voice/incoming` has **no `<Gather>` and no DTMF menu**. Its docstring reads
+"English only -- no IVR/language menu" and it connects every inbound call
+straight to the English ConversationRelay:
+
 ```
-Incoming call
-  -> POST /voice/incoming (returns TwiML with <Gather> DTMF menu: 1=EN, 2=TA, 3=SI)
-  -> Caller presses 1, 2, or 3 (no digit within timeout -> Redirect, defaults to EN)
-  -> POST /voice/language-selected
-  -> English: ConversationRelay WebSocket /ws/conversation?lang=en
-  -> Tamil:   Media Streams WebSocket /ws/media-stream/ta
-  -> Sinhala: Media Streams WebSocket /ws/media-stream/si
+Incoming phone call
+  -> POST /voice/incoming
+  -> <Connect><ConversationRelay …/ws/conversation?lang=en&brand=rodrigo>
 ```
 
-DIGIT map (`DIGIT_TO_LANG` in `server.py`): `1`->`en`, `2`->`ta`, `3`->`si`.
+```
+Website Book-a-Demo call (Star Properties)
+  -> Hatton's shared TwiML app <Redirect>s here on agent id 'starproperties'
+  -> POST /voice/demo-incoming
+  -> <Connect><ConversationRelay …/ws/conversation?lang=en&brand=starproperties>
+```
+
+The Tamil/Sinhala Media Streams handlers (`/ws/media-stream/{lang}`) still
+exist and still work, but **nothing routes a phone caller to them** now that
+the menu is gone.
+
+> This section previously described a `<Gather>` menu with press 1/2/3 and a
+> `DIGIT_TO_LANG` map. That was removed from the code and the doc was not
+> updated. On 2026-07-30 the stale text caused a test to be written asserting a
+> `<Gather>` that does not exist. If you change the routing, change this too.
 
 ### TTS / STT routing by language
 | Lang | Digit | Transport          | STT (Google)        | TTS                                     |
@@ -124,8 +159,8 @@ per turn). `bedrooms` is in metadata but deliberately NOT a filter — occupancy
   consultative real-estate **sales** persona (qualify -> build value -> handle
   objections -> advance to a viewing + lead capture), strictly KB-grounded.
 - New **OCCUPANCY vs BEDROOMS** rule: "N people/family/guests" = occupancy, never
-  a bedroom count (fixes the "4 people -> only 4-bedroom units" drift). Apartments
-  start at 3 bedrooms; agent states that floor as a benefit, never invents a 1-/2-bed.
+  a bedroom count (fixes the "4 people -> only 4-bedroom units" drift). The
+  bedroom-floor wording is portfolio-specific — see the Jul 16 2026 note below.
 - New **SALES APPROACH** block + honour-the-requested-property-TYPE rule (don't
   drift apartment->house on area match).
 - Rent must be read with its exact period ("per day" vs "per month" — e.g. P03 is
@@ -140,10 +175,196 @@ per turn). `bedrooms` is in metadata but deliberately NOT a filter — occupancy
   changes without an image rebuild. (`docker compose build` currently fails on the
   VPS with `No space left on device` — disk at ~89%, images ~56GB; unrelated to code.)
 
+### Jul 16 2026 — DEMO portfolio swap (P51–P62)
+
+`knowledge_docs/flico_info.txt` no longer holds the real 49-listing Rodrigo
+portfolio. It was replaced with **12 synthetic DEMO listings (P51–P62)** to
+exercise 1BR/2BR search: 3x 1BR apartment (P51–53), 3x 2BR apartment (P54–56),
+3x 1BR house (P57–59), 3x 2BR house (P60–62), across Colombo 2,3,5,6,7,8.
+**This data is not real inventory** — the source note says to replace every row
+with verified Google Sheet data before real production use. The real portfolio
+is recoverable from git history (the commit before this one).
+
+Consequences worth knowing:
+- The portfolio is now **1BR/2BR only, residential only**. The system prompt's
+  bedroom-floor and commercial/office claims were rewritten to match: Fiona used
+  to be told "our apartments start at three bedrooms" and "we do not currently
+  have any one-bedroom or two-bedroom apartments", which would have made her deny
+  the very listings this demo exists to test. If you restore the real KB, restore
+  those prompt lines too — prompt and KB must state the same portfolio facts.
+- `kb/formatter.py` now emits each row's stored prose (`description`) instead of a
+  synthesized one-liner. The old line dropped the street, amenities, bathrooms,
+  lease terms and availability, so the sqlite backend was silently starving the
+  "tell the caller everything" prompt rule. Rows with no prose still fall back to
+  the synthesized line.
+- Unlike the chroma backend, the sqlite backend **does** filter on bedrooms, from
+  an explicit "N-bed(room)" phrase only — the count may be a digit or a word
+  ("two bedroom"), since STT transcribes what the caller says. A plain "two
+  bedroom" is an EXACT match (`bedrooms = 2`); only "at least 2" / "2 or more" /
+  "2+" is a floor (`min_bedrooms`). "N people" is still never a bedroom filter.
+  The count is sticky across turns like type and zone.
+- **The relaxation ladder never substitutes silently.** When the exact filter set
+  is empty it relaxes rent, then bedrooms, then property_type — and prepends a
+  `NOTE:` to the context naming what was given up, so the LLM cannot present a
+  house as the apartment that was asked for. Zone is never dropped. An exact
+  match carries no note. `kb/engine.py::_RELAXATIONS` is the whole ladder.
+- Rent: "under/below/less than" is exclusive, "up to/max/budget of" inclusive.
+  Ranges ("between 300k and 500k", "300k-500k") and floors ("over 300k") parse;
+  a scale unit is required there so "more than 2 bedrooms" is never read as money.
+
+`tests/test_portfolio_lookups.py` (renamed from test_demo_portfolio_lookups.py
+once the demo portfolio was replaced by the real 60-row inventory) asserts all
+of the above end-to-end against the real KB prose. Its expectations are computed
+from `tests/truth_table.py` via `tests/oracle.py::expected_ids`, not hardcoded —
+the old hardcoded ID lists all went stale the moment the portfolio changed.
+
+> **It does NOT need sentence-transformers, and it DOES gate deploys.** This doc
+> claimed the opposite for months. `tests/conftest.py::build_kb` monkeypatches
+> the embedder before `RealEstateKB.__init__` runs, and the real library is only
+> imported lazily inside that constructor — so the file runs fine in the
+> `pytest numpy pydantic`-only CI environment, and a failure here blocks
+> `kb-verify` and therefore every deploy. Verified 2026-07-30 in an isolated
+> venv: 37/37 in under a second.
+
+### Jul 17 2026 — the pipeline is INVERTED: rows are the source, prose is generated
+
+`knowledge_docs/listings.json` is the **source of truth**. `kb/prose.py` GENERATES
+each listing's paragraph from its fields. **Nothing parses prose back into
+fields** on this path — do not reintroduce that, it is the whole point.
+
+Why: the agency's data *arrives structured*. The old pipeline forced it into prose
+so `kb/migrate.py` could regex it back into rows — we destructured the data, then
+paid to reconstruct it. That round-trip is where the bugs lived (duplicated type
+vocabulary that drifted, first-`Rs`-wins rent matching, unknown types silently
+filed as apartments).
+
+- **Edit listings** in `listings.json`. Review is a PR diff — a changed rent is one
+  line. Rollback is `git revert`.
+- `flico_info.txt` is now a **fallback only**, kept so a rollback is one file away.
+  `initialize_kb` prefers `listings.json` and falls back on any failure.
+- `flico_preamble.txt` holds the non-listing prose (intro, AREAS COVERED, NEXT
+  STEPS).
+- `key_features` are **data** now. They used to exist only inside the paragraph
+  (`migrate.py` hardcoded `key_features=[]`), so no filter could ever see them —
+  "something with a pool" was unanswerable structurally. It no longer is.
+- `commentary` holds human-authored colour ("It is a garden bungalow"). That is
+  where personality belongs — **never** an LLM paraphrase.
+
+**No LLM in this pipeline.** The exhaustive proof is a statement about a FIXED row
+set; make row derivation probabilistic and all 584 filter cases verify against a
+moving target. An LLM belongs at import-time for genuinely messy documents only
+(a PDF) — emitting *rows, never prose*, with per-field source quotes, nulls that
+block publish rather than guesses, and a human reviewing **against the source**,
+not against the LLM's own output. Then it is frozen as data. Never re-run.
+
+`tests/test_prose_roundtrip.py` is the migration bridge: it renders every row and
+feeds it through the OLD `parse_prose`, asserting the fields survive and match the
+truth table. Two independent implementations agreeing is evidence; one agreeing
+with itself is not. **Delete it together with migrate.py's regex layer** once
+`/kb-reload` accepts structured rows.
+
+**Production runs Python 3.11; this dev box runs 3.12.** A PEP 701 f-string
+(nested same-type quotes) compiled here and was a SyntaxError there — which would
+have been a hard outage, since `kb/prose.py` is imported by `server.py`. Local
+`py_compile` will not save you. The `kb-verify` CI job pins 3.11 and caught it.
+
+### Jul 16 2026 — the KB filter is verified by EXHAUSTION, not by sampling
+
+Five bugs were found by spot-checking, then six more by enumeration. The root
+cause was never the individual bugs: the suite tested a hand-picked *diagonal* of
+a (filter dimension x semantic decision) matrix nobody had written down, so every
+dimension no one consciously decided kept its accidental default. Stickiness
+alone regressed twice (bedrooms, then budget) before this landed.
+
+**Do not fix a KB bug by adding one more example test.** Add the dimension to the
+grammar/oracle and let the sweep prove the whole space. The domain is finite:
+
+- `tests/truth_table.py` — the 12 rows as plain data, transcribed by hand.
+  **Imports nothing from `kb/`.** Regenerate + re-audit when real data lands.
+- `tests/oracle.py` — `satisfies()` written from the spec (documented in its
+  docstring), **not** from `database.py`. Testing the code against itself proves
+  nothing; the signed spec is what makes the oracle equal intent.
+- `tests/test_truth_crosscheck.py` — `migrate` == the audited table. One
+  assertion pins both the prose parser and the prose content.
+- `tests/test_exhaustive_filter.py` — every type x zone x beds x rent-bound (584).
+  Rent uses **equivalence classes**: SQL comparisons are monotone, so each
+  distinct rent +/-1 and the midpoints covers *every* real-valued threshold.
+- `tests/test_exhaustive_parser.py` — ~60k utterances from a grammar declared as
+  data, including STT mishearings and decoys that must parse to **nothing**
+  (occupancy "four people", sizes "under 1000 square feet", counts "more than 2
+  bedrooms"). Each decoy was a real bug.
+
+All of it runs on numpy+pydantic+pytest (no sentence-transformers) in ~20s, and
+**gates deploys**: `.github/workflows/deploy-on-push.yml` job `kb-verify` is
+required by `deploy`. `/kb-reload` bypasses CI entirely, so
+`knowledge_base_sqlite._validate` rejects a bad batch **before writing to disk**
+(writing first let a bad paste take effect on the next restart) and keeps the
+previous inventory.
+
+**Ranking may only ORDER the matched set, never truncate it.** `n_results=None`
+is the default end-to-end. It was 6 while the filter matched 9 for "under 300k",
+so prod silently hid three properties the caller qualified for — and the
+acceptance tests ran at 12, certifying a configuration prod never executed. If a
+real portfolio makes unbounded context too slow, cap it *deliberately* and know
+that the completeness guarantee weakens to "top-k of a correct set".
+
+**What is NOT guaranteed** (say this plainly, never oversell it):
+
+- **What Fiona *says*.** We prove she is *handed* a correct, complete,
+  self-labelling context. Obeying it is prompt-following, not proof. Measured,
+  not assumed: `evals/answer_eval.py` (see below). It has already caught a real
+  invention — asked in Sinhala for the cheapest listing she named the right
+  property and rent, then called it "අසාත්මික රහිත" (allergen-free), a feature
+  from nowhere. Retrieval was perfect; the lie was in the translation.
+
+- **Tamil and Sinhala get NO filters.** The parser is English regex and those
+  paths transcribe in native script, so type/zone/bedrooms all come back `None`.
+  This is much less bad than it sounds *because* `n_results=None`: an unfiltered
+  query now returns the COMPLETE inventory (all 12), not 6 arbitrary rows as it
+  did before. Nothing is hidden from the LLM — but the LLM, not the provable SQL
+  layer, is doing the filtering. The honest guarantee for TA/SI is therefore
+  "provably complete context, unproven filtering", versus "provably correct
+  filtered set" for English.
+  **This does not scale.** At 12 rows, handing over the whole inventory is fine.
+  At the real ~49-row portfolio it is slow, expensive per turn, and eventually
+  forces truncation back — at which point TA/SI silently lose listings again. A
+  native-script parser vocabulary is the fix. It is **researched but deliberately
+  not shipped**: see `docs/flico-tamil-sinhala-kb-vocabulary.md`, which has the
+  tables, per-entry confidence flags, the Indic-script `\b` problem, and the
+  substring traps (SI කාමර hiding inside නාන කාමර = two *bathrooms* → bedrooms=2;
+  TA ஒரு meaning both "one" and "a/an" → "a house in Colombo" → zone 1). Shipping
+  it unverified would make a measured-working path worse, so it needs a native
+  speaker and a week of raw STT transcripts first. Sinhala terms vetted so far
+  live in the `server.py` glossary; Tamil has none.
+
+- Utterances outside the declared grammar fall through to unfiltered ranking.
+  Same shape: complete context, LLM filters. An area outside `_AREA_TO_ZONE`
+  ("Nugegoda") yields no zone filter and the whole inventory, so only the
+  PORTFOLIO FACTS block stops a wrong answer. Covered by eval, not by proof.
+
+- The oracle rests on one human audit of 12 rows. Verification relocates trust.
+- `KB_BACKEND=chroma` has none of these semantics.
+
+### evals/answer_eval.py — QA, never quote it as proof
+
+Replicates the exact production call shape per language and grades each reply
+mechanically (invented refs/prices) plus with an LLM judge. Costs money and is
+nondeterministic, so it is NOT in CI. Run it before shipping a prompt or KB
+change:
+
+    docker exec flico-voice-agent python evals/answer_eval.py
+
+Run it MORE THAN ONCE. A single green run means nothing — the failure above only
+appeared on the third pass.
+- Photo URLs from the demo sheet are deliberately NOT in the KB: this is a voice
+  agent, the placeholders are fake, and the KB tells callers a salesperson shares
+  photos on follow-up.
+
 ## Server Endpoints
 
-- `POST /voice/incoming` — Returns TwiML with `<Gather>` DTMF language menu (1=EN, 2=TA, 3=SI)
-- `POST /voice/language-selected` — Routes to ConversationRelay (EN) or Media Streams (TA, SI)
+- `POST /voice/incoming` — Live phone line. **No IVR/`<Gather>`** — connects straight to English ConversationRelay as brand `rodrigo`.
+- `GET|POST /voice/demo-incoming` — Website Book-a-Demo entry. English only, brand `starproperties` (Amaya). Hatton's shared TwiML app `<Redirect>`s here for agent id `starproperties`. Optional distinct voice via `CR_VOICE_STARPROPERTIES`.
+- `POST /voice/language-selected` — Routes to ConversationRelay (EN) or Media Streams (TA, SI). Retained, but the phone line no longer reaches it.
 - `WebSocket /ws/conversation` — English ConversationRelay
 - `WebSocket /ws/media-stream/{lang}` — Tamil/Sinhala Media Streams (Google STT + TTS); `{lang}` is `ta` or `si`
 - `GET /health` — Health check
