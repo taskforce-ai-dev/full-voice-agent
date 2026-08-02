@@ -585,3 +585,28 @@ MANDATORY at the start of EVERY session, before any code exploration:
 
 After modifying any code in this directory, run `graphify update .` from the project
 root to keep the graph current (AST-only, no API cost).
+
+## Website demo routing — DEMO_AGENT_HOSTS (recovered 2026-07-30)
+
+This server owns the router for **every** website Book-a-Demo call. All demo
+cards mint a token for ONE shared Twilio TwiML app whose voiceUrl is this
+server's `/voice/demo-incoming`; the site passes the chosen agent via
+`Device.connect({params:{agent}})`, which Twilio forwards as a POST field on
+that first webhook only. Non-Hatton agents are `<Redirect>`ed to their own
+`/voice/demo-incoming`; `hatton` stays local.
+
+**Adding a website demo agent means adding an entry to `DEMO_AGENT_HOSTS`.**
+Without one the call silently falls through to Tanya, and the visitor gets a
+hotel receptionist for a business that is not a hotel.
+
+> **The dict key MUST equal the agent `id` in the website's `BookDemo.tsx`.**
+> Fetch that repo and read the live value — do not trust a local checkout. On
+> 2026-07-30 the key said `startproperty` while the deployed site already sent
+> `starproperties` (renamed in PR #18), so every Star Properties demo call
+> reached Hatton Hills instead. Current keys: `kitchened`,
+> `worldofrefrigerators`, `starproperties`.
+
+> This router existed **only on the production VPS** until 2026-07-30 — it had
+> been hot-patched into `/opt/hatton-hills/server.py` and never committed. Since
+> deploys rsync + hot-swap `server.py`, any deploy from `main` would have wiped
+> it and broken the other demos. It is in git now; keep it there.
