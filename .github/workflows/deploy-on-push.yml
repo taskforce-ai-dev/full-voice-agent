@@ -107,7 +107,7 @@ jobs:
             echo "Flico Agent untouched — KB verification not required."
           fi
       - if: steps.touched.outputs.run == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with: { python-version: '3.11' }
       - if: steps.touched.outputs.run == 'true'
         run: pip install --quiet pytest numpy pydantic
