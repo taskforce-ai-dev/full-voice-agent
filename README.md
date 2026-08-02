@@ -77,6 +77,14 @@ its host port and the full env var list.
 
 ## Deploy
 
+> **How we actually ship: [`CONTRIBUTING.md`](./CONTRIBUTING.md) §6 — read it first.**
+> Short version: **merging to `main` deploys to production automatically.** Never
+> commit directly to `main`; branch → PR → review → merge.
+>
+> The `./deploy.sh` commands below are the **per-agent provisioning/manual escape
+> hatch**, not the normal path. Day-to-day deploys go through
+> `.github/workflows/deploy-on-push.yml`.
+
 Each agent deploys independently to the DigitalOcean VPS at **`67.207.90.109`** (SSH `root@`),
 running as a Docker container behind nginx (SSL termination, WebSocket upgrade, rate limiting), each
 on its own host port (e.g. Kavya `8000`, Sofia/SLIC `8001`, BSL `8002`, Flico `8003`).

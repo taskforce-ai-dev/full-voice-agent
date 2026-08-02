@@ -4,6 +4,11 @@ This is a **private monorepo** of multilingual AI voice agents for Taskforce AI.
 Read this before making your first change — a few things in this repo are
 WSL-specific and will silently break if you ignore them.
 
+> **This file is the source of truth for how we branch, review, and deploy.**
+> `CLAUDE.md`, `AGENTS.md`, and `README.md` carry short summaries for their own
+> audiences and link back here. If any of them disagrees with this file, **this
+> file wins** — and the summary is a bug, so fix it in the same PR.
+
 For a tour of the repo and the agents, start with [`README.md`](./README.md).
 For deep work on any single agent, read that agent's `CLAUDE.md`.
 
@@ -64,12 +69,28 @@ Keep the subject imperative and concise.
 
 ---
 
-## 3. Branching
+## 3. Branching — PR into `main`, always
 
-- `main` is the default branch and the deploy source.
-- Branch protection is **not enforced server-side** (free GitHub plan), so the
-  discipline is on us: prefer a short-lived feature branch + PR for anything
-  non-trivial, keep `main` green, and don't force-push shared history.
+> **Read §6 before your first push.** `main` is not a staging area:
+> **every push to `main` deploys to production automatically.**
+
+- `main` is the default branch and the **live deploy source**.
+- **Never commit directly to `main`.** Branch, push the branch, open a PR, get
+  one review, then merge. The merge is what ships.
+- Branch naming: `feat/<scope>-<short-desc>`, `fix/<scope>-<short-desc>`,
+  `chore/<...>` — scope is the agent id (`kavya`, `flico`, `bsl`, …) or area
+  (`ci`, `docs`, `ops`).
+- Keep branches short-lived and `main` green. Don't force-push shared history.
+
+### This is convention, not enforcement
+
+We are on the **free GitHub plan**, where protected branches and rulesets are
+unavailable on private repos. GitHub will **not** stop you from pushing straight
+to `main`, and it will not stop that push from deploying to production. There is
+no safety net behind this section — the rule is the safety net.
+
+If you are about to push to `main` and you are not certain what will deploy, stop
+and ask in the team channel first.
 
 ---
 
@@ -128,24 +149,50 @@ rationale.
 
 ---
 
-## 6. Deploying
+## 6. Deploying — merging to `main` IS deploying
 
-Each agent deploys independently to the DigitalOcean VPS (`67.207.90.109`) as a
-Docker container, via the **manual CD workflow** in
-`.github/workflows/deploy.yml`. The GitHub Actions runner checks out the chosen
-ref, rsyncs the agent's folder to `/opt/<dir>` (excluding `.env` and runtime
-state), then runs `docker compose up -d --build` plus a health check.
+> ⚠️ **There is no approval step and no staging environment.** The moment a
+> commit lands on `main`, `.github/workflows/deploy-on-push.yml` deploys every
+> agent whose folder changed to the **production** VPS (`67.207.90.109`), where
+> real customer calls are being answered. Treat a merge to `main` as a
+> production release, because it is one.
+
+Each agent deploys independently as a Docker container. On a push to `main`, the
+mode is chosen automatically **per changed agent**:
+
+- **fast** — only code / `knowledge_docs` changed → rsync + hot-swap the changed
+  `.py` files into the running container + `docker restart`. Seconds, no rebuild.
+- **build** — `requirements*.txt` / `Dockerfile` / `docker-compose.yml` changed →
+  rsync + `docker compose up -d --build`. Slower.
+
+Only agents that actually changed deploy; pushes touching just tooling or docs
+deploy nothing. A `py_compile` syntax gate blocks obviously-broken pushes. The
+VPS `.env` files and runtime state are never touched (rsync excludes them).
+
+**Either mode interrupts in-flight calls on that agent** — fast is a quick
+restart, build is longer. Land production changes during a quiet window.
+
+### Manual deploy / redeploy / rollback
+
+`deploy.yml` is the engine and can also be run on its own — use this to redeploy
+without a code change, or to roll back to an earlier ref:
 
 ```bash
-gh workflow run deploy.yml -f agent=kavya -f ref=main           # tip of main
-gh workflow run deploy.yml -f agent=flico -f ref=flico-v1.0.0   # a specific tag
+gh workflow run deploy.yml -f agent=kavya -f ref=main                  # tip of main
+gh workflow run deploy.yml -f agent=flico -f ref=flico-v1.0.0          # a tag
+gh workflow run deploy.yml -f agent=kavya -f ref=<sha> -f mode=fast    # roll back
 ```
 
-Or use the **Actions tab → Deploy Agent (manual) → Run workflow**. A deploy
-rebuilds the image and restarts that agent's container, briefly interrupting
-in-flight calls — deploy during a quiet window. Full details, the
+Or **Actions tab → Deploy Agent → Run workflow**. Full details, the
 agent → folder → container table, and rollback steps are in
 [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md).
+
+### Who can deploy
+
+Anyone with Write access to this repo can merge to `main`, and therefore can
+deploy to production. Repo secrets (`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`) are
+readable by any workflow in the repo. Access to this repo is access to
+production — treat the member list accordingly.
 
 ---
 

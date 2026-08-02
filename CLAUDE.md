@@ -71,7 +71,14 @@ Claude Code / Codex do the editing, so local machines stay thin. It is fully
 
 ## Deployment — AUTO-DEPLOY ON PUSH (Jul 1 2026)
 
-Pushing to `main` now **auto-deploys** each changed agent to prod
+> **Source of truth: [`CONTRIBUTING.md`](./CONTRIBUTING.md) §6.** This section is
+> a summary for agent sessions. If it contradicts CONTRIBUTING.md, CONTRIBUTING.md
+> is right — fix this section.
+>
+> **Never commit directly to `main`** (CONTRIBUTING.md §3). Branch → PR → review →
+> merge. The merge is the production release.
+
+Pushing to `main` **auto-deploys** each changed agent to prod
 (`67.207.90.109`) via `.github/workflows/deploy-on-push.yml` → `deploy.yml`:
 - **fast** (code / `knowledge_docs` only): rsync + hot-swap the `.py` into the
   running container + `docker restart` (seconds, no rebuild).
