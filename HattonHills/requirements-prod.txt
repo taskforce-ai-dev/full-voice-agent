@@ -16,7 +16,7 @@ chromadb>=0.4.0
 sentence-transformers>=2.2.0
 
 # STT (Media Streams) — Google (default) + Azure (STT_PROVIDER=azure)
-google-cloud-speech>=2.0.0
+google-cloud-speech>=2.40.0
 azure-cognitiveservices-speech>=1.51.1
 # audioop (mulaw→PCM for Azure STT + audio dumps) is stdlib on the 3.11 image;
 # backport it only where it was removed (3.13+).

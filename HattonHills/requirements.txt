@@ -13,7 +13,7 @@ twilio>=9.0.0
 azure-cognitiveservices-speech>=1.51.1
 
 # Google Cloud Speech-to-Text (required for Media Streams STT)
-google-cloud-speech>=2.0.0
+google-cloud-speech>=2.40.0
 
 # Google Cloud TTS (optional, legacy local testing)
 # google-cloud-texttospeech>=2.14.0
