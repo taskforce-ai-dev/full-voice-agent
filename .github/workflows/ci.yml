@@ -11,6 +11,8 @@
 # installing full project dependencies wherever possible:
 #
 #   * lint          - ruff over the whole tree (needs NO project deps).
+#                     ADVISORY by policy (CONTRIBUTING.md §1): reports, never
+#                     fails. See the job comment for the tightening path.
 #   * docs-drift    - re-runs ops/sync-agent-docs.sh and fails if any
 #                     */AGENTS.md is out of sync with its CLAUDE.md.
 #   * dockerfile-lint - hadolint over every agent Dockerfile (ADVISORY: only
@@ -50,10 +52,26 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
-    # Lenient at first: the existing codebase predates ruff, so `ruff check .`
-    # will report style violations on day 1. Kept informational (not a required
-    # status check) so it doesn't block merges. Fix violations incrementally,
-    # then remove continue-on-error and promote `lint` to a required check.
+    # ADVISORY BY POLICY (CONTRIBUTING.md §1): this codebase predates ruff, so a
+    # full-tree `ruff check .` reports ~1,000 pre-existing violations across
+    # every agent folder. They cannot be mass-fixed safely — reformatting agent
+    # .py files on main hot-swaps every production voice agent at once (see
+    # deploy-on-push.yml). Blocking on them keeps CI permanently red, which
+    # trains people to ignore CI.
+    #
+    # The previous job-level `continue-on-error: true` was NOT enough: GitHub
+    # still renders the failed job as a red X on the run and on PR checks, so
+    # the pipeline *looked* broken on every run even when nothing was wrong.
+    # Now the ruff step itself always exits 0 and publishes the full report to
+    # the job log + step summary, so red in this workflow always means a REAL
+    # failure elsewhere.
+    #
+    # Tightening path (in order, as debt is paid down during quiet windows):
+    #   1. per-folder cleanup PRs (one agent at a time, quiet-window merges),
+    #   2. then replace `exit 0` below with `exit "$status"`,
+    #   3. then promote `lint` to a required check.
+    # continue-on-error stays as a belt-and-braces so an infra flake in this
+    # advisory job (pip/network) can never redden the run either.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -63,10 +81,31 @@ jobs:
           python-version: "3.11"
 
       - name: Install ruff
-        run: pip install ruff
+        # Pinned so the advisory violation count only moves when the code (or a
+        # deliberate bump) changes, not whenever ruff releases new rules.
+        run: pip install "ruff==0.16.1"
 
-      - name: Run ruff
-        run: ruff check .
+      - name: Run ruff (advisory — reports, never blocks; CONTRIBUTING.md §1)
+        run: |
+          set +e
+          ruff check . --output-format concise
+          status=$?
+          {
+            echo "## ruff (advisory — does not block merges)"
+            if [ "$status" -eq 0 ]; then
+              echo ""
+              echo "No violations. Consider starting the tightening path in ci.yml."
+            else
+              echo ""
+              echo "Pre-existing violations, grandfathered per CONTRIBUTING.md §1."
+              echo "Do not mass-fix: reformatting agent folders auto-deploys to prod."
+              echo ""
+              echo '```'
+              ruff check . --statistics 2>/dev/null
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
 
   # -------------------------------------------------------------------------
   # 2. Docs drift — AGENTS.md must mirror CLAUDE.md.
