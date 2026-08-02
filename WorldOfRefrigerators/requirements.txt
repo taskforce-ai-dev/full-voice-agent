@@ -7,7 +7,7 @@ websockets>=12.0
 anthropic>=0.40.0
 
 # Telephony
-twilio>=9.0.0
+twilio>=9.10.9
 
 # Azure Speech (TTS/STT — production and local testing)
 azure-cognitiveservices-speech>=1.35.0
