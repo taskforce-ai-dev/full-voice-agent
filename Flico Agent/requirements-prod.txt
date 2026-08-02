@@ -21,7 +21,7 @@ pydantic>=2,<3
 
 # STT
 google-cloud-speech>=2.0.0
-azure-cognitiveservices-speech>=1.34.0
+azure-cognitiveservices-speech>=1.51.1
 
 # Gemini native SDK
 google-genai>=1.0.0
