@@ -36,13 +36,13 @@ WORKDIR /app
 # dependencies don't change — even if application code does.
 # requirements-prod.txt intentionally excludes pyaudio (needs PortAudio C lib,
 # only used in local demo) and azure-cognitiveservices-speech (backup TTS).
-COPY requirements-prod.txt .
+COPY requirements-prod.lock.txt .
 # Install CPU-only torch FIRST so sentence-transformers does not pull the full
 # CUDA/GPU stack (nvidia-cu13, cudnn, nccl, triton — ~6GB). This droplet has no
 # GPU; CPU inference is functionally identical and cuts the image from ~9GB to
 # ~2.5GB, avoiding disk-exhaustion on the shared VPS.
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir -r requirements-prod.txt
+RUN pip install --no-cache-dir -r requirements-prod.lock.txt
 
 # --- Application code --------------------------------------------------------
 # Only the files needed at runtime are copied. We deliberately exclude:

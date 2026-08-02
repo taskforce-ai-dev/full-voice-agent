@@ -43,8 +43,8 @@ WORKDIR /app
 # pulls the CUDA wheel. Cuts the image from ~9GB to ~2.5GB with no runtime change
 # (MiniLM embeddings run on CPU regardless).
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-COPY requirements-prod.txt .
-RUN pip install --no-cache-dir -r requirements-prod.txt
+COPY requirements-prod.lock.txt .
+RUN pip install --no-cache-dir -r requirements-prod.lock.txt
 
 # --- Bake the embedding model into the image --------------------------------
 # The KB embeds with all-MiniLM-L6-v2. Without this, the model is downloaded from

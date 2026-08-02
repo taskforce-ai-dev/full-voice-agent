@@ -187,6 +187,33 @@ Or **Actions tab → Deploy Agent → Run workflow**. Full details, the
 agent → folder → container table, and rollback steps are in
 [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md).
 
+### Dependencies are pinned — edit the source, regenerate the lock
+
+Each agent has two dependency files:
+
+- **`requirements-prod.txt`** — the human-readable statement of intent, with
+  comments. This is what you edit and what Dependabot updates.
+- **`requirements-prod.lock.txt`** — **generated**, fully resolved including
+  transitive packages. **This is what the Dockerfile installs.**
+
+The lock is why rebuilding the same commit gives you the same image. Without it
+every rebuild resolved to whatever was newest that day, so an agent could break
+with nobody having changed a line.
+
+After changing `requirements-prod.txt`, regenerate the lock:
+
+```bash
+cd "<Agent Folder>"
+docker run --rm -v "$PWD:/w" -w /w python:3.11-slim sh -c \
+  'pip install --no-cache-dir -q -r requirements-prod.txt && pip freeze' \
+  > requirements-prod.lock.txt
+```
+
+Never hand-edit the lock. If a Dependabot PR bumps `requirements-prod.txt`, the
+lock must be regenerated in the same PR or the bump has no effect on the image.
+
+> `Sofia Agent/` is intentionally unpinned — it is parked and does not deploy.
+
 ### Who can deploy
 
 Anyone with Write access to this repo can merge to `main`, and therefore can
