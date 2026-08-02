@@ -1,0 +1,159 @@
+# ============================================================================
+# PR Deploy Impact — tell the reviewer what merging will ship
+# ----------------------------------------------------------------------------
+# Merging a PR to main deploys to PRODUCTION via deploy-on-push.yml. On the free
+# GitHub plan nothing enforces review, so the reviewer's go/no-go IS the gate.
+# This workflow makes that call an informed one: every PR gets a sticky comment
+# naming the agents that will deploy on merge, the mode each will use, and
+# whether calls get interrupted.
+#
+# The detection logic here MIRRORS deploy-on-push.yml (same agent map, same
+# fast/build rule, same Flico KB gate). If you change the detection rules there,
+# change them here too — a comment that under-reports the blast radius is worse
+# than no comment at all.
+#
+# This workflow only reports. It never deploys and touches no secrets.
+# ============================================================================
+
+name: PR Deploy Impact
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-deploy-impact-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  impact:
+    # Fork PRs get a read-only token and cannot be commented on from here.
+    # Team members push branches to this repo, so this is the normal path.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Diff from the merge base so we describe what this PR ADDS to main,
+          # not everything main has moved on by since the branch was cut.
+          BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD_SHA")
+          echo "Changed files:"; printf '%s\n' "$CHANGED"
+
+          : > rows.md
+          any=false
+          build_any=false
+
+          # Same agent map as deploy-on-push.yml. Folder names contain spaces —
+          # keep them quoted and matched with grep -F.
+          for entry in "BSL Agent:bsl" "Flico Agent:flico" "HattonHills:hatton" \
+                       "SLIC Agent:slic" "Sofia Agent:sofia" "Kavya:kavya" \
+                       "Kitchened:kitchened" "WorldOfRefrigerators:wor"; do
+            dir="${entry%%:*}"; id="${entry##*:}"
+            match=$(printf '%s\n' "$CHANGED" | grep -F "$dir/" || true)
+            [ -z "$match" ] && continue
+
+            any=true
+            mode=fast
+            effect='hot-swap changed `.py` + `docker restart` — seconds'
+            if printf '%s\n' "$match" | grep -qE 'requirements.*\.txt|Dockerfile|docker-compose\.ya?ml'; then
+              mode=build
+              effect='full image rebuild + `compose up -d --build` — minutes'
+              build_any=true
+            fi
+
+            count=$(printf '%s\n' "$match" | grep -c . || true)
+            printf '| `%s` | `%s` | **%s** | %s | %s |\n' \
+              "$id" "$dir" "$mode" "$effect" "$count" >> rows.md
+            echo "-> $id ($mode)"
+          done
+
+          echo "any=$any" >> "$GITHUB_OUTPUT"
+          echo "build_any=$build_any" >> "$GITHUB_OUTPUT"
+
+          if printf '%s\n' "$CHANGED" | grep -qF 'Flico Agent/'; then
+            echo "flico=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "flico=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: body
+        env:
+          ANY: ${{ steps.detect.outputs.any }}
+          BUILD_ANY: ${{ steps.detect.outputs.build_any }}
+          FLICO: ${{ steps.detect.outputs.flico }}
+        run: |
+          set -euo pipefail
+          {
+            echo '<!-- deploy-impact -->'
+            echo '## Deploy impact'
+            echo
+            if [ "$ANY" = "true" ]; then
+              echo '> **Merging this PR deploys to production** (`67.207.90.109`).'
+              echo '> The agents below restart, briefly interrupting any in-flight calls.'
+              echo '> Merge during a quiet window.'
+              echo
+              echo '| Agent | Folder | Mode | Effect on merge | Files |'
+              echo '|---|---|---|---|---|'
+              cat rows.md
+              echo
+              if [ "$BUILD_ANY" = "true" ]; then
+                echo '**Heads up:** at least one agent is in `build` mode — a full image'
+                echo 'rebuild, so the outage window is minutes rather than seconds.'
+                echo
+              fi
+            else
+              echo 'No agent folders changed — **merging this PR deploys nothing.**'
+              echo 'Tooling, CI and docs changes do not reach the VPS.'
+              echo
+            fi
+
+            if [ "$FLICO" = "true" ]; then
+              echo '`Flico Agent/` is touched, so the **KB verification gate** runs on merge'
+              echo '(`pytest` over the retrieval filter). If it fails, no agent deploys.'
+              echo
+            fi
+
+            echo '<details><summary>Rollback</summary>'
+            echo
+            echo '```bash'
+            echo 'gh workflow run deploy.yml -f agent=<id> -f ref=<last-good-sha> -f mode=fast'
+            echo '```'
+            echo
+            echo '</details>'
+            echo
+            echo '_Mirrors the detection in `deploy-on-push.yml`. See [CONTRIBUTING.md §6](../blob/main/CONTRIBUTING.md). Reporting only — this workflow never deploys._'
+          } > comment.md
+          cat comment.md
+
+      - name: Post or update the sticky comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq 'map(select(.body | startswith("<!-- deploy-impact -->"))) | .[0].id // empty')
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+              -F body=@comment.md >/dev/null
+            echo "Updated comment $existing"
+          else
+            gh api --method POST "repos/$REPO/issues/$PR/comments" \
+              -F body=@comment.md >/dev/null
+            echo "Created new comment"
+          fi
