@@ -1,10 +1,10 @@
 # Core server
 fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
+uvicorn[standard]>=0.52.0
 websockets>=12.0
 
 # AI / LLM
-anthropic>=0.40.0
+anthropic>=0.120.2
 openai>=1.0.0
 
 # Telephony
@@ -20,14 +20,14 @@ numpy>=1.24
 pydantic>=2,<3
 
 # STT
-google-cloud-speech>=2.0.0
-azure-cognitiveservices-speech>=1.34.0
+google-cloud-speech>=2.40.0
+azure-cognitiveservices-speech>=1.51.1
 
 # Gemini native SDK
 google-genai>=1.0.0
 
 # HTTP client
-httpx>=0.25.0
+httpx>=0.28.1
 
 # Form parsing (required for request.form() — Twilio webhook body parsing)
 python-multipart>=0.0.7

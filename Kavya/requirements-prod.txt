@@ -1,5 +1,5 @@
 # Core server
-fastapi>=0.104.0
+fastapi>=0.141.1
 uvicorn[standard]>=0.24.0
 websockets>=12.0
 
@@ -8,7 +8,7 @@ anthropic>=0.40.0
 openai>=1.0.0
 
 # Telephony
-twilio>=9.0.0
+twilio>=9.10.9
 
 # Knowledge base / RAG
 chromadb>=0.4.0
@@ -28,14 +28,14 @@ google-genai>=1.0.0
 httpx>=0.25.0
 
 # Form parsing (required for request.form() — Twilio webhook body parsing)
-python-multipart>=0.0.7
+python-multipart>=0.0.32
 
 # Utilities
 python-dotenv>=1.0.0
-aiohttp>=3.9.0
+aiohttp>=3.14.3
 
 # PDF support for knowledge base (optional)
-PyPDF2>=3.0.0
+PyPDF2>=3.0.1
 
 # Error tracking (optional; activated by SENTRY_DSN)
 sentry-sdk>=2,<3

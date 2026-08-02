@@ -1,7 +1,7 @@
 # Core server
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
-websockets>=12.0
+websockets>=17.0
 
 # AI / LLM
 anthropic>=0.40.0
@@ -10,10 +10,10 @@ anthropic>=0.40.0
 twilio>=9.0.0
 
 # Azure Speech (TTS/STT — production and local testing)
-azure-cognitiveservices-speech>=1.35.0
+azure-cognitiveservices-speech>=1.51.1
 
 # Google Cloud Speech-to-Text (required for Media Streams STT)
-google-cloud-speech>=2.0.0
+google-cloud-speech>=2.40.0
 
 # Google Cloud TTS (optional, legacy local testing)
 # google-cloud-texttospeech>=2.14.0
@@ -31,7 +31,7 @@ httpx>=0.25.0
 PyPDF2>=3.0.0
 
 # Local testing audio playback
-pyaudio>=0.2.13
+pyaudio>=0.2.14
 
 # Error tracking (optional; activated by SENTRY_DSN)
 sentry-sdk>=2,<3

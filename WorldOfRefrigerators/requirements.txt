@@ -1,13 +1,13 @@
 # Core server
 fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
+uvicorn[standard]>=0.52.0
 websockets>=12.0
 
 # AI / LLM
 anthropic>=0.40.0
 
 # Telephony
-twilio>=9.0.0
+twilio>=9.10.9
 
 # Azure Speech (TTS/STT — production and local testing)
 azure-cognitiveservices-speech>=1.35.0
@@ -28,7 +28,7 @@ aiohttp>=3.9.0
 httpx>=0.25.0
 
 # PDF support for knowledge base (optional)
-PyPDF2>=3.0.0
+PyPDF2>=3.0.1
 
 # Local testing audio playback
 pyaudio>=0.2.13
