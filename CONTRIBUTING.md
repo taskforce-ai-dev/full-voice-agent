@@ -165,10 +165,24 @@ rationale.
 Each agent deploys independently as a Docker container. On a push to `main`, the
 mode is chosen automatically **per changed agent**:
 
+- **image** — the image is built on the **GitHub runner**, pushed to GHCR tagged
+  by commit SHA, and the VPS only pulls and restarts. Nothing is compiled on the
+  production host.
 - **fast** — only code / `knowledge_docs` changed → rsync + hot-swap the changed
   `.py` files into the running container + `docker restart`. Seconds, no rebuild.
 - **build** — `requirements*.txt` / `Dockerfile` / `docker-compose.yml` changed →
-  rsync + `docker compose up -d --build`. Slower.
+  rsync + `docker compose up -d --build`, **built on the VPS**. Legacy.
+
+> **`image` is where all agents are heading.** Building on the production host
+> means pip and docker compete with the containers answering calls — on
+> 2026-08-02 eight concurrent builds starved the box and failed 3 of 8 deploys.
+> `Kitchened` is the pilot; the rest follow once it has proven itself.
+>
+> The mode is chosen from the agent's `docker-compose.yml`: if it pulls a
+> `ghcr.io/...` image instead of declaring `build:`, it gets `image` mode. There
+> is no second list to keep in sync. For a registry agent **every** change means
+> a new image — there is no `fast` hot-swap path, because the container no longer
+> runs code copied from disk.
 
 Only agents that actually changed deploy; pushes touching just tooling or docs
 deploy nothing. A `py_compile` syntax gate blocks obviously-broken pushes. The
