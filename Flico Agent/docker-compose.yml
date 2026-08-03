@@ -13,7 +13,16 @@
 services:
   flico:
     # -- Build from the Dockerfile in the project root ----------
-    build: .
+    # -- Image is built in CI and pulled from GHCR --------------
+    # NOT built here. .github/workflows/deploy.yml (mode: image) builds on the
+    # GitHub runner and pushes ghcr.io/taskforce-ai-dev/flico:<sha>; the VPS
+    # only pulls. Building on the production host is what starved the box on
+    # 2026-08-02. See CONTRIBUTING.md §6.
+    #
+    # IMAGE_TAG is exported by the deploy step and pins this to one immutable
+    # SHA tag. To roll back by hand:
+    #   IMAGE_TAG=<sha> docker compose pull && IMAGE_TAG=<sha> docker compose up -d
+    image: ghcr.io/taskforce-ai-dev/flico:${IMAGE_TAG:-latest}
     container_name: flico-voice-agent
 
     # -- Networking ---------------------------------------------

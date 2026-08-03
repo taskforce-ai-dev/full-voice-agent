@@ -173,10 +173,13 @@ mode is chosen automatically **per changed agent**:
 - **build** — `requirements*.txt` / `Dockerfile` / `docker-compose.yml` changed →
   rsync + `docker compose up -d --build`, **built on the VPS**. Legacy.
 
-> **`image` is where all agents are heading.** Building on the production host
-> means pip and docker compete with the containers answering calls — on
-> 2026-08-02 eight concurrent builds starved the box and failed 3 of 8 deploys.
-> `Kitchened` is the pilot; the rest follow once it has proven itself.
+> **All seven active agents use `image`.** Building on the production host meant
+> pip and docker competing with the containers answering calls — on 2026-08-02
+> eight concurrent builds starved the box and failed 3 of 8 deploys. Nothing is
+> compiled on the VPS any more.
+>
+> `fast` and `build` remain only for `Sofia Agent`, which is parked. Do not use
+> them for a new agent.
 >
 > The mode is chosen from the agent's `docker-compose.yml`: if it pulls a
 > `ghcr.io/...` image instead of declaring `build:`, it gets `image` mode. There
