@@ -153,9 +153,14 @@ rationale.
 
 > ⚠️ **There is no approval step and no staging environment.** The moment a
 > commit lands on `main`, `.github/workflows/deploy-on-push.yml` deploys every
-> agent whose folder changed to the **production** VPS (`67.207.90.109`), where
-> real customer calls are being answered. Treat a merge to `main` as a
-> production release, because it is one.
+> agent whose folder changed to the **production** VPS (`67.207.90.109`). Treat a
+> merge to `main` as a production release, because it is one.
+
+> **Status (Aug 2026): no agent is answering for a client yet.** The fleet is
+> deployed and healthy but takes no customer traffic, so today a bad merge costs
+> a rebuild rather than a dropped call. That will change, and it will not change
+> with an announcement — so the rules here are written for the live case.
+> **If you are unsure whether an agent is live, assume it is.**
 
 Each agent deploys independently as a Docker container. On a push to `main`, the
 mode is chosen automatically **per changed agent**:
@@ -169,8 +174,10 @@ Only agents that actually changed deploy; pushes touching just tooling or docs
 deploy nothing. A `py_compile` syntax gate blocks obviously-broken pushes. The
 VPS `.env` files and runtime state are never touched (rsync excludes them).
 
-**Either mode interrupts in-flight calls on that agent** — fast is a quick
-restart, build is longer. Land production changes during a quiet window.
+**Either mode restarts that agent's container** — fast is quick, build is longer.
+Once an agent is live this drops any call in progress, so land changes during a
+quiet window. While the fleet is pre-launch the restart costs only the rebuild
+time, which is why structural work is best done now rather than later.
 
 ### Manual deploy / redeploy / rollback
 
