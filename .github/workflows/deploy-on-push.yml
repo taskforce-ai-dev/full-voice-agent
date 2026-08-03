@@ -66,6 +66,13 @@ jobs:
             done <<< "$match"
             mode=fast
             printf '%s\n' "$match" | grep -qE 'requirements.*\.txt|Dockerfile|docker-compose\.ya?ml' && mode=build
+            # Registry-based agents never build on the VPS. Their compose pulls a
+            # tagged image instead of declaring `build:`, so ANY change to them —
+            # code included — means a new image, not a hot-swap. Detect that from
+            # the compose file rather than keeping a second list in sync.
+            if grep -qE '^[[:space:]]*image:[[:space:]]*ghcr\.io/' "$dir/docker-compose.yml" 2>/dev/null; then
+              mode=image
+            fi
             items="${items}{\"agent\":\"${id}\",\"mode\":\"${mode}\"},"
             echo "-> will deploy ${id} (${mode})"
           done

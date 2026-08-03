@@ -37,11 +37,11 @@ on:
         type: string
         default: "main"
       mode:
-        description: "fast (restart, no rebuild) or build (rebuild image)"
+        description: "image (build on runner, pull on VPS) | fast (hot-swap) | build (legacy: rebuild ON the VPS)"
         required: true
         type: choice
-        options: [fast, build]
-        default: fast
+        options: [image, fast, build]
+        default: image
   workflow_call:
     inputs:
       agent: { required: true, type: string }
@@ -60,6 +60,11 @@ jobs:
   deploy:
     name: Deploy ${{ inputs.agent }} (${{ inputs.mode }})
     runs-on: ubuntu-latest
+    # packages:write is needed only by `image` mode, to push to GHCR. contents:read
+    # is the checkout. Nothing here needs more.
+    permissions:
+      contents: read
+      packages: write
     env:
       AGENT: ${{ inputs.agent }}
       REF: ${{ inputs.ref }}
@@ -86,6 +91,62 @@ jobs:
           esac
           { echo "src=$SRC"; echo "opt=$OPT"; echo "con=$CON"; } >> "$GITHUB_OUTPUT"
           echo "Deploy '$AGENT' [$SRC] -> $OPT (container $CON) @ $REF  mode=$MODE"
+
+      # ---------------------------------------------------------------------
+      # IMAGE mode: build on the RUNNER, never on the VPS.
+      #
+      # Building on the production host means pip + docker compete with the
+      # containers answering calls. On 2026-08-02 eight concurrent builds
+      # starved the box and killed the SSH sessions mid-export, failing 3 of 8
+      # deploys. Building here removes that failure class entirely; the VPS only
+      # pulls.
+      #
+      # Tagged by commit SHA so a rollback pulls the exact image that ran,
+      # rather than rebuilding from a ref and hoping it resolves the same.
+      # ---------------------------------------------------------------------
+      - name: Set up Buildx
+        if: ${{ inputs.mode == 'image' }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: ${{ inputs.mode == 'image' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        if: ${{ inputs.mode == 'image' }}
+        id: img
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # GHCR requires a lowercase namespace; the org is already lowercase but
+          # do not depend on that.
+          repo="ghcr.io/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')/${AGENT}"
+          sha="$(git rev-parse --short HEAD)"
+          { echo "repo=$repo"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
+          echo "Image: $repo:$sha (also tagged :latest)"
+
+      - name: Build & push image
+        if: ${{ inputs.mode == 'image' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.map.outputs.src }}
+          file: ${{ steps.map.outputs.src }}/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.img.outputs.repo }}:${{ steps.img.outputs.sha }}
+            ${{ steps.img.outputs.repo }}:latest
+          # Links the package to this repo so GITHUB_TOKEN can pull it and the
+          # package page points somewhere useful.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.agent }}
+          cache-to: type=gha,scope=${{ inputs.agent }},mode=max
 
       - name: Set up SSH
         env:
@@ -146,6 +207,37 @@ jobs:
         run: |
           ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" \
             "set -e; cd \"$OPT\"; docker compose up -d --build; docker compose ps"
+
+      - name: Apply — IMAGE (pull + restart, no build on the VPS)
+        if: ${{ inputs.mode == 'image' }}
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          OPT: ${{ steps.map.outputs.opt }}
+          REPO_IMG: ${{ steps.img.outputs.repo }}
+          IMG_SHA: ${{ steps.img.outputs.sha }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The token travels over stdin via the heredoc, never argv, so it does
+          # not show up in the remote process list.
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" bash -s <<REMOTE
+          set -euo pipefail
+          printf '%s' '$GH_TOKEN' | docker login ghcr.io -u '$GH_ACTOR' --password-stdin
+          cd "$OPT"
+          # compose resolves \${IMAGE_TAG} in the image: line. Shell env beats the
+          # .env file, so this pins the deploy to one immutable SHA tag.
+          export IMAGE_TAG='$IMG_SHA'
+          docker compose pull
+          docker compose up -d
+          docker compose ps
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          # Reclaim the image this deploy replaced. This box has a history of
+          # disk exhaustion — see the CPU-only-torch note in the Dockerfiles —
+          # and pulling without pruning is exactly how it fills up.
+          docker image prune -f >/dev/null 2>&1 || true
+          REMOTE
+          echo "Deployed $REPO_IMG:$IMG_SHA"
 
       - name: Health check
         env:
