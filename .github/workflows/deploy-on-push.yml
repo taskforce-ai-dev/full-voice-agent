@@ -22,6 +22,10 @@ on:
 
 permissions:
   contents: read
+  # A called reusable workflow cannot request MORE than its caller grants, and
+  # deploy.yml needs packages:write to push the image to GHCR in `image` mode.
+  # Without this the whole run dies with startup_failure before any step runs.
+  packages: write
 
 concurrency:
   group: auto-deploy-main
