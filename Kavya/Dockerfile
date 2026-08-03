@@ -41,8 +41,8 @@ WORKDIR /app
 # pure dead weight. Installing the CPU build first means sentence-transformers
 # never pulls the CUDA wheel. Cuts the image from ~9GB to ~2.5GB, no runtime change.
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-COPY requirements-prod.txt .
-RUN pip install --no-cache-dir -r requirements-prod.txt
+COPY requirements-prod.lock.txt .
+RUN pip install --no-cache-dir -r requirements-prod.lock.txt
 
 # --- Application code --------------------------------------------------------
 # Only the files needed at runtime are copied. We deliberately exclude:
