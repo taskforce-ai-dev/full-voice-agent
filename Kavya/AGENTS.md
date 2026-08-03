@@ -595,6 +595,50 @@ naming a fabricated SOC 2 / ISO 27001 to a hotel's IT reviewer is worse than hav
 `server.py.pre-hattonhills-20260730`). Reverting the database alone is not enough — the KB,
 `yanolja_service.py`, `tools.py`, `server.py` and `post_call.py` all changed together.
 
+### v0.18 — Transfers: own the caller ID, and stop trusting "completed"
+**Problem (two incidents, same root):** `<Dial>` without `callerId` makes Twilio
+pass the GUEST's number through. Dialling a Sri Lankan mobile from an
+international gateway while claiming a local CLI gets filtered as spoofing:
+
+- **2026-07-31** — carrier returned `no-answer`, duration 0. Handset silent, but
+  the failsafe fired correctly, so it looked like "the manager didn't pick up".
+- **2026-08-03** (live demo) — carrier **answered instantly** with a recorded
+  intercept, played it at the guest for 52 s, and reported
+  `DialCallStatus=completed`. Indistinguishable from a real pickup, so the code
+  logged "human answered", skipped the failsafe, and the lead vanished silently.
+  The guest heard a recorded message after asking for a human.
+
+`TWILIO_CALLER_ID` already existed as an escape hatch but was **never set in
+production**, because a comment claimed that leaving it unset "falls back to the
+Twilio number the guest dialled". It does not — `_transfer_caller_id()` returns
+the env var verbatim. That wrong comment is the actual defect.
+
+**Changes:**
+- Corrected both caller-ID comments; the docstring now says SET THIS IN
+  PRODUCTION rather than describing pass-through as the deliberate default.
+- `.env.example` gained `TWILIO_CALLER_ID`, `HANDOFF_DIAL_TIMEOUT` and
+  `HANDOFF_MIN_ANSWER_SECONDS` with the failure modes spelled out, so a
+  from-scratch deploy no longer inherits the broken default silently.
+- New `HANDOFF_MIN_ANSWER_SECONDS` (default 2.0) + `_answer_looks_intercepted()`.
+- New `POST /voice/dial-status` records Twilio's initiated/ringing/answered/
+  completed timestamps per transfer leg; both `<Number>` tags now carry
+  `statusCallback` + `statusCallbackEvent`.
+- `/voice/dial-result` re-labels a `completed` that was answered in under
+  `HANDOFF_MIN_ANSWER_SECONDS` as `intercepted` and runs the WhatsApp failsafe.
+  **Fails open** — missing timing is treated as a genuine answer, because a
+  false positive would bounce a guest who really did reach a human back into
+  the failsafe, which is worse than one missed notification.
+
+**Prod config:** `TWILIO_CALLER_ID=+15187503185` was set in `/opt/kavya/.env` on
+2026-08-03 and verified live — the leg then rang properly and was answered by a
+human ~8 s in. Note `docker compose restart` does NOT reload `.env`; it needs
+`up -d --force-recreate`, and `IMAGE_TAG` must be pinned or compose resolves
+`:latest`.
+
+**How to test:** `pytest tests/test_handoff_intercept.py` (24 tests, no network)
+covers the instant-answer replay, the threshold boundary, callback retries, and
+both dial-result branches.
+
 ## graphify — GRAPH-FIRST, ALWAYS
 
 This sub-project is part of the shared graphify knowledge graph at `../graphify-out/`

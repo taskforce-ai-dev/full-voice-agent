@@ -53,6 +53,7 @@ if os.getenv("SENTRY_DSN"):
 import queue
 import re
 import threading
+import time
 import wave
 import xml.sax.saxutils
 from contextlib import asynccontextmanager
@@ -154,6 +155,19 @@ HUMAN_AGENT_PHONE: str = os.getenv("HUMAN_AGENT_PHONE", "").strip()
 # guest is holding music-free silence while this runs.
 HANDOFF_DIAL_TIMEOUT: int = int(os.getenv("HANDOFF_DIAL_TIMEOUT", "40"))
 
+# Minimum plausible time between a dial being placed and a HUMAN answering it.
+#
+# WHY THIS EXISTS: on 2026-08-03 a transfer to the manager was answered by a
+# carrier intercept — the leg was answered in the SAME SECOND it was initiated,
+# played a recorded announcement at the guest for 52 seconds, and reported
+# DialCallStatus=completed. "completed" is indistinguishable from a real pickup,
+# so the failsafe stood down and nobody was ever told the guest had called. A
+# real handset cannot be lifted in under a second; anything that fast is a
+# network answer (intercept, unconditional divert, or instant voicemail).
+HANDOFF_MIN_ANSWER_SECONDS: float = float(
+    os.getenv("HANDOFF_MIN_ANSWER_SECONDS", "2.0")
+)
+
 # Caller ID presented to the human agent when a call is transferred.
 #
 # WHY THIS EXISTS: <Dial> with no callerId makes Twilio pass through the
@@ -161,13 +175,21 @@ HANDOFF_DIAL_TIMEOUT: int = int(os.getenv("HANDOFF_DIAL_TIMEOUT", "40"))
 # manager's Sri Lankan mobile were presented as coming FROM another Sri Lankan
 # mobile that the Twilio account does not own. Twilio accepts this, but the
 # destination carrier commonly filters it as caller-ID spoofing, so the handset
-# never rings — Twilio reports status=no-answer with duration=0 while the
-# manager sees nothing. Every transfer then fell through to the WhatsApp
-# failsafe.
+# never rings. The failure is NOT consistent, which is what makes it dangerous:
+#   - 2026-07-31: carrier reported status=no-answer, duration=0 (handset silent,
+#     failsafe fired correctly).
+#   - 2026-08-03: carrier ANSWERED the leg instantly with a recorded intercept,
+#     played it at the guest for 52 s, and reported status=completed — so the
+#     transfer looked successful, the failsafe stood down, and the lead vanished.
+#     See HANDOFF_MIN_ANSWER_SECONDS for the guard against that second shape.
 #
 # Setting this to a number the Twilio account OWNS makes the leg deliverable.
-# Leave unset to fall back to the Twilio number the guest dialled (captured per
-# call from the inbound `To`), which is always account-owned.
+#
+# LEAVING IT UNSET DOES NOT FALL BACK TO AN OWNED NUMBER. An earlier version of
+# this comment claimed it fell back to the Twilio number the guest dialled; it
+# does not, and that wrong comment is why the variable sat unset in production
+# until 2026-08-03. Unset means pass-through, i.e. the broken path above.
+# `_transfer_caller_id()` returns exactly this value and nothing else.
 TWILIO_CALLER_ID: str = os.getenv("TWILIO_CALLER_ID", "").strip()
 PUBLIC_HOSTNAME: str = os.getenv("PUBLIC_HOSTNAME", "voice.taskforceai.tech").strip()
 
@@ -265,15 +287,18 @@ _call_phone: dict[str, str] = {}  # CallSid -> caller phone number
 def _transfer_caller_id(call_sid: str) -> str:
     """Caller ID for the outbound transfer leg, or "" for Twilio's default.
 
-    DEFAULTS TO "" — i.e. Twilio passes the GUEST's number through, which is the
-    long-standing behaviour and is deliberately preserved: the manager sees who
-    is actually calling and can ring them back directly. That is a feature, not
-    an accident, so do not "fix" it by defaulting to an owned number.
+    DEFAULTS TO "" — i.e. Twilio passes the GUEST's number through. That shows
+    the manager who is actually calling, which is genuinely useful, but it is
+    NOT safe on Sri Lankan mobile destinations: the leg arrives at the local
+    carrier from an international gateway claiming a local CLI, and gets
+    filtered or intercepted (see the TWILIO_CALLER_ID comment above).
 
-    Set TWILIO_CALLER_ID only if a destination carrier starts filtering the
-    pass-through as caller-ID spoofing (symptom: Twilio reports
-    status=no-answer, duration=0, and the handset never rings). It is an escape
-    hatch, not the normal configuration.
+    SET THIS IN PRODUCTION. Treating pass-through as the normal configuration is
+    what broke handovers on 2026-07-31 and again on 2026-08-03. Point it at a
+    number the account owns — the number the guest dialled is the natural
+    choice. The manager loses the guest's CLI, but the whisper announces the
+    reason and the failsafe WhatsApp carries the guest's number, so nothing is
+    actually lost.
     """
     return TWILIO_CALLER_ID
 
@@ -282,8 +307,32 @@ def _transfer_caller_id(call_sid: str) -> str:
 # up. The relay session that follows a failed dial is a brand-new WebSocket with
 # empty history, so everything Kavya needs to run the failsafe (what the guest
 # wanted, their name if given, the number they called from) has to survive here.
-# CallSid -> {reason, caller_phone, transcript, dial_status, notified}
+# CallSid -> {reason, caller_phone, transcript, dial_status, notified, dial_events}
 _handoff_state: dict[str, dict] = {}
+
+
+def _answer_looks_intercepted(state: dict) -> tuple[bool, str]:
+    """Did the 'answered' dial leg reach a human, or a network intercept?
+
+    Reads the per-event timestamps recorded by /voice/dial-status. A handset
+    cannot be answered in under a second; when it happens the leg was taken by
+    an intercept recording, an unconditional divert, or instant voicemail.
+
+    FAILS OPEN. If the timestamps are missing (status callback lost, or it
+    raced the action callback) this returns False and the transfer is treated
+    as genuine. A false negative costs one missed WhatsApp; a false positive
+    would bounce a guest who really did speak to a human back into the
+    failsafe, which is worse.
+    """
+    events = state.get("dial_events") or {}
+    initiated = events.get("initiated")
+    answered = events.get("answered")
+    if initiated is None or answered is None:
+        return False, "no timing available"
+    gap = answered - initiated
+    if gap < HANDOFF_MIN_ANSWER_SECONDS:
+        return True, f"answered {gap:.2f}s after dial — too fast for a handset"
+    return False, f"answered after {gap:.2f}s"
 _HANDOFF_STATE_MAX = 200  # bound the dict; abandoned calls never clean up
 
 
@@ -1665,7 +1714,11 @@ async def relay_action(request: Request) -> Response:
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
             f'  <Dial action="{dial_action_url}" method="POST" timeout="{HANDOFF_DIAL_TIMEOUT}"{_cid_attr} answerOnBridge="true">\n'
-            f'    <Number url="{whisper_url}">{HUMAN_AGENT_PHONE}</Number>\n'
+            f'    <Number url="{whisper_url}"'
+            f' statusCallback="https://{host}/voice/dial-status?parent={call_sid}"'
+            ' statusCallbackMethod="POST"'
+            ' statusCallbackEvent="initiated ringing answered completed">'
+            f'{HUMAN_AGENT_PHONE}</Number>\n'
             "  </Dial>\n"
             "</Response>"
         )
@@ -1694,6 +1747,33 @@ async def whisper(request: Request) -> Response:
     return Response(content=twiml, media_type="application/xml")
 
 
+@app.post("/voice/dial-status")
+async def dial_status(request: Request) -> Response:
+    """Per-event status callback for the outbound transfer leg.
+
+    Twilio POSTs here on initiated / ringing / answered / completed. We only
+    need the timestamps, so that /voice/dial-result can tell a real pickup from
+    a carrier intercept that answered instantly (see _answer_looks_intercepted).
+
+    Only records against calls we actually dispatched a transfer for, so a
+    stray or replayed callback cannot grow _handoff_state without bound.
+    """
+    form = await request.form()
+    parent = request.query_params.get("parent", "")
+    event = str(form.get("CallStatus") or "").strip().lower()
+    entry = _handoff_state.get(parent)
+    if entry is not None and event:
+        events = entry.setdefault("dial_events", {})
+        # First occurrence wins — Twilio can retry a callback, and a retry must
+        # not overwrite the original timing with a later clock reading.
+        events.setdefault(event, time.time())
+        logger.info(
+            "[handoff] dial-status parent=%s event=%s (have: %s)",
+            parent, event, ",".join(sorted(events)),
+        )
+    return Response(status_code=204)
+
+
 @app.post("/voice/dial-result")
 async def dial_result(request: Request) -> Response:
     """Callback from <Dial action>. If the human answered â†’ hang up.
@@ -1704,7 +1784,20 @@ async def dial_result(request: Request) -> Response:
     call_sid = form.get("CallSid", "")
     host = request.url.hostname
     logger.info("[handoff] dial-result status=%s call_sid=%s", status, call_sid)
+
+    # "completed" only means the leg ended normally — it does NOT prove a human
+    # answered. A carrier intercept answers instantly and also reports
+    # completed, so check the timing before standing the failsafe down.
+    intercepted, why = _answer_looks_intercepted(_handoff_state.get(call_sid, {}))
+    if status in ("completed", "answered") and intercepted:
+        logger.warning(
+            "[handoff] dial reported %s for %s but %s — treating as NOT answered",
+            status, call_sid, why,
+        )
+        status = "intercepted"
+
     if status in ("completed", "answered"):
+        logger.info("[handoff] human answer accepted for %s (%s)", call_sid, why)
         # Human took the call — no failsafe needed, drop the carry-over.
         state = _handoff_state.pop(call_sid, {})
         # This is the end of the line for this call, so THIS is where the
@@ -4102,7 +4195,11 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                                 '<Response>'
                                 '<Say voice="Polly.Joanna">Connecting you now. Please hold.</Say>'
                                 f'<Dial action="https://{host}/voice/dial-result" method="POST" timeout="{HANDOFF_DIAL_TIMEOUT}"{_cid_attr} answerOnBridge="true">'
-                                f'<Number url="https://{host}/voice/whisper?reason={reason_q}">{HUMAN_AGENT_PHONE}</Number>'
+                                f'<Number url="https://{host}/voice/whisper?reason={reason_q}"'
+                                f' statusCallback="https://{host}/voice/dial-status?parent={call_sid}"'
+                                ' statusCallbackMethod="POST"'
+                                ' statusCallbackEvent="initiated ringing answered completed">'
+                                f'{HUMAN_AGENT_PHONE}</Number>'
                                 '</Dial>'
                                 '</Response>'
                             )
