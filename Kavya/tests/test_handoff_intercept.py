@@ -10,6 +10,7 @@ nobody was ever told the guest had called.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -163,6 +164,90 @@ def test_ordinary_failures_still_run_the_failsafe(client, status):
     resp = _dial_result(client, status)
     assert "mode=handover_failsafe" in resp.text
     assert server._handoff_state[CALL]["dial_status"] == status
+
+
+# ---------------------------------------------------------------------------
+# The actual bug: Twilio's real payload uses CallStatus=in-progress, never
+# CallStatus=answered. statusCallbackEvent is *named* "answered" but that is
+# a DialCallStatus vocabulary word, not what shows up in the CallStatus field
+# of the callback. Every test above builds dial_events by hand with an
+# "answered" key or POSTs a literal CallStatus=answered — a payload Twilio
+# does not produce — so none of them would catch this. These replay the real
+# wire payload and the real production timings from 2026-08-04.
+# ---------------------------------------------------------------------------
+
+def test_dial_status_normalizes_in_progress_to_answered(client):
+    """Twilio never sends CallStatus=answered — the real callback for a
+    picked-up leg carries CallStatus=in-progress. Unless the handler maps
+    that onto the canonical "answered" key, _answer_looks_intercepted's
+    events.get("answered") lookup is always None and the detector never
+    fires. This must fail against unfixed code.
+    """
+    _seed()
+    r = client.post(
+        f"/voice/dial-status?parent={CALL}", data={"CallStatus": "in-progress"}
+    )
+    assert r.status_code == 204
+    events = server._handoff_state[CALL]["dial_events"]
+    assert "answered" in events, (
+        "in-progress must be normalised to the canonical 'answered' key so "
+        f"_answer_looks_intercepted can find it (got keys: {sorted(events)})"
+    )
+
+
+def _shift_clock(monkeypatch, offset):
+    """Shift server.py's notion of "now" by `offset` seconds, relative to the
+    real clock at call time, for every subsequent time.time() call — not
+    just the next one.
+
+    A plain fixed-sequence fake (e.g. an iterator of canned timestamps) does
+    not work here: the test client's own machinery (httpx's cookie jar) and
+    Python's logging module (LogRecord timestamps) also call time.time()
+    during the same request, consuming values meant for the handler under
+    test. Offsetting the real clock instead means every caller — ours or
+    incidental — gets a consistent, still-monotonic answer.
+    """
+    real_time = time.time
+    monkeypatch.setattr(server.time, "time", lambda: real_time() + offset)
+
+
+def test_call2_production_intercept_is_caught(client, monkeypatch):
+    """Reproduces production Call 2 (CA7396bfdc41c0112684942259b2257a9e,
+    2026-08-04): initiated -> in-progress 0.598s later, no ringing event —
+    the manager's phone never rang, a carrier intercept picked up instantly.
+    Posts the real Twilio payload end to end through /voice/dial-status and
+    /voice/dial-result and asserts the transfer is treated as intercepted,
+    not accepted.
+    """
+    _seed()
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "initiated"})
+    _shift_clock(monkeypatch, 0.598)
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "in-progress"})
+
+    resp = _dial_result(client, "completed")
+
+    assert "mode=handover_failsafe" in resp.text
+    assert "<Hangup/>" not in resp.text
+    assert server._handoff_state[CALL]["dial_status"] == "intercepted"
+
+
+def test_call1_production_genuine_answer_is_accepted(client, monkeypatch):
+    """Reproduces production Call 1 (CA2b9355fde83632735ba6cb9d22cf5295,
+    2026-08-04): initiated -> ringing -> in-progress ~21s later — the
+    manager's phone rang and he answered it, confirmed by hand. Posts the
+    real Twilio payload end to end and asserts the transfer is accepted.
+    """
+    _seed()
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "initiated"})
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "ringing"})
+    _shift_clock(monkeypatch, 21.0)  # ~21s initiated -> in-progress, as observed
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "in-progress"})
+
+    resp = _dial_result(client, "completed")
+
+    assert "<Hangup/>" in resp.text
+    assert "mode=handover_failsafe" not in resp.text
+    assert CALL not in server._handoff_state
 
 
 # ---------------------------------------------------------------------------
