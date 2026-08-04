@@ -64,6 +64,7 @@ class FakeSession:
         self.started = 0
         self.audio = []
         self.finish_calls = []
+        self.terminal_future = asyncio.get_running_loop().create_future()
 
     async def start(self):
         self.started += 1
@@ -378,7 +379,7 @@ async def test_gateway_capacity_rejection_happens_before_accept_and_is_reusable(
     _, _, websocket, factory = await run_gateway(
         [], settings=settings, registry=registry,
     )
-    assert websocket.accepted is False
+    assert websocket.accepted is True
     assert websocket.close_calls == [(1013, "capacity unavailable")]
     assert factory.sessions == []
 
@@ -560,3 +561,121 @@ async def test_gateway_cleanup_logs_never_include_exception_details(caplog):
     assert "call-1" not in log_output
     assert "sensitive caller" not in log_output
     assert "session_cleanup" in log_output
+
+
+@pytest.mark.asyncio
+async def test_connected_after_start_is_rejected():
+    _, _, websocket, factory = await run_gateway([
+        START, {"event": "connected"},
+    ])
+
+    assert websocket.close_calls == [(1008, "connected after start")]
+    assert factory.sessions[0].finish_calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_double_cancellation_cannot_interrupt_cleanup():
+    finish_started = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    class SlowFinishSession(FakeSession):
+        async def finish(self, schedule_post_call=False):
+            self.finish_calls.append(schedule_post_call)
+            finish_started.set()
+            await allow_finish.wait()
+
+    class SlowFactory:
+        def __init__(self):
+            self.sessions = []
+
+        async def __call__(self, context, transport):
+            session = SlowFinishSession(context, transport)
+            self.sessions.append(session)
+            return session
+
+    gateway, registry = make_gateway()
+    websocket = FakeWebSocket([START])
+    factory = SlowFactory()
+    task = asyncio.create_task(gateway.handle(websocket, factory))
+    while not factory.sessions:
+        await asyncio.sleep(0)
+
+    task.cancel()
+    await finish_started.wait()
+    task.cancel()
+    allow_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert factory.sessions[0].finish_calls == [True]
+    assert factory.sessions[0].transport.is_active is False
+    assert registry.snapshot()["active_sessions"] == 0
+    assert registry.snapshot()["released_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unexpected_failure_class_is_stable_allowlisted(caplog):
+    async def named_sensitive_failure(context, transport):
+        raise RuntimeError("provider body")
+
+    caplog.set_level("INFO", logger="smartpbx_gateway")
+    await run_gateway([START], factory=named_sensitive_failure)
+    records = [json.loads(record.getMessage()) for record in caplog.records]
+    failure = next(item for item in records if item["event"] == "smartpbx_session_failed")
+    assert failure["failure_class"] == "internal_error"
+
+
+@pytest.mark.asyncio
+async def test_gateway_closes_and_releases_on_welcome_pipeline_failure():
+    class WelcomeFailureSession(FakeSession):
+        async def start(self):
+            self.started += 1
+            self.terminal_future.set_result({
+                "transferred": False, "failure_class": "tts_unavailable",
+            })
+
+    class Factory:
+        def __init__(self):
+            self.sessions = []
+
+        async def __call__(self, context, transport):
+            session = WelcomeFailureSession(context, transport)
+            self.sessions.append(session)
+            return session
+
+    factory = Factory()
+    _, registry, websocket, _ = await run_gateway([START], factory=factory)
+
+    assert websocket.close_calls == [(1011, "internal error")]
+    assert factory.sessions[0].finish_calls == [True]
+    assert registry.snapshot()["active_sessions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_closes_and_releases_on_utterance_pipeline_failure():
+    class UtteranceFailureSession(FakeSession):
+        async def feed_audio(self, audio):
+            self.audio.append(audio)
+            self.terminal_future.set_result({
+                "transferred": False, "failure_class": "tts_status",
+            })
+
+    class Factory:
+        def __init__(self):
+            self.sessions = []
+
+        async def __call__(self, context, transport):
+            session = UtteranceFailureSession(context, transport)
+            self.sessions.append(session)
+            return session
+
+    media = {
+        "event": "media",
+        "media": {"payload": base64.b64encode(b"audio").decode("ascii")},
+    }
+    factory = Factory()
+    _, registry, websocket, _ = await run_gateway([START, media], factory=factory)
+
+    assert websocket.close_calls == [(1011, "internal error")]
+    assert factory.sessions[0].finish_calls == [True]
+    assert registry.snapshot()["active_sessions"] == 0

@@ -152,6 +152,9 @@ def smartpbx_status(
 
 
 class _GatewaySession(Protocol):
+    @property
+    def terminal_future(self) -> asyncio.Future: ...
+
     async def start(self) -> None: ...
 
     async def feed_audio(self, audio: bytes) -> None: ...
@@ -196,6 +199,7 @@ class SmartPBXGateway:
         failure_class = ""
         close_outcome: tuple[int, str] | None = None
         disconnected = False
+        cancellation: asyncio.CancelledError | None = None
         lease: SessionLease | None = None
         transport: SmartPBXMediaTransport | None = None
         session: _GatewaySession | None = None
@@ -216,6 +220,7 @@ class SmartPBXGateway:
 
         lease = await self._registry.try_acquire()
         if lease is None:
+            await websocket.accept()
             await _safe_close(websocket, 1013, "capacity unavailable")
             self._log_lifecycle(
                 session_id, call_fingerprint, outcome, "capacity", started_at
@@ -242,10 +247,38 @@ class SmartPBXGateway:
             state = _SessionState.STARTED
 
             while True:
-                raw = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=self._settings.idle_timeout_seconds,
-                )
+                terminal = getattr(session, "terminal_future", None)
+                if terminal is None:
+                    raw = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=self._settings.idle_timeout_seconds,
+                    )
+                else:
+                    receive_task = asyncio.create_task(websocket.receive_text())
+                    done, _ = await asyncio.wait(
+                        {receive_task, terminal},
+                        timeout=self._settings.idle_timeout_seconds,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        receive_task.cancel()
+                        await asyncio.gather(receive_task, return_exceptions=True)
+                        raise asyncio.TimeoutError
+                    if terminal in done:
+                        receive_task.cancel()
+                        await asyncio.gather(receive_task, return_exceptions=True)
+                        terminal_outcome = terminal.result()
+                        transferred = bool(terminal_outcome.get("transferred"))
+                        failure_class = _stable_failure_value(
+                            terminal_outcome.get("failure_class")
+                        )
+                        outcome = "transferred" if transferred else "failed"
+                        close_outcome = (
+                            (1000, "transferred") if transferred
+                            else (1011, "internal error")
+                        )
+                        break
+                    raw = receive_task.result()
                 event = parse_smartpbx_event(
                     raw,
                     max_message_chars=self._settings.max_message_chars,
@@ -275,7 +308,9 @@ class SmartPBXGateway:
                 elif isinstance(event, UnknownEvent):
                     self._observe_unknown()
                 elif isinstance(event, ConnectedEvent):
-                    continue
+                    raise ProtocolViolation(
+                        POLICY_VIOLATION, "connected after start", "connected_after_start"
+                    )
         except asyncio.TimeoutError:
             is_start_timeout = state is _SessionState.ACCEPTED
             failure_class = "start_timeout" if is_start_timeout else "idle_timeout"
@@ -287,13 +322,16 @@ class SmartPBXGateway:
         except WebSocketDisconnect:
             disconnected = True
             outcome = "disconnect"
+        except asyncio.CancelledError as error:
+            cancellation = error
+            outcome = "cancelled"
         except ProtocolViolation as error:
             outcome = "protocol_error"
             failure_class = error.failure_class
             close_outcome = (error.close_code, error.public_reason)
         except Exception as error:
             outcome = "failed"
-            failure_class = type(error).__name__[:64]
+            failure_class = _stable_failure_class(error)
             close_outcome = (1011, "internal error")
             self._log_event(
                 "smartpbx_session_failed", session_id, call_fingerprint,
@@ -301,31 +339,56 @@ class SmartPBXGateway:
             )
         finally:
             state = _SessionState.TERMINAL
-            if session is not None:
+            cleanup_task = asyncio.create_task(self._cleanup(
+                session, transport, lease, session_id, call_fingerprint, started_at
+            ))
+            while not cleanup_task.done():
                 try:
-                    await session.finish(schedule_post_call=True)
-                except Exception:
-                    self._log_event(
-                        "smartpbx_session_cleanup_failed", session_id,
-                        call_fingerprint, "degraded", "session_cleanup",
-                        started_at, level=logging.ERROR,
-                    )
-            if transport is not None:
-                try:
-                    await transport.close()
-                except Exception:
-                    self._log_event(
-                        "smartpbx_transport_cleanup_failed", session_id,
-                        call_fingerprint, "degraded", "transport_cleanup",
-                        started_at, level=logging.ERROR,
-                    )
-            if lease is not None:
-                await lease.release()
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError as error:
+                    if cancellation is None:
+                        cancellation = error
+            await cleanup_task
             if close_outcome is not None and not disconnected:
                 await _safe_close(websocket, *close_outcome)
             self._log_lifecycle(
                 session_id, call_fingerprint, outcome, failure_class, started_at
             )
+            if cancellation is not None:
+                raise cancellation
+
+    async def _cleanup(
+        self, session, transport, lease, session_id, call_fingerprint, started_at
+    ):
+        if session is not None:
+            try:
+                await asyncio.wait_for(
+                    session.finish(schedule_post_call=True), timeout=5.0
+                )
+            except (Exception, asyncio.CancelledError):
+                self._log_event(
+                    "smartpbx_session_cleanup_failed", session_id,
+                    call_fingerprint, "degraded", "session_cleanup",
+                    started_at, level=logging.ERROR,
+                )
+        if transport is not None:
+            try:
+                await asyncio.wait_for(transport.close(), timeout=5.0)
+            except (Exception, asyncio.CancelledError):
+                self._log_event(
+                    "smartpbx_transport_cleanup_failed", session_id,
+                    call_fingerprint, "degraded", "transport_cleanup",
+                    started_at, level=logging.ERROR,
+                )
+        if lease is not None:
+            try:
+                await asyncio.wait_for(lease.release(), timeout=5.0)
+            except (Exception, asyncio.CancelledError):
+                self._log_event(
+                    "smartpbx_lease_cleanup_failed", session_id,
+                    call_fingerprint, "degraded", "lease_cleanup",
+                    started_at, level=logging.ERROR,
+                )
 
     async def _receive_start(self, websocket: Any):
         deadline = (
@@ -421,3 +484,16 @@ def _saturating_increment(value: int) -> int:
 
 def _configuration_error() -> ValueError:
     return ValueError("invalid SmartPBX configuration")
+
+_FAILURE_CLASSES = frozenset({
+    "stt_unavailable", "stt_queue_overflow", "tts_unavailable", "tts_status",
+    "tts_timeout", "tts_exception", "pipeline", "internal_error",
+})
+
+
+def _stable_failure_class(error: Exception) -> str:
+    return _stable_failure_value(getattr(error, "failure_class", "internal_error"))
+
+
+def _stable_failure_value(value: Any) -> str:
+    return value if value in _FAILURE_CLASSES else "internal_error"
