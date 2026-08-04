@@ -50,6 +50,14 @@ on:
 
 permissions:
   pull-requests: write
+  # Needed to read each agent's docker-compose.yml through the contents API in
+  # order to tell `image` agents from legacy `fast`/`build` ones. Declaring a
+  # permissions block sets every UNLISTED scope to `none`, so omitting this does
+  # not inherit read access — it denies it, the API call 404s, and the mode
+  # detection silently degrades. That is exactly how this shipped broken once.
+  # Read-only, and still no checkout: the compose file is text we grep, never
+  # code we run.
+  contents: read
 
 concurrency:
   group: pr-deploy-impact-${{ github.event.pull_request.number }}
@@ -76,6 +84,7 @@ jobs:
           any=false
           build_any=false
           image_any=false
+          unknown_any=false
 
           # Same agent map as deploy-on-push.yml. Folder names contain spaces —
           # keep them quoted and matched with grep -F.
@@ -106,8 +115,19 @@ jobs:
             # `image` reports the mode it will actually deploy with.
             enc="${dir// /%20}"
             compose=$(gh api "repos/$REPO/contents/$enc/docker-compose.yml?ref=$HEAD_SHA" \
-                        -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)
-            if printf '%s\n' "$compose" | grep -qE '^[[:space:]]*image:[[:space:]]*ghcr\.io/'; then
+                        -H 'Accept: application/vnd.github.raw' 2>&1) || compose=""
+
+            if [ -z "$compose" ]; then
+              # NEVER fall through to `fast` here. Defaulting to the least
+              # alarming answer on failure is precisely how this workflow spent
+              # weeks assuring reviewers that image deploys were seconds-long
+              # hot-swaps. If the mode cannot be determined, say so loudly and
+              # let the reviewer assume the worst.
+              echo "::warning::could not read $dir/docker-compose.yml — deploy mode unknown"
+              mode='⚠️ unknown'
+              effect='**could not read `docker-compose.yml`** — assume a full rebuild'
+              unknown_any=true
+            elif printf '%s\n' "$compose" | grep -qE '^[[:space:]]*image:[[:space:]]*ghcr\.io/'; then
               mode=image
               effect='built on the runner, pushed to GHCR, VPS pulls + restarts — minutes'
               image_any=true
@@ -122,6 +142,7 @@ jobs:
           echo "any=$any" >> "$GITHUB_OUTPUT"
           echo "build_any=$build_any" >> "$GITHUB_OUTPUT"
           echo "image_any=$image_any" >> "$GITHUB_OUTPUT"
+          echo "unknown_any=$unknown_any" >> "$GITHUB_OUTPUT"
 
           if printf '%s\n' "$CHANGED" | grep -qF 'Flico Agent/'; then
             echo "flico=true" >> "$GITHUB_OUTPUT"
@@ -134,6 +155,7 @@ jobs:
           ANY: ${{ steps.detect.outputs.any }}
           BUILD_ANY: ${{ steps.detect.outputs.build_any }}
           IMAGE_ANY: ${{ steps.detect.outputs.image_any }}
+          UNKNOWN_ANY: ${{ steps.detect.outputs.unknown_any }}
           FLICO: ${{ steps.detect.outputs.flico }}
         run: |
           set -euo pipefail
@@ -150,6 +172,13 @@ jobs:
               echo '|---|---|---|---|---|'
               cat rows.md
               echo
+              if [ "$UNKNOWN_ANY" = "true" ]; then
+                echo '> ⚠️ **This comment is not reliable.** The deploy mode for at least one'
+                echo '> agent above could not be determined, so the blast radius shown may be'
+                echo '> understated. Check `deploy-on-push.yml` by hand before merging, and'
+                echo '> open an issue — this workflow is broken.'
+                echo
+              fi
               if [ "$BUILD_ANY" = "true" ] || [ "$IMAGE_ANY" = "true" ]; then
                 echo '**Heads up:** at least one agent needs a full image build, so the'
                 echo 'outage window is minutes rather than seconds. Dependency bumps land'
