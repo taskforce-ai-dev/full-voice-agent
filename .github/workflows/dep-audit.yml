@@ -10,13 +10,27 @@ name: dep-audit
 # discovered CVE fails the build.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  # NOT on pull_request/push. This job fans out to 8 parallel jobs (one per
+  # agent) and every one is `continue-on-error: true` — it has never blocked a
+  # merge and is not meant to. Running it per-PR cost ~664 billed Actions
+  # minutes in the 2026-08 cycle: a third of the 2,000-minute allowance, spent
+  # on advisory output nobody gates on.
+  #
+  # The cost is dominated by job COUNT, not runtime. Each of the 8 jobs takes
+  # ~40 seconds but GitHub bills every job rounded UP to a whole minute, so
+  # ~5 minutes of real work bills as 8.
+  #
+  # Weekly is the right cadence for advisory CVE scanning anyway: it catches
+  # newly disclosed CVEs against already-merged pinned deps, which is exactly
+  # the case a per-PR run CANNOT catch. Use workflow_dispatch for an on-demand
+  # check when changing dependencies.
+  #
+  # If this is ever made blocking (drop `continue-on-error`), restore the
+  # pull_request trigger at the same time — a required check that only runs
+  # weekly is worse than no check.
   workflow_dispatch:
   schedule:
-    # Weekly, Mondays at 06:00 UTC — catches newly disclosed CVEs against
-    # already-merged pinned deps even when no code changes.
+    # Weekly, Mondays at 06:00 UTC.
     - cron: '0 6 * * 1'
 
 permissions:
