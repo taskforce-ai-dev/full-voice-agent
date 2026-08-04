@@ -25,6 +25,16 @@ Two things differ deliberately from the Kavya original, both load-bearing:
    and the LOOP EXIT's own final read-back re-triggering the spelling
    fallback it had just escaped — are asserted against directly here so they
    cannot silently reappear in this copy.
+
+NOTE: a second, pre-existing WhatsApp promise lives elsewhere in this prompt
+(the post-create_booking success bullet: "they will also receive a WhatsApp
+confirmation shortly with all the details"), also unbacked by any code path
+in this repo. That one was deliberately left as-is per product-owner
+direction (Aug 2026): for the public try-it-out demo, that promise is
+considered cosmetic and out of scope here. Only the LOOP EXIT's promise
+below was in scope, because a dangling channel reference there defeats the
+purpose of the loop exit itself (it exists to give the guest a way to catch
+a wrong name) rather than being merely cosmetic.
 """
 
 from __future__ import annotations
