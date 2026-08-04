@@ -1,6 +1,7 @@
 """Contract tests for allowlisted Dialog MCP call control."""
 
 import asyncio
+import gzip
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -454,9 +455,18 @@ def exception_contains(
 
 
 async def open_real_session_with_response(
-    monkeypatch, response: httpx.Response, *, max_response_bytes: int = 128
+    monkeypatch,
+    response: httpx.Response,
+    *,
+    max_response_bytes: int = 128,
+    seen_requests: list[httpx.Request] | None = None,
 ):
-    transport = httpx.MockTransport(lambda request: response)
+    def respond(request: httpx.Request) -> httpx.Response:
+        if seen_requests is not None:
+            seen_requests.append(request)
+        return response
+
+    transport = httpx.MockTransport(respond)
     monkeypatch.setattr(smartpbx_mcp, "_new_http_transport", lambda: transport)
     async with smartpbx_mcp._open_session(
         endpoint="https://dialog.example/mcp",
@@ -488,6 +498,67 @@ async def test_real_mcp_transport_rejects_declared_oversize_before_sdk_parsing(
 
     assert exception_contains(raised.value, MCPResponseTooLarge)
     assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_real_mcp_client_requests_identity_encoding(monkeypatch):
+    requests = []
+    response = httpx.Response(
+        200,
+        headers={"Content-Type": "application/json", "Content-Length": "129"},
+        stream=TrackingChunkedStream(b"x" * 129),
+    )
+
+    with pytest.raises(BaseException):
+        await open_real_session_with_response(
+            monkeypatch, response, seen_requests=requests
+        )
+
+    assert requests[0].headers["Accept-Encoding"] == "identity"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content_encoding",
+    ["gzip", " GZip ", "deflate", "br", "identity, gzip", "identity, identity", ""],
+)
+async def test_transport_rejects_non_identity_encoding_before_decoding(
+    content_encoding,
+):
+    decoded = b"x" * 1024
+    wire_body = gzip.compress(decoded)
+    assert len(wire_body) < 128 < len(decoded)
+    stream = TrackingChunkedStream(wire_body)
+    response = httpx.Response(
+        200,
+        headers={"Content-Encoding": content_encoding},
+        stream=stream,
+    )
+    source = httpx.MockTransport(lambda request: response)
+    transport = smartpbx_mcp._BoundedHTTPTransport(source, maximum_response_bytes=128)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(smartpbx_mcp.MCPUnsupportedContentEncoding):
+            await client.get("https://dialog.example/mcp")
+
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_encoding", ["identity", "IDENTITY", " identity "])
+async def test_transport_accepts_normalized_identity_encoding(content_encoding):
+    response = httpx.Response(
+        200,
+        headers={"Content-Encoding": content_encoding},
+        content=b"safe",
+    )
+    source = httpx.MockTransport(lambda request: response)
+    transport = smartpbx_mcp._BoundedHTTPTransport(source, maximum_response_bytes=128)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        received = await client.get("https://dialog.example/mcp")
+
+    assert received.content == b"safe"
 
 
 @pytest.mark.asyncio
@@ -539,11 +610,19 @@ async def test_production_sdk_loggers_never_emit_sensitive_provider_data(
         sdk_logger.warning(sensitive)
         sdk_logger.error(sensitive)
 
+    httpx_marker = "unrelated-httpx-record-visible"
+    logging.getLogger("httpx").warning(httpx_marker)
+
     for fragment in sensitive.split():
         assert fragment not in caplog.text
+    assert httpx_marker in caplog.text
 
 
 def test_sdk_logger_policy_is_idempotent_for_exact_process_global_loggers():
+    assert smartpbx_mcp.SUPPRESSED_SDK_LOGGERS == (
+        "mcp.client.streamable_http",
+        "client",
+    )
     smartpbx_mcp._apply_sdk_logger_policy()
     smartpbx_mcp._apply_sdk_logger_policy()
 

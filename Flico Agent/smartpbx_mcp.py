@@ -37,19 +37,15 @@ _MAX_CALL_ID_CHARS = 256
 SUPPRESSED_SDK_LOGGERS = (
     "mcp.client.streamable_http",
     "client",
-    "httpx",
-    "httpcore.connection",
-    "mcp.client.session",
-    "mcp.shared.session",
-    "httpcore.http11",
-    "httpcore.http2",
-    "httpcore.proxy",
-    "httpcore.socks",
 )
 
 
 class MCPResponseTooLarge(httpx.TransportError):
     """The MCP provider response exceeded the configured byte limit."""
+
+
+class MCPUnsupportedContentEncoding(httpx.TransportError):
+    """The MCP provider returned an unsafe encoded response."""
 
 
 class _DropSDKLogRecords(logging.Filter):
@@ -102,6 +98,15 @@ class _BoundedHTTPTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         response = await self._source.handle_async_request(request)
+        content_encoding = response.headers.get("Content-Encoding")
+        if (
+            content_encoding is not None
+            and content_encoding.strip().casefold() != "identity"
+        ):
+            await response.aclose()
+            raise MCPUnsupportedContentEncoding(
+                "SmartPBX MCP response encoding rejected"
+            )
         declared_length = response.headers.get("Content-Length", "").strip()
         if declared_length.isdecimal() and (
             int(declared_length) > self._maximum_response_bytes
@@ -313,8 +318,10 @@ async def _open_session(
     transport = _BoundedHTTPTransport(
         _new_http_transport(), maximum_response_bytes=max_response_bytes
     )
+    client_headers = dict(headers)
+    client_headers["Accept-Encoding"] = "identity"
     async with httpx.AsyncClient(
-        headers=dict(headers),
+        headers=client_headers,
         timeout=timeout,
         follow_redirects=False,
         transport=transport,
