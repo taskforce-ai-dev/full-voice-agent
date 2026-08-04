@@ -209,3 +209,31 @@ def test_failsafe_greeting_does_not_already_ask_for_the_name():
     """
     greeting = server.HANDOFF_FAILSAFE_GREETING.lower()
     assert "your name" not in greeting
+
+
+# ---------------------------------------------------------------------------
+# #121 — ConversationRelay STT hints so Kavya understands spoken digit
+# shorthand ("double seven" -> 77) live, in the call.
+# ---------------------------------------------------------------------------
+
+def test_english_conversationrelay_carries_digit_shorthand_hints():
+    """The English ConversationRelay TwiML must bias Google's STT toward the
+    spoken digit shorthand ("double"/"triple" + digit words) so the transcriber
+    emits those words and Kavya can expand them live. Without the hint,
+    "double seven" is garbled and she never receives the word "double"."""
+    twiml = server._build_conversation_relay_twiml(
+        "host", "en", server.LANGUAGE_CONFIGS["en"])
+    assert 'hints="' in twiml
+    for token in ("double", "triple", "oh", "seven"):
+        assert token in twiml, f"hint vocabulary missing {token!r}"
+
+
+def test_transcription_language_is_off_by_default():
+    """transcriptionLanguage is emitted ONLY when CR_TRANSCRIPTION_LANGUAGE is
+    set (the en-IN A/B); the default must keep the unchanged en-US behaviour."""
+    cfg = dict(server.LANGUAGE_CONFIGS["en"], transcription_language="")
+    twiml = server._build_conversation_relay_twiml("host", "en", cfg)
+    assert "transcriptionLanguage=" not in twiml
+    cfg_in = dict(server.LANGUAGE_CONFIGS["en"], transcription_language="en-IN")
+    assert 'transcriptionLanguage="en-IN"' in server._build_conversation_relay_twiml(
+        "host", "en", cfg_in)
