@@ -362,6 +362,18 @@ ClickUp as well as on the PR.
 > `clickup_send_chat_message` (member IDs above) instead. This was discovered the
 > hard way: the first update posted looked correct and notified nobody.
 
+> **Markdown tables and `---` rules are silently destroyed.** ClickUp chat
+> renders each of them as the literal string `undefined` — the message posts
+> "successfully", and the content is simply gone. A status update posted this way
+> lost its entire merged-PRs table and nobody could have told from the send
+> result. **Use bullet lists instead of tables, and blank lines instead of `---`.**
+> Fenced code blocks, `**bold**`, `` `code` `` and emoji all render fine.
+>
+> **Read the message back after sending.** `clickup_get_chat_channel_messages`
+> with `limit: 1` shows what actually landed. Both failure modes in this section
+> — mentions that notify nobody, tables that vanish — return `success: true` and
+> look correct until you read the channel.
+
 Also note the message posts as whichever account holds the ClickUp OAuth, which
 is currently `Thivarrakesh Parthipan` (`216208369`) — not `chrys@taskforceai.tech`.
 Write updates in a voice that suits being sent by a person, not by a bot.
