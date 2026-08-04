@@ -1,0 +1,1792 @@
+{
+    "updatedAt": "2026-07-09T05:09:54.023Z",
+    "createdAt": "2026-04-08T04:58:15.642Z",
+    "id": "lGCsV0DYRtPNXfsd",
+    "name": "Treehouse Post-Call Processor",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+        {
+            "parameters": {
+                "httpMethod": "POST",
+                "path": "treehouse-call-webhook",
+                "options": {}
+            },
+            "id": "28d1c55d-0868-4525-8fb8-f0c7a38a0868",
+            "name": "Webhook (from Voice Agent)",
+            "type": "n8n-nodes-base.webhook",
+            "typeVersion": 2,
+            "position": [
+                1472,
+                1216
+            ],
+            "webhookId": "treehouse-call-webhook",
+            "retryOnFail": false
+        },
+        {
+            "parameters": {
+                "modelId": {
+                    "__rl": true,
+                    "value": "gpt-4o-mini",
+                    "mode": "list",
+                    "cachedResultName": "gpt-4o-mini"
+                },
+                "messages": {
+                    "values": [
+                        {
+                            "content": "=You are a post-call processor for Treehouse Chalets' voice booking agent (Kavya). You receive a single call record as JSON and produce a structured output for downstream WhatsApp notifications (to management AND to the customer).\n\nINPUT\nThe user message will contain one JSON object with fields like: timestamp, call_sid, language, caller_phone, guest_name, num_guests, check_in, check_out, room_preference, availability_result, call_outcome, follow_up_needed, summary, transcript.\n\nOUTPUT\nReturn ONLY a single valid JSON object \u2014 no markdown, no code fences, no prose before or after. Use this exact schema:\n\n{\n  \"whatsapp_summary\": \"string\",\n  \"booking_confirmed\": boolean,\n  \"customer_phone\": \"string | null\",\n  \"customer_whatsapp_message\": \"string | null\"\n}\n\nRULES\n\n1. whatsapp_summary (ALWAYS REQUIRED) \u2014 for management\n   - 4\u20137 short lines, plain text, suitable for WhatsApp.\n   - Include: caller name, phone, dates, room, guests, outcome, and booking reference if any.\n   - If booking failed or was not made, state the reason briefly (e.g. \"no availability\", \"guest hung up\").\n   - Use emojis sparingly for scannability: \ud83d\udcde \ud83d\udecf\ufe0f \ud83d\udcc5 \u2705 \u274c \ud83d\udcb0.\n\n2. booking_confirmed\n   - true ONLY if the call_outcome field is \"booking_confirmed\" AND a booking reference number is present (check \"booking_reference\" field first, then transcript/summary).\n   - false in all other cases.\n\n3. If booking_confirmed is false:\n   - Set customer_phone AND customer_whatsapp_message to null.\n\n4. If booking_confirmed is true:\n   - customer_phone: FIRST check if the input has a \"guest_phone\" field (the exact phone from the booking system). If present, use it as-is (digits only, no plus). Otherwise extract the phone number the customer GAVE during the call (from the transcript \u2014 Kavya typically confirms it back to them). COPY THE DIGITS EXACTLY as they appear in the transcript, in the same order, adding or removing nothing except stripping \"+\", spaces, and dashes. Do NOT add, derive, or convert a country code, and do NOT reformat the number in any way \u2014 downstream automation handles normalization. Example: if the transcript says \"0711 754 668\", return \"0711754668\"; if it says \"plus nine four seven one one...\", return \"94711...\". If no phone was captured in the transcript, fall back to the caller_phone field (strip the + and any spaces).\n   - customer_whatsapp_message: a friendly WhatsApp confirmation to send to the customer. Use the template below.\n\nCUSTOMER WHATSAPP TEMPLATE (use for customer_whatsapp_message)\n\nHi {{GUEST_FIRST_NAME}}! \ud83c\udf3f\n\nYour booking at *Treehouse Chalets* is confirmed! \u2705\n\n\ud83d\udcc5 Check-In: {{CHECK_IN}}\n\ud83d\udcc5 Check-Out: {{CHECK_OUT}}\n\ud83d\udecf\ufe0f Room: {{ROOM_TYPE}}\n\ud83d\udc65 Guests: {{GUESTS}}\n\ud83d\udcb0 Total: LKR {{TOTAL}}\n\ud83d\udd16 Reference: {{BOOKING_REF}}\n\nYour stay includes breakfast and dinner. For 2+ night stays, you'll also enjoy complimentary nature walks, night walks, and stargazing with our telescope! \ud83d\udd2d\n\nLooking forward to welcoming you! \ud83c\udf33\n\n\u2014 Treehouse Chalets Team\n\nNOTES\n- Format dates as \"DD Month YYYY\" (e.g. \"25 May 2024\") in the customer WhatsApp message.\n- Format TOTAL with thousands separator (e.g. \"52,580\").\n- Use single asterisks for *bold* in WhatsApp (it does not support HTML or double asterisks).\n- Match the call language for customer_whatsapp_message: if the call was in Sinhala, write the WhatsApp message in Sinhala script.\n- If any required booking field (phone, dates, room, reference) is missing, set booking_confirmed to false and explain in whatsapp_summary.\n- Output JSON only. No commentary.",
+                            "role": "system"
+                        },
+                        {
+                            "content": "={{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body) }}"
+                        }
+                    ]
+                },
+                "jsonOutput": true,
+                "options": {
+                    "temperature": 0.2
+                }
+            },
+            "id": "045f0a40-47ac-4b24-af60-7cc22f1b2e7f",
+            "name": "OpenAI \u2014 Build Summary + Email",
+            "type": "@n8n/n8n-nodes-langchain.openAi",
+            "typeVersion": 1.8,
+            "position": [
+                1920,
+                1216
+            ],
+            "credentials": {
+                "openAiApi": {
+                    "id": "HubsDTk7TUGiFsOK",
+                    "name": "OpenAi account"
+                }
+            }
+        },
+        {
+            "parameters": {
+                "mode": "raw",
+                "jsonOutput": "={{ $json.message.content }}",
+                "options": {}
+            },
+            "id": "b0c92a6e-41a5-466f-9aee-1cd023ec0811",
+            "name": "Parse AI JSON",
+            "type": "n8n-nodes-base.set",
+            "typeVersion": 3.4,
+            "position": [
+                2272,
+                1216
+            ]
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "strict",
+                        "version": 2
+                    },
+                    "conditions": [
+                        {
+                            "id": "cond-001",
+                            "leftValue": "={{ $json.booking_confirmed }}",
+                            "rightValue": true,
+                            "operator": {
+                                "type": "boolean",
+                                "operation": "true",
+                                "singleValue": true
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                },
+                "options": {}
+            },
+            "id": "5d75ebb5-f13b-497d-b7ee-02104869524f",
+            "name": "IF Booking Confirmed",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2.2,
+            "position": [
+                2496,
+                1312
+            ]
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "https://www.wasenderapi.com/api/send-message",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        },
+                        {
+                            "name": "Authorization",
+                            "value": "Bearer <WASENDER_TOKEN — see n8n UI>"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "bodyParameters": {
+                    "parameters": [
+                        {
+                            "name": "to",
+                            "value": "={{ '94' + String($('Webhook (from Voice Agent)').item.json.body.guest_phone || $('Parse AI JSON').item.json.customer_phone || '').replace(/[^0-9]/g, '').replace(/^0+/, '').replace(/^94/, '') }}@s.whatsapp.net"
+                        },
+                        {
+                            "name": "text",
+                            "value": "={{ $('Parse AI JSON').item.json.customer_whatsapp_message }}"
+                        }
+                    ]
+                },
+                "options": {}
+            },
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.3,
+            "position": [
+                2720,
+                1216
+            ],
+            "id": "c3fd0c59-9a14-4963-8780-0d902b70e6a5",
+            "name": "wa customer confirmation",
+            "onError": "continueRegularOutput"
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "https://www.wasenderapi.com/api/send-message",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        },
+                        {
+                            "name": "Authorization",
+                            "value": "Bearer <WASENDER_TOKEN — see n8n UI>"
+                        },
+                        {}
+                    ]
+                },
+                "sendBody": true,
+                "bodyParameters": {
+                    "parameters": [
+                        {
+                            "name": "to",
+                            "value": "=94716517638\n"
+                        },
+                        {
+                            "name": "text",
+                            "value": "={{ $('Parse AI JSON').item.json.whatsapp_summary }}"
+                        }
+                    ]
+                },
+                "options": {}
+            },
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.3,
+            "position": [
+                3168,
+                1216
+            ],
+            "id": "653a43e1-56dc-467d-b75a-192af9aa6ab5",
+            "name": "wa summary message",
+            "onError": "continueRegularOutput"
+        },
+        {
+            "parameters": {
+                "operation": "append",
+                "documentId": {
+                    "__rl": true,
+                    "value": "17aUyUY2SWwf7SwiWPhK1S7SJbdyP3VBswqCOnBsmOtQ",
+                    "mode": "id"
+                },
+                "sheetName": {
+                    "__rl": true,
+                    "value": "Calls",
+                    "mode": "name"
+                },
+                "columns": {
+                    "mappingMode": "defineBelow",
+                    "value": {
+                        "Date/Time": "={{ $json.body.timestamp }}",
+                        "Call SID": "={{ $json.body.call_sid }}",
+                        "Language": "={{ $json.body.language }}",
+                        "Caller Phone": "={{ $json.body.caller_phone }}",
+                        "Guest Name": "={{ $json.body.guest_name }}",
+                        "Guests": "={{ $json.body.num_guests }}",
+                        "Check-In": "={{ $json.body.check_in }}",
+                        "Check-Out": "={{ $json.body.check_out }}",
+                        "Room preference": "={{ $json.body.room_preference }}",
+                        "Availability": "={{ $json.body.availability_result }}",
+                        "Outcome": "={{ $json.body.call_outcome }}",
+                        "Follow-Up Needed": "={{ $json.body.follow_up_needed }}",
+                        "Summary": "={{ $json.body.summary }}",
+                        "Transcript": "={{ $json.body.transcript }}"
+                    },
+                    "matchingColumns": [],
+                    "schema": [
+                        {
+                            "id": "Date/Time",
+                            "displayName": "Date/Time",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Call SID",
+                            "displayName": "Call SID",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Language",
+                            "displayName": "Language",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Caller Phone",
+                            "displayName": "Caller Phone",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Guest Name",
+                            "displayName": "Guest Name",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Guests",
+                            "displayName": "Guests",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Check-In",
+                            "displayName": "Check-In",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Check-Out",
+                            "displayName": "Check-Out",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Room preference",
+                            "displayName": "Room preference",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Availability",
+                            "displayName": "Availability",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Outcome",
+                            "displayName": "Outcome",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Follow-Up Needed",
+                            "displayName": "Follow-Up Needed",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Summary",
+                            "displayName": "Summary",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        },
+                        {
+                            "id": "Transcript",
+                            "displayName": "Transcript",
+                            "required": false,
+                            "defaultMatch": false,
+                            "display": true,
+                            "type": "string",
+                            "canBeUsedToMatch": true,
+                            "removed": false
+                        }
+                    ],
+                    "attemptToConvertTypes": false,
+                    "convertFieldsToString": false
+                },
+                "options": {}
+            },
+            "type": "n8n-nodes-base.googleSheets",
+            "typeVersion": 4.7,
+            "position": [
+                1696,
+                1216
+            ],
+            "id": "eeeabe6c-813c-45bc-b7ca-a3fc5a6da9af",
+            "name": "Append row in sheet",
+            "credentials": {
+                "googleSheetsOAuth2Api": {
+                    "id": "6uUUXmRncgI1pdGv",
+                    "name": "Google Sheets account 2"
+                }
+            }
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "https://www.wasenderapi.com/api/send-message",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        },
+                        {
+                            "name": "Authorization",
+                            "value": "Bearer <WASENDER_TOKEN — see n8n UI>"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "bodyParameters": {
+                    "parameters": [
+                        {
+                            "name": "to",
+                            "value": "={{ $('Parse AI JSON').item.json.customer_phone }}@s.whatsapp.net\n"
+                        },
+                        {
+                            "name": "text",
+                            "value": "={{ $('Parse AI JSON').item.json.whatsapp_summary }}"
+                        }
+                    ]
+                },
+                "options": {}
+            },
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.3,
+            "position": [
+                2720,
+                1408
+            ],
+            "id": "47d78c96-aae8-483f-a9c0-8967d167750f",
+            "name": "wa summary message1",
+            "onError": "continueRegularOutput"
+        },
+        {
+            "parameters": {
+                "amount": 6
+            },
+            "type": "n8n-nodes-base.wait",
+            "typeVersion": 1.1,
+            "position": [
+                2944,
+                1216
+            ],
+            "id": "wait-rate-limit-6s",
+            "name": "Wait 6s",
+            "webhookId": "wait-rate-limit-6s"
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "https://client-portal-pi-fawn.vercel.app/api/agents/kavya/summaries",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "x-api-key",
+                            "value": "<CLIENT_PORTAL_INGEST_KEY — see n8n UI>"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "specifyBody": "json",
+                "jsonBody": "={\n  \"call_sid\":        {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.call_sid) }},\n  \"caller_name\":     {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.guest_name) }},\n  \"caller_phone\":    {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.caller_phone) }},\n  \"summary\":         {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.summary) }},\n  \"mentioned_dates\": {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.check_in + ' \u2192 ' + $('Webhook (from Voice Agent)').item.json.body.check_out) }},\n  \"key_points\":      {{ JSON.stringify('- Room: ' + $('Webhook (from Voice Agent)').item.json.body.room_preference + '\\n- Guests: ' + $('Webhook (from Voice Agent)').item.json.body.num_guests + '\\n- ' + $('Webhook (from Voice Agent)').item.json.body.availability_result) }},\n  \"topics\":          {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.call_outcome) }},\n  \"sentiment\":       {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.call_outcome === 'booking_confirmed' ? 'positive' : 'neutral') }},\n  \"duration_sec\":    {{ Math.round((new Date($('Webhook (from Voice Agent)').item.json.body.call_end_time).getTime() - new Date($('Webhook (from Voice Agent)').item.json.body.timestamp).getTime()) / 1000) }}\n}",
+                "options": {}
+            },
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.3,
+            "position": [
+                2496,
+                1120
+            ],
+            "id": "d203745c-6cab-4043-924d-ba4bb74bac1b",
+            "name": "HTTP Request",
+            "onError": "continueRegularOutput"
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "loose",
+                        "version": 2
+                    },
+                    "conditions": [
+                        {
+                            "id": "92347193-e438-4e3e-ac8c-8c8379ad6118",
+                            "leftValue": "={{ $json.error }}",
+                            "rightValue": "",
+                            "operator": {
+                                "type": "object",
+                                "operation": "exists",
+                                "singleValue": true
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                },
+                "options": {}
+            },
+            "id": "6b40c696-5e0c-4776-b678-45ca78c4c4c8",
+            "name": "IF send failed \u2014 wa customer confirmation",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2.2,
+            "position": [
+                2880,
+                1440
+            ]
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "https://o4511653441699840.ingest.us.sentry.io/api/4511653460901888/store/",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        },
+                        {
+                            "name": "X-Sentry-Auth",
+                            "value": "Sentry sentry_version=7, sentry_key=efe80061e00be83781c61d0165a82788, sentry_client=n8n-postcall/1.0"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "specifyBody": "json",
+                "jsonBody": "={{ JSON.stringify({message: 'WhatsApp send failed (wa customer confirmation): ' + String($json.error.message || $json.error).slice(0, 300), level: 'error', logger: 'n8n.postcall', platform: 'other', environment: 'production', tags: { agent: 'kavya', source: 'n8n', wa_node: 'wa customer confirmation' }, fingerprint: ['n8n-wa-send-failure', 'wa customer confirmation'], extra: { workflow: 'Treehouse Post-Call Processor', call_sid: $('Webhook (from Voice Agent)').item.json.body.call_sid, caller_phone: $('Webhook (from Voice Agent)').item.json.body.caller_phone, error: String($json.error.message || $json.error).slice(0, 1000) } }) }}",
+                "options": {}
+            },
+            "id": "23a9ee47-4188-4a09-92ce-3399fa7a97ec",
+            "name": "Sentry alert \u2014 wa customer confirmation",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.3,
+            "position": [
+                3072,
+                1440
+            ],
+            "onError": "continueRegularOutput"
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "loose",
+                        "version": 2
+                    },
+                    "conditions": [
+                        {
+                            "id": "f3e8662d-3d41-418c-b10c-5fbb54372952",
+                            "leftValue": "={{ $json.error }}",
+                            "rightValue": "",
+                            "operator": {
+                                "type": "object",
+                                "operation": "exists",
+                                "singleValue": true
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                },
+                "options": {}
+            },
+            "id": "b174af2f-6ad9-435a-b9c8-f581738131f2",
+            "name": "IF send failed \u2014 wa summary message",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2.2,
+            "position": [
+                3328,
+                1440
+            ]
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "https://o4511653441699840.ingest.us.sentry.io/api/4511653460901888/store/",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        },
+                        {
+                            "name": "X-Sentry-Auth",
+                            "value": "Sentry sentry_version=7, sentry_key=efe80061e00be83781c61d0165a82788, sentry_client=n8n-postcall/1.0"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "specifyBody": "json",
+                "jsonBody": "={{ JSON.stringify({message: 'WhatsApp send failed (wa summary message): ' + String($json.error.message || $json.error).slice(0, 300), level: 'error', logger: 'n8n.postcall', platform: 'other', environment: 'production', tags: { agent: 'kavya', source: 'n8n', wa_node: 'wa summary message' }, fingerprint: ['n8n-wa-send-failure', 'wa summary message'], extra: { workflow: 'Treehouse Post-Call Processor', call_sid: $('Webhook (from Voice Agent)').item.json.body.call_sid, caller_phone: $('Webhook (from Voice Agent)').item.json.body.caller_phone, error: String($json.error.message || $json.error).slice(0, 1000) } }) }}",
+                "options": {}
+            },
+            "id": "a67c1bf9-857c-4d32-9fe8-a1914fa0965d",
+            "name": "Sentry alert \u2014 wa summary message",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.3,
+            "position": [
+                3520,
+                1440
+            ],
+            "onError": "continueRegularOutput"
+        },
+        {
+            "parameters": {
+                "conditions": {
+                    "options": {
+                        "caseSensitive": true,
+                        "leftValue": "",
+                        "typeValidation": "loose",
+                        "version": 2
+                    },
+                    "conditions": [
+                        {
+                            "id": "ff13911f-b211-4827-8701-146b21d1c7bc",
+                            "leftValue": "={{ $json.error }}",
+                            "rightValue": "",
+                            "operator": {
+                                "type": "object",
+                                "operation": "exists",
+                                "singleValue": true
+                            }
+                        }
+                    ],
+                    "combinator": "and"
+                },
+                "options": {}
+            },
+            "id": "4c992c89-1069-4db3-a200-f82c3a90b6c2",
+            "name": "IF send failed \u2014 wa summary message1",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2.2,
+            "position": [
+                2880,
+                1632
+            ]
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "https://o4511653441699840.ingest.us.sentry.io/api/4511653460901888/store/",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        },
+                        {
+                            "name": "X-Sentry-Auth",
+                            "value": "Sentry sentry_version=7, sentry_key=efe80061e00be83781c61d0165a82788, sentry_client=n8n-postcall/1.0"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "specifyBody": "json",
+                "jsonBody": "={{ JSON.stringify({message: 'WhatsApp send failed (wa summary message1): ' + String($json.error.message || $json.error).slice(0, 300), level: 'error', logger: 'n8n.postcall', platform: 'other', environment: 'production', tags: { agent: 'kavya', source: 'n8n', wa_node: 'wa summary message1' }, fingerprint: ['n8n-wa-send-failure', 'wa summary message1'], extra: { workflow: 'Treehouse Post-Call Processor', call_sid: $('Webhook (from Voice Agent)').item.json.body.call_sid, caller_phone: $('Webhook (from Voice Agent)').item.json.body.caller_phone, error: String($json.error.message || $json.error).slice(0, 1000) } }) }}",
+                "options": {}
+            },
+            "id": "138edfa9-fc4a-4a5e-9696-76668165531a",
+            "name": "Sentry alert \u2014 wa summary message1",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.3,
+            "position": [
+                3072,
+                1632
+            ],
+            "onError": "continueRegularOutput"
+        }
+    ],
+    "connections": {
+        "Webhook (from Voice Agent)": {
+            "main": [
+                [
+                    {
+                        "node": "Append row in sheet",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Append row in sheet": {
+            "main": [
+                [
+                    {
+                        "node": "OpenAI \u2014 Build Summary + Email",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "OpenAI \u2014 Build Summary + Email": {
+            "main": [
+                [
+                    {
+                        "node": "Parse AI JSON",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Parse AI JSON": {
+            "main": [
+                [
+                    {
+                        "node": "IF Booking Confirmed",
+                        "type": "main",
+                        "index": 0
+                    },
+                    {
+                        "node": "HTTP Request",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "IF Booking Confirmed": {
+            "main": [
+                [
+                    {
+                        "node": "wa customer confirmation",
+                        "type": "main",
+                        "index": 0
+                    }
+                ],
+                [
+                    {
+                        "node": "wa summary message1",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "wa customer confirmation": {
+            "main": [
+                [
+                    {
+                        "node": "Wait 6s",
+                        "type": "main",
+                        "index": 0
+                    },
+                    {
+                        "node": "IF send failed \u2014 wa customer confirmation",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Wait 6s": {
+            "main": [
+                [
+                    {
+                        "node": "wa summary message",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "IF send failed \u2014 wa customer confirmation": {
+            "main": [
+                [
+                    {
+                        "node": "Sentry alert \u2014 wa customer confirmation",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "wa summary message": {
+            "main": [
+                [
+                    {
+                        "node": "IF send failed \u2014 wa summary message",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "IF send failed \u2014 wa summary message": {
+            "main": [
+                [
+                    {
+                        "node": "Sentry alert \u2014 wa summary message",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "wa summary message1": {
+            "main": [
+                [
+                    {
+                        "node": "IF send failed \u2014 wa summary message1",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "IF send failed \u2014 wa summary message1": {
+            "main": [
+                [
+                    {
+                        "node": "Sentry alert \u2014 wa summary message1",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        }
+    },
+    "settings": {
+        "executionOrder": "v1",
+        "callerPolicy": "workflowsFromSameOwner",
+        "availableInMCP": false
+    },
+    "staticData": null,
+    "meta": {
+        "templateCredsSetupCompleted": true
+    },
+    "pinData": {
+        "Webhook (from Voice Agent)": [
+            {
+                "json": {
+                    "headers": {
+                        "host": "automation.taskforceai.tech",
+                        "x-real-ip": "175.157.216.37",
+                        "x-forwarded-for": "175.157.216.37",
+                        "x-forwarded-proto": "https",
+                        "x-forwarded-host": "automation.taskforceai.tech",
+                        "x-forwarded-port": "443",
+                        "connection": "upgrade",
+                        "content-length": "959",
+                        "user-agent": "curl/8.5.0",
+                        "accept": "*/*",
+                        "content-type": "application/json"
+                    },
+                    "params": {},
+                    "query": {},
+                    "body": {
+                        "timestamp": "2026-05-14T09:15:00.000000",
+                        "call_end_time": "2026-05-14T09:18:00.000000",
+                        "call_sid": "CA_SMOKE_TEST_20260514",
+                        "language": "English",
+                        "caller_phone": "+94711754668",
+                        "transcript": "Guest: Smoke test booking please.\nKavya: Confirmed. Reference number SMOKE one two three.\nGuest: Thank you.",
+                        "guest_name": "Smoke Test",
+                        "num_guests": "2 adults",
+                        "check_in": "2026-06-10",
+                        "check_out": "2026-06-12",
+                        "room_preference": "Eco Harmony",
+                        "availability_result": "Eco Harmony available for requested dates at 52,580 rupees for 2 nights",
+                        "call_outcome": "booking_confirmed",
+                        "follow_up_needed": "No",
+                        "summary": "Smoke test booking. Guest Smoke Test booked Eco Harmony for June 10-12, 2026 (2 nights). Email mr.darknight2007 at gmail dot com. Phone plus nine four seven one one seven five four six six eight. Reference SMOKE123. Total fifty two thousand five hundred eighty rupees."
+                    },
+                    "webhookUrl": "https://automation.taskforceai.tech/webhook/treehouse-call-webhook",
+                    "executionMode": "production"
+                },
+                "pairedItem": {
+                    "item": 0
+                }
+            }
+        ]
+    },
+    "versionId": "56eed98b-6cc9-4486-b558-775017de79dd",
+    "activeVersionId": "56eed98b-6cc9-4486-b558-775017de79dd",
+    "versionCounter": 111,
+    "triggerCount": 1,
+    "shared": [
+        {
+            "updatedAt": "2026-04-08T04:58:15.650Z",
+            "createdAt": "2026-04-08T04:58:15.650Z",
+            "role": "workflow:owner",
+            "workflowId": "lGCsV0DYRtPNXfsd",
+            "projectId": "yxOVxX2EUIPpjV2s",
+            "project": {
+                "updatedAt": "2025-12-22T16:36:50.081Z",
+                "createdAt": "2025-12-22T16:33:47.774Z",
+                "id": "yxOVxX2EUIPpjV2s",
+                "name": "Sandeep Pamuditha <sandeep@taskforceai.tech>",
+                "type": "personal",
+                "icon": null,
+                "description": null,
+                "projectRelations": [
+                    {
+                        "updatedAt": "2025-12-22T16:33:47.774Z",
+                        "createdAt": "2025-12-22T16:33:47.774Z",
+                        "userId": "347740a4-29e5-4c57-9347-30a33ccb5878",
+                        "projectId": "yxOVxX2EUIPpjV2s",
+                        "user": {
+                            "updatedAt": "2026-07-09T04:27:27.000Z",
+                            "createdAt": "2025-12-22T16:33:47.193Z",
+                            "id": "347740a4-29e5-4c57-9347-30a33ccb5878",
+                            "email": "sandeep@taskforceai.tech",
+                            "firstName": "Sandeep",
+                            "lastName": "Pamuditha",
+                            "personalizationAnswers": {
+                                "version": "v4",
+                                "personalization_survey_submitted_at": "2025-12-22T16:38:28.985Z",
+                                "personalization_survey_n8n_version": "2.0.3",
+                                "automationGoalDevops": [
+                                    "incident-response",
+                                    "monitoring-alerting",
+                                    "other"
+                                ],
+                                "companyType": "systems-integrator",
+                                "role": "it"
+                            },
+                            "settings": {
+                                "userActivated": true,
+                                "easyAIWorkflowOnboarded": true,
+                                "firstSuccessfulWorkflowId": "IITszPTphcrx5MHC",
+                                "userActivatedAt": 1766473178592,
+                                "npsSurvey": {
+                                    "responded": true,
+                                    "lastShownAt": 1768216046791
+                                }
+                            },
+                            "disabled": false,
+                            "mfaEnabled": false,
+                            "lastActiveAt": "2026-07-09",
+                            "isPending": false
+                        }
+                    }
+                ]
+            }
+        }
+    ],
+    "tags": [
+        {
+            "updatedAt": "2026-05-19T05:10:47.369Z",
+            "createdAt": "2026-04-25T06:01:46.047Z",
+            "id": "83MPQlsG9rbxXWIF",
+            "name": "Amrah"
+        }
+    ],
+    "activeVersion": {
+        "updatedAt": "2026-07-09T05:09:54.031Z",
+        "createdAt": "2026-07-09T05:09:54.031Z",
+        "versionId": "56eed98b-6cc9-4486-b558-775017de79dd",
+        "workflowId": "lGCsV0DYRtPNXfsd",
+        "nodes": [
+            {
+                "parameters": {
+                    "httpMethod": "POST",
+                    "path": "treehouse-call-webhook",
+                    "options": {}
+                },
+                "id": "28d1c55d-0868-4525-8fb8-f0c7a38a0868",
+                "name": "Webhook (from Voice Agent)",
+                "type": "n8n-nodes-base.webhook",
+                "typeVersion": 2,
+                "position": [
+                    1472,
+                    1216
+                ],
+                "webhookId": "treehouse-call-webhook",
+                "retryOnFail": false
+            },
+            {
+                "parameters": {
+                    "modelId": {
+                        "__rl": true,
+                        "value": "gpt-4o-mini",
+                        "mode": "list",
+                        "cachedResultName": "gpt-4o-mini"
+                    },
+                    "messages": {
+                        "values": [
+                            {
+                                "content": "=You are a post-call processor for Treehouse Chalets' voice booking agent (Kavya). You receive a single call record as JSON and produce a structured output for downstream WhatsApp notifications (to management AND to the customer).\n\nINPUT\nThe user message will contain one JSON object with fields like: timestamp, call_sid, language, caller_phone, guest_name, num_guests, check_in, check_out, room_preference, availability_result, call_outcome, follow_up_needed, summary, transcript.\n\nOUTPUT\nReturn ONLY a single valid JSON object \u2014 no markdown, no code fences, no prose before or after. Use this exact schema:\n\n{\n  \"whatsapp_summary\": \"string\",\n  \"booking_confirmed\": boolean,\n  \"customer_phone\": \"string | null\",\n  \"customer_whatsapp_message\": \"string | null\"\n}\n\nRULES\n\n1. whatsapp_summary (ALWAYS REQUIRED) \u2014 for management\n   - 4\u20137 short lines, plain text, suitable for WhatsApp.\n   - Include: caller name, phone, dates, room, guests, outcome, and booking reference if any.\n   - If booking failed or was not made, state the reason briefly (e.g. \"no availability\", \"guest hung up\").\n   - Use emojis sparingly for scannability: \ud83d\udcde \ud83d\udecf\ufe0f \ud83d\udcc5 \u2705 \u274c \ud83d\udcb0.\n\n2. booking_confirmed\n   - true ONLY if the call_outcome field is \"booking_confirmed\" AND a booking reference number is present (check \"booking_reference\" field first, then transcript/summary).\n   - false in all other cases.\n\n3. If booking_confirmed is false:\n   - Set customer_phone AND customer_whatsapp_message to null.\n\n4. If booking_confirmed is true:\n   - customer_phone: FIRST check if the input has a \"guest_phone\" field (the exact phone from the booking system). If present, use it as-is (digits only, no plus). Otherwise extract the phone number the customer GAVE during the call (from the transcript \u2014 Kavya typically confirms it back to them). COPY THE DIGITS EXACTLY as they appear in the transcript, in the same order, adding or removing nothing except stripping \"+\", spaces, and dashes. Do NOT add, derive, or convert a country code, and do NOT reformat the number in any way \u2014 downstream automation handles normalization. Example: if the transcript says \"0711 754 668\", return \"0711754668\"; if it says \"plus nine four seven one one...\", return \"94711...\". If no phone was captured in the transcript, fall back to the caller_phone field (strip the + and any spaces).\n   - customer_whatsapp_message: a friendly WhatsApp confirmation to send to the customer. Use the template below.\n\nCUSTOMER WHATSAPP TEMPLATE (use for customer_whatsapp_message)\n\nHi {{GUEST_FIRST_NAME}}! \ud83c\udf3f\n\nYour booking at *Treehouse Chalets* is confirmed! \u2705\n\n\ud83d\udcc5 Check-In: {{CHECK_IN}}\n\ud83d\udcc5 Check-Out: {{CHECK_OUT}}\n\ud83d\udecf\ufe0f Room: {{ROOM_TYPE}}\n\ud83d\udc65 Guests: {{GUESTS}}\n\ud83d\udcb0 Total: LKR {{TOTAL}}\n\ud83d\udd16 Reference: {{BOOKING_REF}}\n\nYour stay includes breakfast and dinner. For 2+ night stays, you'll also enjoy complimentary nature walks, night walks, and stargazing with our telescope! \ud83d\udd2d\n\nLooking forward to welcoming you! \ud83c\udf33\n\n\u2014 Treehouse Chalets Team\n\nNOTES\n- Format dates as \"DD Month YYYY\" (e.g. \"25 May 2024\") in the customer WhatsApp message.\n- Format TOTAL with thousands separator (e.g. \"52,580\").\n- Use single asterisks for *bold* in WhatsApp (it does not support HTML or double asterisks).\n- Match the call language for customer_whatsapp_message: if the call was in Sinhala, write the WhatsApp message in Sinhala script.\n- If any required booking field (phone, dates, room, reference) is missing, set booking_confirmed to false and explain in whatsapp_summary.\n- Output JSON only. No commentary.",
+                                "role": "system"
+                            },
+                            {
+                                "content": "={{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body) }}"
+                            }
+                        ]
+                    },
+                    "jsonOutput": true,
+                    "options": {
+                        "temperature": 0.2
+                    }
+                },
+                "id": "045f0a40-47ac-4b24-af60-7cc22f1b2e7f",
+                "name": "OpenAI \u2014 Build Summary + Email",
+                "type": "@n8n/n8n-nodes-langchain.openAi",
+                "typeVersion": 1.8,
+                "position": [
+                    1920,
+                    1216
+                ],
+                "credentials": {
+                    "openAiApi": {
+                        "id": "HubsDTk7TUGiFsOK",
+                        "name": "OpenAi account"
+                    }
+                }
+            },
+            {
+                "parameters": {
+                    "mode": "raw",
+                    "jsonOutput": "={{ $json.message.content }}",
+                    "options": {}
+                },
+                "id": "b0c92a6e-41a5-466f-9aee-1cd023ec0811",
+                "name": "Parse AI JSON",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 3.4,
+                "position": [
+                    2272,
+                    1216
+                ]
+            },
+            {
+                "parameters": {
+                    "conditions": {
+                        "options": {
+                            "caseSensitive": true,
+                            "leftValue": "",
+                            "typeValidation": "strict",
+                            "version": 2
+                        },
+                        "conditions": [
+                            {
+                                "id": "cond-001",
+                                "leftValue": "={{ $json.booking_confirmed }}",
+                                "rightValue": true,
+                                "operator": {
+                                    "type": "boolean",
+                                    "operation": "true",
+                                    "singleValue": true
+                                }
+                            }
+                        ],
+                        "combinator": "and"
+                    },
+                    "options": {}
+                },
+                "id": "5d75ebb5-f13b-497d-b7ee-02104869524f",
+                "name": "IF Booking Confirmed",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2.2,
+                "position": [
+                    2496,
+                    1312
+                ]
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": "https://www.wasenderapi.com/api/send-message",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                        "parameters": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "name": "Authorization",
+                                "value": "Bearer <WASENDER_TOKEN — see n8n UI>"
+                            }
+                        ]
+                    },
+                    "sendBody": true,
+                    "bodyParameters": {
+                        "parameters": [
+                            {
+                                "name": "to",
+                                "value": "={{ '94' + String($('Webhook (from Voice Agent)').item.json.body.guest_phone || $('Parse AI JSON').item.json.customer_phone || '').replace(/[^0-9]/g, '').replace(/^0+/, '').replace(/^94/, '') }}@s.whatsapp.net"
+                            },
+                            {
+                                "name": "text",
+                                "value": "={{ $('Parse AI JSON').item.json.customer_whatsapp_message }}"
+                            }
+                        ]
+                    },
+                    "options": {}
+                },
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.3,
+                "position": [
+                    2720,
+                    1216
+                ],
+                "id": "c3fd0c59-9a14-4963-8780-0d902b70e6a5",
+                "name": "wa customer confirmation",
+                "onError": "continueRegularOutput"
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": "https://www.wasenderapi.com/api/send-message",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                        "parameters": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "name": "Authorization",
+                                "value": "Bearer <WASENDER_TOKEN — see n8n UI>"
+                            },
+                            {}
+                        ]
+                    },
+                    "sendBody": true,
+                    "bodyParameters": {
+                        "parameters": [
+                            {
+                                "name": "to",
+                                "value": "=94716517638\n"
+                            },
+                            {
+                                "name": "text",
+                                "value": "={{ $('Parse AI JSON').item.json.whatsapp_summary }}"
+                            }
+                        ]
+                    },
+                    "options": {}
+                },
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.3,
+                "position": [
+                    3168,
+                    1216
+                ],
+                "id": "653a43e1-56dc-467d-b75a-192af9aa6ab5",
+                "name": "wa summary message",
+                "onError": "continueRegularOutput"
+            },
+            {
+                "parameters": {
+                    "operation": "append",
+                    "documentId": {
+                        "__rl": true,
+                        "value": "17aUyUY2SWwf7SwiWPhK1S7SJbdyP3VBswqCOnBsmOtQ",
+                        "mode": "id"
+                    },
+                    "sheetName": {
+                        "__rl": true,
+                        "value": "Calls",
+                        "mode": "name"
+                    },
+                    "columns": {
+                        "mappingMode": "defineBelow",
+                        "value": {
+                            "Date/Time": "={{ $json.body.timestamp }}",
+                            "Call SID": "={{ $json.body.call_sid }}",
+                            "Language": "={{ $json.body.language }}",
+                            "Caller Phone": "={{ $json.body.caller_phone }}",
+                            "Guest Name": "={{ $json.body.guest_name }}",
+                            "Guests": "={{ $json.body.num_guests }}",
+                            "Check-In": "={{ $json.body.check_in }}",
+                            "Check-Out": "={{ $json.body.check_out }}",
+                            "Room preference": "={{ $json.body.room_preference }}",
+                            "Availability": "={{ $json.body.availability_result }}",
+                            "Outcome": "={{ $json.body.call_outcome }}",
+                            "Follow-Up Needed": "={{ $json.body.follow_up_needed }}",
+                            "Summary": "={{ $json.body.summary }}",
+                            "Transcript": "={{ $json.body.transcript }}"
+                        },
+                        "matchingColumns": [],
+                        "schema": [
+                            {
+                                "id": "Date/Time",
+                                "displayName": "Date/Time",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Call SID",
+                                "displayName": "Call SID",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Language",
+                                "displayName": "Language",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Caller Phone",
+                                "displayName": "Caller Phone",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Guest Name",
+                                "displayName": "Guest Name",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Guests",
+                                "displayName": "Guests",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Check-In",
+                                "displayName": "Check-In",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Check-Out",
+                                "displayName": "Check-Out",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Room preference",
+                                "displayName": "Room preference",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Availability",
+                                "displayName": "Availability",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Outcome",
+                                "displayName": "Outcome",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Follow-Up Needed",
+                                "displayName": "Follow-Up Needed",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Summary",
+                                "displayName": "Summary",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            },
+                            {
+                                "id": "Transcript",
+                                "displayName": "Transcript",
+                                "required": false,
+                                "defaultMatch": false,
+                                "display": true,
+                                "type": "string",
+                                "canBeUsedToMatch": true,
+                                "removed": false
+                            }
+                        ],
+                        "attemptToConvertTypes": false,
+                        "convertFieldsToString": false
+                    },
+                    "options": {}
+                },
+                "type": "n8n-nodes-base.googleSheets",
+                "typeVersion": 4.7,
+                "position": [
+                    1696,
+                    1216
+                ],
+                "id": "eeeabe6c-813c-45bc-b7ca-a3fc5a6da9af",
+                "name": "Append row in sheet",
+                "credentials": {
+                    "googleSheetsOAuth2Api": {
+                        "id": "6uUUXmRncgI1pdGv",
+                        "name": "Google Sheets account 2"
+                    }
+                }
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": "https://www.wasenderapi.com/api/send-message",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                        "parameters": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "name": "Authorization",
+                                "value": "Bearer <WASENDER_TOKEN — see n8n UI>"
+                            }
+                        ]
+                    },
+                    "sendBody": true,
+                    "bodyParameters": {
+                        "parameters": [
+                            {
+                                "name": "to",
+                                "value": "={{ $('Parse AI JSON').item.json.customer_phone }}@s.whatsapp.net\n"
+                            },
+                            {
+                                "name": "text",
+                                "value": "={{ $('Parse AI JSON').item.json.whatsapp_summary }}"
+                            }
+                        ]
+                    },
+                    "options": {}
+                },
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.3,
+                "position": [
+                    2720,
+                    1408
+                ],
+                "id": "47d78c96-aae8-483f-a9c0-8967d167750f",
+                "name": "wa summary message1",
+                "onError": "continueRegularOutput"
+            },
+            {
+                "parameters": {
+                    "amount": 6
+                },
+                "type": "n8n-nodes-base.wait",
+                "typeVersion": 1.1,
+                "position": [
+                    2944,
+                    1216
+                ],
+                "id": "wait-rate-limit-6s",
+                "name": "Wait 6s",
+                "webhookId": "wait-rate-limit-6s"
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": "https://client-portal-pi-fawn.vercel.app/api/agents/kavya/summaries",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                        "parameters": [
+                            {
+                                "name": "x-api-key",
+                                "value": "<CLIENT_PORTAL_INGEST_KEY — see n8n UI>"
+                            }
+                        ]
+                    },
+                    "sendBody": true,
+                    "specifyBody": "json",
+                    "jsonBody": "={\n  \"call_sid\":        {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.call_sid) }},\n  \"caller_name\":     {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.guest_name) }},\n  \"caller_phone\":    {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.caller_phone) }},\n  \"summary\":         {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.summary) }},\n  \"mentioned_dates\": {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.check_in + ' \u2192 ' + $('Webhook (from Voice Agent)').item.json.body.check_out) }},\n  \"key_points\":      {{ JSON.stringify('- Room: ' + $('Webhook (from Voice Agent)').item.json.body.room_preference + '\\n- Guests: ' + $('Webhook (from Voice Agent)').item.json.body.num_guests + '\\n- ' + $('Webhook (from Voice Agent)').item.json.body.availability_result) }},\n  \"topics\":          {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.call_outcome) }},\n  \"sentiment\":       {{ JSON.stringify($('Webhook (from Voice Agent)').item.json.body.call_outcome === 'booking_confirmed' ? 'positive' : 'neutral') }},\n  \"duration_sec\":    {{ Math.round((new Date($('Webhook (from Voice Agent)').item.json.body.call_end_time).getTime() - new Date($('Webhook (from Voice Agent)').item.json.body.timestamp).getTime()) / 1000) }}\n}",
+                    "options": {}
+                },
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.3,
+                "position": [
+                    2496,
+                    1120
+                ],
+                "id": "d203745c-6cab-4043-924d-ba4bb74bac1b",
+                "name": "HTTP Request",
+                "onError": "continueRegularOutput"
+            },
+            {
+                "parameters": {
+                    "conditions": {
+                        "options": {
+                            "caseSensitive": true,
+                            "leftValue": "",
+                            "typeValidation": "loose",
+                            "version": 2
+                        },
+                        "conditions": [
+                            {
+                                "id": "92347193-e438-4e3e-ac8c-8c8379ad6118",
+                                "leftValue": "={{ $json.error }}",
+                                "rightValue": "",
+                                "operator": {
+                                    "type": "object",
+                                    "operation": "exists",
+                                    "singleValue": true
+                                }
+                            }
+                        ],
+                        "combinator": "and"
+                    },
+                    "options": {}
+                },
+                "id": "6b40c696-5e0c-4776-b678-45ca78c4c4c8",
+                "name": "IF send failed \u2014 wa customer confirmation",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2.2,
+                "position": [
+                    2880,
+                    1440
+                ]
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": "https://o4511653441699840.ingest.us.sentry.io/api/4511653460901888/store/",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                        "parameters": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "name": "X-Sentry-Auth",
+                                "value": "Sentry sentry_version=7, sentry_key=efe80061e00be83781c61d0165a82788, sentry_client=n8n-postcall/1.0"
+                            }
+                        ]
+                    },
+                    "sendBody": true,
+                    "specifyBody": "json",
+                    "jsonBody": "={{ JSON.stringify({message: 'WhatsApp send failed (wa customer confirmation): ' + String($json.error.message || $json.error).slice(0, 300), level: 'error', logger: 'n8n.postcall', platform: 'other', environment: 'production', tags: { agent: 'kavya', source: 'n8n', wa_node: 'wa customer confirmation' }, fingerprint: ['n8n-wa-send-failure', 'wa customer confirmation'], extra: { workflow: 'Treehouse Post-Call Processor', call_sid: $('Webhook (from Voice Agent)').item.json.body.call_sid, caller_phone: $('Webhook (from Voice Agent)').item.json.body.caller_phone, error: String($json.error.message || $json.error).slice(0, 1000) } }) }}",
+                    "options": {}
+                },
+                "id": "23a9ee47-4188-4a09-92ce-3399fa7a97ec",
+                "name": "Sentry alert \u2014 wa customer confirmation",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.3,
+                "position": [
+                    3072,
+                    1440
+                ],
+                "onError": "continueRegularOutput"
+            },
+            {
+                "parameters": {
+                    "conditions": {
+                        "options": {
+                            "caseSensitive": true,
+                            "leftValue": "",
+                            "typeValidation": "loose",
+                            "version": 2
+                        },
+                        "conditions": [
+                            {
+                                "id": "f3e8662d-3d41-418c-b10c-5fbb54372952",
+                                "leftValue": "={{ $json.error }}",
+                                "rightValue": "",
+                                "operator": {
+                                    "type": "object",
+                                    "operation": "exists",
+                                    "singleValue": true
+                                }
+                            }
+                        ],
+                        "combinator": "and"
+                    },
+                    "options": {}
+                },
+                "id": "b174af2f-6ad9-435a-b9c8-f581738131f2",
+                "name": "IF send failed \u2014 wa summary message",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2.2,
+                "position": [
+                    3328,
+                    1440
+                ]
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": "https://o4511653441699840.ingest.us.sentry.io/api/4511653460901888/store/",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                        "parameters": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "name": "X-Sentry-Auth",
+                                "value": "Sentry sentry_version=7, sentry_key=efe80061e00be83781c61d0165a82788, sentry_client=n8n-postcall/1.0"
+                            }
+                        ]
+                    },
+                    "sendBody": true,
+                    "specifyBody": "json",
+                    "jsonBody": "={{ JSON.stringify({message: 'WhatsApp send failed (wa summary message): ' + String($json.error.message || $json.error).slice(0, 300), level: 'error', logger: 'n8n.postcall', platform: 'other', environment: 'production', tags: { agent: 'kavya', source: 'n8n', wa_node: 'wa summary message' }, fingerprint: ['n8n-wa-send-failure', 'wa summary message'], extra: { workflow: 'Treehouse Post-Call Processor', call_sid: $('Webhook (from Voice Agent)').item.json.body.call_sid, caller_phone: $('Webhook (from Voice Agent)').item.json.body.caller_phone, error: String($json.error.message || $json.error).slice(0, 1000) } }) }}",
+                    "options": {}
+                },
+                "id": "a67c1bf9-857c-4d32-9fe8-a1914fa0965d",
+                "name": "Sentry alert \u2014 wa summary message",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.3,
+                "position": [
+                    3520,
+                    1440
+                ],
+                "onError": "continueRegularOutput"
+            },
+            {
+                "parameters": {
+                    "conditions": {
+                        "options": {
+                            "caseSensitive": true,
+                            "leftValue": "",
+                            "typeValidation": "loose",
+                            "version": 2
+                        },
+                        "conditions": [
+                            {
+                                "id": "ff13911f-b211-4827-8701-146b21d1c7bc",
+                                "leftValue": "={{ $json.error }}",
+                                "rightValue": "",
+                                "operator": {
+                                    "type": "object",
+                                    "operation": "exists",
+                                    "singleValue": true
+                                }
+                            }
+                        ],
+                        "combinator": "and"
+                    },
+                    "options": {}
+                },
+                "id": "4c992c89-1069-4db3-a200-f82c3a90b6c2",
+                "name": "IF send failed \u2014 wa summary message1",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2.2,
+                "position": [
+                    2880,
+                    1632
+                ]
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": "https://o4511653441699840.ingest.us.sentry.io/api/4511653460901888/store/",
+                    "sendHeaders": true,
+                    "headerParameters": {
+                        "parameters": [
+                            {
+                                "name": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "name": "X-Sentry-Auth",
+                                "value": "Sentry sentry_version=7, sentry_key=efe80061e00be83781c61d0165a82788, sentry_client=n8n-postcall/1.0"
+                            }
+                        ]
+                    },
+                    "sendBody": true,
+                    "specifyBody": "json",
+                    "jsonBody": "={{ JSON.stringify({message: 'WhatsApp send failed (wa summary message1): ' + String($json.error.message || $json.error).slice(0, 300), level: 'error', logger: 'n8n.postcall', platform: 'other', environment: 'production', tags: { agent: 'kavya', source: 'n8n', wa_node: 'wa summary message1' }, fingerprint: ['n8n-wa-send-failure', 'wa summary message1'], extra: { workflow: 'Treehouse Post-Call Processor', call_sid: $('Webhook (from Voice Agent)').item.json.body.call_sid, caller_phone: $('Webhook (from Voice Agent)').item.json.body.caller_phone, error: String($json.error.message || $json.error).slice(0, 1000) } }) }}",
+                    "options": {}
+                },
+                "id": "138edfa9-fc4a-4a5e-9696-76668165531a",
+                "name": "Sentry alert \u2014 wa summary message1",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.3,
+                "position": [
+                    3072,
+                    1632
+                ],
+                "onError": "continueRegularOutput"
+            }
+        ],
+        "connections": {
+            "Webhook (from Voice Agent)": {
+                "main": [
+                    [
+                        {
+                            "node": "Append row in sheet",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "Append row in sheet": {
+                "main": [
+                    [
+                        {
+                            "node": "OpenAI \u2014 Build Summary + Email",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "OpenAI \u2014 Build Summary + Email": {
+                "main": [
+                    [
+                        {
+                            "node": "Parse AI JSON",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "Parse AI JSON": {
+                "main": [
+                    [
+                        {
+                            "node": "IF Booking Confirmed",
+                            "type": "main",
+                            "index": 0
+                        },
+                        {
+                            "node": "HTTP Request",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "IF Booking Confirmed": {
+                "main": [
+                    [
+                        {
+                            "node": "wa customer confirmation",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ],
+                    [
+                        {
+                            "node": "wa summary message1",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "wa customer confirmation": {
+                "main": [
+                    [
+                        {
+                            "node": "Wait 6s",
+                            "type": "main",
+                            "index": 0
+                        },
+                        {
+                            "node": "IF send failed \u2014 wa customer confirmation",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "Wait 6s": {
+                "main": [
+                    [
+                        {
+                            "node": "wa summary message",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "IF send failed \u2014 wa customer confirmation": {
+                "main": [
+                    [
+                        {
+                            "node": "Sentry alert \u2014 wa customer confirmation",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "wa summary message": {
+                "main": [
+                    [
+                        {
+                            "node": "IF send failed \u2014 wa summary message",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "IF send failed \u2014 wa summary message": {
+                "main": [
+                    [
+                        {
+                            "node": "Sentry alert \u2014 wa summary message",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "wa summary message1": {
+                "main": [
+                    [
+                        {
+                            "node": "IF send failed \u2014 wa summary message1",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            },
+            "IF send failed \u2014 wa summary message1": {
+                "main": [
+                    [
+                        {
+                            "node": "Sentry alert \u2014 wa summary message1",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            }
+        },
+        "authors": "Sandeep Pamuditha",
+        "name": null,
+        "description": null,
+        "workflowPublishHistory": [
+            {
+                "createdAt": "2026-07-09T05:09:54.176Z",
+                "id": 554,
+                "workflowId": "lGCsV0DYRtPNXfsd",
+                "versionId": "56eed98b-6cc9-4486-b558-775017de79dd",
+                "event": "activated",
+                "userId": "347740a4-29e5-4c57-9347-30a33ccb5878"
+            }
+        ]
+    }
+}

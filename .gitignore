@@ -105,3 +105,17 @@ service-account*.json
 # MCP server config -- holds live API tokens in plaintext env blocks (Jul 2026: added
 # 5 Hostinger MCP servers here with a raw HOSTINGER_API_TOKEN)
 .mcp.json
+
+# n8n workflow exports -- a raw export from the n8n UI carries LIVE credentials
+# inline (WasenderAPI bearer, portal ingest key) in every httpRequest node, and
+# again inside the duplicated `activeVersion` block. On 2026-08-04 an unignored
+# export was sitting in the working tree with a live WasenderAPI token in eight
+# places, one `git add .` away from being committed.
+#
+# So: ignore every export by DEFAULT and opt curated snapshots back in, rather
+# than the reverse. A new export is then untracked until someone has scrubbed it
+# and un-ignored it deliberately. Scrub with the placeholder convention already
+# used below, e.g. `Bearer <WASENDER_TOKEN — see n8n UI>`.
+n8n-workflows/*.json
+!n8n-workflows/treehouse-post-call-processor.json
+!n8n-workflows/kavya-handover-whatsapp.json
