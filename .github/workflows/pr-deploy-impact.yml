@@ -8,9 +8,15 @@
 # whether calls get interrupted.
 #
 # The detection logic here MIRRORS deploy-on-push.yml (same agent map, same
-# fast/build rule, same Flico KB gate). If you change the detection rules there,
-# change them here too — a comment that under-reports the blast radius is worse
-# than no comment at all.
+# image/fast/build rule, same Flico KB gate). If you change the detection rules
+# there, change them here too — a comment that under-reports the blast radius is
+# worse than no comment at all.
+#
+# That is not hypothetical: when `image` mode was added (PR #105/#107) this file
+# was not updated, so for six weeks it told reviewers every registry agent was a
+# `fast` hot-swap — "seconds" — when merging actually triggered a full runner
+# build and VPS pull. Under-reporting is the one failure this workflow exists to
+# prevent, so treat the two files as a pair.
 #
 # ---------------------------------------------------------------------------
 # WHY pull_request_target, AND WHY IT IS SAFE HERE
@@ -58,6 +64,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
@@ -68,6 +75,7 @@ jobs:
           : > rows.md
           any=false
           build_any=false
+          image_any=false
 
           # Same agent map as deploy-on-push.yml. Folder names contain spaces —
           # keep them quoted and matched with grep -F.
@@ -87,6 +95,24 @@ jobs:
               build_any=true
             fi
 
+            # Registry agents override both. deploy-on-push.yml decides this by
+            # grepping the agent's docker-compose.yml ON DISK — which this
+            # workflow cannot do, because it deliberately never checks the PR out
+            # (see the pull_request_target note at the top). Read the file through
+            # the contents API instead: it is text we grep, never code we run, so
+            # the no-checkout invariant still holds.
+            #
+            # Read at the PR HEAD, not the base, so a PR that CONVERTS an agent to
+            # `image` reports the mode it will actually deploy with.
+            enc="${dir// /%20}"
+            compose=$(gh api "repos/$REPO/contents/$enc/docker-compose.yml?ref=$HEAD_SHA" \
+                        -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)
+            if printf '%s\n' "$compose" | grep -qE '^[[:space:]]*image:[[:space:]]*ghcr\.io/'; then
+              mode=image
+              effect='built on the runner, pushed to GHCR, VPS pulls + restarts — minutes'
+              image_any=true
+            fi
+
             count=$(printf '%s\n' "$match" | grep -c . || true)
             printf '| `%s` | `%s` | **%s** | %s | %s |\n' \
               "$id" "$dir" "$mode" "$effect" "$count" >> rows.md
@@ -95,6 +121,7 @@ jobs:
 
           echo "any=$any" >> "$GITHUB_OUTPUT"
           echo "build_any=$build_any" >> "$GITHUB_OUTPUT"
+          echo "image_any=$image_any" >> "$GITHUB_OUTPUT"
 
           if printf '%s\n' "$CHANGED" | grep -qF 'Flico Agent/'; then
             echo "flico=true" >> "$GITHUB_OUTPUT"
@@ -106,6 +133,7 @@ jobs:
         env:
           ANY: ${{ steps.detect.outputs.any }}
           BUILD_ANY: ${{ steps.detect.outputs.build_any }}
+          IMAGE_ANY: ${{ steps.detect.outputs.image_any }}
           FLICO: ${{ steps.detect.outputs.flico }}
         run: |
           set -euo pipefail
@@ -122,10 +150,16 @@ jobs:
               echo '|---|---|---|---|---|'
               cat rows.md
               echo
-              if [ "$BUILD_ANY" = "true" ]; then
-                echo '**Heads up:** at least one agent is in `build` mode — a full image'
-                echo 'rebuild, so the outage window is minutes rather than seconds. Dependency'
-                echo 'bumps land here: a routine-looking version PR is a production rebuild.'
+              if [ "$BUILD_ANY" = "true" ] || [ "$IMAGE_ANY" = "true" ]; then
+                echo '**Heads up:** at least one agent needs a full image build, so the'
+                echo 'outage window is minutes rather than seconds. Dependency bumps land'
+                echo 'here: a routine-looking version PR is a production rebuild.'
+                echo
+              fi
+              if [ "$IMAGE_ANY" = "true" ]; then
+                echo 'For `image` agents there is **no `fast` hot-swap path** — the container'
+                echo 'runs a baked image, not code copied from disk, so *any* change (a `.md`'
+                echo 'file included) means a new build. Nothing compiles on the VPS.'
                 echo
               fi
             else
@@ -143,7 +177,11 @@ jobs:
             echo '<details><summary>Rollback</summary>'
             echo
             echo '```bash'
-            echo 'gh workflow run deploy.yml -f agent=<id> -f ref=<last-good-sha> -f mode=fast'
+            echo '# registry agents (all seven active ones) — pulls the exact image that ran'
+            echo 'gh workflow run deploy.yml -f agent=<id> -f ref=<last-good-sha> -f mode=image'
+            echo
+            echo '# legacy fast/build path — Sofia Agent only'
+            echo 'gh workflow run deploy.yml -f agent=sofia -f ref=<last-good-sha> -f mode=fast'
             echo '```'
             echo
             echo '</details>'
