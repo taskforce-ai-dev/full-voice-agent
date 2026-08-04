@@ -16,7 +16,6 @@ import httpx
 
 from smartpbx_protocol import CallContext
 
-
 logger = logging.getLogger(__name__)
 
 _ACCOUNT_HEADERS = frozenset({"account_id", "X-Account-ID"})
@@ -34,6 +33,93 @@ _MAX_ENDPOINT_CHARS = 2048
 _MAX_API_KEY_CHARS = 512
 _MAX_ACCOUNT_ID_CHARS = 256
 _MAX_CALL_ID_CHARS = 256
+
+SUPPRESSED_SDK_LOGGERS = (
+    "mcp.client.streamable_http",
+    "client",
+    "httpx",
+    "httpcore.connection",
+    "mcp.client.session",
+    "mcp.shared.session",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+
+
+class MCPResponseTooLarge(httpx.TransportError):
+    """The MCP provider response exceeded the configured byte limit."""
+
+
+class _DropSDKLogRecords(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return False
+
+
+_SDK_LOG_FILTER = _DropSDKLogRecords()
+
+
+def _apply_sdk_logger_policy() -> None:
+    """Suppress sensitive SDK records for this service.
+
+    Logging filters are process-global for these exact logger names. Adding the
+    same singleton filter is idempotent, including when calls overlap.
+    """
+    for logger_name in SUPPRESSED_SDK_LOGGERS:
+        sdk_logger = logging.getLogger(logger_name)
+        if _SDK_LOG_FILTER not in sdk_logger.filters:
+            sdk_logger.addFilter(_SDK_LOG_FILTER)
+
+
+class _BoundedResponseStream(httpx.AsyncByteStream):
+    def __init__(self, source: httpx.AsyncByteStream, maximum_bytes: int) -> None:
+        self._source = source
+        self._maximum_bytes = maximum_bytes
+        self._seen_bytes = 0
+        self._closed = False
+
+    async def __aiter__(self):
+        async for chunk in self._source:
+            self._seen_bytes += len(chunk)
+            if self._seen_bytes > self._maximum_bytes:
+                await self.aclose()
+                raise MCPResponseTooLarge("SmartPBX MCP response exceeded byte limit")
+            yield chunk
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
+            await self._source.aclose()
+
+
+class _BoundedHTTPTransport(httpx.AsyncBaseTransport):
+    def __init__(
+        self, source: httpx.AsyncBaseTransport, maximum_response_bytes: int
+    ) -> None:
+        self._source = source
+        self._maximum_response_bytes = maximum_response_bytes
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self._source.handle_async_request(request)
+        declared_length = response.headers.get("Content-Length", "").strip()
+        if declared_length.isdecimal() and (
+            int(declared_length) > self._maximum_response_bytes
+        ):
+            await response.aclose()
+            raise MCPResponseTooLarge("SmartPBX MCP response exceeded byte limit")
+        response.stream = _BoundedResponseStream(
+            response.stream, self._maximum_response_bytes
+        )
+        return response
+
+    async def aclose(self) -> None:
+        await self._source.aclose()
+
+
+def _new_http_transport() -> httpx.AsyncBaseTransport:
+    return httpx.AsyncHTTPTransport()
+
 
 class CallControl(Protocol):
     """The only call-control operations available to the voice pipeline."""
@@ -64,7 +150,8 @@ class DialogMCPSettings:
     transfer_destinations: Mapping[str, str] = field(repr=False)
     connect_timeout_seconds: int
     read_timeout_seconds: int
-    retry_count: int
+    max_response_bytes: int
+    retries: int
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> DialogMCPSettings:
@@ -75,13 +162,28 @@ class DialogMCPSettings:
         account_header = _env_text(environ, "SMARTPBX_MCP_ACCOUNT_HEADER")
         raw_destinations = _env_text(environ, "SMARTPBX_TRANSFER_DESTINATIONS_JSON")
         connect_timeout = _bounded_integer(
-            environ, "SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS", default=5, minimum=1, maximum=30
+            environ,
+            "SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS",
+            default=5,
+            minimum=1,
+            maximum=30,
         )
         read_timeout = _bounded_integer(
-            environ, "SMARTPBX_MCP_READ_TIMEOUT_SECONDS", default=15, minimum=1, maximum=60
+            environ,
+            "SMARTPBX_MCP_READ_TIMEOUT_SECONDS",
+            default=15,
+            minimum=1,
+            maximum=60,
         )
-        retry_count = _bounded_integer(
-            environ, "SMARTPBX_MCP_RETRY_COUNT", default=1, minimum=0, maximum=2
+        max_response_bytes = _bounded_integer(
+            environ,
+            "SMARTPBX_MCP_MAX_RESPONSE_BYTES",
+            default=1048576,
+            minimum=128,
+            maximum=1048576,
+        )
+        retries = _bounded_integer(
+            environ, "SMARTPBX_MCP_RETRIES", default=1, minimum=0, maximum=1
         )
 
         attempted = any((endpoint, api_key, account_header, raw_destinations))
@@ -94,7 +196,8 @@ class DialogMCPSettings:
             transfer_destinations=MappingProxyType(destinations),
             connect_timeout_seconds=connect_timeout,
             read_timeout_seconds=read_timeout,
-            retry_count=retry_count,
+            max_response_bytes=max_response_bytes,
+            retries=retries,
         )
         if not attempted:
             return value
@@ -149,16 +252,15 @@ class DialogMCPCallControl:
         if destination is None:
             _log_result("transfer_call", "destination_rejected", 0)
             return False
-        return await self._invoke(
-            "transfer_call", {"destination_number": destination}
-        )
+        return await self._invoke("transfer_call", {"destination_number": destination})
 
     async def hangup_call(self) -> bool:
         return await self._invoke("hangup_call", {})
 
     async def _invoke(self, tool_name: str, arguments: dict[str, str]) -> bool:
-        attempts = self._settings.retry_count + 1
+        attempts = self._settings.retries + 1
         for attempt in range(1, attempts + 1):
+            tool_dispatched = False
             try:
                 async with asyncio.timeout(self._settings.read_timeout_seconds):
                     async with self._session_factory(
@@ -166,11 +268,13 @@ class DialogMCPCallControl:
                         headers=self._headers(),
                         connect_timeout=self._settings.connect_timeout_seconds,
                         read_timeout=self._settings.read_timeout_seconds,
+                        max_response_bytes=self._settings.max_response_bytes,
                     ) as session:
                         await session.initialize()
+                        tool_dispatched = True
                         result = await session.call_tool(tool_name, arguments=arguments)
             except Exception as error:
-                retryable = _is_retryable(error)
+                retryable = not tool_dispatched and _is_retryable_pre_dispatch(error)
                 if retryable and attempt < attempts:
                     _log_result(tool_name, "retryable_failure", attempt)
                     continue
@@ -192,15 +296,28 @@ class DialogMCPCallControl:
 
 @asynccontextmanager
 async def _open_session(
-    *, endpoint: str, headers: Mapping[str, str], connect_timeout: int, read_timeout: int
+    *,
+    endpoint: str,
+    headers: Mapping[str, str],
+    connect_timeout: int,
+    read_timeout: int,
+    max_response_bytes: int,
 ):
     """Open the official MCP v1 Streamable HTTP client lifecycle."""
+    _apply_sdk_logger_policy()
+
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
 
     timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
+    transport = _BoundedHTTPTransport(
+        _new_http_transport(), maximum_response_bytes=max_response_bytes
+    )
     async with httpx.AsyncClient(
-        headers=dict(headers), timeout=timeout, follow_redirects=False
+        headers=dict(headers),
+        timeout=timeout,
+        follow_redirects=False,
+        transport=transport,
     ) as http_client:
         async with streamable_http_client(endpoint, http_client=http_client) as streams:
             read_stream, write_stream, _ = streams
@@ -218,10 +335,13 @@ def _result_outcome(result: object) -> str:
     return "success"
 
 
-def _is_retryable(error: Exception) -> bool:
+def _is_retryable_pre_dispatch(error: Exception) -> bool:
     if isinstance(error, httpx.HTTPStatusError):
         return 500 <= error.response.status_code <= 599
-    return isinstance(error, (TimeoutError, httpx.TransportError))
+    return isinstance(
+        error,
+        (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout),
+    )
 
 
 def _log_result(tool_name: str, outcome: str, attempt: int) -> None:
@@ -247,7 +367,8 @@ def _validate_endpoint(endpoint: str) -> None:
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
-        or port is not None and not 1 <= port <= 65535
+        or port is not None
+        and not 1 <= port <= 65535
     ):
         raise _configuration_error()
 
@@ -278,7 +399,7 @@ def _parse_destinations(raw: str) -> dict[str, str]:
             raise _configuration_error()
         destinations[key] = value
         if value.startswith("sip:") and ":" in value.rsplit("@", 1)[1]:
-            if int(value.rsplit(":", 1)[1]) > 65535:
+            if not 1 <= int(value.rsplit(":", 1)[1]) <= 65535:
                 raise _configuration_error()
     return destinations
 
@@ -312,8 +433,10 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _safe_header_value(value: str, max_chars: int) -> bool:
-    return bool(value) and len(value) <= max_chars and all(
-        33 <= ord(char) <= 126 for char in value
+    return (
+        bool(value)
+        and len(value) <= max_chars
+        and all(33 <= ord(char) <= 126 for char in value)
     )
 
 

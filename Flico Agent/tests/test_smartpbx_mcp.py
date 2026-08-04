@@ -1,15 +1,17 @@
 """Contract tests for allowlisted Dialog MCP call control."""
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 import pytest
 
-from smartpbx_mcp import DialogMCPCallControl, DialogMCPSettings
+import smartpbx_mcp
+from smartpbx_mcp import DialogMCPCallControl, DialogMCPSettings, MCPResponseTooLarge
 from smartpbx_protocol import CallContext, MediaFormat
-
 
 BASE_ENV = {
     "SMARTPBX_MCP_URL": "https://dialog.example:9443/ucp/v2/mcp",
@@ -50,6 +52,11 @@ class FakeResult:
 _DEFAULT_OUTCOME = object()
 
 
+@dataclass(frozen=True)
+class InitializeFailure:
+    error: Exception
+
+
 class FakeSession:
     def __init__(self, outcome=_DEFAULT_OUTCOME):
         self.outcome = (
@@ -59,10 +66,14 @@ class FakeSession:
 
     async def initialize(self):
         self.events.append(("initialize",))
+        if isinstance(self.outcome, InitializeFailure):
+            raise self.outcome.error
 
     async def call_tool(self, name, arguments):
         assert self.events == [("initialize",)]
         self.events.append(("call_tool", name, arguments))
+        if isinstance(self.outcome, InitializeFailure):
+            raise AssertionError("call_tool reached after failed initialization")
         if isinstance(self.outcome, BaseException):
             raise self.outcome
         return self.outcome
@@ -74,13 +85,24 @@ class FakeSessionFactory:
         self.calls = []
         self.sessions = []
 
-    def __call__(self, *, endpoint, headers, connect_timeout, read_timeout):
-        self.calls.append({
-            "endpoint": endpoint,
-            "headers": dict(headers),
-            "connect_timeout": connect_timeout,
-            "read_timeout": read_timeout,
-        })
+    def __call__(
+        self,
+        *,
+        endpoint,
+        headers,
+        connect_timeout,
+        read_timeout,
+        max_response_bytes,
+    ):
+        self.calls.append(
+            {
+                "endpoint": endpoint,
+                "headers": dict(headers),
+                "connect_timeout": connect_timeout,
+                "read_timeout": read_timeout,
+                "max_response_bytes": max_response_bytes,
+            }
+        )
         outcome = self.outcomes.pop(0)
         session = FakeSession(outcome)
         self.sessions.append(session)
@@ -167,6 +189,7 @@ def test_each_documented_account_header_can_be_selected(header):
         '{"live_agent":"sip:user name@example.com"}',
         '{"live_agent":"sip:200@example.com:99999"}',
         '{"live_agent":"tel:+94110000000","live_agent":"tel:+94770000000"}',
+        '{"live_agent":"sip:200@example.com:0"}',
     ],
 )
 def test_destination_map_rejects_unbounded_or_unsafe_values(destinations):
@@ -260,6 +283,7 @@ async def test_outbound_headers_use_other_leg_call_id_and_exactly_one_account_he
         account_header: "account-1",
         "call_id": "call-other-leg-sensitive",
     }
+    assert factory.calls[0]["max_response_bytes"] == 1048576
     assert alternate not in headers
     assert "callId" not in headers
 
@@ -282,7 +306,7 @@ async def test_arbitrary_runtime_destination_is_rejected_without_opening_a_sessi
 async def test_mcp_error_and_malformed_results_fail_closed_without_retry(result):
     factory = FakeSessionFactory(result)
     control = DialogMCPCallControl(
-        settings(SMARTPBX_MCP_RETRY_COUNT="2"),
+        settings(SMARTPBX_MCP_RETRIES="1"),
         context(),
         session_factory=factory,
     )
@@ -296,7 +320,7 @@ async def test_mcp_error_and_malformed_results_fail_closed_without_retry(result)
 async def test_auth_and_validation_http_failures_are_not_retried(status_code):
     factory = FakeSessionFactory(http_error(status_code))
     control = DialogMCPCallControl(
-        settings(SMARTPBX_MCP_RETRY_COUNT="2"),
+        settings(SMARTPBX_MCP_RETRIES="1"),
         context(),
         session_factory=factory,
     )
@@ -308,17 +332,14 @@ async def test_auth_and_validation_http_failures_are_not_retried(status_code):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "retryable",
-    [
-        httpx.ConnectError("connection failed"),
-        httpx.ReadTimeout("read timed out"),
-        http_error(503),
-        asyncio.TimeoutError(),
-    ],
+    [httpx.ConnectError("connection failed"), http_error(503)],
 )
-async def test_transport_timeout_and_5xx_failures_retry_once_then_succeed(retryable):
-    factory = FakeSessionFactory(retryable, FakeResult(False, [object()]))
+async def test_pre_tool_initialization_failures_retry_once(retryable):
+    factory = FakeSessionFactory(
+        InitializeFailure(retryable), FakeResult(False, [object()])
+    )
     control = DialogMCPCallControl(
-        settings(SMARTPBX_MCP_RETRY_COUNT="1"),
+        settings(SMARTPBX_MCP_RETRIES="1"),
         context(),
         session_factory=factory,
     )
@@ -360,10 +381,184 @@ async def test_failure_logs_are_structured_and_redacted(caplog):
         ("SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS", "31"),
         ("SMARTPBX_MCP_READ_TIMEOUT_SECONDS", "0"),
         ("SMARTPBX_MCP_READ_TIMEOUT_SECONDS", "61"),
-        ("SMARTPBX_MCP_RETRY_COUNT", "-1"),
-        ("SMARTPBX_MCP_RETRY_COUNT", "3"),
+        ("SMARTPBX_MCP_RETRIES", "-1"),
+        ("SMARTPBX_MCP_RETRIES", "2"),
+        ("SMARTPBX_MCP_MAX_RESPONSE_BYTES", "127"),
+        ("SMARTPBX_MCP_MAX_RESPONSE_BYTES", "1048577"),
     ],
 )
-def test_timeouts_and_retry_count_are_bounded(name, value):
+def test_numeric_settings_are_bounded(name, value):
     with pytest.raises(ValueError, match="configuration"):
         settings(**{name: value})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ambiguous",
+    [
+        httpx.ConnectError("transport failed after dispatch"),
+        httpx.ReadTimeout("read timed out"),
+        http_error(503),
+        asyncio.TimeoutError(),
+    ],
+)
+async def test_call_tool_failures_are_never_retried(ambiguous):
+    factory = FakeSessionFactory(ambiguous, FakeResult(False, [object()]))
+    control = DialogMCPCallControl(
+        settings(SMARTPBX_MCP_RETRIES="1"),
+        context(),
+        session_factory=factory,
+    )
+
+    assert await control.hangup_call() is False
+    assert len(factory.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_before_call_tool_is_not_retried():
+    factory = FakeSessionFactory(
+        InitializeFailure(httpx.ReadTimeout("read timed out")),
+        FakeResult(False, [object()]),
+    )
+    control = DialogMCPCallControl(
+        settings(SMARTPBX_MCP_RETRIES="1"),
+        context(),
+        session_factory=factory,
+    )
+
+    assert await control.hangup_call() is False
+    assert len(factory.calls) == 1
+
+
+class TrackingChunkedStream(httpx.AsyncByteStream):
+    def __init__(self, *chunks: bytes):
+        self._chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self):
+        self.closed = True
+
+
+def exception_contains(
+    error: BaseException, expected_type: type[BaseException]
+) -> bool:
+    if isinstance(error, expected_type):
+        return True
+    return isinstance(error, BaseExceptionGroup) and any(
+        exception_contains(child, expected_type) for child in error.exceptions
+    )
+
+
+async def open_real_session_with_response(
+    monkeypatch, response: httpx.Response, *, max_response_bytes: int = 128
+):
+    transport = httpx.MockTransport(lambda request: response)
+    monkeypatch.setattr(smartpbx_mcp, "_new_http_transport", lambda: transport)
+    async with smartpbx_mcp._open_session(
+        endpoint="https://dialog.example/mcp",
+        headers={
+            "X-API-Key": "test-secret-never-log",
+            "account_id": "account-1",
+            "call_id": "call-other-leg-sensitive",
+        },
+        connect_timeout=1,
+        read_timeout=1,
+        max_response_bytes=max_response_bytes,
+    ) as session:
+        await session.initialize()
+
+
+@pytest.mark.asyncio
+async def test_real_mcp_transport_rejects_declared_oversize_before_sdk_parsing(
+    monkeypatch,
+):
+    stream = TrackingChunkedStream(b"x" * 129)
+    response = httpx.Response(
+        200,
+        headers={"Content-Type": "application/json", "Content-Length": "129"},
+        stream=stream,
+    )
+
+    with pytest.raises(BaseException) as raised:
+        await open_real_session_with_response(monkeypatch, response)
+
+    assert exception_contains(raised.value, MCPResponseTooLarge)
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_length", [None, "64"])
+async def test_real_mcp_transport_caps_chunked_or_lying_length_responses(
+    content_length,
+):
+    stream = TrackingChunkedStream(b"x" * 64, b"y" * 65)
+    headers = {"Content-Type": "text/event-stream"}
+    if content_length is not None:
+        headers["Content-Length"] = content_length
+    response = httpx.Response(200, headers=headers, stream=stream)
+    source = httpx.MockTransport(lambda request: response)
+    transport = smartpbx_mcp._BoundedHTTPTransport(source, maximum_response_bytes=128)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        async with client.stream("POST", "https://dialog.example/mcp") as received:
+            with pytest.raises(MCPResponseTooLarge):
+                async for _ in received.aiter_bytes():
+                    pass
+
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_production_sdk_loggers_never_emit_sensitive_provider_data(
+    monkeypatch, caplog
+):
+    sensitive = (
+        "test-secret-never-log account-1 tel:+94110000000 "
+        "call-main-sensitive call-other-leg-sensitive provider-response-sensitive"
+    )
+    response = httpx.Response(
+        200,
+        headers={"Content-Type": "application/json"},
+        content=sensitive.encode(),
+    )
+    caplog.set_level(logging.DEBUG)
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.5):
+            await open_real_session_with_response(
+                monkeypatch, response, max_response_bytes=1024
+            )
+
+    for logger_name in smartpbx_mcp.SUPPRESSED_SDK_LOGGERS:
+        sdk_logger = logging.getLogger(logger_name)
+        sdk_logger.debug(sensitive)
+        sdk_logger.warning(sensitive)
+        sdk_logger.error(sensitive)
+
+    for fragment in sensitive.split():
+        assert fragment not in caplog.text
+
+
+def test_sdk_logger_policy_is_idempotent_for_exact_process_global_loggers():
+    smartpbx_mcp._apply_sdk_logger_policy()
+    smartpbx_mcp._apply_sdk_logger_policy()
+
+    for logger_name in smartpbx_mcp.SUPPRESSED_SDK_LOGGERS:
+        filters = logging.getLogger(logger_name).filters
+        assert sum(item is smartpbx_mcp._SDK_LOG_FILTER for item in filters) == 1
+
+
+def test_docker_cpu_torch_pin_matches_production_lock():
+    project_root = Path(__file__).parents[1]
+    dockerfile = (project_root / "Dockerfile").read_text()
+    lockfile = (project_root / "requirements-prod.lock.txt").read_text()
+
+    assert (
+        "RUN pip install --no-cache-dir torch==2.13.0+cpu "
+        "--index-url https://download.pytorch.org/whl/cpu"
+    ) in dockerfile
+    assert "torch==2.13.0+cpu" in lockfile
