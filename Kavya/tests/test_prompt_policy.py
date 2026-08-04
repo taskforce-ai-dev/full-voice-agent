@@ -177,18 +177,47 @@ def test_prompt_has_a_two_token_one_part_at_a_time_branch():
     assert "confirm ONE PART AT A TIME" in PROMPT
 
 
+def test_suspect_token_criterion_does_not_flag_real_english_names():
+    """Read literally, "is an ordinary English word sitting where a name
+    should be" would flag real first names that are also ordinary English
+    words - Joy, Rose, Mark, Grace, Shane - common among Sri Lankan
+    Christian and Burgher callers, adding a needless re-ask to a clean
+    call. The criterion must be narrowed to words that are CLEARLY not a
+    name. 'cha' also moved out of this example pair - it is a fragment
+    (already covered by the lone-syllable-or-fragment criterion), not an
+    ordinary English word."""
+    assert "is an ordinary English word that is clearly not a name ('car')" in PROMPT
+    assert "ordinary English word sitting where a name should be" not in PROMPT
+
+
 def test_prompt_has_a_loop_exit_for_repeated_name_mismatches():
     """Without an exit, a persistently mis-transcribed name (common for Sri
     Lankan names over telephony) traps the guest in an endless re-ask loop,
-    as happened on the production call above (seven turns). After two
-    attempts on the same part, Kavya must take her best guess, promise a
-    WhatsApp follow-up, and move on."""
+    as happened on the production call above (seven turns). After the same
+    part has been re-asked twice, Kavya must take her best guess and move
+    on. The wording counts RE-ASKS explicitly ("re-asked ... TWICE") rather
+    than "TWO attempts", which was ambiguous about whether the guest's
+    original answer counted as the first attempt."""
     assert "LOOP EXIT" in PROMPT
-    assert "after TWO attempts on the same part" in PROMPT
+    assert "if you have re-asked the same part TWICE" in PROMPT
+
+
+def test_loop_exit_promise_is_truthful_about_the_whatsapp_message():
+    """The n8n post-call processor's customer WhatsApp message is a one-way
+    automated template populated with the LLM-extracted name - the very
+    name the agent just admitted it is unsure of - and nothing in that
+    workflow reads replies or flags the name as unverified for a human
+    follow-up (verified against n8n-workflows/treehouse-post-call-processor.json
+    and post_call.py). So the prompt must NOT claim anyone will confirm,
+    verify, follow up, call, or reply about the spelling - it may only
+    promise that the guest receives a booking confirmation on WhatsApp and
+    should check the name spelling on it themselves."""
     assert (
-        "our reservations team will confirm the exact spelling with you "
-        "on WhatsApp together with your booking confirmation"
+        "You'll get your booking confirmation on WhatsApp shortly, so "
+        "please check the spelling of your name on it"
     ) in PROMPT
+    assert "will confirm the exact spelling" not in PROMPT
+    assert "reservations team will" not in PROMPT
 
 
 def test_hard_gate_carves_out_the_loop_exit_exception():
@@ -208,6 +237,24 @@ def test_hard_gate_carves_out_the_loop_exit_exception():
     ) in PROMPT
 
 
+def test_loop_exit_final_readback_is_exempt_from_the_spelling_fallback():
+    """The LOOP EXIT's own closing line ("Read back your single best guess
+    of the whole name once") is itself a read-back. The SPELLING FALLBACK
+    section's second trigger ("If you read a name back and the guest says
+    it is NOT right ... ask them to spell the part that was wrong") is
+    phrased unconditionally, so without an explicit carve-out it fires on
+    this exact read-back and sends the model back into spelling immediately
+    after LOOP EXIT told it to stop - defeating the escape hatch it was
+    meant to be. The prompt must say plainly that this one read-back is an
+    exception: even a rejected answer here does not trigger another spell
+    request."""
+    assert (
+        "this final read-back is an exception to the read-back rules "
+        "below: even if the guest says it is still wrong, do NOT ask "
+        "them to spell it again"
+    ) in PROMPT
+
+
 def test_loop_exit_only_fires_after_spelling_fallback_has_been_tried():
     """Sequencing fix: the intended flow is (1) up to TWO repeat attempts on
     the suspect part, (2) THEN the spelling fallback (PR #122), (3) THEN the
@@ -223,8 +270,23 @@ def test_loop_exit_only_fires_after_spelling_fallback_has_been_tried():
     real content."""
     assert "try the SPELLING FALLBACK below for that part" in PROMPT
     assert "Only if spelling ALSO fails to resolve it" in PROMPT
-    assert "repeat attempts described above have not resolved it" in PROMPT
+    assert "the repeat attempts described above have STILL not" in PROMPT
     assert PROMPT.index("LOOP EXIT") < PROMPT.index("SPELLING FALLBACK for names")
+
+
+def test_spelling_fallback_trigger_is_grammatical():
+    """The pre-fix trigger sentence read "If you STILL cannot make out the
+    name after the repeat attempts described above have not resolved it" -
+    an ungrammatical double condition (STILL ... have not) produced by
+    splicing PR #122's spelling fallback onto the sequencing fix above it.
+    This is the load-bearing trigger for the spelling fallback, so the
+    grammar bug matters beyond cosmetics. Locks the corrected single-clause
+    phrasing and the absence of the old broken text."""
+    assert (
+        "If the repeat attempts described above have STILL not resolved "
+        "the name, politely ask them to spell it"
+    ) in PROMPT
+    assert "If you STILL cannot make out the name after the repeat" not in PROMPT
 
 
 def test_mobile_number_is_read_back_in_local_form_not_plus94():
