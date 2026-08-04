@@ -64,6 +64,59 @@ handover_context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVa
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Spoken shorthand callers use when dictating a number: "double seven" -> "77",
+# "triple two" -> "222". The operand may be a numeral ("double 7") or a spoken
+# digit-word ("double seven"); "oh"/"o" count as zero.
+_SPOKEN_DIGITS = {
+    "zero": "0", "oh": "0", "o": "0", "nought": "0", "naught": "0",
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+
+_REPEAT_WORDS = {"double": 2, "triple": 3, "treble": 3}
+
+_REPEAT_RE = re.compile(
+    r"\b(double|triple|treble)\b[\s.\-]*"
+    r"(\d|zero|oh|o|nought|naught|one|two|three|four|five|six|seven|eight|nine)\b",
+    re.IGNORECASE,
+)
+
+
+def expand_spoken_repeats(raw: Any) -> str:
+    """Expand spoken 'double'/'triple' shorthand in a dictated number.
+
+    Callers reading out a phone number constantly say "double seven" for "77"
+    or "triple two" for "222". The system prompt already tells the LLM to expand
+    these, but callers use them so often that the model occasionally passes the
+    words straight through -- and the plain digit-strip in `normalize_whatsapp`
+    would then silently DROP those digits ("double" is not a digit). Expanding
+    them here deterministically means every digit survives regardless of what
+    the model does. If the shorthand was already expanded upstream there is
+    nothing to match and this is a harmless no-op.
+
+    >>> expand_spoken_repeats("double seven")
+    '77'
+    >>> expand_spoken_repeats("triple two")
+    '222'
+    >>> expand_spoken_repeats("double 5")
+    '55'
+    >>> expand_spoken_repeats("0771 754 double 6 8")
+    '0771 754 66 8'
+    >>> expand_spoken_repeats("0771234567")
+    '0771234567'
+    """
+    if not raw:
+        return ""
+
+    def _sub(m: "re.Match[str]") -> str:
+        count = _REPEAT_WORDS[m.group(1).lower()]
+        token = m.group(2).lower()
+        digit = token if token.isdigit() else _SPOKEN_DIGITS[token]
+        return digit * count
+
+    return _REPEAT_RE.sub(_sub, str(raw))
+
+
 def normalize_whatsapp(raw: Any) -> str:
     """Normalise a spoken/dialled phone number to digits with a country code.
 
@@ -75,6 +128,8 @@ def normalize_whatsapp(raw: Any) -> str:
     '94771234567'
     >>> normalize_whatsapp("771234567")
     '94771234567'
+    >>> normalize_whatsapp("0771 754 double 6 8")
+    '94771754668'
     >>> normalize_whatsapp("0044 7700 900123")
     '447700900123'
     >>> normalize_whatsapp("001 415 555 0132")
@@ -82,7 +137,7 @@ def normalize_whatsapp(raw: Any) -> str:
     """
     if not raw:
         return ""
-    digits = re.sub(r"\D", "", str(raw))
+    digits = re.sub(r"\D", "", expand_spoken_repeats(raw))
     if not digits:
         return ""
 

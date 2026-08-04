@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import handover  # noqa: E402
 from handover import (  # noqa: E402
     build_payload,
+    expand_spoken_repeats,
     normalize_whatsapp,
     send_handover_notification,
 )
@@ -124,6 +125,51 @@ def test_normalize_whatsapp_never_double_prefixes():
     """The bug that bit the post-call processor: 0711754668 -> 947171754668."""
     assert normalize_whatsapp("0711754668") == "94711754668"
     assert normalize_whatsapp(normalize_whatsapp("0711754668")) == "94711754668"
+
+
+# ---------------------------------------------------------------------------
+# expand_spoken_repeats — callers say "double seven" for "77", "triple two"
+# for "222" when dictating a phone number. Without expansion the bare
+# digit-strip drops those digits (the word "double" has none).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("double seven", "77"),                 # the reported case: digit-word
+        ("triple two", "222"),
+        ("treble nine", "999"),                 # British "treble"
+        ("double 5", "55"),                     # numeral operand
+        ("triple 0", "000"),
+        ("double oh", "00"),                    # "oh" == zero
+        ("double o", "00"),                     # single-letter "o" == zero
+        ("Double Seven", "77"),                 # case-insensitive
+        ("double-six", "66"),                   # hyphenated
+        ("0771 754 double 6 8", "0771 754 66 8"),
+        ("0771234567", "0771234567"),           # already expanded -> no-op
+        ("seven seven", "seven seven"),         # no shorthand -> untouched
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_expand_spoken_repeats(raw, expected):
+    assert expand_spoken_repeats(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # "oh seven one one, seven five four, double six eight" said as digits
+        # with the trailing shorthand left unexpanded by the model.
+        ("0711 754 double 6 8", "94711754668"),   # 0711754668 -> +94
+        ("0 double 7 1234567", "94771234567"),    # 0 + 77 + 1234567
+        ("double 7 1234567", "94771234567"),      # bare NSN: 77 + 1234567
+        ("triple 7 123456", "94777123456"),       # 777 + 123456 (9-digit NSN)
+    ],
+)
+def test_normalize_whatsapp_expands_double_triple(raw, expected):
+    """A number dictated with 'double'/'triple' still normalises correctly."""
+    assert normalize_whatsapp(raw) == expected
 
 
 # ---------------------------------------------------------------------------
