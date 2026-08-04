@@ -75,12 +75,24 @@ def normalize_whatsapp(raw: Any) -> str:
     '94771234567'
     >>> normalize_whatsapp("771234567")
     '94771234567'
+    >>> normalize_whatsapp("0044 7700 900123")
+    '447700900123'
+    >>> normalize_whatsapp("001 415 555 0132")
+    '14155550132'
     """
     if not raw:
         return ""
     digits = re.sub(r"\D", "", str(raw))
     if not digits:
         return ""
+
+    # International access code: a leading "00" means the caller dialled out
+    # internationally, so the rest is already a full country-code + number
+    # ("0044 7700 900123" -> "447700900123"). Return it untouched. This MUST come
+    # before the local-trunk branch below, which strips every leading zero and
+    # would otherwise turn "0044..." into a non-existent "94..." Sri Lankan number.
+    if digits.startswith("00"):
+        return digits[2:]
 
     # Local trunk form: 0771234567 -> 771234567 -> 94771234567
     if digits.startswith("0"):

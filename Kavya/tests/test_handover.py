@@ -93,6 +93,11 @@ def _patch_session(session: _FakeSession):
         ("077-123 4567", "94771234567"),      # punctuation
         ("+94711754668", "94711754668"),      # the real manager number
         ("+1 415 555 0132", "14155550132"),   # foreign guest, left intact
+        # International access code "00" -> keep the rest, do NOT prefix 94.
+        ("0044 7700 900123", "447700900123"),  # UK, 00-dialled
+        ("001 415 555 0132", "14155550132"),   # US, 00-dialled
+        ("0094 77 123 4567", "94771234567"),   # SL dialled internationally
+        ("00", ""),                            # bare access code - unusable
         ("", ""),
         (None, ""),
         ("   ", ""),
@@ -102,6 +107,17 @@ def _patch_session(session: _FakeSession):
 )
 def test_normalize_whatsapp(raw, expected):
     assert normalize_whatsapp(raw) == expected
+
+
+def test_normalize_whatsapp_international_not_mangled():
+    """A leading 00 access code must survive, not be re-homed to +94.
+
+    Regression: digits.lstrip("0") used to strip both zeros of the access code,
+    then 94 was prefixed unconditionally, turning a real UK number
+    (0044 7700 900123) into a non-existent Sri Lankan one (94447700900123).
+    """
+    assert normalize_whatsapp("0044 7700 900123") == "447700900123"
+    assert normalize_whatsapp("001 415 555 0132") == "14155550132"
 
 
 def test_normalize_whatsapp_never_double_prefixes():
