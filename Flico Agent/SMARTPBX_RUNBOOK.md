@@ -48,17 +48,29 @@ IMAGE_TAG=<immutable-sha> docker compose --profile smartpbx up -d flico-smartpbx
 docker compose --profile smartpbx ps
 ```
 
-An ordinary `docker compose up -d` does not start this service. To stop it
-without affecting the existing voice-agent container:
+An ordinary `docker compose up -d` does not start this service.
+
+### Rollback procedure
+
+1. Disable or remove the Dialog AI Provider/dashboard routing first, so no new
+   carrier calls are directed to this endpoint.
+2. Verify carrier/fallback routing with the carrier or dashboard owner before
+   changing the container. Do not rely on the endpoint-down drill as rollback
+   evidence; it is a separate controlled validation.
+3. Drain active calls: wait for the SmartPBX status count to reach zero, or use
+   the carrier's approved active-call handling procedure before the agreed
+   maintenance deadline.
+4. After the route is withdrawn and active calls are drained, stop
+   `flico-smartpbx` without affecting the existing voice-agent container:
 
 ```bash
 docker compose --profile smartpbx stop flico-smartpbx
 docker compose --profile smartpbx rm -f flico-smartpbx
 ```
 
-Rollback is an immediate profile stop. If the issue is image-specific, use the
-last known immutable SHA and recreate only `flico-smartpbx`; do not roll back
-the legacy `flico` service as part of this procedure.
+If the issue is image-specific, use the last known immutable SHA and recreate
+only `flico-smartpbx`; do not roll back the legacy `flico` service as part
+of this procedure.
 
 ## Status, logs, and safe observability
 
@@ -94,7 +106,7 @@ dashboard gate open and do not claim the endpoint is verified.
    test destination in `SMARTPBX_TRANSFER_DESTINATIONS_JSON`. Verify one
    allowlisted transfer reaches the expected test endpoint, then remove the
    temporary destination if it is not part of production policy.
-3. Run the mandatory endpoint-down carrier fallback drill: stop
+3. Run the mandatory controlled endpoint-down carrier fallback drill: stop
    `flico-smartpbx` (or block the WSS route under a controlled maintenance
    window), place a synthetic carrier call, confirm the carrier uses its
    documented fallback rather than retrying indefinitely, restore the service,

@@ -128,7 +128,7 @@ services:
 
   flico-smartpbx:
     profiles: ["smartpbx"]
-    image: ghcr.io/taskforce-ai-dev/flico:${IMAGE_TAG:-latest}
+    image: ghcr.io/taskforce-ai-dev/flico:${IMAGE_TAG:?IMAGE_TAG must be an immutable SHA}
     container_name: flico-smartpbx
 
     ports:

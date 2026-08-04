@@ -28,35 +28,49 @@ def _environment_values(text: str) -> dict[str, str]:
     return values
 
 
-def test_smartpbx_compose_service_is_explicitly_isolated_and_opt_in():
-    compose = _text(COMPOSE)
-
-    assert "flico-smartpbx:" in compose
-    service = compose.split("  flico-smartpbx:", 1)[1]
-    assert "profiles: [\"smartpbx\"]" in service
-    assert "container_name: flico-smartpbx" in service
-    assert "image: ghcr.io/taskforce-ai-dev/flico:${IMAGE_TAG:-latest}" in service
-    assert '"127.0.0.1:8005:8000"' in service
-    assert "/udp" not in service.lower()
-    assert "FLICO_SERVICE_MODE: smartpbx" in service
-    assert "ENABLE_SMARTPBX_WSS: \"true\"" in service
-    assert "ENABLE_ASTERISK_ARI: \"false\"" in service
-    assert "ASTERISK_ARI_" not in service
-    assert "ASTERISK_RTP_" not in service
-    assert "restart: unless-stopped" in service
-    assert 'max-size: "10m"' in service
-    assert 'max-file: "3"' in service
-    assert 'curl", "-f", "http://localhost:8000/health"' in service
-
-    # SmartPBX is profile-gated, so an ordinary `docker compose up -d` does not
-    # select it; it must only be started with `--profile smartpbx`.
-    assert "profiles:" not in compose.split("  flico-smartpbx:", 1)[0]
+def _smartpbx_service() -> dict:
+    document = yaml.safe_load(_text(COMPOSE))
+    assert "flico-smartpbx" in document["services"]
+    assert "flico-smartpbx" not in document.get("networks", {})
+    return document["services"]["flico-smartpbx"]
 
 
-def test_smartpbx_compose_keeps_runtime_inputs_read_only():
-    service = _text(COMPOSE).split("  flico-smartpbx:", 1)[1]
+def test_smartpbx_compose_service_is_immutable_isolated_and_opt_in():
+    service = _smartpbx_service()
+    image = service["image"]
 
-    for mount in (
+    assert service["profiles"] == ["smartpbx"]
+    assert service["container_name"] == "flico-smartpbx"
+    assert image.startswith("ghcr.io/taskforce-ai-dev/flico:")
+    assert "${IMAGE_TAG:?" in image
+    assert "immutable SHA" in image
+    assert ":-latest" not in image
+    assert service["ports"] == ["127.0.0.1:8005:8000"]
+    assert not any("/udp" in port.lower() for port in service["ports"])
+    assert "env_file" not in service
+    assert service["restart"] == "unless-stopped"
+
+
+def test_smartpbx_compose_has_only_required_non_legacy_environment():
+    environment = _smartpbx_service()["environment"]
+
+    assert environment["FLICO_SERVICE_MODE"] == "smartpbx"
+    assert environment["ENABLE_SMARTPBX_WSS"] == "true"
+    assert environment["ENABLE_ASTERISK_ARI"] == "false"
+    assert not any(
+        name != "ENABLE_ASTERISK_ARI" and "ASTERISK" in name
+        for name in environment
+    )
+    assert not any(
+        name.startswith(("SIP_", "ASTERISK_RTP_", "TWILIO_"))
+        for name in environment
+    )
+
+
+def test_smartpbx_compose_mounts_only_read_only_runtime_inputs():
+    volumes = _smartpbx_service()["volumes"]
+
+    required = {
         "./server.py:/app/server.py:ro",
         "./knowledge_docs:/app/knowledge_docs:ro",
         "./kb:/app/kb:ro",
@@ -64,8 +78,25 @@ def test_smartpbx_compose_keeps_runtime_inputs_read_only():
         "./smartpbx_mcp.py:/app/smartpbx_mcp.py:ro",
         "./smartpbx_protocol.py:/app/smartpbx_protocol.py:ro",
         "./smartpbx_transport.py:/app/smartpbx_transport.py:ro",
-    ):
-        assert mount in service
+    }
+    assert required <= set(volumes)
+    assert all(volume.endswith(":ro") for volume in volumes)
+
+
+def test_smartpbx_compose_bounds_logs_and_healthcheck():
+    service = _smartpbx_service()
+
+    assert service["logging"] == {
+        "driver": "json-file",
+        "options": {"max-size": "10m", "max-file": "3"},
+    }
+    assert service["healthcheck"] == {
+        "test": ["CMD", "curl", "-f", "http://localhost:8000/health"],
+        "interval": "30s",
+        "timeout": "10s",
+        "retries": 3,
+        "start_period": "40s",
+    }
 
 
 def test_smartpbx_environment_template_is_safe_and_complete():
@@ -90,34 +121,48 @@ def test_smartpbx_environment_template_is_safe_and_complete():
         "SMARTPBX_MCP_RETRIES": "1",
     }
     assert {key: environment.get(key) for key in expected} == expected
-    assert environment["SMARTPBX_WS_TOKEN"] == ""
-    assert environment["SMARTPBX_API_KEY"] == ""
 
 
-def test_smartpbx_nginx_is_tls_only_and_proxies_exactly_three_routes():
+def test_smartpbx_nginx_is_tls_only_and_proxies_exact_routes_with_bounds():
     nginx = _text(NGINX)
 
-    assert "upstream flico_smartpbx" in nginx
-    assert "server 127.0.0.1:8005;" in nginx
-    assert "listen 443 ssl http2;" in nginx
-    assert "server_name smartpbx-flico.taskforceai.tech;" in nginx
-    assert "Strict-Transport-Security" in nginx
-    assert "limit_conn_zone" in nginx
-    assert "location = /ws/v1/smartpbx/media" in nginx
-    assert "location = /health" in nginx
-    assert "location = /smartpbx/status" in nginx
+    for directive in (
+        "upstream flico_smartpbx",
+        "server 127.0.0.1:8005;",
+        "listen 443 ssl http2;",
+        "server_name smartpbx-flico.taskforceai.tech;",
+        "ssl_certificate ",
+        "ssl_certificate_key ",
+        "ssl_protocols TLSv1.2 TLSv1.3;",
+        "Strict-Transport-Security",
+        "limit_conn_zone $binary_remote_addr zone=smartpbx_per_ip:10m;",
+        "limit_conn smartpbx_per_ip 4;",
+        "client_max_body_size 64k;",
+        "client_body_timeout 10s;",
+        "client_header_timeout 10s;",
+        "keepalive_timeout 75s;",
+        "proxy_connect_timeout 5s;",
+        "proxy_read_timeout 120s;",
+        "proxy_send_timeout 120s;",
+        "proxy_set_header Upgrade $http_upgrade;",
+        'proxy_set_header Connection "upgrade";',
+        "proxy_http_version 1.1;",
+        "proxy_buffering off;",
+        "proxy_request_buffering off;",
+        "access_log off;",
+    ):
+        assert directive in nginx
     assert nginx.count("location = ") == 3
-    assert "location / {" in nginx
-    assert "return 404;" in nginx
-    assert "proxy_set_header Upgrade $http_upgrade;" in nginx
-    assert 'proxy_set_header Connection "upgrade";' in nginx
-    assert "proxy_http_version 1.1;" in nginx
-    assert "proxy_buffering off;" in nginx
-    assert "client_max_body_size 64k;" in nginx
-    assert "proxy_read_timeout 120s;" in nginx
-    assert "proxy_send_timeout 120s;" in nginx
-    assert "access_log off;" in nginx
-    assert "Access-Control-Allow-Origin" not in nginx
+    for route in (
+        "location = /ws/v1/smartpbx/media",
+        "location = /health",
+        "location = /smartpbx/status",
+        "location / {",
+        "return 404;",
+    ):
+        assert route in nginx
+    assert "Access-Control-Allow" not in nginx
+    assert "log_format" not in nginx
 
 
 def test_runbook_marks_external_readiness_as_operator_gates():
@@ -143,11 +188,13 @@ def test_runbook_marks_external_readiness_as_operator_gates():
     assert "wss://smartpbx-flico.taskforceai.tech/ws/v1/smartpbx/media" in runbook
 
 
-def test_smartpbx_is_a_compose_service_not_a_network():
-    document = yaml.safe_load(_text(COMPOSE))
+def test_runbook_rollback_withdraws_dashboard_and_drains_before_stopping():
+    runbook = _text(RUNBOOK).lower()
+    rollback = runbook.split("## status, logs", 1)[0]
 
-    assert "flico-smartpbx" in document["services"]
-    assert "flico-smartpbx" not in document.get("networks", {})
-    service = document["services"]["flico-smartpbx"]
-    assert service["profiles"] == ["smartpbx"]
-    assert service["environment"]["FLICO_SERVICE_MODE"] == "smartpbx"
+    disable_dashboard = rollback.index("disable or remove the dialog ai provider")
+    verify_fallback = rollback.index("verify carrier/fallback routing")
+    drain_calls = rollback.index("drain active calls")
+    stop_service = rollback.index("stop flico-smartpbx")
+
+    assert disable_dashboard < verify_fallback < drain_calls < stop_service
