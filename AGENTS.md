@@ -340,6 +340,32 @@ WasenderAPI. See `Kavya/CLAUDE.md` v0.17 for the agent-side design.
 - The agent never blocks on this webhook failing: `send_handover_notification`
   swallows every error, and Kavya still promises the guest a callback.
 
+## Team updates go to ClickUp (Aug 2026)
+
+**Whenever work lands that affects Chanya or Oshadi, post an update in ClickUp —
+both of them, every time.** A GitHub review comment is not enough on its own:
+they work in Claude Code on the web and do not live in the repo's notification
+feed. If a PR of theirs is merged, blocked, conflicted, or superseded, say so in
+ClickUp as well as on the PR.
+
+- **Workspace:** one space, `Team Space` (`901811463233`).
+- **Channel:** `Critical now` (`6-901818856901-8`). There is **no** `general`
+  channel, despite the name being used informally.
+- **Member IDs:** Chanya Shehani `113567586`, Oshadi Whyshni Kumaravel
+  `113618423`.
+  - `chanya@taskfirceai.tech` (`113618477`) is a **dead seat** from a mistyped
+    invite — note the `taskfirce`. Never address that one; she gets nothing.
+
+> **Markdown `@mentions` do not notify anyone.** Writing `@Chanya Shehani` in the
+> message body renders as plain text — ClickUp needs a real mention entity, which
+> the MCP server does not expose. Use the `followers` array on
+> `clickup_send_chat_message` (member IDs above) instead. This was discovered the
+> hard way: the first update posted looked correct and notified nobody.
+
+Also note the message posts as whichever account holds the ClickUp OAuth, which
+is currently `Thivarrakesh Parthipan` (`216208369`) — not `chrys@taskforceai.tech`.
+Write updates in a voice that suits being sent by a person, not by a bot.
+
 ## Claude Code / Codex Sync
 
 This repo is maintained with both Claude Code and Codex. Keep `CLAUDE.md` and
