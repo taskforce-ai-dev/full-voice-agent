@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
 """Smoke-test the Treehouse Post-Call Processor n8n workflow end-to-end.
 
-Fires the post-call webhook with a booking-confirmed payload whose transcript
-contains a LOCAL-format Sri Lankan phone number (0711 754 668) — the exact
-shape that caused the July 2026 WhatsApp JID 422 regression — then polls the
-n8n API and asserts:
+Fires the post-call webhook once per CASE and, for each, polls the n8n API and
+asserts the "wa customer confirmation" node normalised the phone correctly and
+sent to the expected WhatsApp JID.
 
-  1. the execution succeeded,
-  2. the OpenAI node copied the phone digits verbatim (no reformatting),
-  3. the "wa customer confirmation" node sent successfully to the
-     normalized JID 94711754668@s.whatsapp.net.
+The `to` expression in that node mirrors `Kavya/handover.py::normalize_whatsapp`
+(expand spoken "double"/"triple" -> strip to digits -> "00" intl access code ->
+"0"-trunk -> "94" -> 9-digit NSN -> international). These cases exercise the
+three paths that used to break, and every one is arranged to resolve to the SAME
+real test WhatsApp number (94711754668) so the sends actually deliver instead of
+422-ing on a non-existent number:
+
+  1. local, dictated in the transcript ("0711 754 668")      -> extraction path
+  2. spoken "double" shorthand, via guest_phone
+     ("0711 754 double 6 8")                                  -> to-expr expands
+  3. international 00 access code, via guest_phone
+     ("0094711754668")                                        -> to-expr slices 00
+
+Case 1 also asserts the OpenAI node copied the digits verbatim (no reformatting).
+Cases 2 and 3 pass the number in `guest_phone`, which the `to` expression reads
+before `customer_phone`, so they test the normalisation deterministically without
+depending on what the extraction model does with the words.
 
 Run after ANY edit to the workflow:
 
     python3 n8n-workflows/smoke_test_postcall.py
 
-NOTE: a successful run delivers one real WhatsApp message to the test number
-(94711754668) and one summary to the manager number. Exit code 0 = pass.
+NOTE: a successful run delivers THREE real WhatsApp messages to the test number
+(94711754668) and three manager summaries (one per case). Exit code 0 = all pass.
 
 Reads N8N_API_KEY from .env.secrets at the repo root.
 """
@@ -30,9 +42,31 @@ from pathlib import Path
 N8N_BASE = "https://automation.taskforceai.tech"
 WORKFLOW_ID = "lGCsV0DYRtPNXfsd"
 WEBHOOK_PATH = "/webhook/treehouse-call-webhook"
-TEST_NUMBER_LOCAL_SPOKEN = "0711 754 668"   # as the guest says it
-TEST_NUMBER_DIGITS = "0711754668"           # what extraction must return
-EXPECTED_JID = "94711754668@s.whatsapp.net"  # what the node must send to
+
+EXPECTED_JID = "94711754668@s.whatsapp.net"  # every case resolves here
+
+# label, guest_phone (None => force the extraction path), spoken number in the
+# transcript, expected verbatim extraction (None => skip, guest_phone is used).
+CASES = [
+    {
+        "label": "local number dictated in transcript",
+        "guest_phone": None,
+        "spoken": "0711 754 668",
+        "expect_extracted": "0711754668",
+    },
+    {
+        "label": "spoken 'double' shorthand (via guest_phone)",
+        "guest_phone": "0711 754 double 6 8",
+        "spoken": "0711 754 668",
+        "expect_extracted": None,
+    },
+    {
+        "label": "international 00 access code (via guest_phone)",
+        "guest_phone": "0094711754668",
+        "spoken": "0711 754 668",
+        "expect_extracted": None,
+    },
+]
 
 
 def api_key() -> str:
@@ -50,18 +84,17 @@ def api_get(key: str, path: str) -> dict:
         return json.load(resp)
 
 
-def main() -> None:
-    key = api_key()
-    call_sid = f"CA_SMOKE_{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+def fire(call_sid: str, case: dict) -> None:
+    now = datetime.now(timezone.utc).isoformat()
     payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "call_end_time": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now,
+        "call_end_time": now,
         "call_sid": call_sid,
         "language": "English",
         "caller_phone": "+94776697566",
         "transcript": (
             "Guest: Smoke test booking please. My WhatsApp number is "
-            f"{TEST_NUMBER_LOCAL_SPOKEN}.\n"
+            f"{case['spoken']}.\n"
             "Kavya: Confirmed. Reference number SMOKE one two three.\n"
             "Guest: Thank you."
         ),
@@ -75,6 +108,8 @@ def main() -> None:
         "follow_up_needed": "No",
         "summary": "Automated smoke test of the post-call processor.",
     }
+    if case["guest_phone"] is not None:
+        payload["guest_phone"] = case["guest_phone"]
     req = urllib.request.Request(
         f"{N8N_BASE}{WEBHOOK_PATH}",
         data=json.dumps(payload).encode(),
@@ -83,13 +118,13 @@ def main() -> None:
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         resp.read()
-    print(f"webhook fired ({call_sid}); waiting for execution ...")
 
-    execution = None
+
+def wait_for_execution(key: str, call_sid: str) -> dict | None:
     for _ in range(12):
         time.sleep(5)
         latest = api_get(
-            key, f"/api/v1/executions?workflowId={WORKFLOW_ID}&limit=3")
+            key, f"/api/v1/executions?workflowId={WORKFLOW_ID}&limit=5")
         for entry in latest["data"]:
             detail = api_get(
                 key, f"/api/v1/executions/{entry['id']}?includeData=true")
@@ -99,42 +134,65 @@ def main() -> None:
                 continue
             body = hook[0]["data"]["main"][0][0]["json"]["body"]
             if body.get("call_sid") == call_sid and entry["status"] != "running":
-                execution = detail
-                break
-        if execution:
-            break
-    if not execution:
-        sys.exit("FAIL: smoke-test execution never completed")
+                return detail
+    return None
 
+
+def check(execution: dict, case: dict) -> list[str]:
     run = execution["data"]["resultData"]["runData"]
     failures = []
 
     if execution.get("status") != "success":
         failures.append(f"execution status = {execution.get('status')}")
 
-    parsed = run.get("Parse AI JSON")
-    phone = (parsed[0]["data"]["main"][0][0]["json"].get("customer_phone")
-             if parsed else None)
-    if phone != TEST_NUMBER_DIGITS:
-        failures.append(
-            f"extraction reformatted the phone: {phone!r} "
-            f"(expected {TEST_NUMBER_DIGITS!r})")
+    if case["expect_extracted"] is not None:
+        parsed = run.get("Parse AI JSON")
+        phone = (parsed[0]["data"]["main"][0][0]["json"].get("customer_phone")
+                 if parsed else None)
+        if phone != case["expect_extracted"]:
+            failures.append(
+                f"extraction reformatted the phone: {phone!r} "
+                f"(expected {case['expect_extracted']!r})")
 
     wa = run.get("wa customer confirmation")
     wa_out = wa[0]["data"]["main"][0][0]["json"] if wa else {}
     if not wa_out.get("success"):
-        failures.append(f"wa customer confirmation failed: "
-                        f"{json.dumps(wa_out)[:300]}")
+        failures.append(
+            f"wa customer confirmation failed: {json.dumps(wa_out)[:300]}")
     elif wa_out["data"].get("jid") != EXPECTED_JID:
         failures.append(f"sent to wrong JID: {wa_out['data'].get('jid')!r}")
 
-    if failures:
-        print("FAIL (execution", execution["id"], ")")
-        for f in failures:
-            print("  -", f)
+    return failures
+
+
+def main() -> None:
+    key = api_key()
+    stamp = f"{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+    any_failed = False
+
+    for i, case in enumerate(CASES):
+        call_sid = f"CA_SMOKE_{stamp}_{i}"
+        print(f"\n[{i + 1}/{len(CASES)}] {case['label']}")
+        fire(call_sid, case)
+        print(f"  webhook fired ({call_sid}); waiting for execution ...")
+        execution = wait_for_execution(key, call_sid)
+        if not execution:
+            print("  FAIL: execution never completed")
+            any_failed = True
+            continue
+        failures = check(execution, case)
+        if failures:
+            any_failed = True
+            print(f"  FAIL (execution {execution['id']}):")
+            for f in failures:
+                print("    -", f)
+        else:
+            print(f"  PASS (execution {execution['id']}): "
+                  f"sent to {EXPECTED_JID}")
+
+    if any_failed:
         sys.exit(1)
-    print(f"PASS (execution {execution['id']}): phone extracted verbatim, "
-          f"WhatsApp sent to {EXPECTED_JID}")
+    print(f"\nAll {len(CASES)} cases passed.")
 
 
 if __name__ == "__main__":
