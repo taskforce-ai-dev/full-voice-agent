@@ -97,14 +97,21 @@ def test_paid_experiences_still_carry_their_service_charge():
 
 
 # ---------------------------------------------------------------------------
-# Name capture: confirm by read-back, never by spelling
+# Name capture: read-back confirmation, with a spelling fallback
 # ---------------------------------------------------------------------------
 
-def test_prompt_forbids_asking_the_guest_to_spell_their_name():
-    """Spelled letters (B/P/V/D/E/G, M/N) are more confusable over a phone
-    line than the name spoken naturally, so asking for a spelling makes
-    capture less reliable, not more - do not reintroduce a spell-out step."""
-    assert "NEVER ask the guest to spell their name out letter by letter" in PROMPT
+def test_prompt_offers_a_spelling_fallback_for_names():
+    """Policy reversed on request: the earlier build forbade spelling (spelled
+    letters like B/P/V/D/E/G are confusable over a phone). In practice, making
+    a guest repeat a name Kavya cannot catch — or that they said was wrong — is
+    worse than asking them to spell it once. Kavya now falls back to spelling
+    when she cannot make out the name after one repeat, or when the guest
+    rejects her read-back — and NOT for a name already heard clearly."""
+    assert "SPELLING FALLBACK for names" in PROMPT
+    assert "could you spell your last name for me" in PROMPT.lower()
+    # It must stay a fallback, not the default: still only used after a failed
+    # catch or a rejected read-back.
+    assert "never for a name you already heard clearly and confirmed" in PROMPT
 
 
 def test_prompt_uses_yes_no_read_back_for_uncertain_names():
