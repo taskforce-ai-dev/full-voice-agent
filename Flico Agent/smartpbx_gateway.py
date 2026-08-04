@@ -70,12 +70,14 @@ class SessionLease:
     def __init__(self, registry: SmartPBXSessionRegistry) -> None:
         self._registry = registry
         self._released = False
+        self._release_lock = asyncio.Lock()
 
     async def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        await self._registry._release()
+        async with self._release_lock:
+            if self._released:
+                return
+            await self._registry._release()
+            self._released = True
 
 
 class SmartPBXSessionRegistry:

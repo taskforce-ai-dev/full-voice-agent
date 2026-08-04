@@ -1,5 +1,6 @@
 """Contract tests for bounded SmartPBX configuration and admission."""
 
+import asyncio
 import pytest
 
 from smartpbx_gateway import (
@@ -134,6 +135,34 @@ async def test_releasing_a_lease_admits_another_without_underflow_on_double_rele
         "admitted_total": 2,
         "rejected_capacity_total": 0,
         "released_total": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cancelled_release_waiting_for_registry_lock_can_be_retried():
+    registry = SmartPBXSessionRegistry(max_sessions=1)
+    lease = await registry.try_acquire()
+    assert lease is not None
+    await registry._lock.acquire()
+    release_task = asyncio.create_task(lease.release())
+    await asyncio.sleep(0)
+
+    release_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await release_task
+    registry._lock.release()
+
+    await lease.release()
+    replacement = await registry.try_acquire()
+
+    assert replacement is not None
+    await replacement.release()
+    assert registry.snapshot() == {
+        "active_sessions": 0,
+        "max_sessions": 1,
+        "admitted_total": 2,
+        "rejected_capacity_total": 0,
+        "released_total": 2,
     }
 
 
