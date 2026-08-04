@@ -35,6 +35,8 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
+from handover import normalize_whatsapp
+
 from yanolja_client import (
     YanoljaError,
     list_rooms,
@@ -607,7 +609,11 @@ async def book(
     if guest_email:
         guest_payload["email"] = guest_email.strip()
     if guest_phone:
-        guest_payload["phone"] = guest_phone.strip()
+        # Store the canonical number the WhatsApp handover path produces, so the
+        # PMS and the manager notification never disagree. normalize_whatsapp()
+        # also expands spoken "double"/"triple" shorthand ("double seven" -> 77).
+        # Fall back to the raw value only if normalisation finds no usable digits.
+        guest_payload["phone"] = normalize_whatsapp(guest_phone) or guest_phone.strip()
 
     try:
         guest = await create_guest(guest_payload)
