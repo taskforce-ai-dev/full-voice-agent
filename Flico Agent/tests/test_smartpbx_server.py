@@ -128,6 +128,26 @@ def test_smartpbx_route_is_registered_exactly_once():
     assert paths.count("/ws/v1/smartpbx/media") == 1
 
 
+def test_smartpbx_route_rejects_valid_configuration_outside_service_mode(monkeypatch):
+    class NoSessionFactory:
+        async def __call__(self, context, transport):
+            raise AssertionError("legacy mode must not construct a SmartPBX session")
+
+    monkeypatch.setattr(server, "SMARTPBX_SERVICE_MODE", False)
+    monkeypatch.setattr(server, "SMARTPBX_GATEWAY", enabled_gateway())
+    monkeypatch.setattr(server, "SMARTPBX_SESSION_FACTORY", NoSessionFactory())
+    client = TestClient(server.app, raise_server_exceptions=True)
+
+    with pytest.raises(WebSocketDisconnect) as closed:
+        with client.websocket_connect(
+            "/ws/v1/smartpbx/media",
+            headers={"X-Flico-SmartPBX-Token": "shared-secret"},
+        ):
+            pass
+
+    assert closed.value.code == 1008
+
+
 def test_existing_health_and_voice_routes_are_unchanged():
     client = TestClient(server.app, raise_server_exceptions=True)
 
@@ -164,6 +184,7 @@ def test_smartpbx_status_is_operational_only(monkeypatch):
 
 def test_canonical_websocket_exchange_emits_documented_media(monkeypatch):
     factory = RouteFactory()
+    monkeypatch.setattr(server, "SMARTPBX_SERVICE_MODE", True)
     monkeypatch.setattr(server, "SMARTPBX_GATEWAY", enabled_gateway(), raising=False)
     monkeypatch.setattr(server, "SMARTPBX_SESSION_FACTORY", factory, raising=False)
     client = TestClient(server.app, raise_server_exceptions=True)
@@ -488,6 +509,7 @@ def test_valid_token_fifth_call_receives_asgi_close_1013(monkeypatch):
     lease = asyncio.run(registry.try_acquire())
     assert lease is not None
     gateway = SmartPBXGateway(settings, registry)
+    monkeypatch.setattr(server, "SMARTPBX_SERVICE_MODE", True)
     monkeypatch.setattr(server, "SMARTPBX_GATEWAY", gateway)
     client = TestClient(server.app, raise_server_exceptions=True)
 
@@ -767,6 +789,7 @@ async def test_real_media_session_fatal_future_closes_gateway_and_releases(monke
     monkeypatch.setattr(server.MediaStreamSession, "_start_stt", lambda self: True)
     monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "")
     monkeypatch.setattr(server, "ELEVENLABS_VOICE_ID", "")
+    monkeypatch.setattr(server, "SMARTPBX_SERVICE_MODE", True)
     monkeypatch.setattr(server, "SMARTPBX_GATEWAY", gateway)
     monkeypatch.setattr(server, "SMARTPBX_SESSION_FACTORY", factory)
     client = TestClient(server.app, raise_server_exceptions=True)
@@ -785,3 +808,146 @@ async def test_real_media_session_fatal_future_closes_gateway_and_releases(monke
     }
     assert registry.snapshot()["active_sessions"] == 0
     assert registry.snapshot()["released_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_claude_transfer_is_terminal_and_attempted_once(monkeypatch):
+    control = FakeCallControl(result=False)
+    block = SimpleNamespace(
+        type="tool_use", name="transfer_to_human", input={"reason": "help"},
+    )
+    session = server.MediaStreamSession(
+        None, "en",
+        anthropic_client=SimpleNamespace(
+            messages=FakeClaudeMessages(FakeClaudeStream([block]))
+        ),
+        transport=SimpleNamespace(), call_control=control,
+        privacy_safe=True, log_fingerprint="safe-fp",
+    )
+
+    async def no_op_speak(text, generation=-1):
+        return None
+
+    monkeypatch.setattr(session, "_speak", no_op_speak)
+
+    assert await session._run_llm_claude() == ""
+    assert await session._run_llm_claude() == ""
+    assert session.terminal_future.result() == {
+        "transferred": False, "failure_class": "transfer",
+    }
+    assert control.destinations == ["live_agent"]
+    assert session._active is False
+
+
+@pytest.mark.asyncio
+async def test_finished_smartpbx_session_ignores_late_stt_callbacks(monkeypatch):
+    control = FakeCallControl(result=False)
+    session = server.MediaStreamSession(
+        None, "en", transport=SimpleNamespace(), call_control=control,
+        privacy_safe=True, log_fingerprint="safe-fp",
+    )
+    session._event_loop = asyncio.get_running_loop()
+    processed = []
+
+    async def record_process(text):
+        processed.append(text)
+
+    async def no_op_speak(text, generation=-1):
+        return None
+
+    monkeypatch.setattr(session, "_process_utterance", record_process)
+    monkeypatch.setattr(session, "_speak", no_op_speak)
+
+    await session.finish()
+    session._on_stt_result("late transcript")
+    session._on_stt_interim("late interim")
+    session._on_stt_runtime_failure("stt_runtime")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await session._flush_transcript()
+
+    assert processed == []
+    assert control.destinations == []
+    assert session._fatal_future is None
+    assert session._tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_successful_claude_transfer_resolves_terminal_once(monkeypatch):
+    control = FakeCallControl(result=True)
+    block = SimpleNamespace(
+        type="tool_use", name="transfer_to_human", input={"reason": "help"},
+    )
+    session = server.MediaStreamSession(
+        None, "en",
+        anthropic_client=SimpleNamespace(
+            messages=FakeClaudeMessages(FakeClaudeStream([block]))
+        ),
+        transport=SimpleNamespace(), call_control=control,
+        privacy_safe=True, log_fingerprint="safe-fp",
+    )
+
+    async def no_op_speak(text, generation=-1):
+        return None
+
+    monkeypatch.setattr(session, "_speak", no_op_speak)
+
+    assert await session._run_llm_claude() == ""
+    assert await session._run_llm_claude() == ""
+    assert session.terminal_future.result() == {
+        "transferred": True, "failure_class": "transfer",
+    }
+    assert control.destinations == ["live_agent"]
+    assert session._active is False
+@pytest.mark.asyncio
+async def test_default_disabled_mcp_configuration_builds_session_without_call_control(
+    monkeypatch,
+):
+    monkeypatch.setattr(server, "LLM_PROVIDER", "claude")
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: object())
+    monkeypatch.setenv(
+        "SMARTPBX_MCP_URL", "https://dialog.cybergate.lk:9443/ucp/v2/mcp"
+    )
+    monkeypatch.setenv("SMARTPBX_ACCOUNT_ID", "account-1")
+    monkeypatch.setenv("SMARTPBX_TRANSFER_DESTINATIONS_JSON", "{}")
+    monkeypatch.delenv("SMARTPBX_API_KEY", raising=False)
+    monkeypatch.delenv("SMARTPBX_MCP_ACCOUNT_HEADER", raising=False)
+
+    session = await server._make_smartpbx_session(
+        SimpleNamespace(
+            call_id="call-1",
+            caller_id_number="+15550000001",
+            account_id="account-1",
+        ),
+        SimpleNamespace(),
+    )
+
+    assert session.call_control is None
+
+
+def test_legacy_server_import_ignores_disabled_malformed_smartpbx_settings():
+    environment = os.environ.copy()
+    environment.update({
+        "FLICO_SERVICE_MODE": "legacy",
+        "ENABLE_ASTERISK_ARI": "false",
+        "ENABLE_SMARTPBX_WSS": "false",
+        "SMARTPBX_WS_TOKEN": "stale-token",
+        "SMARTPBX_ACCOUNT_ID": "stale-account",
+        "SMARTPBX_MAX_CALLS": "invalid",
+        "SMARTPBX_MAX_MESSAGE_CHARS": "999999",
+        "SMARTPBX_MAX_AUDIO_BYTES": "invalid",
+        "SMARTPBX_MAX_OUTBOUND_FRAMES": "0",
+        "SMARTPBX_START_TIMEOUT_SECONDS": "-1",
+        "SMARTPBX_IDLE_TIMEOUT_SECONDS": "invalid",
+    })
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import server"],
+        cwd=Path(server.__file__).parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr

@@ -128,8 +128,9 @@ services:
 
   flico-smartpbx:
     profiles: ["smartpbx"]
-    image: ghcr.io/taskforce-ai-dev/flico:${IMAGE_TAG:?IMAGE_TAG must be an immutable SHA}
+    image: ghcr.io/taskforce-ai-dev/flico@${SMARTPBX_IMAGE_DIGEST:-sha256:0000000000000000000000000000000000000000000000000000000000000000}
     container_name: flico-smartpbx
+    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "65536"]
 
     ports:
       - "127.0.0.1:8005:8000"
@@ -164,6 +165,7 @@ services:
       SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS: ${SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS:-3}
       SMARTPBX_MCP_READ_TIMEOUT_SECONDS: ${SMARTPBX_MCP_READ_TIMEOUT_SECONDS:-8}
       SMARTPBX_MCP_RETRIES: ${SMARTPBX_MCP_RETRIES:-1}
+      SMARTPBX_MCP_MAX_RESPONSE_BYTES: ${SMARTPBX_MCP_MAX_RESPONSE_BYTES:-1048576}
 
     volumes:
       - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro

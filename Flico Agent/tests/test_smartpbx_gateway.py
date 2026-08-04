@@ -125,14 +125,15 @@ def test_smartpbx_is_disabled_and_unconfigured_by_default():
     assert "shared-secret" not in repr(settings)
 
 
-def test_disabled_smartpbx_can_still_report_valid_configuration():
+def test_disabled_smartpbx_discards_feature_configuration():
     settings = SmartPBXSettings.from_env({
         "SMARTPBX_WS_TOKEN": "shared-secret",
         "SMARTPBX_ACCOUNT_ID": "account-1",
     })
 
     assert settings.enabled is False
-    assert settings.configured is True
+    assert settings.configured is False
+    assert settings.token_matches("shared-secret") is False
 
 
 @pytest.mark.parametrize(

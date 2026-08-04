@@ -28,6 +28,7 @@ _SIP_DESTINATION = re.compile(
 _MAX_DESTINATIONS_JSON_CHARS = 4096
 _MAX_DESTINATIONS = 16
 _MAX_DESTINATION_CHARS = 256
+_DEFAULT_DIALOG_MCP_ENDPOINT = "https://dialog.cybergate.lk:9443/ucp/v2/mcp"
 
 _MAX_ENDPOINT_CHARS = 2048
 _MAX_API_KEY_CHARS = 512
@@ -191,7 +192,6 @@ class DialogMCPSettings:
             environ, "SMARTPBX_MCP_RETRIES", default=1, minimum=0, maximum=1
         )
 
-        attempted = any((endpoint, api_key, account_header, raw_destinations))
         destinations = _parse_destinations(raw_destinations)
         value = cls(
             endpoint=endpoint,
@@ -204,7 +204,13 @@ class DialogMCPSettings:
             max_response_bytes=max_response_bytes,
             retries=retries,
         )
-        if not attempted:
+        template_transfer_disabled = (
+            endpoint in ("", _DEFAULT_DIALOG_MCP_ENDPOINT)
+            and not api_key
+            and not account_header
+            and not destinations
+        )
+        if template_transfer_disabled:
             return value
         if (
             not _safe_header_value(api_key, _MAX_API_KEY_CHARS)

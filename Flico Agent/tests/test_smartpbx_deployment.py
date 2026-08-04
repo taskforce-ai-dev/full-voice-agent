@@ -41,14 +41,22 @@ def test_smartpbx_compose_service_is_immutable_isolated_and_opt_in():
 
     assert service["profiles"] == ["smartpbx"]
     assert service["container_name"] == "flico-smartpbx"
-    assert image.startswith("ghcr.io/taskforce-ai-dev/flico:")
-    assert "${IMAGE_TAG:?" in image
-    assert "immutable SHA" in image
+    assert image == (
+        "ghcr.io/taskforce-ai-dev/flico@${SMARTPBX_IMAGE_DIGEST:-sha256:"
+        + "0" * 64
+        + "}"
+    )
+    assert "IMAGE_TAG" not in image
     assert ":-latest" not in image
     assert service["ports"] == ["127.0.0.1:8005:8000"]
     assert not any("/udp" in port.lower() for port in service["ports"])
     assert "env_file" not in service
     assert service["restart"] == "unless-stopped"
+    assert service["command"] == [
+        "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000",
+        "--ws-max-size", "65536",
+    ]
+    assert "command" not in yaml.safe_load(_text(COMPOSE))["services"]["flico"]
 
 
 def test_smartpbx_compose_has_only_required_non_legacy_environment():
@@ -119,6 +127,8 @@ def test_smartpbx_environment_template_is_safe_and_complete():
         "SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS": "3",
         "SMARTPBX_MCP_READ_TIMEOUT_SECONDS": "8",
         "SMARTPBX_MCP_RETRIES": "1",
+        "SMARTPBX_MCP_MAX_RESPONSE_BYTES": "1048576",
+        "SMARTPBX_IMAGE_DIGEST": "",
     }
     assert {key: environment.get(key) for key in expected} == expected
 

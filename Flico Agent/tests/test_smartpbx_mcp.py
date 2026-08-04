@@ -641,3 +641,36 @@ def test_docker_cpu_torch_pin_matches_production_lock():
         "--index-url https://download.pytorch.org/whl/cpu"
     ) in dockerfile
     assert "torch==2.13.0+cpu" in lockfile
+def test_template_default_endpoint_and_empty_destinations_leave_mcp_disabled():
+    value = DialogMCPSettings.from_env({
+        "SMARTPBX_MCP_URL": "https://dialog.cybergate.lk:9443/ucp/v2/mcp",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+        "SMARTPBX_TRANSFER_DESTINATIONS_JSON": "{}",
+    })
+
+    assert value.enabled is False
+    assert value.configured is False
+    assert value.transfer_destinations == {}
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"SMARTPBX_MCP_URL": "https://other.example/ucp/v2/mcp"},
+        {
+            "SMARTPBX_MCP_URL": "https://dialog.cybergate.lk:9443/ucp/v2/mcp",
+            "SMARTPBX_ACCOUNT_ID": "account-1",
+            "SMARTPBX_TRANSFER_DESTINATIONS_JSON": (
+                '{"live_agent":"tel:+94110000000"}'
+            ),
+        },
+        {
+            "SMARTPBX_MCP_URL": "https://dialog.cybergate.lk:9443/ucp/v2/mcp",
+            "SMARTPBX_ACCOUNT_ID": "account-1",
+            "SMARTPBX_API_KEY": "secret",
+        },
+    ],
+)
+def test_meaningful_partial_mcp_configuration_still_fails_closed(override):
+    with pytest.raises(ValueError, match="configuration"):
+        DialogMCPSettings.from_env(override)

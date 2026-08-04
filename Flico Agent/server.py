@@ -1577,6 +1577,7 @@ def _make_stt(
 PIPELINE_FAILURE_CLASSES = frozenset({
     "stt_unavailable", "stt_queue_overflow", "tts_unavailable",
     "tts_status", "tts_timeout", "tts_exception", "pipeline",
+    "transfer",
 })
 
 
@@ -1673,13 +1674,23 @@ class MediaStreamSession:
             "failure_class": failure_class[:64],
         }, sort_keys=True))
 
+    def _pipeline_is_active(self) -> bool:
+        return self._active and not self._finished
+
     def _spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
 
+    def _schedule_if_active(self, operation):
+        if self._pipeline_is_active():
+            return self._spawn(operation())
+        return None
+
     async def _run_pipeline_task(self, work):
+        if not self._pipeline_is_active():
+            return
         try:
             await (work() if callable(work) else work)
         except asyncio.CancelledError:
@@ -1693,25 +1704,41 @@ class MediaStreamSession:
             else:
                 logger.exception("Media pipeline task failed [%s]", self._log_id)
 
+    async def _complete_terminal_locked(
+        self, failure_class: str, transferred: bool
+    ) -> None:
+        self._active = False
+        self._is_speaking = False
+        current = asyncio.current_task()
+        siblings = [task for task in tuple(self._tasks) if task is not current]
+        for task in siblings:
+            task.cancel()
+        if siblings:
+            await asyncio.gather(*siblings, return_exceptions=True)
+        stable = failure_class if failure_class in PIPELINE_FAILURE_CLASSES else "pipeline"
+        self.terminal_future.set_result({
+            "transferred": transferred,
+            "failure_class": stable,
+        })
+
+    async def _resolve_terminal_outcome(
+        self, failure_class: str, transferred: bool
+    ) -> None:
+        """Record an already-attempted SmartPBX transfer exactly once."""
+        async with self._fatal_lock:
+            if self._finished or self.terminal_future.done():
+                return
+            await self._complete_terminal_locked(failure_class, transferred)
+
     async def _terminate_pipeline(self, failure_class: str) -> None:
         """Resolve the one terminal outcome after a bounded live-agent attempt."""
+        if not self._pipeline_is_active():
+            return
         async with self._fatal_lock:
-            if self.terminal_future.done():
+            if not self._pipeline_is_active() or self.terminal_future.done():
                 return
             transferred = await self._transfer_to_live_agent()
-            self._active = False
-            self._is_speaking = False
-            current = asyncio.current_task()
-            siblings = [task for task in tuple(self._tasks) if task is not current]
-            for task in siblings:
-                task.cancel()
-            if siblings:
-                await asyncio.gather(*siblings, return_exceptions=True)
-            stable = failure_class if failure_class in PIPELINE_FAILURE_CLASSES else "pipeline"
-            self.terminal_future.set_result({
-                "transferred": transferred,
-                "failure_class": stable,
-            })
+            await self._complete_terminal_locked(failure_class, transferred)
 
     async def _await_tts_tasks(self, tasks: list[asyncio.Task]) -> None:
         try:
@@ -1858,7 +1885,7 @@ class MediaStreamSession:
         ))
 
     async def feed_audio(self, audio: bytes):
-        if self._active and self._stt:
+        if self._pipeline_is_active() and self._stt:
             accepted = self._stt.feed(audio)
             if self.privacy_safe and accepted is False:
                 await self._terminate_pipeline("stt_queue_overflow")
@@ -1889,30 +1916,40 @@ class MediaStreamSession:
             return False
 
     def _on_stt_runtime_failure(self, failure_class: str) -> None:
-        if self._event_loop is None or self._event_loop.is_closed():
+        if (
+            not self._pipeline_is_active()
+            or self._event_loop is None
+            or self._event_loop.is_closed()
+        ):
             return
         self._event_loop.call_soon_threadsafe(
-            lambda: self._spawn(self._terminate_pipeline(failure_class))
+            lambda: self._schedule_if_active(
+                lambda: self._terminate_pipeline(failure_class)
+            )
         )
 
     # -- STT callback (called from background thread) ----------------------
 
     def _on_stt_result(self, transcript: str):
         """Called from STT thread on FINAL results."""
+        if not self._pipeline_is_active():
+            return
         if self.privacy_safe:
             self._safe_log("smartpbx_stt_final")
         else:
             logger.info("STT final result [%s]: %r (speaking=%s)", self._log_id, transcript, self._is_speaking)
         self._latest_interim = ""  # clear -- final supersedes interim
-        if self._event_loop is None:
+        if self._event_loop is None or self._event_loop.is_closed():
             return
         if self._is_speaking:
-            asyncio.run_coroutine_threadsafe(
-                self._handle_bargein(), self._event_loop,
+            self._event_loop.call_soon_threadsafe(
+                lambda: self._schedule_if_active(self._handle_bargein)
             )
             return
-        asyncio.run_coroutine_threadsafe(
-            self._accumulate_transcript(transcript), self._event_loop,
+        self._event_loop.call_soon_threadsafe(
+            lambda: self._schedule_if_active(
+                lambda: self._accumulate_transcript(transcript)
+            )
         )
 
     def _on_stt_interim(self, transcript: str):
@@ -1922,19 +1959,25 @@ class MediaStreamSession:
         We drive our own endpointing: each interim resets a 1.5 s silence
         timer; when the timer fires we use the latest interim as the utterance.
         """
+        if not self._pipeline_is_active():
+            return
         self._latest_interim = transcript
-        if self._event_loop is None:
+        if self._event_loop is None or self._event_loop.is_closed():
             return
         if self._is_speaking:
-            asyncio.run_coroutine_threadsafe(
-                self._handle_bargein(), self._event_loop,
+            self._event_loop.call_soon_threadsafe(
+                lambda: self._schedule_if_active(self._handle_bargein)
             )
             return
-        asyncio.run_coroutine_threadsafe(
-            self._set_transcript_interim(transcript), self._event_loop,
+        self._event_loop.call_soon_threadsafe(
+            lambda: self._schedule_if_active(
+                lambda: self._set_transcript_interim(transcript)
+            )
         )
 
     async def _handle_bargein(self):
+        if not self._pipeline_is_active():
+            return
         logger.info("Barge-in detected [%s]", self._log_id)
         self._is_speaking = False
         self._speak_generation += 1
@@ -1968,26 +2011,32 @@ class MediaStreamSession:
     # -- Endpointing -------------------------------------------------------
 
     async def _accumulate_transcript(self, text: str):
+        if not self._pipeline_is_active():
+            return
         if self._endpointing_handle:
             self._endpointing_handle.cancel()
             self._endpointing_handle = None
         self._pending_transcript = text
         self._endpointing_handle = self._event_loop.call_later(
             ENDPOINTING_SILENCE,
-            lambda: self._spawn(self._flush_transcript()),
+            lambda: self._schedule_if_active(self._flush_transcript),
         )
 
     async def _set_transcript_interim(self, text: str):
         """Overwrite (not append) pending transcript with latest interim; reset timer."""
+        if not self._pipeline_is_active():
+            return
         self._pending_transcript = text
         if self._endpointing_handle:
             self._endpointing_handle.cancel()
         self._endpointing_handle = self._event_loop.call_later(
             ENDPOINTING_SILENCE,
-            lambda: self._spawn(self._flush_transcript()),
+            lambda: self._schedule_if_active(self._flush_transcript),
         )
 
     async def _flush_transcript(self):
+        if not self._pipeline_is_active():
+            return
         transcript = self._pending_transcript.strip()
         self._pending_transcript = ""
         self._latest_interim = ""
@@ -2009,6 +2058,8 @@ class MediaStreamSession:
     # -- Utterance -> KB + LLM + TTS ---------------------------------------
 
     async def _process_utterance(self, text: str):
+        if not self._pipeline_is_active():
+            return
         try:
             kb_context = retrieve_context(text, sticky=self.sticky_filters)
         except Exception:
@@ -2060,7 +2111,8 @@ class MediaStreamSession:
     async def _transfer_to_live_agent(self) -> bool:
         """Attempt the single operator-allowlisted SmartPBX handoff."""
         if (
-            self.call_control is None
+            not self._pipeline_is_active()
+            or self.call_control is None
             or self.lang != "en"
             or self._transfer_attempted
         ):
@@ -2070,6 +2122,8 @@ class MediaStreamSession:
             await self._speak("Please hold while I connect you to a consultant.")
         except Exception:
             self._safe_log("smartpbx_hold_failed", level=logging.ERROR, failure_class="tts")
+        if not self._pipeline_is_active():
+            return False
         try:
             transferred = await self.call_control.transfer_call("live_agent")
         except Exception:
@@ -2201,6 +2255,8 @@ class MediaStreamSession:
 
     async def _run_llm_claude(self) -> str:
         """Anthropic Claude streaming for Media Streams with sentence-level TTS."""
+        if not self._pipeline_is_active():
+            return ""
         logger.info("Claude call [%s]", self._log_id)
 
         text_content = ""
@@ -2256,10 +2312,12 @@ class MediaStreamSession:
         if tts_tasks:
             await self._await_tts_tasks(tts_tasks)
 
+        if transfer_requested:
+            transferred = await self._transfer_to_live_agent()
+            await self._resolve_terminal_outcome("transfer", transferred)
+            return ""
         if text_content:
             self.history.append({"role": "assistant", "content": text_content})
-        if transfer_requested:
-            await self._transfer_to_live_agent()
         return text_content
 
     # -- TTS -> Twilio mulaw audio -----------------------------------------
@@ -3204,6 +3262,9 @@ async def smartpbx_runtime_status() -> dict[str, bool | int | str]:
 @app.websocket("/ws/v1/smartpbx/media")
 async def ws_smartpbx_media(websocket: WebSocket):
     """Accept direct Dialog SmartPBX media through the isolated gateway."""
+    if not SMARTPBX_SERVICE_MODE:
+        await websocket.close(code=1008, reason="service unavailable")
+        return
     await SMARTPBX_GATEWAY.handle(websocket, SMARTPBX_SESSION_FACTORY)
 
 

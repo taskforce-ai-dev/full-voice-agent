@@ -54,12 +54,22 @@ class SmartPBXSettings:
     def from_env(cls, environ: Mapping[str, str]) -> SmartPBXSettings:
         """Read bounded configuration without retaining a token in repr output."""
         enabled = _parse_enabled(environ.get("ENABLE_SMARTPBX_WSS", "false"))
+        token = environ.get("SMARTPBX_WS_TOKEN", "")
+        account_id = environ.get("SMARTPBX_ACCOUNT_ID", "")
+        if not enabled:
+            return cls(
+                enabled=False,
+                token="",
+                account_id="",
+                **{
+                    attribute: default
+                    for _, (attribute, default, _, _) in _INTEGER_SETTINGS.items()
+                },
+            )
         values = {
             attribute: _parse_bounded_integer(environ.get(name, str(default)), minimum, maximum)
             for name, (attribute, default, minimum, maximum) in _INTEGER_SETTINGS.items()
         }
-        token = environ.get("SMARTPBX_WS_TOKEN", "")
-        account_id = environ.get("SMARTPBX_ACCOUNT_ID", "")
         if not isinstance(token, str) or not isinstance(account_id, str):
             raise _configuration_error()
         settings = cls(

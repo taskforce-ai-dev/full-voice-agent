@@ -34,17 +34,22 @@ gates as complete:
    fallback test before enabling production routing.
 
 Before every launch, run the focused deployment contract test plus the Compose
-and Nginx checks shown under validation. Confirm `IMAGE_TAG` is an immutable
-release SHA, the host has the certificate paths referenced by
+and Nginx checks shown under validation. Confirm `SMARTPBX_IMAGE_DIGEST` is a
+canonical immutable `sha256:` digest (64 lowercase hexadecimal characters),
+the host has the certificate paths referenced by
 `nginx-smartpbx.conf`, and the service profile is intentionally selected.
+The profile-off default is an intentionally unresolvable all-zero digest, so a
+normal legacy `docker compose up -d` never requires a SmartPBX image value.
+The SmartPBX container starts Uvicorn with `--ws-max-size 65536`, a hard
+64 KiB inbound WebSocket-frame cap applied before application allocation.
 
 ## Start, stop, and rollback
 
 From the `Flico Agent` directory on the deployment host:
 
 ```bash
-IMAGE_TAG=<immutable-sha> docker compose --profile smartpbx pull flico-smartpbx
-IMAGE_TAG=<immutable-sha> docker compose --profile smartpbx up -d flico-smartpbx
+SMARTPBX_IMAGE_DIGEST=sha256:<64-lowercase-hex> docker compose --profile smartpbx pull flico-smartpbx
+SMARTPBX_IMAGE_DIGEST=sha256:<64-lowercase-hex> docker compose --profile smartpbx up -d flico-smartpbx
 docker compose --profile smartpbx ps
 ```
 
