@@ -140,6 +140,8 @@ def normalize_whatsapp(raw: Any) -> str:
     '447700900123'
     >>> normalize_whatsapp("001 415 555 0132")
     '14155550132'
+    >>> normalize_whatsapp("double oh 44 7700 900123")
+    '447700900123'
     """
     if not raw:
         return ""
@@ -151,7 +153,9 @@ def normalize_whatsapp(raw: Any) -> str:
     # internationally, so the rest is already a full country-code + number
     # ("0044 7700 900123" -> "447700900123"). Return it untouched. This MUST come
     # before the local-trunk branch below, which strips every leading zero and
-    # would otherwise turn "0044..." into a non-existent "94..." Sri Lankan number.
+    # would otherwise turn "0044..." into a non-existent "94..." Sri Lankan
+    # number. Note expand_spoken_repeats turns a spoken "double oh" into "00",
+    # so this is exactly the input that reaches here.
     if digits.startswith("00"):
         return digits[2:]
 

@@ -119,6 +119,9 @@ def test_normalize_whatsapp_international_not_mangled():
     """
     assert normalize_whatsapp("0044 7700 900123") == "447700900123"
     assert normalize_whatsapp("001 415 555 0132") == "14155550132"
+    # expand_spoken_repeats turns a spoken "double oh" into "00", which is
+    # exactly the input that used to get mangled — it must be handled too.
+    assert normalize_whatsapp("double oh 44 7700 900123") == "447700900123"
 
 
 def test_normalize_whatsapp_never_double_prefixes():
