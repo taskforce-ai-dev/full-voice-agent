@@ -133,6 +133,18 @@ def test_name_confirmation_is_not_gated_on_unperceivable_audio_signal():
     assert "you are NOT confident" not in PROMPT
 
 
+def test_prompt_frames_transcription_as_machine_generated():
+    """Positive counterpart to test_prompt_never_blames_unclear_audio_for_a_name_capture
+    below, which only locks the MACHINE TRANSCRIPTION bullet in by an absence
+    assertion (that the old "audio was unclear" phrase is gone). An
+    absence-only test would stay green even if the whole framing bullet were
+    deleted, so also assert the bullet's actual content is present: the
+    model is told it receives a machine transcription, not audio, and must
+    judge only the text."""
+    assert "MACHINE TRANSCRIPTION" in PROMPT
+    assert "you cannot hear audio" in PROMPT
+
+
 def test_prompt_never_blames_unclear_audio_for_a_name_capture():
     """Production call CA464ae445b9b20813a0f8316e6ad5dbfb (2026-08-04, guest
     Chanya Shehani): the guest gave two tokens ('cha Shawnee') and both were
@@ -177,6 +189,42 @@ def test_prompt_has_a_loop_exit_for_repeated_name_mismatches():
         "our reservations team will confirm the exact spelling with you "
         "on WhatsApp together with your booking confirmation"
     ) in PROMPT
+
+
+def test_hard_gate_carves_out_the_loop_exit_exception():
+    """The hard gate ("do NOT proceed to the mobile number ... until you
+    have BOTH a distinct first name AND a distinct last name captured and
+    confirmed") otherwise flatly contradicts the LOOP EXIT immediately
+    above it, which fires precisely when the name is NOT confirmed - "the
+    guest still says no" is one of its two triggers - and tells the model
+    to proceed to the mobile number anyway. Without an explicit exception,
+    the model has to arbitrate between two absolute directives at exactly
+    the moment the escape hatch should release it: the same "no applicable
+    instruction, fall back to something forbidden" shape that produced the
+    original seven-turn call."""
+    assert (
+        "confirmed — except under the LOOP EXIT rule above, which "
+        "explicitly permits proceeding on a best-effort guess"
+    ) in PROMPT
+
+
+def test_loop_exit_only_fires_after_spelling_fallback_has_been_tried():
+    """Sequencing fix: the intended flow is (1) up to TWO repeat attempts on
+    the suspect part, (2) THEN the spelling fallback (PR #122), (3) THEN the
+    loop exit's best-guess-plus-WhatsApp escape hatch. Before this fix,
+    LOOP EXIT - which appears earlier in the rendered prompt than the
+    SPELLING FALLBACK block - never mentioned spelling at all, so a model
+    could exit after two failed repeats without ever trying to spell the
+    name. A same-strings-exist assertion would not catch that: it checks
+    the actual cross-referencing phrases that wire the two blocks together,
+    plus that LOOP EXIT (which points forward to spelling) still precedes
+    SPELLING FALLBACK (which points back to the repeat attempts) in the
+    rendered text, so both forward- and backward-references resolve to
+    real content."""
+    assert "try the SPELLING FALLBACK below for that part" in PROMPT
+    assert "Only if spelling ALSO fails to resolve it" in PROMPT
+    assert "repeat attempts described above have not resolved it" in PROMPT
+    assert PROMPT.index("LOOP EXIT") < PROMPT.index("SPELLING FALLBACK for names")
 
 
 def test_mobile_number_is_read_back_in_local_form_not_plus94():
