@@ -94,6 +94,12 @@ def expand_spoken_repeats(raw: Any) -> str:
     the model does. If the shorthand was already expanded upstream there is
     nothing to match and this is a harmless no-op.
 
+    REQUIREMENT -- PHONE-NUMBER FIELDS ONLY. Never run this over free-form
+    conversation text. "double" is a room type at Hatton Hills, so "I'd like a
+    double, two nights" would be mangled into "22". This is safe only because
+    its two callers (`normalize_whatsapp` and the booking phone field) hand it
+    nothing but a dictated phone number. Do NOT reuse it on general text.
+
     >>> expand_spoken_repeats("double seven")
     '77'
     >>> expand_spoken_repeats("triple two")

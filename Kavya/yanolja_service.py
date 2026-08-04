@@ -35,7 +35,7 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 
-from handover import expand_spoken_repeats
+from handover import normalize_whatsapp
 
 from yanolja_client import (
     YanoljaError,
@@ -609,9 +609,11 @@ async def book(
     if guest_email:
         guest_payload["email"] = guest_email.strip()
     if guest_phone:
-        # Expand spoken "double"/"triple" shorthand ("double seven" -> "77")
-        # before storing, in case the model passed the words through verbatim.
-        guest_payload["phone"] = expand_spoken_repeats(guest_phone).strip()
+        # Store the canonical number the WhatsApp handover path produces, so the
+        # PMS and the manager notification never disagree. normalize_whatsapp()
+        # also expands spoken "double"/"triple" shorthand ("double seven" -> 77).
+        # Fall back to the raw value only if normalisation finds no usable digits.
+        guest_payload["phone"] = normalize_whatsapp(guest_phone) or guest_phone.strip()
 
     try:
         guest = await create_guest(guest_payload)
