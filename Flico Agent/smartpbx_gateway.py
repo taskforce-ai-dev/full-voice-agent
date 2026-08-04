@@ -3,9 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
 import secrets
+import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Mapping
+from enum import Enum
+from typing import Any, Awaitable, Callable, Mapping, Protocol
+
+from starlette.websockets import WebSocketDisconnect
+
+from smartpbx_protocol import (
+    ConnectedEvent, DtmfEvent, HangupEvent, MediaEvent, POLICY_VIOLATION,
+    ProtocolViolation, StartEvent, StopEvent, UnknownEvent,
+    parse_smartpbx_event, validate_event_context,
+)
+from smartpbx_transport import SmartPBXMediaTransport
+
+
+logger = logging.getLogger(__name__)
 
 
 SMARTPBX_PROTOCOL_VERSION = "smartpbx-ai-provider-v06"
@@ -131,6 +149,250 @@ def smartpbx_status(
         **registry.snapshot(),
         "protocol_version": SMARTPBX_PROTOCOL_VERSION,
     }
+
+
+class _GatewaySession(Protocol):
+    async def start(self) -> None: ...
+
+    async def feed_audio(self, audio: bytes) -> None: ...
+
+    async def finish(self, schedule_post_call: bool = False) -> None: ...
+
+
+SessionFactory = Callable[[Any, SmartPBXMediaTransport], Awaitable[_GatewaySession]]
+
+
+class _SessionState(Enum):
+    NEW = "NEW"
+    ACCEPTED = "ACCEPTED"
+    STARTED = "STARTED"
+    TERMINAL = "TERMINAL"
+
+
+class SmartPBXGateway:
+    """Authenticate and drive one bounded SmartPBX media session."""
+
+    _TOKEN_HEADER = "X-Flico-SmartPBX-Token"
+
+    def __init__(
+        self, settings: SmartPBXSettings, registry: SmartPBXSessionRegistry
+    ) -> None:
+        self._settings = settings
+        self._registry = registry
+        self._unknown_events_total = 0
+
+    def snapshot(self) -> dict[str, bool | int | str]:
+        return {
+            **smartpbx_status(self._settings, self._registry),
+            "unknown_events_total": self._unknown_events_total,
+        }
+
+    async def handle(self, websocket: Any, session_factory: SessionFactory) -> None:
+        session_id = uuid.uuid4().hex
+        started_at = time.monotonic()
+        state = _SessionState.NEW
+        call_fingerprint = ""
+        outcome = "rejected"
+        failure_class = ""
+        close_outcome: tuple[int, str] | None = None
+        disconnected = False
+        lease: SessionLease | None = None
+        transport: SmartPBXMediaTransport | None = None
+        session: _GatewaySession | None = None
+
+        token = websocket.headers.get(self._TOKEN_HEADER, "")
+        if not self._settings.enabled or not self._settings.configured:
+            await _safe_close(websocket, POLICY_VIOLATION, "service unavailable")
+            self._log_lifecycle(
+                session_id, call_fingerprint, outcome, "disabled", started_at
+            )
+            return
+        if not self._settings.token_matches(token):
+            await _safe_close(websocket, POLICY_VIOLATION, "unauthorized")
+            self._log_lifecycle(
+                session_id, call_fingerprint, outcome, "authentication", started_at
+            )
+            return
+
+        lease = await self._registry.try_acquire()
+        if lease is None:
+            await _safe_close(websocket, 1013, "capacity unavailable")
+            self._log_lifecycle(
+                session_id, call_fingerprint, outcome, "capacity", started_at
+            )
+            return
+
+        try:
+            await websocket.accept()
+            state = _SessionState.ACCEPTED
+            context = await self._receive_start(websocket)
+            if context.account_id != self._settings.account_id:
+                raise ProtocolViolation(
+                    POLICY_VIOLATION, "account mismatch", "account_mismatch"
+                )
+            call_fingerprint = _fingerprint(context.call_id)
+            transport = SmartPBXMediaTransport(
+                websocket,
+                context,
+                max_queue_frames=self._settings.max_outbound_frames,
+            )
+            transport.start()
+            session = await session_factory(context, transport)
+            await session.start()
+            state = _SessionState.STARTED
+
+            while True:
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=self._settings.idle_timeout_seconds,
+                )
+                event = parse_smartpbx_event(
+                    raw,
+                    max_message_chars=self._settings.max_message_chars,
+                    max_audio_bytes=self._settings.max_audio_bytes,
+                )
+                if isinstance(event, StartEvent):
+                    validate_event_context(event, context)
+                    raise ProtocolViolation(
+                        POLICY_VIOLATION, "duplicate start", "duplicate_start"
+                    )
+                if isinstance(event, MediaEvent):
+                    await session.feed_audio(event.audio)
+                elif isinstance(event, DtmfEvent):
+                    self._log_event(
+                        "smartpbx_dtmf_observed", session_id, call_fingerprint,
+                        "ignored", "", started_at,
+                    )
+                elif isinstance(event, HangupEvent):
+                    validate_event_context(event, context)
+                    outcome = "hangup"
+                    close_outcome = (1000, "call ended")
+                    break
+                elif isinstance(event, StopEvent):
+                    outcome = "stop"
+                    close_outcome = (1000, "call ended")
+                    break
+                elif isinstance(event, UnknownEvent):
+                    self._observe_unknown()
+                elif isinstance(event, ConnectedEvent):
+                    continue
+        except asyncio.TimeoutError:
+            is_start_timeout = state is _SessionState.ACCEPTED
+            failure_class = "start_timeout" if is_start_timeout else "idle_timeout"
+            outcome = "timeout"
+            close_outcome = (
+                POLICY_VIOLATION,
+                "start timeout" if is_start_timeout else "idle timeout",
+            )
+        except WebSocketDisconnect:
+            disconnected = True
+            outcome = "disconnect"
+        except ProtocolViolation as error:
+            outcome = "protocol_error"
+            failure_class = error.failure_class
+            close_outcome = (error.close_code, error.public_reason)
+        except Exception as error:
+            outcome = "failed"
+            failure_class = type(error).__name__[:64]
+            close_outcome = (1011, "internal error")
+            self._log_event(
+                "smartpbx_session_failed", session_id, call_fingerprint,
+                outcome, failure_class, started_at, level=logging.ERROR,
+            )
+        finally:
+            state = _SessionState.TERMINAL
+            if session is not None:
+                try:
+                    await session.finish(schedule_post_call=True)
+                except Exception:
+                    self._log_event(
+                        "smartpbx_session_cleanup_failed", session_id,
+                        call_fingerprint, "degraded", "session_cleanup",
+                        started_at, level=logging.ERROR,
+                    )
+            if transport is not None:
+                try:
+                    await transport.close()
+                except Exception:
+                    self._log_event(
+                        "smartpbx_transport_cleanup_failed", session_id,
+                        call_fingerprint, "degraded", "transport_cleanup",
+                        started_at, level=logging.ERROR,
+                    )
+            if lease is not None:
+                await lease.release()
+            if close_outcome is not None and not disconnected:
+                await _safe_close(websocket, *close_outcome)
+            self._log_lifecycle(
+                session_id, call_fingerprint, outcome, failure_class, started_at
+            )
+
+    async def _receive_start(self, websocket: Any):
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self._settings.start_timeout_seconds
+        )
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+            event = parse_smartpbx_event(
+                raw,
+                max_message_chars=self._settings.max_message_chars,
+                max_audio_bytes=self._settings.max_audio_bytes,
+            )
+            if isinstance(event, StartEvent):
+                return event.context
+            if isinstance(event, ConnectedEvent):
+                continue
+            if isinstance(event, UnknownEvent):
+                self._observe_unknown()
+                continue
+            raise ProtocolViolation(
+                POLICY_VIOLATION, "start required", "start_required"
+            )
+
+    def _observe_unknown(self) -> None:
+        self._unknown_events_total = _saturating_increment(
+            self._unknown_events_total
+        )
+
+    def _log_lifecycle(
+        self, session_id: str, call_fingerprint: str, outcome: str,
+        failure_class: str, started_at: float,
+    ) -> None:
+        self._log_event(
+            "smartpbx_session_ended", session_id, call_fingerprint,
+            outcome, failure_class, started_at,
+        )
+
+    def _log_event(
+        self, event: str, session_id: str, call_fingerprint: str,
+        outcome: str, failure_class: str, started_at: float,
+        *, level: int = logging.INFO,
+    ) -> None:
+        record = {
+            "event": event[:64],
+            "session_id": session_id,
+            "call_fingerprint": call_fingerprint,
+            "outcome": outcome[:64],
+            "failure_class": failure_class[:64],
+            "active_count": self._registry.snapshot()["active_sessions"],
+            "duration": round(max(0.0, time.monotonic() - started_at), 3),
+        }
+        logger.log(level, "%s", json.dumps(record, sort_keys=True))
+
+
+def _fingerprint(call_id: str) -> str:
+    return hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:12]
+
+
+async def _safe_close(websocket: Any, code: int, reason: str) -> None:
+    try:
+        await websocket.close(code=code, reason=reason)
+    except Exception:
+        return
 
 
 def _parse_enabled(value: str) -> bool:

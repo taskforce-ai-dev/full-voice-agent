@@ -73,6 +73,14 @@ from media_transport import MediaTransport, TwilioMediaTransport
 from asterisk_ari import AsteriskAriClient
 from asterisk_rtp import AsteriskRtpTransport, RtpPortAllocator
 from brands import BRANDS, DEFAULT_BRAND, resolve_brand
+from smartpbx_gateway import (
+    SmartPBXGateway,
+    SmartPBXSessionRegistry,
+    SmartPBXSettings,
+)
+from smartpbx_mcp import CallControl, DialogMCPCallControl, DialogMCPSettings
+from smartpbx_protocol import CallContext
+from smartpbx_transport import SmartPBXMediaTransport
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -115,6 +123,9 @@ ASTERISK_DEFAULT_LANG: str = os.getenv("ASTERISK_DEFAULT_LANG", "en")
 AZURE_SPEECH_KEY: str = os.getenv("AZURE_SPEECH_KEY", "")
 AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "southeastasia")
 STT_PROVIDER: str = os.getenv("STT_PROVIDER", "google").lower()
+SMARTPBX_SETTINGS = SmartPBXSettings.from_env(os.environ)
+SMARTPBX_REGISTRY = SmartPBXSessionRegistry(SMARTPBX_SETTINGS.max_calls)
+SMARTPBX_GATEWAY = SmartPBXGateway(SMARTPBX_SETTINGS, SMARTPBX_REGISTRY)
 # Self-hosted Sinhala VITS TTS service (legacy fallback -- no longer the
 # active Sinhala path; resolvable via the shared docker network if revived).
 SINHALA_TTS_URL: str = os.getenv("SINHALA_TTS_URL", "http://sinhala-tts:8000")
@@ -1453,6 +1464,7 @@ class MediaStreamSession:
         transport: MediaTransport | None = None,
         call_sid: str = "unknown",
         caller_phone: str = "unknown",
+        call_control: CallControl | None = None,
     ):
         self.ws = websocket
         self.anthropic_client = anthropic_client
@@ -1460,7 +1472,8 @@ class MediaStreamSession:
         self.gemini_client = gemini_client
         self.lang = lang
         self.system_prompt = _build_system_prompt(lang)
-        self.tools = []
+        self.call_control = call_control
+        self.tools = [TRANSFER_TOOL] if (call_control is not None and lang == "en") else []
         self.media_transport = transport
 
         self.stream_sid: str | None = None
@@ -1486,6 +1499,9 @@ class MediaStreamSession:
         # Cleared when the call ends -- guards against sending to a closed
         # WebSocket if the LLM/TTS pipeline is still running after hangup.
         self._active = True
+        self._finished = False
+        self._post_call_scheduled = False
+        self._transfer_attempted = False
 
     # -- Main event loop ---------------------------------------------------
 
@@ -1541,36 +1557,49 @@ class MediaStreamSession:
         except Exception:
             logger.exception("Media stream error -- Call: %s", self.call_sid)
         finally:
-            # Mark the session dead first so any in-flight LLM/TTS work stops
-            # trying to write to the now-closed WebSocket.
+            await self.finish(schedule_post_call=True)
+
+    async def finish(self, schedule_post_call: bool = False):
+        """Finish external media once and optionally schedule post-call work."""
+        if not self._finished:
+            self._finished = True
             self._active = False
             self._is_speaking = False
             if self._stt:
-                self._stt.stop()
+                try:
+                    self._stt.stop()
+                finally:
+                    self._stt = None
             if self._endpointing_handle:
                 self._endpointing_handle.cancel()
+                self._endpointing_handle = None
             logger.info(
                 "Media stream session ended -- Call: %s, history: %d msgs",
                 self.call_sid, len(self.history),
             )
+        if schedule_post_call:
+            self._schedule_post_call()
 
-            # Real-estate lead post-call -> n8n -> Google Sheet (fire-and-forget).
-            if self.history:
-                try:
-                    asyncio.create_task(
-                        process_realestate_post_call(
-                            call_sid=self.call_sid,
-                            caller_phone=self.caller_phone,
-                            transcript=self.history,
-                            anthropic_client=self.anthropic_client,
-                            model=MODEL,
-                            started_at=self.started_at,
-                        )
-                    )
-                except Exception:
-                    logger.exception(
-                        "[realestate-postcall] schedule failed [%s]", self.call_sid
-                    )
+    def _schedule_post_call(self):
+        """Schedule the existing lead workflow at most once per session."""
+        if self._post_call_scheduled or not self.history:
+            return
+        self._post_call_scheduled = True
+        try:
+            asyncio.create_task(
+                process_realestate_post_call(
+                    call_sid=self.call_sid,
+                    caller_phone=self.caller_phone,
+                    transcript=self.history,
+                    anthropic_client=self.anthropic_client,
+                    model=MODEL,
+                    started_at=self.started_at,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "[realestate-postcall] schedule failed [%s]", self.call_sid
+            )
 
     async def start(self):
         """Start an Asterisk/RTP-driven media session."""
@@ -1578,6 +1607,9 @@ class MediaStreamSession:
         if self.media_transport is None:
             raise RuntimeError("External media session requires a transport")
         self._active = True
+        self._finished = False
+        self._post_call_scheduled = False
+        self._transfer_attempted = False
         logger.info(
             "External media session started -- Call: %s, lang: %s, phone: %s",
             self.call_sid, self.lang, self.caller_phone,
@@ -1738,6 +1770,8 @@ class MediaStreamSession:
                 logger.info("Agent [%s]: %s", self.call_sid, response_text[:200])
         except Exception:
             logger.exception("LLM error [%s]", self.call_sid)
+            if await self._transfer_to_live_agent():
+                return
             if self.lang == "si":
                 error_msg = "\u0DC3\u0DB8\u0DCF\u0DC0\u0DB1\u0DCA\u0DB1, \u0DAD\u0DCF\u0D9A\u0DCA\u0DC2\u0DAB\u0DD2\u0D9A \u0DAF\u0DDD\u0DC2\u0DBA\u0D9A\u0DCA \u0D87\u0DAD\u0DD2 \u0DC0\u0DD2\u0DBA. \u0D9A\u0DBB\u0DD4\u0DAB\u0DCF\u0D9A\u0DBB \u0DB1\u0DD0\u0DC0\u0DAD \u0D8B\u0DAD\u0DCA\u0DC3\u0DCF\u0DC4 \u0D9A\u0DBB\u0DB1\u0DCA\u0DB1."
             elif self.lang == "ta":
@@ -1745,6 +1779,29 @@ class MediaStreamSession:
             else:
                 error_msg = "I'm sorry, I encountered a technical issue. Please try again."
             await self._speak(error_msg)
+
+    async def _transfer_to_live_agent(self) -> bool:
+        """Attempt the single operator-allowlisted SmartPBX handoff."""
+        if (
+            self.call_control is None
+            or self.lang != "en"
+            or self._transfer_attempted
+        ):
+            return False
+        self._transfer_attempted = True
+        try:
+            await self._speak("Please hold while I connect you to a consultant.")
+        except Exception:
+            logger.exception("SmartPBX hold prompt failed")
+        try:
+            transferred = await self.call_control.transfer_call("live_agent")
+        except Exception:
+            logger.exception("SmartPBX live-agent transfer failed")
+            return False
+        if transferred:
+            self._active = False
+            self._is_speaking = False
+        return transferred
 
     # -- OpenAI streaming + sentence-level TTS -----------------------------
 
@@ -1872,21 +1929,20 @@ class MediaStreamSession:
         text_content = ""
         sentence_buffer = ""
         tts_tasks: list[asyncio.Task] = []
+        transfer_requested = False
         gen = self._speak_generation
 
         async with self.anthropic_client.messages.stream(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             temperature=LLM_TEMPERATURE,
-            # cache_control caches the system prefix for ~5 min,
-            # cutting input tokens on the 2nd+ turn of every call.
             system=[{
                 "type": "text",
                 "text": self.system_prompt,
                 "cache_control": {"type": "ephemeral"},
             }],
             messages=self.history,
-            tools=NOT_GIVEN,
+            tools=(self.tools or NOT_GIVEN),
         ) as stream:
             async for event in stream:
                 if event.type == "content_block_delta":
@@ -1896,25 +1952,34 @@ class MediaStreamSession:
                         sentences, sentence_buffer = _extract_sentences(
                             sentence_buffer
                         )
-                        for s in sentences:
+                        for sentence in sentences:
                             task = asyncio.create_task(
-                                self._speak(s, generation=gen)
+                                self._speak(sentence, generation=gen)
                             )
                             tts_tasks.append(task)
+            try:
+                final_message = await stream.get_final_message()
+                for block in final_message.content:
+                    if (
+                        getattr(block, "type", None) == "tool_use"
+                        and getattr(block, "name", "") == "transfer_to_human"
+                    ):
+                        transfer_requested = True
+            except Exception:
+                logger.exception("Failed to inspect final message for transfer tool")
 
-        # Flush remaining sentence buffer
         remaining = sentence_buffer.strip()
         if remaining:
             tts_tasks.append(
-                asyncio.create_task(
-                    self._speak(remaining, generation=gen)
-                )
+                asyncio.create_task(self._speak(remaining, generation=gen))
             )
         if tts_tasks:
             await asyncio.gather(*tts_tasks)
 
         if text_content:
             self.history.append({"role": "assistant", "content": text_content})
+        if transfer_requested:
+            await self._transfer_to_live_agent()
         return text_content
 
     # -- TTS -> Twilio mulaw audio -----------------------------------------
@@ -2786,6 +2851,53 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", brand: str = D
                 })
         except Exception:
             logger.exception("Failed to persist call record [%s]", call_sid)
+
+
+async def _make_smartpbx_session(
+    context: CallContext, transport: SmartPBXMediaTransport
+) -> MediaStreamSession:
+    """Build one English Flico session without coupling SmartPBX to legacy runtimes."""
+    call_control: CallControl | None = None
+    mcp_settings = DialogMCPSettings.from_env(os.environ)
+    if mcp_settings.enabled and "live_agent" in mcp_settings.transfer_destinations:
+        call_control = DialogMCPCallControl(mcp_settings, context)
+
+    anthropic_client = None
+    openai_client = None
+    gemini_client = None
+    if LLM_PROVIDER == "claude":
+        anthropic_client = _get_anthropic_client()
+    elif LLM_PROVIDER == "gemini":
+        gemini_client = _get_gemini_client()
+    else:
+        openai_client = _get_client()
+
+    return MediaStreamSession(
+        websocket=None,
+        lang="en",
+        anthropic_client=anthropic_client,
+        openai_client=openai_client,
+        gemini_client=gemini_client,
+        transport=transport,
+        call_sid=context.call_id,
+        caller_phone=context.caller_id_number,
+        call_control=call_control,
+    )
+
+
+SMARTPBX_SESSION_FACTORY = _make_smartpbx_session
+
+
+@app.get("/smartpbx/status")
+async def smartpbx_runtime_status() -> dict[str, bool | int | str]:
+    """Return only bounded, non-sensitive SmartPBX operational state."""
+    return SMARTPBX_GATEWAY.snapshot()
+
+
+@app.websocket("/ws/v1/smartpbx/media")
+async def ws_smartpbx_media(websocket: WebSocket):
+    """Accept direct Dialog SmartPBX media through the isolated gateway."""
+    await SMARTPBX_GATEWAY.handle(websocket, SMARTPBX_SESSION_FACTORY)
 
 
 # ---------------------------------------------------------------------------
