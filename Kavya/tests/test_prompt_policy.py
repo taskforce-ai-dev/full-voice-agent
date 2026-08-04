@@ -124,12 +124,59 @@ def test_name_confirmation_is_not_gated_on_unperceivable_audio_signal():
     or per-token confidence signal, so it cannot genuinely assess whether
     "the audio was unclear". That criterion was dropped from the name
     read-back trigger; do not reintroduce a self-reported confidence
-    judgement there. (Note: "the audio was unclear" still legitimately
-    appears elsewhere in the prompt, in the pre-existing first/last-name
-    capture logic - this test targets only the confidence-judgement
-    framing that was removed, not that unrelated phrase.)"""
+    judgement there. (Note: this used to also flag a second, unrelated
+    "the audio was unclear" phrase in the first/last-name capture logic as
+    a legitimate survivor. That occurrence was itself removed - see
+    test_prompt_never_blames_unclear_audio_for_a_name_capture below - so
+    the phrase no longer appears anywhere in the prompt.)"""
     assert "how confident you are" not in PROMPT
     assert "you are NOT confident" not in PROMPT
+
+
+def test_prompt_never_blames_unclear_audio_for_a_name_capture():
+    """Production call CA464ae445b9b20813a0f8316e6ad5dbfb (2026-08-04, guest
+    Chanya Shehani): the guest gave two tokens ('cha Shawnee') and both were
+    mis-transcribed, but the only applicable branch told the model to judge
+    whether "the audio was unclear or garbled" - a signal the model never
+    receives (Twilio ConversationRelay's transcript message carries no audio
+    or confidence field). The model fell back to asking for the guest's
+    "full name" again, which the prompt elsewhere forbids. That branch is
+    replaced by explicit one-token / two-token-mis-transcribed handling, so
+    this exact phrase must not reappear anywhere in the prompt."""
+    assert "If the audio was unclear or garbled" not in PROMPT
+
+
+def test_prompt_forbids_the_generic_full_name_reask():
+    """Re-asking for the "full name" (or "first name and last name") in one
+    breath is what produced the seven-turn loop on the call above - the
+    guest can't tell which part is being re-asked. Every re-ask must name
+    exactly one part."""
+    assert (
+        "NEVER ask the guest to repeat their 'full name', or their "
+        "'first name and last name', in one breath"
+    ) in PROMPT
+
+
+def test_prompt_has_a_two_token_one_part_at_a_time_branch():
+    """The missing branch that caused the production failure: two tokens
+    arrived and at least one looks mis-transcribed. Confirm one part at a
+    time rather than re-asking for the whole name."""
+    assert "If you received TWO tokens but either looks mis-transcribed" in PROMPT
+    assert "confirm ONE PART AT A TIME" in PROMPT
+
+
+def test_prompt_has_a_loop_exit_for_repeated_name_mismatches():
+    """Without an exit, a persistently mis-transcribed name (common for Sri
+    Lankan names over telephony) traps the guest in an endless re-ask loop,
+    as happened on the production call above (seven turns). After two
+    attempts on the same part, Kavya must take her best guess, promise a
+    WhatsApp follow-up, and move on."""
+    assert "LOOP EXIT" in PROMPT
+    assert "after TWO attempts on the same part" in PROMPT
+    assert (
+        "our reservations team will confirm the exact spelling with you "
+        "on WhatsApp together with your booking confirmation"
+    ) in PROMPT
 
 
 def test_mobile_number_is_read_back_in_local_form_not_plus94():
