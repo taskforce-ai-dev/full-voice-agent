@@ -94,3 +94,32 @@ def test_paid_experiences_still_carry_their_service_charge():
     a decision, not a stray find-and-replace."""
     assert "plus ten percent service charge" in KB
     assert "additional ten percent service charge" in KB
+
+
+# ---------------------------------------------------------------------------
+# Name capture: confirm by read-back, never by spelling
+# ---------------------------------------------------------------------------
+
+def test_prompt_forbids_asking_the_guest_to_spell_their_name():
+    """Spelled letters (B/P/V/D/E/G, M/N) are more confusable over a phone
+    line than the name spoken naturally, so asking for a spelling makes
+    capture less reliable, not more - do not reintroduce a spell-out step."""
+    assert "NEVER ask the guest to spell their name out letter by letter" in PROMPT
+
+
+def test_prompt_uses_yes_no_read_back_for_uncertain_names():
+    assert "read the full name back and" in PROMPT
+    assert "yes/no confirmation" in PROMPT
+
+
+def test_name_confirmation_is_not_gated_on_unperceivable_audio_signal():
+    """Kavya's model only ever sees STT transcript text - it has no acoustic
+    or per-token confidence signal, so it cannot genuinely assess whether
+    "the audio was unclear". That criterion was dropped from the name
+    read-back trigger; do not reintroduce a self-reported confidence
+    judgement there. (Note: "the audio was unclear" still legitimately
+    appears elsewhere in the prompt, in the pre-existing first/last-name
+    capture logic - this test targets only the confidence-judgement
+    framing that was removed, not that unrelated phrase.)"""
+    assert "how confident you are" not in PROMPT
+    assert "you are NOT confident" not in PROMPT
