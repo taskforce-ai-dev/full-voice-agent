@@ -449,12 +449,41 @@ IVR_MENU_ENABLED: bool = os.getenv("IVR_MENU_ENABLED", "false").lower() == "true
 # ws_media_stream guard.
 DIGIT_TO_LANG: dict[str, str] = {"1": "en"}
 
+# ConversationRelay transcription hints (#121). A comma-separated vocabulary
+# that biases Google's telephony STT toward tokens it otherwise mishears on
+# Sri Lankan-accented English. Two groups:
+#   1. Spoken digit shorthand for phone numbers — "double"/"triple" and the
+#      digit words. Without these, "double seven" is garbled and Kavya never
+#      receives the word "double" to expand, so she cannot understand it live.
+#   2. A starter set of common Sri Lankan given names and surnames, so names
+#      survive transcription (see the wrong-name booking incident).
+# Extend without a code change via CR_HINTS_EN.
+_DEFAULT_EN_HINTS = (
+    "double, triple, treble, oh, zero, one, two, three, four, five, six, "
+    "seven, eight, nine, "
+    "Chanya, Shehani, Oshadi, Kavya, Nimal, Kamal, Sunil, Saman, Chaminda, "
+    "Ruwan, Nuwan, Kasun, Tharindu, Sachini, Nadeesha, Dilhani, Ishara, "
+    "Hasini, Dilan, "
+    "Perera, Fernando, Silva, Bandara, Jayawardena, Wickramasinghe, "
+    "Gunawardena, Rajapaksa, Dissanayake, Senanayake, Ranasinghe, Wijesinghe"
+)
+CR_HINTS_EN: str = os.getenv("CR_HINTS_EN", _DEFAULT_EN_HINTS)
+
+# Separate STT language for the English line (#121). Default "" keeps the
+# existing behaviour (transcription follows `language`, en-US). Set
+# CR_TRANSCRIPTION_LANGUAGE=en-IN to A/B whether Indian-English acoustic models
+# recognise Sri Lankan accents better — env-controlled so it flips without a
+# redeploy, and emitted only when set so a bad value can't affect the default.
+CR_TRANSCRIPTION_LANGUAGE_EN: str = os.getenv("CR_TRANSCRIPTION_LANGUAGE", "").strip()
+
 # Per-language ConversationRelay TwiML configuration
 LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
     "en": {
         "tts_provider": "ElevenLabs",
         "voice": "bm3QvaZ3fUSCRBC3UV1f-flash_v2_5",
         "language": "en-US",
+        "transcription_language": CR_TRANSCRIPTION_LANGUAGE_EN,
+        "hints": CR_HINTS_EN,
         "welcome_greeting": "Welcome to Hatton Hills! I'm Kavya, how can I help you today?",
         "extra_attrs": '        elevenlabsTextNormalization="on"\n',
     },
@@ -1907,6 +1936,21 @@ def _build_conversation_relay_twiml(
     greeting = xml.sax.saxutils.escape(config["welcome_greeting"])
     mode_qs = f"&amp;mode={url_quote(mode)}" if mode else ""
 
+    # Optional STT tuning (#121). `hints` biases recognition toward tokens the
+    # telephony model mishears on Sri Lankan-accented English (spoken digit
+    # shorthand like "double"/"triple", plus common local names). A separate
+    # transcriptionLanguage is emitted only when explicitly configured, so the
+    # default en-US behaviour is unchanged.
+    hints = config.get("hints", "")
+    hints_attr = (
+        f'        hints="{xml.sax.saxutils.escape(hints)}"\n' if hints else ""
+    )
+    tx_lang = config.get("transcription_language", "")
+    tx_lang_attr = (
+        f'        transcriptionLanguage="{xml.sax.saxutils.escape(tx_lang)}"\n'
+        if tx_lang else ""
+    )
+
     return (
         f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}{mode_qs}"\n'
         f'        ttsProvider="{config["tts_provider"]}"\n'
@@ -1914,7 +1958,9 @@ def _build_conversation_relay_twiml(
         f'{extra}'
         f'        language="{config["language"]}"\n'
         f'        transcriptionProvider="google"\n'
+        f'{tx_lang_attr}'
         f'        speechModel="telephony"\n'
+        f'{hints_attr}'
         f'        welcomeGreeting="{greeting}"\n'
         '        interruptible="true"\n'
         '        dtmfDetection="true">\n'
