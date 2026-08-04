@@ -123,3 +123,15 @@ def test_name_confirmation_is_not_gated_on_unperceivable_audio_signal():
     framing that was removed, not that unrelated phrase.)"""
     assert "how confident you are" not in PROMPT
     assert "you are NOT confident" not in PROMPT
+
+
+def test_mobile_number_is_read_back_in_local_form_not_plus94():
+    """When Kavya repeats the guest's mobile number to confirm it, she must
+    say it in the natural local form the guest gave (e.g. "zero seven seven,
+    ..."), NOT prefixed with the +94 country code spoken as "plus nine four".
+    The +94 canonicalisation is a backend concern (WhatsApp/PMS); the guest
+    should only ever hear their own local number. (Note: "plus nine four"
+    still legitimately appears elsewhere in the prompt for the hotel's own
+    reservations hotline - this test targets the mobile read-back rule.)"""
+    assert "READING THE MOBILE NUMBER BACK" in PROMPT
+    assert "NEVER speak the country code" in PROMPT
