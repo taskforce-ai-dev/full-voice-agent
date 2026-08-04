@@ -126,6 +126,76 @@ services:
       retries: 3
       start_period: 40s
 
+  flico-smartpbx:
+    profiles: ["smartpbx"]
+    image: ghcr.io/taskforce-ai-dev/flico:${IMAGE_TAG:-latest}
+    container_name: flico-smartpbx
+
+    ports:
+      - "127.0.0.1:8005:8000"
+
+    # Do not use env_file here: it would inject legacy Asterisk settings.
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-credentials.json
+      KB_BACKEND: sqlite
+      FLICO_SERVICE_MODE: smartpbx
+      ENABLE_ASTERISK_ARI: "false"
+      ENABLE_SMARTPBX_WSS: "true"
+      LLM_PROVIDER: ${LLM_PROVIDER:-claude}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-4-20250514}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+      ELEVENLABS_VOICE_SPEED: ${ELEVENLABS_VOICE_SPEED:-1.0}
+      SMARTPBX_WS_TOKEN: ${SMARTPBX_WS_TOKEN:-}
+      SMARTPBX_ACCOUNT_ID: ${SMARTPBX_ACCOUNT_ID:-}
+      SMARTPBX_MAX_CALLS: ${SMARTPBX_MAX_CALLS:-4}
+      SMARTPBX_MAX_MESSAGE_CHARS: ${SMARTPBX_MAX_MESSAGE_CHARS:-65536}
+      SMARTPBX_MAX_AUDIO_BYTES: ${SMARTPBX_MAX_AUDIO_BYTES:-32768}
+      SMARTPBX_MAX_OUTBOUND_FRAMES: ${SMARTPBX_MAX_OUTBOUND_FRAMES:-128}
+      SMARTPBX_START_TIMEOUT_SECONDS: ${SMARTPBX_START_TIMEOUT_SECONDS:-10}
+      SMARTPBX_IDLE_TIMEOUT_SECONDS: ${SMARTPBX_IDLE_TIMEOUT_SECONDS:-90}
+      SMARTPBX_MCP_URL: ${SMARTPBX_MCP_URL:-https://dialog.cybergate.lk:9443/ucp/v2/mcp}
+      SMARTPBX_API_KEY: ${SMARTPBX_API_KEY:-}
+      SMARTPBX_TRANSFER_DESTINATIONS_JSON: ${SMARTPBX_TRANSFER_DESTINATIONS_JSON:-{}}
+      SMARTPBX_MCP_ACCOUNT_HEADER: ${SMARTPBX_MCP_ACCOUNT_HEADER:-}
+      SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS: ${SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS:-3}
+      SMARTPBX_MCP_READ_TIMEOUT_SECONDS: ${SMARTPBX_MCP_READ_TIMEOUT_SECONDS:-8}
+      SMARTPBX_MCP_RETRIES: ${SMARTPBX_MCP_RETRIES:-1}
+
+    volumes:
+      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+      - ./server.py:/app/server.py:ro
+      - ./brands.py:/app/brands.py:ro
+      - ./knowledge_docs:/app/knowledge_docs:ro
+      - ./knowledge_base.py:/app/knowledge_base.py:ro
+      - ./knowledge_base_chroma.py:/app/knowledge_base_chroma.py:ro
+      - ./knowledge_base_sqlite.py:/app/knowledge_base_sqlite.py:ro
+      - ./kb:/app/kb:ro
+      - ./media_transport.py:/app/media_transport.py:ro
+      - ./post_call.py:/app/post_call.py:ro
+      - ./smartpbx_gateway.py:/app/smartpbx_gateway.py:ro
+      - ./smartpbx_mcp.py:/app/smartpbx_mcp.py:ro
+      - ./smartpbx_protocol.py:/app/smartpbx_protocol.py:ro
+      - ./smartpbx_transport.py:/app/smartpbx_transport.py:ro
+
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
 networks:
   taskforceai-net:
     external: true
