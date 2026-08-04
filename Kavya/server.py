@@ -1821,9 +1821,25 @@ async def dial_status(request: Request) -> Response:
     entry = _handoff_state.get(parent)
     if entry is not None and event:
         events = entry.setdefault("dial_events", {})
+        # Twilio's statusCallbackEvent is *named* "answered", but the
+        # CallStatus field it actually POSTs when a leg is picked up reads
+        # "in-progress" — Twilio never sends CallStatus=answered.
+        # "answered" is DialCallStatus vocabulary, not CallStatus vocabulary;
+        # the two were conflated when this endpoint was written. Because of
+        # that, the canonical "answered" key this dict is keyed on was NEVER
+        # populated, _answer_looks_intercepted's events.get("answered") always
+        # missed, and carrier-intercept detection silently never fired once
+        # from its 2026-08-03 release until this was found and fixed on
+        # 2026-08-04. Normalise "in-progress" onto "answered" here so the
+        # detector's lookup matches what Twilio actually sends. Do NOT
+        # "simplify" this back to storing the raw CallStatus value — that is
+        # the exact bug. Still accept a literal "answered" too, in case a
+        # future Twilio change or a replayed callback sends that literal
+        # value.
+        canonical = "answered" if event in ("in-progress", "answered") else event
         # First occurrence wins — Twilio can retry a callback, and a retry must
         # not overwrite the original timing with a later clock reading.
-        events.setdefault(event, time.time())
+        events.setdefault(canonical, time.time())
         logger.info(
             "[handoff] dial-status parent=%s event=%s (have: %s)",
             parent, event, ",".join(sorted(events)),
