@@ -479,6 +479,19 @@ def test_azure_stt_privacy_mode_redacts_transcripts_and_cancel_details(
     assert sentinel not in caplog.text
 
 
+def test_privacy_safe_stt_factory_allows_azure_when_selected(monkeypatch):
+    monkeypatch.setattr(server, "STT_PROVIDER", "azure")
+    monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", True)
+    monkeypatch.setattr(server, "audioop", object())
+
+    stream = server._make_stt(
+        lambda text: None, lambda text: None, "en", privacy_safe=True,
+    )
+
+    assert isinstance(stream, server.AzureSTTStream)
+    assert stream._privacy_safe is True
+
+
 @pytest.mark.asyncio
 async def test_privacy_safe_start_never_logs_real_call_or_phone(monkeypatch, caplog):
     sentinel = "PRIVATE-start-call-phone"

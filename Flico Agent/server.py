@@ -1559,8 +1559,6 @@ def _make_stt(
 ):
     """Build the configured STT backend. STT_PROVIDER: 'google' (default) | 'azure'."""
     if STT_PROVIDER == "azure":
-        if privacy_safe:
-            raise PipelineFailure("stt_unavailable")
         if AZURE_STT_AVAILABLE and audioop is not None:
             return AzureSTTStream(on_final_result, on_interim_result, lang, privacy_safe=privacy_safe)
         logger.error("STT_PROVIDER=azure but Azure STT unavailable — falling back to Google")
