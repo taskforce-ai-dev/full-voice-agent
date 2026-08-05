@@ -384,6 +384,17 @@ appeared on the third pass.
   **unused** — `_tts_sinhala` and `_tts_azure` are wired but no live code path
   calls them. Revive by routing `si` to `_tts_sinhala` in `_speak()` if desired.
 
+### Dialog SmartPBX WSS (operator-gated)
+
+`flico-smartpbx` is a separate opt-in Compose profile, never part of ordinary
+`docker compose up -d`. It serves only loopback `127.0.0.1:8005:8000`; the
+dedicated Nginx example proxies only its WSS media route, health, and status
+endpoints. Follow `SMARTPBX_RUNBOOK.md` before using the candidate endpoint
+`wss://smartpbx-flico.taskforceai.tech/ws/v1/smartpbx/media`. DNS, TLS, Dialog
+dashboard configuration, source-IP allowlisting, and carrier fallback have not
+been configured by this repository. The previously exposed Dialog API key must
+be revoked and never reused.
+
 ## graphify — GRAPH-FIRST, ALWAYS
 
 This sub-project is part of the shared graphify knowledge graph at `../graphify-out/`

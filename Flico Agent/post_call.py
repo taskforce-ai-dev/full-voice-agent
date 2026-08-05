@@ -28,6 +28,14 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+
+def _privacy_log(event: str, fingerprint: str, *, level: int = logging.INFO) -> None:
+    """Emit only allowlisted metadata for privacy-sensitive call processing."""
+    logger.log(level, "%s", json.dumps({
+        "event": event[:64],
+        "call_fingerprint": fingerprint[:64],
+    }, sort_keys=True))
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -126,7 +134,7 @@ def _clean_json_response(text: str) -> str:
 _CATALOG_CACHE: str | None = None
 
 
-def _load_catalog() -> str:
+def _load_catalog(*, privacy_safe: bool = False, log_fingerprint: str = "") -> str:
     """Build a compact 'Pxx — listing' catalog from the KB docs (cached).
 
     Lets the extractor map the property the caller discussed to its Ref code.
@@ -157,7 +165,10 @@ def _load_catalog() -> str:
                         desc = desc[:170].rsplit(" ", 1)[0] + "…"
                     entries.append(f"{pid} — {desc}")
     except Exception:
-        logger.exception("[realestate-postcall] failed to load property catalog")
+        if privacy_safe:
+            _privacy_log("post_call_catalog_failed", log_fingerprint, level=logging.ERROR)
+        else:
+            logger.exception("[realestate-postcall] failed to load property catalog")
     _CATALOG_CACHE = "\n".join(entries)
     return _CATALOG_CACHE
 
@@ -273,26 +284,40 @@ def _build_payload(
 # n8n webhook POST
 # ---------------------------------------------------------------------------
 
-async def _post_to_n8n(payload: dict[str, Any]) -> None:
+async def _post_to_n8n(
+    payload: dict[str, Any], *, privacy_safe: bool = False,
+    log_fingerprint: str = "",
+) -> None:
     """POST the lead payload to the n8n webhook. Fire-and-forget."""
     if not REALESTATE_WEBHOOK_URL:
-        logger.info("[realestate-postcall] no webhook URL configured — skipping")
+        if privacy_safe:
+            _privacy_log("post_call_webhook_skipped", log_fingerprint)
+        else:
+            logger.info("[realestate-postcall] no webhook URL configured — skipping")
         return
     try:
         async with httpx.AsyncClient(timeout=10) as http:
             resp = await http.post(REALESTATE_WEBHOOK_URL, json=payload)
             if resp.status_code < 300:
-                logger.info(
-                    "[realestate-postcall] sent ok (%d) for %s",
-                    resp.status_code, payload.get("call_id"),
-                )
+                if privacy_safe:
+                    _privacy_log("post_call_webhook_sent", log_fingerprint)
+                else:
+                    logger.info(
+                        "[realestate-postcall] sent ok (%d) for %s",
+                        resp.status_code, payload.get("call_id"),
+                    )
+            elif privacy_safe:
+                _privacy_log("post_call_webhook_failed", log_fingerprint, level=logging.WARNING)
             else:
                 logger.warning(
                     "[realestate-postcall] webhook returned %d: %s",
                     resp.status_code, resp.text[:300],
                 )
     except Exception:
-        logger.exception("[realestate-postcall] POST failed")
+        if privacy_safe:
+            _privacy_log("post_call_webhook_exception", log_fingerprint, level=logging.ERROR)
+        else:
+            logger.exception("[realestate-postcall] POST failed")
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +331,9 @@ async def process_realestate_post_call(
     anthropic_client: Any | None,
     model: str = "",
     started_at: datetime | None = None,
+    *,
+    privacy_safe: bool = False,
+    log_fingerprint: str = "",
 ) -> None:
     """Extract the lead from the transcript and POST it to n8n. Never raises."""
     try:
@@ -315,18 +343,30 @@ async def process_realestate_post_call(
 
         transcript_text = _format_transcript(transcript)
         if not transcript_text.strip():
-            logger.info("[realestate-postcall] empty transcript [%s] — skipping", call_sid)
+            if privacy_safe:
+                _privacy_log("post_call_empty_transcript", log_fingerprint)
+            else:
+                logger.info("[realestate-postcall] empty transcript [%s] — skipping", call_sid)
             return
 
         extracted: dict[str, Any] = {}
         if anthropic_client is not None:
             try:
                 extracted = await extract_lead(
-                    anthropic_client, transcript_text, model, _load_catalog()
+                    anthropic_client, transcript_text, model,
+                    _load_catalog(
+                        privacy_safe=privacy_safe,
+                        log_fingerprint=log_fingerprint,
+                    ),
                 )
             except Exception:
-                logger.exception("[realestate-postcall] extraction failed [%s]", call_sid)
+                if privacy_safe:
+                    _privacy_log("post_call_extraction_failed", log_fingerprint, level=logging.ERROR)
+                else:
+                    logger.exception("[realestate-postcall] extraction failed [%s]", call_sid)
                 extracted = {}
+        elif privacy_safe:
+            _privacy_log("post_call_minimal_lead", log_fingerprint, level=logging.WARNING)
         else:
             logger.warning(
                 "[realestate-postcall] no Anthropic client [%s] — sending minimal lead", call_sid
@@ -335,6 +375,11 @@ async def process_realestate_post_call(
         payload = _build_payload(
             call_sid, caller_phone, extracted, transcript_text, timestamp, call_end_time
         )
-        await _post_to_n8n(payload)
+        await _post_to_n8n(
+            payload, privacy_safe=privacy_safe, log_fingerprint=log_fingerprint,
+        )
     except Exception:
-        logger.exception("[realestate-postcall] processing failed [%s]", call_sid)
+        if privacy_safe:
+            _privacy_log("post_call_processing_failed", log_fingerprint, level=logging.ERROR)
+        else:
+            logger.exception("[realestate-postcall] processing failed [%s]", call_sid)
