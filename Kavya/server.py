@@ -1192,12 +1192,21 @@ async def _notify_handover_fallback(
     state: dict,
     caller_phone: str,
     full_transcript: list[dict[str, str]],
+    lead: str = "Guest hung up before leaving callback details.",
 ) -> None:
-    """Notify the manager after a failsafe session ended without a tool call.
+    """Notify the manager with whatever details we have, without the guest's help.
 
-    Runs when the guest hung up before giving their details. We fall back to
-    the number they called from and a transcript-derived summary. If we have no
-    number at all there is nothing actionable to send, so we skip.
+    Two callers, both cases where nobody collected the guest's details:
+
+    * `/voice/dial-result`, the moment the transfer is judged unanswered — the
+      guest may hang up at any second, so we page immediately.
+    * the failsafe session's `finally`, if the guest hung up before Kavya got
+      their name and number.
+
+    Either way we fall back to the number they rang from and a
+    transcript-derived summary. `lead` is the opening sentence, since the two
+    situations need to read differently to the manager. If we have no number at
+    all there is nothing actionable to send, so we skip.
     """
     number = (state.get("caller_phone") or caller_phone or "").strip()
     if not number or number == "unknown":
@@ -1205,11 +1214,12 @@ async def _notify_handover_fallback(
             "[handover] failsafe ended with no details and no caller ID [%s] "
             "— manager NOT notified", call_sid,
         )
+        _remember_handoff(call_sid, notified=False)
         return
 
     reason = (state.get("reason") or "").strip() or "Guest asked to speak to a human."
     summary = (
-        f"Guest hung up before leaving callback details. {reason} "
+        f"{lead} {reason} "
         f"The human agent did not answer the transfer "
         f"(dial status: {state.get('dial_status', 'unknown')}). "
         f"Number below is the caller ID they rang from."
@@ -1229,6 +1239,16 @@ async def _notify_handover_fallback(
         "[handover] fallback notification for %s — ok=%s",
         call_sid, outcome.get("ok"),
     )
+    if not outcome.get("ok"):
+        # `notified` is set optimistically BEFORE the POST, so that two notify
+        # paths racing cannot both send. This send failed, so hand the job back
+        # to whichever path runs next rather than standing them all down — a
+        # swallowed n8n 5xx losing the lead is the exact outcome this whole
+        # path exists to prevent. Mutate in place: _remember_handoff would
+        # resurrect state for a call that has already finished and been popped.
+        entry = _handoff_state.get(call_sid)
+        if entry is not None:
+            entry["notified"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -1966,6 +1986,41 @@ async def dial_result(request: Request) -> Response:
         "[handoff] human did not answer (%s) for %s — entering failsafe",
         status, call_sid,
     )
+
+    # Page the manager NOW, not only from the recovery session below.
+    #
+    # The recovery session can only notify anyone if its WebSocket actually
+    # opens — via the notify_human_handover tool, or via its end-of-session
+    # fallback. On a carrier intercept it usually never opens: the guest has
+    # just spent the whole dial listening to a recorded intercept message
+    # instead of ringing, and hangs up before Kavya comes back. Live on
+    # 2026-08-05 two consecutive intercepted transfers both reached
+    # "entering failsafe" and the manager was told nothing at all, because the
+    # guest was gone by then. The transfer failed completely silently.
+    #
+    # So notify from here, where we KNOW the transfer failed and depend on
+    # nothing further happening. `notified` makes it idempotent: it suppresses
+    # only the duplicate end-of-session net. If the guest does stay on the
+    # line, notify_human_handover still sends its richer follow-up with the
+    # name and number she collects — two messages beat none.
+    state = dict(_handoff_state.get(call_sid) or {})
+    if not state.get("notified"):
+        _remember_handoff(call_sid, notified=True)
+        asyncio.create_task(
+            _notify_handover_fallback(
+                call_sid=call_sid,
+                state=state,
+                caller_phone=state.get("caller_phone", ""),
+                full_transcript=state.get("transcript") or [],
+                lead=(
+                    "A transfer to you was NOT answered. The guest may still "
+                    "be on the line or may already have hung up — please call "
+                    "them back on the number below. Details are from the call "
+                    "so far."
+                ),
+            )
+        )
+
     recovery_config = dict(LANGUAGE_CONFIGS["en"])
     recovery_config["welcome_greeting"] = HANDOFF_FAILSAFE_GREETING
     cr_tag = _build_conversation_relay_twiml(

@@ -268,3 +268,105 @@ def test_caller_id_helper_has_no_hidden_fallback():
     that wrong comment is why production ran on pass-through for three days."""
     server_module_value = server.TWILIO_CALLER_ID
     assert server._transfer_caller_id("CA_ANY") == server_module_value
+
+
+# ---------------------------------------------------------------------------
+# The manager is paged from dial-result, not only from the recovery session
+# ---------------------------------------------------------------------------
+#
+# Live on 2026-08-05 two consecutive intercepted transfers both reached
+# "entering failsafe" and notified nobody: the guest had spent the whole dial
+# listening to an intercept recording and hung up, so the recovery session's
+# WebSocket never opened and neither of its notification paths could run.
+
+@pytest.fixture
+def sent(monkeypatch):
+    """Capture handover notifications at the n8n boundary."""
+    calls: list[dict] = []
+
+    async def _fake_send(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "status": 200}
+
+    monkeypatch.setattr(server, "send_handover_notification", _fake_send)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_intercepted_transfer_pages_the_manager_without_a_recovery_session(
+    client, sent, monkeypatch
+):
+    """The guest hangs up during the intercept. Nobody collects their details.
+
+    The manager must still be told, using the number they rang from. This is
+    the whole point of the failsafe and it is the case that was silently
+    broken.
+    """
+    import asyncio
+
+    _seed()
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "initiated"})
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "in-progress"})
+
+    resp = _dial_result(client, "completed")
+    assert "mode=handover_failsafe" in resp.text  # judged NOT answered
+
+    # The notify is fire-and-forget; let the scheduled task run.
+    await asyncio.sleep(0)
+    for _ in range(10):
+        if sent:
+            break
+        await asyncio.sleep(0.01)
+
+    assert sent, "manager was NOT notified when the transfer was intercepted"
+    assert sent[0]["customer_whatsapp"] == "+94776697566"
+    assert "NOT answered" in sent[0]["call_summary"]
+    assert "call them back" in sent[0]["call_summary"]
+
+
+@pytest.mark.asyncio
+async def test_manager_is_not_paged_twice_for_one_failed_transfer(
+    client, sent
+):
+    """`notified` guards the duplicate. The end-of-session net must stand down."""
+    import asyncio
+
+    _seed()
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "initiated"})
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "in-progress"})
+    _dial_result(client, "completed")
+
+    for _ in range(10):
+        if sent:
+            break
+        await asyncio.sleep(0.01)
+
+    assert server._handoff_state[CALL]["notified"] is True
+
+    # Replay the end-of-session fallback the way the WebSocket `finally` does.
+    state = server._handoff_state[CALL]
+    if not state.get("notified"):  # pragma: no cover - must not fire
+        await server._notify_handover_fallback(
+            call_sid=CALL, state=state, caller_phone="+94776697566",
+            full_transcript=[],
+        )
+
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_genuine_pickup_does_not_page_the_manager(client, sent, monkeypatch):
+    """A real human answered. Paging them about a missed call would be noise."""
+    import asyncio
+
+    _seed()
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "initiated"})
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "ringing"})
+    _shift_clock(monkeypatch, 21.0)
+    client.post(f"/voice/dial-status?parent={CALL}", data={"CallStatus": "in-progress"})
+
+    resp = _dial_result(client, "completed")
+    assert "<Hangup/>" in resp.text
+
+    await asyncio.sleep(0.05)
+    assert sent == []
