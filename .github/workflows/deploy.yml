@@ -132,7 +132,7 @@ jobs:
 
       - name: Build & push image
         if: ${{ inputs.mode == 'image' }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ steps.map.outputs.src }}
           file: ${{ steps.map.outputs.src }}/Dockerfile
