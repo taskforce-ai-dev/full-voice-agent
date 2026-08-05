@@ -738,10 +738,29 @@ too low cuts off genuine slow answers, too high lets voicemail win. Measured on
 this route: post-dial delay is 11–13 s before ringing even starts, and genuine
 answers landed at 18.6 s / 19.7 s / 20.65 s from dial.
 
-**Prod config (2026-08-05):** `HUMAN_AGENT_PHONE` moved to a Dialog number —
-the previous SLT-Mobitel 071 line sits on the route that intermittently
-intercepts. `HANDOFF_DIAL_TIMEOUT=25` set in `/opt/kavya/.env`. Backup at
-`/opt/kavya/.env.bak.handover-20260805-043451`. Env-only; same image.
+**Prod config (2026-08-05) — SETTLED, not a demo-day workaround.** Both values
+below were made permanent by the repo owner on 2026-08-05, reviewed with the
+measurements above in hand. Treat them as decisions, not leftovers:
+
+- `HUMAN_AGENT_PHONE` moved to a **Dialog (07x)** number. The previous
+  SLT-Mobitel 071 line sits on the route that intermittently intercepts —
+  three consecutive transfers were intercepted before the switch and none
+  after. That handset also diverted to voicemail after 20s of ringing.
+  If this number ever moves: pick a non-SLT-Mobitel network, confirm it either
+  has no voicemail or diverts LATER than `HANDOFF_DIAL_TIMEOUT`, and re-test an
+  unanswered transfer end to end including the manager's WhatsApp.
+- `HANDOFF_DIAL_TIMEOUT=25`. **Do NOT "restore" this to the old 40.** Raising it
+  hands unanswered transfers to voicemail, and because voicemail is
+  undetectable the failsafe then never fires and the lead is lost silently —
+  the exact failure this value exists to prevent. The margin is tight (the
+  20.65s genuine answer had 4.3s to spare) and that is understood and accepted.
+  If real answers start getting cut off, the fix is a faster-ringing
+  destination or a better route, not a higher number.
+
+Both set in `/opt/kavya/.env`. Backup at
+`/opt/kavya/.env.bak.handover-20260805-043451`. Env-only; same image. Note
+`docker compose restart` does NOT reload `.env` — it needs
+`up -d --force-recreate` with `IMAGE_TAG` pinned.
 
 **Verified live**, not just in tests: genuine pickup answered 18.6 s in with the
 early hang-up correctly standing down; an unanswered transfer produced
