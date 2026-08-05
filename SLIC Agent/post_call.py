@@ -237,7 +237,7 @@ async def extract_claim_details(
         return result
 
     except json.JSONDecodeError as exc:
-        logger.error("Failed to parse LLM extraction JSON (attempt 1): %s", exc)
+        logger.warning("Failed to parse LLM extraction JSON (attempt 1): %s", exc)
         # Retry once with a simpler prompt
         try:
             logger.info("Retrying extraction with simplified prompt...")
