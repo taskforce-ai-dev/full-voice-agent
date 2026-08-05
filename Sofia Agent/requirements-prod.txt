@@ -1,7 +1,11 @@
 # Core server
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
-websockets>=17.0
+# Upper bound is NOT optional: google-genai (below) requires websockets<17.0.
+# This file previously said `websockets>=17.0`, which combined with google-genai
+# made the requirements unsatisfiable — Sofia could not build at all. Every
+# other agent in this repo resolves to websockets 16.1.1 for the same reason.
+websockets>=13.0,<17.0
 
 # AI / LLM
 anthropic>=0.120.2
