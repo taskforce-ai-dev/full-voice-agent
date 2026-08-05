@@ -106,7 +106,7 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Set up Buildx
         if: ${{ inputs.mode == 'image' }}
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         if: ${{ inputs.mode == 'image' }}
