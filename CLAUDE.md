@@ -434,9 +434,11 @@ ClickUp as well as on the PR.
 > — mentions that notify nobody, tables that vanish — return `success: true` and
 > look correct until you read the channel.
 
-Also note the message posts as whichever account holds the ClickUp OAuth, which
-is currently `Thivarrakesh Parthipan` (`216208369`) — not `chrys@taskforceai.tech`.
-Write updates in a voice that suits being sent by a person, not by a bot.
+Messages post as `Thivarrakesh Parthipan` (`216208369`), the account holding the
+ClickUp OAuth. **That is the repo owner himself** — he drives Claude Code from a
+shared `chrys@taskforceai.tech` login but is Thivarrakesh (GitHub `thiva2k`), so
+the two names are one person, not a mismatch to work around or apologise for.
+Write updates in a voice that suits being sent by him, not by a bot.
 
 ## Claude Code / Codex Sync
 
