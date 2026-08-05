@@ -370,3 +370,144 @@ async def test_genuine_pickup_does_not_page_the_manager(client, sent, monkeypatc
 
     await asyncio.sleep(0.05)
     assert sent == []
+
+
+# ---------------------------------------------------------------------------
+# Early hang-up of an intercepted leg
+# ---------------------------------------------------------------------------
+#
+# The guest is bridged the moment the leg is "answered" (answerOnBridge), so an
+# intercept plays its recording AT them until the carrier stops -- 49s and 52s
+# in production. Only then does <Dial> return and the failsafe get its turn, by
+# which point the guest has hung up. Ending the leg immediately keeps them on
+# the line to be recovered.
+
+class _FakeCalls:
+    def __init__(self, log):
+        self._log = log
+        self._sid = None
+
+    def __call__(self, sid):
+        self._sid = sid
+        return self
+
+    def update(self, **kwargs):
+        self._log.append((self._sid, kwargs))
+
+
+class _FakeTwilio:
+    def __init__(self, log):
+        self.calls = _FakeCalls(log)
+
+
+@pytest.fixture
+def hangups(monkeypatch):
+    log: list = []
+    monkeypatch.setattr(server, "_get_twilio_client", lambda: _FakeTwilio(log))
+    return log
+
+
+def test_instant_answer_with_no_ringing_is_hung_up(client, hangups, monkeypatch):
+    """The production signature: answered in well under a second, never rang."""
+    monkeypatch.setattr(server, "HANDOFF_KILL_INTERCEPT", True)
+    _seed()
+    client.post(
+        f"/voice/dial-status?parent={CALL}",
+        data={"CallStatus": "initiated", "CallSid": "CA_CHILD"},
+    )
+    client.post(
+        f"/voice/dial-status?parent={CALL}",
+        data={"CallStatus": "in-progress", "CallSid": "CA_CHILD"},
+    )
+
+    assert hangups == [("CA_CHILD", {"status": "completed"})]
+
+
+def test_a_leg_that_rang_is_never_hung_up(client, hangups, monkeypatch):
+    """A real handset rings first. Cutting off a live human call is far worse
+    than sitting through one recording, so ringing vetoes the hang-up even when
+    the answer gap is short."""
+    monkeypatch.setattr(server, "HANDOFF_KILL_INTERCEPT", True)
+    _seed()
+    for status in ("initiated", "ringing", "in-progress"):
+        client.post(
+            f"/voice/dial-status?parent={CALL}",
+            data={"CallStatus": status, "CallSid": "CA_CHILD"},
+        )
+
+    assert hangups == []
+
+
+def test_slow_answer_is_never_hung_up(client, hangups, monkeypatch):
+    """Past the threshold it is a human, whatever the callbacks did."""
+    monkeypatch.setattr(server, "HANDOFF_KILL_INTERCEPT", True)
+    _seed()
+    client.post(
+        f"/voice/dial-status?parent={CALL}",
+        data={"CallStatus": "initiated", "CallSid": "CA_CHILD"},
+    )
+    _shift_clock(monkeypatch, 21.0)
+    client.post(
+        f"/voice/dial-status?parent={CALL}",
+        data={"CallStatus": "in-progress", "CallSid": "CA_CHILD"},
+    )
+
+    assert hangups == []
+
+
+def test_kill_switch_disables_the_hang_up(client, hangups, monkeypatch):
+    """HANDOFF_KILL_INTERCEPT=false must stand it down without a deploy."""
+    monkeypatch.setattr(server, "HANDOFF_KILL_INTERCEPT", False)
+    _seed()
+    client.post(
+        f"/voice/dial-status?parent={CALL}",
+        data={"CallStatus": "initiated", "CallSid": "CA_CHILD"},
+    )
+    client.post(
+        f"/voice/dial-status?parent={CALL}",
+        data={"CallStatus": "in-progress", "CallSid": "CA_CHILD"},
+    )
+
+    assert hangups == []
+
+
+def test_intercept_is_hung_up_once_even_if_twilio_retries(
+    client, hangups, monkeypatch
+):
+    """Twilio replays callbacks. A second hang-up on a dead SID is noise."""
+    monkeypatch.setattr(server, "HANDOFF_KILL_INTERCEPT", True)
+    _seed()
+    client.post(
+        f"/voice/dial-status?parent={CALL}",
+        data={"CallStatus": "initiated", "CallSid": "CA_CHILD"},
+    )
+    for _ in range(3):
+        client.post(
+            f"/voice/dial-status?parent={CALL}",
+            data={"CallStatus": "in-progress", "CallSid": "CA_CHILD"},
+        )
+
+    assert len(hangups) == 1
+
+
+def test_hangup_failure_does_not_break_the_callback(client, monkeypatch):
+    """If the REST call throws, <Dial> still ends on its own — the failsafe is
+    delayed, not lost. The callback must still return 204."""
+    monkeypatch.setattr(server, "HANDOFF_KILL_INTERCEPT", True)
+
+    class _Boom:
+        def calls(self, sid):
+            raise RuntimeError("twilio down")
+
+    monkeypatch.setattr(server, "_get_twilio_client", lambda: _Boom())
+    _seed()
+    client.post(
+        f"/voice/dial-status?parent={CALL}",
+        data={"CallStatus": "initiated", "CallSid": "CA_CHILD"},
+    )
+    resp = client.post(
+        f"/voice/dial-status?parent={CALL}",
+        data={"CallStatus": "in-progress", "CallSid": "CA_CHILD"},
+    )
+
+    assert resp.status_code == 204
