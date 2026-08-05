@@ -21,6 +21,11 @@
 #                     are installed best-effort; if an agent's deps are too
 #                     heavy to install, the job is intentionally lenient and
 #                     does not hard-fail the pipeline.
+#   * deps-resolve  - dry-run resolves every requirements-prod.lock.txt on a
+#                     real Python 3.11. BLOCKING, and deliberately so: it is
+#                     the only job that touches the file the images actually
+#                     install. See its comment for the five merged-but-
+#                     unbuildable bumps that motivated it.
 #
 # IMPORTANT: folder names contain spaces. They are always double-quoted in
 # shell and passed as quoted JSON strings in the matrix.
@@ -215,3 +220,69 @@ jobs:
           cd "$dir"
           # If imports fail due to missing heavy deps, stay lenient for now.
           pytest || echo "pytest reported failures in \"$dir\" (lenient mode)."
+
+  # ---------------------------------------------------------------------------
+  # 5. deps-resolve — can each agent's production lock actually be installed?
+  #
+  #    WHY THIS EXISTS: on 2026-08-05 five Dependabot bumps were merged with
+  #    fully green checks and left `main` unbuildable for four agents:
+  #
+  #      numpy 2.5.1        Requires-Python >=3.12  (images are python:3.11-slim)
+  #      scipy 1.18.0       Requires-Python >=3.12
+  #      websockets 17.0.1  google-genai requires <17.0
+  #      pydantic-core 2.47.0  pydantic pins it EXACTLY
+  #      tokenizers 0.23.1  transformers requires <=0.23.0
+  #
+  #    Nothing above is exotic — every one is visible to the resolver in
+  #    seconds. They passed because NO job in this file installs
+  #    requirements-prod.lock.txt: `test` installs its own deps best-effort and
+  #    is continue-on-error, and nothing builds the Docker image. A lock file
+  #    could therefore be merged in a state where no agent could deploy, and
+  #    the failure surfaced later at deploy time with no obvious link back.
+  #
+  #    Running on a real 3.11 interpreter is load-bearing. A resolve on 3.12
+  #    accepts both the numpy and scipy pins happily; they only fail inside the
+  #    image. Two of the five were exactly that class, so this job MUST keep
+  #    python-version pinned to whatever the Dockerfiles use.
+  #
+  #    Deliberately NOT using pip's --python-version flag: it requires
+  #    --only-binary=:all:, which reports sdist-only deps (e.g. metaphone in
+  #    BSL) as missing and produces false failures. Matching the interpreter
+  #    for real avoids that entirely.
+  # ---------------------------------------------------------------------------
+  deps-resolve:
+    name: deps-resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Resolve every production lock against Python 3.11
+        run: |
+          set -uo pipefail
+          failed=0
+          shopt -s nullglob
+          for lock in */requirements-prod.lock.txt; do
+            dir="$(dirname "$lock")"
+            printf '::group::%s\n' "$dir"
+            # --dry-run resolves without installing. The runner interpreter is
+            # already 3.11 (set above), so Requires-Python is enforced for real
+            # and sdist-only packages resolve normally.
+            if pip install --dry-run --ignore-installed \
+                 -r "$lock" > /tmp/out.txt 2>&1; then
+              echo "OK — $dir resolves on Python 3.11"
+            else
+              echo "FAILED — $dir cannot be installed on Python 3.11:"
+              grep -iE 'ERROR|conflict is caused|Requires-Python' /tmp/out.txt | head -20 || tail -20 /tmp/out.txt
+              failed=1
+            fi
+            echo '::endgroup::'
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::At least one production lock cannot be installed. A merge would leave main unbuildable for that agent."
+            exit 1
+          fi
+          echo "All production locks resolve on Python 3.11."
