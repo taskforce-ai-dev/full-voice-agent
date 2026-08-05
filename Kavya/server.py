@@ -168,6 +168,13 @@ HANDOFF_MIN_ANSWER_SECONDS: float = float(
     os.getenv("HANDOFF_MIN_ANSWER_SECONDS", "2.0")
 )
 
+# Hang up a leg the moment it is identified as a carrier intercept, instead of
+# holding the guest through the recording. See /voice/dial-status for the full
+# reasoning. Set to "false" to disable at runtime without a code deploy.
+HANDOFF_KILL_INTERCEPT: bool = os.getenv(
+    "HANDOFF_KILL_INTERCEPT", "true"
+).strip().lower() not in ("0", "false", "no", "off")
+
 # Caller ID presented to the human agent when a call is transferred.
 #
 # WHY THIS EXISTS: <Dial> with no callerId makes Twilio pass through the
@@ -1893,6 +1900,64 @@ async def dial_status(request: Request) -> Response:
             "[handoff] dial-status parent=%s event=%s (have: %s)",
             parent, event, ",".join(sorted(events)),
         )
+
+        # Cut a carrier intercept off immediately rather than holding the guest
+        # through it.
+        #
+        # answerOnBridge bridges the guest the instant the leg is "answered".
+        # When that answer is an intercept recording, the guest hears it for as
+        # long as the carrier plays it — 49s and 52s in the three production
+        # incidents — and only when it finally ends does <Dial> return and the
+        # failsafe get its turn. By then the guest has almost always hung up,
+        # which is why the failsafe kept opening a recovery session with nobody
+        # left on the line. Ending the leg here collapses that wait to about a
+        # second, so the guest is still there to be recovered.
+        #
+        # Deliberately STRICTER than _answer_looks_intercepted: this also
+        # requires that no ringing event arrived. A genuine handset pickup
+        # essentially always rings first, and unlike dial-result — which only
+        # reclassifies a call that has already ended — this cuts off a live
+        # one. It must not fire on a fast-but-real answer.
+        if (
+            HANDOFF_KILL_INTERCEPT
+            and canonical == "answered"
+            and "ringing" not in events
+            and not entry.get("intercept_killed")
+        ):
+            initiated = events.get("initiated")
+            answered = events.get("answered")
+            child_sid = str(form.get("CallSid") or "").strip()
+            gap = (
+                answered - initiated
+                if initiated is not None and answered is not None
+                else None
+            )
+            if child_sid and gap is not None and gap < HANDOFF_MIN_ANSWER_SECONDS:
+                entry["intercept_killed"] = True
+                logger.warning(
+                    "[handoff] leg %s answered %.2fs after dial with no ringing "
+                    "— carrier intercept, hanging it up so the guest is not held "
+                    "through the recording", child_sid, gap,
+                )
+                twilio = _get_twilio_client()
+                if twilio:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(
+                            None,
+                            lambda: twilio.calls(child_sid).update(
+                                status="completed"
+                            ),
+                        )
+                    except Exception:
+                        # Not fatal: <Dial> still ends on its own when the
+                        # carrier stops talking, so the failsafe is delayed
+                        # rather than lost.
+                        logger.warning(
+                            "[handoff] could not hang up intercepted leg %s",
+                            child_sid, exc_info=True,
+                        )
+
     return Response(status_code=204)
 
 
