@@ -5,7 +5,7 @@ uvicorn[standard]>=0.24.0
 # This file previously said `websockets>=17.0`, which combined with google-genai
 # made the requirements unsatisfiable — Sofia could not build at all. Every
 # other agent in this repo resolves to websockets 16.1.1 for the same reason.
-websockets>=13.0,<17.0
+websockets>=16.1.1,<17.0
 
 # AI / LLM
 anthropic>=0.120.2
