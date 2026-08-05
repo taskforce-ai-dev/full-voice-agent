@@ -573,12 +573,19 @@ pre-migration.
 **Data security answers (new prompt section).** Hotel prospects evaluating the system ask about data
 security and are easily spooked, so Kavya now answers it confidently instead of deflecting to a
 handoff. Added a `DATA SECURITY` block to `_build_system_prompt` plus matching KB paragraphs:
-encryption in transit and at rest; **role-based access control** — only **Mr. Chrys** and **Rakesh**
-can access sensitive data, no other TaskForce AI employee can, no shared admin account; **Rakesh**
-leads data security and is a cybersecurity major; the hotel owns its data and it is never sold or
-shared. Kavya must also admit plainly to being an AI agent built by TaskForce AI, and is explicitly
-forbidden from inventing certifications, audits, compliance standards or data-centre locations —
-naming a fabricated SOC 2 / ISO 27001 to a hotel's IT reviewer is worse than having none to cite.
+encryption in transit and at rest; **role-based access control** — access to sensitive data is
+restricted to a named few at TaskForce AI, no other employee can reach it, and there is no shared
+admin account; the hotel owns its data and it is never sold or shared. Kavya must also admit plainly
+to being an AI agent built by TaskForce AI, and is explicitly forbidden from inventing
+certifications, audits, compliance standards or data-centre locations — naming a fabricated
+SOC 2 / ISO 27001 to a hotel's IT reviewer is worse than having none to cite.
+
+> **Updated 2026-08-05:** as originally shipped this block named two individuals as the only people
+> with access. **Those names have since been removed from the prompt** — verified with
+> `grep -c "Chrys\|Rakesh"` returning 0 in `server.py`, 0 in `knowledge_docs/`, and 0 inside the
+> running production container. The `DATA SECURITY` block itself is still live and every rule above
+> still applies; it simply no longer names anyone. Do not re-add personal names here — Kavya says
+> this out loud to prospects.
 
 **Also in this change:**
 - Global **one-question-at-a-time** rule promoted into `VOICE RULES` (it previously sat only inside
@@ -596,9 +603,24 @@ naming a fabricated SOC 2 / ISO 27001 to a hotel's IT reviewer is worse than hav
 `yanolja_service.py`, `tools.py`, `server.py` and `post_call.py` all changed together.
 
 ### v0.18 — Transfers: own the caller ID, and stop trusting "completed"
-**Problem (two incidents, same root):** `<Dial>` without `callerId` makes Twilio
-pass the GUEST's number through. Dialling a Sri Lankan mobile from an
-international gateway while claiming a local CLI gets filtered as spoofing:
+
+> **CORRECTION (2026-08-05) — read this before trusting the diagnosis below.**
+> This section blames the intercepts on presenting a foreign caller ID to a Sri
+> Lankan mobile. **That is wrong**, and it was disproved by Twilio's own call
+> records: a leg on 2026-08-03 10:09 was intercepted while presenting a **Sri
+> Lankan** caller ID, and three legs on the US number rang normally. The
+> intercepted legs answer with SIP `200 OK` at ~333 ms PDD and never send `180
+> Ringing`; Twilio's side is clean (no error codes, no notifications,
+> geo-permissions fine). The real cause is an **intermittent international
+> termination route into SLT-Mobitel** — a carrier problem, not a config one.
+> Setting `TWILIO_CALLER_ID` is still correct and should stay, but it does not
+> prevent intercepts. See v0.21. The changes listed in this section are all
+> still live and still right; only the *explanation* was wrong.
+
+**Problem (two incidents, thought at the time to share one root):** `<Dial>`
+without `callerId` makes Twilio pass the GUEST's number through. The theory was
+that dialling a Sri Lankan mobile from an international gateway while claiming a
+local CLI gets filtered as spoofing:
 
 - **2026-07-31** — carrier returned `no-answer`, duration 0. Handset silent, but
   the failsafe fired correctly, so it looked like "the manager didn't pick up".
@@ -638,6 +660,108 @@ human ~8 s in. Note `docker compose restart` does NOT reload `.env`; it needs
 **How to test:** `pytest tests/test_handoff_intercept.py` (24 tests, no network)
 covers the instant-answer replay, the threshold boundary, callback retries, and
 both dial-result branches.
+
+### v0.21 — The failsafe had never fired. Three faults, all silent.
+**Context:** a customer demo was scheduled for 2026-08-05. Live testing the night
+before found that asking Kavya for a human still did not reliably reach anyone,
+*despite v0.18 having shipped specifically to fix that*. Three distinct faults,
+none of which produced an error anywhere.
+
+#### Fault 1 — the manager was never notified. Not once, in five weeks.
+
+The n8n handover workflow (`YmeWVEUR54A8o8Tb`) had **zero executions** between
+its creation on 2026-07-31 and 2026-08-05. The failsafe had never run.
+
+Both notification paths lived inside the **failsafe recovery session** — the new
+ConversationRelay WebSocket that `/voice/dial-result` opens after a failed dial:
+the `notify_human_handover` tool, and the end-of-session `_notify_handover_fallback`.
+Both require that WebSocket to open.
+
+On a carrier intercept it does not. The guest spends the whole dial listening to
+a recorded message instead of ringing and hangs up before Kavya returns. So the
+two notify paths were unreachable *precisely* in the case they existed for.
+Observed live twice in seven minutes: both calls logged `entering failsafe` and
+told nobody.
+
+**Fix (PR #177):** notify from `/voice/dial-result` itself, at the moment the
+transfer is judged failed, depending on nothing further happening. The existing
+`notified` flag makes it idempotent — it suppresses only the duplicate
+end-of-session net, so if the guest *does* stay on the line
+`notify_human_handover` still sends its richer follow-up with the name and
+number Kavya collects. Two messages beat none.
+
+`notified` is set **optimistically before** the POST (that is what stops two
+racing paths both sending) and **cleared again if the POST fails**, mutating the
+state entry in place. Without that rollback the flag would mean "attempted"
+rather than "delivered", and a swallowed n8n 5xx would stand every remaining
+path down permanently — losing the lead, which is the one outcome this path
+exists to prevent.
+
+#### Fault 2 — the guest was held through ~50 s of the intercept recording.
+
+`answerOnBridge="true"` bridges the guest the instant the leg is "answered". When
+that answer is an intercept, the recording plays **at the guest** for as long as
+the carrier talks — 49 s and 52 s in the incidents — and only when it ends does
+`<Dial>` return and the failsafe get its turn. By then the guest is gone. This is
+*why* Fault 1 was never survivable.
+
+**Fix (PR #178):** hang the leg up as soon as it is identified, via the Twilio
+REST API from `/voice/dial-status`. Collapses the wait to about a second.
+
+The trigger is deliberately **stricter** than `_answer_looks_intercepted`: it
+also requires that **no `ringing` event arrived**. dial-result only reclassifies
+a call that has already ended; this cuts off a **live** one, and a genuine
+handset essentially always rings first. New `HANDOFF_KILL_INTERCEPT` (default
+true) disables it at runtime without a deploy. A failed REST hang-up is
+non-fatal — `<Dial>` still ends on its own, so the failsafe is delayed, not lost.
+
+#### Fault 3 — voicemail, which no detection logic can catch.
+
+The manager's handset diverted to voicemail after exactly **20 s of ringing**
+(31 s from dial). Voicemail **rings first and answers slowly**, so by timing it
+is *indistinguishable from a human*:
+
+| | rings first? | answers at | detectable? |
+|---|---|---|---|
+| Carrier intercept | no | 0.5 s | yes — caught |
+| Real human | yes | 18.6 s | yes — correctly accepted |
+| **Voicemail** | **yes** | **31 s** | **no — identical to a human** |
+
+Twilio's Answering Machine Detection would separate them, but **AMD is not
+available on TwiML `<Dial><Number>`** — it requires restructuring the call
+through the REST API.
+
+**Fix: config, not code.** `HANDOFF_DIAL_TIMEOUT` 40 → 25, so Twilio gives up
+*before* the divert and returns a clean `no-answer`, which already triggers the
+failsafe correctly. See `.env.example` for the trade-off in both directions —
+too low cuts off genuine slow answers, too high lets voicemail win. Measured on
+this route: post-dial delay is 11–13 s before ringing even starts, and genuine
+answers landed at 18.6 s / 19.7 s / 20.65 s from dial.
+
+**Prod config (2026-08-05):** `HUMAN_AGENT_PHONE` moved to a Dialog number —
+the previous SLT-Mobitel 071 line sits on the route that intermittently
+intercepts. `HANDOFF_DIAL_TIMEOUT=25` set in `/opt/kavya/.env`. Backup at
+`/opt/kavya/.env.bak.handover-20260805-043451`. Env-only; same image.
+
+**Verified live**, not just in tests: genuine pickup answered 18.6 s in with the
+early hang-up correctly standing down; an unanswered transfer produced
+`no-answer` → failsafe → **manager notified 0.93 s later** with a real WhatsApp
+delivered (`msgId 68884788`), and the guest was recovered and asked for a
+callback number.
+
+**How to test:** `pytest tests/test_handoff_intercept.py` — now 36 tests. The
+three added for #177 and the six for #178 assert at the n8n and Twilio
+boundaries rather than restating the implementation. Two of them **fail against
+the pre-#177 code** with `manager was NOT notified when the transfer was
+intercepted`; that failure is the point of the test, and any future test for
+this path should clear the same bar. The original 24 all passed against a
+completely broken detector because they hand-built `dial_events` with an
+`"answered"` key Twilio never sends.
+
+**Known remaining:** the carrier route itself. Intercepted legs answer SIP
+`200 OK` at ~333 ms PDD with no `180 Ringing`. Twilio's side is clean, and it is
+**not** caller-ID filtering (see the correction at the top of v0.18). Needs a
+Twilio carrier-ops ticket, not a code change.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 
