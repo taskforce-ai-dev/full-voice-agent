@@ -9,7 +9,7 @@ openai>=1.0.0
 
 # Telephony
 # Pinned to 7.x so AccessToken.to_jwt() returns a str (used by /api/voice-token).
-twilio>=7.0,<8.0
+twilio>=9.10.9,<10.0
 
 # Knowledge base / RAG
 chromadb>=0.4.0

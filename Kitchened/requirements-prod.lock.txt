@@ -116,7 +116,7 @@ threadpoolctl==3.6.0
 tokenizers==0.23.1
 tqdm==4.70.0
 transformers==5.14.1
-twilio==7.17.0
+twilio==9.10.9
 typer==0.27.0
 typing-inspection==0.4.2
 urllib3==2.7.0
