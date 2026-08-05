@@ -42,7 +42,7 @@ WORKDIR /app
 # build first means sentence-transformers sees torch already satisfied and never
 # pulls the CUDA wheel. Cuts the image from ~9GB to ~2.5GB with no runtime change
 # (MiniLM embeddings run on CPU regardless).
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch==2.13.0+cpu --index-url https://download.pytorch.org/whl/cpu
 COPY requirements-prod.lock.txt .
 RUN pip install --no-cache-dir -r requirements-prod.lock.txt
 
