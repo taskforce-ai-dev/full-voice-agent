@@ -135,11 +135,23 @@ updates:
       # standalone bump can never resolve. Bumping pydantic brings it along.
       - dependency-name: "pydantic-core"
 
+  # PARKED 2026-08-05. Sofia is not deployed — there is no container on the VPS
+  # at all (not even a stopped one), only a staged /opt/sofia directory. Weekly
+  # PRs for a dormant agent are pure triage cost: five were opened and merged on
+  # 2026-08-05 before anyone checked whether the agent was live.
+  #
+  # `open-pull-requests-limit: 0` stops Dependabot opening PRs while still
+  # tracking the dependency graph, so security advisories remain visible.
+  #
+  # UNPARK by restoring `open-pull-requests-limit: 5` when Sofia is deployed.
+  # Its requirements do now resolve (fixed in #184 — the previous
+  # `websockets>=17.0` pin contradicted google-genai and made the agent
+  # unbuildable), so there is nothing blocking a deploy other than the decision.
   - package-ecosystem: "pip"
     directory: "/Sofia Agent"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     commit-message:
       prefix: "deps(pip)"
     ignore:
