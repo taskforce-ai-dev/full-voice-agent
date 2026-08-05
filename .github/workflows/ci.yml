@@ -271,7 +271,13 @@ jobs:
             # --dry-run resolves without installing. The runner interpreter is
             # already 3.11 (set above), so Requires-Python is enforced for real
             # and sdist-only packages resolve normally.
+            # --extra-index-url mirrors what every agent Dockerfile does before
+            # installing the lock. Flico pins torch==2.13.0+cpu, and that "+cpu"
+            # local version exists ONLY on the PyTorch CPU index, never on PyPI.
+            # Without this the job reports a false failure for an agent whose
+            # real image builds perfectly well.
             if pip install --dry-run --ignore-installed \
+                 --extra-index-url https://download.pytorch.org/whl/cpu \
                  -r "$lock" > /tmp/out.txt 2>&1; then
               echo "OK — $dir resolves on Python 3.11"
             else
