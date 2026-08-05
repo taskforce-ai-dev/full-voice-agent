@@ -1214,6 +1214,7 @@ async def _notify_handover_fallback(
             "[handover] failsafe ended with no details and no caller ID [%s] "
             "— manager NOT notified", call_sid,
         )
+        _remember_handoff(call_sid, notified=False)
         return
 
     reason = (state.get("reason") or "").strip() or "Guest asked to speak to a human."
@@ -1238,6 +1239,16 @@ async def _notify_handover_fallback(
         "[handover] fallback notification for %s — ok=%s",
         call_sid, outcome.get("ok"),
     )
+    if not outcome.get("ok"):
+        # `notified` is set optimistically BEFORE the POST, so that two notify
+        # paths racing cannot both send. This send failed, so hand the job back
+        # to whichever path runs next rather than standing them all down — a
+        # swallowed n8n 5xx losing the lead is the exact outcome this whole
+        # path exists to prevent. Mutate in place: _remember_handoff would
+        # resurrect state for a call that has already finished and been popped.
+        entry = _handoff_state.get(call_sid)
+        if entry is not None:
+            entry["notified"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -2002,9 +2013,10 @@ async def dial_result(request: Request) -> Response:
                 caller_phone=state.get("caller_phone", ""),
                 full_transcript=state.get("transcript") or [],
                 lead=(
-                    "The transfer to you was NOT answered, so the guest is "
-                    "still waiting. Details below are from the call so far — "
-                    "they may hang up before leaving more."
+                    "A transfer to you was NOT answered. The guest may still "
+                    "be on the line or may already have hung up — please call "
+                    "them back on the number below. Details are from the call "
+                    "so far."
                 ),
             )
         )

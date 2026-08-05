@@ -321,6 +321,7 @@ async def test_intercepted_transfer_pages_the_manager_without_a_recovery_session
     assert sent, "manager was NOT notified when the transfer was intercepted"
     assert sent[0]["customer_whatsapp"] == "+94776697566"
     assert "NOT answered" in sent[0]["call_summary"]
+    assert "call them back" in sent[0]["call_summary"]
 
 
 @pytest.mark.asyncio
