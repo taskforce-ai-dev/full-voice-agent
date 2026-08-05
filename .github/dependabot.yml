@@ -14,6 +14,22 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps(pip)"
+    ignore:
+      # numpy/scipy 2.5.x / 1.18.x require Python >=3.12; images are 3.11-slim.
+      # Remove these two when the base image moves — see the note at the bottom.
+      - dependency-name: "numpy"
+        versions: [">=2.5.0"]
+      - dependency-name: "scipy"
+        versions: [">=1.18.0"]
+      # google-genai requires websockets<17.0 and every agent pins google-genai.
+      - dependency-name: "websockets"
+        versions: [">=17.0"]
+      # transformers 5.14.1 requires tokenizers<=0.23.0.
+      - dependency-name: "tokenizers"
+        versions: [">0.23.0"]
+      # Transitive only: pydantic pins pydantic-core to an exact version, so a
+      # standalone bump can never resolve. Bumping pydantic brings it along.
+      - dependency-name: "pydantic-core"
 
   - package-ecosystem: "pip"
     directory: "/Flico Agent"
@@ -30,6 +46,22 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps(pip)"
+    ignore:
+      # numpy/scipy 2.5.x / 1.18.x require Python >=3.12; images are 3.11-slim.
+      # Remove these two when the base image moves — see the note at the bottom.
+      - dependency-name: "numpy"
+        versions: [">=2.5.0"]
+      - dependency-name: "scipy"
+        versions: [">=1.18.0"]
+      # google-genai requires websockets<17.0 and every agent pins google-genai.
+      - dependency-name: "websockets"
+        versions: [">=17.0"]
+      # transformers 5.14.1 requires tokenizers<=0.23.0.
+      - dependency-name: "tokenizers"
+        versions: [">0.23.0"]
+      # Transitive only: pydantic pins pydantic-core to an exact version, so a
+      # standalone bump can never resolve. Bumping pydantic brings it along.
+      - dependency-name: "pydantic-core"
 
   - package-ecosystem: "pip"
     directory: "/Kavya"
@@ -38,6 +70,22 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps(pip)"
+    ignore:
+      # numpy/scipy 2.5.x / 1.18.x require Python >=3.12; images are 3.11-slim.
+      # Remove these two when the base image moves — see the note at the bottom.
+      - dependency-name: "numpy"
+        versions: [">=2.5.0"]
+      - dependency-name: "scipy"
+        versions: [">=1.18.0"]
+      # google-genai requires websockets<17.0 and every agent pins google-genai.
+      - dependency-name: "websockets"
+        versions: [">=17.0"]
+      # transformers 5.14.1 requires tokenizers<=0.23.0.
+      - dependency-name: "tokenizers"
+        versions: [">0.23.0"]
+      # Transitive only: pydantic pins pydantic-core to an exact version, so a
+      # standalone bump can never resolve. Bumping pydantic brings it along.
+      - dependency-name: "pydantic-core"
 
   - package-ecosystem: "pip"
     directory: "/Kitchened"
@@ -46,6 +94,22 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps(pip)"
+    ignore:
+      # numpy/scipy 2.5.x / 1.18.x require Python >=3.12; images are 3.11-slim.
+      # Remove these two when the base image moves — see the note at the bottom.
+      - dependency-name: "numpy"
+        versions: [">=2.5.0"]
+      - dependency-name: "scipy"
+        versions: [">=1.18.0"]
+      # google-genai requires websockets<17.0 and every agent pins google-genai.
+      - dependency-name: "websockets"
+        versions: [">=17.0"]
+      # transformers 5.14.1 requires tokenizers<=0.23.0.
+      - dependency-name: "tokenizers"
+        versions: [">0.23.0"]
+      # Transitive only: pydantic pins pydantic-core to an exact version, so a
+      # standalone bump can never resolve. Bumping pydantic brings it along.
+      - dependency-name: "pydantic-core"
 
   - package-ecosystem: "pip"
     directory: "/SLIC Agent"
@@ -54,6 +118,22 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps(pip)"
+    ignore:
+      # numpy/scipy 2.5.x / 1.18.x require Python >=3.12; images are 3.11-slim.
+      # Remove these two when the base image moves — see the note at the bottom.
+      - dependency-name: "numpy"
+        versions: [">=2.5.0"]
+      - dependency-name: "scipy"
+        versions: [">=1.18.0"]
+      # google-genai requires websockets<17.0 and every agent pins google-genai.
+      - dependency-name: "websockets"
+        versions: [">=17.0"]
+      # transformers 5.14.1 requires tokenizers<=0.23.0.
+      - dependency-name: "tokenizers"
+        versions: [">0.23.0"]
+      # Transitive only: pydantic pins pydantic-core to an exact version, so a
+      # standalone bump can never resolve. Bumping pydantic brings it along.
+      - dependency-name: "pydantic-core"
 
   - package-ecosystem: "pip"
     directory: "/Sofia Agent"
@@ -62,6 +142,22 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps(pip)"
+    ignore:
+      # numpy/scipy 2.5.x / 1.18.x require Python >=3.12; images are 3.11-slim.
+      # Remove these two when the base image moves — see the note at the bottom.
+      - dependency-name: "numpy"
+        versions: [">=2.5.0"]
+      - dependency-name: "scipy"
+        versions: [">=1.18.0"]
+      # google-genai requires websockets<17.0 and every agent pins google-genai.
+      - dependency-name: "websockets"
+        versions: [">=17.0"]
+      # transformers 5.14.1 requires tokenizers<=0.23.0.
+      - dependency-name: "tokenizers"
+        versions: [">0.23.0"]
+      # Transitive only: pydantic pins pydantic-core to an exact version, so a
+      # standalone bump can never resolve. Bumping pydantic brings it along.
+      - dependency-name: "pydantic-core"
 
   - package-ecosystem: "pip"
     directory: "/WorldOfRefrigerators"
@@ -70,6 +166,22 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps(pip)"
+    ignore:
+      # numpy/scipy 2.5.x / 1.18.x require Python >=3.12; images are 3.11-slim.
+      # Remove these two when the base image moves — see the note at the bottom.
+      - dependency-name: "numpy"
+        versions: [">=2.5.0"]
+      - dependency-name: "scipy"
+        versions: [">=1.18.0"]
+      # google-genai requires websockets<17.0 and every agent pins google-genai.
+      - dependency-name: "websockets"
+        versions: [">=17.0"]
+      # transformers 5.14.1 requires tokenizers<=0.23.0.
+      - dependency-name: "tokenizers"
+        versions: [">0.23.0"]
+      # Transitive only: pydantic pins pydantic-core to an exact version, so a
+      # standalone bump can never resolve. Bumping pydantic brings it along.
+      - dependency-name: "pydantic-core"
 
   # ---- Node dashboard (npm) ----
   - package-ecosystem: "npm"
@@ -88,3 +200,31 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps(actions)"
+
+# -----------------------------------------------------------------------------
+# Why the ignore: rules above exist
+# -----------------------------------------------------------------------------
+# Five Dependabot bumps once merged with fully green CI and left `main`
+# unbuildable for four agents (reverted in #181, #182, #183):
+#   - numpy 2.5.x / scipy 1.18.x — both require Python >=3.12; our images are
+#     python:3.11-slim. Unblock by moving the base image to python:3.12-slim
+#     across all agents. That is a real change with its own testing and blast
+#     radius, and it is not urgent — the current pins work fine. If it is ever
+#     done, these two ignore rules are what to remove first.
+#   - websockets >=17.0 — google-genai requires websockets<17.0, and every
+#     agent pins google-genai. Unblock when google-genai raises that ceiling.
+#   - tokenizers >0.23.0 — transformers requires tokenizers<=0.23.0. Unblock
+#     when transformers raises that ceiling.
+#   - pydantic-core — transitive only; pydantic pins it to an exact version,
+#     so a standalone bump can never resolve on its own. It rides along
+#     whenever pydantic itself is bumped — do not add an ignore rule for
+#     pydantic.
+#
+# CI now has a deps-resolve job (#185) that installs each production lock on
+# real Python 3.11, so a repeat of one of these would fail CI instead of
+# silently merging. These ignore rules exist only to stop Dependabot
+# recreating the same doomed PRs every week — they are noise-suppression on
+# top of a real CI gate, not a substitute for one.
+#
+# The /Flico Agent pip entry above deliberately has NO ignore rules — do not
+# add any there.
