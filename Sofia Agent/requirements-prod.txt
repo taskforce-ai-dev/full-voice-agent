@@ -22,7 +22,7 @@ sentence-transformers>=5.6.1
 google-cloud-speech>=2.40.0
 
 # Gemini native SDK
-google-genai>=1.0.0
+google-genai>=2.16.0
 
 # HTTP client
 httpx>=0.25.0
