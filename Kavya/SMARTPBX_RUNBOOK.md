@@ -4,17 +4,50 @@ This runbook operates only the opt-in `kavya-smartpbx` profile at `/opt/kavya`.
 It leaves the existing `kavya` Twilio service unchanged and keeps Flico untouched:
 do not stop, edit, restart, or route Flico through this service.
 
-## Preconditions
+## Preconditions and immutable image identity
 
-- Dialog has confirmed the WSS account ID. Kavya accepts either `account_id` or
-  `X-Account-ID` for MCP, but Dialog vendor docs conflict: a tenant must confirm
-  and credentialedly test exactly one spelling before optional transfer activation.
-  If Dialog supplies egress IPs, its source-IP allowlist is an operator prerequisite.
-- DNS and a certificate exist for `smartpbx-kavya.taskforceai.tech`.
-- Replace `<REVIEWED_COMMIT_SHA>` with the immutable CI-built SHA containing this
-  change. Never use `latest`.
-- The 7.8 GiB VPS must retain observed headroom for legacy Twilio, Nginx, Docker,
-  and the host after SmartPBX's `1536m`, `2.0` CPU, and `256` PID caps.
+- Dialog has confirmed its tenant account value and the one MCP account-header
+  spelling. `SMARTPBX_ACCOUNT_ID` is server-side and must equal the
+  carrier-emitted `start.accountId`; it is not a dashboard field.
+- The four-call limit is enforced locally and is also the purchased Dialog
+  capacity; it is not a dashboard field.
+- If Dialog supplies egress ranges, configure its source-IP allowlist before
+  cutover.
+- The successful image workflow emits exactly two values for the reviewed
+  release: its CI short SHA image tag and its full commit revision label. Copy
+  both from that successful workflow/review record, without deriving one from
+  the other.
+
+```sh
+cd /opt/kavya
+# Replace these two example shapes with the reviewed values from the successful
+# image workflow. The first is exactly the CI `git rev-parse --short HEAD` tag.
+REVIEWED_CI_SHORT_SHA=abcdef0
+REVIEWED_FULL_COMMIT_SHA=0123456789abcdef0123456789abcdef01234567
+SMARTPBX_IMAGE="ghcr.io/taskforce-ai-dev/kavya:$REVIEWED_CI_SHORT_SHA"
+```
+
+Prefer the image already pulled by the successful image deploy workflow:
+
+```sh
+docker image inspect "$SMARTPBX_IMAGE" >/dev/null
+docker image inspect "$SMARTPBX_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' | grep -Fx "$REVIEWED_FULL_COMMIT_SHA"
+```
+
+If that exact image is not local and the GHCR package is private, use a
+least-privilege package-read token. The token is read silently, passed only on
+standard input, and is neither an argument nor output:
+
+```sh
+read -r GHCR_USERNAME
+read -r -s GHCR_READ_TOKEN
+printf '\n'
+printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+unset GHCR_READ_TOKEN
+docker pull "$SMARTPBX_IMAGE"
+docker logout ghcr.io >/dev/null 2>&1
+docker image inspect "$SMARTPBX_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' | grep -Fx "$REVIEWED_FULL_COMMIT_SHA"
+```
 
 ## Create the isolated server-side environment
 
@@ -31,7 +64,6 @@ Populate every line below from approved server-side secrets; do not copy `.env`,
 and do not add Twilio credentials or `HUMAN_AGENT_PHONE`.
 
 ```dotenv
-# LLM and TTS
 ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 LLM_PROVIDER=claude
@@ -45,7 +77,6 @@ OPENAI_TTS_INSTRUCTIONS=
 ELEVENLABS_API_KEY=
 ELEVENLABS_VOICE_ID=
 ELEVENLABS_VOICE_ID_AR=
-# STT and PMS
 STT_PROVIDER=azure
 AZURE_SPEECH_KEY=
 AZURE_SPEECH_REGION=southeastasia
@@ -54,7 +85,6 @@ YANOLJA_USERNAME=
 YANOLJA_PASSWORD=
 YANOLJA_TIMEOUT=30
 DEMO_RATES_ENABLED=true
-# Post-call, dashboard, and observability
 N8N_BASE_URL=
 N8N_POSTCALL_WEBHOOK=/webhook/post-call-data
 DASHBOARD_API_URL=
@@ -63,7 +93,6 @@ DASHBOARD_AGENT_ID=kavya
 SENTRY_DSN=
 SENTRY_TRACES_SAMPLE_RATE=0.0
 SENTRY_ENV=production
-# SmartPBX ingress and manager notification
 SMARTPBX_WS_TOKEN=
 SMARTPBX_ACCOUNT_ID=
 SMARTPBX_MAX_MESSAGE_CHARS=65536
@@ -72,7 +101,6 @@ SMARTPBX_MAX_OUTBOUND_FRAMES=128
 SMARTPBX_START_TIMEOUT_SECONDS=10
 SMARTPBX_IDLE_TIMEOUT_SECONDS=90
 SMARTPBX_HUMAN_AGENT_WHATSAPP=
-# Dialog MCP (leave destinations {} to keep transfer disabled)
 SMARTPBX_MCP_URL=https://dialog.cybergate.lk:9443/ucp/v2/mcp
 SMARTPBX_API_KEY=
 SMARTPBX_MCP_ACCOUNT_HEADER=
@@ -83,85 +111,107 @@ SMARTPBX_MCP_MAX_RESPONSE_BYTES=1048576
 SMARTPBX_MCP_RETRIES=1
 ```
 
-## MCP header and dashboard boundary
-
 Kavya accepts `SMARTPBX_MCP_ACCOUNT_HEADER=account_id` and
-`SMARTPBX_MCP_ACCOUNT_HEADER=X-Account-ID`. Dialog vendor docs conflict, so a
-tenant must credentialedly confirm and test exactly one spelling in
-`.env.smartpbx`; never send both headers. MCP API/account headers and all MCP
-credentials remain server-only. The dashboard WSS headers carry only the
-dedicated WSS token; they never carry MCP credentials.
+`SMARTPBX_MCP_ACCOUNT_HEADER=X-Account-ID`; Dialog must approve exactly one.
+MCP API/account headers and all MCP credentials are server-only. The dashboard WSS
+headers carry only the dedicated WSS token; they never carry MCP credentials.
 
-Only the dedicated WSS token is pasted into the Dialog dashboard. Configure:
+## Dialog dashboard fields
+
+Only the dedicated WSS token is pasted into the Dialog dashboard.
 
 | Field | Value |
 | --- | --- |
+| Name | `Kavya SmartPBX` |
+| Media format | `g711_ulaw` |
+| Sample rate | `8000` Hz |
 | Media WebSocket URL | `wss://smartpbx-kavya.taskforceai.tech/ws/v1/smartpbx/media` |
-| WebSocket header name | `X-Kavya-SmartPBX-Token` |
-| WebSocket header value | the `SMARTPBX_WS_TOKEN` value only |
-| Account ID in start event | `SMARTPBX_ACCOUNT_ID` |
-| Audio encoding / sample rate | `g711_ulaw` / `8000` Hz |
-| Maximum concurrent calls | `4` |
+| WebSocket headers | `X-Kavya-SmartPBX-Token: <SMARTPBX_WS_TOKEN>` |
 
-Do not paste the MCP URL, API key, account ID/header, destinations, or other
-server value into dashboard WSS headers.
+## TLS bootstrap, local service validation, then public proxy
 
-## Nginx and immutable-profile preflight
+The generic sequence below is safe from a blank host. Operator state on
+2026-08-06 is already issued: DNS-only A record is live, the HTTP bootstrap site
+is installed, and the certificate expires 2026-11-04. Still run the checks and
+skip only a completed issuance; never install the certificate-referencing site
+before its files exist.
 
 ```sh
 cd /opt/kavya
-sudo install -m 0644 nginx-smartpbx.conf /etc/nginx/sites-available/kavya-smartpbx
+getent ahostsv4 smartpbx-kavya.taskforceai.tech | grep -F '67.207.90.109'
+sudo install -m 0644 nginx-smartpbx-acme.conf /etc/nginx/sites-available/kavya-smartpbx
 sudo ln -sfn /etc/nginx/sites-available/kavya-smartpbx /etc/nginx/sites-enabled/kavya-smartpbx
 sudo nginx -t
 sudo systemctl reload nginx
-SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
-SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx pull kavya-smartpbx
-SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx up -d kavya-smartpbx
-SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx ps
-SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx logs --tail=100 kavya-smartpbx
+sudo certbot certonly --webroot -w /var/www/html -d smartpbx-kavya.taskforceai.tech
+test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/fullchain.pem
+test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/privkey.pem
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+curl --fail http://127.0.0.1:8006/health
+curl --fail http://127.0.0.1:8006/smartpbx/status
+sudo install -m 0644 nginx-smartpbx.conf /etc/nginx/sites-available/kavya-smartpbx
+sudo nginx -t
+sudo systemctl reload nginx
 curl --fail https://smartpbx-kavya.taskforceai.tech/health
 curl --fail https://smartpbx-kavya.taskforceai.tech/smartpbx/status
 ```
 
-Use the identical pin for both `pull` and `up`. The config check intentionally
-does not print rendered secrets. Do not continue on a config failure, public
-Docker port, or unreviewed tag.
+`config > /dev/null` validates Compose without printing secrets. `--pull never`
+requires the exact reviewed image verified above and prevents an unreviewed pull.
+Do not continue after a config, loopback health, or status failure.
 
 ## Cutover gates
 
-Before enabling the Dialog route, record privacy-safe call fingerprints and outcomes, never raw call IDs or credentials:
+Before enabling the Dialog route, record privacy-safe call fingerprints and
+outcomes, never raw call IDs or credentials:
 
-1. Bad/missing WSS auth is rejected.
-2. A real or synthetic bidirectional call proves caller audio reaches STT, an
-   LLM turn completes, and the caller receives the response.
-3. Exercise a KB answer and representative PMS tool, then verify a post-call
-   record reaches dashboard/webhook.
+1. Bad or missing WSS auth is rejected.
+2. A bidirectional call proves caller audio reaches STT, an LLM turn completes,
+   and the caller receives the response.
+3. Exercise a KB answer and PMS tool, then verify a post-call record reaches the
+   dashboard/webhook.
 4. Hold four authenticated calls: **4 accepted + 5th rejected**, then hang up
    and verify `/smartpbx/status` returns zero active sessions.
-5. Test endpoint-down behavior and verify the carrier/dashboard fallback reaches
-   the approved operator without a caller-supplied destination.
+5. Test endpoint-down fallback before shifting traffic.
 
-## Optional transfer activation
+## Optional transfer activation and compulsory revoke
 
-Base WSS voice cutover does not require MCP credentials or a destination map:
-`SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` is valid and keeps transfer-disabled
-behavior. Activate transfer only after Dialog confirms the MCP endpoint/API key
-and the exact one account-header spelling. For a supervised non-production transfer drill,
-approve one non-production destination, make one observed transfer, then restore
-`{}` unless separately approved for production.
+Base WSS cutover is transfer-disabled with
+`SMARTPBX_TRANSFER_DESTINATIONS_JSON={}`. Every edit to `.env.smartpbx` requires
+the following recreation; an environment-file edit alone does not update the
+running container.
 
-Enable the dashboard route only after every gate passes; keep legacy Twilio running.
+Enable a supervised non-production transfer drill only after Dialog approves the
+endpoint, API key, account-header spelling, and an allowlisted test destination.
+Edit `.env.smartpbx` to add only that test destination, then apply it:
+
+```sh
+cd /opt/kavya
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+curl --fail http://127.0.0.1:8006/health
+```
+
+Perform one observed drill. Restore `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` in
+`.env.smartpbx`, then recreate the same and only service. Prove the restored
+configuration reached the running process before considering the drill revoked:
+
+```sh
+cd /opt/kavya
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+curl --fail http://127.0.0.1:8006/health
+curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e '.transfer_enabled == false'
+```
 
 ## Withdraw and rollback without dropping calls
 
 1. Withdraw the Dialog dashboard/carrier route and verify its approved fallback.
-2. Before stop, drain active calls: poll `/smartpbx/status` until `active_sessions`
-   is zero; retain service until the agreed active-call deadline, then escalate.
+2. Before stopping anything, drain active calls: poll `/smartpbx/status` until
+   `active_sessions` is zero; retain service until the agreed deadline, then
+   escalate.
 3. Only after drain completes:
 
    ```sh
    cd /opt/kavya
-   SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx stop kavya-smartpbx
+   SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx stop kavya-smartpbx
    ```
-
-Restore `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` after every temporary drill.

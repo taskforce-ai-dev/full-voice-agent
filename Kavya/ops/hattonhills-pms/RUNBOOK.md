@@ -58,9 +58,12 @@ sudo mysql yanolja_pms -e "SELECT room_number FROM rooms WHERE room_number LIKE 
 ## Verify through the API (no root needed)
 
 ```bash
-TOKEN=$(curl -s -X POST https://yanolja.taskforceai.tech/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin123"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+: "${YANOLJA_USERNAME:?set this protected environment variable first}"
+: "${YANOLJA_PASSWORD:?set this protected environment variable first}"
+TOKEN=$(printf '{"username":"%s","password":"%s"}' "$YANOLJA_USERNAME" "$YANOLJA_PASSWORD" | \
+  curl -sS --fail -X POST https://yanolja.taskforceai.tech/api/auth/login \
+    -H 'Content-Type: application/json' --data-binary @- | \
+  python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
 curl -s https://yanolja.taskforceai.tech/api/rooms -H "Authorization: Bearer $TOKEN" | python3 -m json.tool | head -40
 ```
 

@@ -4970,8 +4970,10 @@ def build_service_app(
         SmartPBXSessionRegistry,
         SmartPBXSettings,
     )
+    from smartpbx_mcp import DialogMCPSettings
 
     settings = SmartPBXSettings.from_env(environ)
+    transfer_settings = DialogMCPSettings.from_env(environ)
     registry = SmartPBXSessionRegistry(settings.max_calls)
     gateway = SmartPBXGateway(settings, registry)
     smartpbx_app = FastAPI(
@@ -4987,7 +4989,7 @@ def build_service_app(
         return {"status": "ok", "service_mode": "smartpbx"}
 
     def status() -> dict[str, bool | int | str]:
-        return gateway.snapshot()
+        return {**gateway.snapshot(), "transfer_enabled": transfer_settings.enabled}
 
     async def smartpbx_media(websocket: WebSocket) -> None:
         await gateway.handle(websocket, _new_smartpbx_session)

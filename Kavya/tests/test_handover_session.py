@@ -233,7 +233,10 @@ def test_a_normal_session_is_not_in_failsafe_mode(n8n):
         seen["tools"] = [t["name"] for t in tools]
         return "Welcome! How can I help?"
 
-    _run_session(fake_llm, url="/ws/conversation?lang=en", prompt="Do you have rooms?")
+    # This test exercises normal-call tool selection, not PMS credentials. The
+    # Yanolja client now correctly fails closed without explicit credentials.
+    with patch.object(tools_mod, "is_configured", return_value=True):
+        _run_session(fake_llm, url="/ws/conversation?lang=en", prompt="Do you have rooms?")
 
     assert "YOUR ONLY JOB NOW" not in seen["system"]
     assert "notify_human_handover" not in seen["tools"]

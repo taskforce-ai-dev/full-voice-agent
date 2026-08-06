@@ -583,11 +583,31 @@ def test_smartpbx_mode_exposes_only_bounded_routes():
     status = routes["/smartpbx/status"].endpoint()
     assert status["enabled"] is True
     assert status["configured"] is True
+    assert status["transfer_enabled"] is False
     assert status["active_sessions"] == 0
     assert status["max_sessions"] == 4
     assert "token" not in status
     assert "account_id" not in status
     assert "do-not-expose" not in repr(status)
+
+
+def test_smartpbx_status_reports_transfer_enabled_only_for_complete_allowlisted_configuration():
+    import server
+
+    environment = {
+        "ENABLE_SMARTPBX_WSS": "true",
+        "SMARTPBX_WS_TOKEN": "test-token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+        "SMARTPBX_MCP_URL": "https://dialog.example:9443/ucp/v2/mcp",
+        "SMARTPBX_API_KEY": "api-key-marker",
+        "SMARTPBX_MCP_ACCOUNT_HEADER": "account_id",
+        "SMARTPBX_TRANSFER_DESTINATIONS_JSON": '{"human_support":"tel:+94110000000"}',
+    }
+
+    app = server.build_service_app("smartpbx", environment)
+    routes = {route.path: route for route in app.routes}
+
+    assert routes["/smartpbx/status"].endpoint()["transfer_enabled"] is True
 
 
 def test_unknown_service_mode_fails_closed():
