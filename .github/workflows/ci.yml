@@ -17,10 +17,11 @@
 #                     */AGENTS.md is out of sync with its CLAUDE.md.
 #   * dockerfile-lint - hadolint over every agent Dockerfile (ADVISORY: only
 #                     `error`-level findings fail the build).
-#   * test          - matrix over ONLY agents that actually ship tests. Deps
-#                     are installed best-effort; if an agent's deps are too
-#                     heavy to install, the job is intentionally lenient and
-#                     does not hard-fail the pipeline.
+#   * test          - matrix over ONLY agents that actually ship tests.
+#                     Dependency INSTALL stays best-effort (an infra/network
+#                     flake pulling in heavy ML deps is not a test failure),
+#                     but BLOCKING as of 2026-08-06: once deps install, a
+#                     failing test fails the run. See the job comment.
 #   * deps-resolve  - dry-run resolves every requirements-prod.lock.txt on a
 #                     real Python 3.11. BLOCKING, and deliberately so: it is
 #                     the only job that touches the file the images actually
@@ -30,10 +31,16 @@
 # IMPORTANT: folder names contain spaces. They are always double-quoted in
 # shell and passed as quoted JSON strings in the matrix.
 #
-# NOTE ON LENIENCY: the `test` job starts lenient (continue-on-error) on
-# purpose so CI lands reliably green while coverage is thin. As real test
-# coverage grows, remove `continue-on-error` and tighten the `|| true`
-# fallbacks so failing tests block merges.
+# NOTE ON LENIENCY (tightened 2026-08-06): the `test` job started lenient
+# (continue-on-error, plus a `pytest || echo ... lenient mode` fallback) on
+# purpose so CI landed reliably green while coverage was thin. Coverage has
+# since grown — Kavya alone collects 230+ tests, including the 36 handoff-
+# intercept tests that encode a real fixed production bug, and the
+# prompt-policy tests that lock the name-recovery rules whose breakage once
+# produced a wrong booking (issue #117). A safety net that cannot fail the
+# build is decoration, so both fallbacks are gone: a failing test now blocks
+# the run. Dependency INSTALL remains best-effort on purpose — see the job
+# comment below for why that line stays lenient while the test step doesn't.
 # ---------------------------------------------------------------------------
 name: CI
 
@@ -161,9 +168,16 @@ jobs:
   # -------------------------------------------------------------------------
   # 4. Test — matrix over ONLY agents that ship tests.
   #
-  #    Lenient on purpose (see header). `continue-on-error: true` keeps the
-  #    pipeline green while coverage is thin; deps are installed best-effort.
-  #    Tighten both as real coverage grows.
+  #    BLOCKING as of 2026-08-06 (see header note for why). A failing test
+  #    now fails this job and the run. Dependency INSTALL stays best-effort
+  #    on purpose: heavy ML deps (torch, sentence-transformers) can fail to
+  #    install on an infra/network flake, and that is a different failure
+  #    mode than a test actually failing — conflating them would make a red
+  #    run here mean "something in PyPI/network hiccuped" as often as it
+  #    means "a test caught a real regression," which is exactly the kind of
+  #    noise that trains people to stop reading this job. If install ever
+  #    needs to be made strict too, expect infra flakiness and be ready to
+  #    defend it (per the task this change shipped from).
   #
   #    Spaced folder names are passed as quoted JSON strings and double-quoted
   #    in every shell command below.
@@ -171,7 +185,6 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -205,21 +218,41 @@ jobs:
         run: |
           dir="${{ matrix.agent }}"
           python -m pip install --upgrade pip
-          # Best-effort: heavy deps (torch/CUDA) may fail to install; that's OK
-          # while we're lenient — pytest collection will simply skip.
+          # Best-effort and deliberately still lenient (see job comment):
+          # heavy deps (torch/CUDA) failing to install is an infra flake, not
+          # a test result. If this ever fails, pytest collection below will
+          # simply error on the missing imports — that failure is real and
+          # DOES block, same as any other; only the install step itself
+          # stays non-fatal.
           if [ -f "$dir/requirements-prod.txt" ]; then
             pip install -r "$dir/requirements-prod.txt" || \
               echo "Full deps for \"$dir\" failed to install — continuing lenient."
           fi
-          pip install pytest
+          # pytest-asyncio is required for Kavya's async tests (yanolja
+          # availability/booking, handoff-intercept). It lives in Kavya's
+          # requirements.txt (local-dev deps), not requirements-prod.txt, so
+          # it must be installed explicitly here — without it those tests
+          # don't get skipped, they FAIL ("async def functions are not
+          # natively supported"), which is silent today only because this
+          # job used to swallow every test failure regardless of cause.
+          pip install "pytest>=9.1.1" "pytest-asyncio>=1.4.0"
 
       - name: Run pytest in "${{ matrix.agent }}"
         if: steps.detect.outputs.has_tests == 'true'
         run: |
           dir="${{ matrix.agent }}"
           cd "$dir"
-          # If imports fail due to missing heavy deps, stay lenient for now.
-          pytest || echo "pytest reported failures in \"$dir\" (lenient mode)."
+          # Scoped to tests/, NOT bare `pytest`. Both agents also carry
+          # manual/live scripts at the top level whose names collide with
+          # pytest's default discovery (test_voice.py, test_dashboard_client.py,
+          # ops/mosvold-pms/live_conversation_test.py, live_smoke_test.py) -
+          # none contain a single `def test_*`, but Kavya's
+          # live_conversation_test.py fails at collection (it opens a real
+          # WebSocket to the live production URL at import time), which
+          # aborts the whole run before any real test executes. Bare `pytest`
+          # was only ever "working" here because continue-on-error and the
+          # `|| echo` fallback below swallowed that collection error too.
+          pytest tests
 
   # ---------------------------------------------------------------------------
   # 5. deps-resolve — can each agent's production lock actually be installed?
@@ -235,8 +268,9 @@ jobs:
   #
   #    Nothing above is exotic — every one is visible to the resolver in
   #    seconds. They passed because NO job in this file installs
-  #    requirements-prod.lock.txt: `test` installs its own deps best-effort and
-  #    is continue-on-error, and nothing builds the Docker image. A lock file
+  #    requirements-prod.lock.txt: `test` installs each agent's plain
+  #    requirements-prod.txt (unpinned, best-effort — see its own comment),
+  #    never the .lock file, and nothing builds the Docker image. A lock file
   #    could therefore be merged in a state where no agent could deploy, and
   #    the failure surfaced later at deploy time with no obvious link back.
   #
