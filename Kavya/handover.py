@@ -286,6 +286,7 @@ async def send_handover_notification(
     customer_whatsapp: str,
     call_summary: str,
     human_agent_whatsapp: str,
+    privacy_safe: bool = False,
 ) -> dict[str, Any]:
     """POST the handover payload to n8n.
 
@@ -301,11 +302,21 @@ async def send_handover_notification(
     )
 
     if not payload["customer_whatsapp"]:
+        if privacy_safe:
+            logger.info("smartpbx_handover event=not_actionable")
+            return {"ok": False, "error": "missing_customer_whatsapp"}
         logger.error(
             "[handover] refusing to notify -- no usable customer WhatsApp number "
             "(call_sid=%s, raw=%r)", call_sid, customer_whatsapp,
         )
         return {"ok": False, "error": "missing_customer_whatsapp", "payload": payload}
+
+    if not payload["human_agent_whatsapp"]:
+        if privacy_safe:
+            logger.info("smartpbx_handover event=not_actionable")
+            return {"ok": False, "error": "missing_human_agent_whatsapp"}
+        logger.error("[handover] refusing to notify -- no usable manager WhatsApp number")
+        return {"ok": False, "error": "missing_human_agent_whatsapp", "payload": payload}
 
     url = f"{N8N_BASE_URL}{N8N_HANDOVER_WEBHOOK}"
     try:
@@ -313,6 +324,12 @@ async def send_handover_notification(
 
         session = await get_session()
         async with session.post(url, json=payload) as resp:
+            if privacy_safe:
+                if resp.status < 300:
+                    logger.info("smartpbx_handover event=sent status=%d", resp.status)
+                    return {"ok": True, "status": resp.status}
+                logger.warning("smartpbx_handover event=failed status=%d", resp.status)
+                return {"ok": False, "status": resp.status, "error": "delivery_failed"}
             body = await resp.text()
             if resp.status < 300:
                 logger.info(
@@ -330,5 +347,8 @@ async def send_handover_notification(
                 "payload": payload,
             }
     except Exception as exc:
+        if privacy_safe:
+            logger.warning("smartpbx_handover event=failed outcome=exception")
+            return {"ok": False, "error": "delivery_failed"}
         logger.exception("[handover] failed to POST handover payload: %s", exc)
         return {"ok": False, "error": repr(exc), "payload": payload}

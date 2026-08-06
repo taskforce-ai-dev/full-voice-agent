@@ -63,6 +63,8 @@ class KavyaSmartPBXSession:
     async def feed_audio(self, payload: bytes) -> None:
         if self._finish_task is not None:
             return
+        if getattr(self._pipeline, "transfer_pending", False):
+            return
         if self._start_task is None or not self._start_task.done():
             raise RuntimeError("SmartPBX session is not started")
         pipeline = self._require_pipeline()
@@ -117,6 +119,8 @@ class KavyaSmartPBXSession:
                     self._welcome_task.cancel()
                 await asyncio.gather(self._welcome_task, return_exceptions=True)
             pipeline._write_audio_dump()
+            if self._smartpbx_transfer_context is not None and self._smartpbx_transfer_context.coordinator is not None:
+                await self._smartpbx_transfer_context.coordinator.finalize_notification_retry()
 
             transcript = list(getattr(pipeline, "full_transcript", []))
             if schedule_post_call and transcript:
@@ -191,11 +195,25 @@ class KavyaSmartPBXSession:
     def _bind_smartpbx_tool_context(self, pipeline: Any) -> None:
         """Bind transfer and booking state to this validated Dialog call only."""
         from smartpbx_mcp import DialogMCPCallControl, DialogMCPSettings
+        from smartpbx_handover import SmartPBXHandoverCoordinator
         from tools import SmartPBXTransferContext
+        import handover
+        try:
+            import dashboard_client
+            dashboard_sender = dashboard_client.send_call_transferred
+        except Exception:
+            dashboard_sender = None
 
         settings = DialogMCPSettings.from_env(os.environ)
         control = DialogMCPCallControl(settings, self._context)
-        self._smartpbx_transfer_context = SmartPBXTransferContext(control)
+        coordinator = SmartPBXHandoverCoordinator(
+            call_control=control, pipeline=pipeline, call_sid=self._context.other_leg_call_id,
+            caller_phone=self._context.caller_number,
+            transcript=lambda: list(getattr(pipeline, "full_transcript", [])),
+            dashboard_sender=dashboard_sender, notification_sender=handover.send_handover_notification,
+            human_agent_whatsapp=os.getenv("HUMAN_AGENT_PHONE", ""),
+        )
+        self._smartpbx_transfer_context = SmartPBXTransferContext(control, coordinator=coordinator)
         pipeline._smartpbx_transfer_context = self._smartpbx_transfer_context
         pipeline._smartpbx_caller_context = {
             "caller_phone": self._context.caller_number,

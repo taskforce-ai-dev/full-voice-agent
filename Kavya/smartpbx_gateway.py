@@ -264,11 +264,12 @@ class SmartPBXGateway:
             raise ProtocolViolation(POLICY_VIOLATION, "start required", "start_required")
 
     async def _receive_or_terminal(self, websocket: Any, session: _GatewaySession) -> str | None:
+        timeout = None if getattr(session, "transfer_pending", False) else self._settings.idle_timeout_seconds
         terminal = getattr(session, "terminal_future", None)
         if terminal is None:
-            return await asyncio.wait_for(websocket.receive_text(), timeout=self._settings.idle_timeout_seconds)
+            return await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
         receive_task = asyncio.create_task(websocket.receive_text())
-        done, _ = await asyncio.wait({receive_task, terminal}, timeout=self._settings.idle_timeout_seconds, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait({receive_task, terminal}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         if not done:
             receive_task.cancel()
             await asyncio.gather(receive_task, return_exceptions=True)

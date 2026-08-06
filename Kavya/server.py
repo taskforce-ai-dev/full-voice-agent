@@ -2626,9 +2626,25 @@ class MediaStreamSession:
         # Set only by KavyaSmartPBXSession. None preserves legacy Twilio tools.
         self._smartpbx_transfer_context: Any | None = None
         self._smartpbx_caller_context: dict[str, str] | None = None
+        self.transfer_pending = False
 
     def _is_smartpbx_session(self) -> bool:
         return self._smartpbx_transfer_context is not None
+
+    async def enter_transfer_pending(self) -> None:
+        """Silence AI activity after carrier acknowledgement without closing Dialog."""
+        if self.transfer_pending:
+            return
+        self.transfer_pending = True
+        self._cancel_reprompt()
+        if self._endpointing_handle:
+            self._endpointing_handle.cancel()
+            self._endpointing_handle = None
+        self._pending_transcript = ""
+        self._latest_interim = ""
+        self._is_speaking = False
+        self._speak_generation += 1
+        await self._clear_media_audio(force=True)
 
     def _log_tool_execution(self, tool_name: str, tool_input: Any) -> None:
         if self._is_smartpbx_session():
@@ -2747,6 +2763,8 @@ class MediaStreamSession:
 
     def _on_stt_result(self, transcript: str):
         """Called from STT thread on FINAL results."""
+        if self.transfer_pending:
+            return
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=stt_final")
         else:
@@ -2770,6 +2788,8 @@ class MediaStreamSession:
         We drive our own endpointing: each interim resets a 1.5 s silence
         timer; when the timer fires we use the latest interim as the utterance.
         """
+        if self.transfer_pending:
+            return
         self._latest_interim = transcript
         if self._event_loop is None:
             return
@@ -2798,6 +2818,8 @@ class MediaStreamSession:
 
     async def _send_media_audio(self, audio: bytes) -> None:
         """Send raw mulaw through the active provider-specific media transport."""
+        if self.transfer_pending:
+            return
         if self._media_transport is not None:
             await self._media_transport.send_audio(audio)
             return
@@ -2808,8 +2830,10 @@ class MediaStreamSession:
                 "media": {"payload": base64.b64encode(audio).decode("ascii")},
             }))
 
-    async def _clear_media_audio(self) -> None:
+    async def _clear_media_audio(self, force: bool = False) -> None:
         """Clear pending speech without leaking one provider's wire protocol."""
+        if self.transfer_pending and not force:
+            return
         if self._media_transport is not None:
             await self._media_transport.clear_audio()
             return
@@ -2821,6 +2845,8 @@ class MediaStreamSession:
 
     async def _send_tts_done(self) -> None:
         """Complete one utterance using local acknowledgement when available."""
+        if self.transfer_pending:
+            return
         if self._media_transport is not None:
             await self._media_transport.send_mark("tts_done")
             self._is_speaking = False
@@ -2868,6 +2894,8 @@ class MediaStreamSession:
 
     def _schedule_reprompt(self) -> None:
         """Arm a silence nudge after the agent finishes speaking."""
+        if self.transfer_pending:
+            return
         if self._reprompt_task and not self._reprompt_task.done():
             self._reprompt_task.cancel()
         self._reprompt_task = asyncio.create_task(self._reprompt_after_silence())
@@ -2880,6 +2908,8 @@ class MediaStreamSession:
     async def _reprompt_after_silence(self) -> None:
         try:
             await asyncio.sleep(SILENCE_REPROMPT_DELAY)
+            if self.transfer_pending:
+                return
             if self._reprompt_count >= MAX_REPROMPTS:
                 return
             if self._is_speaking:
@@ -2907,6 +2937,8 @@ class MediaStreamSession:
     # â”€â”€ Endpointing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _accumulate_transcript(self, text: str):
+        if self.transfer_pending:
+            return
         # Caller is speaking — cancel any pending silence nudge and reset
         # the re-prompt counter so future silences start fresh.
         self._cancel_reprompt()
@@ -2925,6 +2957,8 @@ class MediaStreamSession:
 
     async def _set_transcript_interim(self, text: str):
         """Overwrite (not append) pending transcript with latest interim; reset timer."""
+        if self.transfer_pending:
+            return
         # Caller is speaking — cancel any pending silence nudge and reset
         # the re-prompt counter.
         self._cancel_reprompt()
@@ -2938,6 +2972,10 @@ class MediaStreamSession:
         )
 
     async def _flush_transcript(self):
+        if self.transfer_pending:
+            self._pending_transcript = ""
+            self._latest_interim = ""
+            return
         transcript = self._pending_transcript.strip()
         self._pending_transcript = ""
         self._latest_interim = ""
@@ -2955,6 +2993,8 @@ class MediaStreamSession:
 
     async def _process_utterance(self, text: str):
         """Run one turn with call-local SmartPBX state when this is a Dialog call."""
+        if self.transfer_pending:
+            return
         transfer_token = caller_token = None
         if self._smartpbx_transfer_context is not None:
             transfer_token = smartpbx_transfer_context.set(
@@ -3118,6 +3158,8 @@ class MediaStreamSession:
                         "content": result_str,
                     })
                     self._log_tool_result(tc["name"], result_str)
+                    if self.transfer_pending:
+                        return full_text
 
                 continue
 
@@ -3258,6 +3300,8 @@ class MediaStreamSession:
                         "content": result_str,
                     })
                     self._log_tool_result(tc["function"]["name"], result_str)
+                    if self.transfer_pending:
+                        return full_text
 
                 continue
 
@@ -3409,6 +3453,8 @@ class MediaStreamSession:
                         "content": result_str,
                     })
                     self._log_tool_result(tb["name"], result_str)
+                    if self.transfer_pending:
+                        return full_text
 
                 self.history.append({"role": "user", "content": tool_results})
                 continue
@@ -3442,7 +3488,11 @@ class MediaStreamSession:
         English / Tamil / Arabic â†’ ElevenLabs eleven_multilingual_v2 (cloned voice)
         Sinhala        â†’ OpenAI gpt-4o-mini-tts (nova)
         """
+        if self.transfer_pending:
+            return
         async with self._speak_lock:
+            if self.transfer_pending:
+                return
             if generation >= 0 and generation != self._speak_generation:
                 return
             if self.lang in ("en", "ta", "ar"):

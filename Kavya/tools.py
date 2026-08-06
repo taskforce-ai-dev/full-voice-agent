@@ -55,6 +55,7 @@ class SmartPBXTransferContext:
     """Per-utterance Dialog handover state; None deliberately means legacy Twilio."""
 
     call_control: Any | None
+    coordinator: Any | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     transfer_attempted: bool = False
 
@@ -608,6 +609,8 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
 
     elif tool_name == "transfer_to_human":
         if transfer_context is not None:
+            if transfer_context.coordinator is not None:
+                return await transfer_context.coordinator.attempt(tool_input.get("reason"))
             async with transfer_context.lock:
                 if transfer_context.transfer_attempted:
                     return json.dumps({"status": "unavailable"})

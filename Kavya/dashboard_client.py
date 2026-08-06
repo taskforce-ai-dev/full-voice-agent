@@ -182,15 +182,29 @@ async def send_call_transferred(
     call_sid: str,
     caller_phone: str,
     reason: str,
-    human_phone: str,
+    human_phone: str = "",
+    *,
+    transfer_target: str | None = None,
+    transfer_provider: str | None = None,
+    transfer_confirmation: str | None = None,
+    privacy_safe: bool = False,
 ) -> None:
     """Emit a call.transferred event when a call is handed off to a human."""
     from datetime import datetime, timezone
 
-    _announce_once()
+    _announce_once(privacy_safe=privacy_safe)
     if not _ENABLED:
         return
 
+    metadata = {"transfer_reason": reason}
+    if human_phone:
+        metadata["human_phone"] = human_phone
+    if transfer_target:
+        metadata["transfer_target"] = transfer_target
+    if transfer_provider:
+        metadata["transfer_provider"] = transfer_provider
+    if transfer_confirmation:
+        metadata["transfer_confirmation"] = transfer_confirmation
     payload = {
         "eventType": "call.transferred",
         "occurredAt": datetime.now(timezone.utc).isoformat(),
@@ -207,10 +221,7 @@ async def send_call_transferred(
             "id": call_sid,
             "status": "transferred",
             "contact": caller_phone,
-            "metadata": {
-                "transfer_reason": reason,
-                "human_phone": human_phone,
-            },
+            "metadata": metadata,
         },
     }
-    await _post(payload)
+    await _post(payload, privacy_safe=privacy_safe)
