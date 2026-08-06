@@ -1620,24 +1620,28 @@ async def lifespan(app: FastAPI):
         logger.warning("ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID not set — "
                        "ConversationRelay TTS will not work in production.")
 
-    if HUMAN_AGENT_PHONE:
-        logger.info("[handoff] enabled â†’ %s", HUMAN_AGENT_PHONE)
-    else:
-        logger.info("[handoff] disabled (HUMAN_AGENT_PHONE not set)")
+    # SmartPBX must not initialize or advertise the legacy Twilio handoff path.
+    # The established Twilio service retains this startup behavior unchanged.
+    if KAVYA_SERVICE_MODE != "smartpbx":
+        if HUMAN_AGENT_PHONE:
+            logger.info("[handoff] enabled â†’ %s", HUMAN_AGENT_PHONE)
+        else:
+            logger.info("[handoff] disabled (HUMAN_AGENT_PHONE not set)")
 
-    logger.info("[handoff] public hostname: %s", PUBLIC_HOSTNAME)
+        logger.info("[handoff] public hostname: %s", PUBLIC_HOSTNAME)
 
-    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-        # Eagerly construct the singleton so failures show up at boot, not on first call.
-        _get_twilio_client()
-        logger.info(
-            "[handoff] Twilio REST client configured (account=%s...)",
-            TWILIO_ACCOUNT_SID[:10],
-        )
+        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+            _get_twilio_client()
+            logger.info(
+                "[handoff] Twilio REST client configured (account=%s...)",
+                TWILIO_ACCOUNT_SID[:10],
+            )
+        else:
+            logger.warning(
+                "[handoff] Twilio REST client NOT configured — handoff will fail"
+            )
     else:
-        logger.warning(
-            "[handoff] Twilio REST client NOT configured — handoff will fail"
-        )
+        logger.info("SmartPBX mode: legacy Twilio handoff startup is disabled")
 
     # NOTE: bookings go to the Yanolja PMS via booking_api -> yanolja_service ->
     # yanolja_client. Hatton Hills is an invented demo property, so there is no

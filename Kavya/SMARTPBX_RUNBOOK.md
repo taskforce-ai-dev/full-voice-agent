@@ -1,105 +1,167 @@
 # Kavya Dialog SmartPBX cutover runbook
 
-This runbook operates the isolated `kavya-smartpbx` Compose profile. It does
-not replace or modify the existing `kavya` Twilio service. The profile is
-disabled by default and has no public Docker port: its application listens only
-at `127.0.0.1:8006`, behind the dedicated TLS Nginx host.
+This runbook operates only the opt-in `kavya-smartpbx` profile at `/opt/kavya`.
+It leaves the existing `kavya` Twilio service unchanged and keeps Flico untouched:
+do not stop, edit, restart, or route Flico through this service.
 
-## Preconditions and server configuration
+## Preconditions
 
-1. Provision DNS and a valid TLS certificate for
-   `smartpbx-kavya.taskforceai.tech`, then install `nginx-smartpbx.conf` as the
-   dedicated Nginx virtual host. Validate Nginx before reload.
-2. Generate a unique WebSocket token on the server. Never reuse a Twilio,
-   dashboard, MCP, or API credential:
+- Dialog has confirmed the WSS account ID. Kavya accepts either `account_id` or
+  `X-Account-ID` for MCP, but Dialog vendor docs conflict: a tenant must confirm
+  and credentialedly test exactly one spelling before optional transfer activation.
+  If Dialog supplies egress IPs, its source-IP allowlist is an operator prerequisite.
+- DNS and a certificate exist for `smartpbx-kavya.taskforceai.tech`.
+- Replace `<REVIEWED_COMMIT_SHA>` with the immutable CI-built SHA containing this
+  change. Never use `latest`.
+- The 7.8 GiB VPS must retain observed headroom for legacy Twilio, Nginx, Docker,
+  and the host after SmartPBX's `1536m`, `2.0` CPU, and `256` PID caps.
 
-   ```sh
-   /home/dev/full-voice-agent/.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))'
-   ```
+## Create the isolated server-side environment
 
-3. In the server-only `Kavya/.env`, set fresh values for
-   `SMARTPBX_WS_TOKEN` and `SMARTPBX_ACCOUNT_ID`. Keep
-   `ENABLE_SMARTPBX_WSS=false` in the shared file: the isolated Compose profile
-   sets it to `true` only for its own container. Do not add these values to a
-   dashboard, browser, client source, or Nginx configuration.
-4. Start only the isolated profile after the preceding checks:
+```sh
+cd /opt/kavya
+umask 077
+touch /opt/kavya/.env.smartpbx
+chmod 600 /opt/kavya/.env.smartpbx
+openssl rand -hex 32
+```
 
-   ```sh
-   docker compose --profile smartpbx up -d kavya-smartpbx
-   curl --fail https://smartpbx-kavya.taskforceai.tech/health
-   ```
+Paste the generated value only as `SMARTPBX_WS_TOKEN` in the protected file.
+Populate every line below from approved server-side secrets; do not copy `.env`,
+and do not add Twilio credentials or `HUMAN_AGENT_PHONE`.
 
-## Dialog dashboard fields
+```dotenv
+# LLM and TTS
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+LLM_PROVIDER=claude
+CLAUDE_MODEL=claude-sonnet-4-20250514
+OPENAI_MODEL=gpt-4o
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash
+OPENAI_TTS_MODEL=gpt-4o-mini-tts
+OPENAI_TTS_VOICE=nova
+OPENAI_TTS_INSTRUCTIONS=
+ELEVENLABS_API_KEY=
+ELEVENLABS_VOICE_ID=
+ELEVENLABS_VOICE_ID_AR=
+# STT and PMS
+STT_PROVIDER=azure
+AZURE_SPEECH_KEY=
+AZURE_SPEECH_REGION=southeastasia
+YANOLJA_BASE_URL=
+YANOLJA_USERNAME=
+YANOLJA_PASSWORD=
+YANOLJA_TIMEOUT=30
+DEMO_RATES_ENABLED=true
+# Post-call, dashboard, and observability
+N8N_BASE_URL=
+N8N_POSTCALL_WEBHOOK=/webhook/post-call-data
+DASHBOARD_API_URL=
+DASHBOARD_API_KEY=
+DASHBOARD_AGENT_ID=kavya
+SENTRY_DSN=
+SENTRY_TRACES_SAMPLE_RATE=0.0
+SENTRY_ENV=production
+# SmartPBX ingress and manager notification
+SMARTPBX_WS_TOKEN=
+SMARTPBX_ACCOUNT_ID=
+SMARTPBX_MAX_MESSAGE_CHARS=65536
+SMARTPBX_MAX_AUDIO_BYTES=32768
+SMARTPBX_MAX_OUTBOUND_FRAMES=128
+SMARTPBX_START_TIMEOUT_SECONDS=10
+SMARTPBX_IDLE_TIMEOUT_SECONDS=90
+SMARTPBX_HUMAN_AGENT_WHATSAPP=
+# Dialog MCP (leave destinations {} to keep transfer disabled)
+SMARTPBX_MCP_URL=https://dialog.cybergate.lk:9443/ucp/v2/mcp
+SMARTPBX_API_KEY=
+SMARTPBX_MCP_ACCOUNT_HEADER=
+SMARTPBX_TRANSFER_DESTINATIONS_JSON={}
+SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS=5
+SMARTPBX_MCP_READ_TIMEOUT_SECONDS=15
+SMARTPBX_MCP_MAX_RESPONSE_BYTES=1048576
+SMARTPBX_MCP_RETRIES=1
+```
 
-Create or update the Dialog AI-provider connection with exactly these values:
+## MCP header and dashboard boundary
+
+Kavya accepts `SMARTPBX_MCP_ACCOUNT_HEADER=account_id` and
+`SMARTPBX_MCP_ACCOUNT_HEADER=X-Account-ID`. Dialog vendor docs conflict, so a
+tenant must credentialedly confirm and test exactly one spelling in
+`.env.smartpbx`; never send both headers. MCP API/account headers and all MCP
+credentials remain server-only. The dashboard WSS headers carry only the
+dedicated WSS token; they never carry MCP credentials.
+
+Only the dedicated WSS token is pasted into the Dialog dashboard. Configure:
 
 | Field | Value |
 | --- | --- |
 | Media WebSocket URL | `wss://smartpbx-kavya.taskforceai.tech/ws/v1/smartpbx/media` |
 | WebSocket header name | `X-Kavya-SmartPBX-Token` |
-| WebSocket header value | the fresh `SMARTPBX_WS_TOKEN` only |
-| Account ID in Dialog start event | the server `SMARTPBX_ACCOUNT_ID` |
-| Audio encoding | `g711_ulaw` |
-| Sample rate | `8000` Hz |
+| WebSocket header value | the `SMARTPBX_WS_TOKEN` value only |
+| Account ID in start event | `SMARTPBX_ACCOUNT_ID` |
+| Audio encoding / sample rate | `g711_ulaw` / `8000` Hz |
 | Maximum concurrent calls | `4` |
 
-The dashboard WSS headers contain only `X-Kavya-SmartPBX-Token`. API/account
-credentials are server-only and must not be added to dashboard WSS headers:
-that includes `SMARTPBX_API_KEY`, any MCP endpoint credential, and transfer
-destinations.
+Do not paste the MCP URL, API key, account ID/header, destinations, or other
+server value into dashboard WSS headers.
 
-## MCP transfer boundary (disabled until deliberately enabled)
-
-Transfer is transfer-disabled with the checked-in example configuration:
-`SMARTPBX_TRANSFER_DESTINATIONS_JSON={}`. It remains disabled unless all of
-the following are server-only values: `SMARTPBX_MCP_URL`, `SMARTPBX_API_KEY`,
-`SMARTPBX_ACCOUNT_ID`, `SMARTPBX_MCP_ACCOUNT_HEADER`, and a non-empty approved
-destination map.
-
-The Dialog MCP URL shape is `https://<dialog-mcp-host>/ucp/v2/mcp`. The explicit
-account header choice is `SMARTPBX_MCP_ACCOUNT_HEADER=account_id`. At runtime
-send only that one account header; do not also send `X-Account-ID`.
-
-Before enabling transfer, obtain and record from Dialog:
-
-- the production MCP URL and API key;
-- the account ID and confirmation that the exact account header is `account_id`;
-- an approved non-production test destination, formatted `tel:+<digits>` or
-  `sip:<user>@<host>`;
-- each approved production destination in the same format, with its logical
-  destination key and business owner.
-
-Populate `SMARTPBX_TRANSFER_DESTINATIONS_JSON` only with those approved
-destinations, for example `{"human_support":"tel:+<approved-test-number>"}`.
-Never use an unapproved number in a production map.
-
-## Test call and non-production transfer drill
-
-1. With transfer still disabled, place one Dialog test call. Confirm the TLS
-   connection reaches the WSS path, the `g711_ulaw`/`8000` media session starts,
-   the agent speaks, and `https://smartpbx-kavya.taskforceai.tech/smartpbx/status`
-   returns to zero active sessions after hangup.
-2. For a non-production transfer drill, obtain written approval, use a
-   non-production Dialog account and the approved test destination, and set all
-   required server-only MCP values. Place one supervised test call, invoke the
-   logical destination once, and verify the Dialog leg—not a caller-supplied
-   number—was transferred.
-3. Remove the temporary destination or restore `{}` immediately after the drill
-   unless a separately approved production cutover has occurred. Record the
-   call ID, operator, outcome, and rollback owner without recording credentials.
-
-## Cutover and rollback
-
-For cutover, enable the Dialog dashboard connection only after the test call
-passes. Continue to leave the existing `kavya` Twilio service running; no
-production deployment mutation is part of this profile addition.
-
-To roll back, disable the Dialog dashboard connection first, then run:
+## Nginx and immutable-profile preflight
 
 ```sh
-docker compose --profile smartpbx stop kavya-smartpbx
+cd /opt/kavya
+sudo install -m 0644 nginx-smartpbx.conf /etc/nginx/sites-available/kavya-smartpbx
+sudo ln -sfn /etc/nginx/sites-available/kavya-smartpbx /etc/nginx/sites-enabled/kavya-smartpbx
+sudo nginx -t
+sudo systemctl reload nginx
+SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
+SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx pull kavya-smartpbx
+SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx up -d kavya-smartpbx
+SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx ps
+SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx logs --tail=100 kavya-smartpbx
+curl --fail https://smartpbx-kavya.taskforceai.tech/health
+curl --fail https://smartpbx-kavya.taskforceai.tech/smartpbx/status
 ```
 
-Remove any temporary MCP destinations from the server configuration and restore
-`SMARTPBX_TRANSFER_DESTINATIONS_JSON={}`. Do not stop, edit, restart, or route
-Flico through this service; Flico is not part of this deployment or rollback.
+Use the identical pin for both `pull` and `up`. The config check intentionally
+does not print rendered secrets. Do not continue on a config failure, public
+Docker port, or unreviewed tag.
+
+## Cutover gates
+
+Before enabling the Dialog route, record privacy-safe call fingerprints and outcomes, never raw call IDs or credentials:
+
+1. Bad/missing WSS auth is rejected.
+2. A real or synthetic bidirectional call proves caller audio reaches STT, an
+   LLM turn completes, and the caller receives the response.
+3. Exercise a KB answer and representative PMS tool, then verify a post-call
+   record reaches dashboard/webhook.
+4. Hold four authenticated calls: **4 accepted + 5th rejected**, then hang up
+   and verify `/smartpbx/status` returns zero active sessions.
+5. Test endpoint-down behavior and verify the carrier/dashboard fallback reaches
+   the approved operator without a caller-supplied destination.
+
+## Optional transfer activation
+
+Base WSS voice cutover does not require MCP credentials or a destination map:
+`SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` is valid and keeps transfer-disabled
+behavior. Activate transfer only after Dialog confirms the MCP endpoint/API key
+and the exact one account-header spelling. For a supervised non-production transfer drill,
+approve one non-production destination, make one observed transfer, then restore
+`{}` unless separately approved for production.
+
+Enable the dashboard route only after every gate passes; keep legacy Twilio running.
+
+## Withdraw and rollback without dropping calls
+
+1. Withdraw the Dialog dashboard/carrier route and verify its approved fallback.
+2. Before stop, drain active calls: poll `/smartpbx/status` until `active_sessions`
+   is zero; retain service until the agreed active-call deadline, then escalate.
+3. Only after drain completes:
+
+   ```sh
+   cd /opt/kavya
+   SMARTPBX_IMAGE_TAG=<REVIEWED_COMMIT_SHA> docker compose --env-file .env.smartpbx --profile smartpbx stop kavya-smartpbx
+   ```
+
+Restore `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` after every temporary drill.
