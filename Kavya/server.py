@@ -214,6 +214,7 @@ def _get_twilio_client() -> TwilioRestClient | None:
 KB_DOCS_DIRECTORY: str = os.getenv("KB_DOCS_DIRECTORY", "knowledge_docs")
 KB_RELOAD_SECRET: str = os.getenv("KB_RELOAD_SECRET", "")
 PORT: int = int(os.getenv("PORT", "8000"))
+KAVYA_SERVICE_MODE: str = os.getenv("KAVYA_SERVICE_MODE", "twilio").strip().lower()
 AZURE_SPEECH_KEY: str = os.getenv("AZURE_SPEECH_KEY", "")
 AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "southeastasia")
 
@@ -2538,13 +2539,15 @@ class MediaStreamSession:
 
     def __init__(
         self,
-        websocket: WebSocket,
+        websocket: WebSocket | None,
         lang: str,
         anthropic_client: AsyncAnthropic | None = None,
         openai_client: AsyncOpenAI | None = None,
         gemini_client=None,
+        media_transport: Any | None = None,
     ):
         self.ws = websocket
+        self._media_transport = media_transport
         self.anthropic_client = anthropic_client
         self.client = openai_client  # OpenAI client (kept for openai provider)
         self.gemini_client = gemini_client
@@ -2715,10 +2718,42 @@ class MediaStreamSession:
         if self._endpointing_handle:
             self._endpointing_handle.cancel()
             self._endpointing_handle = None
+        await self._clear_media_audio()
+
+    async def _send_media_audio(self, audio: bytes) -> None:
+        """Send raw mulaw through the active provider-specific media transport."""
+        if self._media_transport is not None:
+            await self._media_transport.send_audio(audio)
+            return
+        async with self._ws_lock:
+            await self.ws.send_text(json.dumps({
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {"payload": base64.b64encode(audio).decode("ascii")},
+            }))
+
+    async def _clear_media_audio(self) -> None:
+        """Clear pending speech without leaking one provider's wire protocol."""
+        if self._media_transport is not None:
+            await self._media_transport.clear_audio()
+            return
         async with self._ws_lock:
             await self.ws.send_text(json.dumps({
                 "event": "clear",
                 "streamSid": self.stream_sid,
+            }))
+
+    async def _send_tts_done(self) -> None:
+        """Complete one utterance using local acknowledgement when available."""
+        if self._media_transport is not None:
+            await self._media_transport.send_mark("tts_done")
+            self._is_speaking = False
+            return
+        async with self._ws_lock:
+            await self.ws.send_text(json.dumps({
+                "event": "mark",
+                "streamSid": self.stream_sid,
+                "mark": {"name": "tts_done"},
             }))
 
     # â”€â”€ Debug: live-call audio capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -3273,13 +3308,13 @@ class MediaStreamSession:
     async def _speak(self, text: str, generation: int = -1):
         """Route text to appropriate TTS provider.
 
-        Tamil / Arabic â†’ ElevenLabs eleven_multilingual_v2 (cloned voice)
+        English / Tamil / Arabic â†’ ElevenLabs eleven_multilingual_v2 (cloned voice)
         Sinhala        â†’ OpenAI gpt-4o-mini-tts (nova)
         """
         async with self._speak_lock:
             if generation >= 0 and generation != self._speak_generation:
                 return
-            if self.lang in ("ta", "ar"):
+            if self.lang in ("en", "ta", "ar"):
                 await self._tts_elevenlabs(text)
             elif self.lang == "si":
                 await self._tts_openai(text)
@@ -3337,21 +3372,10 @@ class MediaStreamSession:
                     async for chunk in resp.aiter_bytes(chunk_size=640):
                         if not self._is_speaking:
                             break
-                        b64 = base64.b64encode(chunk).decode("ascii")
-                        async with self._ws_lock:
-                            await self.ws.send_text(json.dumps({
-                                "event": "media",
-                                "streamSid": self.stream_sid,
-                                "media": {"payload": b64},
-                            }))
+                        await self._send_media_audio(chunk)
 
             if self._is_speaking:
-                async with self._ws_lock:
-                    await self.ws.send_text(json.dumps({
-                        "event": "mark",
-                        "streamSid": self.stream_sid,
-                        "mark": {"name": "tts_done"},
-                    }))
+                await self._send_tts_done()
             else:
                 logger.info("ElevenLabs TTS interrupted by barge-in [%s]", self.call_sid)
 
@@ -3401,20 +3425,9 @@ class MediaStreamSession:
                     async for chunk in resp.aiter_bytes(chunk_size=640):
                         if not self._is_speaking:
                             break
-                        b64 = base64.b64encode(chunk).decode("ascii")
-                        async with self._ws_lock:
-                            await self.ws.send_text(json.dumps({
-                                "event": "media",
-                                "streamSid": self.stream_sid,
-                                "media": {"payload": b64},
-                            }))
+                        await self._send_media_audio(chunk)
             if self._is_speaking:
-                async with self._ws_lock:
-                    await self.ws.send_text(json.dumps({
-                        "event": "mark",
-                        "streamSid": self.stream_sid,
-                        "mark": {"name": "tts_done"},
-                    }))
+                await self._send_tts_done()
             else:
                 logger.info("Azure TTS interrupted by barge-in [%s]", self.call_sid)
         except httpx.TimeoutException:
@@ -3492,31 +3505,14 @@ class MediaStreamSession:
                             if not self._is_speaking:
                                 break
                             frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
-                            b64 = base64.b64encode(frame).decode("ascii")
-                            async with self._ws_lock:
-                                await self.ws.send_text(json.dumps({
-                                    "event": "media",
-                                    "streamSid": self.stream_sid,
-                                    "media": {"payload": b64},
-                                }))
+                            await self._send_media_audio(frame)
 
             # Flush any remaining tail of mulaw audio.
             if self._is_speaking and mulaw_buf:
-                b64 = base64.b64encode(mulaw_buf).decode("ascii")
-                async with self._ws_lock:
-                    await self.ws.send_text(json.dumps({
-                        "event": "media",
-                        "streamSid": self.stream_sid,
-                        "media": {"payload": b64},
-                    }))
+                await self._send_media_audio(mulaw_buf)
 
             if self._is_speaking:
-                async with self._ws_lock:
-                    await self.ws.send_text(json.dumps({
-                        "event": "mark",
-                        "streamSid": self.stream_sid,
-                        "mark": {"name": "tts_done"},
-                    }))
+                await self._send_tts_done()
             else:
                 logger.info("OpenAI TTS interrupted by barge-in [%s]", self.call_sid)
 
@@ -4729,6 +4725,69 @@ async def ws_media_stream(websocket: WebSocket, lang: str):
         gemini_client=gemini_client,
     )
     await session.run()
+
+
+# ---------------------------------------------------------------------------
+# Service-mode boundary
+# ---------------------------------------------------------------------------
+_twilio_app = app
+
+
+async def _new_smartpbx_session(context, transport):
+    from smartpbx_session import KavyaSmartPBXSession
+
+    return KavyaSmartPBXSession(context, transport)
+
+
+def build_service_app(
+    service_mode: str,
+    environ: Any,
+) -> FastAPI:
+    """Select one ingress surface; never activate Twilio and Dialog together."""
+    mode = service_mode.strip().lower() if isinstance(service_mode, str) else ""
+    if mode == "twilio":
+        return _twilio_app
+    if mode != "smartpbx":
+        raise ValueError("invalid KAVYA_SERVICE_MODE")
+
+    from smartpbx_gateway import (
+        SmartPBXGateway,
+        SmartPBXSessionRegistry,
+        SmartPBXSettings,
+    )
+
+    settings = SmartPBXSettings.from_env(environ)
+    registry = SmartPBXSessionRegistry(settings.max_calls)
+    gateway = SmartPBXGateway(settings, registry)
+    smartpbx_app = FastAPI(
+        title="Hatton Hills Voice Agent (Kavya) — SmartPBX",
+        version="1.0.0",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+
+    def smartpbx_health() -> dict[str, str]:
+        return {"status": "ok", "service_mode": "smartpbx"}
+
+    def status() -> dict[str, bool | int | str]:
+        return gateway.snapshot()
+
+    async def smartpbx_media(websocket: WebSocket) -> None:
+        await gateway.handle(websocket, _new_smartpbx_session)
+
+    smartpbx_app.add_api_route("/health", smartpbx_health, methods=["GET"])
+    smartpbx_app.add_api_route("/smartpbx/status", status, methods=["GET"])
+    smartpbx_app.add_api_websocket_route(
+        "/ws/v1/smartpbx/media",
+        smartpbx_media,
+    )
+    smartpbx_app.state.smartpbx_gateway = gateway
+    return smartpbx_app
+
+
+app = build_service_app(KAVYA_SERVICE_MODE, os.environ)
 
 
 # ---------------------------------------------------------------------------
