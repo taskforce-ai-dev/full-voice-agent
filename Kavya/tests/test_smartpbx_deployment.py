@@ -226,15 +226,23 @@ def test_tls_and_mcp_recreates_fail_fast_and_wait_for_bounded_loopback_readiness
     for block in (tls, enable, revoke):
         assert "set -euo pipefail" in block
         assert "deadline=$((SECONDS + 90))" in block
-        assert "curl --silent --show-error --fail http://127.0.0.1:8006/health" in block
-        assert "curl --silent --show-error --fail http://127.0.0.1:8006/smartpbx/status" in block
+        assert "curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health" in block
+        assert "curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status" in block
         assert "sleep 2" in block
         assert "exit 1" in block
-        assert block.find(recreate) < block.find(readiness)
+        invocations = [
+            match.start()
+            for match in re.finditer(r"(?m)^wait_for_smartpbx_ready\s*$", block)
+        ]
+        assert len(invocations) == 1
+        assert block.find(recreate) < invocations[0]
 
-    assert tls.find(readiness) < tls.find("sudo install -m 0644 nginx-smartpbx.conf")
-    assert runbook.find(readiness, runbook.find("Enable a supervised non-production transfer drill")) < runbook.find("Perform one observed drill")
-    assert revoke.find(readiness) < revoke.find(".transfer_enabled == false")
+    tls_invocation = re.search(r"(?m)^wait_for_smartpbx_ready\s*$", tls).start()
+    enable_invocation = re.search(r"(?m)^wait_for_smartpbx_ready\s*$", enable).start()
+    revoke_invocation = re.search(r"(?m)^wait_for_smartpbx_ready\s*$", revoke).start()
+    assert tls_invocation < tls.find("sudo install -m 0644 nginx-smartpbx.conf")
+    assert runbook.find("Enable a supervised non-production transfer drill") + enable_invocation < runbook.find("Perform one observed drill")
+    assert revoke_invocation < revoke.find(".transfer_enabled == false")
 
 
 def test_yanolja_credentials_are_blank_and_smartpbx_chroma_state_is_ignored():

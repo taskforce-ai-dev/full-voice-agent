@@ -155,8 +155,8 @@ SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smart
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
 wait_for_smartpbx_ready() {
   deadline=$((SECONDS + 90))
-  while ! curl --silent --show-error --fail http://127.0.0.1:8006/health >/dev/null \
-    || ! curl --silent --show-error --fail http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+  while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health >/dev/null \
+    || ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status >/dev/null; do
     if (( SECONDS >= deadline )); then
       echo "SmartPBX did not become ready within 90 seconds" >&2
       exit 1
@@ -208,8 +208,8 @@ cd /opt/kavya
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
 wait_for_smartpbx_ready() {
   deadline=$((SECONDS + 90))
-  while ! curl --silent --show-error --fail http://127.0.0.1:8006/health >/dev/null \
-    || ! curl --silent --show-error --fail http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+  while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health >/dev/null \
+    || ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status >/dev/null; do
     if (( SECONDS >= deadline )); then
       echo "SmartPBX did not become ready within 90 seconds" >&2
       exit 1
@@ -230,8 +230,8 @@ cd /opt/kavya
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
 wait_for_smartpbx_ready() {
   deadline=$((SECONDS + 90))
-  while ! curl --silent --show-error --fail http://127.0.0.1:8006/health >/dev/null \
-    || ! curl --silent --show-error --fail http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+  while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health >/dev/null \
+    || ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status >/dev/null; do
     if (( SECONDS >= deadline )); then
       echo "SmartPBX did not become ready within 90 seconds" >&2
       exit 1
