@@ -169,12 +169,52 @@ def test_prompt_forbids_the_generic_full_name_reask():
     ) in PROMPT
 
 
-def test_prompt_has_a_two_token_one_part_at_a_time_branch():
-    """The missing branch that caused the production failure: two tokens
-    arrived and at least one looks mis-transcribed. Confirm one part at a
-    time rather than re-asking for the whole name."""
-    assert "If you received TWO tokens but either looks mis-transcribed" in PROMPT
+def test_prompt_has_a_two_or_more_token_one_part_at_a_time_branch():
+    """The missing branch that caused the production failure: two or more
+    tokens arrived and at least one looks mis-transcribed. Confirm one part
+    at a time rather than re-asking for the whole name. Generalised from
+    the original TWO-tokens-only wording (#123) to close the three-or-more
+    token gap - see test_prompt_has_no_gap_for_three_or_more_tokens below -
+    without duplicating this branch for every possible token count."""
+    assert "If you received TWO OR MORE tokens" in PROMPT
     assert "confirm ONE PART AT A TIME" in PROMPT
+
+
+def test_prompt_has_no_gap_for_three_or_more_tokens():
+    """Before this fix, the prompt had a branch for exactly ONE token and a
+    branch for exactly TWO tokens - nothing for three or more, even though
+    Sri Lankan names routinely have three parts (first, middle, last). A
+    three-token reply (clean or mis-transcribed) had no matching branch,
+    which is the identical "no applicable instruction, fall back to
+    something forbidden" shape that produced the original seven-turn loop
+    on a two-token reply (#123) - it just had not been hit yet because
+    nobody had tested a long name. The branch is now token-count-agnostic:
+    it explicitly says extra tokens are a normal name shape, not an error,
+    and gives a deterministic mapping (first token = first name, every
+    other token joined = last name) that applies for any token count, not
+    just two."""
+    assert "more than two tokens" in PROMPT
+    assert "Chanya Malsha Shehani" in PROMPT
+    assert "whether the guest gave two tokens or more" in PROMPT
+    assert (
+        "take the FIRST token as the first name and join every remaining "
+        "token together as the last name"
+    ) in PROMPT
+
+
+def test_suspect_token_resolution_maps_back_to_first_and_last_name():
+    """The suspect-token branch resolves tokens one at a time by position
+    (first suspect part, then the next), but never explicitly said how the
+    resolved tokens map back onto the first-name/last-name fields once
+    there are more than two of them. Left implicit, that is exactly the
+    kind of ambiguity the #123 history warns about: a model asked to fill
+    two fields from N confirmed tokens with no stated mapping has no
+    single correct move. The prompt must state the same first-token/
+    remaining-tokens mapping used in the clean case applies here too."""
+    assert (
+        "Once every token is resolved, map them the same way as the clean "
+        "case above"
+    ) in PROMPT
 
 
 def test_suspect_token_criterion_does_not_flag_real_english_names():
