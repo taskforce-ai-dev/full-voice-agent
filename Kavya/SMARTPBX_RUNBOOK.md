@@ -19,6 +19,7 @@ do not stop, edit, restart, or route Flico through this service.
   the other.
 
 ```sh
+set -euo pipefail
 cd /opt/kavya
 # Replace these two example shapes with the reviewed values from the successful
 # image workflow. The first is exactly the CI `git rev-parse --short HEAD` tag.
@@ -30,6 +31,7 @@ SMARTPBX_IMAGE="ghcr.io/taskforce-ai-dev/kavya:$REVIEWED_CI_SHORT_SHA"
 Prefer the image already pulled by the successful image deploy workflow:
 
 ```sh
+set -euo pipefail
 docker image inspect "$SMARTPBX_IMAGE" >/dev/null
 docker image inspect "$SMARTPBX_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' | grep -Fx "$REVIEWED_FULL_COMMIT_SHA"
 ```
@@ -39,6 +41,7 @@ least-privilege package-read token. The token is read silently, passed only on
 standard input, and is neither an argument nor output:
 
 ```sh
+set -euo pipefail
 read -r GHCR_USERNAME
 read -r -s GHCR_READ_TOKEN
 printf '\n'
@@ -52,6 +55,7 @@ docker image inspect "$SMARTPBX_IMAGE" --format '{{ index .Config.Labels "org.op
 ## Create the isolated server-side environment
 
 ```sh
+set -euo pipefail
 cd /opt/kavya
 umask 077
 touch /opt/kavya/.env.smartpbx
@@ -137,6 +141,7 @@ skip only a completed issuance; never install the certificate-referencing site
 before its files exist.
 
 ```sh
+set -euo pipefail
 cd /opt/kavya
 getent ahostsv4 smartpbx-kavya.taskforceai.tech | grep -F '67.207.90.109'
 sudo install -m 0644 nginx-smartpbx-acme.conf /etc/nginx/sites-available/kavya-smartpbx
@@ -148,8 +153,18 @@ test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/fullchain.pem
 test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/privkey.pem
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
-curl --fail http://127.0.0.1:8006/health
-curl --fail http://127.0.0.1:8006/smartpbx/status
+wait_for_smartpbx_ready() {
+  deadline=$((SECONDS + 90))
+  while ! curl --silent --show-error --fail http://127.0.0.1:8006/health >/dev/null \
+    || ! curl --silent --show-error --fail http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+    if (( SECONDS >= deadline )); then
+      echo "SmartPBX did not become ready within 90 seconds" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+}
+wait_for_smartpbx_ready
 sudo install -m 0644 nginx-smartpbx.conf /etc/nginx/sites-available/kavya-smartpbx
 sudo nginx -t
 sudo systemctl reload nginx
@@ -159,7 +174,8 @@ curl --fail https://smartpbx-kavya.taskforceai.tech/smartpbx/status
 
 `config > /dev/null` validates Compose without printing secrets. `--pull never`
 requires the exact reviewed image verified above and prevents an unreviewed pull.
-Do not continue after a config, loopback health, or status failure.
+The bounded 90-second loop covers the configured 40-second container warm-up;
+it requires both loopback endpoints before the final TLS vhost is installed.
 
 ## Cutover gates
 
@@ -187,9 +203,21 @@ endpoint, API key, account-header spelling, and an allowlisted test destination.
 Edit `.env.smartpbx` to add only that test destination, then apply it:
 
 ```sh
+set -euo pipefail
 cd /opt/kavya
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
-curl --fail http://127.0.0.1:8006/health
+wait_for_smartpbx_ready() {
+  deadline=$((SECONDS + 90))
+  while ! curl --silent --show-error --fail http://127.0.0.1:8006/health >/dev/null \
+    || ! curl --silent --show-error --fail http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+    if (( SECONDS >= deadline )); then
+      echo "SmartPBX did not become ready within 90 seconds" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+}
+wait_for_smartpbx_ready
 ```
 
 Perform one observed drill. Restore `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` in
@@ -197,9 +225,21 @@ Perform one observed drill. Restore `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` in
 configuration reached the running process before considering the drill revoked:
 
 ```sh
+set -euo pipefail
 cd /opt/kavya
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
-curl --fail http://127.0.0.1:8006/health
+wait_for_smartpbx_ready() {
+  deadline=$((SECONDS + 90))
+  while ! curl --silent --show-error --fail http://127.0.0.1:8006/health >/dev/null \
+    || ! curl --silent --show-error --fail http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+    if (( SECONDS >= deadline )); then
+      echo "SmartPBX did not become ready within 90 seconds" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+}
+wait_for_smartpbx_ready
 curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e '.transfer_enabled == false'
 ```
 
@@ -212,6 +252,7 @@ curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e '.transfer_enabled == 
 3. Only after drain completes:
 
    ```sh
+   set -euo pipefail
    cd /opt/kavya
    SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx stop kavya-smartpbx
    ```

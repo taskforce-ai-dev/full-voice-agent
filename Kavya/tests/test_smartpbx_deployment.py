@@ -210,6 +210,33 @@ def test_acme_bootstrap_precedes_loopback_health_and_final_tls_proxy():
     assert "already issued" in runbook
 
 
+def test_tls_and_mcp_recreates_fail_fast_and_wait_for_bounded_loopback_readiness():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    recreate = (
+        'SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose '
+        "--env-file .env.smartpbx --profile smartpbx up -d --force-recreate "
+        "--pull never kavya-smartpbx"
+    )
+    readiness = "wait_for_smartpbx_ready"
+
+    tls = runbook.split("## TLS bootstrap, local service validation, then public proxy", 1)[1].split("## Cutover gates", 1)[0]
+    enable = runbook.split("Enable a supervised non-production transfer drill", 1)[1].split("Perform one observed drill", 1)[0]
+    revoke = runbook.split("Perform one observed drill", 1)[1].split("## Withdraw", 1)[0]
+
+    for block in (tls, enable, revoke):
+        assert "set -euo pipefail" in block
+        assert "deadline=$((SECONDS + 90))" in block
+        assert "curl --silent --show-error --fail http://127.0.0.1:8006/health" in block
+        assert "curl --silent --show-error --fail http://127.0.0.1:8006/smartpbx/status" in block
+        assert "sleep 2" in block
+        assert "exit 1" in block
+        assert block.find(recreate) < block.find(readiness)
+
+    assert tls.find(readiness) < tls.find("sudo install -m 0644 nginx-smartpbx.conf")
+    assert runbook.find(readiness, runbook.find("Enable a supervised non-production transfer drill")) < runbook.find("Perform one observed drill")
+    assert revoke.find(readiness) < revoke.find(".transfer_enabled == false")
+
+
 def test_yanolja_credentials_are_blank_and_smartpbx_chroma_state_is_ignored():
     example = read_text(".env.example")
     client = read_text("yanolja_client.py")
