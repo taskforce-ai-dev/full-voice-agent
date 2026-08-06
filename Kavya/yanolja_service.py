@@ -197,6 +197,34 @@ def resolve_property(query: str) -> str:
     return PROPERTY_HATTON
 
 
+def _resolve_stored_phone(guest_phone: str, caller_phone: str = "") -> str:
+    """Pick the WhatsApp/PMS number to store for a booking.
+
+    Prefer the guest's dictated number, but only if it VALIDATES -- a
+    wrong-length number comes back from ``normalize_whatsapp`` as "" and must
+    never be stored, because a plausible-looking wrong 94... number silently
+    sends the confirmation to a real stranger (the Booking 80 defect). When the
+    dictated number is unusable, fall back to the line the guest is calling from
+    (caller ID) so the booking still carries a reachable number instead of
+    garbage or nothing. Returns "" only when neither yields a valid number, in
+    which case downstream (the n8n post-call processor) still confirms on the
+    caller's line.
+
+    >>> _resolve_stored_phone("0771234567")
+    '94771234567'
+    >>> _resolve_stored_phone("074294451", "+94711754668")  # dictated too short
+    '94711754668'
+    >>> _resolve_stored_phone("", "0771234567")             # none given
+    '94771234567'
+    >>> _resolve_stored_phone("074294451", "")              # both unusable
+    ''
+    """
+    normalized = normalize_whatsapp(guest_phone)
+    if not normalized and caller_phone:
+        normalized = normalize_whatsapp(caller_phone)
+    return normalized
+
+
 def _property_prompt() -> str:
     """Never asks the guest to choose — there is only one property. Retained
     because `_room_choice_prompt` falls back to it for an unknown property."""
@@ -533,6 +561,7 @@ async def book(
     num_adults: int = 1,
     num_children: int = 0,
     property_name: str = "",
+    caller_phone: str = "",
 ) -> dict:
     try:
         ci = _parse_date(check_in)
@@ -608,12 +637,14 @@ async def book(
     guest_payload: dict[str, Any] = {"firstName": first, "lastName": last}
     if guest_email:
         guest_payload["email"] = guest_email.strip()
-    if guest_phone:
-        # Store the canonical number the WhatsApp handover path produces, so the
-        # PMS and the manager notification never disagree. normalize_whatsapp()
-        # also expands spoken "double"/"triple" shorthand ("double seven" -> 77).
-        # Fall back to the raw value only if normalisation finds no usable digits.
-        guest_payload["phone"] = normalize_whatsapp(guest_phone) or guest_phone.strip()
+    # Store the canonical number the WhatsApp handover path produces, so the PMS
+    # and the manager notification never disagree. _resolve_stored_phone validates
+    # the guest's dictated number (rejecting a wrong-length one rather than padding
+    # it into a plausible-looking wrong 94... number) and falls back to the
+    # caller's own line when it is unusable, so the booking is never blocked.
+    stored_phone = _resolve_stored_phone(guest_phone, caller_phone)
+    if stored_phone:
+        guest_payload["phone"] = stored_phone
 
     try:
         guest = await create_guest(guest_payload)

@@ -1099,8 +1099,9 @@ def _build_system_prompt(lang: str = "en") -> str:
         "Sri Lanka, ask which country they are calling from and "
         "you add the country code yourself based on that country. Under no "
         "circumstances should you ask the caller to dictate the country "
-        "code digits. If the number you heard sounds incomplete, only ask "
-        "them to repeat the local number — never the country code.\n"
+        "code digits. If the local number is the wrong length, follow the "
+        "MOBILE NUMBER LENGTH CHECK rule below — only ask them to repeat the "
+        "local number, never the country code.\n"
         "- READING THE MOBILE NUMBER BACK: when you repeat the mobile number "
         "to the guest to confirm it, say it EXACTLY as they gave it — the "
         "plain local digits, digit by digit (for example 'zero seven seven, "
@@ -1115,6 +1116,40 @@ def _build_system_prompt(lang: str = "en") -> str:
         "THREE times (e.g. 'triple five' = 555). Always expand these "
         "fully. For example, 'oh seven one one, seven five four, "
         "double six eight' = 0711 754 668.\n"
+        "- MOBILE NUMBER LENGTH CHECK: a Sri Lankan mobile number has "
+        "exactly NINE digits after the leading zero (for example 'zero "
+        "seven seven, one two three, four five six seven' is 077 123 4567 "
+        "— nine digits after the zero). ACCEPT EVERY natural way a guest "
+        "gives it: with or without the leading zero, with or without 'plus "
+        "nine four' or 'nine four' in front, in any grouping, and using "
+        "'double'/'triple' shorthand or 'oh' for zero. Those are all valid "
+        "— never reject a number because of HOW it was said. After "
+        "expanding any shorthand, silently count the local digits (ignore a "
+        "leading zero and any 'nine four' country code you may have "
+        "assumed). Exactly nine local digits means it is complete: do NOT "
+        "re-ask.\n"
+        "- ONLY when the count is genuinely WRONG — fewer than nine or more "
+        "than nine local digits — tell the guest plainly and re-ask once, "
+        "e.g. 'Sorry, that came through as only eight digits — could you "
+        "say your mobile number once more?'. If the SECOND attempt is also "
+        "the wrong length, ask them to say it slowly, DIGIT BY DIGIT, e.g. "
+        "'Let's try once more, nice and slow — could you say your number "
+        "one digit at a time?'.\n"
+        "- CALLER-ID FALLBACK (never block the booking): if after asking "
+        "digit by digit the number is STILL the wrong length, do NOT keep "
+        "looping and do NOT stop. Say gracefully that you'll use the number "
+        "they are calling from, e.g. 'No problem at all — it seems we "
+        "didn't quite catch that, so we'll send your confirmation to the "
+        "number you're calling from.' Then continue as normal. You do NOT "
+        "need to read that number back and you do NOT need to say or pass "
+        "any digits — the system automatically uses the line the guest is "
+        "calling from whenever the number given is unusable. The booking "
+        "(and any handover callback) must ALWAYS proceed; an unclear or "
+        "wrong-length number NEVER cancels them.\n"
+        "- FOREIGN NUMBERS: if the guest has made clear they are calling "
+        "from outside Sri Lanka, the nine-digit rule does NOT apply — take "
+        "the digits they give for their own country, do not force them to "
+        "Sri Lankan length, and do not re-ask on length alone.\n"
         "- Ask ONE question at a time and wait for the answer before asking the "
         "next. Never stack multiple questions in a single turn. Keep each "
         "question short and conversational.\n"
@@ -1314,7 +1349,10 @@ def _build_handoff_failsafe_prompt(state: dict) -> str:
             f"- The guest is calling from {caller_phone}. Offer that number "
             "first: 'Can our team reach you on WhatsApp on the number you're "
             "calling from?' If they say yes, use exactly that number. If they "
-            "want a different number, take the one they give you.\n"
+            "want a different number, take the one they give you. If a number "
+            "they dictate keeps coming out the wrong length, do not loop — "
+            "reassure them you'll reach them on the number they're calling "
+            "from and use that.\n"
         )
     else:
         number_rules = (
@@ -1380,6 +1418,12 @@ def _build_handoff_failsafe_prompt(state: dict) -> str:
         "'double five'), interpret it as that digit repeated twice ('55'). "
         "Likewise 'triple seven' means '777'. This is common when callers read "
         "out phone numbers.\n"
+        "- NUMBER LENGTH: a Sri Lankan mobile number is nine digits after the "
+        "leading zero. Accept any natural way it is said, but if the number "
+        "the guest dictates is clearly the wrong length (too few or too many "
+        "digits), say so warmly and ask once more. Do NOT loop endlessly on "
+        "it — an unclear or wrong-length number must NEVER stop you from "
+        "passing the guest's details to the team.\n"
         "- If the guest DICTATED a number to you, read it back once so a "
         "mis-heard digit gets corrected, then send it. If they simply agreed "
         "to be reached on the number they called from, that is ALREADY "
@@ -4190,6 +4234,15 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                     message.get("streamSid", "n/a"),
                     caller_phone,
                 )
+
+                # Make the caller's own line reachable to the booking tool as a
+                # WhatsApp fallback: if the guest's dictated number is unusable
+                # (wrong length), create_booking uses this so the booking still
+                # carries a reachable number instead of nothing. The failsafe
+                # branch below installs its own richer context; this covers the
+                # normal booking path, where handover_context is otherwise unset.
+                if not is_failsafe:
+                    handover_context.set({"caller_phone": caller_phone})
 
                 if is_failsafe:
                     # Rebuild Kavya's context from the pre-transfer leg of this

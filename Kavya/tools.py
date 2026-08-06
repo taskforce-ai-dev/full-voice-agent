@@ -547,6 +547,15 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
             "create_booking for property: %s, room type: %s", property_name, requested_room
         )
 
+        # The line the guest is calling from (caller ID), stashed on the
+        # per-call context by the WebSocket session. If the guest's dictated
+        # number is unusable (wrong length -> normalize_whatsapp returns ""),
+        # yanolja_service.book falls back to this so the booking still carries a
+        # reachable WhatsApp number instead of storing garbage or nothing.
+        from handover import handover_context
+
+        caller_phone = (handover_context.get() or {}).get("caller_phone", "")
+
         result = await create_booking(
             check_in=tool_input["check_in"],
             check_out=tool_input["check_out"],
@@ -560,6 +569,7 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
             rate_type=tool_input.get("rate_type", "BB"),
             room_name=tool_input.get("room_name", ""),
             property_name=property_name,
+            caller_phone=caller_phone,
         )
 
     elif tool_name == "retrieve_booking":

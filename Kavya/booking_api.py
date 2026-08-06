@@ -122,6 +122,7 @@ async def create_booking(
     rate_type: str = "BB",
     room_name: str = "",
     property_name: str = "",   # "Hatton Hills" (single property; may be empty)
+    caller_phone: str = "",    # line the guest is calling from; WhatsApp fallback
 ) -> dict[str, Any]:
     if not is_configured():
         return dict(_UNAVAILABLE)
@@ -137,6 +138,7 @@ async def create_booking(
             num_adults=num_adults,
             num_children=num_children,
             property_name=property_name or "",
+            caller_phone=caller_phone or "",
         )
     except yanolja_client.YanoljaError as exc:
         logger.warning("Yanolja booking failed: %s", exc)

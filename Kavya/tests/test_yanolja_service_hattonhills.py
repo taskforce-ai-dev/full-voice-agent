@@ -308,3 +308,26 @@ async def test_no_mosvold_string_reaches_the_caller(pms):
     blob = repr(result).lower()
     for stale in ("mosvold", "sundara", "balapitiya", "ahangama", "deluxe", "founders"):
         assert stale not in blob, f"{stale!r} leaked into a caller-facing payload"
+
+
+# --------------------------------------------------------------------------- #
+# Phone stored on a booking: validate, never manufacture, fall back to caller  #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("guest, caller, expected", [
+    # A good dictated number is kept (and canonicalised to 94 + 9-digit NSN).
+    ("0774294451", "", "94774294451"),
+    ("077 429 4451", "0711754668", "94774294451"),   # guest good -> caller ignored
+    # A wrong-length dictated number is NOT padded into a plausible wrong one;
+    # it falls back to the line the guest is calling from (Booking 80 defect).
+    ("074294451", "0711754668", "94711754668"),      # one digit dropped
+    ("07742944510", "+94711754668", "94711754668"),  # one digit too many
+    ("", "0711754668", "94711754668"),               # none dictated
+    # Both unusable -> store nothing; downstream confirms on the caller's line.
+    ("074294451", "", ""),
+    ("", "", ""),
+    # A wrong-length CALLER id is not trusted either.
+    ("074294451", "12", ""),
+])
+def test_resolve_stored_phone(guest, caller, expected):
+    assert ys._resolve_stored_phone(guest, caller) == expected
