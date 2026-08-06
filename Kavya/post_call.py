@@ -221,6 +221,7 @@ async def extract_booking_details(
     openai_client: Any | None = None,
     gemini_client: Any | None = None,
     model: str = "",
+    privacy_safe: bool = False,
 ) -> dict[str, Any]:
     """Extract structured booking details from a call transcript via LLM.
 
@@ -254,7 +255,10 @@ async def extract_booking_details(
                 gemini_client, transcript_text, model or "gemini-2.5-flash",
             )
         else:
-            logger.warning("No LLM client available for extraction (provider=%s)", llm_provider)
+            if privacy_safe:
+                logger.warning("smartpbx_post_call event=extraction_no_client")
+            else:
+                logger.warning("No LLM client available for extraction (provider=%s)", llm_provider)
             empty["_extraction_error"] = "no_client"
             return empty
 
@@ -265,13 +269,20 @@ async def extract_booking_details(
         return _normalize_property_and_room(result)
 
     except json.JSONDecodeError as exc:
-        logger.warning("Failed to parse LLM extraction JSON (attempt 1): %s", exc)
+        if privacy_safe:
+            logger.warning("smartpbx_post_call event=extraction_parse_failed attempt=1")
+        else:
+            logger.warning("Failed to parse LLM extraction JSON (attempt 1): %s", exc)
         # Retry once with a simpler prompt
         try:
-            logger.info("Retrying extraction with simplified prompt...")
+            if privacy_safe:
+                logger.info("smartpbx_post_call event=extraction_retry")
+            else:
+                logger.info("Retrying extraction with simplified prompt...")
             retry_result = await _retry_extraction(
                 transcript_text, llm_provider,
                 anthropic_client, openai_client, gemini_client, model,
+                privacy_safe=privacy_safe,
             )
             if retry_result:
                 for key in empty:
@@ -279,12 +290,20 @@ async def extract_booking_details(
                         retry_result[key] = empty[key]
                 return _normalize_property_and_room(retry_result)
         except Exception as retry_exc:
-            logger.error("Retry extraction also failed: %s", retry_exc)
-        empty["_extraction_error"] = f"json_parse: {exc}"
+            if privacy_safe:
+                logger.error("smartpbx_post_call event=extraction_retry_failed")
+            else:
+                logger.error("Retry extraction also failed: %s", retry_exc)
+        empty["_extraction_error"] = (
+            "json_parse" if privacy_safe else f"json_parse: {exc}"
+        )
         return empty
     except Exception as exc:
-        logger.exception("LLM extraction failed: %s", exc)
-        empty["_extraction_error"] = str(exc)
+        if privacy_safe:
+            logger.error("smartpbx_post_call event=extraction_failed")
+        else:
+            logger.exception("LLM extraction failed: %s", exc)
+        empty["_extraction_error"] = "extraction_failed" if privacy_safe else str(exc)
         return empty
 
 
@@ -301,6 +320,7 @@ async def _retry_extraction(
     openai_client: Any | None,
     gemini_client: Any | None,
     model: str,
+    privacy_safe: bool = False,
 ) -> dict[str, Any] | None:
     """Retry extraction with a shorter prompt if the first attempt failed."""
     prompt = f"{RETRY_PROMPT}\n\nTranscript:\n{transcript_text}"
@@ -334,7 +354,10 @@ async def _retry_extraction(
             return None
         return json.loads(text)
     except Exception as exc:
-        logger.error("Retry extraction failed: %s", exc)
+        if privacy_safe:
+            logger.error("smartpbx_post_call event=extraction_retry_failed")
+        else:
+            logger.error("Retry extraction failed: %s", exc)
         return None
 
 
@@ -342,7 +365,7 @@ async def _retry_extraction(
 # n8n webhook POST
 # ---------------------------------------------------------------------------
 
-async def _post_to_n8n(payload: dict[str, Any]) -> None:
+async def _post_to_n8n(payload: dict[str, Any], privacy_safe: bool = False) -> None:
     """POST the call data payload to the n8n webhook. Fire-and-forget."""
     from booking_api import get_session
 
@@ -351,14 +374,23 @@ async def _post_to_n8n(payload: dict[str, Any]) -> None:
         session = await get_session()
         async with session.post(url, json=payload) as resp:
             if resp.status < 300:
-                logger.info("Post-call data sent to n8n — status %d", resp.status)
+                if privacy_safe:
+                    logger.info("smartpbx_post_call event=n8n_sent status=%d", resp.status)
+                else:
+                    logger.info("Post-call data sent to n8n — status %d", resp.status)
             else:
                 body = await resp.text()
-                logger.error(
-                    "n8n post-call webhook returned %d: %s", resp.status, body[:500],
-                )
+                if privacy_safe:
+                    logger.error("smartpbx_post_call event=n8n_failed status=%d", resp.status)
+                else:
+                    logger.error(
+                        "n8n post-call webhook returned %d: %s", resp.status, body[:500],
+                    )
     except Exception as exc:
-        logger.exception("Failed to POST post-call data to n8n: %s", exc)
+        if privacy_safe:
+            logger.error("smartpbx_post_call event=n8n_failed outcome=exception")
+        else:
+            logger.exception("Failed to POST post-call data to n8n: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +418,7 @@ async def process_post_call_data(
     openai_client: Any | None = None,
     gemini_client: Any | None = None,
     model: str = "",
+    privacy_safe: bool = False,
 ) -> None:
     """Orchestrate post-call processing: extract details, POST to n8n.
 
@@ -393,7 +426,10 @@ async def process_post_call_data(
     are caught and logged -- never propagated.
     """
     try:
-        logger.info("Starting post-call processing for CallSid: %s", call_sid)
+        if privacy_safe:
+            logger.info("smartpbx_post_call event=processing_started")
+        else:
+            logger.info("Starting post-call processing for CallSid: %s", call_sid)
 
         transcript_text = _format_transcript(full_transcript)
 
@@ -406,15 +442,19 @@ async def process_post_call_data(
             openai_client=openai_client,
             gemini_client=gemini_client,
             model=model,
+            privacy_safe=privacy_safe,
         )
 
         # Remove internal error key before sending to n8n
         extraction_error = extracted.pop("_extraction_error", None)
         if extraction_error:
-            logger.warning(
-                "Extraction had issues for %s: %s — sending partial data",
-                call_sid, extraction_error,
-            )
+            if privacy_safe:
+                logger.warning("smartpbx_post_call event=extraction_partial")
+            else:
+                logger.warning(
+                    "Extraction had issues for %s: %s — sending partial data",
+                    call_sid, extraction_error,
+                )
 
         # Build the payload
         lang_names = {"en": "English", "si": "Sinhala", "ta": "Tamil", "ar": "Arabic"}
@@ -429,7 +469,7 @@ async def process_post_call_data(
         }
 
         # POST to n8n
-        await _post_to_n8n(payload)
+        await _post_to_n8n(payload, privacy_safe=privacy_safe)
 
         if dashboard_client is not None:
             try:
@@ -441,10 +481,13 @@ async def process_post_call_data(
                     _dur = int((_end - _start).total_seconds())
                 except Exception:
                     _dur = 0
-                logger.info(
-                    "[handoff] dispatching call.completed: call_sid=%s caller_phone=%s",
-                    call_sid, caller_phone,
-                )
+                if privacy_safe:
+                    logger.info("smartpbx_post_call event=dashboard_dispatch")
+                else:
+                    logger.info(
+                        "[handoff] dispatching call.completed: call_sid=%s caller_phone=%s",
+                        call_sid, caller_phone,
+                    )
                 await dashboard_client.send_call_completed(
                     call_sid=call_sid,
                     caller_phone=caller_phone,
@@ -454,14 +497,24 @@ async def process_post_call_data(
                     duration_sec=_dur,
                     full_transcript=full_transcript,
                     extracted=extracted,
+                    privacy_safe=privacy_safe,
                 )
             except Exception as exc:
-                logger.warning("[dashboard] send_call_completed failed: %s", exc)
+                if privacy_safe:
+                    logger.warning("smartpbx_post_call event=dashboard_failed")
+                else:
+                    logger.warning("[dashboard] send_call_completed failed: %s", exc)
 
-        logger.info(
-            "Post-call processing complete for %s — outcome: %s, follow_up: %s",
-            call_sid, extracted.get("call_outcome"), extracted.get("follow_up_needed"),
-        )
+        if privacy_safe:
+            logger.info("smartpbx_post_call event=processing_completed")
+        else:
+            logger.info(
+                "Post-call processing complete for %s — outcome: %s, follow_up: %s",
+                call_sid, extracted.get("call_outcome"), extracted.get("follow_up_needed"),
+            )
 
     except Exception:
-        logger.exception("Post-call processing failed for CallSid: %s", call_sid)
+        if privacy_safe:
+            logger.error("smartpbx_post_call event=processing_failed")
+        else:
+            logger.exception("Post-call processing failed for CallSid: %s", call_sid)

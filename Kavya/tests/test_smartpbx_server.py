@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -174,6 +175,7 @@ async def test_dialog_audio_and_post_call_metadata_come_from_validated_context(c
     assert post_call_calls[0]["call_sid"] == "dialog-safe-call"
     assert post_call_calls[0]["caller_phone"] == "+94000000000"
     assert post_call_calls[0]["lang"] == "en"
+    assert post_call_calls[0]["privacy_safe"] is True
     assert "dialog-media-leg" not in caplog.text
     assert "dialog-safe-call" not in caplog.text
     assert "+94000000000" not in caplog.text
@@ -292,6 +294,188 @@ def test_smartpbx_stt_streams_can_disable_raw_sdk_transcript_logging(caplog):
         stream._on_recognizing(Event())
 
     assert "raw azure stt transcript" not in caplog.text
+
+
+def test_google_smartpbx_english_stt_constructs_en_us_without_duplicate_alternative(monkeypatch):
+    import server
+
+    captured = {}
+
+    class RecognitionConfig:
+        AudioEncoding = SimpleNamespace(MULAW="mulaw")
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class StreamingRecognitionConfig:
+        def __init__(self, **kwargs):
+            self.config = kwargs["config"]
+
+    class SpeechClient:
+        def streaming_recognize(self, *, config, requests):
+            captured["config"] = config.config.kwargs
+            return []
+
+    fake_google = SimpleNamespace(
+        SpeechClient=SpeechClient,
+        RecognitionConfig=RecognitionConfig,
+        StreamingRecognitionConfig=StreamingRecognitionConfig,
+        StreamingRecognizeRequest=lambda **kwargs: kwargs,
+    )
+    monkeypatch.setattr(server, "google_speech", fake_google)
+    stream = server.GoogleSTTStream(lambda _text: None, lang="en", privacy_safe=True)
+    stream._running = True
+
+    stream._run_one_stream()
+
+    assert captured["config"]["language_code"] == "en-US"
+    assert "en-US" not in captured["config"]["alternative_language_codes"]
+
+
+def test_azure_smartpbx_english_stt_constructs_en_us(monkeypatch):
+    import server
+
+    class Signal:
+        def connect(self, _callback):
+            return None
+
+    class SpeechConfig:
+        def __init__(self, **_kwargs):
+            self.speech_recognition_language = None
+
+    class PushAudioInputStream:
+        def __init__(self, **_kwargs):
+            pass
+
+    class SpeechRecognizer:
+        def __init__(self, *, speech_config, audio_config):
+            self.speech_config = speech_config
+            self.audio_config = audio_config
+            self.recognizing = Signal()
+            self.recognized = Signal()
+            self.canceled = Signal()
+
+        def start_continuous_recognition_async(self):
+            return None
+
+    fake_azure = SimpleNamespace(
+        SpeechConfig=SpeechConfig,
+        SpeechRecognizer=SpeechRecognizer,
+        audio=SimpleNamespace(
+            AudioStreamFormat=lambda **kwargs: kwargs,
+            PushAudioInputStream=PushAudioInputStream,
+            AudioConfig=lambda **kwargs: kwargs,
+        ),
+    )
+    monkeypatch.setattr(server, "azure_speech", fake_azure)
+    monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", True)
+    monkeypatch.setattr(server, "AZURE_SPEECH_KEY", "test-key")
+    stream = server.AzureSTTStream(lambda _text: None, lang="en", privacy_safe=True)
+
+    stream.start()
+
+    assert stream._recognizer.speech_config.speech_recognition_language == "en-US"
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_local_tts_completion_schedules_one_silence_nudge():
+    import server
+
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+    blocker = asyncio.Event()
+    starts = 0
+
+    async def wait_for_silence():
+        nonlocal starts
+        starts += 1
+        await blocker.wait()
+
+    pipeline._reprompt_after_silence = wait_for_silence
+    await pipeline._send_tts_done()
+    await asyncio.sleep(0)
+    first = pipeline._reprompt_task
+    await pipeline._send_tts_done()
+    await asyncio.sleep(0)
+    second = pipeline._reprompt_task
+
+    assert first is not second
+    assert first.cancelled()
+    assert starts == 2
+    pipeline._cancel_reprompt()
+    await asyncio.gather(second, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_dialog_silence_nudge_log_is_event_only(caplog, monkeypatch):
+    import server
+
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+    pipeline.call_sid = "REPROMPT-CALL-ID-SECRET"
+    monkeypatch.setattr(server, "SILENCE_REPROMPT_DELAY", 0)
+
+    async def no_speak(_text, generation=-1):
+        return None
+
+    pipeline._speak = no_speak
+    with caplog.at_level(logging.INFO):
+        await pipeline._reprompt_after_silence()
+
+    assert "REPROMPT-CALL-ID-SECRET" not in caplog.text
+    assert "smartpbx_media event=silence_reprompt attempt=1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_legacy_tts_done_keeps_wire_mark_without_local_reprompt():
+    import server
+
+    class CapturingWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_text(self, message):
+            self.messages.append(message)
+
+    websocket = CapturingWebSocket()
+    pipeline = server.MediaStreamSession(websocket=websocket, lang="si")
+    pipeline.stream_sid = "legacy-stream"
+
+    await pipeline._send_tts_done()
+
+    assert '"event": "mark"' in websocket.messages[0]
+    assert pipeline._reprompt_task is None
+
+
+@pytest.mark.asyncio
+async def test_finish_cancels_and_awaits_inflight_welcome_speech():
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class HangingPipeline(FakePipeline):
+        async def _speak(self, _text):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    async def process_post_call(**_metadata):
+        return None
+
+    session, _, _, _ = make_session(
+        post_call_processor=process_post_call, pipeline=HangingPipeline()
+    )
+    await session.start()
+    await entered.wait()
+    try:
+        await session.finish(False)
+        assert session._welcome_task.done()
+        assert cancelled.is_set()
+    finally:
+        if not session._welcome_task.done():
+            session._welcome_task.cancel()
+            await asyncio.gather(session._welcome_task, return_exceptions=True)
 
 
 def test_dialog_audio_dump_status_never_logs_the_call_id(caplog, monkeypatch, tmp_path):

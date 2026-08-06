@@ -542,8 +542,11 @@ AZURE_VOICES: dict[str, tuple[str, str]] = {
 }
 
 # Google STT primary + alternative languages per lang code
-STT_PRIMARY: dict[str, str] = {"si": "si-LK", "ta": "ta-IN", "ar": "ar-SA"}
+STT_PRIMARY: dict[str, str] = {
+    "en": "en-US", "si": "si-LK", "ta": "ta-IN", "ar": "ar-SA",
+}
 STT_ALTERNATIVES: dict[str, list[str]] = {
+    "en": [],
     "si": ["en-US", "ta-IN"],
     "ta": ["en-US", "si-LK"],
     "ar": ["en-US"],
@@ -2817,6 +2820,7 @@ class MediaStreamSession:
         if self._media_transport is not None:
             await self._media_transport.send_mark("tts_done")
             self._is_speaking = False
+            self._schedule_reprompt()
             return
         async with self._ws_lock:
             await self.ws.send_text(json.dumps({
@@ -2881,10 +2885,16 @@ class MediaStreamSession:
             messages = REPROMPT_MESSAGES.get(self.lang, REPROMPT_MESSAGES["en"])
             text = messages[min(self._reprompt_count, len(messages) - 1)]
             self._reprompt_count += 1
-            logger.info(
-                "No-speech re-prompt [%s] attempt %d (lang=%s)",
-                self.call_sid, self._reprompt_count, self.lang,
-            )
+            if self._is_smartpbx_session():
+                logger.info(
+                    "smartpbx_media event=silence_reprompt attempt=%d",
+                    self._reprompt_count,
+                )
+            else:
+                logger.info(
+                    "No-speech re-prompt [%s] attempt %d (lang=%s)",
+                    self.call_sid, self._reprompt_count, self.lang,
+                )
             self.full_transcript.append({"role": "assistant", "text": text})
             await self._speak(text)
         except asyncio.CancelledError:

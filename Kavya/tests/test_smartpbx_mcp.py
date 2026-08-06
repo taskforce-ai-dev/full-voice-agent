@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import logging
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -52,14 +53,14 @@ class FakeSession:
 
     async def initialize(self):
         self.events.append(("initialize",))
-        if isinstance(self.outcome, Exception):
+        if isinstance(self.outcome, BaseException):
             raise self.outcome
 
     async def call_tool(self, name, arguments):
         self.events.append(("call_tool", name, arguments))
         if isinstance(self.outcome, AfterDispatch):
             raise self.outcome.error
-        if isinstance(self.outcome, Exception):
+        if isinstance(self.outcome, BaseException):
             raise self.outcome
         return self.outcome
 
@@ -192,6 +193,57 @@ async def test_nested_lifecycle_read_timeout_after_dispatch_is_not_retried():
     assert len(fake_mcp.calls) == 1
 
 
+def status_error(status):
+    request = httpx.Request("POST", "https://dialog.example/ucp/v2/mcp")
+    return httpx.HTTPStatusError(
+        "status", request=request, response=httpx.Response(status, request=request)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("leaves", "expected_failure", "expected_calls"),
+    [
+        ([httpx.ConnectError("down"), httpx.ReadTimeout("never retry")], "timeout", 1),
+        ([httpx.ConnectError("down"), status_error(400)], "client", 1),
+        ([status_error(503), status_error(400)], "client", 1),
+        ([httpx.ConnectError("down"), ValueError("nonretryable")], "transport", 1),
+        ([httpx.ConnectError("down"), status_error(503)], None, 2),
+    ],
+)
+async def test_nested_predispatch_retry_requires_every_leaf_to_be_retryable(
+    leaves, expected_failure, expected_calls
+):
+    fake_mcp = FakeSessionFactory(
+        ExceptionGroup("mixed lifecycle", leaves), FakeResult(False, [object()])
+    )
+    control = DialogMCPCallControl(settings(), context(), fake_mcp)
+
+    result = await control.transfer_call("human_support")
+
+    assert len(fake_mcp.calls) == expected_calls
+    if expected_failure is None:
+        assert result.transferred is True
+    else:
+        assert result == smartpbx_mcp.TransferResult(False, expected_failure)
+
+
+@pytest.mark.asyncio
+async def test_nested_cancellation_propagates_and_never_retries():
+    cancellation = asyncio.CancelledError("cancelled")
+    lifecycle_error = BaseExceptionGroup(
+        "mixed lifecycle", [httpx.ConnectError("down"), cancellation]
+    )
+    fake_mcp = FakeSessionFactory(lifecycle_error, FakeResult(False, [object()]))
+    control = DialogMCPCallControl(settings(), context(), fake_mcp)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await control.transfer_call("human_support")
+
+    assert cancellation in tuple(smartpbx_mcp._exception_leaves(raised.value))
+    assert len(fake_mcp.calls) == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "calls", "failure"),
@@ -217,6 +269,27 @@ async def test_malformed_tool_result_is_bounded_and_never_retried():
     result = await control.transfer_call("human_support")
 
     assert result == smartpbx_mcp.TransferResult(False, "malformed_result")
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        SimpleNamespace(isError="false", content=[object()]),
+        SimpleNamespace(isError=False, content=(object(),)),
+        SimpleNamespace(isError=False, content=[]),
+        {"isError": False, "content": [object()]},
+    ],
+)
+async def test_malformed_result_types_are_nonretryable(result):
+    fake_mcp = FakeSessionFactory(result)
+
+    outcome = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert outcome == smartpbx_mcp.TransferResult(False, "malformed_result")
     assert len(fake_mcp.calls) == 1
 
 
@@ -408,3 +481,15 @@ async def test_smartpbx_concurrent_transfer_tool_calls_dispatch_only_once():
 
     assert results == ['{"status": "transferred"}', '{"status": "unavailable"}']
     assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_transfer_tool_result_is_byte_for_byte_equivalent():
+    from tools import execute_tool, smartpbx_transfer_context
+
+    assert smartpbx_transfer_context.get() is None
+    result = await execute_tool(
+        "transfer_to_human", {"reason": "Caller asked for the manager."}
+    )
+
+    assert result == '{"status": "transferring", "reason": "Caller asked for the manager."}'

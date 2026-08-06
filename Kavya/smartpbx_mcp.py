@@ -224,7 +224,7 @@ class DialogMCPCallControl:
                 if (
                     not tool_dispatched
                     and attempt <= self._settings.retries
-                    and _is_retryable_pre_dispatch(cause)
+                    and _is_retryable_pre_dispatch(error)
                 ):
                     _log_result("retryable_failure", attempt)
                     continue
@@ -347,17 +347,20 @@ def _result_outcome(result: object) -> str:
 
 
 def _unwrap_lifecycle_error(error: BaseException) -> BaseException:
-    """Extract an SDK/AnyIO leaf exception without exposing its detail."""
+    """Select the most conservative SDK/AnyIO leaf for failure classification."""
     if isinstance(error, BaseExceptionGroup):
         leaves = tuple(_exception_leaves(error))
         if leaves:
-            return next(
-                (
-                    leaf for leaf in leaves
-                    if isinstance(leaf, (httpx.TimeoutException, httpx.HTTPStatusError, httpx.TransportError))
-                ),
-                leaves[0],
-            )
+            nonretryable = tuple(leaf for leaf in leaves if not _is_retryable_leaf(leaf))
+            if nonretryable:
+                for leaf in nonretryable:
+                    if isinstance(leaf, (asyncio.TimeoutError, httpx.TimeoutException)):
+                        return leaf
+                for leaf in nonretryable:
+                    if isinstance(leaf, httpx.HTTPStatusError) and leaf.response.status_code < 500:
+                        return leaf
+                return nonretryable[0]
+            return leaves[0]
     return error
 
 
@@ -374,6 +377,11 @@ def _contains_cancellation(error: BaseException) -> bool:
 
 
 def _is_retryable_pre_dispatch(error: BaseException) -> bool:
+    leaves = tuple(_exception_leaves(error))
+    return bool(leaves) and all(_is_retryable_leaf(leaf) for leaf in leaves)
+
+
+def _is_retryable_leaf(error: BaseException) -> bool:
     if isinstance(error, httpx.HTTPStatusError):
         return 500 <= error.response.status_code <= 599
     return isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))

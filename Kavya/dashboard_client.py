@@ -30,17 +30,20 @@ _TIMEOUT = aiohttp.ClientTimeout(total=5)
 _announced = False
 
 
-def _announce_once() -> None:
+def _announce_once(privacy_safe: bool = False) -> None:
     """Log enabled/disabled status exactly once, on first public-API call."""
     global _announced
     if _announced:
         return
     _announced = True
     if _ENABLED:
-        logger.info(
-            "[dashboard] enabled → %s (agent_id=%s)",
-            DASHBOARD_API_URL, DASHBOARD_AGENT_ID,
-        )
+        if privacy_safe:
+            logger.info("smartpbx_dashboard event=enabled")
+        else:
+            logger.info(
+                "[dashboard] enabled → %s (agent_id=%s)",
+                DASHBOARD_API_URL, DASHBOARD_AGENT_ID,
+            )
     else:
         logger.info("[dashboard] disabled (env not set)")
 
@@ -49,7 +52,7 @@ def _announce_once() -> None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-async def _post(payload: dict[str, Any]) -> None:
+async def _post(payload: dict[str, Any], privacy_safe: bool = False) -> None:
     """POST payload to the dashboard ingest endpoint. Never raises."""
     from booking_api import get_session
 
@@ -61,23 +64,32 @@ async def _post(payload: dict[str, Any]) -> None:
             url, json=payload, headers=headers, timeout=_TIMEOUT
         ) as resp:
             if resp.status < 300:
-                logger.info(
-                    "[dashboard] %s ok (%d)",
-                    payload.get("eventType"), resp.status,
-                )
+                if privacy_safe:
+                    logger.info("smartpbx_dashboard event=sent status=%d", resp.status)
+                else:
+                    logger.info(
+                        "[dashboard] %s ok (%d)",
+                        payload.get("eventType"), resp.status,
+                    )
             else:
                 body = await resp.text()
-                logger.warning(
-                    "[dashboard] send failed: HTTP %d %s",
-                    resp.status, body[:300],
-                )
+                if privacy_safe:
+                    logger.warning("smartpbx_dashboard event=failed status=%d", resp.status)
+                else:
+                    logger.warning(
+                        "[dashboard] send failed: HTTP %d %s",
+                        resp.status, body[:300],
+                    )
     except Exception as exc:
         # Use %r and include the exception type so empty-string exceptions
         # (e.g. aiohttp ServerDisconnectedError with no args) are visible.
-        logger.warning(
-            "[dashboard] send failed: type=%s repr=%r str=%r",
-            type(exc).__name__, exc, str(exc),
-        )
+        if privacy_safe:
+            logger.warning("smartpbx_dashboard event=failed outcome=exception")
+        else:
+            logger.warning(
+                "[dashboard] send failed: type=%s repr=%r str=%r",
+                type(exc).__name__, exc, str(exc),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +138,10 @@ async def send_call_completed(
     duration_sec: int,
     full_transcript: list[dict[str, str]],
     extracted: dict[str, Any],
+    privacy_safe: bool = False,
 ) -> None:
     """Emit a call.completed event with full transcript + extracted summary."""
-    _announce_once()
+    _announce_once(privacy_safe=privacy_safe)
     if not _ENABLED:
         return
 
@@ -162,7 +175,7 @@ async def send_call_completed(
             },
         },
     }
-    await _post(payload)
+    await _post(payload, privacy_safe=privacy_safe)
 
 
 async def send_call_transferred(

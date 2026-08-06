@@ -112,6 +112,10 @@ class KavyaSmartPBXSession:
                 pipeline._endpointing_handle = None
             if getattr(pipeline, "_stt", None) is not None:
                 pipeline._stt.stop()
+            if self._welcome_task is not None:
+                if not self._welcome_task.done():
+                    self._welcome_task.cancel()
+                await asyncio.gather(self._welcome_task, return_exceptions=True)
             pipeline._write_audio_dump()
 
             transcript = list(getattr(pipeline, "full_transcript", []))
@@ -129,6 +133,7 @@ class KavyaSmartPBXSession:
                         openai_client=getattr(pipeline, "client", None),
                         gemini_client=getattr(pipeline, "gemini_client", None),
                         model=self._model,
+                        privacy_safe=True,
                     )
                 )
         finally:
