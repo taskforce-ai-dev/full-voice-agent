@@ -47,6 +47,20 @@ async def test_real_session_exposes_inner_transfer_pending_state():
 
 
 @pytest.mark.asyncio
+async def test_real_session_uses_isolated_smartpbx_manager_environment(monkeypatch):
+    monkeypatch.setenv("SMARTPBX_HUMAN_AGENT_WHATSAPP", "0770000000")
+    monkeypatch.setenv("HUMAN_AGENT_PHONE", "legacy-must-not-win")
+    pipeline = _Pipeline()
+    session = KavyaSmartPBXSession(_context(), object(), pipeline=pipeline)
+
+    session._bind_smartpbx_tool_context(pipeline)
+
+    coordinator = pipeline._smartpbx_transfer_context.coordinator
+    assert coordinator._human_agent_whatsapp == "0770000000"
+    assert pipeline._smartpbx_caller_context == {"caller_phone": "0771234567"}
+
+
+@pytest.mark.asyncio
 async def test_cancelled_pending_entry_never_redispatches_acknowledged_mcp_transfer():
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -73,6 +87,29 @@ async def test_cancelled_pending_entry_never_redispatches_acknowledged_mcp_trans
 
     assert control.calls == 1
     assert result == {"status": "transferred", "confirmation": "provider_acknowledged"}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dashboard_acknowledgement_never_redispatches_mcp():
+    entered = asyncio.Event()
+
+    async def dashboard(**_kwargs):
+        entered.set()
+        await asyncio.Future()
+
+    control = _Control()
+    coordinator = SmartPBXHandoverCoordinator(
+        call_control=control, pipeline=_Pipeline(), call_sid="safe", caller_phone="0771234567",
+        transcript=lambda: [], dashboard_sender=dashboard, notification_sender=None, human_agent_whatsapp="0770000000",
+    )
+    task = asyncio.create_task(coordinator.attempt("help"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert json.loads(await coordinator.attempt("again"))["status"] == "transferred"
+    assert control.calls == 1
 
 
 def test_transcript_tail_consumes_only_bounded_recent_items_and_caps_each_item_before_normalizing():

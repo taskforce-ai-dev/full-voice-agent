@@ -76,3 +76,27 @@ async def test_transfer_pending_waits_for_dialog_terminal_event_past_normal_idle
 
     assert socket.close_calls == [(1000, "call ended")]
     assert session.finishes == 1
+
+
+@pytest.mark.asyncio
+async def test_transfer_becoming_pending_during_receive_rechecks_the_idle_deadline():
+    settings = replace(SmartPBXSettings.from_env({
+        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+    }), idle_timeout_seconds=0.03)
+    session = Session()
+    session.transfer_pending = False
+
+    async def factory(_context, _transport):
+        return session
+
+    socket = Socket()
+    gateway = SmartPBXGateway(settings, SmartPBXSessionRegistry(4))
+    task = asyncio.create_task(gateway.handle(socket, factory))
+    await asyncio.sleep(0.01)
+    session.transfer_pending = True
+    await asyncio.sleep(0.04)
+    assert not task.done()
+    socket.messages.put_nowait(json.dumps({"event": "hangup"}))
+    await task
+    assert session.finishes == 1
