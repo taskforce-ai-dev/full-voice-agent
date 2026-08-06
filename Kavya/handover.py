@@ -311,12 +311,9 @@ async def send_handover_notification(
         )
         return {"ok": False, "error": "missing_customer_whatsapp", "payload": payload}
 
-    if not payload["human_agent_whatsapp"]:
-        if privacy_safe:
-            logger.info("smartpbx_handover event=not_actionable")
-            return {"ok": False, "error": "missing_human_agent_whatsapp"}
-        logger.error("[handover] refusing to notify -- no usable manager WhatsApp number")
-        return {"ok": False, "error": "missing_human_agent_whatsapp", "payload": payload}
+    if privacy_safe and not payload["human_agent_whatsapp"]:
+        logger.info("smartpbx_handover event=not_actionable")
+        return {"ok": False, "error": "missing_human_agent_whatsapp"}
 
     url = f"{N8N_BASE_URL}{N8N_HANDOVER_WEBHOOK}"
     try:

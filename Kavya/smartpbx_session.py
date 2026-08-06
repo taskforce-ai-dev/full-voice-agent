@@ -214,7 +214,7 @@ class KavyaSmartPBXSession:
         coordinator = SmartPBXHandoverCoordinator(
             call_control=control, pipeline=pipeline, call_sid=self._context.other_leg_call_id,
             caller_phone=self._context.caller_number,
-            transcript=lambda: list(getattr(pipeline, "full_transcript", [])),
+            transcript=lambda: getattr(pipeline, "full_transcript", []),
             dashboard_sender=dashboard_sender, notification_sender=handover.send_handover_notification,
             human_agent_whatsapp=os.getenv("SMARTPBX_HUMAN_AGENT_WHATSAPP", ""),
         )
