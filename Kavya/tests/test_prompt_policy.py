@@ -378,19 +378,37 @@ def test_prompt_accepts_natural_number_formats_and_only_rejects_wrong_length():
     assert "do NOT re-ask" in PROMPT
 
 
-def test_prompt_escalates_to_digit_by_digit_before_giving_up():
+def test_prompt_escalates_to_digit_by_digit_then_keeps_trying():
+    """Digit-by-digit is not a one-shot before giving up: Kavya reads the
+    number back and keeps patiently re-asking for several attempts. She must
+    NOT jump to the calling-number fallback after a single failed attempt."""
     assert "DIGIT BY DIGIT" in PROMPT
     assert "one digit at a time" in PROMPT
+    assert "READ IT BACK AND KEEP TRYING" in PROMPT
+    assert "keep patiently re-asking" in PROMPT
+    assert (
+        "Do NOT announce that you will use the number they are calling from "
+        "after just one failed digit-by-digit attempt"
+    ) in PROMPT
 
 
-def test_prompt_falls_back_to_caller_id_and_never_blocks_the_booking():
-    """If the number stays wrong, Kavya uses the line the guest is calling from
-    and the booking/handover ALWAYS proceeds - it is never cancelled over a
-    number."""
-    assert "CALLER-ID FALLBACK" in PROMPT
-    assert "number you're calling from" in PROMPT
-    assert "must ALWAYS proceed" in PROMPT
-    assert "NEVER cancels them" in PROMPT
+def test_prompt_asks_permission_for_caller_id_only_as_a_last_resort():
+    """After SEVERAL failed attempts, Kavya asks PERMISSION to use the calling
+    number (a question), not a unilateral 'we'll use your number'. She uses it
+    only on an explicit yes, and never reaches this step early."""
+    assert "LAST RESORT — ASK PERMISSION" in PROMPT
+    assert "may I send your confirmation to the number you're calling from" in PROMPT
+    assert "If the guest says YES" in PROMPT
+    assert "Never jump straight to this last-resort step" in PROMPT
+
+
+def test_prompt_cannot_confirm_the_booking_if_the_guest_refuses_caller_id_too():
+    """If the guest refuses the calling number AND still can't give a workable
+    one, Kavya does not force the booking through - she says she can't confirm
+    it without a contact number."""
+    assert "If the guest says NO" in PROMPT
+    assert "can't confirm the booking without a number" in PROMPT
+    assert "Do NOT force the booking through in this case" in PROMPT
 
 
 def test_prompt_exempts_foreign_numbers_from_the_nine_digit_rule():
