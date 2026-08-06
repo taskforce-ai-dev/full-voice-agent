@@ -82,3 +82,49 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # Isolated Dialog SmartPBX ingress. This profile is off unless explicitly
+  # selected; it never changes the existing Twilio service above.
+  kavya-smartpbx:
+    profiles: ["smartpbx"]
+    # Like kavya, production pulls the immutable GHCR image made by CI.
+    # Do not add build: here: production hosts must not build images.
+    image: ghcr.io/taskforce-ai-dev/kavya:${IMAGE_TAG:-latest}
+    container_name: kavya-smartpbx
+
+    # Host Nginx is the public TLS boundary; keep the application loopback-only.
+    ports:
+      - "127.0.0.1:8006:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-credentials.json
+      KAVYA_SERVICE_MODE: smartpbx
+      ENABLE_SMARTPBX_WSS: "true"
+      SMARTPBX_AUTH_HEADER_NAME: X-Kavya-SmartPBX-Token
+      SMARTPBX_MAX_CALLS: "4"
+      STT_PROVIDER: "${STT_PROVIDER:-azure}"
+      AZURE_SPEECH_KEY: "${AZURE_SPEECH_KEY:-}"
+      AZURE_SPEECH_REGION: "${AZURE_SPEECH_REGION:-}"
+
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./knowledge_docs:/app/knowledge_docs
+      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
