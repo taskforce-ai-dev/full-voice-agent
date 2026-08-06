@@ -22,6 +22,7 @@ import handover  # noqa: E402
 from handover import (  # noqa: E402
     build_payload,
     expand_spoken_repeats,
+    is_valid_lk_nsn,
     normalize_whatsapp,
     send_handover_notification,
 )
@@ -104,10 +105,45 @@ def _patch_session(session: _FakeSession):
         ("   ", ""),
         ("abc", ""),
         ("0", ""),                            # only a trunk prefix - unusable
+        # Wrong-length local numbers: rejected, NOT padded into a real-looking
+        # wrong number. This is the Booking 80 defect (a dropped digit turned
+        # 074294451 into a plausible 9474294451 sent to a stranger).
+        ("074294451", ""),                    # trunk form, one digit dropped
+        ("07742944510", ""),                  # trunk form, one digit too many
+        ("74294451", ""),                     # bare, 8 digits - too short
+        ("77", ""),                           # far too short
     ],
 )
 def test_normalize_whatsapp(raw, expected):
     assert normalize_whatsapp(raw) == expected
+
+
+@pytest.mark.parametrize("nsn,valid", [
+    ("771234567", True),    # 9 digits - a real SL mobile NSN
+    ("711754668", True),
+    ("74294451", False),    # 8 - a digit dropped
+    ("7712345678", False),  # 10 - a digit too many
+    ("", False),
+    ("7712345a7", False),   # not all digits
+])
+def test_is_valid_lk_nsn(nsn, valid):
+    assert is_valid_lk_nsn(nsn) is valid
+
+
+def test_wrong_length_number_is_never_padded_into_a_plausible_wrong_one():
+    """The Booking 80 defect: 074294451 (a dropped digit) must NOT become
+    9474294451 — a real, reachable, WRONG number. It must come back empty so
+    callers fall back to the line the guest is actually calling from."""
+    assert normalize_whatsapp("074294451") == ""          # was 9474294451
+    assert normalize_whatsapp("0774294451") == "94774294451"  # the correct 9-digit form
+
+
+def test_international_numbers_are_accepted_on_their_own_length():
+    """A foreign guest is not forced to Sri Lankan length: an E.164-sane number
+    is kept as-is; only absurd lengths are rejected."""
+    assert normalize_whatsapp("+1 415 555 0132") == "14155550132"   # 11, kept
+    assert normalize_whatsapp("0044 7700 900123") == "447700900123"  # 12, kept
+    assert normalize_whatsapp("+1 415 555 013299999") == ""          # 16, absurd
 
 
 def test_normalize_whatsapp_international_not_mangled():

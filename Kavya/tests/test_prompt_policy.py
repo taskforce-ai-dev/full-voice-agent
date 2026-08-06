@@ -354,3 +354,45 @@ def test_mobile_number_is_read_back_in_local_form_not_plus94():
     reservations hotline - this test targets the mobile read-back rule.)"""
     assert "READING THE MOBILE NUMBER BACK" in PROMPT
     assert "NEVER speak the country code" in PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Mobile number: validate LENGTH, re-ask, fall back to caller ID (never block)
+# ---------------------------------------------------------------------------
+
+def test_prompt_states_the_sri_lankan_mobile_length_rule():
+    """A concrete count (nine local digits) is what makes a fumbled number
+    DETECTABLE. Without it Kavya cannot tell a complete number from a
+    dropped-digit one - the Booking 80 defect, where 074294451 was accepted
+    and stored as a real-looking but wrong 9474294451."""
+    assert "MOBILE NUMBER LENGTH CHECK" in PROMPT
+    assert "exactly NINE digits after the leading zero" in PROMPT
+
+
+def test_prompt_accepts_natural_number_formats_and_only_rejects_wrong_length():
+    """The rule must not refuse a valid number for HOW it was said (leading
+    zero or not, with or without the country code, double/triple shorthand) -
+    only when the digit count is genuinely wrong."""
+    assert "never reject a number because of HOW it was said" in PROMPT
+    assert "ONLY when the count is genuinely WRONG" in PROMPT
+    assert "do NOT re-ask" in PROMPT
+
+
+def test_prompt_escalates_to_digit_by_digit_before_giving_up():
+    assert "DIGIT BY DIGIT" in PROMPT
+    assert "one digit at a time" in PROMPT
+
+
+def test_prompt_falls_back_to_caller_id_and_never_blocks_the_booking():
+    """If the number stays wrong, Kavya uses the line the guest is calling from
+    and the booking/handover ALWAYS proceeds - it is never cancelled over a
+    number."""
+    assert "CALLER-ID FALLBACK" in PROMPT
+    assert "number you're calling from" in PROMPT
+    assert "must ALWAYS proceed" in PROMPT
+    assert "NEVER cancels them" in PROMPT
+
+
+def test_prompt_exempts_foreign_numbers_from_the_nine_digit_rule():
+    assert "FOREIGN NUMBERS" in PROMPT
+    assert "nine-digit rule does NOT apply" in PROMPT
