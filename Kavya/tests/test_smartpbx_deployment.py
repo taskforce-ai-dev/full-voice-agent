@@ -46,6 +46,7 @@ def test_dockerfile_locks_dependencies_and_copies_every_smartpbx_runtime_module(
     assert "requirements-prod.lock.txt" in dockerfile
     for module in (
         "smartpbx_gateway.py",
+        "smartpbx_handover.py",
         "smartpbx_mcp.py",
         "smartpbx_protocol.py",
         "smartpbx_session.py",
