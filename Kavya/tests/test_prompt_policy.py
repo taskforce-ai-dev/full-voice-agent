@@ -217,6 +217,21 @@ def test_suspect_token_resolution_maps_back_to_first_and_last_name():
     ) in PROMPT
 
 
+def test_three_token_branch_sits_before_spelling_fallback_and_loop_exit():
+    """The three-or-more-token branch must feed INTO the existing repeat ->
+    SPELLING FALLBACK -> LOOP EXIT sequence, not sit after it or duplicate
+    it as a second, competing escape hatch. Confirms rendering order: the
+    TWO-OR-MORE-tokens branch appears before both LOOP EXIT (its own
+    re-ask logic funnels into the same LOOP EXIT already gated above) and
+    SPELLING FALLBACK (which the LOOP EXIT tries before giving up), so
+    there is exactly one escape hatch in the whole section, reached the
+    same way regardless of how many tokens the guest gave."""
+    two_or_more = PROMPT.index("If you received TWO OR MORE tokens")
+    loop_exit = PROMPT.index("LOOP EXIT")
+    spelling_fallback = PROMPT.index("SPELLING FALLBACK for names")
+    assert two_or_more < loop_exit < spelling_fallback
+
+
 def test_suspect_token_criterion_does_not_flag_real_english_names():
     """Read literally, "is an ordinary English word sitting where a name
     should be" would flag real first names that are also ordinary English
