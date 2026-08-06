@@ -244,14 +244,22 @@ jobs:
           cd "$dir"
           # Scoped to tests/, NOT bare `pytest`. Both agents also carry
           # manual/live scripts at the top level whose names collide with
-          # pytest's default discovery (test_voice.py, test_dashboard_client.py,
-          # ops/mosvold-pms/live_conversation_test.py, live_smoke_test.py) -
-          # none contain a single `def test_*`, but Kavya's
-          # live_conversation_test.py fails at collection (it opens a real
-          # WebSocket to the live production URL at import time), which
-          # aborts the whole run before any real test executes. Bare `pytest`
-          # was only ever "working" here because continue-on-error and the
-          # `|| echo` fallback below swallowed that collection error too.
+          # pytest's default discovery (test_voice.py, test_dashboard_client.py)
+          # - neither contains a single `def test_*`.
+          #
+          # This scoping was proven load-bearing, not cosmetic, by two
+          # now-deleted Kavya scripts: ops/mosvold-pms/live_conversation_test.py
+          # and live_smoke_test.py (Mosvold-era, pointed at the retired
+          # treehouse.taskforceai.tech host). live_conversation_test.py ran
+          # asyncio.run(main()) at MODULE level, opening a real WebSocket to
+          # production the instant pytest imported it. Verified live before
+          # #204 merged: bare `pytest --collect-only` in Kavya/ does not fail
+          # cleanly on that file, it HANGS - confirmed by manually killing it
+          # after 120s. On a blocking job that would have burned the job
+          # timeout on every single run while hitting production from CI, not
+          # gone red. Bare `pytest` was only ever "working" here because
+          # continue-on-error and the `|| echo` fallback below swallowed a
+          # hang exactly as readily as a real test failure.
           pytest tests
 
   # ---------------------------------------------------------------------------
