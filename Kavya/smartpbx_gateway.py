@@ -270,6 +270,10 @@ class SmartPBXGateway:
             return await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
         receive_task = asyncio.create_task(websocket.receive_text())
         done, _ = await asyncio.wait({receive_task, terminal}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        if not done and getattr(session, "transfer_pending", False):
+            done, _ = await asyncio.wait(
+                {receive_task, terminal}, timeout=None, return_when=asyncio.FIRST_COMPLETED
+            )
         if not done:
             receive_task.cancel()
             await asyncio.gather(receive_task, return_exceptions=True)

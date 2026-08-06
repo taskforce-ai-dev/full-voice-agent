@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections import deque
+from collections.abc import Sequence
 from enum import Enum
 from typing import Any, Awaitable, Callable
 
@@ -19,6 +21,7 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 _MAX_REASON = 500
 _MAX_TRANSCRIPT_MESSAGES = 8
 _MAX_TRANSCRIPT_CHARS = 3000
+_MAX_TRANSCRIPT_MESSAGE_CHARS = 512
 
 
 def bound_reason(value: Any) -> str:
@@ -29,13 +32,20 @@ def bound_reason(value: Any) -> str:
 
 def bound_transcript_tail(messages: Any) -> str:
     items: list[str] = []
-    for message in list(messages or [])[-_MAX_TRANSCRIPT_MESSAGES:]:
+    if isinstance(messages, Sequence) or (
+        hasattr(messages, "__len__") and hasattr(messages, "__getitem__")
+    ):
+        size = len(messages)
+        tail = messages[max(0, size - _MAX_TRANSCRIPT_MESSAGES):size]
+    else:
+        tail = deque(messages or (), maxlen=_MAX_TRANSCRIPT_MESSAGES)
+    for message in tail:
         if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
             continue
         text = message.get("text")
         if not isinstance(text, str):
             continue
-        cleaned = " ".join(_CONTROL.sub(" ", text).split())
+        cleaned = " ".join(_CONTROL.sub(" ", text[:_MAX_TRANSCRIPT_MESSAGE_CHARS]).split())
         if cleaned:
             items.append(f"{message['role'].title()}: {cleaned}")
     return "\n".join(items)[-_MAX_TRANSCRIPT_CHARS:]
@@ -74,20 +84,27 @@ class SmartPBXHandoverCoordinator:
             if self._result is not None:
                 return self._result
             self._reason = bound_reason(reason)
+            self._result = json.dumps({"status": "unavailable", "notification": "failed"})
             try:
                 result = await self._call_control.transfer_call("human_support") if self._call_control else None
             except asyncio.CancelledError:
                 raise
-            except BaseException:
+            except Exception:
                 result = None
             if getattr(result, "transferred", False):
                 self._phase = HandoverPhase.ACKNOWLEDGED
-                await self._enter_pending()
-                await self._send_dashboard()
                 self._result = json.dumps({"status": "transferred", "confirmation": "provider_acknowledged"})
+                try:
+                    await self._enter_pending()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                await self._send_dashboard()
                 return self._result
             self._phase = HandoverPhase.IMMEDIATE_FAILED
-            self._result = json.dumps({"status": "unavailable", "notification": await self._deliver_notification()})
+            notification = await self._deliver_notification()
+            self._result = json.dumps({"status": "unavailable", "notification": notification})
             return self._result
 
     async def finalize_notification_retry(self) -> None:
@@ -112,7 +129,7 @@ class SmartPBXHandoverCoordinator:
                 privacy_safe=True)
         except asyncio.CancelledError:
             raise
-        except BaseException:
+        except Exception:
             return
 
     async def _deliver_notification(self) -> str:
@@ -129,6 +146,7 @@ class SmartPBXHandoverCoordinator:
             self._notification_state = "not_actionable"
             return self._notification_state
         self._notification_attempts += 1
+        self._notification_state = "failed"
         summary = "Live transfer could not be started; please call the guest back. " + self._reason
         tail = bound_transcript_tail(self._transcript())
         if tail:
@@ -140,7 +158,7 @@ class SmartPBXHandoverCoordinator:
                     human_agent_whatsapp=self._human_agent_whatsapp, privacy_safe=True)
         except asyncio.CancelledError:
             raise
-        except BaseException:
+        except Exception:
             self._notification_state = "failed"
             return self._notification_state
         if outcome.get("ok"):

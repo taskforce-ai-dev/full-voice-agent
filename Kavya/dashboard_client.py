@@ -72,13 +72,16 @@ async def _post(payload: dict[str, Any], privacy_safe: bool = False) -> None:
                         payload.get("eventType"), resp.status,
                     )
             else:
-                body = await resp.text()
                 if privacy_safe:
                     logger.warning("smartpbx_dashboard event=failed status=%d", resp.status)
                 else:
+                    content = getattr(resp, "content", None)
+                    if content is None:
+                        body = (await resp.text())[:300]
+                    else:
+                        body = (await content.read(300)).decode("utf-8", "replace")
                     logger.warning(
-                        "[dashboard] send failed: HTTP %d %s",
-                        resp.status, body[:300],
+                        "[dashboard] send failed: HTTP %d %s", resp.status, body,
                     )
     except Exception as exc:
         # Use %r and include the exception type so empty-string exceptions

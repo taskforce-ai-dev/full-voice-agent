@@ -53,6 +53,11 @@ class KavyaSmartPBXSession:
     def terminal_future(self) -> asyncio.Future[None]:
         return self._terminal_future
 
+    @property
+    def transfer_pending(self) -> bool:
+        """Expose the inner pipeline state to the provider-neutral gateway."""
+        return bool(getattr(self._pipeline, "transfer_pending", False))
+
     async def start(self) -> None:
         async with self._start_lock:
             if self._start_task is None:
@@ -211,7 +216,7 @@ class KavyaSmartPBXSession:
             caller_phone=self._context.caller_number,
             transcript=lambda: list(getattr(pipeline, "full_transcript", [])),
             dashboard_sender=dashboard_sender, notification_sender=handover.send_handover_notification,
-            human_agent_whatsapp=os.getenv("HUMAN_AGENT_PHONE", ""),
+            human_agent_whatsapp=os.getenv("SMARTPBX_HUMAN_AGENT_WHATSAPP", ""),
         )
         self._smartpbx_transfer_context = SmartPBXTransferContext(control, coordinator=coordinator)
         pipeline._smartpbx_transfer_context = self._smartpbx_transfer_context
