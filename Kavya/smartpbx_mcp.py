@@ -34,11 +34,15 @@ _MAX_API_KEY_CHARS = 512
 _MAX_ACCOUNT_ID_CHARS = 256
 _MAX_CALL_ID_CHARS = 256
 
-_SDK_LOGGERS = ("mcp.client.streamable_http", "client")
+_SDK_LOGGERS = ("mcp.client.streamable_http", "mcp.client.session")
 
 
 class TransferDisabled(RuntimeError):
     """The explicitly configured handover boundary is unavailable."""
+
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+        super().__init__(failure)
 
 
 class MCPResponseTooLarge(httpx.TransportError):
@@ -81,6 +85,7 @@ class DialogMCPSettings:
     read_timeout_seconds: int = 15
     max_response_bytes: int = 1048576
     retries: int = 1
+    failure: str | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> DialogMCPSettings:
@@ -90,15 +95,19 @@ class DialogMCPSettings:
             api_key = _env_text(environ, "SMARTPBX_API_KEY")
             account_id = _env_text(environ, "SMARTPBX_ACCOUNT_ID")
             account_header = _env_text(environ, "SMARTPBX_MCP_ACCOUNT_HEADER")
-            raw_destinations = _env_text(
-                environ, "SMARTPBX_TRANSFER_DESTINATIONS_JSON"
-            )
-            values = (endpoint, api_key, account_id, account_header, raw_destinations)
-            if not any(values):
-                return cls()
-            if not all(values):
-                return cls()
+            raw_destinations = _env_text(environ, "SMARTPBX_TRANSFER_DESTINATIONS_JSON")
+        except (TypeError, ValueError):
+            return cls(failure="invalid_configuration")
+        values = (endpoint, api_key, account_id, account_header, raw_destinations)
+        if not any(values):
+            return cls(failure="not_configured")
+        if not all(values):
+            return cls(failure="incomplete_configuration")
+        try:
             destinations = _parse_destinations(raw_destinations)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return cls(failure="invalid_destinations")
+        try:
             connect_timeout = _bounded_integer(
                 environ,
                 "SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS",
@@ -127,15 +136,18 @@ class DialogMCPSettings:
                 minimum=0,
                 maximum=1,
             )
-            if (
-                not _safe_header_value(api_key, _MAX_API_KEY_CHARS)
-                or not _safe_header_value(account_id, _MAX_ACCOUNT_ID_CHARS)
-                or account_header not in _ACCOUNT_HEADERS
-            ):
-                return cls()
-            _validate_endpoint(endpoint)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return cls()
+            return cls(failure="invalid_limits")
+        if not _safe_header_value(api_key, _MAX_API_KEY_CHARS):
+            return cls(failure="invalid_api_key")
+        if not _safe_header_value(account_id, _MAX_ACCOUNT_ID_CHARS):
+            return cls(failure="invalid_account_id")
+        if account_header not in _ACCOUNT_HEADERS:
+            return cls(failure="invalid_account_header")
+        try:
+            _validate_endpoint(endpoint)
+        except (TypeError, ValueError):
+            return cls(failure="invalid_endpoint")
         return cls(
             endpoint=endpoint,
             api_key=api_key,
@@ -146,6 +158,7 @@ class DialogMCPSettings:
             read_timeout_seconds=read_timeout,
             max_response_bytes=max_response_bytes,
             retries=retries,
+            failure=None,
         )
 
     @property
@@ -156,6 +169,7 @@ class DialogMCPSettings:
             and self.account_id
             and self.account_header in _ACCOUNT_HEADERS
             and self.transfer_destinations
+            and self.failure is None
         )
 
 
@@ -180,10 +194,12 @@ class DialogMCPCallControl:
     async def transfer_call(self, destination_key: str) -> TransferResult:
         """Transfer only to a configured logical destination using the Dialog leg."""
         if not self._enabled or not isinstance(destination_key, str):
-            raise TransferDisabled("handover is unavailable")
+            raise TransferDisabled(
+                "invalid_configuration" if self._settings.failure else "context_mismatch"
+            )
         destination = self._settings.transfer_destinations.get(destination_key)
         if destination is None:
-            raise TransferDisabled("handover is unavailable")
+            raise TransferDisabled("destination_not_allowed")
         return await self._invoke("transfer_call", {"destination_number": destination})
 
     async def _invoke(self, tool_name: str, arguments: dict[str, str]) -> TransferResult:
@@ -201,15 +217,18 @@ class DialogMCPCallControl:
                         await session.initialize()
                         tool_dispatched = True
                         result = await session.call_tool(tool_name, arguments=arguments)
-            except Exception as error:
+            except BaseException as error:
+                if _contains_cancellation(error):
+                    raise
+                cause = _unwrap_lifecycle_error(error)
                 if (
                     not tool_dispatched
                     and attempt <= self._settings.retries
-                    and _is_retryable_pre_dispatch(error)
+                    and _is_retryable_pre_dispatch(cause)
                 ):
                     _log_result("retryable_failure", attempt)
                     continue
-                failure = _failure_class(error)
+                failure = _failure_class(cause)
                 _log_result(failure, attempt)
                 return TransferResult(False, failure)
 
@@ -327,18 +346,45 @@ def _result_outcome(result: object) -> str:
     return "tool_error" if is_error else "success"
 
 
-def _is_retryable_pre_dispatch(error: Exception) -> bool:
+def _unwrap_lifecycle_error(error: BaseException) -> BaseException:
+    """Extract an SDK/AnyIO leaf exception without exposing its detail."""
+    if isinstance(error, BaseExceptionGroup):
+        leaves = tuple(_exception_leaves(error))
+        if leaves:
+            return next(
+                (
+                    leaf for leaf in leaves
+                    if isinstance(leaf, (httpx.TimeoutException, httpx.HTTPStatusError, httpx.TransportError))
+                ),
+                leaves[0],
+            )
+    return error
+
+
+def _exception_leaves(error: BaseException):
+    if isinstance(error, BaseExceptionGroup):
+        for nested in error.exceptions:
+            yield from _exception_leaves(nested)
+    else:
+        yield error
+
+
+def _contains_cancellation(error: BaseException) -> bool:
+    return any(isinstance(leaf, asyncio.CancelledError) for leaf in _exception_leaves(error))
+
+
+def _is_retryable_pre_dispatch(error: BaseException) -> bool:
     if isinstance(error, httpx.HTTPStatusError):
         return 500 <= error.response.status_code <= 599
     return isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
 
 
-def _failure_class(error: Exception) -> str:
+def _failure_class(error: BaseException) -> str:
     """Return only stable, non-sensitive failure classifications."""
     if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
         return "timeout"
     if isinstance(error, httpx.HTTPStatusError):
-        return "server" if error.response.status_code >= 500 else "transport"
+        return "server" if error.response.status_code >= 500 else "client"
     if isinstance(error, httpx.TransportError):
         return "transport"
     return "transport"

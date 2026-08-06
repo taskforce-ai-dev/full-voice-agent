@@ -677,5 +677,8 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     if property_name and isinstance(result, dict):
         result = {**result, "property": property_name}
 
-    logger.info("Tool '%s' returned: %s", tool_name, result)
+    if transfer_context is None:
+        logger.info("Tool '%s' returned: %s", tool_name, result)
+    else:
+        logger.info("smartpbx_tool event=result tool=%s", tool_name)
     return json.dumps(result)

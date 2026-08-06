@@ -92,6 +92,7 @@ class KavyaSmartPBXSession:
             on_final_result=pipeline._on_stt_result,
             on_interim_result=pipeline._on_stt_interim,
             lang="en",
+            privacy_safe=True,
         )
         pipeline._stt.start()
         if self._welcome_text:

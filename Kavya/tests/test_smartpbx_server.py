@@ -226,6 +226,154 @@ async def test_smartpbx_english_pipeline_uses_existing_elevenlabs_tts():
     assert spoken == ["Hello from Kavya."]
 
 
+@pytest.mark.asyncio
+async def test_dialog_media_logs_never_contain_transcript_agent_text_or_call_id(caplog, monkeypatch):
+    import server
+
+    secret_guest = "guest transcript must stay private"
+    secret_agent = "agent response must stay private"
+    secret_call = "dialog-call-id-must-stay-private"
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+    pipeline.call_sid = secret_call
+    pipeline._pending_transcript = secret_guest
+    pipeline._event_loop = asyncio.get_running_loop()
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+
+    async def response():
+        return secret_agent
+
+    async def no_speak(_text, generation=-1):
+        return None
+
+    monkeypatch.setattr(pipeline, "_run_llm_claude", response)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    with caplog.at_level(logging.INFO):
+        await pipeline._flush_transcript()
+
+    assert secret_guest not in caplog.text
+    assert secret_agent not in caplog.text
+    assert secret_call not in caplog.text
+    assert "smartpbx_media event=guest_utterance" in caplog.text
+    assert "smartpbx_media event=agent_response" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_legacy_media_logs_keep_existing_transcript_and_call_id_semantics(caplog):
+    import server
+
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline.call_sid = "legacy-call-id"
+    pipeline._pending_transcript = "legacy transcript"
+    pipeline._event_loop = asyncio.get_running_loop()
+
+    async def no_process(_text):
+        return None
+
+    pipeline._process_utterance = no_process
+    with caplog.at_level(logging.INFO):
+        await pipeline._flush_transcript()
+
+    assert "legacy-call-id" in caplog.text
+    assert "legacy transcript" in caplog.text
+
+
+def test_smartpbx_stt_streams_can_disable_raw_sdk_transcript_logging(caplog):
+    import server
+
+    class Event:
+        class Result:
+            text = "raw azure stt transcript"
+        result = Result()
+
+    stream = server.AzureSTTStream(lambda _text: None, lambda _text: None, "en", privacy_safe=True)
+    with caplog.at_level(logging.INFO):
+        stream._on_recognizing(Event())
+
+    assert "raw azure stt transcript" not in caplog.text
+
+
+def test_dialog_audio_dump_status_never_logs_the_call_id(caplog, monkeypatch, tmp_path):
+    import server
+
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+    pipeline.call_sid = "dialog-audio-dump-call-id"
+    pipeline._audio_dump = [b"\xff" * 80]
+    monkeypatch.setattr(server, "STT_DEBUG_DIR", str(tmp_path))
+
+    with caplog.at_level(logging.INFO):
+        pipeline._write_audio_dump()
+
+    assert "dialog-audio-dump-call-id" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_dialog_utterance_context_is_isolated_across_two_sessions_and_resets():
+    import server
+    from handover import handover_context
+    from tools import SmartPBXTransferContext, smartpbx_transfer_context
+
+    first = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    second = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    first._smartpbx_transfer_context = SmartPBXTransferContext(None)
+    second._smartpbx_transfer_context = SmartPBXTransferContext(None)
+    first._smartpbx_caller_context = {"caller_phone": "first-caller"}
+    second._smartpbx_caller_context = {"caller_phone": "second-caller"}
+    observed = []
+
+    async def capture(label):
+        observed.append((label, smartpbx_transfer_context.get(), handover_context.get()))
+        await asyncio.sleep(0)
+
+    first._process_utterance_bound = lambda _text: capture("first")
+    second._process_utterance_bound = lambda _text: capture("second")
+    await asyncio.gather(first._process_utterance("one"), second._process_utterance("two"))
+
+    assert observed == [
+        ("first", first._smartpbx_transfer_context, {"caller_phone": "first-caller"}),
+        ("second", second._smartpbx_transfer_context, {"caller_phone": "second-caller"}),
+    ]
+    assert smartpbx_transfer_context.get() is None
+    assert handover_context.get() == {}
+
+
+@pytest.mark.asyncio
+async def test_dialog_utterance_context_resets_after_failure_and_cancellation():
+    import server
+    from handover import handover_context
+    from tools import SmartPBXTransferContext, smartpbx_transfer_context
+
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = SmartPBXTransferContext(None)
+    pipeline._smartpbx_caller_context = {"caller_phone": "private-caller"}
+
+    async def fail(_text):
+        raise RuntimeError("expected")
+
+    pipeline._process_utterance_bound = fail
+    with pytest.raises(RuntimeError, match="expected"):
+        await pipeline._process_utterance("failure")
+    assert smartpbx_transfer_context.get() is None
+    assert handover_context.get() == {}
+
+    entered = asyncio.Event()
+
+    async def wait_forever(_text):
+        entered.set()
+        await asyncio.Event().wait()
+
+    pipeline._process_utterance_bound = wait_forever
+    task = asyncio.create_task(pipeline._process_utterance("cancellation"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert smartpbx_transfer_context.get() is None
+    assert handover_context.get() == {}
+
+
 
 def test_smartpbx_mode_exposes_only_bounded_routes():
     import server
