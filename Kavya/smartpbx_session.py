@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
@@ -46,6 +47,7 @@ class KavyaSmartPBXSession:
         self._welcome_task: asyncio.Task[None] | None = None
         self._post_call_task: asyncio.Task[None] | None = None
         self._call_start_time = ""
+        self._smartpbx_transfer_context: Any | None = None
 
     @property
     def terminal_future(self) -> asyncio.Future[None]:
@@ -79,6 +81,7 @@ class KavyaSmartPBXSession:
     async def _start_once(self) -> None:
         self._load_runtime_defaults()
         pipeline = self._require_pipeline()
+        self._bind_smartpbx_tool_context(pipeline)
         pipeline.lang = "en"
         pipeline.call_sid = self._context.other_leg_call_id
         pipeline.caller_phone = self._context.caller_number
@@ -178,3 +181,16 @@ class KavyaSmartPBXSession:
         if self._pipeline is None:
             raise RuntimeError("Kavya media pipeline is unavailable")
         return self._pipeline
+
+    def _bind_smartpbx_tool_context(self, pipeline: Any) -> None:
+        """Bind transfer and booking state to this validated Dialog call only."""
+        from smartpbx_mcp import DialogMCPCallControl, DialogMCPSettings
+        from tools import SmartPBXTransferContext
+
+        settings = DialogMCPSettings.from_env(os.environ)
+        control = DialogMCPCallControl(settings, self._context)
+        self._smartpbx_transfer_context = SmartPBXTransferContext(control)
+        pipeline._smartpbx_transfer_context = self._smartpbx_transfer_context
+        pipeline._smartpbx_caller_context = {
+            "caller_phone": self._context.caller_number,
+        }

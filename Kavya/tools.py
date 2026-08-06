@@ -32,8 +32,11 @@ property can be reintroduced by restoring the alias map, making `property`
 required again, and letting `normalise_property` return None. Do not delete it.
 """
 
+import asyncio
 import json
 import logging
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 from booking_api import (
@@ -45,6 +48,20 @@ from booking_api import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SmartPBXTransferContext:
+    """Per-utterance Dialog handover state; None deliberately means legacy Twilio."""
+
+    call_control: Any | None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    transfer_attempted: bool = False
+
+
+smartpbx_transfer_context: ContextVar[SmartPBXTransferContext | None] = ContextVar(
+    "smartpbx_transfer_context", default=None
+)
 
 # ---------------------------------------------------------------------------
 # Property / room vocabulary
@@ -510,7 +527,11 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     str
         A JSON-encoded string with the API result or an error payload.
     """
-    logger.info("Executing tool '%s' with input: %s", tool_name, tool_input)
+    transfer_context = smartpbx_transfer_context.get()
+    if transfer_context is None:
+        logger.info("Executing tool '%s' with input: %s", tool_name, tool_input)
+    else:
+        logger.info("smartpbx_tool event=execute tool=%s", tool_name)
 
     property_name: str | None = None
 
@@ -586,6 +607,25 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         )
 
     elif tool_name == "transfer_to_human":
+        if transfer_context is not None:
+            async with transfer_context.lock:
+                if transfer_context.transfer_attempted:
+                    return json.dumps({"status": "unavailable"})
+                transfer_context.transfer_attempted = True
+                if transfer_context.call_control is None:
+                    return json.dumps({"status": "unavailable"})
+                try:
+                    transfer = await transfer_context.call_control.transfer_call(
+                        "human_support"
+                    )
+                except Exception:
+                    logger.info("smartpbx_tool event=transfer outcome=unavailable")
+                    return json.dumps({"status": "unavailable"})
+                if getattr(transfer, "transferred", False):
+                    logger.info("smartpbx_tool event=transfer outcome=transferred")
+                    return json.dumps({"status": "transferred"})
+                logger.info("smartpbx_tool event=transfer outcome=unavailable")
+                return json.dumps({"status": "unavailable"})
         reason = (tool_input.get("reason") or "").strip() or "Caller requested human assistance."
         return json.dumps({"status": "transferring", "reason": reason})
 

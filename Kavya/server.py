@@ -76,6 +76,7 @@ from tools import (
     get_tools_gemini,
     get_handover_tools,
     execute_tool,
+    smartpbx_transfer_context,
 )
 from booking_api import close_session, is_configured
 # Imported for DEMO_RATES_ENABLED so the system prompt and the tool results
@@ -2584,6 +2585,24 @@ class MediaStreamSession:
         # No-speech re-prompt state
         self._reprompt_task: asyncio.Task | None = None
         self._reprompt_count: int = 0
+        # Set only by KavyaSmartPBXSession. None preserves legacy Twilio tools.
+        self._smartpbx_transfer_context: Any | None = None
+        self._smartpbx_caller_context: dict[str, str] | None = None
+
+    def _is_smartpbx_session(self) -> bool:
+        return self._smartpbx_transfer_context is not None
+
+    def _log_tool_execution(self, tool_name: str, tool_input: Any) -> None:
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=tool_execute tool=%s", tool_name)
+        else:
+            logger.info("Executing tool '%s': %s", tool_name, tool_input)
+
+    def _log_tool_result(self, tool_name: str, result: str) -> None:
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=tool_result tool=%s", tool_name)
+        else:
+            logger.info("Tool '%s' â†’ %s", tool_name, result[:200])
 
     # â”€â”€ Main event loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -2677,7 +2696,10 @@ class MediaStreamSession:
 
     def _on_stt_result(self, transcript: str):
         """Called from STT thread on FINAL results."""
-        logger.info("STT final result [%s]: %r (speaking=%s)", self.call_sid, transcript, self._is_speaking)
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=stt_final")
+        else:
+            logger.info("STT final result [%s]: %r (speaking=%s)", self.call_sid, transcript, self._is_speaking)
         self._latest_interim = ""  # clear — final supersedes interim
         if self._event_loop is None:
             return
@@ -2710,7 +2732,10 @@ class MediaStreamSession:
         )
 
     async def _handle_bargein(self):
-        logger.info("Barge-in detected [%s]", self.call_sid)
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=barge_in")
+        else:
+            logger.info("Barge-in detected [%s]", self.call_sid)
         self._is_speaking = False
         self._speak_generation += 1
         self._pending_transcript = ""
@@ -2858,13 +2883,32 @@ class MediaStreamSession:
         self._endpointing_handle = None
         if not transcript:
             return
-        logger.info("Guest [%s]: %s", self.call_sid, transcript)
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=guest_utterance")
+        else:
+            logger.info("Guest [%s]: %s", self.call_sid, transcript)
         self.full_transcript.append({"role": "user", "text": transcript})
         await self._process_utterance(transcript)
 
     # â”€â”€ Utterance â†’ KB + Claude + TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _process_utterance(self, text: str):
+        """Run one turn with call-local SmartPBX state when this is a Dialog call."""
+        transfer_token = caller_token = None
+        if self._smartpbx_transfer_context is not None:
+            transfer_token = smartpbx_transfer_context.set(
+                self._smartpbx_transfer_context
+            )
+            caller_token = handover_context.set(self._smartpbx_caller_context or {})
+        try:
+            await self._process_utterance_bound(text)
+        finally:
+            if caller_token is not None:
+                handover_context.reset(caller_token)
+            if transfer_token is not None:
+                smartpbx_transfer_context.reset(transfer_token)
+
+    async def _process_utterance_bound(self, text: str):
         try:
             kb_context = retrieve_context(text)
         except Exception:
@@ -2887,10 +2931,16 @@ class MediaStreamSession:
             else:
                 response_text = await self._run_llm()
             if response_text:
-                logger.info("Agent [%s]: %s", self.call_sid, response_text[:200])
+                if self._is_smartpbx_session():
+                    logger.info("smartpbx_media event=agent_response")
+                else:
+                    logger.info("Agent [%s]: %s", self.call_sid, response_text[:200])
                 self.full_transcript.append({"role": "assistant", "text": response_text})
         except Exception:
-            logger.exception("LLM error [%s]", self.call_sid)
+            if self._is_smartpbx_session():
+                logger.error("smartpbx_media event=llm_error")
+            else:
+                logger.exception("LLM error [%s]", self.call_sid)
             fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
             error_msg = fillers.get("_default", "I'm sorry, I encountered an error.")
             await self._speak(error_msg)
@@ -2992,7 +3042,7 @@ class MediaStreamSession:
                     except json.JSONDecodeError:
                         logger.error("Bad tool JSON for %s", tc["name"])
                         parsed_input = {}
-                    logger.info("Executing tool '%s': %s", tc["name"], parsed_input)
+                    self._log_tool_execution(tc["name"], parsed_input)
                     try:
                         result_str = await execute_tool(tc["name"], parsed_input)
                     except Exception as exc:
@@ -3003,7 +3053,7 @@ class MediaStreamSession:
                         "tool_call_id": tc["id"],
                         "content": result_str,
                     })
-                    logger.info("Tool '%s' â†’ %s", tc["name"], result_str[:200])
+                    self._log_tool_result(tc["name"], result_str)
 
                 continue
 
@@ -3127,7 +3177,7 @@ class MediaStreamSession:
 
                 for tc in tool_calls_openai:
                     parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
-                    logger.info("Executing tool '%s': %s", tc["function"]["name"], parsed_input)
+                    self._log_tool_execution(tc["function"]["name"], parsed_input)
                     try:
                         result_str = await execute_tool(tc["function"]["name"], parsed_input)
                     except Exception as exc:
@@ -3138,7 +3188,7 @@ class MediaStreamSession:
                         "tool_call_id": tc["id"],
                         "content": result_str,
                     })
-                    logger.info("Tool '%s' â†’ %s", tc["function"]["name"], result_str[:200])
+                    self._log_tool_result(tc["function"]["name"], result_str)
 
                 continue
 
@@ -3226,8 +3276,11 @@ class MediaStreamSession:
                             try:
                                 parsed = json.loads(tool_json) if tool_json else {}
                             except json.JSONDecodeError:
-                                logger.error("Bad tool JSON for %s: %s",
-                                             cur_tool_name, tool_json[:200])
+                                if self._is_smartpbx_session():
+                                    logger.error("smartpbx_media event=bad_tool_json")
+                                else:
+                                    logger.error("Bad tool JSON for %s: %s",
+                                                 cur_tool_name, tool_json[:200])
                                 parsed = {}
                             tool_use_blocks.append({
                                 "id": cur_tool_id,
@@ -3269,7 +3322,7 @@ class MediaStreamSession:
                 # Execute tools and build tool_result blocks
                 tool_results: list[dict[str, Any]] = []
                 for tb in tool_use_blocks:
-                    logger.info("Executing tool '%s': %s", tb["name"], tb["input"])
+                    self._log_tool_execution(tb["name"], tb["input"])
                     try:
                         result_str = await execute_tool(tb["name"], tb["input"])
                     except Exception as exc:
@@ -3280,7 +3333,7 @@ class MediaStreamSession:
                         "tool_use_id": tb["id"],
                         "content": result_str,
                     })
-                    logger.info("Tool '%s' â†’ %s", tb["name"], result_str[:200])
+                    self._log_tool_result(tb["name"], result_str)
 
                 self.history.append({"role": "user", "content": tool_results})
                 continue
