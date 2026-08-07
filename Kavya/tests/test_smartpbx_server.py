@@ -1901,3 +1901,43 @@ async def test_direct_reprompt_lifecycle_replaces_cancels_resets_and_suppresses_
         pipeline._endpointing_handle.cancel()
         pipeline._endpointing_handle = None
     blocker.set()
+
+
+@pytest.mark.asyncio
+async def test_direct_tts_done_mark_then_queued_bargein_cancels_reprompt():
+    import server
+
+    transport = BlockingMarkTransport()
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=transport)
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._event_loop = asyncio.get_running_loop()
+    pipeline._is_speaking = True
+    starting_generation = pipeline._speak_generation
+    barge_finished = asyncio.Event()
+    original_bargein = pipeline._handle_bargein
+
+    async def tracked_bargein():
+        try:
+            await original_bargein()
+        finally:
+            barge_finished.set()
+
+    pipeline._handle_bargein = tracked_bargein
+    completion = asyncio.create_task(pipeline._send_tts_done())
+
+    try:
+        await asyncio.wait_for(transport.mark_entered.wait(), timeout=1)
+        transport.release_mark.set()
+        pipeline._on_stt_result("caller interrupted")
+        await asyncio.wait_for(completion, timeout=1)
+        await asyncio.wait_for(barge_finished.wait(), timeout=1)
+
+        assert transport.marks == ["tts_done"]
+        assert transport.clears == 1
+        assert pipeline._speak_generation == starting_generation + 1
+        assert pipeline._is_speaking is False
+        assert pipeline._reprompt_task is None
+    finally:
+        transport.release_mark.set()
+        await asyncio.gather(completion, return_exceptions=True)
+        pipeline._cancel_reprompt()
