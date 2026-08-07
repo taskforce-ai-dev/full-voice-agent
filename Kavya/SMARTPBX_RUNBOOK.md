@@ -199,8 +199,7 @@ it requires both loopback endpoints before the final TLS vhost is installed.
 
 ## Cutover gates
 
-Before enabling the Dialog route, record privacy-safe call fingerprints and
-outcomes, never raw call IDs or credentials:
+Before enabling the Dialog route, emit only the fixed protocol diagnostic with exactly seven fields: `event=smartpbx_protocol_diagnostic`, `correlation_id`, `stage`, `outcome`, `failure_class`, `active_sessions`, and `duration_ms`. The `correlation_id` is opaque, local, randomly generated, and never derived from Dialog. No additional event names, fields, values, or measurements are permitted.
 
 1. Bad or missing WSS auth is rejected.
 2. A bidirectional call proves caller audio reaches STT, an LLM turn completes,
