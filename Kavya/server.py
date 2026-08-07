@@ -3493,7 +3493,8 @@ class MediaStreamSession:
     async def _speak(self, text: str, generation: int = -1):
         """Route text to appropriate TTS provider.
 
-        English / Tamil / Arabic â†’ ElevenLabs eleven_multilingual_v2 (cloned voice)
+        English        â†’ protected canonical ElevenLabs eleven_flash_v2_5 profile
+        Tamil / Arabic â†’ retained ElevenLabs eleven_multilingual_v2 voices
         Sinhala        â†’ OpenAI gpt-4o-mini-tts (nova)
         """
         if self.transfer_pending:
