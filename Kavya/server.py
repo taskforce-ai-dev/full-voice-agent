@@ -86,6 +86,7 @@ import yanolja_service
 from post_call import process_post_call_data
 from handover import handover_context, send_handover_notification
 from english_voice_profile import load_kavya_english_voice_profile
+from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
 
 try:
     import dashboard_client
@@ -3517,12 +3518,20 @@ class MediaStreamSession:
     async def _tts_elevenlabs(self, text: str):
         """Stream ElevenLabs TTS as 8 kHz mu-law through the active transport."""
         if not ELEVENLABS_API_KEY:
+            if self.lang == "en" and self._is_smartpbx_session():
+                diagnostic_sink = getattr(self, "_smartpbx_diagnostic_sink", None)
+                if callable(diagnostic_sink):
+                    diagnostic_sink(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_MISSING_API_KEY)
             logger.warning("ElevenLabs API key not configured — skipping TTS")
             return
         if self.lang == "en":
             try:
                 profile = load_kavya_english_voice_profile()
             except ValueError:
+                if self._is_smartpbx_session():
+                    diagnostic_sink = getattr(self, "_smartpbx_diagnostic_sink", None)
+                    if callable(diagnostic_sink):
+                        diagnostic_sink(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_PROFILE_FAILURE)
                 logger.warning("Canonical Kavya English voice is not configured — skipping TTS")
                 return
             voice_id = profile.voice_id
@@ -3549,6 +3558,10 @@ class MediaStreamSession:
                         body = await resp.aread()
                         if self._is_smartpbx_session():
                             self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
+                            if self.lang == "en":
+                                diagnostic_sink = getattr(self, "_smartpbx_diagnostic_sink", None)
+                                if callable(diagnostic_sink):
+                                    diagnostic_sink(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_HTTP_STATUS)
                         else:
                             logger.error("ElevenLabs %d: %s", resp.status_code, body[:200])
                         self._is_speaking = False
@@ -3570,12 +3583,20 @@ class MediaStreamSession:
         except httpx.TimeoutException:
             if self._is_smartpbx_session():
                 self._log_tts_failure("elevenlabs", "timeout")
+                if self.lang == "en":
+                    diagnostic_sink = getattr(self, "_smartpbx_diagnostic_sink", None)
+                    if callable(diagnostic_sink):
+                        diagnostic_sink(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_TIMEOUT)
             else:
                 logger.error("ElevenLabs timeout for: %s", text[:80])
             self._is_speaking = False
         except Exception:
             if self._is_smartpbx_session():
                 self._log_tts_failure("elevenlabs", "exception")
+                if self.lang == "en":
+                    diagnostic_sink = getattr(self, "_smartpbx_diagnostic_sink", None)
+                    if callable(diagnostic_sink):
+                        diagnostic_sink(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_EXCEPTION)
             else:
                 logger.exception("ElevenLabs TTS failed for: %s", text[:80])
             self._is_speaking = False
