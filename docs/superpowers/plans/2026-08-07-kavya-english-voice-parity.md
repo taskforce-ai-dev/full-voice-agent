@@ -23,24 +23,29 @@
 ## File Map
 
 - Create `Kavya/english_voice_profile.py` and `Kavya/tests/test_english_voice_profile.py`.
+- Modify `Kavya/Dockerfile` in the same task that creates the importable profile, so no commit can leave `server.py` importing a module absent from the image.
 - Modify `Kavya/server.py`, `Kavya/tests/test_call_quality_fixes.py`, `Kavya/tests/test_handover_server.py`, and `Kavya/tests/test_smartpbx_server.py`.
-- Modify `Kavya/Dockerfile`, `Kavya/.env.example`, `Kavya/docker-compose.yml`, `Kavya/SMARTPBX_RUNBOOK.md`, and `Kavya/tests/test_smartpbx_deployment.py`.
+- Create `Kavya/scripts/validate_english_voice_env.sh` and `Kavya/tests/test_validate_english_voice_env.py`.
+- Modify `Kavya/.env.example`, `Kavya/docker-compose.yml`, `Kavya/SMARTPBX_RUNBOOK.md`, and `Kavya/tests/test_smartpbx_deployment.py`.
 
-### Task 1: Build the Redacted Canonical Profile
+### Task 1: Build, Package, and Test the Redacted Canonical Profile
 
 **Files:**
 - Create: `Kavya/english_voice_profile.py`
 - Create: `Kavya/tests/test_english_voice_profile.py`
+- Modify: `Kavya/Dockerfile:50`
 
 **Interfaces:**
 - Produces `KAVYA_EN_ELEVENLABS_VOICE_ID: str`, `ELEVEN_FLASH_V2_5: str`, `ULAW_8000: str`, `ElevenLabsVoiceSettings`, `KavyaEnglishVoiceProfile`, and `load_kavya_english_voice_profile(environment: Mapping[str, str] | None = None) -> KavyaEnglishVoiceProfile`.
-- `KavyaEnglishVoiceProfile.twilio_composite_voice: str` is `voice_id` plus `-flash_v2_5`; `.request_voice_settings: dict[str, float | bool]` contains the nonsecret direct settings.
+- `KavyaEnglishVoiceProfile.twilio_composite_voice: str` is the protected identifier plus `-flash_v2_5`; `.request_voice_settings: dict[str, float | bool]` is the direct TTS settings payload.
 
-- [ ] **Step 1: Write failing tests**
+- [ ] **Step 1: Write failing profile and image-allowlist tests**
 
 Create `tests/test_english_voice_profile.py`:
 
 ```python
+from pathlib import Path
+
 import pytest
 
 from english_voice_profile import (
@@ -51,10 +56,14 @@ from english_voice_profile import (
 )
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 def test_profile_selects_exact_semantics_and_redacts_voice_id():
     profile = load_kavya_english_voice_profile(
         {KAVYA_EN_ELEVENLABS_VOICE_ID: "unit-test-canonical-voice"}
     )
+
     assert profile.twilio_composite_voice == "unit-test-canonical-voice-flash_v2_5"
     assert profile.model_id == ELEVEN_FLASH_V2_5
     assert profile.output_format == ULAW_8000
@@ -74,17 +83,24 @@ def test_profile_fails_closed_when_protected_value_is_absent_or_blank(value):
     environment = {}
     if value is not None:
         environment[KAVYA_EN_ELEVENLABS_VOICE_ID] = value
+
     with pytest.raises(ValueError, match=KAVYA_EN_ELEVENLABS_VOICE_ID):
         load_kavya_english_voice_profile(environment)
+
+
+def test_dockerfile_explicit_allowlist_includes_profile_runtime_module():
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "english_voice_profile.py" in dockerfile
 ```
 
 - [ ] **Step 2: Verify red**
 
 Run: `pytest tests/test_english_voice_profile.py -q`
 
-Expected: FAIL during collection with `ModuleNotFoundError: No module named 'english_voice_profile'`.
+Expected: FAIL during collection with `ModuleNotFoundError: No module named 'english_voice_profile'`; after temporarily commenting out the import-only tests, the allowlist assertion also fails because Docker does not copy the new module.
 
-- [ ] **Step 3: Implement minimum profile**
+- [ ] **Step 3: Implement the profile and image closure together**
 
 Create `english_voice_profile.py`:
 
@@ -94,6 +110,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+
 
 KAVYA_EN_ELEVENLABS_VOICE_ID = "KAVYA_EN_ELEVENLABS_VOICE_ID"
 ELEVEN_FLASH_V2_5 = "eleven_flash_v2_5"
@@ -153,19 +170,28 @@ def load_kavya_english_voice_profile(
     return KavyaEnglishVoiceProfile(voice_id=value.strip())
 ```
 
-- [ ] **Step 4: Verify green**
+Replace the Docker explicit allowlist with this exact line in the same change:
 
-Run: `pytest tests/test_english_voice_profile.py -q`
-
-Expected: `4 passed`.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add Kavya/english_voice_profile.py Kavya/tests/test_english_voice_profile.py
-git commit -m "feat(kavya): add canonical English voice profile"
+```dockerfile
+COPY server.py media_stream_server.py tools.py booking_api.py post_call.py knowledge_base.py yanolja_client.py yanolja_service.py dashboard_client.py handover.py smartpbx_gateway.py smartpbx_handover.py smartpbx_mcp.py smartpbx_protocol.py smartpbx_session.py smartpbx_transport.py english_voice_profile.py ./
 ```
 
+- [ ] **Step 4: Verify the independently buildable profile/image boundary**
+
+```bash
+pytest tests/test_english_voice_profile.py -q
+docker build -t kavya-english-voice-profile:local .
+docker run --rm --entrypoint python kavya-english-voice-profile:local -c "import english_voice_profile; import server"
+```
+
+Expected: pytest passes, the locked dependency image builds, and the container import exits `0`. This must happen before any later task imports the module from `server.py`.
+
+- [ ] **Step 5: Commit profile and Docker closure atomically**
+
+```bash
+git add Kavya/english_voice_profile.py Kavya/tests/test_english_voice_profile.py Kavya/Dockerfile
+git commit -m "feat(kavya): add packaged canonical English voice profile"
+```
 ### Task 2: Wire Normal, Recovery, and SmartPBX English TTS
 
 **Files:**
@@ -378,70 +404,175 @@ git add Kavya/server.py Kavya/tests/test_call_quality_fixes.py Kavya/tests/test_
 git commit -m "fix(kavya): share canonical English voice selection"
 ```
 
-### Task 3: Package the Module and Document Root-Only Preflight
+
+### Task 3: Add a Value-Safe Equality Preflight and Configuration Contract
 
 **Files:**
-- Modify: `Kavya/Dockerfile:50`
+- Create: `Kavya/scripts/validate_english_voice_env.sh`
+- Create: `Kavya/tests/test_validate_english_voice_env.py`
 - Modify: `Kavya/.env.example:18-23`
 - Modify: `Kavya/docker-compose.yml:35-43,114-167`
 - Modify: `Kavya/SMARTPBX_RUNBOOK.md:42-100`
 - Modify: `Kavya/tests/test_smartpbx_deployment.py:20-63`
 
 **Interfaces:**
-- Legacy `kavya` receives the key via its existing `.env` `env_file`; `kavya-smartpbx` receives exact `${KAVYA_EN_ELEVENLABS_VOICE_ID}` mapping.
-- The image can execute `import english_voice_profile; import server`.
+- `scripts/validate_english_voice_env.sh FIRST_ENV SECOND_ENV` reads only exact `KAVYA_EN_ELEVENLABS_VOICE_ID` assignments, prints exactly `canonical_voice_match=ok` on equal nonblank values, and otherwise exits nonzero without printing either value.
+- Legacy `kavya` receives the key through its existing `.env` `env_file`; `kavya-smartpbx` receives exact `${KAVYA_EN_ELEVENLABS_VOICE_ID}` interpolation. The runbook invokes the validator for `/opt/kavya/.env` and `/opt/kavya/.env.smartpbx`.
 
-- [ ] **Step 1: Write failing packaging contract**
+- [ ] **Step 1: Write failing validator and packaging-contract tests**
 
-Append to `tests/test_smartpbx_deployment.py`:
+Create `tests/test_validate_english_voice_env.py`:
 
 ```python
-def test_canonical_english_voice_profile_is_packaged_and_server_side_only():
-    example = read_text(".env.example")
-    compose = yaml.safe_load(read_text("docker-compose.yml"))
-    dockerfile = read_text("Dockerfile")
+from pathlib import Path
+import subprocess
+
+import pytest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+VALIDATOR = PROJECT_ROOT / "scripts" / "validate_english_voice_env.sh"
+KEY = "KAVYA_EN_ELEVENLABS_VOICE_ID"
+
+
+def write_environment(path: Path, value: str | None) -> None:
+    if value is None:
+        path.write_text("UNRELATED=value\n", encoding="utf-8")
+    else:
+        path.write_text(f"{KEY}={value}\n", encoding="utf-8")
+
+
+def run_validator(first: Path, second: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["sh", str(VALIDATOR), str(first), str(second)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_equal_nonblank_values_pass_with_only_fixed_marker(tmp_path):
+    first = tmp_path / "first.env"
+    second = tmp_path / "second.env"
+    write_environment(first, "equal-placeholder")
+    write_environment(second, "equal-placeholder")
+
+    result = run_validator(first, second)
+
+    assert result.returncode == 0
+    assert result.stdout == "canonical_voice_match=ok\n"
+    assert result.stderr == ""
+
+
+def test_mismatch_fails_without_echoing_either_value(tmp_path):
+    first = tmp_path / "first.env"
+    second = tmp_path / "second.env"
+    write_environment(first, "first-placeholder")
+    write_environment(second, "second-placeholder")
+
+    result = run_validator(first, second)
+
+    assert result.returncode != 0
+    assert "first-placeholder" not in result.stdout + result.stderr
+    assert "second-placeholder" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("value", ["", None])
+def test_blank_or_missing_value_fails_without_success_marker(tmp_path, value):
+    first = tmp_path / "first.env"
+    second = tmp_path / "second.env"
+    write_environment(first, "present-placeholder")
+    write_environment(second, value)
+
+    result = run_validator(first, second)
+
+    assert result.returncode != 0
+    assert "canonical_voice_match=ok" not in result.stdout + result.stderr
+    assert "present-placeholder" not in result.stdout + result.stderr
+```
+
+Append this complete test to `tests/test_smartpbx_deployment.py`:
+
+```python
+def test_voice_preflight_uses_the_equality_validator_without_hash_output():
     runbook = read_text("SMARTPBX_RUNBOOK.md")
-    assert re.search(r"^KAVYA_EN_ELEVENLABS_VOICE_ID=$", example, re.MULTILINE)
-    assert compose["services"]["kavya"]["env_file"] == [".env"]
-    assert compose["services"]["kavya-smartpbx"]["environment"]["KAVYA_EN_ELEVENLABS_VOICE_ID"] == "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
-    assert "english_voice_profile.py" in dockerfile
-    for value in ("KAVYA_EN_ELEVENLABS_VOICE_ID=", "sudoedit /opt/kavya/.env", "sudoedit /opt/kavya/.env.smartpbx", "sha256sum", "config > /dev/null", "SMARTPBX_TRANSFER_DESTINATIONS_JSON={}", "transfer-disabled"):
-        assert value in runbook
-    assert "KAVYA_EN_ELEVENLABS_VOICE_ID=<" not in runbook
+    validator = PROJECT_ROOT / "scripts" / "validate_english_voice_env.sh"
+
+    assert validator.is_file()
+    assert "validate_english_voice_env.sh /opt/kavya/.env /opt/kavya/.env.smartpbx" in runbook
+    assert "sha256sum" not in runbook
+    assert "canonical_voice_match=ok" in runbook
 ```
 
 - [ ] **Step 2: Verify red**
 
-Run: `pytest tests/test_smartpbx_deployment.py::test_canonical_english_voice_profile_is_packaged_and_server_side_only -q`
+Run: `pytest tests/test_validate_english_voice_env.py tests/test_smartpbx_deployment.py::test_voice_preflight_uses_the_equality_validator_without_hash_output -q`
 
-Expected: FAIL because the new protected key, image allowlist item, SmartPBX mapping, and provisioning instructions are absent.
+Expected: FAIL because the script does not exist and the current runbook has separate nonblank/hash checks rather than an equality validator.
 
-- [ ] **Step 3: Implement configuration and image closure**
+- [ ] **Step 3: Implement the complete no-value validator**
 
-After `ELEVENLABS_API_KEY` in `.env.example`, add only:
+Create executable `scripts/validate_english_voice_env.sh` with this complete content:
+
+```sh
+#!/bin/sh
+set -eu
+
+key=KAVYA_EN_ELEVENLABS_VOICE_ID
+first_value=
+second_value=
+
+cleanup() {
+    unset first_value second_value key
+}
+trap cleanup EXIT HUP INT TERM
+
+read_value() {
+    env_file=$1
+    [ -r "$env_file" ] || return 1
+    value=$(awk -F= -v expected_key="$key" '
+        $1 == expected_key {
+            if (seen) {
+                exit 2
+            }
+            seen = 1
+            value = substr($0, index($0, "=") + 1)
+        }
+        END {
+            if (!seen) {
+                exit 1
+            }
+            print value
+        }
+    ' "$env_file") || return 1
+    case "$value" in
+        *[![:space:]]*) printf '%s' "$value" ;;
+        *) return 1 ;;
+    esac
+}
+
+[ "$#" -eq 2 ] || exit 64
+first_value=$(read_value "$1") || exit 1
+second_value=$(read_value "$2") || exit 1
+[ "$first_value" = "$second_value" ] || exit 1
+printf '%s\n' 'canonical_voice_match=ok'
+```
+
+The script accepts exactly two paths, uses command substitution so values never reach caller stdout/stderr, rejects duplicate/missing/blank assignments, compares raw nonblank values exactly, unsets its value variables on every exit, and emits only the fixed success marker.
+
+In `.env.example`, after `ELEVENLABS_API_KEY=...`, add only:
 
 ```dotenv
 KAVYA_EN_ELEVENLABS_VOICE_ID=
 ```
 
-After `ELEVENLABS_API_KEY` in `services.kavya-smartpbx.environment`, add:
+In `services.kavya-smartpbx.environment`, after `ELEVENLABS_API_KEY`, add:
 
 ```yaml
 KAVYA_EN_ELEVENLABS_VOICE_ID: "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
 ```
 
-Do not add an override to `services.kavya`: its existing `env_file: [.env]` is correct. Replace the Docker allowlist line with:
-
-```dockerfile
-COPY server.py media_stream_server.py tools.py booking_api.py post_call.py knowledge_base.py yanolja_client.py yanolja_service.py dashboard_client.py handover.py smartpbx_gateway.py smartpbx_handover.py smartpbx_mcp.py smartpbx_protocol.py smartpbx_session.py smartpbx_transport.py english_voice_profile.py ./
-```
-
-After `ELEVENLABS_API_KEY=` in the isolated runbook template, add `KAVYA_EN_ELEVENLABS_VOICE_ID=`. Then add this complete runbook section after that template:
-
-````markdown
-### Canonical English voice provisioning preflight
-
-Retrieve the existing approved English identity only from a root-only secret source. Do not copy it from source code, a log, the dashboard, or this runbook. Do not rotate `ELEVENLABS_API_KEY` or alter `ELEVENLABS_VOICE_ID`. Put the same protected value into both files with `sudoedit`; never pass it as a command argument or paste it into a ticket, commit, or screen share.
+Do not override `services.kavya`: its current `env_file: [.env]` is its wiring. In the runbook template, add `KAVYA_EN_ELEVENLABS_VOICE_ID=` after `ELEVENLABS_API_KEY=`. Replace the prior separate `awk` and `sha256sum` preflight with this exact block:
 
 ```sh
 set -euo pipefail
@@ -452,38 +583,34 @@ sudo chown root:root /opt/kavya/.env /opt/kavya/.env.smartpbx
 sudo chmod 600 /opt/kavya/.env /opt/kavya/.env.smartpbx
 sudoedit /opt/kavya/.env
 sudoedit /opt/kavya/.env.smartpbx
-for protected_file in /opt/kavya/.env /opt/kavya/.env.smartpbx; do
-  sudo test "$(stat -c '%U:%G:%a' "$protected_file")" = root:root:600
-  sudo awk -F= '$1 == "KAVYA_EN_ELEVENLABS_VOICE_ID" { value = substr($0, index($0, "=") + 1); if (value ~ /[^[:space:]]/) ok = 1 } END { exit ok ? 0 : 1 }' "$protected_file"
-  sudo awk -F= '$1 == "KAVYA_EN_ELEVENLABS_VOICE_ID" { value = substr($0, index($0, "=") + 1); if (value ~ /[^[:space:]]/) print value }' "$protected_file" | sha256sum
-done
+sudo /opt/kavya/scripts/validate_english_voice_env.sh /opt/kavya/.env /opt/kavya/.env.smartpbx
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
 ```
 
-This prints only a hash and starts, stops, edits, or routes no service, so a failed preflight leaves running services unchanged. Keep `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` and MCP transfer-disabled; deployment and a live call require another approval.
-````
+State immediately below that block: retrieve the established English identity only from the root-only approved secret source; never print/paste it; `canonical_voice_match=ok` proves only equal nonblank values; the preflight starts, stops, edits, or routes no service; and `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` plus MCP transfer-disabled remain unchanged.
 
-- [ ] **Step 4: Verify focused/full tests, secret scan, build, and image import**
+- [ ] **Step 4: Verify validator/configuration behavior and the focused/full suites**
 
 ```bash
-pytest tests/test_english_voice_profile.py tests/test_call_quality_fixes.py tests/test_handover_server.py tests/test_smartpbx_server.py tests/test_smartpbx_deployment.py -q
+chmod 755 scripts/validate_english_voice_env.sh
+pytest tests/test_validate_english_voice_env.py tests/test_smartpbx_deployment.py -q
+pytest tests/test_english_voice_profile.py tests/test_call_quality_fixes.py tests/test_handover_server.py tests/test_smartpbx_server.py tests/test_validate_english_voice_env.py tests/test_smartpbx_deployment.py -q
 pytest tests -q
 gitleaks detect --source .. --no-git --redact
-docker build -t kavya-english-voice-parity:local .
-docker run --rm --entrypoint python kavya-english-voice-parity:local -c "import english_voice_profile; import server"
 ```
 
-Expected: pytest passes, gitleaks reports no introduced secret, build uses unchanged `requirements-prod.lock.txt`, and the container import exits `0`, proving the Docker runtime-module closure.
+Expected: validator tests prove equality success and secret-safe mismatch/blank/missing failures; packaging contract proves the exact two-file validator invocation with no hash; focused and full pytest pass; gitleaks reports no introduced secret. Do not repeat the Docker closure check here: Task 1 already proved it before `server.py` may import the module.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit the tested preflight/configuration contract**
 
 ```bash
-git add Kavya/Dockerfile Kavya/.env.example Kavya/docker-compose.yml Kavya/SMARTPBX_RUNBOOK.md Kavya/tests/test_smartpbx_deployment.py
-git commit -m "chore(kavya): package protected English voice profile"
+git add Kavya/scripts/validate_english_voice_env.sh Kavya/tests/test_validate_english_voice_env.py Kavya/.env.example Kavya/docker-compose.yml Kavya/SMARTPBX_RUNBOOK.md Kavya/tests/test_smartpbx_deployment.py
+git commit -m "chore(kavya): validate canonical voice configuration"
 ```
 
 ## Final Review Checklist
 
-- [ ] Run `rg -n "KAVYA_EN_ELEVENLABS_VOICE_ID|ELEVENLABS_VOICE_ID|eleven_multilingual_v2|eleven_flash_v2_5|output_format" Kavya` and confirm one English profile, retained non-English branch, blank example values, Docker inclusion, and no real ID.
-- [ ] Run `git diff origin/Rakesh...HEAD -- Kavya` and reject any protocol, MCP, handover, RAG, deployment, dashboard, or Flico change.
-- [ ] Obtain independent review of redaction, fail-closed behavior, normal/recovery consumers, direct request shape, non-English retention, image closure, and transfer-disabled preservation. Do not deploy or live-test under this plan.
+- [ ] Confirm `rg -n "KAVYA_EN_ELEVENLABS_VOICE_ID|ELEVENLABS_VOICE_ID|eleven_multilingual_v2|eleven_flash_v2_5|output_format" Kavya` finds exactly the planned English profile, retained non-English branch, blank examples, test-only placeholders, and no real identifier.
+- [ ] Confirm `sh Kavya/scripts/validate_english_voice_env.sh` never prints assigned values on any failure path and emits only `canonical_voice_match=ok` on equal nonblank values.
+- [ ] Confirm `git diff origin/Rakesh...HEAD -- Kavya` contains no protocol, MCP, handover, RAG, deployment, dashboard, or Flico behavior change.
+- [ ] Obtain independent review of profile redaction, profile/image atomicity, normal/recovery selection, direct request shape, validator secrecy/equality semantics, retained-language behavior, and transfer-disabled preservation. Do not deploy or live-test under this plan.
