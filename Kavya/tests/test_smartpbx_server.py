@@ -1367,3 +1367,49 @@ async def test_smartpbx_start_uses_exact_configured_stt_factory_with_private_eng
         assert calls[0]["on_interim_result"].__self__ is pipeline
     finally:
         await session.finish(False)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_runtime_invalid_provider_fails_before_client_pipeline_or_stt(monkeypatch):
+    import server
+
+    client_factory_calls = []
+    pipeline_constructions = []
+    stt_calls = []
+    real_media_session = server.MediaStreamSession
+
+    def recording_client_factory(name):
+        def factory():
+            client_factory_calls.append(name)
+            return object()
+
+        return factory
+
+    def recording_media_session(*args, **kwargs):
+        pipeline_constructions.append((args, kwargs))
+        return real_media_session(*args, **kwargs)
+
+    def configured_stt_factory(**kwargs):
+        stt_calls.append(kwargs)
+        return FakeSTT()
+
+    async def process_post_call(**_metadata):
+        return None
+
+    monkeypatch.setattr(server, "_get_anthropic_client", recording_client_factory("claude"))
+    monkeypatch.setattr(server, "_get_gemini_client", recording_client_factory("gemini"))
+    monkeypatch.setattr(server, "_get_client", recording_client_factory("openai"))
+    monkeypatch.setattr(server, "MediaStreamSession", recording_media_session)
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), stt_factory=configured_stt_factory,
+        post_call_processor=process_post_call, welcome_text="",
+        llm_provider="invalid-provider", model="invalid-provider-model",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        await session.start()
+
+    assert str(exc_info.value) == "invalid LLM provider: invalid-provider"
+    assert client_factory_calls == []
+    assert pipeline_constructions == []
+    assert stt_calls == []
