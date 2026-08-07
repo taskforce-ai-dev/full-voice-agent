@@ -413,13 +413,13 @@ git commit -m "fix(kavya): share canonical English voice selection"
 - Modify: `Kavya/.env.example:18-23`
 - Modify: `Kavya/docker-compose.yml:35-43,114-167`
 - Modify: `Kavya/SMARTPBX_RUNBOOK.md:42-100`
-- Modify: `Kavya/tests/test_smartpbx_deployment.py:20-63`
+- Modify: `Kavya/tests/test_smartpbx_deployment.py:1-63`
 
 **Interfaces:**
 - `scripts/validate_english_voice_env.sh FIRST_ENV SECOND_ENV` reads only exact `KAVYA_EN_ELEVENLABS_VOICE_ID` assignments, prints exactly `canonical_voice_match=ok` on equal nonblank values, and otherwise exits nonzero without printing either value.
-- Legacy `kavya` receives the key through its existing `.env` `env_file`; `kavya-smartpbx` receives exact `${KAVYA_EN_ELEVENLABS_VOICE_ID}` interpolation. The runbook invokes the validator for `/opt/kavya/.env` and `/opt/kavya/.env.smartpbx`.
+- The legacy `kavya` service receives the canonical key through its existing `.env` `env_file`; `kavya-smartpbx` maps it through exact `${KAVYA_EN_ELEVENLABS_VOICE_ID}` Compose interpolation. Both stay transfer-disabled in their reviewed packaging contract.
 
-- [ ] **Step 1: Write failing validator and packaging-contract tests**
+- [ ] **Step 1: Write failing validator and two-service configuration-contract tests**
 
 Create `tests/test_validate_english_voice_env.py`:
 
@@ -491,26 +491,60 @@ def test_blank_or_missing_value_fails_without_success_marker(tmp_path, value):
     assert "present-placeholder" not in result.stdout + result.stderr
 ```
 
-Append this complete test to `tests/test_smartpbx_deployment.py`:
+`tests/test_smartpbx_deployment.py` already starts with these exact current imports and helper; retain them, then append the following test below the existing deployment contracts:
 
 ```python
-def test_voice_preflight_uses_the_equality_validator_without_hash_output():
-    runbook = read_text("SMARTPBX_RUNBOOK.md")
-    validator = PROJECT_ROOT / "scripts" / "validate_english_voice_env.sh"
+from pathlib import Path
+import re
 
-    assert validator.is_file()
-    assert "validate_english_voice_env.sh /opt/kavya/.env /opt/kavya/.env.smartpbx" in runbook
+import yaml
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def read_text(name: str) -> str:
+    return (PROJECT_ROOT / name).read_text(encoding="utf-8")
+
+
+def test_canonical_voice_configuration_covers_both_kavya_services_and_stays_disabled():
+    example = read_text(".env.example")
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    legacy = compose["services"]["kavya"]
+    smartpbx = compose["services"]["kavya-smartpbx"]
+    environment = smartpbx["environment"]
+
+    assert re.search(r"^KAVYA_EN_ELEVENLABS_VOICE_ID=$", example, re.MULTILINE)
+    assert re.search(r"^KAVYA_EN_ELEVENLABS_VOICE_ID=.+$", example, re.MULTILINE) is None
+    assert legacy["env_file"] == [".env"]
+    assert environment["KAVYA_EN_ELEVENLABS_VOICE_ID"] == "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
+    assert environment["SMARTPBX_API_KEY"] == "${SMARTPBX_API_KEY}"
+    assert environment["SMARTPBX_MCP_ACCOUNT_HEADER"] == "${SMARTPBX_MCP_ACCOUNT_HEADER}"
+    assert environment["SMARTPBX_TRANSFER_DESTINATIONS_JSON"] == "${SMARTPBX_TRANSFER_DESTINATIONS_JSON}"
+    assert re.search(r"^SMARTPBX_API_KEY=$", example, re.MULTILINE)
+    assert re.search(r"^SMARTPBX_MCP_ACCOUNT_HEADER=$", example, re.MULTILINE)
+    assert re.search(r"^SMARTPBX_TRANSFER_DESTINATIONS_JSON=\{\}$", example, re.MULTILINE)
+    for required in (
+        "## Canonical English voice provisioning",
+        "sudo chown root:root /opt/kavya/.env /opt/kavya/.env.smartpbx",
+        "sudo chmod 600 /opt/kavya/.env /opt/kavya/.env.smartpbx",
+        "sudo /opt/kavya/scripts/validate_english_voice_env.sh /opt/kavya/.env /opt/kavya/.env.smartpbx",
+        "canonical_voice_match=ok",
+        "SMARTPBX_TRANSFER_DESTINATIONS_JSON={}",
+        "transfer-disabled",
+    ):
+        assert required in runbook
     assert "sha" + "256sum" not in runbook
-    assert "canonical_voice_match=ok" in runbook
 ```
 
 - [ ] **Step 2: Verify red**
 
-Run: `pytest tests/test_validate_english_voice_env.py tests/test_smartpbx_deployment.py::test_voice_preflight_uses_the_equality_validator_without_hash_output -q`
+Run: `pytest tests/test_validate_english_voice_env.py tests/test_smartpbx_deployment.py::test_canonical_voice_configuration_covers_both_kavya_services_and_stays_disabled -q`
 
-Expected: FAIL because the script does not exist and the current runbook has separate nonblank/hash checks rather than an equality validator.
+Expected: FAIL because the validator file, blank canonical key, SmartPBX mapping, and fully headed runbook section do not exist. The current Compose file still has the legacy `kavya` `env_file` and SmartPBX service names, which the new test fixes as the authoritative two-path contract.
 
-- [ ] **Step 3: Implement the complete no-value validator**
+- [ ] **Step 3: Implement the complete no-value validator and exact configuration/runbook contract**
 
 Create executable `scripts/validate_english_voice_env.sh` with this complete content:
 
@@ -558,21 +592,28 @@ second_value=$(read_value "$2") || exit 1
 printf '%s\n' 'canonical_voice_match=ok'
 ```
 
-The script accepts exactly two paths, uses command substitution so values never reach caller stdout/stderr, rejects duplicate/missing/blank assignments, compares raw nonblank values exactly, unsets its value variables on every exit, and emits only the fixed success marker.
+The script accepts exactly two paths, uses command substitution so values never reach caller stdout/stderr, rejects duplicate/missing/blank assignments, compares raw nonblank values exactly, unsets value variables on every exit, and emits only its fixed success marker.
 
-In `.env.example`, after `ELEVENLABS_API_KEY=...`, add only:
+After `ELEVENLABS_API_KEY` in `.env.example`, add only:
 
 ```dotenv
 KAVYA_EN_ELEVENLABS_VOICE_ID=
 ```
 
-In `services.kavya-smartpbx.environment`, after `ELEVENLABS_API_KEY`, add:
+After `ELEVENLABS_API_KEY` in `services.kavya-smartpbx.environment`, add:
 
 ```yaml
 KAVYA_EN_ELEVENLABS_VOICE_ID: "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
 ```
 
-Do not override `services.kavya`: its current `env_file: [.env]` is its wiring. In the runbook template, add `KAVYA_EN_ELEVENLABS_VOICE_ID=` after `ELEVENLABS_API_KEY=`. Replace the previous separate per-file check preflight with this exact block:
+Do not add a `services.kavya.environment` override: the exact existing `env_file: [.env]` makes the canonical blank-template key available to the legacy Twilio service. Do not change the existing SmartPBX `SMARTPBX_API_KEY`, `SMARTPBX_MCP_ACCOUNT_HEADER`, or `SMARTPBX_TRANSFER_DESTINATIONS_JSON` mappings, and keep the example API key and account header blank with destinations `{}`.
+
+In `SMARTPBX_RUNBOOK.md`, find the current isolated `.env.smartpbx` template, whose closing code fence is immediately followed by the paragraph beginning `Kavya accepts`. Add `KAVYA_EN_ELEVENLABS_VOICE_ID=` directly after `ELEVENLABS_API_KEY=` inside that template. Immediately after its closing fence and before that `Kavya accepts` paragraph, insert this complete headed section:
+
+````markdown
+## Canonical English voice provisioning
+
+Retrieve Kavya's established English voice identity only from the approved root-only secret source. Do not copy it from source code, a log, the dashboard, or this runbook. Do not rotate `ELEVENLABS_API_KEY` or alter `ELEVENLABS_VOICE_ID`. Set the same protected value in both files with `sudoedit`; never place it in a command argument, commit, ticket, or screen share.
 
 ```sh
 set -euo pipefail
@@ -587,9 +628,10 @@ sudo /opt/kavya/scripts/validate_english_voice_env.sh /opt/kavya/.env /opt/kavya
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
 ```
 
-State immediately below that block: retrieve the established English identity only from the root-only approved secret source; never print/paste it; `canonical_voice_match=ok` proves only equal nonblank values; the preflight starts, stops, edits, or routes no service; and `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` plus MCP transfer-disabled remain unchanged.
+`canonical_voice_match=ok` proves only that both root-only files contain an equal nonblank protected value; it does not print the value. The configuration check prints no secrets. This preflight does not start, stop, recreate, or reroute any service, and it preserves `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` with MCP transfer-disabled. If either command fails, do not run a Compose `up`; leave containers unchanged, restore both files to their prior root-only state with `sudoedit`, and rerun the preflight before any later approved deployment.
+````
 
-- [ ] **Step 4: Verify validator/configuration behavior and the focused/full suites**
+- [ ] **Step 4: Verify validator/configuration behavior and focused/full suites**
 
 ```bash
 chmod 755 scripts/validate_english_voice_env.sh
@@ -599,9 +641,9 @@ pytest tests -q
 gitleaks detect --source .. --no-git --redact
 ```
 
-Expected: validator tests prove equality success and secret-safe mismatch/blank/missing failures; packaging contract proves the exact two-file validator invocation with no hash; focused and full pytest pass; gitleaks reports no introduced secret. Do not repeat the Docker closure check here: Task 1 already proved it before `server.py` may import the module.
+Expected: validator tests prove equality success and mismatch/blank/missing secret-safe failures; the deployment contract proves the blank example, legacy `.env` route, exact SmartPBX interpolation, root-only runbook invocation, and transfer-disabled packaging invariant; focused/full pytest pass; gitleaks reports no introduced secret. Do not repeat image closure here: Task 1 completed that check before Task 2 can import the profile from `server.py`.
 
-- [ ] **Step 5: Commit the tested preflight/configuration contract**
+- [ ] **Step 5: Commit tested preflight/configuration contract**
 
 ```bash
 git add Kavya/scripts/validate_english_voice_env.sh Kavya/tests/test_validate_english_voice_env.py Kavya/.env.example Kavya/docker-compose.yml Kavya/SMARTPBX_RUNBOOK.md Kavya/tests/test_smartpbx_deployment.py
@@ -611,6 +653,6 @@ git commit -m "chore(kavya): validate canonical voice configuration"
 ## Final Review Checklist
 
 - [ ] Confirm `rg -n "KAVYA_EN_ELEVENLABS_VOICE_ID|ELEVENLABS_VOICE_ID|eleven_multilingual_v2|eleven_flash_v2_5|output_format" Kavya` finds exactly the planned English profile, retained non-English branch, blank examples, test-only placeholders, and no real identifier.
-- [ ] Confirm `sh Kavya/scripts/validate_english_voice_env.sh` never prints assigned values on any failure path and emits only `canonical_voice_match=ok` on equal nonblank values.
+- [ ] Confirm `sh Kavya/scripts/validate_english_voice_env.sh` never prints assigned values on failure and emits only `canonical_voice_match=ok` on equal nonblank values.
 - [ ] Confirm `git diff origin/Rakesh...HEAD -- Kavya` contains no protocol, MCP, handover, RAG, deployment, dashboard, or Flico behavior change.
-- [ ] Obtain independent review of profile redaction, profile/image atomicity, normal/recovery selection, direct request shape, validator secrecy/equality semantics, retained-language behavior, and transfer-disabled preservation. Do not deploy or live-test under this plan.
+- [ ] Obtain independent review of profile redaction, profile/image atomicity, normal/recovery selection, direct request shape, validator secrecy/equality semantics, both Compose paths, exact runbook anchor, and transfer-disabled preservation. Do not deploy or live-test under this plan.
