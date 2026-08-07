@@ -301,3 +301,54 @@ def test_canonical_voice_configuration_covers_both_kavya_services_and_stays_disa
     ):
         assert required in runbook
     assert "sha" + "256sum" not in runbook
+
+
+def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_operations():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    cutover = runbook.split("## Cutover gates", 1)[1].split("## ", 1)[0]
+    diagnostics = cutover.split("\n\n1.", 1)[0]
+    normalized_diagnostics = re.sub(r"\s+", " ", diagnostics).lower()
+
+    assert "fingerprint" not in normalized_diagnostics
+    assert "event=smartpbx_protocol_diagnostic" in diagnostics
+    assert diagnostics.count("event=") == 1
+    assert "exactly seven fields" in normalized_diagnostics
+    for field in (
+        "correlation_id",
+        "stage",
+        "outcome",
+        "failure_class",
+        "active_sessions",
+        "duration_ms",
+    ):
+        assert f"`{field}`" in diagnostics
+    assert "opaque, local, randomly generated" in normalized_diagnostics
+    assert "never derived from dialog" in normalized_diagnostics
+    for forbidden in (
+        "payload",
+        "audio",
+        "transcript",
+        "credential",
+        "exception",
+        "stack",
+        "session_id",
+        "call_fingerprint",
+        "counter",
+        "raw call",
+        "call id",
+        "dialog id",
+    ):
+        assert forbidden not in normalized_diagnostics
+
+    assert "transfer-disabled" in runbook
+    assert "Test endpoint-down fallback before shifting traffic." in cutover
+    assert "**4 accepted + 5th rejected**" in cutover
+    for required in ("REVIEWED_CI_SHORT_SHA", "REVIEWED_FULL_COMMIT_SHA", "--pull never", "kavya-smartpbx"):
+        assert required in runbook
+
+    rollback = runbook.split("## Withdraw and rollback without dropping calls", 1)[1]
+    withdraw = rollback.find("Withdraw the Dialog dashboard/carrier route")
+    drain = rollback.find("`active_sessions` is zero")
+    stop = rollback.find("stop kavya-smartpbx")
+    assert withdraw >= 0
+    assert withdraw < drain < stop
