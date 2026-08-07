@@ -358,6 +358,7 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
 
 
 BUILD_KAVYA_IMAGE_WORKFLOW = PROJECT_ROOT.parent / ".github/workflows/build-kavya-image.yml"
+DEPLOY_WORKFLOW = PROJECT_ROOT.parent / ".github/workflows/deploy.yml"
 
 
 def read_build_kavya_image_workflow():
@@ -423,19 +424,31 @@ def test_build_kavya_image_publisher_is_dispatch_only_and_least_privilege():
 def test_build_kavya_image_publisher_validates_the_checked_out_review_before_registry_access():
     _document, _job, steps, _text = build_kavya_image_job()
 
-    checkout = workflow_step(steps, "Checkout reviewed ref")
+    publisher_checkout = workflow_step(steps, "Checkout trusted publisher tooling")
+    source_checkout = workflow_step(steps, "Checkout reviewed source")
     validation = workflow_step(steps, "Validate reviewed checkout")
     login = workflow_step(steps, "Log in to GHCR")
     build = workflow_step(steps, "Build and push immutable image")
 
-    assert checkout["uses"].startswith("actions/checkout@")
-    assert checkout["with"]["ref"] == "${{ inputs.ref }}"
+    assert publisher_checkout["uses"].startswith("actions/checkout@")
+    assert publisher_checkout["with"] == {
+        "ref": "${{ github.workflow_sha }}",
+        "path": ".publisher",
+        "persist-credentials": "false",
+    }
+    assert source_checkout["uses"].startswith("actions/checkout@")
+    assert source_checkout["with"] == {
+        "ref": "${{ inputs.ref }}",
+        "path": "source",
+        "persist-credentials": "false",
+    }
+    assert steps.index(publisher_checkout) < steps.index(source_checkout) < steps.index(validation)
     assert steps.index(validation) < steps.index(login) < steps.index(build)
+    assert validation.get("working-directory") == "source"
     assert "[[ $expected_sha =~ ^[0-9a-f]{40}$ ]]" in validation["run"]
     assert "actual_sha=\"$(git rev-parse HEAD)\"" in validation["run"]
     assert "test -z \"$(git status --porcelain)\"" in validation["run"]
     assert "test \"$actual_sha\" = \"$expected_sha\"" in validation["run"]
-
 
 def test_build_kavya_image_publisher_uses_one_immutable_checked_out_tag_and_verifies_digest():
     _document, job, steps, text = build_kavya_image_job()
@@ -448,8 +461,8 @@ def test_build_kavya_image_publisher_uses_one_immutable_checked_out_tag_and_veri
     assert "image=\"ghcr.io/taskforce-ai-dev/kavya\"" in identity["run"]
     assert "tag=\"${image}:${actual_sha::7}\"" in identity["run"]
     assert build["uses"].startswith("docker/build-push-action@")
-    assert build["with"]["context"] == "Kavya"
-    assert build["with"]["file"] == "Kavya/Dockerfile"
+    assert build["with"]["context"] == "source/Kavya"
+    assert build["with"]["file"] == "source/Kavya/Dockerfile"
     assert build["with"]["push"] == "true"
     assert build["with"]["tags"] == "${{ steps.identity.outputs.tag }}"
     assert build["with"]["labels"] == (
@@ -520,12 +533,14 @@ def run_kavya_image_tag_probe(tmp_path, docker_exit, docker_output):
 def test_build_kavya_image_publisher_uses_static_concurrency_and_env_only_input_flow():
     document, _job, steps, _text = build_kavya_image_job()
 
-    checkout = workflow_step(steps, "Checkout reviewed ref")
+    publisher_checkout = workflow_step(steps, "Checkout trusted publisher tooling")
+    source_checkout = workflow_step(steps, "Checkout reviewed source")
     validation = workflow_step(steps, "Validate reviewed checkout")
     assert "concurrency" in document
     concurrency = document["concurrency"]
 
-    assert checkout["with"]["persist-credentials"] == "false"
+    assert publisher_checkout["with"]["persist-credentials"] == "false"
+    assert source_checkout["with"]["persist-credentials"] == "false"
     assert concurrency["group"] == "kavya-image-publisher"
     assert concurrency["cancel-in-progress"] == "false"
     assert "${{" not in concurrency["group"]
@@ -537,7 +552,7 @@ def test_build_kavya_image_publisher_uses_static_concurrency_and_env_only_input_
 
 
 def test_build_kavya_image_publisher_probes_registry_before_build_with_an_executable_script():
-    _document, _job, steps, _text = build_kavya_image_job()
+    _document, _job, steps, text = build_kavya_image_job()
 
     login = workflow_step(steps, "Log in to GHCR")
     probe = workflow_step(steps, "Probe immutable tag")
@@ -545,7 +560,9 @@ def test_build_kavya_image_publisher_probes_registry_before_build_with_an_execut
 
     assert KAVYA_IMAGE_TAG_PROBE.is_file()
     assert os.access(KAVYA_IMAGE_TAG_PROBE, os.X_OK)
-    assert "bash .github/scripts/check-kavya-image-tag.sh \"$TAG\"" in probe["run"]
+    assert "bash .publisher/.github/scripts/check-kavya-image-tag.sh \"$TAG\"" in probe["run"]
+    assert "source/.github/scripts" not in probe["run"]
+    assert not re.search(r"(?:bash|sh)\s+source/.github/scripts/", text)
     assert steps.index(login) < steps.index(probe) < steps.index(build)
 
 
@@ -555,6 +572,13 @@ def test_build_kavya_image_publisher_probes_registry_before_build_with_an_execut
         (0, "already present", 10, "existing"),
         (1, "manifest unknown", 0, "absent"),
         (1, "no such manifest", 0, "absent"),
+        (1, "authentication required: manifest unknown", 1, "probe_failed"),
+        (1, "token expired: no such manifest", 1, "probe_failed"),
+        (1, "proxy returned 404", 1, "probe_failed"),
+        (1, "denied: manifest unknown", 1, "probe_failed"),
+        (1, "timeout: manifest unknown", 1, "probe_failed"),
+        (1, "500 internal server error: no such manifest", 1, "probe_failed"),
+        (1, "registry returned 404", 1, "probe_failed"),
         (1, "denied: requested access", 1, "probe_failed"),
         (1, "dial tcp: lookup registry: no such host", 1, "probe_failed"),
         (1, "429 rate limit", 1, "probe_failed"),
@@ -587,9 +611,48 @@ def test_build_kavya_image_publisher_verifies_existing_tags_without_overwriting_
     assert "${{ steps.probe.outputs.mode }}" in resolve["env"]["MODE"]
     assert "${{ steps.build.outputs.digest }}" in resolve["env"]["BUILT_DIGEST"]
     assert "docker buildx imagetools inspect \"$TAG\"" in resolve["run"]
+    assert "pushed_digest=" in resolve["run"]
+    assert "test \"$pushed_digest\" = \"$BUILT_DIGEST\"" in resolve["run"]
+    assert resolve["run"].find("test \"$pushed_digest\" = \"$BUILT_DIGEST\"") < resolve["run"].find("echo \"digest=$digest\"")
     assert "[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]" in resolve["run"]
     assert "digest=$digest" in resolve["run"]
     assert "${{ steps.digest.outputs.digest }}" in verify["env"]["DIGEST"]
     assert "docker pull \"$image_ref\"" in verify["run"]
     assert "test \"$actual_revision\" = \"$EXPECTED_SHA\"" in verify["run"]
     assert "test \"$actual_revision\" = \"$ACTUAL_SHA\"" in verify["run"]
+
+
+
+def test_build_kavya_image_publisher_uses_only_trusted_tooling_and_honest_writer_scope_note():
+    document, _job, steps, text = build_kavya_image_job()
+
+    source_checkout = workflow_step(steps, "Checkout reviewed source")
+    probe = workflow_step(steps, "Probe immutable tag")
+
+    assert source_checkout["with"]["ref"] == "${{ inputs.ref }}"
+    assert "github.workflow_sha" not in source_checkout["with"]["ref"]
+    assert ".publisher/.github/scripts/check-kavya-image-tag.sh" in probe["run"]
+    assert "source/.github/scripts" not in "\n".join(workflow_run_strings(document))
+    assert "single-writer" not in text.lower()
+    assert "out-of-band writers are possible" in text
+    assert "consumers use the verified digest" in text
+
+
+def test_deploy_workflow_rejects_kavya_image_mode_before_any_publisher_or_host_step():
+    text = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    document = yaml.load(text, Loader=yaml.BaseLoader)
+    steps = document["jobs"]["deploy"]["steps"]
+
+    guard = workflow_step(steps, "Reject Kavya image publishing")
+    guard_run = guard["run"]
+    assert '[[ "$AGENT" == "kavya" && "$MODE" == "image" ]]' in guard_run
+    assert "Kavya image mode is disabled; use the build-only Kavya image publisher." in guard_run
+    assert "exit 1" in guard_run
+    for later_name in (
+        "Set up Buildx",
+        "Log in to GHCR",
+        "Build & push image",
+        "Set up SSH",
+        "Sync agent files to the VPS (preserves .env + runtime state)",
+    ):
+        assert steps.index(guard) < steps.index(workflow_step(steps, later_name))
