@@ -101,3 +101,38 @@ For each of six commits: run status/diff check; RED tests only and GREEN product
 Finally run focused protocol/gateway/server/deployment pytest with the verified interpreter, compile changed modules, existing transfer-disabled Compose assertion with python3, existing reviewed Docker import command, diff check, and gitleaks. Accept PR #209 CI only if cached PR head and every required check SHA equal final GREEN SHA; stale earlier green checks do not count. Do not mutate PR merely to refresh a docs-plan cache.
 
 A later approved rollback remains: withdraw Dialog route, wait active_sessions zero, then stop kavya-smartpbx. Do not touch Twilio or Flico.
+
+## Detailed execution addendum
+
+### Collection-safe RED rules
+
+Task 1 RED must import smartpbx_protocol as a module and use getattr/type(event).__name__ inside assertions; it must not import UnsupportedEvent at module scope. Cover Hangup missing/blank/non-string/over-limit legs, optional reason absent/empty/non-string/exact-boundary/over-boundary, ignored extra accountId, every DTMF digit 0-9 star hash A-D, duration absent/0/10000/bool/negative/fractional/10001, leg mismatch, extras, and blank/non-string event.
+
+Task 2 RED adds a dedicated tests/test_smartpbx_diagnostics.py. Imports of the absent diagnostics module occur inside test functions, caught and asserted, so missing code is an assertion failure rather than collection failure. It asserts exact enum members, typed callback signature, seven field record/no extras, correlation format/uniqueness/no sentinels, and Docker explicit COPY/import allowlist. GREEN adds smartpbx_diagnostics.py and adds it to Kavya/Dockerfile line 63 in the same production commit.
+
+Task 3 RED changes all factory fakes and direct session constructions. Inventory with rg before editing: tests/test_smartpbx_gateway.py, tests/test_smartpbx_gateway_transfer_pending.py, tests/test_smartpbx_real_handover_lifecycle.py, and every direct KavyaSmartPBXSession call. The coherent GREEN changes smartpbx_gateway.py:143 SessionFactory, gateway handle:157-245, cleanup:288-303, smartpbx_session.py constructor:20-50/start:88-108, and server.py _new_smartpbx_session:4953-4956 together. The three-argument factory is context, transport, typed sink.
+
+Task 3 fault tests inject session.finish, transport.close, lease.release, and websocket.close independently. For each applicable path assert every operation is called exactly once, a later cleanup operation runs after earlier failure, released_total equals one when release succeeds, only one WebSocket close is attempted, and the exact terminal-cleanup tuple is captured. A cancelled handle shields cleanup and reraises cancellation. A valid Hangup or terminal future exits receive loop before queued later media is read.
+
+Task 4 RED separately covers all five English SmartPBX sites in server.py: missing API key 3519-3521, profile ValueError 3522-3527, non-200 3548-3555, timeout 3570-3575, generic exception 3576-3581. It asserts finite TTS tuples, zero text/status/provider/body/voice/API/exception leakage, and for each changed conditional verifies no-sink and non-SmartPBX logging/control flow are unchanged. GREEN only invokes the typed sink; it never changes returns, speaking state, exception propagation, or voice behavior.
+
+Task 5 RED allows literal fixed event=smartpbx_protocol_diagnostic while forbidding raw or dynamic event names, raw payload contents, exception text/stacks, fingerprint, session_id, and unknown counter. GREEN rewrites only runbook Cutover gates and retains transfer-disabled wording plus withdrawal, active_sessions drain, then stop rollback order.
+
+### Exact per-task commit mechanics
+
+Before every RED and GREEN: run git status --short and git diff --check; verify only the stated tests-only or production/docs-only paths. Run the task command from cd Kavya with PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' and /home/dev/incoming/taskforce-ai/.venv/bin/python -m pytest. Record exact expected RED output in the RED commit body. An unexpected RED pass stops the task.
+
+Immediately before each remote publication run git ls-remote origin refs/heads/Rakesh. Use that SHA as expectedHeadOid in createCommitOnBranch, omit force, and include only that commit's files. After success run git fetch origin Rakesh and git merge --ff-only origin/Rakesh, then rerun focused verification. There are ten commits total: RED and GREEN for each of five tasks.
+
+### Final commands
+
+cd Kavya
+PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' /home/dev/incoming/taskforce-ai/.venv/bin/python -m pytest tests -q
+/home/dev/incoming/taskforce-ai/.venv/bin/python -B -m py_compile smartpbx_protocol.py smartpbx_diagnostics.py smartpbx_gateway.py smartpbx_session.py server.py
+/home/dev/incoming/taskforce-ai/.venv/bin/python -c 'from pathlib import Path; import yaml; c=yaml.safe_load(Path("docker-compose.yml").read_text()); assert "kavya-smartpbx" in c["services"]; print("compose=ok")'
+docker build -f Dockerfile -t kavya-smartpbx-plan-import .
+docker run --rm kavya-smartpbx-plan-import /home/dev/incoming/taskforce-ai/.venv/bin/python -c 'import smartpbx_diagnostics; print("smartpbx_diagnostics_import=ok")'
+/home/dev/.cache/pre-commit/repoietpp3fj/golangenv-default/bin/gitleaks detect --source .. --no-git --redact
+git diff --check
+
+Use gh pr view 209 --repo taskforce-ai-dev/full-voice-agent --json headRefOid,statusCheckRollup and gh run list --repo taskforce-ai-dev/full-voice-agent --branch Rakesh --limit 10 --json headSha,status,conclusion,url. Accept only if cached PR head and every required check SHA equals final GREEN SHA.
