@@ -39,7 +39,7 @@ class KavyaSmartPBXSession:
         self._welcome_text = welcome_text
         self._llm_provider = llm_provider
         self._model = model
-        self._diagnostic_sink = diagnostic_sink or _noop_diagnostic
+        self._diagnostic_sink = diagnostic_sink if diagnostic_sink is not None else _noop_diagnostic
 
         loop = asyncio.get_running_loop()
         self._terminal_future: asyncio.Future[None] = loop.create_future()

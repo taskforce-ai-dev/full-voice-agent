@@ -277,23 +277,33 @@ class SmartPBXGateway:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.INTERNAL_ERROR)
             close_outcome = (1011, "internal error")
         finally:
-            cleanup_task = asyncio.create_task(self._cleanup(session, transport, lease, sink))
-            while not cleanup_task.done():
-                try:
-                    await asyncio.shield(cleanup_task)
-                except asyncio.CancelledError as error:
-                    if cancellation is None:
-                        cancellation = error
-                        sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.CANCELLED, DiagnosticFailureClass.CANCELLED)
-            cleanup_degraded = await cleanup_task
-            close_failed = False
-            if accepted and close_outcome is not None and not disconnected:
-                close_failed = not await _safe_close(websocket, *close_outcome)
-                if close_failed:
-                    sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DEGRADED, DiagnosticFailureClass.WEBSOCKET_CLOSE)
-            if completed_normally and cancellation is None and not cleanup_degraded and not close_failed:
-                sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
-            sink_enabled = False
+            try:
+                cleanup_task = asyncio.create_task(self._cleanup(session, transport, lease, sink))
+                while not cleanup_task.done():
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError as error:
+                        if cancellation is None:
+                            cancellation = error
+                            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.CANCELLED, DiagnosticFailureClass.CANCELLED)
+                cleanup_degraded = await cleanup_task
+                close_failed = False
+                if accepted and close_outcome is not None and not disconnected:
+                    close_task = asyncio.create_task(_safe_close(websocket, *close_outcome))
+                    while not close_task.done():
+                        try:
+                            await asyncio.shield(close_task)
+                        except asyncio.CancelledError as error:
+                            if cancellation is None:
+                                cancellation = error
+                                sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.CANCELLED, DiagnosticFailureClass.CANCELLED)
+                    close_failed = not close_task.result()
+                    if close_failed:
+                        sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DEGRADED, DiagnosticFailureClass.WEBSOCKET_CLOSE)
+                if completed_normally and cancellation is None and not cleanup_degraded and not close_failed:
+                    sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
+            finally:
+                sink_enabled = False
             if cancellation is not None:
                 raise cancellation
 
