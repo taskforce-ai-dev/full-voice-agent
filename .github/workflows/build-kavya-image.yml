@@ -27,14 +27,23 @@ jobs:
       tag: ${{ steps.identity.outputs.tag }}
       revision: ${{ steps.identity.outputs.actual_sha }}
     steps:
-      - name: Checkout reviewed ref
+      - name: Checkout trusted publisher tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .publisher
+          persist-credentials: false
+
+      - name: Checkout reviewed source
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
+          path: source
           persist-credentials: false
 
       - name: Validate reviewed checkout
         id: identity
+        working-directory: source
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
         run: |
@@ -72,7 +81,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          bash .github/scripts/check-kavya-image-tag.sh "$TAG" >/dev/null
+          bash .publisher/.github/scripts/check-kavya-image-tag.sh "$TAG" >/dev/null
           probe_code=$?
           set -e
           case "$probe_code" in
@@ -82,15 +91,15 @@ jobs:
           esac
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
-      # The external GHCR package must remain single-writer; deployment consumes
-      # only the verified digest emitted by this build-only workflow.
+      # This workflow serializes itself, but out-of-band writers are possible;
+      # consumers use the verified digest emitted below rather than a mutable tag.
       - name: Build and push immutable image
         id: build
-        if: ${{ steps.probe.outputs.mode == 'absent' }}
+        if: "${{ steps.probe.outputs.mode == 'absent' }}"
         uses: docker/build-push-action@v7
         with:
-          context: Kavya
-          file: Kavya/Dockerfile
+          context: source/Kavya
+          file: source/Kavya/Dockerfile
           push: true
           tags: ${{ steps.identity.outputs.tag }}
           labels: org.opencontainers.image.revision=${{ steps.identity.outputs.actual_sha }}
@@ -104,7 +113,13 @@ jobs:
         run: |
           set -euo pipefail
           case "$MODE" in
-            absent) digest="$BUILT_DIGEST" ;;
+            absent)
+              [[ $BUILT_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]
+              pushed_digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Digest}}" 2>/dev/null)"
+              [[ $pushed_digest =~ ^sha256:[0-9a-f]{64}$ ]]
+              test "$pushed_digest" = "$BUILT_DIGEST"
+              digest="$pushed_digest"
+              ;;
             existing)
               digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Digest}}" 2>/dev/null)"
               ;;

@@ -75,6 +75,14 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      - name: Reject Kavya image publishing
+        run: |
+          set -euo pipefail
+          if [[ "$AGENT" == "kavya" && "$MODE" == "image" ]]; then
+            echo "Kavya image mode is disabled; use the build-only Kavya image publisher." >&2
+            exit 1
+          fi
+
       - name: Resolve agent -> source dir / VPS path / container
         id: map
         run: |
