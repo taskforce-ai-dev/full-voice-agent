@@ -104,6 +104,19 @@ def test_empty_and_partial_configuration_disable_transfer():
     }).enabled is False
 
 
+def test_endpoint_alone_cannot_enable_transfer():
+    configuration = DialogMCPSettings.from_env({
+        "SMARTPBX_MCP_URL": "https://endpoint-only-mcp.example.invalid/ucp/v2/mcp",
+        "SMARTPBX_API_KEY": "",
+        "SMARTPBX_ACCOUNT_ID": "",
+        "SMARTPBX_MCP_ACCOUNT_HEADER": "",
+        "SMARTPBX_TRANSFER_DESTINATIONS_JSON": "{}",
+    })
+
+    assert configuration.enabled is False
+    assert configuration.transfer_destinations == {}
+
+
 def test_secret_and_destinations_do_not_appear_in_settings_repr():
     rendered = repr(settings())
 
