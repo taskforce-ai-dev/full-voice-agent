@@ -55,6 +55,13 @@ def test_dockerfile_locks_dependencies_and_copies_every_smartpbx_runtime_module(
         assert module in dockerfile
 
 
+def test_dockerfile_copies_the_neutral_diagnostics_module_for_runtime_imports():
+    dockerfile = read_text("Dockerfile")
+
+    copy_line = next(line for line in dockerfile.splitlines() if line.startswith("COPY server.py"))
+    assert "smartpbx_diagnostics.py" in copy_line
+
+
 def test_nginx_exposes_only_the_bounded_smartpbx_surface_with_tls():
     nginx = read_text("nginx-smartpbx.conf")
 
