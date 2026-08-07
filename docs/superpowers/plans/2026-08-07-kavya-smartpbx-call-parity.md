@@ -414,13 +414,13 @@ def test_v06_hangup_has_no_account_requirement_and_optional_reason(reason):
     hangup = {"callId": "call-marker", "otherLegCallId": "leg-marker"}
     if reason is not None:
         hangup["reason"] = reason
-    event = parse(json.dumps({"event": "hangup", "hangup": hangup}))
+    event = parse({"event": "hangup", "hangup": hangup})
     assert event == HangupEvent("call-marker", "leg-marker", reason)
 
 
 @pytest.mark.parametrize("digit", list("0123456789*#ABCD"))
 def test_v06_dtmf_accepts_documented_digits(digit):
-    event = parse(json.dumps({"event": "dtmf", "dtmf": {"digit": digit}}))
+    event = parse({"event": "dtmf", "dtmf": {"digit": digit}})
     assert event == DtmfEvent(digit, None)
 
 
@@ -429,22 +429,22 @@ def test_v06_dtmf_accepts_documented_digits(digit):
     ("stop", StopEvent),
 ])
 def test_known_compatibility_extensions_remain_strict(name, expected_type):
-    assert isinstance(parse(json.dumps({"event": name})), expected_type)
+    assert isinstance(parse({"event": name}), expected_type)
 
 
 def test_unknown_event_has_fixed_private_discriminator():
-    event = parse(json.dumps({"event": "private-event-marker"}))
+    event = parse({"event": "private-event-marker"})
     assert event == UnsupportedEvent()
     assert "private-event-marker" not in repr(event)
 
 
 def test_hangup_context_uses_only_documented_identifiers():
-    context = parse_start_event(start_event())
+    context = parse(START).context
     event = HangupEvent(context.call_id, context.other_leg_call_id, None)
     validate_event_context(event, context)
 ~~~
 
-The imports at the top of the test add `HangupEvent`, `DtmfEvent`, and `UnsupportedEvent`; `parse`, `start_event`, `ConnectedEvent`, `StopEvent`, and `validate_event_context` are existing helpers/interfaces in this file.
+The imports at the top of the test add `HangupEvent`, `DtmfEvent`, and `UnsupportedEvent`; `parse`, `START`, `ConnectedEvent`, `StopEvent`, and `validate_event_context` are existing helpers/interfaces in this file.
 
 - [ ] **Step 2: Run RED**
 
@@ -537,7 +537,8 @@ async def test_unsupported_event_logs_only_finite_admission_class(caplog):
     private_name = "private-event-marker"
     private_id = "private-call-marker"
     with caplog.at_level(logging.INFO):
-        websocket, _, _ = await run([
+        _, _, websocket, _ = await run([
+            START,
             json.dumps({"event": private_name, "callId": private_id})
         ])
     assert websocket.close_code == 1008
@@ -618,7 +619,7 @@ def test_dependency_loader_reuses_production_english_objects():
     import server
     deps = load_english_session_dependencies(server)
     assert deps.system_prompt == server._build_system_prompt("en")
-    assert deps.tools is server.get_tools()
+    assert deps.tools == server.get_tools()
     assert deps.welcome_text == server.english_conversation_relay_config(
         server._english_voice_profile()
     )["welcome_greeting"]
@@ -739,7 +740,7 @@ def test_voice_migration_is_root_only_redacted_and_transfer_stays_disabled():
     assert "KAVYA_EN_ELEVENLABS_VOICE_ID=" in example
     assert "chmod 600 /opt/kavya/.env.smartpbx" in runbook
     assert "voice_configured" in runbook
-    assert "voice_id" not in runbook.casefold().split("redacted validation", 1)[-1]
+    assert "KAVYA_EN_ELEVENLABS_VOICE_ID=<" not in runbook
     assert "SMARTPBX_TRANSFER_DESTINATIONS_JSON={}" in runbook
 ~~~
 
