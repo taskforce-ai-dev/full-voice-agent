@@ -14,8 +14,8 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 YANOLJA_BASE_URL: str = os.getenv("YANOLJA_BASE_URL", "https://yanolja.taskforceai.tech/api").rstrip("/")
-YANOLJA_USERNAME: str = os.getenv("YANOLJA_USERNAME", "admin")
-YANOLJA_PASSWORD: str = os.getenv("YANOLJA_PASSWORD", "admin123")
+YANOLJA_USERNAME: str = os.getenv("YANOLJA_USERNAME", "")
+YANOLJA_PASSWORD: str = os.getenv("YANOLJA_PASSWORD", "")
 YANOLJA_TIMEOUT: float = float(os.getenv("YANOLJA_TIMEOUT", "30"))
 
 _session: Optional[aiohttp.ClientSession] = None

@@ -82,3 +82,103 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # Isolated Dialog SmartPBX ingress. This profile is off unless explicitly
+  # selected; it never changes the existing Twilio service above.
+  kavya-smartpbx:
+    profiles: ["smartpbx"]
+    # A SmartPBX deploy must set this to the reviewed CI commit SHA. The disabled
+    # default deliberately cannot pull an unreviewed mutable image.
+    image: ghcr.io/taskforce-ai-dev/kavya:${SMARTPBX_IMAGE_TAG:-disabled}
+    container_name: kavya-smartpbx
+
+    # Host Nginx is the public TLS boundary; keep the application loopback-only.
+    ports:
+      - "127.0.0.1:8006:8000"
+
+    # Do not use env_file here: this is a complete, explicit SmartPBX allowlist.
+    # Populate it only with `docker compose --env-file .env.smartpbx ...`.
+    # In particular, never pass Twilio credentials or HUMAN_AGENT_PHONE here.
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-credentials.json
+      KAVYA_SERVICE_MODE: smartpbx
+      ENABLE_SMARTPBX_WSS: "true"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      LLM_PROVIDER: "${LLM_PROVIDER}"
+      CLAUDE_MODEL: "${CLAUDE_MODEL}"
+      OPENAI_MODEL: "${OPENAI_MODEL}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
+      GEMINI_MODEL: "${GEMINI_MODEL}"
+      OPENAI_TTS_MODEL: "${OPENAI_TTS_MODEL}"
+      OPENAI_TTS_VOICE: "${OPENAI_TTS_VOICE}"
+      OPENAI_TTS_INSTRUCTIONS: "${OPENAI_TTS_INSTRUCTIONS}"
+      ELEVENLABS_API_KEY: "${ELEVENLABS_API_KEY}"
+      ELEVENLABS_VOICE_ID: "${ELEVENLABS_VOICE_ID}"
+      ELEVENLABS_VOICE_ID_AR: "${ELEVENLABS_VOICE_ID_AR}"
+      STT_PROVIDER: "${STT_PROVIDER}"
+      AZURE_SPEECH_KEY: "${AZURE_SPEECH_KEY}"
+      AZURE_SPEECH_REGION: "${AZURE_SPEECH_REGION}"
+      YANOLJA_BASE_URL: "${YANOLJA_BASE_URL}"
+      YANOLJA_USERNAME: "${YANOLJA_USERNAME}"
+      YANOLJA_PASSWORD: "${YANOLJA_PASSWORD}"
+      YANOLJA_TIMEOUT: "${YANOLJA_TIMEOUT}"
+      DEMO_RATES_ENABLED: "${DEMO_RATES_ENABLED}"
+      N8N_BASE_URL: "${N8N_BASE_URL}"
+      N8N_POSTCALL_WEBHOOK: "${N8N_POSTCALL_WEBHOOK}"
+      DASHBOARD_API_URL: "${DASHBOARD_API_URL}"
+      DASHBOARD_API_KEY: "${DASHBOARD_API_KEY}"
+      DASHBOARD_AGENT_ID: "${DASHBOARD_AGENT_ID}"
+      SENTRY_DSN: "${SENTRY_DSN}"
+      SENTRY_TRACES_SAMPLE_RATE: "${SENTRY_TRACES_SAMPLE_RATE}"
+      SENTRY_ENV: "${SENTRY_ENV}"
+      SENTRY_SEND_PII: "false"
+      SENTRY_ENABLE_LOGS: "false"
+      KB_DOCS_DIRECTORY: /app/knowledge_docs
+      SMARTPBX_WS_TOKEN: "${SMARTPBX_WS_TOKEN}"
+      SMARTPBX_ACCOUNT_ID: "${SMARTPBX_ACCOUNT_ID}"
+      SMARTPBX_AUTH_HEADER_NAME: X-Kavya-SmartPBX-Token
+      SMARTPBX_MAX_CALLS: "4"
+      SMARTPBX_MAX_MESSAGE_CHARS: "${SMARTPBX_MAX_MESSAGE_CHARS}"
+      SMARTPBX_MAX_AUDIO_BYTES: "${SMARTPBX_MAX_AUDIO_BYTES}"
+      SMARTPBX_MAX_OUTBOUND_FRAMES: "${SMARTPBX_MAX_OUTBOUND_FRAMES}"
+      SMARTPBX_START_TIMEOUT_SECONDS: "${SMARTPBX_START_TIMEOUT_SECONDS}"
+      SMARTPBX_IDLE_TIMEOUT_SECONDS: "${SMARTPBX_IDLE_TIMEOUT_SECONDS}"
+      SMARTPBX_HUMAN_AGENT_WHATSAPP: "${SMARTPBX_HUMAN_AGENT_WHATSAPP}"
+      SMARTPBX_MCP_URL: "${SMARTPBX_MCP_URL}"
+      SMARTPBX_API_KEY: "${SMARTPBX_API_KEY}"
+      SMARTPBX_MCP_ACCOUNT_HEADER: "${SMARTPBX_MCP_ACCOUNT_HEADER}"
+      SMARTPBX_TRANSFER_DESTINATIONS_JSON: "${SMARTPBX_TRANSFER_DESTINATIONS_JSON}"
+      SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS: "${SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS}"
+      SMARTPBX_MCP_READ_TIMEOUT_SECONDS: "${SMARTPBX_MCP_READ_TIMEOUT_SECONDS}"
+      SMARTPBX_MCP_MAX_RESPONSE_BYTES: "${SMARTPBX_MCP_MAX_RESPONSE_BYTES}"
+      SMARTPBX_MCP_RETRIES: "${SMARTPBX_MCP_RETRIES}"
+
+    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws-max-size", "65536"]
+
+    volumes:
+      # Never share the legacy service's writable Chroma store.
+      - ./chroma_db_smartpbx:/app/chroma_db
+      - ./knowledge_docs:/app/knowledge_docs:ro
+      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+
+    # The 7.8 GiB VPS retains headroom for the existing Twilio service, Nginx,
+    # Docker, and the host OS. Validate observed legacy usage before cutover.
+    mem_limit: 1536m
+    cpus: 2.0
+    pids_limit: 256
+
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

@@ -76,6 +76,7 @@ from tools import (
     get_tools_gemini,
     get_handover_tools,
     execute_tool,
+    smartpbx_transfer_context,
 )
 from booking_api import close_session, is_configured
 # Imported for DEMO_RATES_ENABLED so the system prompt and the tool results
@@ -214,6 +215,7 @@ def _get_twilio_client() -> TwilioRestClient | None:
 KB_DOCS_DIRECTORY: str = os.getenv("KB_DOCS_DIRECTORY", "knowledge_docs")
 KB_RELOAD_SECRET: str = os.getenv("KB_RELOAD_SECRET", "")
 PORT: int = int(os.getenv("PORT", "8000"))
+KAVYA_SERVICE_MODE: str = os.getenv("KAVYA_SERVICE_MODE", "twilio").strip().lower()
 AZURE_SPEECH_KEY: str = os.getenv("AZURE_SPEECH_KEY", "")
 AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "southeastasia")
 
@@ -540,8 +542,11 @@ AZURE_VOICES: dict[str, tuple[str, str]] = {
 }
 
 # Google STT primary + alternative languages per lang code
-STT_PRIMARY: dict[str, str] = {"si": "si-LK", "ta": "ta-IN", "ar": "ar-SA"}
+STT_PRIMARY: dict[str, str] = {
+    "en": "en-US", "si": "si-LK", "ta": "ta-IN", "ar": "ar-SA",
+}
 STT_ALTERNATIVES: dict[str, list[str]] = {
+    "en": [],
     "si": ["en-US", "ta-IN"],
     "ta": ["en-US", "si-LK"],
     "ar": ["en-US"],
@@ -1615,24 +1620,28 @@ async def lifespan(app: FastAPI):
         logger.warning("ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID not set — "
                        "ConversationRelay TTS will not work in production.")
 
-    if HUMAN_AGENT_PHONE:
-        logger.info("[handoff] enabled â†’ %s", HUMAN_AGENT_PHONE)
-    else:
-        logger.info("[handoff] disabled (HUMAN_AGENT_PHONE not set)")
+    # SmartPBX must not initialize or advertise the legacy Twilio handoff path.
+    # The established Twilio service retains this startup behavior unchanged.
+    if KAVYA_SERVICE_MODE != "smartpbx":
+        if HUMAN_AGENT_PHONE:
+            logger.info("[handoff] enabled â†’ %s", HUMAN_AGENT_PHONE)
+        else:
+            logger.info("[handoff] disabled (HUMAN_AGENT_PHONE not set)")
 
-    logger.info("[handoff] public hostname: %s", PUBLIC_HOSTNAME)
+        logger.info("[handoff] public hostname: %s", PUBLIC_HOSTNAME)
 
-    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-        # Eagerly construct the singleton so failures show up at boot, not on first call.
-        _get_twilio_client()
-        logger.info(
-            "[handoff] Twilio REST client configured (account=%s...)",
-            TWILIO_ACCOUNT_SID[:10],
-        )
+        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+            _get_twilio_client()
+            logger.info(
+                "[handoff] Twilio REST client configured (account=%s...)",
+                TWILIO_ACCOUNT_SID[:10],
+            )
+        else:
+            logger.warning(
+                "[handoff] Twilio REST client NOT configured — handoff will fail"
+            )
     else:
-        logger.warning(
-            "[handoff] Twilio REST client NOT configured — handoff will fail"
-        )
+        logger.info("SmartPBX mode: legacy Twilio handoff startup is disabled")
 
     # NOTE: bookings go to the Yanolja PMS via booking_api -> yanolja_service ->
     # yanolja_client. Hatton Hills is an invented demo property, so there is no
@@ -2321,10 +2330,17 @@ class GoogleSTTStream:
     Auto-restarts on the ~5-minute gRPC streaming limit.
     """
 
-    def __init__(self, on_final_result: Any, on_interim_result: Any = None, lang: str = "si"):
+    def __init__(
+        self,
+        on_final_result: Any,
+        on_interim_result: Any = None,
+        lang: str = "si",
+        privacy_safe: bool = False,
+    ):
         self._on_final = on_final_result
         self._on_interim = on_interim_result
         self._lang = lang
+        self._privacy_safe = privacy_safe
         self._audio_q: queue.Queue[bytes | None] = queue.Queue()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -2399,11 +2415,17 @@ class GoogleSTTStream:
                 if result.alternatives:
                     transcript = result.alternatives[0].transcript.strip()
                     if result.is_final:
-                        logger.info("STT final: %r", transcript)
+                        if self._privacy_safe:
+                            logger.info("smartpbx_media event=stt_provider_final")
+                        else:
+                            logger.info("STT final: %r", transcript)
                         if transcript:
                             self._on_final(transcript)
                     else:
-                        logger.info("STT interim: %r", transcript)
+                        if self._privacy_safe:
+                            logger.info("smartpbx_media event=stt_provider_interim")
+                        else:
+                            logger.info("STT interim: %r", transcript)
                         if transcript and self._on_interim:
                             self._on_interim(transcript)
 
@@ -2423,10 +2445,17 @@ class AzureSTTStream:
     applies but is no longer the only path to a final.
     """
 
-    def __init__(self, on_final_result: Any, on_interim_result: Any = None, lang: str = "si"):
+    def __init__(
+        self,
+        on_final_result: Any,
+        on_interim_result: Any = None,
+        lang: str = "si",
+        privacy_safe: bool = False,
+    ):
         self._on_final = on_final_result
         self._on_interim = on_interim_result
         self._lang = lang
+        self._privacy_safe = privacy_safe
         self._chunk_count = 0
         self._running = False
         self._push_stream = None
@@ -2494,7 +2523,10 @@ class AzureSTTStream:
     def _on_recognizing(self, evt):
         text = (evt.result.text or "").strip()
         if text and self._on_interim:
-            logger.info("Azure STT interim: %r", text)
+            if self._privacy_safe:
+                logger.info("smartpbx_media event=stt_provider_interim")
+            else:
+                logger.info("Azure STT interim: %r", text)
             self._on_interim(text)
 
     def _on_recognized(self, evt):
@@ -2502,7 +2534,10 @@ class AzureSTTStream:
             return
         text = (evt.result.text or "").strip()
         if text:
-            logger.info("Azure STT final: %r", text)
+            if self._privacy_safe:
+                logger.info("smartpbx_media event=stt_provider_final")
+            else:
+                logger.info("Azure STT final: %r", text)
             self._on_final(text)
 
     def _on_canceled(self, evt):
@@ -2512,16 +2547,21 @@ class AzureSTTStream:
         )
 
 
-def _make_stt(on_final_result: Any, on_interim_result: Any, lang: str):
+def _make_stt(
+    on_final_result: Any,
+    on_interim_result: Any,
+    lang: str,
+    privacy_safe: bool = False,
+):
     """Build the configured STT backend. STT_PROVIDER: 'google' (default) | 'azure'.
 
     Falls back to Google if Azure is selected but its SDK/audioop is missing.
     """
     if STT_PROVIDER == "azure":
         if AZURE_STT_AVAILABLE and audioop is not None:
-            return AzureSTTStream(on_final_result, on_interim_result, lang)
+            return AzureSTTStream(on_final_result, on_interim_result, lang, privacy_safe)
         logger.error("STT_PROVIDER=azure but Azure STT unavailable — falling back to Google")
-    return GoogleSTTStream(on_final_result, on_interim_result, lang)
+    return GoogleSTTStream(on_final_result, on_interim_result, lang, privacy_safe)
 
 
 # ---------------------------------------------------------------------------
@@ -2538,13 +2578,15 @@ class MediaStreamSession:
 
     def __init__(
         self,
-        websocket: WebSocket,
+        websocket: WebSocket | None,
         lang: str,
         anthropic_client: AsyncAnthropic | None = None,
         openai_client: AsyncOpenAI | None = None,
         gemini_client=None,
+        media_transport: Any | None = None,
     ):
         self.ws = websocket
+        self._media_transport = media_transport
         self.anthropic_client = anthropic_client
         self.client = openai_client  # OpenAI client (kept for openai provider)
         self.gemini_client = gemini_client
@@ -2581,6 +2623,53 @@ class MediaStreamSession:
         # No-speech re-prompt state
         self._reprompt_task: asyncio.Task | None = None
         self._reprompt_count: int = 0
+        # Set only by KavyaSmartPBXSession. None preserves legacy Twilio tools.
+        self._smartpbx_transfer_context: Any | None = None
+        self._smartpbx_caller_context: dict[str, str] | None = None
+        self.transfer_pending = False
+
+    def _is_smartpbx_session(self) -> bool:
+        return self._smartpbx_transfer_context is not None
+
+    async def enter_transfer_pending(self) -> None:
+        """Silence AI activity after carrier acknowledgement without closing Dialog."""
+        if self.transfer_pending:
+            return
+        self.transfer_pending = True
+        self._cancel_reprompt()
+        if self._endpointing_handle:
+            self._endpointing_handle.cancel()
+            self._endpointing_handle = None
+        self._pending_transcript = ""
+        self._latest_interim = ""
+        self._is_speaking = False
+        self._speak_generation += 1
+        await self._clear_media_audio(force=True)
+
+    def _log_tool_execution(self, tool_name: str, tool_input: Any) -> None:
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=tool_execute tool=%s", tool_name)
+        else:
+            logger.info("Executing tool '%s': %s", tool_name, tool_input)
+
+    def _log_tool_result(self, tool_name: str, result: str) -> None:
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=tool_result tool=%s", tool_name)
+        else:
+            logger.info("Tool '%s' â†’ %s", tool_name, result[:200])
+
+    def _log_tool_failure(self, tool_name: str) -> None:
+        if self._is_smartpbx_session():
+            logger.error("smartpbx_media event=tool_error tool=%s", tool_name)
+        else:
+            logger.exception("Tool '%s' failed", tool_name)
+
+    def _log_tts_failure(self, provider: str, outcome: str, status: int | None = None) -> None:
+        if self._is_smartpbx_session():
+            if status is None:
+                logger.error("smartpbx_media event=tts_failure provider=%s outcome=%s", provider, outcome)
+            else:
+                logger.error("smartpbx_media event=tts_failure provider=%s outcome=http_status status=%d", provider, status)
 
     # â”€â”€ Main event loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -2674,7 +2763,12 @@ class MediaStreamSession:
 
     def _on_stt_result(self, transcript: str):
         """Called from STT thread on FINAL results."""
-        logger.info("STT final result [%s]: %r (speaking=%s)", self.call_sid, transcript, self._is_speaking)
+        if self.transfer_pending:
+            return
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=stt_final")
+        else:
+            logger.info("STT final result [%s]: %r (speaking=%s)", self.call_sid, transcript, self._is_speaking)
         self._latest_interim = ""  # clear — final supersedes interim
         if self._event_loop is None:
             return
@@ -2694,6 +2788,8 @@ class MediaStreamSession:
         We drive our own endpointing: each interim resets a 1.5 s silence
         timer; when the timer fires we use the latest interim as the utterance.
         """
+        if self.transfer_pending:
+            return
         self._latest_interim = transcript
         if self._event_loop is None:
             return
@@ -2707,7 +2803,10 @@ class MediaStreamSession:
         )
 
     async def _handle_bargein(self):
-        logger.info("Barge-in detected [%s]", self.call_sid)
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=barge_in")
+        else:
+            logger.info("Barge-in detected [%s]", self.call_sid)
         self._is_speaking = False
         self._speak_generation += 1
         self._pending_transcript = ""
@@ -2715,10 +2814,49 @@ class MediaStreamSession:
         if self._endpointing_handle:
             self._endpointing_handle.cancel()
             self._endpointing_handle = None
+        await self._clear_media_audio()
+
+    async def _send_media_audio(self, audio: bytes) -> None:
+        """Send raw mulaw through the active provider-specific media transport."""
+        if self.transfer_pending:
+            return
+        if self._media_transport is not None:
+            await self._media_transport.send_audio(audio)
+            return
+        async with self._ws_lock:
+            await self.ws.send_text(json.dumps({
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {"payload": base64.b64encode(audio).decode("ascii")},
+            }))
+
+    async def _clear_media_audio(self, force: bool = False) -> None:
+        """Clear pending speech without leaking one provider's wire protocol."""
+        if self.transfer_pending and not force:
+            return
+        if self._media_transport is not None:
+            await self._media_transport.clear_audio()
+            return
         async with self._ws_lock:
             await self.ws.send_text(json.dumps({
                 "event": "clear",
                 "streamSid": self.stream_sid,
+            }))
+
+    async def _send_tts_done(self) -> None:
+        """Complete one utterance using local acknowledgement when available."""
+        if self.transfer_pending:
+            return
+        if self._media_transport is not None:
+            await self._media_transport.send_mark("tts_done")
+            self._is_speaking = False
+            self._schedule_reprompt()
+            return
+        async with self._ws_lock:
+            await self.ws.send_text(json.dumps({
+                "event": "mark",
+                "streamSid": self.stream_sid,
+                "mark": {"name": "tts_done"},
             }))
 
     # â”€â”€ Debug: live-call audio capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2740,10 +2878,13 @@ class MediaStreamSession:
                 wf.setsampwidth(2)
                 wf.setframerate(8000)
                 wf.writeframes(pcm)
-            logger.info(
-                "Wrote STT debug audio: %s (%d chunks, %.1fs)",
-                path, len(self._audio_dump), len(pcm) / 2 / 8000,
-            )
+            if self._is_smartpbx_session():
+                logger.info("smartpbx_media event=audio_dump_written")
+            else:
+                logger.info(
+                    "Wrote STT debug audio: %s (%d chunks, %.1fs)",
+                    path, len(self._audio_dump), len(pcm) / 2 / 8000,
+                )
         except Exception:
             logger.exception("Failed to write STT audio dump")
         finally:
@@ -2753,6 +2894,8 @@ class MediaStreamSession:
 
     def _schedule_reprompt(self) -> None:
         """Arm a silence nudge after the agent finishes speaking."""
+        if self.transfer_pending:
+            return
         if self._reprompt_task and not self._reprompt_task.done():
             self._reprompt_task.cancel()
         self._reprompt_task = asyncio.create_task(self._reprompt_after_silence())
@@ -2765,6 +2908,8 @@ class MediaStreamSession:
     async def _reprompt_after_silence(self) -> None:
         try:
             await asyncio.sleep(SILENCE_REPROMPT_DELAY)
+            if self.transfer_pending:
+                return
             if self._reprompt_count >= MAX_REPROMPTS:
                 return
             if self._is_speaking:
@@ -2774,10 +2919,16 @@ class MediaStreamSession:
             messages = REPROMPT_MESSAGES.get(self.lang, REPROMPT_MESSAGES["en"])
             text = messages[min(self._reprompt_count, len(messages) - 1)]
             self._reprompt_count += 1
-            logger.info(
-                "No-speech re-prompt [%s] attempt %d (lang=%s)",
-                self.call_sid, self._reprompt_count, self.lang,
-            )
+            if self._is_smartpbx_session():
+                logger.info(
+                    "smartpbx_media event=silence_reprompt attempt=%d",
+                    self._reprompt_count,
+                )
+            else:
+                logger.info(
+                    "No-speech re-prompt [%s] attempt %d (lang=%s)",
+                    self.call_sid, self._reprompt_count, self.lang,
+                )
             self.full_transcript.append({"role": "assistant", "text": text})
             await self._speak(text)
         except asyncio.CancelledError:
@@ -2786,6 +2937,8 @@ class MediaStreamSession:
     # â”€â”€ Endpointing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _accumulate_transcript(self, text: str):
+        if self.transfer_pending:
+            return
         # Caller is speaking — cancel any pending silence nudge and reset
         # the re-prompt counter so future silences start fresh.
         self._cancel_reprompt()
@@ -2804,6 +2957,8 @@ class MediaStreamSession:
 
     async def _set_transcript_interim(self, text: str):
         """Overwrite (not append) pending transcript with latest interim; reset timer."""
+        if self.transfer_pending:
+            return
         # Caller is speaking — cancel any pending silence nudge and reset
         # the re-prompt counter.
         self._cancel_reprompt()
@@ -2817,19 +2972,44 @@ class MediaStreamSession:
         )
 
     async def _flush_transcript(self):
+        if self.transfer_pending:
+            self._pending_transcript = ""
+            self._latest_interim = ""
+            return
         transcript = self._pending_transcript.strip()
         self._pending_transcript = ""
         self._latest_interim = ""
         self._endpointing_handle = None
         if not transcript:
             return
-        logger.info("Guest [%s]: %s", self.call_sid, transcript)
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=guest_utterance")
+        else:
+            logger.info("Guest [%s]: %s", self.call_sid, transcript)
         self.full_transcript.append({"role": "user", "text": transcript})
         await self._process_utterance(transcript)
 
     # â”€â”€ Utterance â†’ KB + Claude + TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _process_utterance(self, text: str):
+        """Run one turn with call-local SmartPBX state when this is a Dialog call."""
+        if self.transfer_pending:
+            return
+        transfer_token = caller_token = None
+        if self._smartpbx_transfer_context is not None:
+            transfer_token = smartpbx_transfer_context.set(
+                self._smartpbx_transfer_context
+            )
+            caller_token = handover_context.set(self._smartpbx_caller_context or {})
+        try:
+            await self._process_utterance_bound(text)
+        finally:
+            if caller_token is not None:
+                handover_context.reset(caller_token)
+            if transfer_token is not None:
+                smartpbx_transfer_context.reset(transfer_token)
+
+    async def _process_utterance_bound(self, text: str):
         try:
             kb_context = retrieve_context(text)
         except Exception:
@@ -2852,10 +3032,16 @@ class MediaStreamSession:
             else:
                 response_text = await self._run_llm()
             if response_text:
-                logger.info("Agent [%s]: %s", self.call_sid, response_text[:200])
+                if self._is_smartpbx_session():
+                    logger.info("smartpbx_media event=agent_response")
+                else:
+                    logger.info("Agent [%s]: %s", self.call_sid, response_text[:200])
                 self.full_transcript.append({"role": "assistant", "text": response_text})
         except Exception:
-            logger.exception("LLM error [%s]", self.call_sid)
+            if self._is_smartpbx_session():
+                logger.error("smartpbx_media event=llm_error")
+            else:
+                logger.exception("LLM error [%s]", self.call_sid)
             fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
             error_msg = fillers.get("_default", "I'm sorry, I encountered an error.")
             await self._speak(error_msg)
@@ -2867,7 +3053,10 @@ class MediaStreamSession:
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
 
         for round_idx in range(MAX_TOOL_ROUNDS):
-            logger.info("LLM round %d [%s]", round_idx + 1, self.call_sid)
+            if self._is_smartpbx_session():
+                logger.info("smartpbx_media event=llm_round provider=openai round=%d", round_idx + 1)
+            else:
+                logger.info("LLM round %d [%s]", round_idx + 1, self.call_sid)
 
             text_content = ""
             tool_calls_data: dict[int, dict[str, str]] = {}
@@ -2920,10 +3109,10 @@ class MediaStreamSession:
 
             if tool_calls_data:
                 tool_list = list(tool_calls_data.values())
-                logger.info(
-                    "Tools [%s]: %s", self.call_sid,
-                    [t["name"] for t in tool_list],
-                )
+                if self._is_smartpbx_session():
+                    logger.info("smartpbx_media event=tool_batch count=%d", len(tool_list))
+                else:
+                    logger.info("Tools [%s]: %s", self.call_sid, [t["name"] for t in tool_list])
                 if tts_tasks:
                     await asyncio.gather(*tts_tasks)
 
@@ -2957,18 +3146,20 @@ class MediaStreamSession:
                     except json.JSONDecodeError:
                         logger.error("Bad tool JSON for %s", tc["name"])
                         parsed_input = {}
-                    logger.info("Executing tool '%s': %s", tc["name"], parsed_input)
+                    self._log_tool_execution(tc["name"], parsed_input)
                     try:
                         result_str = await execute_tool(tc["name"], parsed_input)
                     except Exception as exc:
-                        logger.exception("Tool '%s' failed", tc["name"])
+                        self._log_tool_failure(tc["name"])
                         result_str = json.dumps({"error": str(exc)})
                     self.history.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "content": result_str,
                     })
-                    logger.info("Tool '%s' â†’ %s", tc["name"], result_str[:200])
+                    self._log_tool_result(tc["name"], result_str)
+                    if self.transfer_pending:
+                        return full_text
 
                 continue
 
@@ -2987,7 +3178,10 @@ class MediaStreamSession:
                 self.history.append({"role": "assistant", "content": text_content})
             return full_text
 
-        logger.warning("Exhausted %d tool rounds [%s]", MAX_TOOL_ROUNDS, self.call_sid)
+        if self._is_smartpbx_session():
+            logger.warning("smartpbx_media event=tool_round_limit provider=openai")
+        else:
+            logger.warning("Exhausted %d tool rounds [%s]", MAX_TOOL_ROUNDS, self.call_sid)
         return full_text
 
     # â”€â”€ Gemini native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
@@ -2998,7 +3192,10 @@ class MediaStreamSession:
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
 
         for round_idx in range(MAX_TOOL_ROUNDS):
-            logger.info("Gemini round %d [%s]", round_idx + 1, self.call_sid)
+            if self._is_smartpbx_session():
+                logger.info("smartpbx_media event=llm_round provider=gemini round=%d", round_idx + 1)
+            else:
+                logger.info("Gemini round %d [%s]", round_idx + 1, self.call_sid)
 
             text_content = ""
             function_calls: list[dict] = []
@@ -3049,19 +3246,18 @@ class MediaStreamSession:
                         args = dict(fc.args) if fc.args else {}
                         function_calls.append({"name": fc.name, "args": args})
 
-            logger.info(
-                "Gemini round %d [%s] — text=%d chars, tools=%d, finish=%s",
-                round_idx + 1, self.call_sid, len(text_content),
-                len(function_calls), finish_reason,
-            )
+            if self._is_smartpbx_session():
+                logger.info("smartpbx_media event=llm_round_complete provider=gemini tools=%d", len(function_calls))
+            else:
+                logger.info("Gemini round %d [%s] — text=%d chars, tools=%d, finish=%s", round_idx + 1, self.call_sid, len(text_content), len(function_calls), finish_reason)
 
             full_text += text_content
 
             if function_calls:
-                logger.info(
-                    "Tools [%s]: %s", self.call_sid,
-                    [fc["name"] for fc in function_calls],
-                )
+                if self._is_smartpbx_session():
+                    logger.info("smartpbx_media event=tool_batch count=%d", len(function_calls))
+                else:
+                    logger.info("Tools [%s]: %s", self.call_sid, [fc["name"] for fc in function_calls])
                 if tts_tasks:
                     await asyncio.gather(*tts_tasks)
 
@@ -3092,18 +3288,20 @@ class MediaStreamSession:
 
                 for tc in tool_calls_openai:
                     parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
-                    logger.info("Executing tool '%s': %s", tc["function"]["name"], parsed_input)
+                    self._log_tool_execution(tc["function"]["name"], parsed_input)
                     try:
                         result_str = await execute_tool(tc["function"]["name"], parsed_input)
                     except Exception as exc:
-                        logger.exception("Tool '%s' failed", tc["function"]["name"])
+                        self._log_tool_failure(tc["function"]["name"])
                         result_str = json.dumps({"error": str(exc)})
                     self.history.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "content": result_str,
                     })
-                    logger.info("Tool '%s' â†’ %s", tc["function"]["name"], result_str[:200])
+                    self._log_tool_result(tc["function"]["name"], result_str)
+                    if self.transfer_pending:
+                        return full_text
 
                 continue
 
@@ -3122,7 +3320,10 @@ class MediaStreamSession:
                 self.history.append({"role": "assistant", "content": text_content})
             return full_text
 
-        logger.warning("Exhausted %d tool rounds (Gemini) [%s]", MAX_TOOL_ROUNDS, self.call_sid)
+        if self._is_smartpbx_session():
+            logger.warning("smartpbx_media event=tool_round_limit provider=gemini")
+        else:
+            logger.warning("Exhausted %d tool rounds (Gemini) [%s]", MAX_TOOL_ROUNDS, self.call_sid)
         return full_text
 
     # â”€â”€ Claude native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
@@ -3133,7 +3334,10 @@ class MediaStreamSession:
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
 
         for round_idx in range(MAX_TOOL_ROUNDS):
-            logger.info("Claude round %d [%s]", round_idx + 1, self.call_sid)
+            if self._is_smartpbx_session():
+                logger.info("smartpbx_media event=llm_round provider=claude round=%d", round_idx + 1)
+            else:
+                logger.info("Claude round %d [%s]", round_idx + 1, self.call_sid)
 
             text_content = ""
             tool_use_blocks: list[dict[str, Any]] = []
@@ -3191,8 +3395,11 @@ class MediaStreamSession:
                             try:
                                 parsed = json.loads(tool_json) if tool_json else {}
                             except json.JSONDecodeError:
-                                logger.error("Bad tool JSON for %s: %s",
-                                             cur_tool_name, tool_json[:200])
+                                if self._is_smartpbx_session():
+                                    logger.error("smartpbx_media event=bad_tool_json")
+                                else:
+                                    logger.error("Bad tool JSON for %s: %s",
+                                                 cur_tool_name, tool_json[:200])
                                 parsed = {}
                             tool_use_blocks.append({
                                 "id": cur_tool_id,
@@ -3206,10 +3413,10 @@ class MediaStreamSession:
             full_text += text_content
 
             if tool_use_blocks:
-                logger.info(
-                    "Tools [%s]: %s", self.call_sid,
-                    [t["name"] for t in tool_use_blocks],
-                )
+                if self._is_smartpbx_session():
+                    logger.info("smartpbx_media event=tool_batch count=%d", len(tool_use_blocks))
+                else:
+                    logger.info("Tools [%s]: %s", self.call_sid, [t["name"] for t in tool_use_blocks])
                 if tts_tasks:
                     await asyncio.gather(*tts_tasks)
 
@@ -3234,18 +3441,20 @@ class MediaStreamSession:
                 # Execute tools and build tool_result blocks
                 tool_results: list[dict[str, Any]] = []
                 for tb in tool_use_blocks:
-                    logger.info("Executing tool '%s': %s", tb["name"], tb["input"])
+                    self._log_tool_execution(tb["name"], tb["input"])
                     try:
                         result_str = await execute_tool(tb["name"], tb["input"])
                     except Exception as exc:
-                        logger.exception("Tool '%s' failed", tb["name"])
+                        self._log_tool_failure(tb["name"])
                         result_str = json.dumps({"error": str(exc)})
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tb["id"],
                         "content": result_str,
                     })
-                    logger.info("Tool '%s' â†’ %s", tb["name"], result_str[:200])
+                    self._log_tool_result(tb["name"], result_str)
+                    if self.transfer_pending:
+                        return full_text
 
                 self.history.append({"role": "user", "content": tool_results})
                 continue
@@ -3265,7 +3474,10 @@ class MediaStreamSession:
                 self.history.append({"role": "assistant", "content": text_content})
             return full_text
 
-        logger.warning("Exhausted %d tool rounds (Claude) [%s]", MAX_TOOL_ROUNDS, self.call_sid)
+        if self._is_smartpbx_session():
+            logger.warning("smartpbx_media event=tool_round_limit provider=claude")
+        else:
+            logger.warning("Exhausted %d tool rounds (Claude) [%s]", MAX_TOOL_ROUNDS, self.call_sid)
         return full_text
 
     # â”€â”€ TTS â†’ Twilio mulaw audio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -3273,13 +3485,17 @@ class MediaStreamSession:
     async def _speak(self, text: str, generation: int = -1):
         """Route text to appropriate TTS provider.
 
-        Tamil / Arabic â†’ ElevenLabs eleven_multilingual_v2 (cloned voice)
+        English / Tamil / Arabic â†’ ElevenLabs eleven_multilingual_v2 (cloned voice)
         Sinhala        â†’ OpenAI gpt-4o-mini-tts (nova)
         """
+        if self.transfer_pending:
+            return
         async with self._speak_lock:
+            if self.transfer_pending:
+                return
             if generation >= 0 and generation != self._speak_generation:
                 return
-            if self.lang in ("ta", "ar"):
+            if self.lang in ("en", "ta", "ar"):
                 await self._tts_elevenlabs(text)
             elif self.lang == "si":
                 await self._tts_openai(text)
@@ -3329,37 +3545,37 @@ class MediaStreamSession:
                 ) as resp:
                     if resp.status_code != 200:
                         body = await resp.aread()
-                        logger.error("ElevenLabs %d: %s",
-                                     resp.status_code, body[:200])
+                        if self._is_smartpbx_session():
+                            self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
+                        else:
+                            logger.error("ElevenLabs %d: %s", resp.status_code, body[:200])
                         self._is_speaking = False
                         return
 
                     async for chunk in resp.aiter_bytes(chunk_size=640):
                         if not self._is_speaking:
                             break
-                        b64 = base64.b64encode(chunk).decode("ascii")
-                        async with self._ws_lock:
-                            await self.ws.send_text(json.dumps({
-                                "event": "media",
-                                "streamSid": self.stream_sid,
-                                "media": {"payload": b64},
-                            }))
+                        await self._send_media_audio(chunk)
 
             if self._is_speaking:
-                async with self._ws_lock:
-                    await self.ws.send_text(json.dumps({
-                        "event": "mark",
-                        "streamSid": self.stream_sid,
-                        "mark": {"name": "tts_done"},
-                    }))
+                await self._send_tts_done()
             else:
-                logger.info("ElevenLabs TTS interrupted by barge-in [%s]", self.call_sid)
+                if self._is_smartpbx_session():
+                    logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                else:
+                    logger.info("ElevenLabs TTS interrupted by barge-in [%s]", self.call_sid)
 
         except httpx.TimeoutException:
-            logger.error("ElevenLabs timeout for: %s", text[:80])
+            if self._is_smartpbx_session():
+                self._log_tts_failure("elevenlabs", "timeout")
+            else:
+                logger.error("ElevenLabs timeout for: %s", text[:80])
             self._is_speaking = False
         except Exception:
-            logger.exception("ElevenLabs TTS failed for: %s", text[:80])
+            if self._is_smartpbx_session():
+                self._log_tts_failure("elevenlabs", "exception")
+            else:
+                logger.exception("ElevenLabs TTS failed for: %s", text[:80])
             self._is_speaking = False
 
     # â”€â”€ Azure TTS (Sinhala) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -3395,33 +3611,34 @@ class MediaStreamSession:
                 ) as resp:
                     if resp.status_code != 200:
                         body = await resp.aread()
-                        logger.error("Azure TTS %d: %s", resp.status_code, body[:200])
+                        if self._is_smartpbx_session():
+                            self._log_tts_failure("azure", "http_status", resp.status_code)
+                        else:
+                            logger.error("Azure TTS %d: %s", resp.status_code, body[:200])
                         self._is_speaking = False
                         return
                     async for chunk in resp.aiter_bytes(chunk_size=640):
                         if not self._is_speaking:
                             break
-                        b64 = base64.b64encode(chunk).decode("ascii")
-                        async with self._ws_lock:
-                            await self.ws.send_text(json.dumps({
-                                "event": "media",
-                                "streamSid": self.stream_sid,
-                                "media": {"payload": b64},
-                            }))
+                        await self._send_media_audio(chunk)
             if self._is_speaking:
-                async with self._ws_lock:
-                    await self.ws.send_text(json.dumps({
-                        "event": "mark",
-                        "streamSid": self.stream_sid,
-                        "mark": {"name": "tts_done"},
-                    }))
+                await self._send_tts_done()
             else:
-                logger.info("Azure TTS interrupted by barge-in [%s]", self.call_sid)
+                if self._is_smartpbx_session():
+                    logger.info("smartpbx_media event=tts_interrupted provider=azure")
+                else:
+                    logger.info("Azure TTS interrupted by barge-in [%s]", self.call_sid)
         except httpx.TimeoutException:
-            logger.error("Azure TTS timeout for: %s", text[:80])
+            if self._is_smartpbx_session():
+                self._log_tts_failure("azure", "timeout")
+            else:
+                logger.error("Azure TTS timeout for: %s", text[:80])
             self._is_speaking = False
         except Exception:
-            logger.exception("Azure TTS failed for: %s", text[:80])
+            if self._is_smartpbx_session():
+                self._log_tts_failure("azure", "exception")
+            else:
+                logger.exception("Azure TTS failed for: %s", text[:80])
             self._is_speaking = False
 
     # â”€â”€ OpenAI TTS (Sinhala) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -3466,8 +3683,10 @@ class MediaStreamSession:
                 ) as resp:
                     if resp.status_code != 200:
                         body = await resp.aread()
-                        logger.error("OpenAI TTS %d: %s",
-                                     resp.status_code, body[:200])
+                        if self._is_smartpbx_session():
+                            self._log_tts_failure("openai", "http_status", resp.status_code)
+                        else:
+                            logger.error("OpenAI TTS %d: %s", resp.status_code, body[:200])
                         self._is_speaking = False
                         return
 
@@ -3492,39 +3711,31 @@ class MediaStreamSession:
                             if not self._is_speaking:
                                 break
                             frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
-                            b64 = base64.b64encode(frame).decode("ascii")
-                            async with self._ws_lock:
-                                await self.ws.send_text(json.dumps({
-                                    "event": "media",
-                                    "streamSid": self.stream_sid,
-                                    "media": {"payload": b64},
-                                }))
+                            await self._send_media_audio(frame)
 
             # Flush any remaining tail of mulaw audio.
             if self._is_speaking and mulaw_buf:
-                b64 = base64.b64encode(mulaw_buf).decode("ascii")
-                async with self._ws_lock:
-                    await self.ws.send_text(json.dumps({
-                        "event": "media",
-                        "streamSid": self.stream_sid,
-                        "media": {"payload": b64},
-                    }))
+                await self._send_media_audio(mulaw_buf)
 
             if self._is_speaking:
-                async with self._ws_lock:
-                    await self.ws.send_text(json.dumps({
-                        "event": "mark",
-                        "streamSid": self.stream_sid,
-                        "mark": {"name": "tts_done"},
-                    }))
+                await self._send_tts_done()
             else:
-                logger.info("OpenAI TTS interrupted by barge-in [%s]", self.call_sid)
+                if self._is_smartpbx_session():
+                    logger.info("smartpbx_media event=tts_interrupted provider=openai")
+                else:
+                    logger.info("OpenAI TTS interrupted by barge-in [%s]", self.call_sid)
 
         except httpx.TimeoutException:
-            logger.error("OpenAI TTS timeout for: %s", text[:80])
+            if self._is_smartpbx_session():
+                self._log_tts_failure("openai", "timeout")
+            else:
+                logger.error("OpenAI TTS timeout for: %s", text[:80])
             self._is_speaking = False
         except Exception:
-            logger.exception("OpenAI TTS failed for: %s", text[:80])
+            if self._is_smartpbx_session():
+                self._log_tts_failure("openai", "exception")
+            else:
+                logger.exception("OpenAI TTS failed for: %s", text[:80])
             self._is_speaking = False
 
 
@@ -4729,6 +4940,71 @@ async def ws_media_stream(websocket: WebSocket, lang: str):
         gemini_client=gemini_client,
     )
     await session.run()
+
+
+# ---------------------------------------------------------------------------
+# Service-mode boundary
+# ---------------------------------------------------------------------------
+_twilio_app = app
+
+
+async def _new_smartpbx_session(context, transport):
+    from smartpbx_session import KavyaSmartPBXSession
+
+    return KavyaSmartPBXSession(context, transport)
+
+
+def build_service_app(
+    service_mode: str,
+    environ: Any,
+) -> FastAPI:
+    """Select one ingress surface; never activate Twilio and Dialog together."""
+    mode = service_mode.strip().lower() if isinstance(service_mode, str) else ""
+    if mode == "twilio":
+        return _twilio_app
+    if mode != "smartpbx":
+        raise ValueError("invalid KAVYA_SERVICE_MODE")
+
+    from smartpbx_gateway import (
+        SmartPBXGateway,
+        SmartPBXSessionRegistry,
+        SmartPBXSettings,
+    )
+    from smartpbx_mcp import DialogMCPSettings
+
+    settings = SmartPBXSettings.from_env(environ)
+    transfer_settings = DialogMCPSettings.from_env(environ)
+    registry = SmartPBXSessionRegistry(settings.max_calls)
+    gateway = SmartPBXGateway(settings, registry)
+    smartpbx_app = FastAPI(
+        title="Hatton Hills Voice Agent (Kavya) — SmartPBX",
+        version="1.0.0",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+
+    def smartpbx_health() -> dict[str, str]:
+        return {"status": "ok", "service_mode": "smartpbx"}
+
+    def status() -> dict[str, bool | int | str]:
+        return {**gateway.snapshot(), "transfer_enabled": transfer_settings.enabled}
+
+    async def smartpbx_media(websocket: WebSocket) -> None:
+        await gateway.handle(websocket, _new_smartpbx_session)
+
+    smartpbx_app.add_api_route("/health", smartpbx_health, methods=["GET"])
+    smartpbx_app.add_api_route("/smartpbx/status", status, methods=["GET"])
+    smartpbx_app.add_api_websocket_route(
+        "/ws/v1/smartpbx/media",
+        smartpbx_media,
+    )
+    smartpbx_app.state.smartpbx_gateway = gateway
+    return smartpbx_app
+
+
+app = build_service_app(KAVYA_SERVICE_MODE, os.environ)
 
 
 # ---------------------------------------------------------------------------
