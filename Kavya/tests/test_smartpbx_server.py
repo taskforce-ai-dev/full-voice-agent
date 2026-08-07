@@ -1722,3 +1722,28 @@ async def test_retained_non_english_direct_tool_uses_existing_media_stream_fille
     await pipeline._process_utterance_bound("safe guest turn")
 
     assert server.MEDIA_STREAM_FILLERS["ta"]["create_booking"] in [text for text, _generation in spoken]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_retained_non_english_multiround_transcript_preserves_legacy_concatenation(monkeypatch, provider):
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"safe": "value"}, preamble="Preamble."),
+        direct_text_round(provider, "Recovery."),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client, lang="ta")
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    async def successful_tool(_name, _arguments):
+        return "ok"
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("safe guest turn")
+
+    assert pipeline.full_transcript[-1] == {"role": "assistant", "text": "Preamble.Recovery."}
