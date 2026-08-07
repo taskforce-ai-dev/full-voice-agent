@@ -2841,6 +2841,7 @@ class MediaStreamSession:
         else:
             logger.info("Barge-in detected [%s]", self.call_sid)
         self._is_speaking = False
+        self._cancel_reprompt()
         self._speak_generation += 1
         self._pending_transcript = ""
         self._latest_interim = ""
