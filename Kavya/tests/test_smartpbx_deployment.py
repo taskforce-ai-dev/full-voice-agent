@@ -352,3 +352,121 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
     stop = rollback.find("stop kavya-smartpbx")
     assert withdraw >= 0
     assert withdraw < drain < stop
+
+
+BUILD_KAVYA_IMAGE_WORKFLOW = PROJECT_ROOT.parent / ".github/workflows/build-kavya-image.yml"
+
+
+def read_build_kavya_image_workflow():
+    assert BUILD_KAVYA_IMAGE_WORKFLOW.is_file(), (
+        "missing build-only Kavya image publisher workflow"
+    )
+    text = BUILD_KAVYA_IMAGE_WORKFLOW.read_text(encoding="utf-8")
+    document = yaml.load(text, Loader=yaml.BaseLoader)
+    assert isinstance(document, dict)
+    return document, text
+
+
+def build_kavya_image_job():
+    document, text = read_build_kavya_image_workflow()
+    jobs = document.get("jobs", {})
+    assert set(jobs) == {"build"}
+    job = jobs["build"]
+    return document, job, job.get("steps", []), text
+
+
+def workflow_step(steps, name):
+    return next(step for step in steps if step.get("name") == name)
+
+
+def test_build_kavya_image_publisher_is_dispatch_only_and_least_privilege():
+    document, job, steps, text = build_kavya_image_job()
+
+    assert document["name"] == "Build Kavya image (no deploy)"
+    assert set(document["on"]) == {"workflow_dispatch"}
+    inputs = document["on"]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"ref", "expected_sha"}
+    assert inputs["ref"]["required"] == "true"
+    assert inputs["expected_sha"]["required"] == "true"
+    assert job["permissions"] == {"contents": "read", "packages": "write"}
+    assert "environment" not in job
+
+    login = workflow_step(steps, "Log in to GHCR")
+    assert login["uses"].startswith("docker/login-action@")
+    assert login["with"] == {
+        "registry": "ghcr.io",
+        "username": "${{ github.actor }}",
+        "password": "${{ secrets.GITHUB_TOKEN }}",
+    }
+    assert re.findall(r"secrets\.([A-Za-z0-9_]+)", text) == ["GITHUB_TOKEN"]
+
+    for forbidden in (
+        "workflow_run",
+        "docker compose",
+        "systemctl",
+        "nginx",
+        "rsync",
+        "scp",
+        "ssh ",
+        "curl ",
+        "VPS_HOST",
+        "VPS_USER",
+    ):
+        assert forbidden not in text
+
+
+def test_build_kavya_image_publisher_validates_the_checked_out_review_before_registry_access():
+    _document, _job, steps, _text = build_kavya_image_job()
+
+    checkout = workflow_step(steps, "Checkout reviewed ref")
+    validation = workflow_step(steps, "Validate reviewed checkout")
+    login = workflow_step(steps, "Log in to GHCR")
+    build = workflow_step(steps, "Build and push immutable image")
+
+    assert checkout["uses"].startswith("actions/checkout@")
+    assert checkout["with"]["ref"] == "${{ inputs.ref }}"
+    assert steps.index(validation) < steps.index(login) < steps.index(build)
+    assert "[[ $expected_sha =~ ^[0-9a-f]{40}$ ]]" in validation["run"]
+    assert "actual_sha=\"$(git rev-parse HEAD)\"" in validation["run"]
+    assert "test -z \"$(git status --porcelain)\"" in validation["run"]
+    assert "test \"$actual_sha\" = \"$expected_sha\"" in validation["run"]
+
+
+def test_build_kavya_image_publisher_uses_one_immutable_checked_out_tag_and_verifies_digest():
+    _document, job, steps, text = build_kavya_image_job()
+
+    identity = workflow_step(steps, "Validate reviewed checkout")
+    absent = workflow_step(steps, "Refuse existing immutable tag")
+    build = workflow_step(steps, "Build and push immutable image")
+    verify = workflow_step(steps, "Verify pushed digest and revision")
+
+    assert "image=\"ghcr.io/taskforce-ai-dev/kavya\"" in identity["run"]
+    assert "tag=\"${image}:${actual_sha::7}\"" in identity["run"]
+    assert "docker manifest inspect \"$TAG\"" in absent["run"]
+    assert build["uses"].startswith("docker/build-push-action@")
+    assert build["with"]["context"] == "Kavya"
+    assert build["with"]["file"] == "Kavya/Dockerfile"
+    assert build["with"]["push"] == "true"
+    assert build["with"]["tags"] == "${{ steps.identity.outputs.tag }}"
+    assert build["with"]["labels"] == (
+        "org.opencontainers.image.revision=${{ steps.identity.outputs.actual_sha }}"
+    )
+    assert "${{ steps.build.outputs.digest }}" in verify["env"]["DIGEST"]
+    assert "image_ref=\"${IMAGE}@${DIGEST}\"" in verify["run"]
+    assert "docker pull \"$image_ref\"" in verify["run"]
+    assert "docker image inspect \"$image_ref\"" in verify["run"]
+    assert "test \"$actual_revision\" = \"$EXPECTED_SHA\"" in verify["run"]
+    assert "test \"$actual_revision\" = \"$ACTUAL_SHA\"" in verify["run"]
+    assert set(job["outputs"]) == {"digest", "tag", "revision"}
+    assert ":latest" not in text
+
+
+def test_build_kavya_image_publisher_summary_is_limited_to_safe_build_identity():
+    _document, _job, steps, _text = build_kavya_image_job()
+
+    summary = workflow_step(steps, "Write safe build summary")
+    assert summary.get("if") == "${{ always() }}"
+    for safe_field in ("revision", "tag", "digest", "run_id", "status"):
+        assert safe_field in summary["run"]
+    for forbidden in ("expected_sha", "secrets", "github.actor", "ref"):
+        assert forbidden not in summary["run"]
