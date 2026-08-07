@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the English Dialog SmartPBX call path use Kavya's protected canonical English voice and existing English behavior while remaining private, bounded, and transfer-disabled.
+**Goal:** Make the English Dialog SmartPBX call path use Kavya's protected canonical English voice and production English behavior while preserving Dialog `g711_ulaw`/8000, privacy boundaries, Twilio, Flico, and disabled transfer.
 
-**Architecture:** Extract English TTS selection into one protected immutable profile consumed by both ConversationRelay and direct SmartPBX rendering. Keep SmartPBX as an adapter over `MediaStreamSession`; correct v06 event admission and add only finite diagnostics. Deploy only the isolated profile after tests, review, CI/image provenance, and an approved stable-call gate.
+**Architecture:** A focused `english_voice_profile.py` owns the protected English voice identity and constructs both renderer selections. ConversationRelay consumes the profile voice plus flash suffix; direct ElevenLabs TTS consumes the same profile with `output_format=ulaw_8000` in the URL query and `model_id=eleven_flash_v2_5` in the JSON body. The existing `MediaStreamSession` remains the only English conversation pipeline. Dialog v06 parsing stays closed-world, and lifecycle diagnostics use finite, non-sensitive classes.
 
-**Tech Stack:** Python 3.11, FastAPI/WebSockets, pytest/pytest-asyncio, ElevenLabs streaming TTS, Twilio ConversationRelay, Dialog SmartPBX, Docker Compose, Nginx, GitHub Actions.
+**Tech Stack:** Python 3.11, FastAPI/WebSockets, pytest/pytest-asyncio, httpx, ElevenLabs streaming TTS, Twilio ConversationRelay, Dialog SmartPBX, Docker Compose, Nginx, GitHub Actions.
 
 ## Global Constraints
 
@@ -18,232 +18,857 @@
 
 ---
 
-## File map
+## File map and task order
 
-- Create: `Kavya/english_voice_profile.py`; `Kavya/tests/test_english_voice_profile.py`.
-- Modify: `Kavya/server.py:134-140,489-530,1751-1752,1814-1817,2550-2565,2571-2648,3485-3577`.
-- Modify: `Kavya/smartpbx_session.py:88-224`; `Kavya/smartpbx_protocol.py:15-155,189-209`; `Kavya/smartpbx_gateway.py:146-315,344-356`.
-- Modify: `Kavya/.env.example:18-21,178-202`; `Kavya/docker-compose.yml:88-155`; `Kavya/SMARTPBX_RUNBOOK.md:76-130,154-257`.
-- Modify tests: `Kavya/tests/test_smartpbx_protocol.py`, `test_smartpbx_gateway.py`, `test_smartpbx_server.py`, `test_smartpbx_transport.py`, `test_smartpbx_deployment.py`, `test_smartpbx_provider_handover.py`.
+- Create `Kavya/english_voice_profile.py` and `Kavya/tests/test_english_voice_profile.py`.
+- Modify `Kavya/server.py:134-140,489-530,1751-1752,1814-1817,2571-2648,3485-3577`.
+- Modify `Kavya/smartpbx_session.py:17-224`, `Kavya/smartpbx_protocol.py:15-245`, and `Kavya/smartpbx_gateway.py:146-356`.
+- Modify `Kavya/.env.example:18-21,178-202`, `Kavya/docker-compose.yml:88-155`, `Kavya/SMARTPBX_RUNBOOK.md:76-257`.
+- Modify `Kavya/tests/test_smartpbx_protocol.py`, `test_smartpbx_gateway.py`, `test_smartpbx_server.py`, `test_smartpbx_transport.py`, `test_smartpbx_deployment.py`, and `test_smartpbx_provider_handover.py`.
 
-Do not modify `Kavya/smartpbx_mcp.py`, `smartpbx_handover.py`, `tools.py`, Flico, dashboard routing, or Twilio. The independent handover plan owns those paths.
+Tasks are ordered RED then GREEN. No test is described as failing “before” an already-completed later task. `Kavya/smartpbx_mcp.py`, `smartpbx_handover.py`, `tools.py`, all Flico paths, dashboard routing, and the deployed Twilio service are out of scope. Transfer remains disabled throughout.
 
-### Task 1: Protected canonical English profile
+### Task 1: Canonical protected profile and correct direct request builder
 
-**Files:** Create `Kavya/english_voice_profile.py`; test `Kavya/tests/test_english_voice_profile.py`.
+**Files:**
+- Create: `Kavya/english_voice_profile.py`
+- Create: `Kavya/tests/test_english_voice_profile.py`
 
-**Interfaces:** `EnglishVoiceProfile(voice_id: str, model_id: str = "eleven_flash_v2_5", output_format: str = "ulaw_8000")`; `load_english_voice_profile(environ: Mapping[str, str]) -> EnglishVoiceProfile`; `VOICE_ENV_KEY = "KAVYA_EN_ELEVENLABS_VOICE_ID"`. `voice_id` is `repr=False`.
+**Interfaces:**
+- `VOICE_ENV_KEY: Final[str] = "KAVYA_EN_ELEVENLABS_VOICE_ID"`
+- `EnglishVoiceProfile(voice_id: str, model_id: str, output_format: str, voice_settings: Mapping[str, float | bool])`
+- `load_english_voice_profile(environ: Mapping[str, str]) -> EnglishVoiceProfile`
+- `build_direct_stream_request(profile: EnglishVoiceProfile, text: str) -> tuple[str, dict[str, object]]`
+- Voice identifiers are protected values; tests use only the literal marker `test-only-voice-marker`, which is not a deployable identifier.
 
-- [ ] **Step 1: Write RED tests**
+- [ ] **Step 1: Write the complete failing tests**
 
 ~~~python
-def test_profile_is_canonical_and_redacted():
+# Kavya/tests/test_english_voice_profile.py
+from urllib.parse import parse_qs, urlparse
+import pytest
+
+from english_voice_profile import (
+    VOICE_ENV_KEY,
+    build_direct_stream_request,
+    load_english_voice_profile,
+)
+
+
+def test_profile_is_fail_closed_fixed_and_redacted():
     profile = load_english_voice_profile({VOICE_ENV_KEY: "test-only-voice-marker"})
-    assert (profile.model_id, profile.output_format) == ("eleven_flash_v2_5", "ulaw_8000")
+    assert profile.voice_id == "test-only-voice-marker"
+    assert profile.model_id == "eleven_flash_v2_5"
+    assert profile.output_format == "ulaw_8000"
+    assert profile.voice_settings == {
+        "stability": 0.5,
+        "similarity_boost": 0.75,
+        "style": 0.0,
+        "use_speaker_boost": True,
+    }
     assert "test-only-voice-marker" not in repr(profile)
 
-@pytest.mark.parametrize("value", [None, "", "  "])
-def test_profile_fails_closed_when_missing(value):
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_profile_rejects_missing_or_blank_protected_value(value):
+    environ = {} if value is None else {VOICE_ENV_KEY: value}
     with pytest.raises(ValueError, match="canonical English voice is required"):
-        load_english_voice_profile({} if value is None else {VOICE_ENV_KEY: value})
+        load_english_voice_profile(environ)
+
+
+def test_direct_request_puts_format_only_in_query_and_model_only_in_body():
+    profile = load_english_voice_profile({VOICE_ENV_KEY: "test-only-voice-marker"})
+    url, body = build_direct_stream_request(profile, "Hello")
+    parsed = urlparse(url)
+    assert parsed.path.endswith("/test-only-voice-marker/stream")
+    assert parse_qs(parsed.query) == {"output_format": ["ulaw_8000"]}
+    assert body == {
+        "text": "Hello",
+        "model_id": "eleven_flash_v2_5",
+        "voice_settings": dict(profile.voice_settings),
+    }
+    assert "output_format" not in body
 ~~~
 
-- [ ] **Step 2: Verify RED** — Run `cd Kavya && pytest -q tests/test_english_voice_profile.py`; expect `ModuleNotFoundError`.
-- [ ] **Step 3: Implement GREEN**
+- [ ] **Step 2: Run RED**
+
+Run: `cd Kavya && pytest -q tests/test_english_voice_profile.py`
+
+Expected: FAIL during collection with `ModuleNotFoundError: No module named 'english_voice_profile'`.
+
+- [ ] **Step 3: Add the complete minimal implementation**
 
 ~~~python
+# Kavya/english_voice_profile.py
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Final, Mapping
+from urllib.parse import quote, urlencode
+
+VOICE_ENV_KEY: Final[str] = "KAVYA_EN_ELEVENLABS_VOICE_ID"
+ELEVENLABS_STREAM_ROOT: Final[str] = "https://api.elevenlabs.io/v1/text-to-speech"
+
+
 @dataclass(frozen=True)
 class EnglishVoiceProfile:
     voice_id: str = field(repr=False)
     model_id: str = "eleven_flash_v2_5"
     output_format: str = "ulaw_8000"
+    voice_settings: Mapping[str, float | bool] = field(
+        default_factory=lambda: MappingProxyType({
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+            "style": 0.0,
+            "use_speaker_boost": True,
+        })
+    )
 
-def load_english_voice_profile(environ):
+
+def load_english_voice_profile(environ: Mapping[str, str]) -> EnglishVoiceProfile:
     value = environ.get(VOICE_ENV_KEY, "")
     if not isinstance(value, str) or not value.strip():
         raise ValueError("canonical English voice is required")
-    return EnglishVoiceProfile(value.strip())
+    return EnglishVoiceProfile(voice_id=value.strip())
+
+
+def build_direct_stream_request(
+    profile: EnglishVoiceProfile, text: str
+) -> tuple[str, dict[str, object]]:
+    path = f"{ELEVENLABS_STREAM_ROOT}/{quote(profile.voice_id, safe='')}/stream"
+    url = f"{path}?{urlencode({'output_format': profile.output_format})}"
+    body: dict[str, object] = {
+        "text": text,
+        "model_id": profile.model_id,
+        "voice_settings": dict(profile.voice_settings),
+    }
+    return url, body
 ~~~
 
-No `ELEVENLABS_VOICE_ID` or multilingual fallback is accepted.
+- [ ] **Step 4: Run GREEN**
 
-- [ ] **Step 4: Verify GREEN** — Run the same command; expect PASS.
-- [ ] **Step 5: Commit** — `git add Kavya/english_voice_profile.py Kavya/tests/test_english_voice_profile.py && git diff --cached --check && git commit -m "feat(kavya): add protected English voice profile"`.
+Run: `cd Kavya && pytest -q tests/test_english_voice_profile.py`
 
-### Task 2: Shared Twilio English selection
+Expected: `5 passed`; the URL query is `ulaw_8000`, the body contains `eleven_flash_v2_5`, and the body excludes `output_format`.
 
-**Files:** Modify `Kavya/server.py:134-140,489-530,1751-1752,1814-1817`; test `Kavya/tests/test_english_voice_profile.py`.
+- [ ] **Step 5: Commit atomically**
 
-**Interfaces:** `english_conversation_relay_config(profile: EnglishVoiceProfile) -> dict[str, str]`; `_english_voice_profile() -> EnglishVoiceProfile`.
+Run: `git add Kavya/english_voice_profile.py Kavya/tests/test_english_voice_profile.py && git diff --cached --check && git commit -m "feat(kavya): add canonical English voice profile"`
 
-- [ ] **Step 1: Write RED test**
+Expected: one commit containing only the module and its tests.
+
+### Task 2: ConversationRelay derives English voice from the canonical profile
+
+**Files:**
+- Modify: `Kavya/server.py:134-140,489-530,1751-1752,1814-1817`
+- Modify: `Kavya/tests/test_english_voice_profile.py`
+
+**Interfaces:**
+- Consumes Task 1 `EnglishVoiceProfile` and `load_english_voice_profile`.
+- Produces `english_conversation_relay_config(profile: EnglishVoiceProfile) -> dict[str, str]`.
+- Existing `_build_conversation_relay_twiml(host: str, lang: str, config: dict[str, str]) -> str` is consumed unchanged.
+
+- [ ] **Step 1: Append the complete failing test**
 
 ~~~python
-def test_english_relay_config_uses_profile():
-    cfg = server.english_conversation_relay_config(EnglishVoiceProfile("test-only-voice-marker"))
-    assert cfg["voice"] == "test-only-voice-marker-flash_v2_5"
-    assert cfg["tts_provider"] == "ElevenLabs"
-    assert server.LANGUAGE_CONFIGS["si"]["voice"] == "si-LK-Standard-A"
+# append to Kavya/tests/test_english_voice_profile.py
+import server
+from english_voice_profile import EnglishVoiceProfile
+
+
+def test_relay_config_uses_profile_flash_voice_without_changing_non_english():
+    before = dict(server.LANGUAGE_CONFIGS["si"])
+    config = server.english_conversation_relay_config(
+        EnglishVoiceProfile(voice_id="test-only-voice-marker")
+    )
+    assert config == {
+        "tts_provider": "ElevenLabs",
+        "voice": "test-only-voice-marker-flash_v2_5",
+        "language": "en-US",
+        "transcription_language": server.CR_TRANSCRIPTION_LANGUAGE_EN,
+        "hints": server.CR_HINTS_EN,
+        "welcome_greeting": "Welcome to Hatton Hills! I'm Kavya, how can I help you today?",
+        "extra_attrs": '        elevenlabsTextNormalization="on"\n',
+    }
+    assert server.LANGUAGE_CONFIGS["si"] == before
 ~~~
 
-- [ ] **Step 2: Verify RED** — `cd Kavya && pytest -q tests/test_english_voice_profile.py::test_english_relay_config_uses_profile`; expect missing factory.
-- [ ] **Step 3: Implement GREEN** — import Task 1, make `_english_voice_profile()` load `os.environ`, and return the existing nonsecret English config plus `"voice": f"{profile.voice_id}-flash_v2_5"`. Remove only the hard-coded English source; call the factory at current Twilio sites 1751 and 1816. Non-English entries remain unchanged; blank key fails before English Twilio/SmartPBX call.
-- [ ] **Step 4: Verify GREEN** — `cd Kavya && pytest -q tests/test_english_voice_profile.py tests/test_prompt_policy.py`; expect PASS/no fallback.
-- [ ] **Step 5: Commit** — `git add Kavya/server.py Kavya/tests/test_english_voice_profile.py && git diff --cached --check && git commit -m "refactor(kavya): share English relay voice selection"`.
+- [ ] **Step 2: Run RED**
 
-### Task 3: Direct SmartPBX flash μ-law request
+Run: `cd Kavya && pytest -q tests/test_english_voice_profile.py::test_relay_config_uses_profile_flash_voice_without_changing_non_english`
 
-**Files:** Modify `Kavya/server.py:3485-3577`, `Kavya/smartpbx_session.py:152-193`; tests `test_english_voice_profile.py`, `test_smartpbx_server.py:211-228`.
+Expected: FAIL with `AttributeError` because `english_conversation_relay_config` does not exist.
 
-**Interfaces:** extend `MediaStreamSession(..., english_voice_profile: EnglishVoiceProfile | None = None)`; `_elevenlabs_request_settings(text: str) -> tuple[str, dict[str, object]]`.
-
-- [ ] **Step 1: Write RED test**
+- [ ] **Step 3: Add the complete minimal selection code and replace both call sites**
 
 ~~~python
+# server.py imports/constants section
+from english_voice_profile import EnglishVoiceProfile, load_english_voice_profile
+
+
+def _english_voice_profile() -> EnglishVoiceProfile:
+    return load_english_voice_profile(os.environ)
+
+
+def english_conversation_relay_config(
+    profile: EnglishVoiceProfile,
+) -> dict[str, str]:
+    return {
+        "tts_provider": "ElevenLabs",
+        "voice": f"{profile.voice_id}-flash_v2_5",
+        "language": "en-US",
+        "transcription_language": CR_TRANSCRIPTION_LANGUAGE_EN,
+        "hints": CR_HINTS_EN,
+        "welcome_greeting": "Welcome to Hatton Hills! I'm Kavya, how can I help you today?",
+        "extra_attrs": '        elevenlabsTextNormalization="on"\n',
+    }
+
+# voice_incoming, replacing `en = LANGUAGE_CONFIGS["en"]`
+en = english_conversation_relay_config(_english_voice_profile())
+
+# voice_language_selected, replacing `config = LANGUAGE_CONFIGS["en"]`
+config = english_conversation_relay_config(_english_voice_profile())
+~~~
+
+Delete only the hard-coded English `LANGUAGE_CONFIGS["en"]` entry and legacy English voice constant. Retain every non-English entry and route unchanged. Missing profile raises the fixed Task 1 error; no general/multilingual fallback is added.
+
+- [ ] **Step 4: Run GREEN**
+
+Run: `cd Kavya && pytest -q tests/test_english_voice_profile.py tests/test_prompt_policy.py`
+
+Expected: PASS; the test proves shared selection and unchanged retained non-English configuration.
+
+- [ ] **Step 5: Commit atomically**
+
+Run: `git add Kavya/server.py Kavya/tests/test_english_voice_profile.py && git diff --cached --check && git commit -m "refactor(kavya): share English relay voice selection"`
+
+Expected: one commit containing the relay selection change and test.
+
+### Task 3: Direct SmartPBX TTS uses query-format flash requests
+
+**Files:**
+- Modify: `Kavya/server.py:2579-2632,3485-3577`
+- Modify: `Kavya/smartpbx_session.py:152-193`
+- Modify: `Kavya/tests/test_smartpbx_server.py:13-228`
+
+**Interfaces:**
+- Extends `MediaStreamSession(..., english_voice_profile: EnglishVoiceProfile | None = None)`.
+- Consumes Task 1 `build_direct_stream_request`.
+- Existing `FakeTransport` in `test_smartpbx_server.py:13-27` records `audio`, `clears`, and `marks`.
+- The task defines all HTTP fakes below.
+
+- [ ] **Step 1: Add the complete failing integration test and fakes**
+
+~~~python
+# Kavya/tests/test_smartpbx_server.py
+from urllib.parse import parse_qs, urlparse
+from english_voice_profile import EnglishVoiceProfile
+
+
+class _FakeElevenLabsResponse:
+    status_code = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def aiter_bytes(self, chunk_size: int):
+        assert chunk_size == 640
+        yield b"encoded-audio"
+
+
+class _FakeElevenLabsClient:
+    def __init__(self, captured: dict[str, object]):
+        self._captured = captured
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    def stream(self, method: str, url: str, **kwargs):
+        self._captured.update(method=method, url=url, kwargs=kwargs)
+        return _FakeElevenLabsResponse()
+
+
 @pytest.mark.asyncio
-async def test_smartpbx_english_tts_is_flash_ulaw(monkeypatch):
-    pipeline = server.MediaStreamSession(None, "en", media_transport=FakeTransport(),
-        english_voice_profile=EnglishVoiceProfile("test-only-voice-marker"))
-    captured = await capture_elevenlabs_request(monkeypatch, pipeline, "hello")
-    assert captured["json"]["model_id"] == "eleven_flash_v2_5"
-    assert captured["json"]["output_format"] == "ulaw_8000"
-    assert "eleven_multilingual_v2" not in str(captured["json"])
+async def test_smartpbx_english_tts_sends_ulaw_query_flash_body(monkeypatch):
+    import server
+
+    captured: dict[str, object] = {}
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None,
+        lang="en",
+        media_transport=transport,
+        english_voice_profile=EnglishVoiceProfile("test-only-voice-marker"),
+    )
+    pipeline._smartpbx_transfer_context = object()
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "test-only-api-marker")
+    monkeypatch.setattr(
+        server.httpx, "AsyncClient", lambda: _FakeElevenLabsClient(captured)
+    )
+
+    await pipeline._tts_elevenlabs("Hello")
+
+    assert captured["method"] == "POST"
+    assert parse_qs(urlparse(captured["url"]).query) == {
+        "output_format": ["ulaw_8000"]
+    }
+    body = captured["kwargs"]["json"]
+    assert body["model_id"] == "eleven_flash_v2_5"
+    assert "output_format" not in body
+    assert transport.audio == [b"encoded-audio"]
 ~~~
 
-- [ ] **Step 2: Verify RED** — `cd Kavya && pytest -q tests/test_english_voice_profile.py::test_smartpbx_english_tts_is_flash_ulaw`; expect constructor/request-shape failure.
-- [ ] **Step 3: Implement GREEN** — for SmartPBX English require injected profile and request `ELEVENLABS_TTS_URL.format(voice_id=profile.voice_id)` with `{text, model_id: profile.model_id, output_format: profile.output_format}`; inject `server._english_voice_profile()` at session construction. Keep non-English request logic and `smartpbx_transport.py:84-97` unchanged: outbound bytes remain opaque g711 μ-law/8 kHz, no resampling.
-- [ ] **Step 4: Verify GREEN** — `cd Kavya && pytest -q tests/test_english_voice_profile.py tests/test_smartpbx_server.py::test_smartpbx_english_pipeline_uses_existing_elevenlabs_tts tests/test_smartpbx_transport.py`; expect PASS.
-- [ ] **Step 5: Commit** — `git add Kavya/server.py Kavya/smartpbx_session.py Kavya/tests/test_english_voice_profile.py Kavya/tests/test_smartpbx_server.py && git diff --cached --check && git commit -m "fix(kavya): use canonical voice for SmartPBX English TTS"`.
+- [ ] **Step 2: Run RED**
 
-### Task 4: Protected configuration migration
+Run: `cd Kavya && pytest -q tests/test_smartpbx_server.py::test_smartpbx_english_tts_sends_ulaw_query_flash_body`
 
-**Files:** Modify `Kavya/.env.example:18-21,178-202`, `Kavya/docker-compose.yml:88-155`, `Kavya/SMARTPBX_RUNBOOK.md:76-130,154-257`, `Kavya/tests/test_smartpbx_deployment.py`.
+Expected: FAIL with `TypeError` because `MediaStreamSession` has no `english_voice_profile` parameter; current English direct TTS also selects the general voice/multilingual model.
 
-**Interfaces:** only root-owned `/opt/kavya/.env.smartpbx` supplies `KAVYA_EN_ELEVENLABS_VOICE_ID`; compose passes that name to `kavya-smartpbx`; missing value fails closed.
-
-- [ ] **Step 1: Write RED tests**
+- [ ] **Step 3: Add the complete SmartPBX branch while preserving the existing non-English branch**
 
 ~~~python
-def test_smartpbx_receives_only_protected_voice_name():
-    env = yaml.safe_load(read_text("docker-compose.yml"))["services"]["kavya-smartpbx"]["environment"]
-    assert env["KAVYA_EN_ELEVENLABS_VOICE_ID"] == "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
-    assert "ELEVENLABS_VOICE_ID" not in env
+# server.py imports
+from english_voice_profile import (
+    EnglishVoiceProfile,
+    build_direct_stream_request,
+)
 
-def test_examples_never_store_voice_value():
-    assert "KAVYA_EN_ELEVENLABS_VOICE_ID=" in read_text(".env.example")
-    assert "root-only" in read_text("SMARTPBX_RUNBOOK.md")
+# add to MediaStreamSession.__init__ signature
+english_voice_profile: EnglishVoiceProfile | None = None,
+
+# add inside __init__
+self._english_voice_profile = english_voice_profile
+
+# replace request selection at the top of _tts_elevenlabs after API-key guard
+if self._is_smartpbx_session() and self.lang == "en":
+    profile = self._english_voice_profile
+    if profile is None:
+        raise RuntimeError("canonical English voice is unavailable")
+    url, payload = build_direct_stream_request(profile, text)
+else:
+    voice_id = (
+        ELEVENLABS_VOICE_ID_AR or ELEVENLABS_VOICE_ID
+    ) if self.lang == "ar" else ELEVENLABS_VOICE_ID
+    url = ELEVENLABS_TTS_URL.format(voice_id=voice_id) + "?output_format=ulaw_8000"
+    payload = {
+        "text": text,
+        "model_id": ELEVENLABS_MODEL_MULTILINGUAL,
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+            "style": 0.0,
+            "use_speaker_boost": True,
+        },
+    }
+
+# smartpbx_session.py inside _load_runtime_defaults MediaStreamSession call
+self._pipeline = server.MediaStreamSession(
+    websocket=None,
+    lang="en",
+    anthropic_client=anthropic_client,
+    openai_client=openai_client,
+    gemini_client=gemini_client,
+    media_transport=self._transport,
+    english_voice_profile=server._english_voice_profile(),
+)
 ~~~
 
-- [ ] **Step 2: Verify RED** — `cd Kavya && pytest -q tests/test_smartpbx_deployment.py -k protected_voice`; expect missing key/general injection failure.
-- [ ] **Step 3: Implement GREEN** — template contains exactly empty assignment; SmartPBX compose has only `${KAVYA_EN_ELEVENLABS_VOICE_ID}`; runbook says root operator migrates established value into protected file, runs `chmod 600`, and validates only redacted presence/model/format. Do not echo/cat/paste a value. Preserve blank MCP keys and `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}`.
-- [ ] **Step 4: Verify GREEN** — `cd Kavya && pytest -q tests/test_smartpbx_deployment.py`; expect PASS/transfer disabled.
-- [ ] **Step 5: Commit** — `git add Kavya/.env.example Kavya/docker-compose.yml Kavya/SMARTPBX_RUNBOOK.md Kavya/tests/test_smartpbx_deployment.py && git diff --cached --check && git commit -m "chore(kavya): provision canonical SmartPBX voice safely"`.
+Keep the existing `http.stream("POST", url, json=payload, headers=headers, timeout=15.0)` and audio loop unchanged. `output_format` is never inserted into `payload`; `SmartPBXMediaTransport` receives μ-law bytes without resampling.
 
-### Task 5: Dialog v06 bounded protocol conformance
+- [ ] **Step 4: Run GREEN**
 
-**Files:** Modify `Kavya/smartpbx_protocol.py:15-155,189-209`; test `Kavya/tests/test_smartpbx_protocol.py`.
+Run: `cd Kavya && pytest -q tests/test_smartpbx_server.py::test_smartpbx_english_tts_sends_ulaw_query_flash_body tests/test_smartpbx_transport.py tests/test_english_voice_profile.py`
 
-**Interfaces:** `HangupEvent(call_id: str, other_leg_call_id: str, reason: str | None)`; `UnsupportedEvent(failure_class: str = "unsupported_event")`; `validate_event_context(event, context) -> None`.
+Expected: PASS; captured query/body prove the corrected request boundary and transport envelope.
 
-- [ ] **Step 1: Write RED tests**
+- [ ] **Step 5: Commit atomically**
+
+Run: `git add Kavya/server.py Kavya/smartpbx_session.py Kavya/tests/test_smartpbx_server.py && git diff --cached --check && git commit -m "fix(kavya): send canonical SmartPBX English TTS"`
+
+Expected: one commit containing only direct TTS wiring and integration coverage.
+
+### Task 4: Dialog v06 parser conformance remains closed-world
+
+**Files:**
+- Modify: `Kavya/smartpbx_protocol.py:15-245`
+- Modify: `Kavya/tests/test_smartpbx_protocol.py:1-122`
+
+**Interfaces:**
+- `HangupEvent(call_id: str, other_leg_call_id: str, reason: str | None)`.
+- `UnsupportedEvent(failure_class: str = "unsupported_event")`; it stores no event name.
+- `validate_event_context(event: SmartPBXEvent, context: CallContext) -> None`.
+
+- [ ] **Step 1: Add complete RED coverage**
 
 ~~~python
-def test_hangup_has_no_account_requirement_or_reason_requirement():
-    event = parse('{"event":"hangup","hangup":{"callId":"call-marker","otherLegCallId":"leg-marker"}}')
-    assert event.reason is None
+# append to Kavya/tests/test_smartpbx_protocol.py
+@pytest.mark.parametrize("reason", [None, "normal clearing"])
+def test_v06_hangup_has_no_account_requirement_and_optional_reason(reason):
+    hangup = {"callId": "call-marker", "otherLegCallId": "leg-marker"}
+    if reason is not None:
+        hangup["reason"] = reason
+    event = parse(json.dumps({"event": "hangup", "hangup": hangup}))
+    assert event == HangupEvent("call-marker", "leg-marker", reason)
 
-@pytest.mark.parametrize("digit", list("ABCD"))
-def test_dtmf_accepts_documented_letters(digit):
-    assert parse(json.dumps({"event":"dtmf", "dtmf":{"digit":digit}})).digit == digit
 
-def test_unknown_event_is_fixed_and_private():
-    event = parse('{"event":"private-unrecognized-event"}')
-    assert event.failure_class == "unsupported_event"
-    assert "private-unrecognized-event" not in repr(event)
+@pytest.mark.parametrize("digit", list("0123456789*#ABCD"))
+def test_v06_dtmf_accepts_documented_digits(digit):
+    event = parse(json.dumps({"event": "dtmf", "dtmf": {"digit": digit}}))
+    assert event == DtmfEvent(digit, None)
+
+
+@pytest.mark.parametrize("name, expected_type", [
+    ("connected", ConnectedEvent),
+    ("stop", StopEvent),
+])
+def test_known_compatibility_extensions_remain_strict(name, expected_type):
+    assert isinstance(parse(json.dumps({"event": name})), expected_type)
+
+
+def test_unknown_event_has_fixed_private_discriminator():
+    event = parse(json.dumps({"event": "private-event-marker"}))
+    assert event == UnsupportedEvent()
+    assert "private-event-marker" not in repr(event)
+
+
+def test_hangup_context_uses_only_documented_identifiers():
+    context = parse_start_event(start_event())
+    event = HangupEvent(context.call_id, context.other_leg_call_id, None)
+    validate_event_context(event, context)
 ~~~
 
-- [ ] **Step 2: Verify RED** — `cd Kavya && pytest -q tests/test_smartpbx_protocol.py`; expect mandatory account/reason, rejected A-D, raw UnknownEvent failures.
-- [ ] **Step 3: Implement GREEN** — use `_ALLOWED_DTMF_DIGITS = frozenset("0123456789*#ABCD")`; parse optional bounded nonblank reason; compare only callId/otherLegCallId for hangup; replace raw-name `UnknownEvent` with data-free `UnsupportedEvent`. Keep `start` exact g711_ulaw/8000 and `connected`/`stop` known strict extensions.
-- [ ] **Step 4: Verify GREEN** — `cd Kavya && pytest -q tests/test_smartpbx_protocol.py tests/test_smartpbx_gateway.py`; expect PASS/non-μ-law still rejected.
-- [ ] **Step 5: Commit** — `git add Kavya/smartpbx_protocol.py Kavya/tests/test_smartpbx_protocol.py && git diff --cached --check && git commit -m "fix(kavya): align SmartPBX parser with Dialog v06"`.
+The imports at the top of the test add `HangupEvent`, `DtmfEvent`, and `UnsupportedEvent`; `parse`, `start_event`, `ConnectedEvent`, `StopEvent`, and `validate_event_context` are existing helpers/interfaces in this file.
 
-### Task 6: Finite privacy-safe lifecycle diagnostics
+- [ ] **Step 2: Run RED**
 
-**Files:** Modify `Kavya/smartpbx_gateway.py:146-315,344-356`; test `Kavya/tests/test_smartpbx_gateway.py`.
+Run: `cd Kavya && pytest -q tests/test_smartpbx_protocol.py`
 
-**Interfaces:** `_log_lifecycle(stage: Literal["admission","context","session_start","audio","tts","terminal_cleanup"], failure_class: str) -> None`.
+Expected: FAIL because current hangup requires account/reason, A-D are rejected, and `UnknownEvent` retains the raw event name.
 
-- [ ] **Step 1: Write RED test**
+- [ ] **Step 3: Add complete minimal parser implementation**
 
 ~~~python
+_ALLOWED_DTMF_DIGITS = frozenset("0123456789*#ABCD")
+
+
+@dataclass(frozen=True)
+class HangupEvent:
+    call_id: str
+    other_leg_call_id: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class UnsupportedEvent:
+    failure_class: str = "unsupported_event"
+
+
+SmartPBXEvent: TypeAlias = (
+    ConnectedEvent | StartEvent | MediaEvent | DtmfEvent |
+    HangupEvent | StopEvent | UnsupportedEvent
+)
+
+
+def _parse_hangup(message: Mapping[object, object]) -> HangupEvent:
+    hangup = _required_mapping(message, "hangup")
+    reason = hangup.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > _MAX_HANGUP_REASON_CHARS:
+            raise _invalid_message()
+        reason = reason.strip()
+    return HangupEvent(
+        call_id=_required_text(hangup, "callId", _MAX_IDENTIFIER_CHARS),
+        other_leg_call_id=_required_text(hangup, "otherLegCallId", _MAX_IDENTIFIER_CHARS),
+        reason=reason,
+    )
+
+
+def validate_event_context(event: SmartPBXEvent, context: CallContext) -> None:
+    if isinstance(event, StartEvent):
+        actual = (event.context.call_id, event.context.other_leg_call_id, event.context.account_id)
+        expected = (context.call_id, context.other_leg_call_id, context.account_id)
+    elif isinstance(event, HangupEvent):
+        actual = (event.call_id, event.other_leg_call_id)
+        expected = (context.call_id, context.other_leg_call_id)
+    else:
+        return
+    if actual != expected:
+        raise ProtocolViolation(POLICY_VIOLATION, "event context mismatch", "context_mismatch")
+~~~
+
+In `parse_smartpbx_event`, keep existing cases for `connected`, `start`, `media`, `dtmf`, `hangup`, and `stop`, then return `UnsupportedEvent()`. Delete `UnknownEvent`. Do not change `_parse_context`, media bounds, or the `g711_ulaw`/8000 check.
+
+- [ ] **Step 4: Run GREEN**
+
+Run: `cd Kavya && pytest -q tests/test_smartpbx_protocol.py tests/test_smartpbx_gateway.py`
+
+Expected: PASS; the existing parameterized non-μ-law test remains green.
+
+- [ ] **Step 5: Commit atomically**
+
+Run: `git add Kavya/smartpbx_protocol.py Kavya/tests/test_smartpbx_protocol.py && git diff --cached --check && git commit -m "fix(kavya): conform parser to Dialog v06"`
+
+Expected: one protocol/test commit.
+
+### Task 5: Privacy-safe finite gateway diagnostics
+
+**Files:**
+- Modify: `Kavya/smartpbx_gateway.py:146-356`
+- Modify: `Kavya/tests/test_smartpbx_gateway.py:1-175`
+
+**Interfaces:**
+- `LifecycleStage = Literal["admission", "context", "session_start", "audio", "tts", "terminal_cleanup"]`.
+- `log_lifecycle(stage: LifecycleStage, failure_class: str) -> None` accepts only failure classes from `_SAFE_FAILURE_CLASSES`.
+- Existing test `run(messages, *, configuration=None, registry=None, token="test-token", header="X-Kavya-SmartPBX-Token")` is reused.
+
+- [ ] **Step 1: Add the complete failing privacy test**
+
+~~~python
+# append to Kavya/tests/test_smartpbx_gateway.py
 @pytest.mark.asyncio
-async def test_gateway_logs_only_fixed_admission_discriminator(caplog):
-    await run(['{"event":"private-unrecognized-event","callId":"private-id"}'])
-    assert "stage=admission" in caplog.text and "unsupported_event" in caplog.text
-    assert "private-unrecognized-event" not in caplog.text and "private-id" not in caplog.text
+async def test_unsupported_event_logs_only_finite_admission_class(caplog):
+    private_name = "private-event-marker"
+    private_id = "private-call-marker"
+    with caplog.at_level(logging.INFO):
+        websocket, _, _ = await run([
+            json.dumps({"event": private_name, "callId": private_id})
+        ])
+    assert websocket.close_code == 1008
+    assert "stage=admission failure_class=unsupported_event" in caplog.text
+    assert private_name not in caplog.text
+    assert private_id not in caplog.text
 ~~~
 
-- [ ] **Step 2: Verify RED** — `cd Kavya && pytest -q tests/test_smartpbx_gateway.py::test_gateway_logs_only_fixed_admission_discriminator`; expect dynamic unknown event behavior.
-- [ ] **Step 3: Implement GREEN** — allow only stated stages; map parser, context, start, feed, existing safe TTS, and cleanup failures; remove `unknown_events_total` and any raw payload/name diagnostic. No status history.
-- [ ] **Step 4: Verify GREEN** — `cd Kavya && pytest -q tests/test_smartpbx_gateway.py tests/test_smartpbx_server.py::test_dialog_media_logs_never_contain_transcript_agent_text_or_call_id tests/test_smartpbx_transport.py`; expect PASS.
-- [ ] **Step 5: Commit** — `git add Kavya/smartpbx_gateway.py Kavya/tests/test_smartpbx_gateway.py && git diff --cached --check && git commit -m "feat(kavya): add private SmartPBX lifecycle diagnostics"`.
+Add `import json` and `import logging`; `run` and its tuple return are defined earlier in the same existing test file.
 
-### Task 7: English behavior parity through the existing adapter
+- [ ] **Step 2: Run RED**
 
-**Files:** Modify `Kavya/smartpbx_session.py:88-224`, `Kavya/server.py:2550-2565,2631-2648,2764-2935,3337-3478,4073-4257`, `Kavya/tests/test_smartpbx_server.py`, `Kavya/tests/test_smartpbx_provider_handover.py`, runbook.
+Run: `cd Kavya && pytest -q tests/test_smartpbx_gateway.py::test_unsupported_event_logs_only_finite_admission_class`
 
-**Interfaces:** retain `_make_stt(on_final_result, on_interim_result, lang, privacy_safe)`, `_build_system_prompt`, provider `get_tools*`, retrieval/booking tools, `TOOL_FILLERS`, `process_post_call_data`, `_send_tts_done`, `_cancel_reprompt`, `enter_transfer_pending`.
+Expected: FAIL because the current gateway counts `UnknownEvent` instead of rejecting it with the fixed lifecycle discriminator.
 
-- [ ] **Step 1: Write RED parity tests**
+- [ ] **Step 3: Add complete finite diagnostic code and dispatch**
 
 ~~~python
-@pytest.mark.asyncio
-async def test_session_reuses_english_pipeline_and_stt():
-    session, pipeline, stt, _ = make_session(post_call_processor=async_noop)
-    await session.start()
-    assert pipeline.lang == "en" and pipeline.system_prompt == server._build_system_prompt("en")
-    assert stt.kwargs == {"lang":"en", "privacy_safe":True, **stt.callback_kwargs}
+from typing import Literal
+
+LifecycleStage = Literal[
+    "admission", "context", "session_start", "audio", "tts", "terminal_cleanup"
+]
+_SAFE_FAILURE_CLASSES = frozenset({
+    "unsupported_event", "invalid_message", "message_too_big",
+    "unsupported_media_format", "invalid_media", "audio_too_big",
+    "invalid_dtmf", "context_mismatch", "session_start_failed",
+    "audio_ingestion_failed", "tts_failed", "cleanup_failed",
+})
+
+
+def log_lifecycle(stage: LifecycleStage, failure_class: str) -> None:
+    safe_class = failure_class if failure_class in _SAFE_FAILURE_CLASSES else "cleanup_failed"
+    logger.info("smartpbx_lifecycle stage=%s failure_class=%s", stage, safe_class)
+
+# inside the post-start event loop, before MediaEvent handling
+if isinstance(event, UnsupportedEvent):
+    log_lifecycle("admission", event.failure_class)
+    raise ProtocolViolation(POLICY_VIOLATION, "unsupported SmartPBX event", event.failure_class)
+~~~
+
+Replace the dynamic `UnknownEvent` counter/status field entirely. At existing exception boundaries call `log_lifecycle`: parser schema=`admission`; `context_mismatch`=`context`; session factory/start=`session_start`; `feed_audio`=`audio`; fixed TTS failure signal=`tts`; finish/transport/close=`terminal_cleanup`. Pass only the existing fixed class strings shown above; never pass exception text, raw fields, payload, IDs, transcript, or audio. `/smartpbx/status` gains no history or identifiers.
+
+- [ ] **Step 4: Run GREEN**
+
+Run: `cd Kavya && pytest -q tests/test_smartpbx_gateway.py tests/test_smartpbx_server.py::test_dialog_media_logs_never_contain_transcript_agent_text_or_call_id tests/test_smartpbx_transport.py`
+
+Expected: PASS; logs distinguish finite lifecycle stages without sensitive markers.
+
+- [ ] **Step 5: Commit atomically**
+
+Run: `git add Kavya/smartpbx_gateway.py Kavya/tests/test_smartpbx_gateway.py && git diff --cached --check && git commit -m "feat(kavya): add private SmartPBX lifecycle diagnostics"`
+
+Expected: one gateway/test commit.
+
+### Task 6: Explicit English adapter parity contract
+
+**Files:**
+- Modify: `Kavya/smartpbx_session.py:14-224`
+- Modify: `Kavya/server.py:2550-3057,3337-3478,4073-4257`
+- Modify: `Kavya/tests/test_smartpbx_server.py:80-527`
+- Modify: `Kavya/tests/test_smartpbx_provider_handover.py:190-297`
+
+**Interfaces:**
+- New immutable `EnglishSessionDependencies(system_prompt: str, tools: list[dict[str, object]], welcome_text: str, stt_factory: Callable[..., Any], post_call_processor: PostCallProcessor)`.
+- `load_english_session_dependencies(server_module: Any) -> EnglishSessionDependencies` returns references/values from the production English pipeline; it does not copy prompt/tools/RAG/booking/fillers.
+- Existing `FakePipeline`, `FakeSTT`, `FakeTransport`, `context`, and `make_session` are defined in `test_smartpbx_server.py:13-107`.
+
+- [ ] **Step 1: Add genuinely failing contract and observable-behavior tests before wiring**
+
+~~~python
+# append to Kavya/tests/test_smartpbx_server.py
+from smartpbx_session import load_english_session_dependencies
+
+
+def test_dependency_loader_reuses_production_english_objects():
+    import server
+    deps = load_english_session_dependencies(server)
+    assert deps.system_prompt == server._build_system_prompt("en")
+    assert deps.tools is server.get_tools()
+    assert deps.welcome_text == server.english_conversation_relay_config(
+        server._english_voice_profile()
+    )["welcome_greeting"]
+    assert deps.stt_factory is server._make_stt
+    assert deps.post_call_processor is server.process_post_call_data
+
 
 @pytest.mark.asyncio
-async def test_direct_barge_in_clears_queue_and_pending_transfer_cancels_reprompt():
-    pipeline = smartpbx_pipeline()
-    before = pipeline._speak_generation
-    await pipeline._on_stt_interim("speech")
-    assert pipeline._speak_generation == before + 1 and pipeline._media_transport.clears == 1
-    await pipeline._send_tts_done(); await pipeline.enter_transfer_pending()
+async def test_direct_completion_reprompt_and_barge_in_are_transport_local():
+    import server
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(None, "en", media_transport=transport,
+        english_voice_profile=server._english_voice_profile())
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._is_speaking = True
+    generation = pipeline._speak_generation
+    pipeline._event_loop = asyncio.get_running_loop()
+    pipeline._on_stt_interim("speech-marker")
+    await asyncio.sleep(0)
+    assert pipeline._speak_generation == generation + 1
+    assert transport.clears == 1
+    await pipeline._send_tts_done()
+    assert pipeline._reprompt_task is not None
+    await pipeline.enter_transfer_pending()
     assert pipeline._reprompt_task is None
 ~~~
 
-- [ ] **Step 2: Verify RED** — `cd Kavya && pytest -q tests/test_smartpbx_server.py tests/test_smartpbx_provider_handover.py`; expect profile adapter wiring assertion before Task 3 integration.
-- [ ] **Step 3: Implement GREEN** — keep `_load_runtime_defaults` the sole SmartPBX constructor. It uses English prompt/welcome, existing provider tools/RAG/booking/post-call and `_make_stt(..., lang="en", privacy_safe=True)`. Do not fork LLM streams/fillers/tools. Preserve reprompt cap/cancel and transfer-pending suppression. Runbook states direct transport can clear queued local frames/invalidate generation but cannot recall carrier-buffered audio; it also identifies ConversationRelay-only recognition settings as non-reproducible.
-- [ ] **Step 4: Verify GREEN** — `cd Kavya && pytest -q tests/test_smartpbx_server.py tests/test_smartpbx_provider_handover.py tests/test_smartpbx_gateway_transfer_pending.py tests/test_smartpbx_post_call.py`; expect PASS.
-- [ ] **Step 5: Commit** — `git add Kavya/server.py Kavya/smartpbx_session.py Kavya/SMARTPBX_RUNBOOK.md Kavya/tests/test_smartpbx_server.py Kavya/tests/test_smartpbx_provider_handover.py && git diff --cached --check && git commit -m "test(kavya): lock SmartPBX English behavior parity"`.
+The test process supplies only `KAVYA_EN_ELEVENLABS_VOICE_ID=test-only-voice-marker`; it never uses a production value. The first test is guaranteed RED because the loader/type do not exist. The second locks current observable behavior after Task 3 wiring.
 
-### Task 8: Regression, security, review, CI, and image gate
+- [ ] **Step 2: Run RED**
 
-**Files:** modify only an implementation defect proven by a failing listed test; no scope growth.
+Run: `cd Kavya && KAVYA_EN_ELEVENLABS_VOICE_ID=test-only-voice-marker pytest -q tests/test_smartpbx_server.py -k 'dependency_loader or direct_completion_reprompt'`
 
-- [ ] **Step 1: Run targeted suite** — `cd Kavya && pytest -q tests/test_english_voice_profile.py tests/test_smartpbx_protocol.py tests/test_smartpbx_gateway.py tests/test_smartpbx_server.py tests/test_smartpbx_transport.py tests/test_smartpbx_deployment.py tests/test_smartpbx_provider_handover.py tests/test_smartpbx_handover.py tests/test_smartpbx_post_call.py`; expected PASS.
-- [ ] **Step 2: Run full/security checks** — `cd Kavya && pytest -q && python -m compileall -q . && git diff origin/main...HEAD --check`; expected PASS. Inspect only diff/template names, never runtime protected files.
-- [ ] **Step 3: Independent review** — require review of no fallback, flash/ulaw request, g711 admission, diagnostic privacy, adapter reuse, disabled transfer, Docker/runbook isolation. Fix any finding red-first, then rerun Steps 1-2.
-- [ ] **Step 4: CI/image** — `gh pr checks 209 --watch --fail-fast`; expected all required checks PASS. Record reviewed full SHA/CI short SHA and prove image label `org.opencontainers.image.revision` equals full SHA before deployment.
+Expected: collection FAIL with missing `load_english_session_dependencies`.
 
-### Task 9: Operator-gated isolated deployment and stable call
+- [ ] **Step 3: Add the complete dependency contract and consume it**
 
-**Files:** modify runbook only if a prior task discovered a missing exact operator step.
+~~~python
+# Kavya/smartpbx_session.py
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 
-- [ ] **Step 1: Protected provision/live approval** — operator approves temporary sole-DID action and, as root, migrates established voice to `/opt/kavya/.env.smartpbx`, `chmod 600`; verify only redacted presence/model/output-format. Never paste it anywhere.
-- [ ] **Step 2: Isolated deploy** — run exact runbook `docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null`, `up -d --force-recreate --pull never kavya-smartpbx`, `wait_for_smartpbx_ready`; expected only SmartPBX recreates, Flico/Twilio unchanged, transfer disabled.
-- [ ] **Step 3: Supervised stable-call proof** — approved live call must prove expected Kavya voice, intelligible bidirectional audio, normal question, RAG/booking turn, filler, interruption within stated limitation, normal end, no protocol admission error. Record redacted pass/fail only; greeting alone fails.
-- [ ] **Step 4: Rollback/gate** — on failure perform isolated runbook rollback and restore route only with approval; do not touch Twilio/Flico. On pass retain redacted evidence outside Git, keep MCP transfer disabled, and only then unlock the separate handover plan.
 
-## Self-review
+@dataclass(frozen=True)
+class EnglishSessionDependencies:
+    system_prompt: str
+    tools: list[dict[str, object]]
+    welcome_text: str
+    stt_factory: Callable[..., Any]
+    post_call_processor: PostCallProcessor
 
-- Spec coverage: Tasks 1-4 cover protected shared voice and direct flash/ulaw; 5-6 cover v06 and privacy; 7 covers prompt/tools/RAG/booking/STT/re-prompt/fillers/barge-in/post-call; 8-9 cover tests, review, CI, image, deploy/rollback/live proof.
-- No placeholders: protected values/actions are explicitly operator-supplied and intentionally absent; no TODO/TBD exists.
-- Type consistency: `EnglishVoiceProfile` flows Task 1 -> Tasks 2-3 -> Task 7; `HangupEvent.reason`/`UnsupportedEvent.failure_class` flow Task 5 -> Task 6.
-- Scope: account-header/MCP/destination/transfer work is excluded to the next independent plan.
+
+def load_english_session_dependencies(server_module: Any) -> EnglishSessionDependencies:
+    return EnglishSessionDependencies(
+        system_prompt=server_module._build_system_prompt("en"),
+        tools=server_module.get_tools(),
+        welcome_text=server_module.english_conversation_relay_config(
+            server_module._english_voice_profile()
+        )["welcome_greeting"],
+        stt_factory=server_module._make_stt,
+        post_call_processor=server_module.process_post_call_data,
+    )
+
+# in KavyaSmartPBXSession._load_runtime_defaults after `import server`
+dependencies = load_english_session_dependencies(server)
+if self._stt_factory is None:
+    self._stt_factory = dependencies.stt_factory
+if self._post_call_processor is None:
+    self._post_call_processor = dependencies.post_call_processor
+if self._welcome_text is None:
+    self._welcome_text = dependencies.welcome_text
+if self._pipeline is not None:
+    self._pipeline.system_prompt = dependencies.system_prompt
+    self._pipeline.tools = dependencies.tools
+~~~
+
+Keep existing provider-client selection, `retrieve_context`, booking dispatch, `TOOL_FILLERS`, history/full transcript, privacy-safe post-call, `_send_tts_done`, `_cancel_reprompt`, `_on_stt_interim`, and `enter_transfer_pending`; do not duplicate them. Existing provider-handover tests prove filler ordering, failed-tool continuation, and transfer-pending suppression.
+
+- [ ] **Step 4: Run GREEN**
+
+Run: `cd Kavya && KAVYA_EN_ELEVENLABS_VOICE_ID=test-only-voice-marker pytest -q tests/test_smartpbx_server.py tests/test_smartpbx_provider_handover.py tests/test_smartpbx_post_call.py`
+
+Expected: PASS; the loader contract proves shared prompt/tools/STT/welcome/post-call, and existing tests prove RAG/booking/tool/filler/state behavior.
+
+- [ ] **Step 5: Commit atomically**
+
+Run: `git add Kavya/smartpbx_session.py Kavya/server.py Kavya/tests/test_smartpbx_server.py Kavya/tests/test_smartpbx_provider_handover.py && git diff --cached --check && git commit -m "test(kavya): enforce English SmartPBX behavior parity"`
+
+Expected: one adapter-contract/test commit.
+
+### Task 7: Protected configuration, isolation, runbook, and rollback
+
+**Files:**
+- Modify: `Kavya/.env.example:18-21,178-202`
+- Modify: `Kavya/docker-compose.yml:88-155`
+- Modify: `Kavya/SMARTPBX_RUNBOOK.md:76-257`
+- Modify: `Kavya/tests/test_smartpbx_deployment.py:1-264`
+
+**Interfaces:**
+- Only root-owned `/opt/kavya/.env.smartpbx` supplies `KAVYA_EN_ELEVENLABS_VOICE_ID` with mode 0600.
+- `kavya-smartpbx` receives the key name; templates contain an empty assignment only.
+- `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` and blank MCP configuration remain mandatory for this plan.
+
+- [ ] **Step 1: Add complete failing deployment tests**
+
+~~~python
+# append to Kavya/tests/test_smartpbx_deployment.py
+def test_smartpbx_uses_only_protected_canonical_english_voice_key():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    environment = compose["services"]["kavya-smartpbx"]["environment"]
+    assert environment["KAVYA_EN_ELEVENLABS_VOICE_ID"] == "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
+    assert "ELEVENLABS_VOICE_ID" not in environment
+
+
+def test_voice_migration_is_root_only_redacted_and_transfer_stays_disabled():
+    example = read_text(".env.example")
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    assert "KAVYA_EN_ELEVENLABS_VOICE_ID=" in example
+    assert "chmod 600 /opt/kavya/.env.smartpbx" in runbook
+    assert "voice_configured" in runbook
+    assert "voice_id" not in runbook.casefold().split("redacted validation", 1)[-1]
+    assert "SMARTPBX_TRANSFER_DESTINATIONS_JSON={}" in runbook
+~~~
+
+- [ ] **Step 2: Run RED**
+
+Run: `cd Kavya && pytest -q tests/test_smartpbx_deployment.py -k 'canonical_english_voice or voice_migration'`
+
+Expected: FAIL because the protected key/migration instructions do not exist and compose still injects the general voice key.
+
+- [ ] **Step 3: Apply complete configuration snippets and exact runbook block**
+
+~~~dotenv
+# Kavya/.env.example
+# Root-only canonical production English selection; never commit a value.
+KAVYA_EN_ELEVENLABS_VOICE_ID=
+~~~
+
+~~~yaml
+# Kavya/docker-compose.yml, kavya-smartpbx environment
+KAVYA_EN_ELEVENLABS_VOICE_ID: "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
+~~~
+
+~~~markdown
+<!-- Kavya/SMARTPBX_RUNBOOK.md -->
+## Protected canonical English voice migration
+
+As root, copy the established Kavya English selection directly into
+`/opt/kavya/.env.smartpbx`; do not print, paste into chat, or commit it.
+Run `chmod 600 /opt/kavya/.env.smartpbx`.
+The redacted validation may report only:
+`voice_configured=true model=eleven_flash_v2_5 output=ulaw_8000 media=g711_ulaw/8000`.
+It must never report the selected value.
+Keep `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` and all MCP activation values blank.
+
+Direct barge-in clears queued local frames and invalidates speech generation.
+Audio already buffered by the carrier cannot be recalled deterministically;
+this is not byte-perfect interruption parity. ConversationRelay-managed
+recognition options do not exist on direct media; direct English uses `_make_stt`
+with `en-US` and privacy-safe provider logging.
+~~~
+
+Remove `ELEVENLABS_VOICE_ID` only from the `kavya-smartpbx` service environment; retain it wherever dormant non-English/Twilio behavior still consumes it. Do not change Flico or other Compose services.
+
+- [ ] **Step 4: Run GREEN**
+
+Run: `cd Kavya && pytest -q tests/test_smartpbx_deployment.py`
+
+Expected: PASS; isolation, TLS, image pinning, disabled transfer, and rollback tests remain green.
+
+- [ ] **Step 5: Commit atomically**
+
+Run: `git add Kavya/.env.example Kavya/docker-compose.yml Kavya/SMARTPBX_RUNBOOK.md Kavya/tests/test_smartpbx_deployment.py && git diff --cached --check && git commit -m "docs(kavya): secure SmartPBX voice migration"`
+
+Expected: one configuration/runbook/test commit containing no protected value.
+
+### Task 8: Verification, dynamic implementation PR, isolated release, and stable-call gate
+
+**Files:**
+- Modify only code already named in Tasks 1-7 when a failing test proves a defect.
+- Do not modify MCP/transfer files, Flico, Twilio service configuration, or dashboard routing in repository code.
+
+**Interfaces:**
+- The implementation branch/PR is discovered at execution time; this docs PR number is never assumed.
+- Deployment consumes the reviewed immutable commit and matching OCI revision.
+- Live actions require explicit user/operator approval.
+
+- [ ] **Step 1: Run targeted and full local evidence**
+
+Run:
+
+~~~bash
+cd Kavya
+KAVYA_EN_ELEVENLABS_VOICE_ID=test-only-voice-marker pytest -q \
+  tests/test_english_voice_profile.py \
+  tests/test_smartpbx_protocol.py \
+  tests/test_smartpbx_gateway.py \
+  tests/test_smartpbx_server.py \
+  tests/test_smartpbx_transport.py \
+  tests/test_smartpbx_deployment.py \
+  tests/test_smartpbx_provider_handover.py \
+  tests/test_smartpbx_post_call.py
+KAVYA_EN_ELEVENLABS_VOICE_ID=test-only-voice-marker pytest -q
+python -m compileall -q .
+git diff origin/main...HEAD --check
+~~~
+
+Expected: every command exits 0; no skipped/failing SmartPBX boundary; diff contains no actual voice ID/key/account/caller/destination value.
+
+- [ ] **Step 2: Obtain independent review and fix findings RED-first**
+
+Review exactly: profile has no fallback; format is query-only; flash is body model; body excludes format; Twilio/direct share selection; g711 admission unchanged; v06 hangup/DTMF/extensions correct; diagnostics finite/private; English adapter reuses production dependencies; transfer disabled; Flico/Twilio/non-English boundaries retained. For any finding, add a failing test to the owning task, run it to prove RED, implement the smallest correction, then rerun Step 1.
+
+Expected: no unresolved Critical or Important finding.
+
+- [ ] **Step 3: Push implementation branch, create/find its PR dynamically, and wait for CI**
+
+~~~bash
+git push -u origin HEAD
+implementation_pr_url="$(gh pr view --json url --jq .url 2>/dev/null || true)"
+if [ -z "$implementation_pr_url" ]; then
+  gh pr create --draft --fill
+fi
+implementation_pr_number="$(gh pr view --json number --jq .number)"
+implementation_pr_url="$(gh pr view --json url --jq .url)"
+gh pr checks "$implementation_pr_number" --watch --fail-fast
+~~~
+
+Expected: current branch resolves to one implementation PR URL/number and every required check passes. Do not use a hard-coded PR number.
+
+- [ ] **Step 4: Verify image provenance and deploy only the isolated profile**
+
+Use the exact reviewed full SHA and CI-produced short tag. Follow `Kavya/SMARTPBX_RUNBOOK.md` to verify `org.opencontainers.image.revision` equals the reviewed full SHA, validate `docker compose --env-file .env.smartpbx --profile smartpbx config`, recreate only `kavya-smartpbx` with `--pull never`, and run `wait_for_smartpbx_ready`.
+
+Expected: Flico and Twilio Kavya remain untouched; `/smartpbx/status` is healthy and reports transfer disabled. If provenance/readiness fails, stop and execute only the isolated runbook rollback.
+
+- [ ] **Step 5: Run the approved supervised stable-call gate**
+
+After explicit approval for temporary sole-DID routing, one supervised Dialog call must prove: expected Kavya voice; intelligible two-way audio; a normal question; one RAG/booking turn; correct filler without dead air; caller interruption within documented carrier-buffer limit; orderly hangup; no protocol-admission error. Record only redacted pass/fail observations outside Git; a greeting alone fails.
+
+Expected: all observations pass. On any failure, stop only `kavya-smartpbx`, restore the previously approved dashboard route, leave Twilio/Flico untouched, and keep transfer disabled. Only a passing stable-call gate permits the independent MCP plan to begin.
+
+## Final self-review checklist
+
+- Spec coverage: Tasks 1-3 cover canonical protected selection and correct ElevenLabs query/body contract; Tasks 4-5 cover v06 and privacy diagnostics; Task 6 covers English prompt/tools/STT/RAG/booking/filler/re-prompt/barge-in/post-call reuse; Task 7 covers secure migration/isolation/rollback; Task 8 covers full tests, review, dynamic PR/CI, image, deployment, stable call, and rollback.
+- Writing-plans completeness: every task identifies exact paths/interfaces, contains a complete RED test, exact RED/GREEN commands and expectations, minimal code/config snippets, and an atomic commit. Runtime-only release steps contain exact commands/gates instead of repository implementation.
+- Identifier audit: every non-repository helper/type used by a test is defined in the same task; reused helpers include exact existing file anchors/signatures. No `capture_elevenlabs_request`, `RecordingProbe`, `FakeListToolsResult`, `diagnostic_settings`, `acknowledged_coordinator`, or `CarrierTransferOutcome` appears.
+- Request audit: `output_format=ulaw_8000` appears only in the stream URL query; JSON contains `text`, `model_id`, and `voice_settings`; tests assert query and body separately and assert body exclusion.
+- Scope audit: transfer remains disabled, no MCP/account-header work occurs, no actual protected value appears, Flico/Twilio/non-English paths remain intact, and the stable-call gate precedes the independent MCP plan.
 
 ## Execution handoff
 
-Plan saved at `docs/superpowers/plans/2026-08-07-kavya-smartpbx-call-parity.md`. Execute subagent-driven (fresh implementer/review per task) or inline with checkpoints after Tasks 3, 6, 8, and 9. Only Task 9 needs protected operator values and approved live action.
+Plan saved at `docs/superpowers/plans/2026-08-07-kavya-smartpbx-call-parity.md`. Execute with subagent-driven development and a fresh implementer/reviewer per task, or inline with review checkpoints after Tasks 3, 5, 7, and 8.
