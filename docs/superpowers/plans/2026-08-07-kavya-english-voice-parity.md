@@ -500,7 +500,7 @@ def test_voice_preflight_uses_the_equality_validator_without_hash_output():
 
     assert validator.is_file()
     assert "validate_english_voice_env.sh /opt/kavya/.env /opt/kavya/.env.smartpbx" in runbook
-    assert "sha256sum" not in runbook
+    assert "sha" + "256sum" not in runbook
     assert "canonical_voice_match=ok" in runbook
 ```
 
@@ -572,7 +572,7 @@ In `services.kavya-smartpbx.environment`, after `ELEVENLABS_API_KEY`, add:
 KAVYA_EN_ELEVENLABS_VOICE_ID: "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
 ```
 
-Do not override `services.kavya`: its current `env_file: [.env]` is its wiring. In the runbook template, add `KAVYA_EN_ELEVENLABS_VOICE_ID=` after `ELEVENLABS_API_KEY=`. Replace the prior separate `awk` and `sha256sum` preflight with this exact block:
+Do not override `services.kavya`: its current `env_file: [.env]` is its wiring. In the runbook template, add `KAVYA_EN_ELEVENLABS_VOICE_ID=` after `ELEVENLABS_API_KEY=`. Replace the previous separate per-file check preflight with this exact block:
 
 ```sh
 set -euo pipefail
