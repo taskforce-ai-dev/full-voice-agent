@@ -109,6 +109,52 @@ class CapturingTTSClient:
         return CapturingTTSResponse()
 
 
+class FailingTTSResponse(CapturingTTSResponse):
+    def __init__(self, status_code, body=b""):
+        self.status_code = status_code
+        self.body = body
+
+    async def aread(self):
+        return self.body
+
+
+class FailingTTSClient(CapturingTTSClient):
+    def __init__(self, response):
+        super().__init__()
+        self.response = response
+
+    def stream(self, method, url, *, json, headers, timeout):
+        self.requests.append({"method": method, "url": url, "json": json, "headers": headers, "timeout": timeout})
+        return self.response
+
+
+class RaisingTTSResponse:
+    def __init__(self, exception):
+        self.exception = exception
+
+    async def __aenter__(self):
+        raise self.exception
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+def smartpbx_tts_pipeline(server, sink):
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+
+    def record(stage, outcome, failure_class):
+        sink((stage, outcome, failure_class))
+
+    pipeline._smartpbx_diagnostic_sink = record
+    return pipeline
+
+
+def assert_no_tts_secret_leakage(caplog, *secrets):
+    for secret in secrets:
+        assert secret not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_smartpbx_english_tts_uses_profile_without_general_voice(monkeypatch):
     import server
@@ -154,6 +200,148 @@ async def test_retained_non_english_tts_still_requires_general_voice(monkeypatch
     pipeline = server.MediaStreamSession(websocket=None, lang="ta", media_transport=FakeTransport())
     await pipeline._tts_elevenlabs("vanakkam")
     assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_missing_api_key_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    text = "spoken-text-secret"
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "")
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_MISSING_API_KEY)]
+    assert_no_tts_secret_leakage(caplog, api_key, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_profile_failure_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    exception = "profile-exception-secret"
+    text = "spoken-text-secret"
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(
+        server,
+        "load_kavya_english_voice_profile",
+        lambda: (_ for _ in ()).throw(ValueError(f"{voice} {exception}")),
+    )
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_PROFILE_FAILURE)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_http_failure_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    body = "response-body-secret"
+    text = "spoken-text-secret"
+    profile = SimpleNamespace(voice_id=voice, model_id="test-model", request_voice_settings={})
+    client = FailingTTSClient(FailingTTSResponse(599, body.encode()))
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.ERROR):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_HTTP_STATUS)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, body, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_timeout_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    exception = "timeout-exception-secret"
+    text = "spoken-text-secret"
+    profile = SimpleNamespace(voice_id=voice, model_id="test-model", request_voice_settings={})
+    client = FailingTTSClient(RaisingTTSResponse(server.httpx.TimeoutException(exception)))
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.ERROR):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_TIMEOUT)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_exception_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    exception = "generic-exception-secret"
+    text = "spoken-text-secret"
+    profile = SimpleNamespace(voice_id=voice, model_id="test-model", request_voice_settings={})
+    client = FailingTTSClient(RaisingTTSResponse(RuntimeError(exception)))
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.ERROR):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_EXCEPTION)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_without_sink_keeps_existing_failure_behavior(monkeypatch):
+    import server
+
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "")
+
+    await pipeline._tts_elevenlabs("spoken-text-secret")
+
+    assert pipeline._is_speaking is False
+
+
+@pytest.mark.asyncio
+async def test_non_smartpbx_tts_failure_does_not_emit_smartpbx_diagnostic(monkeypatch):
+    import server
+
+    records = []
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_diagnostic_sink = records.append
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "")
+
+    await pipeline._tts_elevenlabs("spoken-text-secret")
+
+    assert records == []
 
 
 def context(**overrides):
