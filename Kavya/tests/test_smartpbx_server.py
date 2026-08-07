@@ -1370,7 +1370,7 @@ async def test_smartpbx_start_uses_exact_configured_stt_factory_with_private_eng
 
 
 @pytest.mark.asyncio
-async def test_smartpbx_runtime_invalid_provider_fails_before_client_pipeline_or_stt(monkeypatch):
+async def test_smartpbx_runtime_invalid_provider_fails_before_client_pipeline_or_stt(monkeypatch, caplog):
     import server
 
     client_factory_calls = []
@@ -1400,16 +1400,52 @@ async def test_smartpbx_runtime_invalid_provider_fails_before_client_pipeline_or
     monkeypatch.setattr(server, "_get_gemini_client", recording_client_factory("gemini"))
     monkeypatch.setattr(server, "_get_client", recording_client_factory("openai"))
     monkeypatch.setattr(server, "MediaStreamSession", recording_media_session)
+    invalid_provider = "private-invalid-provider-sentinel-abcdefghijklmnopqrstuvwxyz"
     session = KavyaSmartPBXSession(
         context(), FakeTransport(), stt_factory=configured_stt_factory,
         post_call_processor=process_post_call, welcome_text="",
-        llm_provider="invalid-provider", model="invalid-provider-model",
+        llm_provider=invalid_provider, model="invalid-provider-model",
     )
 
-    with pytest.raises(ValueError) as exc_info:
-        await session.start()
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(ValueError) as exc_info:
+            await session.start()
 
-    assert str(exc_info.value) == "invalid LLM provider: invalid-provider"
+    assert str(exc_info.value) == "invalid LLM provider"
+    assert invalid_provider not in str(exc_info.value)
+    assert invalid_provider not in caplog.text
     assert client_factory_calls == []
     assert pipeline_constructions == []
     assert stt_calls == []
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_fully_injected_invalid_provider_fails_before_any_start_side_effect(caplog):
+    private_provider = "private-injected-provider-sentinel-abcdefghijklmnopqrstuvwxyz"
+    stt_calls = []
+    pipeline = FakePipeline()
+
+    def configured_stt_factory(**kwargs):
+        stt_calls.append(kwargs)
+        return FakeSTT()
+
+    async def process_post_call(**_metadata):
+        return None
+
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), pipeline=pipeline, stt_factory=configured_stt_factory,
+        post_call_processor=process_post_call, welcome_text="private-welcome-marker",
+        llm_provider=private_provider, model="fully-injected-model",
+    )
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(ValueError) as exc_info:
+            await session.start()
+
+    assert str(exc_info.value) == "invalid LLM provider"
+    assert private_provider not in str(exc_info.value)
+    assert private_provider not in caplog.text
+    assert stt_calls == []
+    assert pipeline._stt is None
+    assert pipeline.spoken == []
+    assert getattr(pipeline, "_smartpbx_transfer_context", None) is None
