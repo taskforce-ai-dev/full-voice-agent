@@ -676,3 +676,112 @@ def test_deploy_workflow_rejects_kavya_image_mode_before_any_publisher_or_host_s
         "Sync agent files to the VPS (preserves .env + runtime state)",
     ):
         assert steps.index(guard) < steps.index(workflow_step(steps, later_name))
+
+
+SMARTPBX_IMAGE_DEPLOY_SCRIPT = PROJECT_ROOT / "scripts" / "deploy_smartpbx_image.sh"
+
+
+def read_smartpbx_image_deploy_script():
+    assert SMARTPBX_IMAGE_DEPLOY_SCRIPT.is_file(), "missing SmartPBX image deployment helper"
+    return SMARTPBX_IMAGE_DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+
+def test_smartpbx_image_deploy_helper_is_root_only_sourceable_and_uses_a_fixed_target():
+    script = read_smartpbx_image_deploy_script()
+
+    assert os.access(SMARTPBX_IMAGE_DEPLOY_SCRIPT, os.X_OK)
+    assert script.startswith("#!/usr/bin/env bash\nset -Eeuo pipefail")
+    for required in (
+        "[[ $EUID -eq 0 ]]",
+        "APP_DIR=/opt/kavya",
+        "cd \"$APP_DIR\"",
+        "flock -n 9",
+        "/var/lock/kavya-smartpbx-image-deploy.lock",
+        "NEW_TAG=$1",
+        "EXPECTED_SHA=$2",
+        "EXPECTED_DIGEST=$3",
+        "validate_inputs",
+        "if [[ \"${BASH_SOURCE[0]}\" == \"$0\" ]]; then",
+        "main \"$@\"",
+    ):
+        assert required in script
+    for forbidden in ("TEST_MODE", "set +e", "sudo ", "eval "):
+        assert forbidden not in script
+
+
+def test_smartpbx_image_deploy_helper_completes_all_preflights_before_arming_rollback():
+    script = read_smartpbx_image_deploy_script()
+
+    for required in (
+        "capture_baseline",
+        "check_loopback_preflight",
+        "check_env_files",
+        "validate_english_voice_env.sh",
+        "canonical_voice_match=ok",
+        "check_legacy_flico",
+        "docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null 2>&1",
+        "docker pull \"$IMAGE@$EXPECTED_DIGEST\" > /dev/null 2>&1",
+        "verify_candidate_image",
+    ):
+        assert required in script
+    assert "trap rollback ERR" in script
+    assert script.find("verify_candidate_image") < script.rfind("trap rollback ERR")
+    assert script.find("trap rollback ERR") < script.find("recreate_smartpbx")
+    assert "ROLLBACK_TAG=" in script
+    assert "ROLLBACK_DIGEST=" in script
+    assert "ROLLBACK_REVISION=" in script
+    assert "docker image tag \"$ROLLBACK_IMAGE_ID\" \"$IMAGE:$ROLLBACK_TAG\"" in script
+    assert "verify_local_rollback" in script
+
+
+def test_smartpbx_image_deploy_helper_recreates_only_smartpbx_and_checks_json_readiness():
+    script = read_smartpbx_image_deploy_script()
+
+    mutation = "SMARTPBX_IMAGE_TAG=\"$TAG\" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx"
+    assert mutation in script
+    assert script.count("--force-recreate --pull never kavya-smartpbx") == 1
+    assert "deadline=$((SECONDS + 90))" in script
+    assert "http://127.0.0.1:8006/health" in script
+    assert "http://127.0.0.1:8006/smartpbx/status" in script
+    assert "jq -e \".active_sessions == 0 and .transfer_enabled == false\"" in script
+    assert "docker inspect --format \"{{.Image}}\" kavya-smartpbx" in script
+    assert "verify_running_image" in script
+    assert "verify_legacy_flico_unchanged" in script
+    for forbidden in (
+        "docker system prune",
+        "docker image prune",
+        "docker compose down",
+        "nginx",
+        "systemctl",
+        "rsync",
+        "ssh ",
+        "flico-voice-agent up",
+        "kavya-smartpbx flico",
+    ):
+        assert forbidden not in script.lower()
+
+
+def test_smartpbx_image_deploy_helper_rolls_back_exact_local_baseline_without_sensitive_output():
+    script = read_smartpbx_image_deploy_script()
+
+    assert "rollback()" in script
+    assert "TAG=$ROLLBACK_TAG" in script
+    assert "wait_for_smartpbx_ready" in script
+    assert "SMARTPBX_ROLLBACK_ESCALATION_REQUIRED" in script
+    assert "return 1" in script[script.find("rollback()"):]
+    for forbidden in (
+        "cat .env",
+        "printenv",
+        "docker compose config$",
+        "curl http://127.0.0.1:8006/smartpbx/status",
+        "docker compose logs",
+    ):
+        assert forbidden not in script
+
+
+def test_smartpbx_runbook_uses_the_guarded_smartpbx_image_deploy_helper():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+
+    assert "deploy_smartpbx_image.sh" in runbook
+    assert "NEW_TAG EXPECTED_SHA EXPECTED_DIGEST" in runbook
+    assert "authenticated integration probe" in runbook
