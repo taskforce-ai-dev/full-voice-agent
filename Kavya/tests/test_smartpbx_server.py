@@ -694,3 +694,83 @@ def test_unknown_service_mode_fails_closed():
 
     with pytest.raises(ValueError, match="invalid KAVYA_SERVICE_MODE"):
         server.build_service_app("both", {})
+
+
+def test_smartpbx_session_declares_optional_diagnostic_sink_and_installs_before_welcome():
+    import inspect
+
+    parameters = inspect.signature(KavyaSmartPBXSession).parameters
+    assert "diagnostic_sink" in parameters
+    assert parameters["diagnostic_sink"].default is not inspect.Parameter.empty
+
+
+@pytest.mark.asyncio
+async def test_server_smartpbx_factory_declares_and_forwards_diagnostic_sink_contract():
+    import inspect
+    import server
+
+    parameters = inspect.signature(server._new_smartpbx_session).parameters
+    assert list(parameters) == ["context", "transport", "diagnostic_sink"]
+
+    sentinel_sink = lambda *_values: None
+    session = await server._new_smartpbx_session(context(), FakeTransport(), sentinel_sink)
+    assert getattr(session, "_diagnostic_sink", None) is sentinel_sink
+
+@pytest.mark.asyncio
+async def test_smartpbx_session_installs_default_noop_sink_on_pipeline_before_welcome():
+    async def process_post_call(**_metadata):
+        pass
+
+    session, pipeline, _, _ = make_session(post_call_processor=process_post_call)
+    await session.start()
+    try:
+        sink = getattr(pipeline, "_smartpbx_diagnostic_sink", None)
+        assert callable(sink)
+        assert pipeline.spoken == ["Welcome to Hatton Hills."]
+    finally:
+        await session.finish(False)
+
+
+class SinkObservingPipeline(FakePipeline):
+    def __init__(self):
+        super().__init__()
+        self.sinks_seen_at_speak = []
+    async def _speak(self, text):
+        self.sinks_seen_at_speak.append(getattr(self, "_smartpbx_diagnostic_sink", None))
+        await super()._speak(text)
+
+
+@pytest.mark.asyncio
+async def test_default_diagnostic_sink_is_callable_before_welcome_speak():
+    async def process_post_call(**_metadata):
+        pass
+    pipeline = SinkObservingPipeline()
+    session, _, _, _ = make_session(post_call_processor=process_post_call, pipeline=pipeline)
+    await session.start()
+    try:
+        assert pipeline.spoken == ["Welcome to Hatton Hills."]
+        assert len(pipeline.sinks_seen_at_speak) == 1
+        assert callable(pipeline.sinks_seen_at_speak[0])
+    finally:
+        await session.finish(False)
+
+
+@pytest.mark.asyncio
+async def test_explicit_diagnostic_sink_reaches_pipeline_before_welcome_by_identity():
+    import inspect
+    async def process_post_call(**_metadata):
+        pass
+    explicit_sink = lambda *_values: None
+    parameters = inspect.signature(KavyaSmartPBXSession).parameters
+    assert "diagnostic_sink" in parameters
+    pipeline = SinkObservingPipeline()
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), pipeline=pipeline, stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=process_post_call, welcome_text="Welcome to Hatton Hills.",
+        llm_provider="claude", model="test-model", diagnostic_sink=explicit_sink,
+    )
+    await session.start()
+    try:
+        assert pipeline.sinks_seen_at_speak == [explicit_sink]
+    finally:
+        await session.finish(False)

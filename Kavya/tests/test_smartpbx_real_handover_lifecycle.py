@@ -117,7 +117,7 @@ async def test_real_acknowledged_transfer_stays_open_until_dialog_stop_and_posts
     async def post_call(**metadata) -> None:
         post_calls.append(metadata)
 
-    async def session_factory(context, transport):
+    async def session_factory(context, transport, sink=None):
         pipeline = server.MediaStreamSession(
             websocket=None,
             lang="en",
@@ -134,6 +134,7 @@ async def test_real_acknowledged_transfer_stays_open_until_dialog_stop_and_posts
             llm_provider="openai",
             model="test-model",
         )
+        assert sink is None or callable(sink)
         sessions.append(session)
         return session
 
