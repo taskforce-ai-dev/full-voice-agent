@@ -539,9 +539,10 @@ async def test_unsupported_event_logs_only_finite_admission_class(caplog):
     with caplog.at_level(logging.INFO):
         _, _, websocket, _ = await run([
             START,
-            json.dumps({"event": private_name, "callId": private_id})
+            json.dumps({"event": private_name, "callId": private_id}),
+            {"event": "hangup", "hangup": {"callId": "call-1", "otherLegCallId": "other-1", "accountId": "account-1", "reason": "normal"}}
         ])
-    assert websocket.close_code == 1008
+    assert websocket.close_calls[-1][0] == 1008
     assert "stage=admission failure_class=unsupported_event" in caplog.text
     assert private_name not in caplog.text
     assert private_id not in caplog.text
