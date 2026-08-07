@@ -1140,3 +1140,230 @@ async def test_explicit_falsey_diagnostic_sink_is_preserved_and_used_before_welc
         )]
     finally:
         await session.finish(False)
+
+
+async def _native_one_event_stream(event):
+    yield event
+
+
+class NativeRecordingOpenAI:
+    def __init__(self, events=None):
+        self.requests = []
+        self.events = events
+        self.chat = SimpleNamespace(completions=self)
+
+    async def create(self, **kwargs):
+        self.requests.append(kwargs)
+        if self.events is not None:
+            self.events.append("openai-dispatch")
+        return _native_one_event_stream(
+            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="native response", tool_calls=None))])
+        )
+
+
+class NativeRecordingGeminiModels:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def generate_content_stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        if self.owner.events is not None:
+            self.owner.events.append("gemini-dispatch")
+        return _native_one_event_stream(
+            SimpleNamespace(candidates=[SimpleNamespace(
+                finish_reason=None,
+                content=SimpleNamespace(parts=[SimpleNamespace(text="native response", function_call=None)]),
+            )])
+        )
+
+
+class NativeRecordingGemini:
+    def __init__(self, events=None):
+        self.requests = []
+        self.events = events
+        self.aio = SimpleNamespace(models=NativeRecordingGeminiModels(self))
+
+
+class NativeRecordingClaudeStream:
+    def __init__(self, event):
+        self.event = event
+
+    async def __aenter__(self):
+        return _native_one_event_stream(self.event)
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class NativeRecordingClaudeMessages:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        if self.owner.events is not None:
+            self.owner.events.append("claude-dispatch")
+        return NativeRecordingClaudeStream(
+            SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="text_delta", text="native response"))
+        )
+
+
+class NativeRecordingClaude:
+    def __init__(self, events=None):
+        self.requests = []
+        self.events = events
+        self.messages = NativeRecordingClaudeMessages(self)
+
+
+def native_provider_clients(events=None):
+    return {
+        "claude": NativeRecordingClaude(events),
+        "gemini": NativeRecordingGemini(events),
+        "openai": NativeRecordingOpenAI(events),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_media_session_uses_explicit_native_provider_model_and_schema(monkeypatch, provider):
+    import server
+
+    clients = native_provider_clients()
+    schemas = {
+        "claude": [{"name": "claude_native_tool"}],
+        "gemini": [{"function_declarations": [{"name": "gemini_native_tool"}]}],
+        "openai": [{"type": "function", "function": {"name": "openai_native_tool"}}],
+    }
+    factory_calls = []
+
+    def provider_factory(name):
+        def factory():
+            factory_calls.append(name)
+            return schemas[name]
+
+        return factory
+
+    monkeypatch.setattr(server, "get_tools", provider_factory("claude"))
+    monkeypatch.setattr(server, "get_tools_gemini", provider_factory("gemini"))
+    monkeypatch.setattr(server, "get_tools_openai", provider_factory("openai"))
+    expected_tools = schemas[provider]
+    pipeline = server.MediaStreamSession(
+        websocket=None,
+        lang="en",
+        anthropic_client=clients["claude"],
+        gemini_client=clients["gemini"],
+        openai_client=clients["openai"],
+        media_transport=FakeTransport(),
+        llm_provider=provider,
+        model=f"{provider}-instance-model",
+    )
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("provider-turn")
+
+    assert pipeline.tools is expected_tools
+    assert factory_calls == [provider]
+    assert len(clients[provider].requests) == 1
+    for other_provider, client in clients.items():
+        if other_provider != provider:
+            assert client.requests == []
+    request = clients[provider].requests[0]
+    assert request["model"] == f"{provider}-instance-model"
+    if provider == "gemini":
+        assert request["config"]["tools"] is expected_tools
+    else:
+        assert request["tools"] is expected_tools
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_runtime_pipeline_forwards_resolved_provider_and_model(monkeypatch):
+    import server
+
+    captured = {}
+    gemini_client = object()
+
+    class CapturingPipeline:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(server, "LLM_PROVIDER", "claude")
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: (_ for _ in ()).throw(AssertionError("wrong client")))
+    monkeypatch.setattr(server, "_get_gemini_client", lambda: gemini_client)
+    monkeypatch.setattr(server, "_get_client", lambda: (_ for _ in ()).throw(AssertionError("wrong client")))
+    monkeypatch.setattr(server, "MediaStreamSession", CapturingPipeline)
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0), welcome_text="",
+        llm_provider="gemini", model="adapter-instance-model",
+    )
+
+    session._load_runtime_defaults()
+
+    assert captured["llm_provider"] == "gemini"
+    assert captured["model"] == "adapter-instance-model"
+    assert captured["gemini_client"] is gemini_client
+
+
+@pytest.mark.asyncio
+async def test_media_session_retrieves_reference_before_selected_provider_dispatch(monkeypatch):
+    import server
+
+    events = []
+    clients = native_provider_clients(events)
+    pipeline = server.MediaStreamSession(
+        websocket=None,
+        lang="en",
+        openai_client=clients["openai"],
+        media_transport=FakeTransport(),
+        llm_provider="openai",
+        model="rag-instance-model",
+    )
+
+    def retrieve(_text):
+        events.append("retrieve")
+        return "reference-marker"
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", retrieve)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("guest-marker")
+
+    assert events.index("retrieve") < events.index("openai-dispatch")
+    assert "reference-marker" in str(clients["openai"].requests[0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_start_uses_exact_configured_stt_factory_with_private_english_inputs():
+    async def process_post_call(**_metadata):
+        return None
+
+    calls = []
+    stt = FakeSTT()
+
+    def configured_factory(**kwargs):
+        calls.append(kwargs)
+        return stt
+
+    pipeline = FakePipeline()
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), pipeline=pipeline, stt_factory=configured_factory,
+        post_call_processor=process_post_call, welcome_text="",
+        llm_provider="claude", model="stt-instance-model",
+    )
+
+    await session.start()
+    try:
+        assert session._stt_factory is configured_factory
+        assert len(calls) == 1
+        assert calls[0]["lang"] == "en"
+        assert calls[0]["privacy_safe"] is True
+        assert calls[0]["on_final_result"].__self__ is pipeline
+        assert calls[0]["on_interim_result"].__self__ is pipeline
+    finally:
+        await session.finish(False)
