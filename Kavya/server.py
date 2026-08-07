@@ -2881,9 +2881,11 @@ class MediaStreamSession:
         if self.transfer_pending:
             return
         if self._media_transport is not None:
+            generation = self._speak_generation
             await self._media_transport.send_mark("tts_done")
             self._is_speaking = False
-            self._schedule_reprompt()
+            if generation == self._speak_generation and not self.transfer_pending:
+                self._schedule_reprompt()
             return
         async with self._ws_lock:
             await self.ws.send_text(json.dumps({
