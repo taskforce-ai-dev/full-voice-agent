@@ -2646,6 +2646,13 @@ class MediaStreamSession:
     def _is_smartpbx_session(self) -> bool:
         return self._smartpbx_transfer_context is not None
 
+    def _is_direct_smartpbx_english(self) -> bool:
+        return (
+            self._is_smartpbx_session()
+            and self._media_transport is not None
+            and self.lang == "en"
+        )
+
     async def enter_transfer_pending(self) -> None:
         """Silence AI activity after carrier acknowledgement without closing Dialog."""
         if self.transfer_pending:
@@ -3077,6 +3084,7 @@ class MediaStreamSession:
     async def _run_llm(self) -> str:
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
+        smartpbx_filler_sent = False
 
         for round_idx in range(MAX_TOOL_ROUNDS):
             if self._is_smartpbx_session():
@@ -3131,7 +3139,7 @@ class MediaStreamSession:
                             if tc_delta.function.arguments:
                                 tool_calls_data[idx]["arguments"] += tc_delta.function.arguments
 
-            full_text += text_content
+            full_text = _join_turn(full_text, text_content)
 
             if tool_calls_data:
                 tool_list = list(tool_calls_data.values())
@@ -3143,9 +3151,18 @@ class MediaStreamSession:
                     await asyncio.gather(*tts_tasks)
 
                 first_tool = tool_list[0]["name"]
-                filler = fillers.get(first_tool, fillers.get("_default", ""))
-                if filler:
-                    await self._speak(filler)
+                if self._is_direct_smartpbx_english():
+                    preamble = sentence_buffer.strip()
+                    if preamble:
+                        await self._speak(preamble, generation=gen)
+                    elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
+                        filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
+                        await self._speak(filler, generation=gen)
+                        smartpbx_filler_sent = True
+                else:
+                    filler = fillers.get(first_tool, fillers.get("_default", ""))
+                    if filler:
+                        await self._speak(filler)
 
                 # Build assistant message with tool_calls
                 assistant_msg: dict[str, Any] = {
@@ -3166,7 +3183,7 @@ class MediaStreamSession:
                 self.history.append(assistant_msg)
 
                 # Execute tools and add results
-                for tc in tool_list:
+                for tool_index, tc in enumerate(tool_list):
                     try:
                         parsed_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
                     except json.JSONDecodeError:
@@ -3177,7 +3194,11 @@ class MediaStreamSession:
                         result_str = await execute_tool(tc["name"], parsed_input)
                     except Exception as exc:
                         self._log_tool_failure(tc["name"])
-                        result_str = json.dumps({"error": str(exc)})
+                        if self._is_direct_smartpbx_english():
+                            assistant_msg["tool_calls"][tool_index]["function"]["arguments"] = "{}"
+                            result_str = json.dumps({"error": "tool_execution_failed"})
+                        else:
+                            result_str = json.dumps({"error": str(exc)})
                     self.history.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -3216,6 +3237,7 @@ class MediaStreamSession:
         """Gemini-native streaming version of _run_llm for Media Streams."""
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
+        smartpbx_filler_sent = False
 
         for round_idx in range(MAX_TOOL_ROUNDS):
             if self._is_smartpbx_session():
@@ -3277,7 +3299,7 @@ class MediaStreamSession:
             else:
                 logger.info("Gemini round %d [%s] — text=%d chars, tools=%d, finish=%s", round_idx + 1, self.call_sid, len(text_content), len(function_calls), finish_reason)
 
-            full_text += text_content
+            full_text = _join_turn(full_text, text_content)
 
             if function_calls:
                 if self._is_smartpbx_session():
@@ -3288,9 +3310,18 @@ class MediaStreamSession:
                     await asyncio.gather(*tts_tasks)
 
                 first_tool = function_calls[0]["name"]
-                filler = fillers.get(first_tool, fillers.get("_default", ""))
-                if filler:
-                    await self._speak(filler)
+                if self._is_direct_smartpbx_english():
+                    preamble = sentence_buffer.strip()
+                    if preamble:
+                        await self._speak(preamble, generation=gen)
+                    elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
+                        filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
+                        await self._speak(filler, generation=gen)
+                        smartpbx_filler_sent = True
+                else:
+                    filler = fillers.get(first_tool, fillers.get("_default", ""))
+                    if filler:
+                        await self._speak(filler)
 
                 # Build assistant message in OpenAI format
                 tool_calls_openai = []
@@ -3319,7 +3350,11 @@ class MediaStreamSession:
                         result_str = await execute_tool(tc["function"]["name"], parsed_input)
                     except Exception as exc:
                         self._log_tool_failure(tc["function"]["name"])
-                        result_str = json.dumps({"error": str(exc)})
+                        if self._is_direct_smartpbx_english():
+                            tc["function"]["arguments"] = "{}"
+                            result_str = json.dumps({"error": "tool_execution_failed"})
+                        else:
+                            result_str = json.dumps({"error": str(exc)})
                     self.history.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -3358,6 +3393,7 @@ class MediaStreamSession:
         """Anthropic Claude streaming for Media Streams with sentence-level TTS."""
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
+        smartpbx_filler_sent = False
 
         for round_idx in range(MAX_TOOL_ROUNDS):
             if self._is_smartpbx_session():
@@ -3436,7 +3472,7 @@ class MediaStreamSession:
                             cur_tool_id = None
                             tool_json = ""
 
-            full_text += text_content
+            full_text = _join_turn(full_text, text_content)
 
             if tool_use_blocks:
                 if self._is_smartpbx_session():
@@ -3447,9 +3483,18 @@ class MediaStreamSession:
                     await asyncio.gather(*tts_tasks)
 
                 first_tool = tool_use_blocks[0]["name"]
-                filler = fillers.get(first_tool, fillers.get("_default", ""))
-                if filler:
-                    await self._speak(filler)
+                if self._is_direct_smartpbx_english():
+                    preamble = sentence_buffer.strip()
+                    if preamble:
+                        await self._speak(preamble, generation=gen)
+                    elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
+                        filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
+                        await self._speak(filler, generation=gen)
+                        smartpbx_filler_sent = True
+                else:
+                    filler = fillers.get(first_tool, fillers.get("_default", ""))
+                    if filler:
+                        await self._speak(filler)
 
                 # Build assistant message with content blocks
                 assistant_content: list[dict[str, Any]] = []
@@ -3466,13 +3511,17 @@ class MediaStreamSession:
 
                 # Execute tools and build tool_result blocks
                 tool_results: list[dict[str, Any]] = []
-                for tb in tool_use_blocks:
+                for tool_index, tb in enumerate(tool_use_blocks):
                     self._log_tool_execution(tb["name"], tb["input"])
                     try:
                         result_str = await execute_tool(tb["name"], tb["input"])
                     except Exception as exc:
                         self._log_tool_failure(tb["name"])
-                        result_str = json.dumps({"error": str(exc)})
+                        if self._is_direct_smartpbx_english():
+                            assistant_content[tool_index + (1 if text_content else 0)]["input"] = {}
+                            result_str = json.dumps({"error": "tool_execution_failed"})
+                        else:
+                            result_str = json.dumps({"error": str(exc)})
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tb["id"],
