@@ -191,6 +191,7 @@ def test_acme_bootstrap_precedes_loopback_health_and_final_tls_proxy():
     assert "return 301 https://$host$request_uri;" in nginx
     assert "location /.well-known/acme-challenge/" in nginx
 
+    tls_start = runbook.find("## TLS bootstrap, local service validation, then public proxy")
     positions = [
         runbook.find("getent ahostsv4 smartpbx-kavya.taskforceai.tech"),
         runbook.find("nginx-smartpbx-acme.conf"),
@@ -198,7 +199,7 @@ def test_acme_bootstrap_precedes_loopback_health_and_final_tls_proxy():
         runbook.find("sudo systemctl reload nginx"),
         runbook.find("certbot certonly --webroot"),
         runbook.find("fullchain.pem"),
-        runbook.find("docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null"),
+        runbook.find("docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null", tls_start),
         runbook.find("up -d --force-recreate --pull never kavya-smartpbx"),
         runbook.find("http://127.0.0.1:8006/health"),
         runbook.find("sudo install -m 0644 nginx-smartpbx.conf"),
