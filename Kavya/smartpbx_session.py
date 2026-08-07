@@ -7,6 +7,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
+from smartpbx_diagnostics import SmartPBXDiagnosticSink
 from smartpbx_protocol import CallContext
 from smartpbx_transport import SmartPBXMediaTransport
 
@@ -28,6 +29,7 @@ class KavyaSmartPBXSession:
         welcome_text: str | None = None,
         llm_provider: str | None = None,
         model: str | None = None,
+        diagnostic_sink: SmartPBXDiagnosticSink | None = None,
     ) -> None:
         self._context = context
         self._transport = transport
@@ -37,6 +39,7 @@ class KavyaSmartPBXSession:
         self._welcome_text = welcome_text
         self._llm_provider = llm_provider
         self._model = model
+        self._diagnostic_sink = diagnostic_sink or _noop_diagnostic
 
         loop = asyncio.get_running_loop()
         self._terminal_future: asyncio.Future[None] = loop.create_future()
@@ -95,6 +98,7 @@ class KavyaSmartPBXSession:
         self._call_start_time = datetime.now(timezone.utc).isoformat()
         pipeline.call_start_time = self._call_start_time
         pipeline._event_loop = asyncio.get_running_loop()
+        pipeline._smartpbx_diagnostic_sink = self._diagnostic_sink
         pipeline._stt = self._stt_factory(
             on_final_result=pipeline._on_stt_result,
             on_interim_result=pipeline._on_stt_interim,
@@ -106,6 +110,7 @@ class KavyaSmartPBXSession:
             self._welcome_task = asyncio.create_task(
                 pipeline._speak(self._welcome_text)
             )
+
 
     async def _finish_once(self, schedule_post_call: bool) -> None:
         try:
@@ -223,3 +228,7 @@ class KavyaSmartPBXSession:
         pipeline._smartpbx_caller_context = {
             "caller_phone": self._context.caller_number,
         }
+
+
+def _noop_diagnostic(*_args: object) -> None:
+    return None

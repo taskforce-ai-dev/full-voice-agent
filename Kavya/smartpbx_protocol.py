@@ -100,9 +100,6 @@ class UnsupportedEvent:
     pass
 
 
-UnknownEvent = UnsupportedEvent
-
-
 SmartPBXEvent: TypeAlias = (
     ConnectedEvent | StartEvent | MediaEvent | DtmfEvent | HangupEvent | StopEvent | UnsupportedEvent
 )

@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import secrets
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 from starlette.websockets import WebSocketDisconnect
 
+from smartpbx_diagnostics import (
+    DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage, SmartPBXDiagnosticSink,
+)
 from smartpbx_protocol import (
     ConnectedEvent, DtmfEvent, HangupEvent, MediaEvent, POLICY_VIOLATION,
-    ProtocolViolation, StartEvent, StopEvent, UnknownEvent, parse_smartpbx_event,
+    ProtocolViolation, StartEvent, StopEvent, UnsupportedEvent, parse_smartpbx_event,
     validate_event_context,
 )
 from smartpbx_transport import SmartPBXMediaTransport
@@ -140,7 +141,7 @@ class _GatewaySession(Protocol):
     async def finish(self, schedule_post_call: bool = False) -> None: ...
 
 
-SessionFactory = Callable[[Any, SmartPBXMediaTransport], Awaitable[_GatewaySession]]
+SessionFactory = Callable[[Any, SmartPBXMediaTransport, SmartPBXDiagnosticSink], Awaitable[_GatewaySession]]
 
 
 class SmartPBXGateway:
@@ -149,98 +150,150 @@ class SmartPBXGateway:
     def __init__(self, settings: SmartPBXSettings, registry: SmartPBXSessionRegistry) -> None:
         self._settings = settings
         self._registry = registry
-        self._unknown_events_total = 0
 
     def snapshot(self) -> dict[str, bool | int | str]:
-        return {**smartpbx_status(self._settings, self._registry), "unknown_events_total": self._unknown_events_total}
+        return smartpbx_status(self._settings, self._registry)
 
     async def handle(self, websocket: Any, session_factory: SessionFactory) -> None:
-        session_id, started_at = uuid.uuid4().hex, time.monotonic()
+        correlation_id = f"spx-{secrets.token_hex(16)}"
+        started_at = time.monotonic()
+        sink_enabled = True
+
+        def sink(
+            stage: DiagnosticStage,
+            outcome: DiagnosticOutcome,
+            failure_class: DiagnosticFailureClass,
+        ) -> None:
+            if sink_enabled:
+                self._emit_diagnostic(correlation_id, started_at, stage, outcome, failure_class)
+
         lease: SessionLease | None = None
         transport: SmartPBXMediaTransport | None = None
         session: _GatewaySession | None = None
+        accepted = False
+        disconnected = False
+        cancellation: asyncio.CancelledError | None = None
         close_outcome: tuple[int, str] | None = None
-        outcome, failure_class, disconnected, cancellation, call_fingerprint = "rejected", "", False, None, ""
+        completed_normally = False
 
         token = websocket.headers.get(self._settings.auth_header_name, "")
         if not self._settings.enabled or not self._settings.configured:
             await _safe_close(websocket, POLICY_VIOLATION, "service unavailable")
-            self._log_lifecycle(session_id, call_fingerprint, outcome, "disabled", started_at)
+            sink(DiagnosticStage.SCHEMA_ADMISSION, DiagnosticOutcome.REJECTED, DiagnosticFailureClass.DISABLED)
+            sink_enabled = False
             return
         if not self._settings.token_matches(token):
             await _safe_close(websocket, POLICY_VIOLATION, "unauthorized")
-            self._log_lifecycle(session_id, call_fingerprint, outcome, "authentication", started_at)
+            sink(DiagnosticStage.SCHEMA_ADMISSION, DiagnosticOutcome.REJECTED, DiagnosticFailureClass.AUTHENTICATION)
+            sink_enabled = False
             return
 
         lease = await self._registry.try_acquire()
         if lease is None:
             await _safe_close(websocket, 1013, "capacity unavailable")
-            self._log_lifecycle(session_id, call_fingerprint, outcome, "capacity", started_at)
+            sink(DiagnosticStage.SCHEMA_ADMISSION, DiagnosticOutcome.REJECTED, DiagnosticFailureClass.CAPACITY)
+            sink_enabled = False
             return
 
-        accepted = False
         try:
             await websocket.accept()
             accepted = True
             context = await self._receive_start(websocket)
             if context.account_id != self._settings.account_id:
                 raise ProtocolViolation(POLICY_VIOLATION, "account mismatch", "account_mismatch")
-            call_fingerprint = _fingerprint(context.call_id)
-            transport = SmartPBXMediaTransport(websocket, context, max_queue_frames=self._settings.max_outbound_frames)
+            transport = SmartPBXMediaTransport(
+                websocket, context, max_queue_frames=self._settings.max_outbound_frames
+            )
             transport.start()
-            session = await session_factory(context, transport)
-            await session.start()
+            try:
+                session = await session_factory(context, transport, sink)
+            except Exception:
+                sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.SESSION_FACTORY)
+                close_outcome = (1011, "internal error")
+                return
+            try:
+                await session.start()
+            except Exception:
+                sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.SESSION_START)
+                close_outcome = (1011, "internal error")
+                return
+            sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
 
             while True:
                 raw = await self._receive_or_terminal(websocket, session)
                 if raw is None:
-                    outcome, close_outcome = "terminal", (1000, "call ended")
+                    close_outcome = (1000, "call ended")
+                    completed_normally = True
                     break
-                event = parse_smartpbx_event(raw, max_message_chars=self._settings.max_message_chars, max_audio_bytes=self._settings.max_audio_bytes)
+                event = parse_smartpbx_event(
+                    raw,
+                    max_message_chars=self._settings.max_message_chars,
+                    max_audio_bytes=self._settings.max_audio_bytes,
+                )
                 if isinstance(event, StartEvent):
                     validate_event_context(event, context)
                     raise ProtocolViolation(POLICY_VIOLATION, "duplicate start", "duplicate_start")
                 if isinstance(event, MediaEvent):
-                    await session.feed_audio(event.audio)
+                    try:
+                        await session.feed_audio(event.audio)
+                    except Exception:
+                        sink(DiagnosticStage.AUDIO_INGESTION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.AUDIO_INGESTION)
+                        close_outcome = (1011, "internal error")
+                        return
                 elif isinstance(event, DtmfEvent):
-                    self._log_event("smartpbx_dtmf_observed", session_id, call_fingerprint, "ignored", "", started_at)
+                    validate_event_context(event, context)
+                    sink(DiagnosticStage.CONTEXT_VALIDATION, DiagnosticOutcome.OBSERVED, DiagnosticFailureClass.NONE)
                 elif isinstance(event, HangupEvent):
                     validate_event_context(event, context)
-                    outcome, close_outcome = "hangup", (1000, "call ended")
+                    close_outcome = (1000, "call ended")
+                    completed_normally = True
                     break
                 elif isinstance(event, StopEvent):
-                    outcome, close_outcome = "stop", (1000, "call ended")
+                    close_outcome = (1000, "call ended")
+                    completed_normally = True
                     break
-                elif isinstance(event, UnknownEvent):
-                    self._unknown_events_total = _saturating_increment(self._unknown_events_total)
+                elif isinstance(event, UnsupportedEvent):
+                    raise ProtocolViolation(POLICY_VIOLATION, "unsupported event", "unsupported_event")
                 elif isinstance(event, ConnectedEvent):
                     raise ProtocolViolation(POLICY_VIOLATION, "connected after start", "connected_after_start")
         except asyncio.TimeoutError:
-            failure_class, outcome = ("start_timeout", "timeout") if not session else ("idle_timeout", "timeout")
-            close_outcome = (POLICY_VIOLATION, "start timeout" if not session else "idle timeout")
+            if session is None:
+                sink(DiagnosticStage.SCHEMA_ADMISSION, DiagnosticOutcome.REJECTED, DiagnosticFailureClass.START_TIMEOUT)
+                close_outcome = (POLICY_VIOLATION, "start timeout")
+            else:
+                sink(DiagnosticStage.AUDIO_INGESTION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.IDLE_TIMEOUT)
+                close_outcome = (POLICY_VIOLATION, "idle timeout")
         except WebSocketDisconnect:
-            disconnected, outcome = True, "disconnect"
+            disconnected = True
+            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DISCONNECTED, DiagnosticFailureClass.TRANSPORT_DISCONNECT)
         except asyncio.CancelledError as error:
-            cancellation, outcome = error, "cancelled"
+            cancellation = error
+            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.CANCELLED, DiagnosticFailureClass.CANCELLED)
         except ProtocolViolation as error:
-            outcome, failure_class, close_outcome = "protocol_error", error.failure_class, (error.close_code, error.public_reason)
-        except Exception as error:
-            outcome, failure_class, close_outcome = "failed", _stable_failure_class(error), (1011, "internal error")
-            self._log_event("smartpbx_session_failed", session_id, call_fingerprint, outcome, failure_class, started_at, level=logging.ERROR)
+            stage, outcome, failure = _protocol_diagnostic(error.failure_class)
+            sink(stage, outcome, failure)
+            close_outcome = (error.close_code, error.public_reason)
+        except Exception:
+            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.INTERNAL_ERROR)
+            close_outcome = (1011, "internal error")
         finally:
-            cleanup_task = asyncio.create_task(
-                self._cleanup(session, transport, lease, session_id, call_fingerprint, started_at)
-            )
+            cleanup_task = asyncio.create_task(self._cleanup(session, transport, lease, sink))
             while not cleanup_task.done():
                 try:
                     await asyncio.shield(cleanup_task)
                 except asyncio.CancelledError as error:
                     if cancellation is None:
                         cancellation = error
-            await cleanup_task
+                        sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.CANCELLED, DiagnosticFailureClass.CANCELLED)
+            cleanup_degraded = await cleanup_task
+            close_failed = False
             if accepted and close_outcome is not None and not disconnected:
-                await _safe_close(websocket, *close_outcome)
-            self._log_lifecycle(session_id, call_fingerprint, outcome, failure_class, started_at)
+                close_failed = not await _safe_close(websocket, *close_outcome)
+                if close_failed:
+                    sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DEGRADED, DiagnosticFailureClass.WEBSOCKET_CLOSE)
+            if completed_normally and cancellation is None and not cleanup_degraded and not close_failed:
+                sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
+            sink_enabled = False
             if cancellation is not None:
                 raise cancellation
 
@@ -252,13 +305,13 @@ class SmartPBXGateway:
                 raise asyncio.TimeoutError
             event = parse_smartpbx_event(
                 await asyncio.wait_for(websocket.receive_text(), timeout=remaining),
-                max_message_chars=self._settings.max_message_chars, max_audio_bytes=self._settings.max_audio_bytes,
+                max_message_chars=self._settings.max_message_chars,
+                max_audio_bytes=self._settings.max_audio_bytes,
             )
             if isinstance(event, StartEvent):
                 return event.context
-            if isinstance(event, UnknownEvent):
-                self._unknown_events_total = _saturating_increment(self._unknown_events_total)
-                continue
+            if isinstance(event, UnsupportedEvent):
+                raise ProtocolViolation(POLICY_VIOLATION, "unsupported event", "unsupported_event")
             if isinstance(event, ConnectedEvent):
                 continue
             raise ProtocolViolation(POLICY_VIOLATION, "start required", "start_required")
@@ -271,9 +324,7 @@ class SmartPBXGateway:
         receive_task = asyncio.create_task(websocket.receive_text())
         done, _ = await asyncio.wait({receive_task, terminal}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         if not done and getattr(session, "transfer_pending", False):
-            done, _ = await asyncio.wait(
-                {receive_task, terminal}, timeout=None, return_when=asyncio.FIRST_COMPLETED
-            )
+            done, _ = await asyncio.wait({receive_task, terminal}, return_when=asyncio.FIRST_COMPLETED)
         if not done:
             receive_task.cancel()
             await asyncio.gather(receive_task, return_exceptions=True)
@@ -285,7 +336,19 @@ class SmartPBXGateway:
             return None
         return receive_task.result()
 
-    async def _cleanup(self, session, transport, lease, session_id, call_fingerprint, started_at) -> None:
+    async def _cleanup(
+        self,
+        session: _GatewaySession | None,
+        transport: SmartPBXMediaTransport | None,
+        lease: SessionLease | None,
+        sink: SmartPBXDiagnosticSink,
+    ) -> bool:
+        degraded = False
+        failures = {
+            "session": DiagnosticFailureClass.SESSION_CLEANUP,
+            "transport": DiagnosticFailureClass.TRANSPORT_CLEANUP,
+            "lease": DiagnosticFailureClass.LEASE_CLEANUP,
+        }
         for name, operation in (
             ("session", None if session is None else session.finish(schedule_post_call=True)),
             ("transport", None if transport is None else transport.close()),
@@ -297,28 +360,53 @@ class SmartPBXGateway:
             try:
                 await asyncio.wait_for(task, timeout=5)
             except (Exception, asyncio.CancelledError):
+                degraded = True
                 if not task.done():
                     task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-                self._log_event(f"smartpbx_{name}_cleanup_failed", session_id, call_fingerprint, "degraded", f"{name}_cleanup", started_at, level=logging.ERROR)
+                sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DEGRADED, failures[name])
+        return degraded
 
-    def _log_lifecycle(self, session_id, call_fingerprint, outcome, failure_class, started_at) -> None:
-        self._log_event("smartpbx_session_ended", session_id, call_fingerprint, outcome, failure_class, started_at)
-
-    def _log_event(self, event, session_id, call_fingerprint, outcome, failure_class, started_at, *, level=logging.INFO) -> None:
-        logger.log(level, "%s", json.dumps({
-            "event": event[:64], "session_id": session_id, "call_fingerprint": call_fingerprint,
-            "outcome": outcome[:64], "failure_class": failure_class[:64],
-            "active_count": self._registry.snapshot()["active_sessions"],
-            "duration": round(max(0.0, time.monotonic() - started_at), 3),
+    def _emit_diagnostic(
+        self,
+        correlation_id: str,
+        started_at: float,
+        stage: DiagnosticStage,
+        outcome: DiagnosticOutcome,
+        failure_class: DiagnosticFailureClass,
+    ) -> None:
+        logger.info("%s", json.dumps({
+            "event": "smartpbx_protocol_diagnostic",
+            "correlation_id": correlation_id,
+            "stage": stage.value,
+            "outcome": outcome.value,
+            "failure_class": failure_class.value,
+            "active_sessions": self._registry.snapshot()["active_sessions"],
+            "duration_ms": round(max(0.0, time.monotonic() - started_at) * 1000),
         }, sort_keys=True))
 
 
-async def _safe_close(websocket: Any, code: int, reason: str) -> None:
+def _protocol_diagnostic(failure_class: str) -> tuple[DiagnosticStage, DiagnosticOutcome, DiagnosticFailureClass]:
+    try:
+        failure = DiagnosticFailureClass(failure_class)
+    except ValueError:
+        return (DiagnosticStage.SCHEMA_ADMISSION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.INTERNAL_ERROR)
+    if failure in {
+        DiagnosticFailureClass.ACCOUNT_MISMATCH,
+        DiagnosticFailureClass.CONTEXT_MISMATCH,
+        DiagnosticFailureClass.DUPLICATE_START,
+        DiagnosticFailureClass.CONNECTED_AFTER_START,
+    }:
+        return (DiagnosticStage.CONTEXT_VALIDATION, DiagnosticOutcome.REJECTED, failure)
+    return (DiagnosticStage.SCHEMA_ADMISSION, DiagnosticOutcome.REJECTED, failure)
+
+
+async def _safe_close(websocket: Any, code: int, reason: str) -> bool:
     try:
         await websocket.close(code=code, reason=reason)
     except Exception:
-        pass
+        return False
+    return True
 
 
 def _default_integer_settings() -> dict[str, int]:
@@ -343,15 +431,3 @@ def _saturating_increment(value: int) -> int:
 
 def _configuration_error() -> ValueError:
     return ValueError("invalid SmartPBX configuration")
-
-
-_FAILURE_CLASSES = frozenset({"stt_unavailable", "stt_queue_overflow", "tts_unavailable", "tts_status", "tts_timeout", "tts_exception", "pipeline", "internal_error"})
-
-
-def _stable_failure_class(error: Exception) -> str:
-    value = getattr(error, "failure_class", "internal_error")
-    return value if value in _FAILURE_CLASSES else "internal_error"
-
-
-def _fingerprint(call_id: str) -> str:
-    return hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:12]

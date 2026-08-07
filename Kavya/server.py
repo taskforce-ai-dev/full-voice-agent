@@ -4950,10 +4950,10 @@ async def ws_media_stream(websocket: WebSocket, lang: str):
 _twilio_app = app
 
 
-async def _new_smartpbx_session(context, transport):
+async def _new_smartpbx_session(context, transport, diagnostic_sink=None):
     from smartpbx_session import KavyaSmartPBXSession
 
-    return KavyaSmartPBXSession(context, transport)
+    return KavyaSmartPBXSession(context, transport, diagnostic_sink=diagnostic_sink)
 
 
 def build_service_app(
