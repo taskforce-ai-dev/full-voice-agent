@@ -85,6 +85,7 @@ from booking_api import close_session, is_configured
 import yanolja_service
 from post_call import process_post_call_data
 from handover import handover_context, send_handover_notification
+from english_voice_profile import load_kavya_english_voice_profile
 
 try:
     import dashboard_client
@@ -489,7 +490,6 @@ CR_TRANSCRIPTION_LANGUAGE_EN: str = os.getenv("CR_TRANSCRIPTION_LANGUAGE", "").s
 LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
     "en": {
         "tts_provider": "ElevenLabs",
-        "voice": "bm3QvaZ3fUSCRBC3UV1f-flash_v2_5",
         "language": "en-US",
         "transcription_language": CR_TRANSCRIPTION_LANGUAGE_EN,
         "hints": CR_HINTS_EN,
@@ -528,6 +528,14 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "extra_attrs": "",
     },
 }
+
+
+def conversation_relay_config(language: str) -> dict[str, str]:
+    config = dict(LANGUAGE_CONFIGS[language])
+    if language == "en":
+        config["voice"] = load_kavya_english_voice_profile().twilio_composite_voice
+    return config
+
 
 # ---------------------------------------------------------------------------
 # Media Streams — Azure TTS + Google STT (Sinhala / Tamil)
@@ -1748,7 +1756,7 @@ async def voice_incoming(request: Request) -> Response:
             except Exception:
                 logger.warning("Could not update call time_limit for %s", incoming_call_sid)
 
-    en = LANGUAGE_CONFIGS["en"]
+    en = conversation_relay_config("en")
     cr = _build_conversation_relay_twiml(host, "en", en)
 
     # IVR language menu (IVR_MENU_ENABLED=true only): 1 = English
@@ -1813,7 +1821,7 @@ async def voice_language_selected(request: Request) -> Response:
 
     if lang == "en":
         # English — ConversationRelay with ElevenLabs
-        config = LANGUAGE_CONFIGS["en"]
+        config = conversation_relay_config("en")
         cr_tag = _build_conversation_relay_twiml(host, "en", config)
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -2177,7 +2185,7 @@ async def dial_result(request: Request) -> Response:
             )
         )
 
-    recovery_config = dict(LANGUAGE_CONFIGS["en"])
+    recovery_config = conversation_relay_config("en")
     recovery_config["welcome_greeting"] = HANDOFF_FAILSAFE_GREETING
     cr_tag = _build_conversation_relay_twiml(
         host, "en", recovery_config, mode="handover_failsafe",
@@ -3506,37 +3514,30 @@ class MediaStreamSession:
     # â”€â”€ ElevenLabs TTS (Tamil) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _tts_elevenlabs(self, text: str):
-        """Stream text via ElevenLabs eleven_multilingual_v2 and send mulaw audio to Twilio.
-        Must only be called from _speak (lock already held).
-        """
-        if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
-            logger.warning("ElevenLabs not configured — skipping TTS")
+        """Stream ElevenLabs TTS as 8 kHz mu-law through the active transport."""
+        if not ELEVENLABS_API_KEY:
+            logger.warning("ElevenLabs API key not configured — skipping TTS")
             return
-
+        if self.lang == "en":
+            try:
+                profile = load_kavya_english_voice_profile()
+            except ValueError:
+                logger.warning("Canonical Kavya English voice is not configured — skipping TTS")
+                return
+            voice_id = profile.voice_id
+            model_id = profile.model_id
+            voice_settings = profile.request_voice_settings
+        else:
+            if not ELEVENLABS_VOICE_ID:
+                logger.warning("ElevenLabs general voice not configured — skipping retained-language TTS")
+                return
+            voice_id = (ELEVENLABS_VOICE_ID_AR or ELEVENLABS_VOICE_ID) if self.lang == "ar" else ELEVENLABS_VOICE_ID
+            model_id = ELEVENLABS_MODEL_MULTILINGUAL
+            voice_settings = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}
         self._is_speaking = True
-        # Arabic uses its own dedicated voice; Tamil keeps the shared cloned voice.
-        voice_id = (
-            ELEVENLABS_VOICE_ID_AR or ELEVENLABS_VOICE_ID
-        ) if self.lang == "ar" else ELEVENLABS_VOICE_ID
-        url = (
-            ELEVENLABS_TTS_URL.format(voice_id=voice_id)
-            + "?output_format=ulaw_8000"
-        )
-        headers = {
-            "xi-api-key": ELEVENLABS_API_KEY,
-            "Content-Type": "application/json",
-        }
-        voice_settings: dict[str, Any] = {
-            "stability": 0.5,
-            "similarity_boost": 0.75,
-            "style": 0.0,
-            "use_speaker_boost": True,
-        }
-        payload: dict[str, Any] = {
-            "text": text,
-            "model_id": ELEVENLABS_MODEL_MULTILINGUAL,
-            "voice_settings": voice_settings,
-        }
+        url = ELEVENLABS_TTS_URL.format(voice_id=voice_id) + "?output_format=ulaw_8000"
+        headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+        payload: dict[str, Any] = {"text": text, "model_id": model_id, "voice_settings": voice_settings}
 
         try:
             async with httpx.AsyncClient() as http:
