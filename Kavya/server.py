@@ -2593,6 +2593,8 @@ class MediaStreamSession:
         openai_client: AsyncOpenAI | None = None,
         gemini_client=None,
         media_transport: Any | None = None,
+        llm_provider: str | None = None,
+        model: str | None = None,
     ):
         self.ws = websocket
         self._media_transport = media_transport
@@ -2600,10 +2602,14 @@ class MediaStreamSession:
         self.client = openai_client  # OpenAI client (kept for openai provider)
         self.gemini_client = gemini_client
         self.lang = lang
+        self.llm_provider = LLM_PROVIDER if llm_provider is None else llm_provider
+        if self.llm_provider not in {"claude", "gemini", "openai"}:
+            raise ValueError(f"invalid LLM provider: {self.llm_provider}")
+        self.model = MODEL if model is None else model
         self.system_prompt = _build_system_prompt(lang)
-        if LLM_PROVIDER == "claude":
+        if self.llm_provider == "claude":
             self.tools = get_tools()
-        elif LLM_PROVIDER == "gemini":
+        elif self.llm_provider == "gemini":
             self.tools = get_tools_gemini()
         else:
             self.tools = get_tools_openai()
@@ -3045,9 +3051,9 @@ class MediaStreamSession:
         self.history = _trim_history(self.history)
 
         try:
-            if LLM_PROVIDER == "claude":
+            if self.llm_provider == "claude":
                 response_text = await self._run_llm_claude()
-            elif LLM_PROVIDER == "gemini":
+            elif self.llm_provider == "gemini":
                 response_text = await self._run_llm_gemini()
             else:
                 response_text = await self._run_llm()
@@ -3087,7 +3093,7 @@ class MediaStreamSession:
 
             messages = [{"role": "system", "content": self.system_prompt}] + self.history
             stream = await self.client.chat.completions.create(
-                model=MODEL,
+                model=self.model,
                 max_tokens=MAX_TOKENS,
                 messages=messages,
                 tools=self.tools or None,
@@ -3233,7 +3239,7 @@ class MediaStreamSession:
                 config["tools"] = self.tools
 
             response = await self.gemini_client.aio.models.generate_content_stream(
-                model=MODEL,
+                model=self.model,
                 contents=gemini_contents,
                 config=config,
             )
@@ -3375,7 +3381,7 @@ class MediaStreamSession:
             # Cuts input tokens and ITPM pressure dramatically on the 2nd+
             # turn of every call.
             async with self.anthropic_client.messages.stream(
-                model=MODEL,
+                model=self.model,
                 max_tokens=MAX_TOKENS,
                 system=[{
                     "type": "text",

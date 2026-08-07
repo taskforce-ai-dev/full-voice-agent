@@ -170,11 +170,16 @@ class KavyaSmartPBXSession:
 
         import server
 
+        if self._llm_provider is None:
+            self._llm_provider = server.LLM_PROVIDER
+        if self._model is None:
+            self._model = server.MODEL
+
         if self._pipeline is None:
             anthropic_client = openai_client = gemini_client = None
-            if server.LLM_PROVIDER == "claude":
+            if self._llm_provider == "claude":
                 anthropic_client = server._get_anthropic_client()
-            elif server.LLM_PROVIDER == "gemini":
+            elif self._llm_provider == "gemini":
                 gemini_client = server._get_gemini_client()
             else:
                 openai_client = server._get_client()
@@ -185,6 +190,8 @@ class KavyaSmartPBXSession:
                 openai_client=openai_client,
                 gemini_client=gemini_client,
                 media_transport=self._transport,
+                llm_provider=self._llm_provider,
+                model=self._model,
             )
         if self._stt_factory is None:
             self._stt_factory = server._make_stt
