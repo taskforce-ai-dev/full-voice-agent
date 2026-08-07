@@ -1,0 +1,116 @@
+name: Build Kavya image (no deploy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to check out and build
+        required: true
+        type: string
+      expected_sha:
+        description: Exact 40-character reviewed commit SHA
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.verify.outputs.digest }}
+      tag: ${{ steps.identity.outputs.tag }}
+      revision: ${{ steps.identity.outputs.actual_sha }}
+    steps:
+      - name: Checkout reviewed ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Validate reviewed checkout
+        id: identity
+        run: |
+          set -euo pipefail
+          expected_sha="${{ inputs.expected_sha }}"
+          if ! [[ $expected_sha =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected_sha must be exactly 40 lowercase hexadecimal characters" >&2
+            exit 1
+          fi
+          actual_sha="$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain)"
+          test "$actual_sha" = "$expected_sha"
+          image="ghcr.io/taskforce-ai-dev/kavya"
+          tag="${image}:${actual_sha::7}"
+          {
+            echo "actual_sha=$actual_sha"
+            echo "image=$image"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse existing immutable tag
+        env:
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "$TAG" >/dev/null 2>&1; then
+            echo "refusing to overwrite immutable image tag" >&2
+            exit 1
+          fi
+
+      - name: Build and push immutable image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: Kavya
+          file: Kavya/Dockerfile
+          push: true
+          tags: ${{ steps.identity.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ steps.identity.outputs.actual_sha }}
+
+      - name: Verify pushed digest and revision
+        id: verify
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ACTUAL_SHA: ${{ steps.identity.outputs.actual_sha }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_ref="${IMAGE}@${DIGEST}"
+          docker pull "$image_ref"
+          actual_revision="$(docker image inspect "$image_ref" --format "{{ index .Config.Labels \"org.opencontainers.image.revision\" }}")"
+          test -n "$actual_revision"
+          test "$actual_revision" = "$EXPECTED_SHA"
+          test "$actual_revision" = "$ACTUAL_SHA"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Write safe build summary
+        if: ${{ always() }}
+        env:
+          REVISION: ${{ steps.identity.outputs.actual_sha }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          DIGEST: ${{ steps.verify.outputs.digest }}
+          RUN_ID: ${{ github.run_id }}
+          STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## Kavya image build"
+            echo "- revision: ${REVISION:-unavailable}"
+            echo "- tag: ${TAG:-unavailable}"
+            echo "- digest: ${DIGEST:-unavailable}"
+            echo "- run_id: $RUN_ID"
+            echo "- status: $STATUS"
+          } >> "$GITHUB_STEP_SUMMARY"
