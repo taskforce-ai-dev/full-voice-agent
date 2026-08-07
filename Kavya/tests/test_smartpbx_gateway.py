@@ -733,3 +733,55 @@ async def test_gateway_never_leaks_raw_or_derived_values_in_any_log_record(monke
         await invoke()
     fixed_diagnostics(caplog)
     assert all(value not in caplog.text for value in sentinels)
+
+
+class _BlockingCloseWebSocket(FakeWebSocket):
+    def __init__(self, messages):
+        super().__init__(messages)
+        self.close_attempts = 0
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def close(self, code=1000, reason=""):
+        self.close_attempts += 1
+        self.close_calls.append((code, reason))
+        self.close_started.set()
+        await self.release_close.wait()
+
+
+@pytest.mark.asyncio
+async def test_gateway_cancellation_during_blocking_close_reraises_and_disables_sink(caplog):
+    registry = SmartPBXSessionRegistry(4)
+    socket = _BlockingCloseWebSocket([START, {"event": "stop"}])
+    factory = Factory()
+    caplog.set_level(logging.INFO)
+    task = asyncio.create_task(SmartPBXGateway(settings(), registry).handle(socket, factory))
+    try:
+        await asyncio.wait_for(socket.close_started.wait(), timeout=.2)
+        task.cancel()
+        socket.release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert socket.close_attempts == 1
+        assert socket.close_calls == [(1000, "call ended")]
+        assert factory.sessions[0].finishes == [True]
+        assert registry.snapshot()["released_total"] == 1
+        assert [(record["stage"], record["outcome"], record["failure_class"]) for record in fixed_diagnostics(caplog)] == [
+            ("session_start", "completed", "none"),
+            ("terminal_cleanup", "cancelled", "cancelled"),
+        ]
+        sink = factory.sinks[0]
+        before_records = len(caplog.records)
+        before_text = caplog.text
+        sink(
+            DiagnosticStage.TERMINAL_CLEANUP,
+            DiagnosticOutcome.COMPLETED,
+            DiagnosticFailureClass.NONE,
+        )
+        assert len(caplog.records) == before_records
+        assert caplog.text == before_text
+    finally:
+        socket.release_close.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

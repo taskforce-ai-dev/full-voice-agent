@@ -774,3 +774,44 @@ async def test_explicit_diagnostic_sink_reaches_pipeline_before_welcome_by_ident
         assert pipeline.sinks_seen_at_speak == [explicit_sink]
     finally:
         await session.finish(False)
+
+
+@pytest.mark.asyncio
+async def test_explicit_falsey_diagnostic_sink_is_preserved_and_used_before_welcome():
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    class FalseySink:
+        def __init__(self):
+            self.calls = []
+
+        def __bool__(self):
+            return False
+
+        def __call__(self, stage, outcome, failure_class):
+            self.calls.append((stage, outcome, failure_class))
+
+    async def process_post_call(**_metadata):
+        pass
+
+    explicit_sink = FalseySink()
+    pipeline = SinkObservingPipeline()
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), pipeline=pipeline, stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=process_post_call, welcome_text="Welcome to Hatton Hills.",
+        llm_provider="claude", model="test-model", diagnostic_sink=explicit_sink,
+    )
+    await session.start()
+    try:
+        assert pipeline.sinks_seen_at_speak == [explicit_sink]
+        pipeline._smartpbx_diagnostic_sink(
+            DiagnosticStage.SESSION_START,
+            DiagnosticOutcome.COMPLETED,
+            DiagnosticFailureClass.NONE,
+        )
+        assert explicit_sink.calls == [(
+            DiagnosticStage.SESSION_START,
+            DiagnosticOutcome.COMPLETED,
+            DiagnosticFailureClass.NONE,
+        )]
+    finally:
+        await session.finish(False)
