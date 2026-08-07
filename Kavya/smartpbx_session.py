@@ -174,6 +174,8 @@ class KavyaSmartPBXSession:
             self._llm_provider = server.LLM_PROVIDER
         if self._model is None:
             self._model = server.MODEL
+        if self._llm_provider not in {"claude", "gemini", "openai"}:
+            raise ValueError(f"invalid LLM provider: {self._llm_provider}")
 
         if self._pipeline is None:
             anthropic_client = openai_client = gemini_client = None
@@ -199,10 +201,6 @@ class KavyaSmartPBXSession:
             self._post_call_processor = server.process_post_call_data
         if self._welcome_text is None:
             self._welcome_text = server.LANGUAGE_CONFIGS["en"]["welcome_greeting"]
-        if self._llm_provider is None:
-            self._llm_provider = server.LLM_PROVIDER
-        if self._model is None:
-            self._model = server.MODEL
 
     def _require_pipeline(self) -> Any:
         if self._pipeline is None:
