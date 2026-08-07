@@ -262,3 +262,34 @@ def test_yanolja_credentials_are_blank_and_smartpbx_chroma_state_is_ignored():
     assert "-d '{\"username\":" not in pms_runbook
     assert "chroma_db_smartpbx/" in root_ignore
     assert "chroma_db_smartpbx/" in kavya_ignore
+
+
+def test_canonical_voice_configuration_covers_both_kavya_services_and_stays_disabled():
+    example = read_text(".env.example")
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    legacy = compose["services"]["kavya"]
+    smartpbx = compose["services"]["kavya-smartpbx"]
+    environment = smartpbx["environment"]
+
+    assert re.search(r"^KAVYA_EN_ELEVENLABS_VOICE_ID=$", example, re.MULTILINE)
+    assert re.search(r"^KAVYA_EN_ELEVENLABS_VOICE_ID=.+$", example, re.MULTILINE) is None
+    assert legacy["env_file"] == [".env"]
+    assert environment["KAVYA_EN_ELEVENLABS_VOICE_ID"] == "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
+    assert environment["SMARTPBX_API_KEY"] == "${SMARTPBX_API_KEY}"
+    assert environment["SMARTPBX_MCP_ACCOUNT_HEADER"] == "${SMARTPBX_MCP_ACCOUNT_HEADER}"
+    assert environment["SMARTPBX_TRANSFER_DESTINATIONS_JSON"] == "${SMARTPBX_TRANSFER_DESTINATIONS_JSON}"
+    assert re.search(r"^SMARTPBX_API_KEY=$", example, re.MULTILINE)
+    assert re.search(r"^SMARTPBX_MCP_ACCOUNT_HEADER=$", example, re.MULTILINE)
+    assert re.search(r"^SMARTPBX_TRANSFER_DESTINATIONS_JSON=\{\}$", example, re.MULTILINE)
+    for required in (
+        "## Canonical English voice provisioning",
+        "sudo chown root:root /opt/kavya/.env /opt/kavya/.env.smartpbx",
+        "sudo chmod 600 /opt/kavya/.env /opt/kavya/.env.smartpbx",
+        "sudo /opt/kavya/scripts/validate_english_voice_env.sh /opt/kavya/.env /opt/kavya/.env.smartpbx",
+        "canonical_voice_match=ok",
+        "SMARTPBX_TRANSFER_DESTINATIONS_JSON={}",
+        "transfer-disabled",
+    ):
+        assert required in runbook
+    assert "sha" + "256sum" not in runbook
