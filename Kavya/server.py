@@ -3139,7 +3139,10 @@ class MediaStreamSession:
                             if tc_delta.function.arguments:
                                 tool_calls_data[idx]["arguments"] += tc_delta.function.arguments
 
-            full_text = _join_turn(full_text, text_content)
+            if self._is_direct_smartpbx_english():
+                full_text = _join_turn(full_text, text_content)
+            else:
+                full_text += text_content
 
             if tool_calls_data:
                 tool_list = list(tool_calls_data.values())
@@ -3299,7 +3302,10 @@ class MediaStreamSession:
             else:
                 logger.info("Gemini round %d [%s] — text=%d chars, tools=%d, finish=%s", round_idx + 1, self.call_sid, len(text_content), len(function_calls), finish_reason)
 
-            full_text = _join_turn(full_text, text_content)
+            if self._is_direct_smartpbx_english():
+                full_text = _join_turn(full_text, text_content)
+            else:
+                full_text += text_content
 
             if function_calls:
                 if self._is_smartpbx_session():
@@ -3472,7 +3478,10 @@ class MediaStreamSession:
                             cur_tool_id = None
                             tool_json = ""
 
-            full_text = _join_turn(full_text, text_content)
+            if self._is_direct_smartpbx_english():
+                full_text = _join_turn(full_text, text_content)
+            else:
+                full_text += text_content
 
             if tool_use_blocks:
                 if self._is_smartpbx_session():
