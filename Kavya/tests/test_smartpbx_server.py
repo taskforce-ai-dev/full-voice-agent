@@ -27,6 +27,18 @@ class FakeTransport:
         self.marks.append(name)
 
 
+class BlockingMarkTransport(FakeTransport):
+    def __init__(self):
+        super().__init__()
+        self.mark_entered = asyncio.Event()
+        self.release_mark = asyncio.Event()
+
+    async def send_mark(self, name):
+        self.marks.append(name)
+        self.mark_entered.set()
+        await self.release_mark.wait()
+
+
 class FakeSTT:
     def __init__(self):
         self.starts = 0
@@ -1747,3 +1759,145 @@ async def test_retained_non_english_multiround_transcript_preserves_legacy_conca
     await pipeline._process_utterance_bound("safe guest turn")
 
     assert pipeline.full_transcript[-1] == {"role": "assistant", "text": "Preamble.Recovery."}
+
+
+@pytest.mark.asyncio
+async def test_direct_tts_done_bargein_during_mark_does_not_rearm_reprompt():
+    import server
+
+    transport = BlockingMarkTransport()
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=transport)
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._is_speaking = True
+    starting_generation = pipeline._speak_generation
+    completion = asyncio.create_task(pipeline._send_tts_done())
+
+    try:
+        await asyncio.wait_for(transport.mark_entered.wait(), timeout=1)
+        await pipeline._handle_bargein()
+        assert pipeline._speak_generation == starting_generation + 1
+        assert transport.clears == 1
+
+        transport.release_mark.set()
+        await asyncio.wait_for(completion, timeout=1)
+
+        assert transport.marks == ["tts_done"]
+        assert pipeline._reprompt_task is None
+        assert pipeline._is_speaking is False
+    finally:
+        transport.release_mark.set()
+        await asyncio.gather(completion, return_exceptions=True)
+        pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_direct_tts_done_transfer_during_mark_does_not_rearm_reprompt():
+    import server
+
+    transport = BlockingMarkTransport()
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=transport)
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._is_speaking = True
+    completion = asyncio.create_task(pipeline._send_tts_done())
+
+    try:
+        await asyncio.wait_for(transport.mark_entered.wait(), timeout=1)
+        await pipeline.enter_transfer_pending()
+        assert transport.clears == 1
+
+        transport.release_mark.set()
+        await asyncio.wait_for(completion, timeout=1)
+
+        assert transport.marks == ["tts_done"]
+        assert pipeline.transfer_pending is True
+        assert pipeline._reprompt_task is None
+        assert pipeline._is_speaking is False
+    finally:
+        transport.release_mark.set()
+        await asyncio.gather(completion, return_exceptions=True)
+        pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_direct_bargein_rejects_stale_generation_but_allows_current_generation():
+    import server
+
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=transport)
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._is_speaking = True
+    old_generation = pipeline._speak_generation
+    spoken = []
+
+    async def tts(text):
+        spoken.append(text)
+
+    pipeline._tts_elevenlabs = tts
+    await pipeline._handle_bargein()
+    await pipeline._speak("stale", generation=old_generation)
+    await pipeline._speak("current", generation=pipeline._speak_generation)
+
+    assert transport.clears == 1
+    assert spoken == ["current"]
+
+
+@pytest.mark.asyncio
+async def test_direct_reprompt_lifecycle_replaces_cancels_resets_and_suppresses_transfer(monkeypatch):
+    import server
+
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._event_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(server, "SILENCE_REPROMPT_DELAY", 0)
+    monkeypatch.setattr(server, "MAX_REPROMPTS", 1)
+    nudged = asyncio.Event()
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+        nudged.set()
+
+    pipeline._speak = speak
+    await pipeline._send_tts_done()
+    await asyncio.wait_for(nudged.wait(), timeout=1)
+    assert len(spoken) == 1
+    assert pipeline._reprompt_count == 1
+
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+
+    async def wait_for_reprompt():
+        started.set()
+        await blocker.wait()
+
+    pipeline._reprompt_after_silence = wait_for_reprompt
+    pipeline._schedule_reprompt()
+    await asyncio.wait_for(started.wait(), timeout=1)
+    first = pipeline._reprompt_task
+    pipeline._schedule_reprompt()
+    second = pipeline._reprompt_task
+    await asyncio.gather(first, return_exceptions=True)
+    assert first is not second
+    assert first.cancelled()
+
+    pipeline._reprompt_count = 1
+    await pipeline._accumulate_transcript("final caller speech")
+    await asyncio.gather(second, return_exceptions=True)
+    assert pipeline._reprompt_task is None
+    assert pipeline._reprompt_count == 0
+
+    pipeline._schedule_reprompt()
+    third = pipeline._reprompt_task
+    pipeline._reprompt_count = 1
+    await pipeline._set_transcript_interim("interim caller speech")
+    await asyncio.gather(third, return_exceptions=True)
+    assert pipeline._reprompt_task is None
+    assert pipeline._reprompt_count == 0
+
+    pipeline.transfer_pending = True
+    pipeline._schedule_reprompt()
+    assert pipeline._reprompt_task is None
+    if pipeline._endpointing_handle:
+        pipeline._endpointing_handle.cancel()
+        pipeline._endpointing_handle = None
+    blocker.set()
