@@ -63,3 +63,20 @@ def test_blank_or_missing_value_fails_without_success_marker(tmp_path, value):
     assert result.returncode != 0
     assert "canonical_voice_match=ok" not in result.stdout + result.stderr
     assert "present-placeholder" not in result.stdout + result.stderr
+
+
+def test_duplicate_assignment_fails_without_echoing_either_value(tmp_path):
+    first = tmp_path / "first.env"
+    second = tmp_path / "second.env"
+    first.write_text(
+        f"{KEY}=duplicate-first-sentinel\n{KEY}=duplicate-second-sentinel\n",
+        encoding="utf-8",
+    )
+    write_environment(second, "duplicate-first-sentinel")
+
+    result = run_validator(first, second)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "duplicate-first-sentinel" not in combined
+    assert "duplicate-second-sentinel" not in combined
