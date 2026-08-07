@@ -490,6 +490,7 @@ def test_build_kavya_image_publisher_summary_is_limited_to_safe_build_identity()
 
 
 KAVYA_IMAGE_TAG_PROBE = PROJECT_ROOT.parent / ".github/scripts/check-kavya-image-tag.sh"
+KAVYA_IMAGE_TARGET = "ghcr.io/taskforce-ai-dev/kavya:deadbee"
 
 
 def workflow_run_strings(value):
@@ -511,8 +512,13 @@ def run_kavya_image_tag_probe(tmp_path, docker_exit, docker_output):
     fake_docker = fake_bin / "docker"
     fake_docker.write_text(
         "#!/usr/bin/env bash\n"
-        'echo "$DOCKER_OUTPUT" >&2\n'
-        'exit "$DOCKER_EXIT"\n',
+        "set -euo pipefail\n"
+        "if [[ \"$1\" != \"buildx\" || \"$2\" != \"imagetools\" || \"$3\" != \"inspect\" || \"$4\" != \"$EXPECTED_TARGET\" ]]; then\n"
+        "  echo unexpected-docker-invocation >&2\n"
+        "  exit 99\n"
+        "fi\n"
+        "echo \"$DOCKER_OUTPUT\" >&2\n"
+        "exit \"$DOCKER_EXIT\"\n",
         encoding="utf-8",
     )
     fake_docker.chmod(0o755)
@@ -520,9 +526,10 @@ def run_kavya_image_tag_probe(tmp_path, docker_exit, docker_output):
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "DOCKER_EXIT": str(docker_exit),
         "DOCKER_OUTPUT": docker_output,
+        "EXPECTED_TARGET": KAVYA_IMAGE_TARGET,
     }
     return subprocess.run(
-        [str(KAVYA_IMAGE_TAG_PROBE), "ghcr.io/taskforce-ai-dev/kavya:deadbee"],
+        [str(KAVYA_IMAGE_TAG_PROBE), KAVYA_IMAGE_TARGET],
         env=environment,
         text=True,
         capture_output=True,
@@ -554,36 +561,49 @@ def test_build_kavya_image_publisher_uses_static_concurrency_and_env_only_input_
 def test_build_kavya_image_publisher_probes_registry_before_build_with_an_executable_script():
     _document, _job, steps, text = build_kavya_image_job()
 
+    buildx = workflow_step(steps, "Set up Buildx")
     login = workflow_step(steps, "Log in to GHCR")
     probe = workflow_step(steps, "Probe immutable tag")
     build = workflow_step(steps, "Build and push immutable image")
 
     assert KAVYA_IMAGE_TAG_PROBE.is_file()
+    probe_script = KAVYA_IMAGE_TAG_PROBE.read_text(encoding="utf-8")
+    assert "docker buildx imagetools inspect \"$TAG\"" in probe_script
+    assert "docker manifest inspect" not in probe_script
     assert os.access(KAVYA_IMAGE_TAG_PROBE, os.X_OK)
     assert "bash .publisher/.github/scripts/check-kavya-image-tag.sh \"$TAG\"" in probe["run"]
     assert "source/.github/scripts" not in probe["run"]
     assert not re.search(r"(?:bash|sh)\s+source/.github/scripts/", text)
-    assert steps.index(login) < steps.index(probe) < steps.index(build)
+    assert steps.index(buildx) < steps.index(login) < steps.index(probe) < steps.index(build)
 
 
 @pytest.mark.parametrize(
     ("docker_exit", "docker_output", "expected_exit", "expected_state"),
     [
-        (0, "already present", 10, "existing"),
-        (1, "manifest unknown", 0, "absent"),
-        (1, "no such manifest", 0, "absent"),
-        (1, "authentication required: manifest unknown", 1, "probe_failed"),
-        (1, "token expired: no such manifest", 1, "probe_failed"),
-        (1, "proxy returned 404", 1, "probe_failed"),
-        (1, "denied: manifest unknown", 1, "probe_failed"),
-        (1, "timeout: manifest unknown", 1, "probe_failed"),
-        (1, "500 internal server error: no such manifest", 1, "probe_failed"),
+        (
+            0,
+            "Name: ghcr.io/taskforce-ai-dev/kavya:deadbee\nMediaType: application/vnd.oci.image.index.v1+json\nManifests: linux/amd64, linux/arm64, provenance",
+            10,
+            "existing",
+        ),
+        (1, f"manifest unknown: {KAVYA_IMAGE_TARGET}", 0, "absent"),
+        (1, f"no such manifest: {KAVYA_IMAGE_TARGET}", 0, "absent"),
+        (1, f"failed to resolve source metadata for {KAVYA_IMAGE_TARGET}: not found", 0, "absent"),
+        (1, f"denied: manifest unknown: {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
+        (1, f"authentication required: no such manifest: {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
+        (1, f"token expired: {KAVYA_IMAGE_TARGET}: not found", 1, "probe_failed"),
+        (1, f"proxy returned 404 for {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
+        (1, f"timeout: manifest unknown: {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
+        (1, f"dial tcp: lookup registry: no such host: {KAVYA_IMAGE_TARGET}: not found", 1, "probe_failed"),
+        (1, f"429 rate limit: no such manifest: {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
+        (1, f"500 internal server error: {KAVYA_IMAGE_TARGET}: not found", 1, "probe_failed"),
+        (1, "manifest unknown", 1, "probe_failed"),
+        (1, "no such manifest", 1, "probe_failed"),
+        (1, "not found", 1, "probe_failed"),
+        (1, "no such manifest: ghcr.io/taskforce-ai-dev/kavya:othertag", 1, "probe_failed"),
+        (1, "failed to resolve source metadata for ghcr.io/taskforce-ai-dev/kavya:othertag: not found", 1, "probe_failed"),
         (1, "registry returned 404", 1, "probe_failed"),
-        (1, "denied: requested access", 1, "probe_failed"),
-        (1, "dial tcp: lookup registry: no such host", 1, "probe_failed"),
-        (1, "429 rate limit", 1, "probe_failed"),
-        (1, "500 internal server error", 1, "probe_failed"),
-        (1, "unexpected registry response", 1, "probe_failed"),
+        (1, "malformed registry response", 1, "probe_failed"),
     ],
 )
 def test_kavya_image_tag_probe_fails_closed_without_echoing_registry_errors(
