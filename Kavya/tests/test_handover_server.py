@@ -252,7 +252,7 @@ async def test_fallback_skips_when_there_is_nothing_actionable():
 
 def test_relay_twiml_has_no_mode_param_for_normal_calls():
     tag = server._build_conversation_relay_twiml(
-        "voice.taskforceai.tech", "en", server.LANGUAGE_CONFIGS["en"],
+        "voice.taskforceai.tech", "en", server.conversation_relay_config("en"),
     )
     assert "mode=" not in tag
     assert "?lang=en" in tag
@@ -264,3 +264,16 @@ def test_normal_call_offers_transfer_but_not_notify():
     names = {t["name"] for t in TOOL_DEFINITIONS}
     assert "transfer_to_human" in names
     assert "notify_human_handover" not in names
+
+
+
+def test_handover_recovery_uses_canonical_english_profile(client, monkeypatch):
+    from english_voice_profile import load_kavya_english_voice_profile
+
+    profile = load_kavya_english_voice_profile(
+        {"KAVYA_EN_ELEVENLABS_VOICE_ID": "unit-test-canonical-voice"}
+    )
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    response = _dial_result(client, "no-answer")
+    assert response.status_code == 200
+    assert 'voice="unit-test-canonical-voice-flash_v2_5"' in response.text

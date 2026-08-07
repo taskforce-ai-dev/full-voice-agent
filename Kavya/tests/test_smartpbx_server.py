@@ -77,6 +77,85 @@ class FakePipeline:
         self.spoken.append(text)
 
 
+class CapturingTTSResponse:
+    status_code = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return False
+
+    async def aread(self):
+        return b""
+
+    async def aiter_bytes(self, chunk_size):
+        assert chunk_size == 640
+        yield b"ulaw-frame"
+
+
+class CapturingTTSClient:
+    def __init__(self):
+        self.requests = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def stream(self, method, url, *, json, headers, timeout):
+        self.requests.append({"method": method, "url": url, "json": json, "headers": headers, "timeout": timeout})
+        return CapturingTTSResponse()
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_uses_profile_without_general_voice(monkeypatch):
+    import server
+    from english_voice_profile import load_kavya_english_voice_profile
+
+    client = CapturingTTSClient()
+    profile = load_kavya_english_voice_profile({"KAVYA_EN_ELEVENLABS_VOICE_ID": "unit-test-canonical-voice"})
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "unit-test-api-key")
+    monkeypatch.setattr(server, "ELEVENLABS_VOICE_ID", "")
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    await pipeline._tts_elevenlabs("Hello from Kavya.")
+    request = client.requests[0]
+    assert request["url"] == "https://api.elevenlabs.io/v1/text-to-speech/unit-test-canonical-voice/stream?output_format=ulaw_8000"
+    assert request["json"] == {"text": "Hello from Kavya.", "model_id": "eleven_flash_v2_5", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}}
+    assert "output_format" not in request["json"]
+    assert "mp3" not in request["url"]
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_fails_closed_when_profile_is_unavailable(monkeypatch):
+    import server
+
+    client = CapturingTTSClient()
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "unit-test-api-key")
+    monkeypatch.setattr(server, "ELEVENLABS_VOICE_ID", "unit-test-general-voice")
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: (_ for _ in ()).throw(ValueError("KAVYA_EN_ELEVENLABS_VOICE_ID must be configured")))
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    await pipeline._tts_elevenlabs("Hello from Kavya.")
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_retained_non_english_tts_still_requires_general_voice(monkeypatch):
+    import server
+
+    client = CapturingTTSClient()
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "unit-test-api-key")
+    monkeypatch.setattr(server, "ELEVENLABS_VOICE_ID", "")
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = server.MediaStreamSession(websocket=None, lang="ta", media_transport=FakeTransport())
+    await pipeline._tts_elevenlabs("vanakkam")
+    assert client.requests == []
+
+
 def context(**overrides):
     values = {
         "call_id": "dialog-media-leg",

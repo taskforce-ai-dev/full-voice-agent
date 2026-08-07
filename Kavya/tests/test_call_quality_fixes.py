@@ -222,7 +222,7 @@ def test_english_conversationrelay_carries_digit_shorthand_hints():
     emits those words and Kavya can expand them live. Without the hint,
     "double seven" is garbled and she never receives the word "double"."""
     twiml = server._build_conversation_relay_twiml(
-        "host", "en", server.LANGUAGE_CONFIGS["en"])
+        "host", "en", server.conversation_relay_config("en"))
     assert 'hints="' in twiml
     for token in ("double", "triple", "oh", "seven"):
         assert token in twiml, f"hint vocabulary missing {token!r}"
@@ -231,9 +231,24 @@ def test_english_conversationrelay_carries_digit_shorthand_hints():
 def test_transcription_language_is_off_by_default():
     """transcriptionLanguage is emitted ONLY when CR_TRANSCRIPTION_LANGUAGE is
     set (the en-IN A/B); the default must keep the unchanged en-US behaviour."""
-    cfg = dict(server.LANGUAGE_CONFIGS["en"], transcription_language="")
+    cfg = dict(server.conversation_relay_config("en"), transcription_language="")
     twiml = server._build_conversation_relay_twiml("host", "en", cfg)
     assert "transcriptionLanguage=" not in twiml
-    cfg_in = dict(server.LANGUAGE_CONFIGS["en"], transcription_language="en-IN")
+    cfg_in = dict(server.conversation_relay_config("en"), transcription_language="en-IN")
     assert 'transcriptionLanguage="en-IN"' in server._build_conversation_relay_twiml(
         "host", "en", cfg_in)
+
+
+
+def test_normal_english_conversationrelay_uses_canonical_profile(client, monkeypatch):
+    from english_voice_profile import load_kavya_english_voice_profile
+
+    profile = load_kavya_english_voice_profile(
+        {"KAVYA_EN_ELEVENLABS_VOICE_ID": "unit-test-canonical-voice"}
+    )
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    incoming = client.post("/voice/incoming", headers={"host": "voice.example.test"})
+    selected = client.post("/voice/language-selected", data={"Digits": "1"}, headers={"host": "voice.example.test"})
+    for response in (incoming, selected):
+        assert response.status_code == 200
+        assert 'voice="unit-test-canonical-voice-flash_v2_5"' in response.text
