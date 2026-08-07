@@ -79,6 +79,7 @@ OPENAI_TTS_MODEL=gpt-4o-mini-tts
 OPENAI_TTS_VOICE=nova
 OPENAI_TTS_INSTRUCTIONS=
 ELEVENLABS_API_KEY=
+KAVYA_EN_ELEVENLABS_VOICE_ID=
 ELEVENLABS_VOICE_ID=
 ELEVENLABS_VOICE_ID_AR=
 STT_PROVIDER=azure
@@ -114,6 +115,25 @@ SMARTPBX_MCP_READ_TIMEOUT_SECONDS=15
 SMARTPBX_MCP_MAX_RESPONSE_BYTES=1048576
 SMARTPBX_MCP_RETRIES=1
 ```
+
+## Canonical English voice provisioning
+
+Retrieve Kavya's established English voice identity only from the approved root-only secret source. Do not copy it from source code, a log, the dashboard, or this runbook. Do not rotate `ELEVENLABS_API_KEY` or alter `ELEVENLABS_VOICE_ID`. Set the same protected value in both files with `sudoedit`; never place it in a command argument, commit, ticket, or screen share.
+
+```sh
+set -euo pipefail
+cd /opt/kavya
+sudo test -f /opt/kavya/.env
+sudo touch /opt/kavya/.env.smartpbx
+sudo chown root:root /opt/kavya/.env /opt/kavya/.env.smartpbx
+sudo chmod 600 /opt/kavya/.env /opt/kavya/.env.smartpbx
+sudoedit /opt/kavya/.env
+sudoedit /opt/kavya/.env.smartpbx
+sudo /opt/kavya/scripts/validate_english_voice_env.sh /opt/kavya/.env /opt/kavya/.env.smartpbx
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
+```
+
+`canonical_voice_match=ok` proves only that both root-only files contain an equal nonblank protected value; it does not print the value. The configuration check prints no secrets. This preflight does not start, stop, recreate, or reroute any service, and it preserves `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` with MCP transfer-disabled. If either command fails, do not run a Compose `up`; leave containers unchanged, restore both files to their prior root-only state with `sudoedit`, and rerun the preflight before any later approved deployment.
 
 Kavya accepts `SMARTPBX_MCP_ACCOUNT_HEADER=account_id` and
 `SMARTPBX_MCP_ACCOUNT_HEADER=X-Account-ID`; Dialog must approve exactly one.
