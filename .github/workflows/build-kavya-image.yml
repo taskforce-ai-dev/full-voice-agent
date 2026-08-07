@@ -12,6 +12,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: kavya-image-publisher
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,14 +31,17 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
 
       - name: Validate reviewed checkout
         id: identity
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
         run: |
           set -euo pipefail
-          expected_sha="${{ inputs.expected_sha }}"
+          expected_sha="$EXPECTED_SHA"
           if ! [[ $expected_sha =~ ^[0-9a-f]{40}$ ]]; then
-            echo "expected_sha must be exactly 40 lowercase hexadecimal characters" >&2
+            echo "expected SHA format is invalid" >&2
             exit 1
           fi
           actual_sha="$(git rev-parse HEAD)"
@@ -58,18 +65,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Refuse existing immutable tag
+      - name: Probe immutable tag
+        id: probe
         env:
           TAG: ${{ steps.identity.outputs.tag }}
         run: |
           set -euo pipefail
-          if docker manifest inspect "$TAG" >/dev/null 2>&1; then
-            echo "refusing to overwrite immutable image tag" >&2
-            exit 1
-          fi
+          set +e
+          bash .github/scripts/check-kavya-image-tag.sh "$TAG" >/dev/null
+          probe_code=$?
+          set -e
+          case "$probe_code" in
+            0) mode=absent ;;
+            10) mode=existing ;;
+            *) echo "registry tag probe failed" >&2; exit 1 ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
+      # The external GHCR package must remain single-writer; deployment consumes
+      # only the verified digest emitted by this build-only workflow.
       - name: Build and push immutable image
         id: build
+        if: ${{ steps.probe.outputs.mode == 'absent' }}
         uses: docker/build-push-action@v7
         with:
           context: Kavya
@@ -78,16 +95,33 @@ jobs:
           tags: ${{ steps.identity.outputs.tag }}
           labels: org.opencontainers.image.revision=${{ steps.identity.outputs.actual_sha }}
 
+      - name: Resolve image digest
+        id: digest
+        env:
+          MODE: ${{ steps.probe.outputs.mode }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            absent) digest="$BUILT_DIGEST" ;;
+            existing)
+              digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Digest}}" 2>/dev/null)"
+              ;;
+            *) echo "unrecognized image mode" >&2; exit 1 ;;
+          esac
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
       - name: Verify pushed digest and revision
         id: verify
         env:
           IMAGE: ${{ steps.identity.outputs.image }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           ACTUAL_SHA: ${{ steps.identity.outputs.actual_sha }}
         run: |
           set -euo pipefail
-          test -n "$DIGEST"
           [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]
           image_ref="${IMAGE}@${DIGEST}"
           docker pull "$image_ref"
