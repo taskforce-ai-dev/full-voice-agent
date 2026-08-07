@@ -1,6 +1,7 @@
 """Kavya SmartPBX media-session and service-mode contract tests."""
 
 import asyncio
+import json
 import logging
 from types import SimpleNamespace
 
@@ -1449,3 +1450,275 @@ async def test_smartpbx_fully_injected_invalid_provider_fails_before_any_start_s
     assert pipeline._stt is None
     assert pipeline.spoken == []
     assert getattr(pipeline, "_smartpbx_transfer_context", None) is None
+
+
+async def _direct_tool_event_stream(events):
+    for event in events:
+        yield event
+
+
+class DirectToolOpenAI:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.chat = SimpleNamespace(completions=self)
+
+    async def create(self, **kwargs):
+        self.requests.append(kwargs)
+        return _direct_tool_event_stream(self.rounds.pop(0))
+
+
+class DirectToolGeminiModels:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def generate_content_stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        return _direct_tool_event_stream(self.owner.rounds.pop(0))
+
+
+class DirectToolGemini:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.aio = SimpleNamespace(models=DirectToolGeminiModels(self))
+
+
+class DirectToolClaudeStream:
+    def __init__(self, events):
+        self.events = events
+
+    async def __aenter__(self):
+        return _direct_tool_event_stream(self.events)
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class DirectToolClaudeMessages:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        return DirectToolClaudeStream(self.owner.rounds.pop(0))
+
+
+class DirectToolClaude:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.messages = DirectToolClaudeMessages(self)
+
+
+def direct_tool_round(provider, arguments, preamble=None):
+    if provider == "openai":
+        return [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+            content=preamble,
+            tool_calls=[SimpleNamespace(
+                index=0, id="tool-1",
+                function=SimpleNamespace(name="create_booking", arguments=json.dumps(arguments)),
+            )],
+        ))])]
+    if provider == "gemini":
+        parts = []
+        if preamble is not None:
+            parts.append(SimpleNamespace(text=preamble, function_call=None))
+        parts.append(SimpleNamespace(
+            text=None,
+            function_call=SimpleNamespace(name="create_booking", args=arguments),
+        ))
+        return [SimpleNamespace(candidates=[SimpleNamespace(
+            finish_reason=None, content=SimpleNamespace(parts=parts),
+        )])]
+    events = []
+    if preamble is not None:
+        events.append(SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text=preamble),
+        ))
+    events.extend([
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(type="tool_use", id="tool-1", name="create_booking"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json=json.dumps(arguments)),
+        ),
+        SimpleNamespace(type="content_block_stop"),
+    ])
+    return events
+
+
+def direct_text_round(provider, text):
+    if provider == "openai":
+        return [SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(content=text, tool_calls=None),
+        )])]
+    if provider == "gemini":
+        return [SimpleNamespace(candidates=[SimpleNamespace(
+            finish_reason=None,
+            content=SimpleNamespace(parts=[SimpleNamespace(text=text, function_call=None)]),
+        )])]
+    return [SimpleNamespace(
+        type="content_block_delta",
+        delta=SimpleNamespace(type="text_delta", text=text),
+    )]
+
+
+def direct_tool_client(provider, rounds):
+    if provider == "openai":
+        return DirectToolOpenAI(rounds)
+    if provider == "gemini":
+        return DirectToolGemini(rounds)
+    return DirectToolClaude(rounds)
+
+
+def direct_tool_pipeline(server, provider, client, lang="en"):
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang=lang, media_transport=FakeTransport(),
+        anthropic_client=client if provider == "claude" else None,
+        gemini_client=client if provider == "gemini" else None,
+        openai_client=client if provider == "openai" else None,
+        llm_provider=provider, model=f"{provider}-tool-model",
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline.tools = [{"provider": provider}]
+    return pipeline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_direct_english_tool_failure_uses_one_filler_and_opaque_recovery(monkeypatch, caplog, provider):
+    import server
+
+    private_arguments = {"private_tool_argument": "private-tool-argument-sentinel"}
+    private_exception = "private-tool-exception-sentinel"
+    recovery = "Recovery is ready."
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, private_arguments),
+        direct_text_round(provider, recovery),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    spoken = []
+    order = []
+    executions = []
+
+    async def speak(text, generation=-1):
+        spoken.append((text, generation))
+        order.append("filler" if text == server.TOOL_FILLERS["create_booking"] else "speech")
+
+    async def fail_tool(name, arguments):
+        executions.append((name, arguments))
+        order.append("execute")
+        raise RuntimeError(private_exception)
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", fail_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        await pipeline._process_utterance_bound("safe guest turn")
+
+    filler = server.TOOL_FILLERS["create_booking"]
+    assert spoken[0] == (filler, 0)
+    assert sum(text == filler for text, _generation in spoken) == 1
+    assert order.index("filler") < order.index("execute")
+    assert [name for name, _arguments in executions] == ["create_booking"]
+    assert recovery in [text for text, _generation in spoken]
+    second_request = repr(client.requests[1])
+    if provider == "gemini":
+        response = client.requests[1]["contents"][-1]["parts"][0]["function_response"]["response"]
+        assert response == {"error": "tool_execution_failed"}
+    else:
+        assert json.dumps({"error": "tool_execution_failed"}) in second_request
+    for private_value in (private_exception, private_arguments["private_tool_argument"]):
+        assert private_value not in second_request
+        assert private_value not in repr(pipeline.history)
+        assert private_value not in repr(pipeline.full_transcript)
+        assert private_value not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_direct_english_tool_preamble_skips_canned_filler_and_recovers(monkeypatch, provider):
+    import server
+
+    private_arguments = {"private_tool_argument": "private-tool-argument-sentinel"}
+    preamble = "I will take care of that."
+    recovery = "Recovery is ready."
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, private_arguments, preamble=preamble),
+        direct_text_round(provider, recovery),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    spoken = []
+    executions = []
+
+    async def speak(text, generation=-1):
+        spoken.append((text, generation))
+
+    async def fail_tool(name, arguments):
+        executions.append((name, arguments))
+        raise RuntimeError("private-tool-exception-sentinel")
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", fail_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    await pipeline._process_utterance_bound("safe guest turn")
+
+    filler = server.TOOL_FILLERS["create_booking"]
+    assert preamble in [text for text, _generation in spoken]
+    assert filler not in [text for text, _generation in spoken]
+    assert [name for name, _arguments in executions] == ["create_booking"]
+    assert recovery in [text for text, _generation in spoken]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_direct_english_multiround_transcript_joins_text_with_existing_separator(monkeypatch, provider):
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"safe": "value"}, preamble="Preamble."),
+        direct_text_round(provider, "Recovery."),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    async def successful_tool(_name, _arguments):
+        return "ok"
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("safe guest turn")
+
+    assert pipeline.full_transcript[-1] == {"role": "assistant", "text": "Preamble. Recovery."}
+
+
+@pytest.mark.asyncio
+async def test_retained_non_english_direct_tool_uses_existing_media_stream_filler(monkeypatch):
+    import server
+
+    client = direct_tool_client("openai", [
+        direct_tool_round("openai", {"safe": "value"}),
+        direct_text_round("openai", "Recovery."),
+    ])
+    pipeline = direct_tool_pipeline(server, "openai", client, lang="ta")
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append((text, generation))
+
+    async def successful_tool(_name, _arguments):
+        return "ok"
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    await pipeline._process_utterance_bound("safe guest turn")
+
+    assert server.MEDIA_STREAM_FILLERS["ta"]["create_booking"] in [text for text, _generation in spoken]
