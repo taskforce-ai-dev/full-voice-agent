@@ -724,9 +724,9 @@ def test_smartpbx_image_deploy_helper_completes_all_preflights_before_arming_rol
         "verify_candidate_image",
     ):
         assert required in script
-    assert "trap rollback ERR" in script
-    assert script.find("verify_candidate_image") < script.rfind("trap rollback ERR")
-    assert script.find("trap rollback ERR") < script.find("recreate_smartpbx")
+    main_block = script.split("main(){", 1)[1].split("\nif [[", 1)[0]
+    assert "trap rollback ERR" in main_block
+    assert main_block.find("verify_candidate_image") < main_block.find("trap rollback ERR") < main_block.find("recreate_smartpbx")
     assert "ROLLBACK_TAG=" in script
     assert "ROLLBACK_DIGEST=" in script
     assert "ROLLBACK_REVISION=" in script
