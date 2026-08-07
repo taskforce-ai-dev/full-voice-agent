@@ -167,7 +167,7 @@ async def test_diagnostic_disabled_or_prestart_is_a_noop():
 
 **Interfaces:**
 
-- Extend `HandoverPhase` with `OUTCOME_UNKNOWN`; provider ack maps to `ACKNOWLEDGED`, never completed.
+- Extend `HandoverPhase` with `OUTCOME_UNKNOWN`; provider ack maps directly to `OUTCOME_UNKNOWN`, never completed.
 - `record_carrier_outcome(outcome: CarrierTransferOutcome) -> None` is permitted only after Dialog supplies a documented carrier outcome contract; otherwise acknowledged transfer remains `OUTCOME_UNKNOWN` and starts explicit approved failsafe behavior.
 - `DialogMCPCallControl.transfer_call(destination_key: str) -> TransferResult` accepts only the existing operator allowlist key `human_support`; configuration is disabled until one approved destination is root-provisioned.
 
