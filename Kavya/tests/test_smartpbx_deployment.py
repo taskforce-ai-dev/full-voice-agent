@@ -1,8 +1,11 @@
 """Static deployment contracts for the isolated Dialog SmartPBX service."""
 
+import os
 from pathlib import Path
+import subprocess
 import re
 
+import pytest
 import yaml
 
 
@@ -376,7 +379,9 @@ def build_kavya_image_job():
 
 
 def workflow_step(steps, name):
-    return next(step for step in steps if step.get("name") == name)
+    step = next((step for step in steps if step.get("name") == name), None)
+    assert step is not None, f"missing workflow step: {name}"
+    return step
 
 
 def test_build_kavya_image_publisher_is_dispatch_only_and_least_privilege():
@@ -436,13 +441,12 @@ def test_build_kavya_image_publisher_uses_one_immutable_checked_out_tag_and_veri
     _document, job, steps, text = build_kavya_image_job()
 
     identity = workflow_step(steps, "Validate reviewed checkout")
-    absent = workflow_step(steps, "Refuse existing immutable tag")
+    probe = workflow_step(steps, "Probe immutable tag")
     build = workflow_step(steps, "Build and push immutable image")
     verify = workflow_step(steps, "Verify pushed digest and revision")
 
     assert "image=\"ghcr.io/taskforce-ai-dev/kavya\"" in identity["run"]
     assert "tag=\"${image}:${actual_sha::7}\"" in identity["run"]
-    assert "docker manifest inspect \"$TAG\"" in absent["run"]
     assert build["uses"].startswith("docker/build-push-action@")
     assert build["with"]["context"] == "Kavya"
     assert build["with"]["file"] == "Kavya/Dockerfile"
@@ -451,7 +455,7 @@ def test_build_kavya_image_publisher_uses_one_immutable_checked_out_tag_and_veri
     assert build["with"]["labels"] == (
         "org.opencontainers.image.revision=${{ steps.identity.outputs.actual_sha }}"
     )
-    assert "${{ steps.build.outputs.digest }}" in verify["env"]["DIGEST"]
+    assert "${{ steps.digest.outputs.digest }}" in verify["env"]["DIGEST"]
     assert "image_ref=\"${IMAGE}@${DIGEST}\"" in verify["run"]
     assert "docker pull \"$image_ref\"" in verify["run"]
     assert "docker image inspect \"$image_ref\"" in verify["run"]
@@ -470,3 +474,122 @@ def test_build_kavya_image_publisher_summary_is_limited_to_safe_build_identity()
         assert safe_field in summary["run"]
     for forbidden in ("expected_sha", "secrets", "github.actor", "ref"):
         assert forbidden not in summary["run"]
+
+
+KAVYA_IMAGE_TAG_PROBE = PROJECT_ROOT.parent / ".github/scripts/check-kavya-image-tag.sh"
+
+
+def workflow_run_strings(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "run" and isinstance(child, str):
+                yield child
+            yield from workflow_run_strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from workflow_run_strings(child)
+
+
+def run_kavya_image_tag_probe(tmp_path, docker_exit, docker_output):
+    assert KAVYA_IMAGE_TAG_PROBE.is_file(), "missing executable Kavya image tag probe"
+    assert os.access(KAVYA_IMAGE_TAG_PROBE, os.X_OK)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "$DOCKER_OUTPUT" >&2\n'
+        'exit "$DOCKER_EXIT"\n',
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    environment = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DOCKER_EXIT": str(docker_exit),
+        "DOCKER_OUTPUT": docker_output,
+    }
+    return subprocess.run(
+        [str(KAVYA_IMAGE_TAG_PROBE), "ghcr.io/taskforce-ai-dev/kavya:deadbee"],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_build_kavya_image_publisher_uses_static_concurrency_and_env_only_input_flow():
+    document, _job, steps, _text = build_kavya_image_job()
+
+    checkout = workflow_step(steps, "Checkout reviewed ref")
+    validation = workflow_step(steps, "Validate reviewed checkout")
+    assert "concurrency" in document
+    concurrency = document["concurrency"]
+
+    assert checkout["with"]["persist-credentials"] == "false"
+    assert concurrency["group"] == "kavya-image-publisher"
+    assert concurrency["cancel-in-progress"] == "false"
+    assert "${{" not in concurrency["group"]
+    assert "env" in validation
+    assert validation["env"] == {"EXPECTED_SHA": "${{ inputs.expected_sha }}"}
+    assert "$EXPECTED_SHA" in validation["run"]
+    assert "${{ inputs." not in validation["run"]
+    assert all("${{ inputs." not in run for run in workflow_run_strings(document))
+
+
+def test_build_kavya_image_publisher_probes_registry_before_build_with_an_executable_script():
+    _document, _job, steps, _text = build_kavya_image_job()
+
+    login = workflow_step(steps, "Log in to GHCR")
+    probe = workflow_step(steps, "Probe immutable tag")
+    build = workflow_step(steps, "Build and push immutable image")
+
+    assert KAVYA_IMAGE_TAG_PROBE.is_file()
+    assert os.access(KAVYA_IMAGE_TAG_PROBE, os.X_OK)
+    assert "bash .github/scripts/check-kavya-image-tag.sh \"$TAG\"" in probe["run"]
+    assert steps.index(login) < steps.index(probe) < steps.index(build)
+
+
+@pytest.mark.parametrize(
+    ("docker_exit", "docker_output", "expected_exit", "expected_state"),
+    [
+        (0, "already present", 10, "existing"),
+        (1, "manifest unknown", 0, "absent"),
+        (1, "no such manifest", 0, "absent"),
+        (1, "denied: requested access", 1, "probe_failed"),
+        (1, "dial tcp: lookup registry: no such host", 1, "probe_failed"),
+        (1, "429 rate limit", 1, "probe_failed"),
+        (1, "500 internal server error", 1, "probe_failed"),
+        (1, "unexpected registry response", 1, "probe_failed"),
+    ],
+)
+def test_kavya_image_tag_probe_fails_closed_without_echoing_registry_errors(
+    tmp_path, docker_exit, docker_output, expected_exit, expected_state
+):
+    result = run_kavya_image_tag_probe(tmp_path, docker_exit, docker_output)
+
+    assert result.returncode == expected_exit
+    assert result.stdout == f"image_tag_state={expected_state}\n"
+    assert docker_output not in result.stdout
+    assert docker_output not in result.stderr
+
+
+def test_build_kavya_image_publisher_verifies_existing_tags_without_overwriting_them():
+    _document, _job, steps, _text = build_kavya_image_job()
+
+    probe = workflow_step(steps, "Probe immutable tag")
+    build = workflow_step(steps, "Build and push immutable image")
+    resolve = workflow_step(steps, "Resolve image digest")
+    verify = workflow_step(steps, "Verify pushed digest and revision")
+
+    assert "mode=existing" in probe["run"]
+    assert "mode=absent" in probe["run"]
+    assert build["if"] == "${{ steps.probe.outputs.mode == 'absent' }}"
+    assert "${{ steps.probe.outputs.mode }}" in resolve["env"]["MODE"]
+    assert "${{ steps.build.outputs.digest }}" in resolve["env"]["BUILT_DIGEST"]
+    assert "docker buildx imagetools inspect \"$TAG\"" in resolve["run"]
+    assert "[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]" in resolve["run"]
+    assert "digest=$digest" in resolve["run"]
+    assert "${{ steps.digest.outputs.digest }}" in verify["env"]["DIGEST"]
+    assert "docker pull \"$image_ref\"" in verify["run"]
+    assert "test \"$actual_revision\" = \"$EXPECTED_SHA\"" in verify["run"]
+    assert "test \"$actual_revision\" = \"$ACTUAL_SHA\"" in verify["run"]
