@@ -15,6 +15,13 @@ from smartpbx_transport import SmartPBXMediaTransport
 PostCallProcessor = Callable[..., Awaitable[None]]
 
 
+def _resolve_llm_provider(provider: str | None, default_provider: str) -> str:
+    resolved_provider = default_provider if provider is None else provider
+    if resolved_provider not in {"claude", "gemini", "openai"}:
+        raise ValueError("invalid LLM provider")
+    return resolved_provider
+
+
 class KavyaSmartPBXSession:
     """Own one Dialog call while reusing Kavya's media-session behavior."""
 
@@ -155,6 +162,11 @@ class KavyaSmartPBXSession:
                 self._terminal_future.set_result(None)
 
     def _load_runtime_defaults(self) -> None:
+        import server
+
+        self._llm_provider = _resolve_llm_provider(
+            self._llm_provider, server.LLM_PROVIDER
+        )
         if all(
             value is not None
             for value in (
@@ -168,14 +180,8 @@ class KavyaSmartPBXSession:
         ):
             return
 
-        import server
-
-        if self._llm_provider is None:
-            self._llm_provider = server.LLM_PROVIDER
         if self._model is None:
             self._model = server.MODEL
-        if self._llm_provider not in {"claude", "gemini", "openai"}:
-            raise ValueError(f"invalid LLM provider: {self._llm_provider}")
 
         if self._pipeline is None:
             anthropic_client = openai_client = gemini_client = None
