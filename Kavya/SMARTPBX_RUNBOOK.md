@@ -275,3 +275,7 @@ curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e '.transfer_enabled == 
    cd /opt/kavya
    SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx stop kavya-smartpbx
    ```
+
+## Guarded immutable image deployment
+
+Use `deploy_smartpbx_image.sh NEW_TAG EXPECTED_SHA EXPECTED_DIGEST` only after an authenticated integration probe; it validates the local baseline before recreating only `kavya-smartpbx`.
