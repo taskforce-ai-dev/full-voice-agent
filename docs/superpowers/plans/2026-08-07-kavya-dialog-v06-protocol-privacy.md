@@ -63,6 +63,7 @@ Exactly ten commits total. Before every commit run git status --short and git di
 
 Final (fail-closed):
     set -euo pipefail
+    cd Kavya
     PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS="-p no:cacheprovider" /home/dev/incoming/taskforce-ai/.venv/bin/python -m pytest tests -q
     /home/dev/incoming/taskforce-ai/.venv/bin/python -B -m py_compile smartpbx_protocol.py smartpbx_diagnostics.py smartpbx_gateway.py smartpbx_session.py server.py
     /home/dev/incoming/taskforce-ai/.venv/bin/python -c 'from pathlib import Path; import yaml; c=yaml.safe_load(Path("docker-compose.yml").read_text()); e=c["services"]["kavya-smartpbx"]["environment"]; assert e["SMARTPBX_TRANSFER_DESTINATIONS_JSON"] == "${SMARTPBX_TRANSFER_DESTINATIONS_JSON}"; assert "SMARTPBX_TRANSFER_DESTINATIONS_JSON" in e'
