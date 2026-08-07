@@ -14,13 +14,12 @@ may temporarily route the sole DID to Kavya for a supervised verification call.
 
 ## Evidence and root cause
 
-The original English route is Twilio ConversationRelay and configures its
-established, hardcoded ElevenLabs voice with the `flash_v2_5` suffix.  The direct
-SmartPBX route instead reads the general ElevenLabs environment voice and uses
-`eleven_multilingual_v2`.  A comparison of non-secret configuration hashes proved
-that the environment was copied correctly; the identities still differ because
-the original path is intentionally hardcoded.  This explains why the corrected
-Dialog call said “Kavya” but sounded like a different agent.  Do not put the
+The original English route selects Kavya's established ElevenLabs voice identity
+and the flash-model semantics. The direct SmartPBX route instead reads a general
+ElevenLabs environment voice and uses `eleven_multilingual_v2`. This explains why
+the corrected Dialog call said “Kavya” but sounded like a different agent. The
+repair must migrate the established production voice value into a protected
+root-only configuration key and remove hardcoded source usage; do not put an
 actual voice identifier in code comments, tests, documentation, logs, or Git.
 
 The active parser also currently treats `hangup.accountId` and `hangup.reason` as
@@ -52,9 +51,9 @@ disconnect has the same cause.
 
 ### External source anchors
 
-- ElevenLabs Text-to-Speech API reference: <https://elevenlabs.io/docs/api-reference/text-to-speech/convert>
-- ElevenLabs output-format reference: <https://elevenlabs.io/docs/developers/voices/output-format>
-- ElevenLabs model guide: <https://elevenlabs.io/docs/developers/models>
+- ElevenLabs telephony guide: <https://elevenlabs.io/docs/eleven-api/guides/how-to/text-to-speech/twilio>
+- ElevenLabs model guide: <https://elevenlabs.io/docs/overview/models>
+- ElevenLabs streaming TTS API reference: <https://elevenlabs.io/docs/api-reference/text-to-speech/stream>
 - Dialog SmartPBX v06 supplied extraction: reviewed protocol anchors for
   `start`, `media`, `dtmf`, and `hangup`; retain it only in the approved
   vendor-material location and do not copy account, call, phone, or credential
@@ -64,16 +63,22 @@ disconnect has the same cause.
 
 ### 1. Canonical English TTS profile
 
-Introduce a single, internal canonical English TTS profile that represents
-Kavya's original English voice identity and model semantics.  Both the Twilio
-ConversationRelay renderer and the direct Dialog renderer must select that
-profile; neither path may silently fall back to the general multilingual voice.
+Introduce one internal canonical English TTS profile. Its only voice-identity
+source is the protected root-only `KAVYA_EN_ELEVENLABS_VOICE_ID` configuration
+key, migrated from Kavya's established production value. Both the Twilio
+ConversationRelay renderer and direct Dialog renderer must derive their selection
+from this same profile, with identical voice identity, nonsecret documented
+settings, and `eleven_flash_v2_5` model semantics. Remove hardcoded source
+usage during implementation.
 
-The direct ElevenLabs request must use the official `eleven_flash_v2_5` model
-name and `ulaw_8000` output.  The Dialog WebSocket transport remains
-`g711_ulaw` at 8000 Hz; no resampling or encoding relaxation is allowed.  The
-profile must be testable without exposing the voice identifier: tests assert a
-redacted profile key, the selected model, output format, and selection path.
+The key is never present in code, Git, logs, status output, diagnostics, or test
+fixtures. A missing or blank key fails closed; there is no fallback to a general
+or multilingual voice. The direct ElevenLabs request must use the official
+`eleven_flash_v2_5` model name and `ulaw_8000` output. The Dialog WebSocket
+transport remains `g711_ulaw` at 8000 Hz; no resampling or encoding relaxation
+is allowed. The profile must be testable without exposing the voice identifier:
+tests assert the redacted configuration key, selected model, documented
+nonsecret settings, output format, and selection path.
 
 Retain the existing non-English model/voice routing code.  It is not evidence
 that Dialog supports those routes.
@@ -91,9 +96,13 @@ v06 extraction:
 - DTMF accepts `0-9`, `*`, `#`, and `A-D`, with the documented optional bounded
   duration.  Identifier handling must use the documented field names and keep
   all existing length/type limits.
-- Unknown, malformed, oversized, mismatched, or non-ulaw events remain safely
-  rejected.  No raw event name, raw payload, call ID, account ID, phone number,
-  transcript, audio, or MCP value may appear in an error, metric label, or log.
+- The v06 core event set is `start`, `media`, `dtmf`, and `hangup`.
+  `connected` and `stop` remain known strict compatibility extensions, each
+  covered by red tests. Any other nonblank event becomes rejected with the
+  sanitized fixed discriminator `unsupported_event`; replace the current
+  `UnknownEvent`/count outcome. No raw event name, raw payload, call ID,
+  account ID, phone number, transcript, audio, or MCP value may appear in an
+  error, metric label, or log.
 
 Add privacy-safe diagnostics with a fixed discriminator and lifecycle stage,
 such as parser stage plus a finite failure class.  These diagnostics must be
@@ -130,17 +139,22 @@ Align these observable behaviors:
 
 ### 4. MCP and transfer lifecycle
 
-MCP call control remains disabled until the voice and core call have passed the
-stable-call gate below.  No credentialed MCP experiment occurs during a live
-customer call.
+MCP production transfer remains disabled until the voice and core call have
+passed the stable-call gate below. The diagnostic is standalone from production
+transfer, but runs during a supervised live SmartPBX call so it can securely use
+the current `start.accountId` and exact `start.otherLegCallId`. Establish MCP,
+send `X-API-Key`, set `call_id=<otherLegCallId>`, issue only `initialize` and
+`list_tools`, then close it. It must make no `call_tool` request.
 
-After that gate, run one standalone, non-call probe: establish MCP, issue only
-`initialize` and `list_tools`, then close it.  Send exactly one account header:
-first lowercase `account_id`.  Only after a deterministic HTTP 4xx that the
-probe records without sensitive content may a second standalone probe use
-`X-Account-ID`.  Never send both headers, never use `call_tool` in either probe,
-and never infer success from a timeout, TLS failure, 5xx, malformed response, or
-connection loss.
+Send exactly one account header. The first attempt uses lowercase
+`account_id`. Only after a deterministic HTTP 4xx authentication/context
+rejection with identical valid active-call context may a fresh attempt use
+`X-Account-ID`, resolving the vendor Postman conflict. Never send both headers,
+never switch on timeout, TLS failure, 5xx, malformed response, or connection
+loss, and never infer success from those outcomes. Record only finite,
+privacy-safe state attribution: diagnostic attempted, authenticated/context
+rejected, inconclusive, or admitted; do not expose account IDs, call IDs, keys,
+request values, or protocol payloads.
 
 Transfer activation is a separate gate.  It requires a configured destination
 from the operator-controlled allowlist and a supervised drill using only that
@@ -171,10 +185,15 @@ this repair.
 3. **Behavior red** — add focused session tests for English prompt/tool/RAG/
    booking/state reuse, direct completion re-prompt timing, filler delivery,
    STT wiring, transfer-pending suppression, and barge-in cancellation.
-4. **Handover red** — add tests for MCP disabled-by-default, standalone header
-   probe sequencing, one-header-only behavior, 4xx-only fallback, no `call_tool`,
-   allowlist enforcement, immediate failure, acknowledgement, and the explicit
-   post-ack unknown outcome.
+4. **Handover red** — add tests for MCP disabled-by-default; supervised
+   live-call diagnostic extraction of `start.accountId` and exact
+   `start.otherLegCallId`; `X-API-Key` and
+   `call_id=<otherLegCallId>`; `initialize`/`list_tools` only; one-header-only
+   behavior; lowercase `account_id` first; a fresh `X-Account-ID` attempt only
+   after deterministic 4xx auth/context rejection with identical valid active-call
+   context; no fallback on timeout or 5xx; no `call_tool`; privacy-safe state
+   attribution; allowlist enforcement, immediate failure, acknowledgement, and
+   the explicit post-ack unknown outcome.
 5. **Green/refactor** — implement the smallest changes that make every new test
    pass, then consolidate duplicated English selection behavior behind the
    canonical profile without changing non-English or Flico behavior.
@@ -200,9 +219,9 @@ The work is not complete until all of the following have evidence:
 5. The Dialog dashboard route is restored or deliberately retained only after
    the call evidence is recorded.  Rollback remains the isolated profile
    rollback in `Kavya/SMARTPBX_RUNBOOK.md`; do not disturb Twilio.
-6. Only after gate 4 does the standalone MCP header probe run.  Transfer stays
-   disabled unless its independent carrier-contract and supervised-drill gate
-   passes.
+6. Only after gate 4 does the supervised-live-call standalone MCP diagnostic
+   run using the active call's documented context. Transfer stays disabled unless
+   its independent carrier-contract and supervised-drill gate passes.
 
 ## Boundaries
 
@@ -211,7 +230,7 @@ Always:
 - Keep Flico's container, configuration, and running path intact.
 - Use TDD red-green evidence for behavior changes and review before deployment.
 - Keep secrets, MCP keys, voice IDs, call identifiers, and customer data out of
-  Git, diagnostics, dashboard events, and test fixtures.
+  Git, diagnostics, dashboard events, status output, and test fixtures.
 
 Ask first:
 
@@ -222,8 +241,8 @@ Ask first:
 Never:
 
 - Remove Twilio, enable MCP transfer before its gates, send both account headers,
-  invoke `call_tool` during a header probe, or weaken the g711 ulaw admission
-  contract.
+  invoke `call_tool` during the MCP diagnostic, switch headers without the
+  specified deterministic 4xx, or weaken the g711 ulaw admission contract.
 
 ## Out of scope
 
