@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import subprocess
 import re
+import json
+import textwrap
 import textwrap
 
 import pytest
@@ -833,3 +835,187 @@ def test_deploy_helper_requires_exactly_three_arguments_before_mutation(tmp_path
     result = subprocess.run(["bash", "-c", command], env=env, text=True, capture_output=True, check=False)
     assert result.returncode != 0
     assert not log.exists() or " compose " not in log.read_text(encoding="utf-8")
+
+
+class FakeDeployHost:
+    """A stateful fake PATH that executes the deploy helper without Docker."""
+
+    image = "ghcr.io/taskforce-ai-dev/kavya"
+    sha = "abcdef0" + "1" * 33
+    digest = "sha256:" + "d" * 64
+    baseline = "sha256:" + "b" * 64
+    candidate = "sha256:" + "c" * 64
+
+    def __init__(self, tmp_path, **state):
+        self.root, self.bin, self.app = tmp_path, tmp_path / "bin", tmp_path / "app"
+        self.bin.mkdir(); self.app.mkdir()
+        (self.app / ".env").write_text("SENTINEL_LOCAL_SECRET\n", encoding="utf-8")
+        (self.app / ".env.smartpbx").write_text("SENTINEL_SMARTPBX_SECRET\n", encoding="utf-8")
+        scripts = self.app / "scripts"; scripts.mkdir()
+        validator = scripts / "validate_english_voice_env.sh"
+        validator.write_text("#!/usr/bin/env bash\n[[ ${VOICE_FAIL:-0} == 0 ]] || exit 1\nprintf '%s\\n' canonical_voice_match=ok\n", encoding="utf-8")
+        validator.chmod(0o755)
+        self.log, self.state = tmp_path / "log", tmp_path / "state.json"
+        defaults = {
+            "baseline_id": self.baseline, "baseline_digest": f"{self.image}@sha256:" + "b" * 64,
+            "baseline_revision": "a" * 40, "candidate_id": self.candidate,
+            "candidate_digest": f"{self.image}@{self.digest}", "candidate_revision": self.sha,
+            "current_id": self.baseline, "alias_id": "", "tag_id": "", "mutated": False,
+            "flico_id": "f" * 64, "legacy_id": "e" * 64,
+            "flico_health": "healthy", "legacy_health": "healthy",
+        }
+        defaults.update(state); self.state.write_text(json.dumps(defaults), encoding="utf-8")
+        self._fake("flock", "exit 0\n"); self._fake("stat", "printf '%s\\n' root:root:600\n")
+        self._fake("jq", "exec /usr/bin/jq \"$@\"\n")
+        self._fake("curl", """
+            printf 'curl %s\\n' "$*" >> "$FAKE_LOG"
+            if [[ $* == *health* ]]; then
+              [[ ${HEALTH_FAIL:-0} == 0 ]] || exit 1
+              if [[ -v HEALTH_JSON ]]; then printf '%s\\n' "$HEALTH_JSON"; else printf '%s\\n' '{"status":"ok","service_mode":"smartpbx"}'; fi
+            else
+              [[ ${STATUS_FAIL:-0} == 0 ]] || exit 1
+              if [[ -v STATUS_JSON ]]; then printf '%s\\n' "$STATUS_JSON"; else printf '%s\\n' '{"active_sessions":0,"transfer_enabled":false}'; fi
+            fi
+        """)
+        self._docker()
+
+    def _fake(self, name, body):
+        path = self.bin / name
+        path.write_text("#!/usr/bin/env bash\nset -Eeuo pipefail\n" + textwrap.dedent(body), encoding="utf-8")
+        path.chmod(0o755)
+
+    def _docker(self):
+        path = self.bin / "docker"
+        path.write_text(textwrap.dedent("""\
+            #!/usr/bin/env python3
+            import json, os, signal, sys
+            state_path=os.environ['FAKE_STATE']; state=json.load(open(state_path))
+            args=sys.argv[1:]
+            with open(os.environ['FAKE_LOG'],'a') as log:
+                log.write('docker ' + ' '.join(args) + '\\n')
+            def save(): json.dump(state, open(state_path,'w'))
+            def image_for(ref):
+                if ref == state['baseline_id'] or ref.endswith(':rollback-local'):
+                    revision=state['baseline_revision']
+                    if state['mutated'] and ref == state['current_id'] and os.getenv('ROLLBACK_IDENTITY_BAD') == '1': revision='9'*40
+                    return state['alias_id'] if ref.endswith(':rollback-local') else state['baseline_id'], state['baseline_digest'], revision
+                image_id, digest, revision = state['candidate_id'], state['candidate_digest'], state['candidate_revision']
+                if state['mutated'] and ref == state['current_id']:
+                    if os.getenv('FORWARD_DIGEST_BAD') == '1': digest='ghcr.io/taskforce-ai-dev/kavya@sha256:'+'9'*64
+                    if os.getenv('FORWARD_REVISION_BAD') == '1': revision='9'*40
+                    if state['current_id'] == state['alias_id'] and os.getenv('ROLLBACK_IDENTITY_BAD') == '1': revision='9'*40
+                if ref.endswith(':abcdef0'): image_id=state['tag_id'] or image_id
+                return image_id, digest, revision
+            if args[0] == 'pull': sys.exit(1 if os.getenv('PULL_FAIL') == '1' else 0)
+            if args[:2] == ['compose', '--env-file']:
+                if 'config' in args: sys.exit(1 if os.getenv('CONFIG_FAIL') == '1' else 0)
+                tag=os.getenv('SMARTPBX_IMAGE_TAG')
+                if tag == 'rollback-local':
+                    if os.getenv('ROLLBACK_RECREATE_BAD') == '1': sys.exit(1)
+                    state['current_id']=state['alias_id']
+                else:
+                    state['mutated']=True; state['current_id']=state['candidate_id']
+                    if os.getenv('FORWARD_ID_BAD') == '1': state['current_id']='sha256:'+'9'*64
+                    if os.getenv('FLICO_CHANGED') == '1': state['flico_health']='unhealthy'
+                    if os.getenv('LEGACY_CHANGED') == '1': state['legacy_id']='9'*64
+                save()
+                if os.getenv('SIGNAL_AFTER') and tag != 'rollback-local': os.kill(os.getppid(), getattr(signal, 'SIG'+os.getenv('SIGNAL_AFTER')))
+                sys.exit(0)
+            if args[:2] == ['inspect', '--format']:
+                fmt, name=args[2], args[3]
+                values={'kavya-smartpbx': {'{{.Image}}':state['current_id']}, 'flico-voice-agent': {'{{.Id}}':state['flico_id'],'{{.State.Health.Status}}':state['flico_health']}, 'kavya-voice-agent': {'{{.Id}}':state['legacy_id'],'{{.State.Health.Status}}':state['legacy_health']}}
+                print(values.get(name,{}).get(fmt,'')); sys.exit(0 if fmt in values.get(name,{}) else 1)
+            if args[:2] == ['image','tag']:
+                source,target=args[2],args[3]
+                if target.endswith(':rollback-local'): state['alias_id']='sha256:'+'8'*64 if os.getenv('ALIAS_BAD') == '1' else source
+                else: state['tag_id']='sha256:'+'8'*64 if os.getenv('TAG_BAD') == '1' else source
+                save(); sys.exit(0)
+            if args[:2] == ['image','inspect']:
+                ref,fmt=args[2],args[4]; image_id,digest,revision=image_for(ref)
+                print(image_id if fmt == '{{.Id}}' else digest if 'RepoDigests' in fmt else revision if 'Config.Labels' in fmt else '')
+                sys.exit(0)
+            sys.exit(98)
+        """), encoding="utf-8")
+        path.chmod(0o755)
+
+    def run(self, *args, prelude="", **env):
+        environment = os.environ | {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state)} | {key: str(value) for key, value in env.items()}
+        override = f"{prelude}; " if prelude else ""
+        command = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; APP_DIR={self.app}; LOCK_FILE={self.root / 'lock'}; {override}main \"$@\""
+        root_environment = [f"{key}={value}" for key, value in environment.items() if key in {"PATH", "FAKE_LOG", "FAKE_STATE", *env}]
+        return subprocess.run(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, capture_output=True, check=False)
+
+    def deploy(self, **env): return self.run(self.sha[:7], self.sha, self.digest, **env)
+    def logs(self): return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+    def compose_count(self): return self.logs().count("up -d --force-recreate --pull never kavya-smartpbx")
+    def current(self): return json.loads(self.state.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("state,environment", [
+    ({"baseline_id": "invalid"}, {}),
+    ({"baseline_digest": "sha256:" + "b" * 64}, {}),
+    ({"baseline_revision": "b" * 39}, {}),
+    ({}, {"ALIAS_BAD": 1}),
+])
+def test_deploy_baseline_metadata_or_alias_mismatch_never_mutates(tmp_path, state, environment):
+    host = FakeDeployHost(tmp_path, **state); result = host.deploy(**environment)
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+@pytest.mark.parametrize("environment", [
+    {"PULL_FAIL": 1}, {"TAG_BAD": 1},
+])
+def test_deploy_candidate_pull_or_tag_identity_mismatch_never_mutates(tmp_path, environment):
+    host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+@pytest.mark.parametrize("environment", [
+    {"HEALTH_FAIL": 1, "STATUS_JSON": '{"active_sessions":0,"transfer_enabled":false}'},
+    {"HEALTH_JSON": "not-json"}, {"HEALTH_JSON": '{"status":"bad","service_mode":"smartpbx"}'},
+    {"STATUS_JSON": '{"active_sessions":1,"transfer_enabled":false}'},
+    {"STATUS_JSON": '{"active_sessions":0,"transfer_enabled":true}'},
+    {"VOICE_FAIL": 1}, {"CONFIG_FAIL": 1},
+])
+def test_deploy_preflight_failures_never_mutate(tmp_path, environment):
+    host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+@pytest.mark.parametrize("environment", [{"FORWARD_ID_BAD": 1}, {"FORWARD_DIGEST_BAD": 1}, {"FORWARD_REVISION_BAD": 1}, {"FLICO_CHANGED": 1}, {"LEGACY_CHANGED": 1}])
+def test_deploy_bad_forward_identity_or_isolation_rolls_back_once(tmp_path, environment):
+    host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
+    assert result.returncode != 0 and host.compose_count() == 2
+    assert host.current()["current_id"] == host.baseline
+
+
+def test_deploy_readiness_timeout_rolls_back_exactly_once(tmp_path):
+    host = FakeDeployHost(tmp_path); result = host.deploy(prelude="wait_for_smartpbx_ready(){ return 1; }")
+    assert result.returncode != 0 and host.compose_count() == 2
+
+
+@pytest.mark.parametrize("environment,prelude", [
+    ({"ROLLBACK_RECREATE_BAD": 1}, ""),
+    ({"ROLLBACK_IDENTITY_BAD": 1}, ""),
+    ({}, "wait_for_smartpbx_ready(){ return 1; }"),
+])
+def test_deploy_rollback_failures_emit_escalation_marker(tmp_path, environment, prelude):
+    host = FakeDeployHost(tmp_path); result = host.deploy(prelude=prelude, FORWARD_ID_BAD=1, **environment)
+    assert result.returncode != 0 and "SMARTPBX_ROLLBACK_ESCALATION_REQUIRED" in result.stderr
+
+
+@pytest.mark.parametrize("signal_name", ["TERM", "INT", "HUP"])
+def test_deploy_signals_after_mutation_roll_back_once(tmp_path, signal_name):
+    host = FakeDeployHost(tmp_path); result = host.deploy(SIGNAL_AFTER=signal_name)
+    assert result.returncode != 0 and host.compose_count() == 2
+
+
+def test_deploy_mutates_only_the_pinned_service_and_never_prints_sentinels(tmp_path):
+    host = FakeDeployHost(tmp_path); result = host.deploy()
+    assert result.returncode == 0
+    assert host.compose_count() == 1
+    assert "up -d --force-recreate --pull never kavya-smartpbx" in host.logs()
+    assert not any(value in (result.stdout + result.stderr + host.logs()) for value in ("SENTINEL_LOCAL_SECRET", "SENTINEL_SMARTPBX_SECRET"))
+    mutation_lines = [line for line in host.logs().splitlines() if "up -d --force-recreate" in line]
+    for forbidden in (" nginx", " prune", " down", " restart", " flico-voice-agent", " kavya-voice-agent"):
+        assert all(forbidden not in line for line in mutation_lines)
