@@ -8,13 +8,46 @@ changing the registry, that an already-existing, caller-selected tag has the
 expected OCI revision label at the time of the probe, and that a
 workflow-derived canary tag is absent at that time.
 
-The first operational acceptance uses existing tag `37bfaf0` and expected
-revision `37bfaf02f04ce7614b9674b1c867b78ab3c7d414`.
+### What a green probe does and does not establish
 
-This is point-in-time evidence, not continuing tag immutability. The publisher
-is the only intended in-repository writer, but an out-of-band package writer
-can move a tag after a successful probe. Consumers must use the separately
-verified digest where that property matters.
+A green probe is deliberately narrow evidence. It establishes only:
+
+- the probe workflow ran from the protected default branch at a commit equal to
+  `github.workflow_sha`, having passed every terminal trust check below;
+- the caller-selected tag resolved to a manifest in the fixed GHCR repository at
+  probe time, and the image at that resolved digest carried an
+  `org.opencontainers.image.revision` label byte-equal to the supplied
+  `expected_revision`; and
+- the internally derived canary tag was reported absent by the shared
+  classifier, which is a live negative control on that classifier and on the
+  read path.
+
+It does not establish any of the following, and no green result should be read
+as if it did:
+
+- that `expected_revision` is a reviewed commit, is reachable from `main`, or
+  corresponds to the source that produced the image. The two payload fields are
+  mutually constrained (`existing_tag == expected_revision[0:7]`) so the caller
+  supplies one value, and the publisher derives both the tag and the label from
+  the same commit SHA — the revision check therefore holds by construction for
+  every image the publisher produced. It detects a mismatched or third-party
+  image, not an unreviewed one;
+- anything about image contents, provenance attestations, or build integrity;
+- that the canary was absent for any reason other than never having been
+  written. It embeds the run ID, so its absence is guaranteed by construction;
+- continuing tag immutability. This is point-in-time evidence. The publisher is
+  the only intended in-repository writer, but an out-of-band package writer can
+  move a tag after a successful probe. Consumers must use the separately
+  verified digest where that property matters; and
+- that the hosted runner or the pinned actions are uncompromised.
+
+The gate is also **procedural, not mechanically enforced**. Nothing in this
+repository makes the publisher depend on a probe result: the publisher has no
+`needs:`, no probe-result query, and no environment with required reviewers. A
+maintainer with write access can dispatch the publisher without the probe ever
+having run. Whether to add mechanical enforcement is an open decision and is
+deliberately out of scope here; until it is made, "the probe must pass first" is
+a review-and-operator convention.
 
 ## Scope and non-goals
 
@@ -356,7 +389,10 @@ image/version block. This evidence is point-in-time only and does not establish
 future tag immutability or action/runner compromise resistance.
 
 Only then may the separately reviewed publisher be considered for SHA
-`69ec0b3`. Rollback is to stop using the probe, correct it in a reviewed
+`69ec0b3`. That sequencing is a procedural rule for the operator and the
+reviewer; as stated in Purpose, nothing in the repository enforces it
+mechanically, and a publisher run started without a green probe will not be
+blocked. Rollback is to stop using the probe, correct it in a reviewed
 protected-main change, and rerun the read-only gate. There is no probe-created
 registry or production state to undo.
 

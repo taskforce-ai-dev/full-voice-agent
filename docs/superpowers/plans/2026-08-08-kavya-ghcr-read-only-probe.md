@@ -2,7 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a protected-default-branch, manually dispatched, read-only GHCR provenance and absent-canary gate that must pass before the immutable Kavya publisher runs for reviewed SHA `69ec0b3`.
+**Goal:** Add a protected-default-branch, repository-dispatched, read-only GHCR provenance and absent-canary gate that must pass before the immutable Kavya publisher runs for reviewed SHA `69ec0b3`.
+
+> **Scope of the evidence.** A green probe establishes that the workflow ran from
+> protected `main` at its own workflow commit, that the caller-selected tag
+> resolved to a manifest whose `org.opencontainers.image.revision` label matched
+> the supplied revision at probe time, and that the derived canary was absent. It
+> does **not** establish that the revision is reviewed or reachable from `main`,
+> anything about image contents, or continuing tag immutability — and the "probe
+> before publisher" rule is procedural: nothing makes the publisher depend on it.
+> See the design document's Purpose section for the full statement.
 
 **Architecture:** A single GitHub-hosted probe job validates two tightly typed inputs before any registry-affecting setup, then checks out only workflow-revision tooling into `.probe-tools`. It uses that trusted tag-probe script to prove a known immutable tag exists and an internally derived canary is absent, while a separate read-only pull verifies the known image's OCI revision label. The job has no source checkout, build context, registry write operation, or deployment capability.
 
@@ -11,11 +20,10 @@
 ## Global Constraints
 
 - Create `.github/workflows/probe-kavya-image.yml`; it is usable only after merge to the protected default branch.
-- Use one `ubuntu-latest` GitHub-hosted job with exactly `contents: read` and `packages: read`; do not add environments or other permissions.
-- Use declared references `actions/checkout@v7`, `docker/setup-buildx-action@v4`, and `docker/login-action@v4`, matching `.github/workflows/build-kavya-image.yml` exactly.
-- Treat those declared action tags and `ubuntu-latest` as mutable channel references, not immutable SHA pins. Record workflow commit SHA, declared action references, runner image/version metadata, and actual Buildx version for human acceptance comparison.
-- The first trusted shell step validates `existing_tag` as seven lowercase hex characters, `expected_revision` as forty lowercase hex characters, and `existing_tag == expected_revision[0:7]` before checkout, setup, login, probing, or image access. Tests cover valid, missing, uppercase, extra-character, and tag/revision-mismatch inputs.
-- Use inputs only through step `env`; never interpolate `${{ inputs.* }}` in Bash. Parse workflow YAML in tests with `yaml.BaseLoader` so YAML 1.1 does not coerce `on` to a boolean.
+- Use one `ubuntu-24.04` GitHub-hosted job with `timeout-minutes: 30` and exactly `contents: read` and `packages: read`; do not add environments or other permissions.
+- Pin every action in this workflow and in `.github/workflows/build-kavya-image.yml` to the full commit SHA recorded in the design document, retaining the `# v7` / `# v4` version comment on each `uses:` line. Record workflow commit SHA, those pinned action identifiers, the fixed runner label with the documented `runner.os` / `runner.arch` values, and the actual Buildx version for human acceptance comparison. The runner image itself remains mutable residual trust.
+- The first trusted shell step is terminal: it validates the dispatch context (`github.event_name`, `github.event.action`, both repository identities, default branch, `github.ref`, `github.ref_name`, `github.ref_type`, `github.ref_protected`, lowercase-40-hex and equal `github.sha` / `github.workflow_sha`, and the exact `github.workflow_ref`) and then the `client_payload` schema — exactly two string keys, `existing_tag` as seven lowercase hex characters, `expected_revision` as forty lowercase hex characters, and `existing_tag == expected_revision[0:7]` — before checkout, setup, login, probing, or image access. Tests cover every negative case.
+- Pass context and payload values only through step `env` and step outputs; never interpolate `${{ … }}` inside a Bash block. Parse workflow YAML in tests with `yaml.BaseLoader` so YAML 1.1 does not coerce `on` to a boolean.
 - Check out `github.workflow_sha` into `.probe-tools` with `persist-credentials: false`; never check out or execute an input/source ref.
 - The fixed Kavya image repository is internal workflow code. Inputs never select registry, repository, digest, source ref, or canary name.
 - Existing-tag probe must accept only exit `10` and exactly one line `image_tag_state=existing`; canary probe must accept only exit `0` and exactly one line `image_tag_state=absent`.
@@ -27,21 +35,31 @@
 
 ## File Map
 
-- Create: `.github/workflows/probe-kavya-image.yml` — the single manually dispatched read-only probe job.
+- Create: `.github/workflows/probe-kavya-image.yml` — the single repository-dispatched read-only probe job.
 - Modify: `Kavya/tests/test_smartpbx_deployment.py` — static workflow contract tests and BaseLoader parser helpers.
-- Read only: `.github/workflows/build-kavya-image.yml` — authoritative declared action references and trusted checkout pattern.
+- Modify: `.github/workflows/build-kavya-image.yml` — action SHA pins, runner label, and job timeout only; no dispatch change.
 - Read only: `.github/scripts/check-kavya-image-tag.sh` — executable probe contract: existing is exit `10`, absent is exit `0`, all uncertain cases exit `1`.
 
 ## Interfaces
 
 | Interface | Definition |
 | --- | --- |
-| Dispatch inputs | `existing_tag: string` matching `^[0-9a-f]{7}$`; `expected_revision: string` matching `^[0-9a-f]{40}$`; and `existing_tag == expected_revision[0:7]`. |
-| Trusted checkout | `actions/checkout@v7` with `ref: ${{ github.workflow_sha }}`, `path: .probe-tools`, and `persist-credentials: false`. |
+| Dispatch trigger | `repository_dispatch` with type `kavya_image_read_only_probe` only; no `workflow_dispatch`, so no caller may select a ref. |
+| Dispatch payload | `client_payload` with exactly `existing_tag: string` matching `^[0-9a-f]{7}$` and `expected_revision: string` matching `^[0-9a-f]{40}$`, and `existing_tag == expected_revision[0:7]`. |
+| Trusted checkout | `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` with `ref: ${{ github.workflow_sha }}`, `path: .probe-tools`, and `persist-credentials: false`. |
 | Existing probe | `.probe-tools/.github/scripts/check-kavya-image-tag.sh "$image:$existing_tag"` returns `10` and one stdout line `image_tag_state=existing`. |
 | Canary probe | The same script receives `"$image:probe-$GITHUB_REPOSITORY_ID-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"`, returns `0`, and one stdout line `image_tag_state=absent`. |
-| Provenance result | `docker image inspect` yields exactly the expected `org.opencontainers.image.revision` value and nothing is logged from pull/inspect streams. |
-| Safe evidence | `probe_version=1`, declared action references, workflow commit SHA, runner image/version, actual Buildx version, `existing_tag_state=pass`, `existing_revision=pass`, `canary_state=pass`, and `probe_result=pass`. |
+| Provenance result | The tag is resolved to a digest once; `docker pull` and `docker image inspect` both read that digest, and the label bytes are compared with `cmp -s` against a `printf`-written expected file. Nothing is logged from the digest/pull/inspect streams. |
+| Safe evidence | Exactly `workflow_commit`, `checkout_action`, `setup_buildx_action`, `login_action`, `runner_label`, `runner_os`, `runner_arch`, `buildx_version`, `existing_tag_state=pass`, `existing_revision=pass`, `canary_state=pass`, `existing_tag`, `expected_revision`, `probe_version=1`, and `probe_result=pass`. |
+
+> **Note on Tasks 1–4.** The YAML and Python snippets in these tasks record the
+> original build sequence. An independent security review then required the
+> finalized design's trust boundary — `repository_dispatch`, terminal ref and
+> workflow-identity checks, full action SHA pins, `ubuntu-24.04` with a 30-minute
+> timeout, `cmp -s` byte-exact contract checks, NUL-safe captures, and the
+> `runner.os` / `runner.arch` evidence — so those snippets no longer match what
+> shipped. The Global Constraints and Interfaces above and the workflow, helper,
+> and test files themselves are authoritative.
 
 ### Task 1: Add the RED structural and trust-contract tests
 
@@ -739,15 +757,22 @@ Check that CI and gitleaks report success for the PR's current head SHA, obtain 
 
 Run:
 
+The first operational acceptance uses existing tag `37bfaf0` and expected revision `37bfaf02f04ce7614b9674b1c867b78ab3c7d414`. Send the documented repository dispatch — it carries no ref or SHA selector, and GitHub selects the default-branch copy of the workflow:
+
 ```bash
-gh workflow run probe-kavya-image.yml --ref main -f existing_tag=37bfaf0 -f expected_revision=37bfaf02f04ce7614b9674b1c867b78ab3c7d414
+gh api --method POST repos/taskforce-ai-dev/full-voice-agent/dispatches \
+  -f event_type=kavya_image_read_only_probe \
+  -f 'client_payload[existing_tag]=37bfaf0' \
+  -f 'client_payload[expected_revision]=37bfaf02f04ce7614b9674b1c867b78ab3c7d414'
 ```
 
-Expected: the completed run records `existing_tag_state=pass`, `existing_revision=pass`, `canary_state=pass`, `probe_version=1`, and `probe_result=pass`, together with workflow commit SHA, declared action references, runner image/version metadata, and actual Buildx version. Inspect GitHub's setup-action logs and record the actual resolved action commit SHAs for checkout, Buildx setup, and login; the workflow summary records declared mutable references only and does not cryptographically prove resolution. Compare those setup-log SHAs and safe metadata in human review; changed action resolution or an unexpected runner or Buildx version fails acceptance.
+Run the design document's full fail-fast dispatcher (it validates both values before `gh api`) rather than the bare call when dispatching by hand.
+
+Expected: the completed run records exactly the fifteen safe-summary keys, including `existing_tag_state=pass`, `existing_revision=pass`, `canary_state=pass`, `probe_version=1`, and `probe_result=pass`, together with the workflow commit SHA, the three pinned action identifiers, `runner_label=ubuntu-24.04` with the documented `runner_os` / `runner_arch`, and the actual Buildx version. Inspect GitHub's setup-action logs and confirm the resolved action commit SHAs match the pins; the summary records the pinned identifiers but does not itself cryptographically prove resolution. A changed action resolution or an unexpected runner or Buildx version fails acceptance.
 
 - [ ] **Step 9: Gate publisher authority on the accepted probe.**
 
-Do not dispatch the immutable publisher for `69ec0b3` unless Step 8 passed and its safe evidence was accepted. A probe failure, malformed marker, existing canary, missing provenance label, metadata mismatch, or uncertain registry result stops the release; correct the reviewed workflow or tests in a new PR and repeat Tasks 1 through 8.
+Do not dispatch the immutable publisher for `69ec0b3` unless Step 8 passed and its safe evidence was accepted. This is an operator and reviewer rule, not a mechanical one: the publisher has no `needs:`, no probe-result query, and no required-reviewer environment, so nothing blocks a publisher run started without a green probe. A probe failure, malformed marker, existing canary, missing provenance label, metadata mismatch, or uncertain registry result stops the release; correct the reviewed workflow or tests in a new PR and repeat Tasks 1 through 8.
 
 ## Plan Self-Check
 
