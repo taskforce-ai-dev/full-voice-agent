@@ -190,6 +190,135 @@ async def test_gateway_ends_the_call_when_the_outbound_sender_dies():
     assert gateway.snapshot()["active_sessions"] == 0
 
 
+class RecordingSocket:
+    """Records the arrival time of every outbound frame."""
+
+    def __init__(self) -> None:
+        self.arrivals: list[float] = []
+
+    async def send_text(self, _message: str) -> None:
+        self.arrivals.append(asyncio.get_running_loop().time())
+
+
+FRAME = b"\xff" * 160  # 160 bytes of g711_ulaw @ 8 kHz == 20ms of audio
+FRAME_SECONDS = 0.02
+
+
+@pytest.mark.asyncio
+async def test_outbound_audio_is_paced_at_realtime():
+    socket = RecordingSocket()
+    transport = _transport(socket, frames=64)
+    transport.start()
+
+    started = asyncio.get_running_loop().time()
+    for _ in range(10):
+        await transport.send_audio(FRAME)
+    await asyncio.wait_for(transport.send_mark("tts_done"), timeout=5)
+    elapsed = asyncio.get_running_loop().time() - started
+    await transport.close()
+
+    assert len(socket.arrivals) == 10
+    # 10 frames of 20ms is 200ms of speech. Sending it all in ~1ms is what makes
+    # barge-in useless: clear_audio() then has an empty queue to cancel.
+    assert elapsed >= 8 * FRAME_SECONDS, (
+        f"200ms of audio was fully on the wire in {elapsed * 1000:.0f}ms"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pacing_does_not_delay_the_first_frame():
+    socket = RecordingSocket()
+    transport = _transport(socket)
+    transport.start()
+
+    started = asyncio.get_running_loop().time()
+    await transport.send_audio(FRAME)
+    for _ in range(20):
+        if socket.arrivals:
+            break
+        await asyncio.sleep(0.001)
+    await transport.close()
+
+    assert socket.arrivals, "the first frame must be sent"
+    assert socket.arrivals[0] - started < 0.01, (
+        "pacing must not add latency before the first frame of a reply"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_new_utterance_after_silence_still_starts_immediately():
+    socket = RecordingSocket()
+    transport = _transport(socket)
+    transport.start()
+    await transport.send_audio(FRAME)
+    await asyncio.wait_for(transport.send_mark("tts_done"), timeout=5)
+    await asyncio.sleep(0.05)  # caller thinking; cadence must not stay armed
+
+    started = asyncio.get_running_loop().time()
+    await transport.send_audio(FRAME)
+    await asyncio.wait_for(transport.send_mark("tts_done"), timeout=5)
+    first_of_second_utterance = socket.arrivals[1] - started
+    await transport.close()
+
+    assert first_of_second_utterance < 0.01
+
+
+@pytest.mark.asyncio
+async def test_barge_in_cancels_audio_that_has_not_been_sent():
+    socket = RecordingSocket()
+    transport = _transport(socket, frames=64)
+    transport.start()
+
+    for _ in range(30):  # 600ms of speech
+        await transport.send_audio(FRAME)
+    await asyncio.sleep(0.05)
+    await transport.clear_audio()
+    sent_at_barge_in = len(socket.arrivals)
+    await asyncio.sleep(0.05)
+    await transport.close()
+
+    assert sent_at_barge_in <= 6, (
+        f"{sent_at_barge_in}/30 frames were already on the wire at barge-in, so "
+        "clear_audio() had nothing left to cancel"
+    )
+    assert len(socket.arrivals) == sent_at_barge_in, (
+        "no further frames may be sent after clear_audio()"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_mark_waits_for_queued_audio_to_reach_the_wire():
+    socket = RecordingSocket()
+    transport = _transport(socket, frames=64)
+    transport.start()
+    for _ in range(10):
+        await transport.send_audio(FRAME)
+
+    await asyncio.wait_for(transport.send_mark("tts_done"), timeout=5)
+
+    # The caller starts its re-prompt timer when the mark returns, so the mark
+    # must not fire while paced audio is still queued.
+    assert len(socket.arrivals) == 10
+    await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_close_drains_paced_audio_promptly():
+    socket = RecordingSocket()
+    transport = _transport(socket, frames=64)
+    transport.start()
+    for _ in range(50):  # a full second of speech still queued
+        await transport.send_audio(FRAME)
+    await asyncio.sleep(0.01)
+
+    started = asyncio.get_running_loop().time()
+    await transport.close()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.1, f"close() waited {elapsed * 1000:.0f}ms for paced audio"
+    assert transport._queue.empty()
+
+
 def _failing_stt_loop(monkeypatch, failures: int = 10_000):
     """Drive GoogleSTTStream._loop with a stream that always fails immediately."""
     import server
