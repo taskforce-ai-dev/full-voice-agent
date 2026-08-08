@@ -28,6 +28,9 @@ jobs:
       - name: Capture registry wording
         run: |
           set -uo pipefail
+          # The runner injects `bash -e`, and a failing inspect is the entire
+          # point of this job, so disable errexit explicitly.
+          set +e
           # Replicate check-kavya-image-tag.sh exactly: combined stdout+stderr
           # into one file, then the same load and case-fold the allowlist sees.
           for ref in \
