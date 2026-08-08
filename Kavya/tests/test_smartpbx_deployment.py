@@ -785,3 +785,33 @@ def test_smartpbx_runbook_uses_the_guarded_smartpbx_image_deploy_helper():
     assert "deploy_smartpbx_image.sh" in runbook
     assert "NEW_TAG EXPECTED_SHA EXPECTED_DIGEST" in runbook
     assert "authenticated integration probe" in runbook
+
+
+
+def test_smartpbx_image_deploy_functions_fail_closed_under_fake_path(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "curl").write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ $FAKE_HEALTH_FAIL == 1 && $* == *health* ]]; then exit 1; fi\n"
+        "echo status\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "jq").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    for command in (fake_bin / "curl", fake_bin / "jq"):
+        command.chmod(0o755)
+    env = os.environ | {"PATH": str(fake_bin) + ":" + os.environ["PATH"], "FAKE_HEALTH_FAIL": "1"}
+    source = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; check_loopback_preflight"
+    health = subprocess.run(["bash", "-c", source], env=env, text=True, capture_output=True, check=False)
+    assert health.returncode != 0
+    bad_sha = "f" * 40
+    bad_digest = "a" * 64
+
+    unrelated = subprocess.run(
+        ["bash", "-c", f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; validate_inputs deadbee {bad_sha} sha256:{bad_digest}"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert unrelated.returncode != 0
