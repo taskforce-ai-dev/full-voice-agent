@@ -322,7 +322,7 @@ def run_probe_workflow_step(tmp_path, name, **values):
     document, _job, steps, _text = kavya_image_probe_job()
     script = probe_workflow_step(steps, name)["run"]
     scripts = tmp_path / ".probe-tools" / ".github" / "scripts"
-    scripts.mkdir(parents=True)
+    scripts.mkdir(parents=True, exist_ok=True)
     log = tmp_path / "tools.log"
     summary = tmp_path / "summary"
     (scripts / "check-kavya-image-tag.sh").write_text(textwrap.dedent("""\
@@ -335,7 +335,7 @@ def run_probe_workflow_step(tmp_path, name, **values):
         printf '%s' "$EXISTING_OUT"; printf '%s' "$EXISTING_ERR" >&2; exit "$EXISTING_CODE"
     """), encoding="utf-8")
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
+    fake_bin.mkdir(exist_ok=True)
     docker = fake_bin / "docker"
     docker.write_text(textwrap.dedent("""\
         #!/usr/bin/env bash
@@ -364,6 +364,7 @@ def run_probe_workflow_step(tmp_path, name, **values):
 @pytest.mark.parametrize(("tag", "revision", "code"), [
     ("37bfaf0", "37bfaf02f04ce7614b9674b1c867b78ab3c7d414", 0), ("", "37bfaf02f04ce7614b9674b1c867b78ab3c7d414", 1),
     ("37BFAF0", "37bfaf02f04ce7614b9674b1c867b78ab3c7d414", 1), ("37bfaf00", "37bfaf02f04ce7614b9674b1c867b78ab3c7d414", 1),
+    ("37bfaf0", "37BFAF02f04ce7614b9674b1c867b78ab3c7d414", 1), ("37bfaf0", "37bfaf02f04ce7614b9674b1c867b78ab3c7d4140", 1),
     ("37bfaf0", "47bfaf02f04ce7614b9674b1c867b78ab3c7d414", 1), ("37bfaf0", "", 1),
 ])
 def test_kavya_image_probe_validation_binds_identity_before_tools(tmp_path, tag, revision, code):
@@ -375,11 +376,14 @@ def test_kavya_image_probe_validation_binds_identity_before_tools(tmp_path, tag,
 @pytest.mark.parametrize(("step", "overrides", "code"), [
     ("Probe known existing tag", {"EXISTING_CODE": 10, "EXISTING_OUT": "image_tag_state=existing\n"}, 0),
     ("Probe known existing tag", {"EXISTING_CODE": 0, "EXISTING_OUT": "image_tag_state=existing\n"}, 1),
+    ("Probe known existing tag", {"EXISTING_CODE": 1, "EXISTING_OUT": "image_tag_state=existing\n"}, 1),
+    ("Probe known existing tag", {"EXISTING_CODE": 99, "EXISTING_OUT": "image_tag_state=existing\n"}, 1),
     ("Probe known existing tag", {"EXISTING_CODE": 10, "EXISTING_OUT": "image_tag_state=existing\nextra\n"}, 1),
-    ("Probe known existing tag", {"EXISTING_CODE": 10, "EXISTING_OUT": ""}, 1),
+    ("Probe known existing tag", {"EXISTING_CODE": 10, "EXISTING_OUT": "wrong\n"}, 1), ("Probe known existing tag", {"EXISTING_CODE": 10, "EXISTING_OUT": ""}, 1),
     ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "image_tag_state=absent\n"}, 0),
+    ("Probe generated absent canary", {"CANARY_CODE": 1, "CANARY_OUT": "image_tag_state=absent\n"}, 1), ("Probe generated absent canary", {"CANARY_CODE": 99, "CANARY_OUT": "image_tag_state=absent\n"}, 1),
     ("Probe generated absent canary", {"CANARY_CODE": 10, "CANARY_OUT": "image_tag_state=absent\n"}, 1),
-    ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "image_tag_state=existing\n"}, 1),
+    ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "image_tag_state=existing\n"}, 1), ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "wrong\n"}, 1), ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": ""}, 1),
 ])
 def test_kavya_image_probe_accepts_only_exact_probe_states(tmp_path, step, overrides, code):
     result, summary, log = run_probe_workflow_step(tmp_path, step, EXISTING_ERR="SENTINEL_EXISTING", CANARY_ERR="SENTINEL_CANARY", **overrides)
@@ -417,6 +421,9 @@ def test_kavya_image_probe_run_scripts_parse_and_summary_is_allowlisted(tmp_path
 ```
 
 The fake `.probe-tools` script and fake Docker binary live under `tmp_path`.
+Their `summary` and `tools.log` files intentionally accumulate across repeated
+calls with the same `tmp_path`; the allowlist test verifies the cumulative
+record and the harness never reads host temporary artifacts.
 They prove workflow-shell behavior and suppression only; existing dynamic tests
 continue to cover the real tag-probe script, and this harness never contacts a registry.
 
@@ -425,10 +432,10 @@ continue to cover the real tag-probe script, and this harness never contacts a r
 Run:
 
 ```bash
-/home/dev/full-voice-agent/.venv/bin/python -m pytest -q Kavya/tests/test_smartpbx_deployment.py -k 'kavya_image_probe_requires_exact_states_provenance_and_internal_canary or kavya_image_probe_has_no_write_deploy_or_sensitive_output_surface'
+/home/dev/full-voice-agent/.venv/bin/python -m pytest -q Kavya/tests/test_smartpbx_deployment.py -k 'kavya_image_probe'
 ```
 
-Expected: selected semantic tests fail because the skeleton lacks the named probe, provenance, metadata, and summary steps. Do not assert a fixed total.
+Expected: tests fail only because the skeleton lacks named workflow steps; there are no collection, parser, or harness-scaffolding failures. Do not assert a fixed total.
 
 - [ ] **Step 4: Commit the RED semantic contract.**
 
@@ -527,10 +534,11 @@ jobs:
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           image="ghcr.io/taskforce-ai-dev/kavya:${EXISTING_TAG}"
-          probe_stdout="$(mktemp)" || fail
-          probe_stderr="$(mktemp)" || fail
-          cleanup() { rm -f "$probe_stdout" "$probe_stderr" || true; }
+          probe_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$probe_dir" || true; }
           trap cleanup EXIT
+          probe_stdout="$probe_dir/stdout"
+          probe_stderr="$probe_dir/stderr"
           expected_marker="image_tag_state=existing"
           if bash .probe-tools/.github/scripts/check-kavya-image-tag.sh "$image" >"$probe_stdout" 2>"$probe_stderr"; then probe_code=0; else probe_code=$?; fi
           [[ "$probe_code" -eq 10 ]] || fail
@@ -547,11 +555,13 @@ jobs:
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           image="ghcr.io/taskforce-ai-dev/kavya:${EXISTING_TAG}"
-          pull_stdout="$(mktemp)"
-          pull_stderr="$(mktemp)"
-          inspect_stdout="$(mktemp)"
-          inspect_stderr="$(mktemp)"
-          trap 'rm -f "$pull_stdout" "$pull_stderr" "$inspect_stdout" "$inspect_stderr"' EXIT
+          probe_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$probe_dir" || true; }
+          trap cleanup EXIT
+          pull_stdout="$probe_dir/pull.stdout"
+          pull_stderr="$probe_dir/pull.stderr"
+          inspect_stdout="$probe_dir/inspect.stdout"
+          inspect_stderr="$probe_dir/inspect.stderr"
           docker pull "$image" >"$pull_stdout" 2>"$pull_stderr" || fail
           docker image inspect "$image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' >"$inspect_stdout" 2>"$inspect_stderr" || fail
           [[ "$(wc -l < "$inspect_stdout")" -eq 1 ]] || fail
@@ -566,10 +576,11 @@ jobs:
           canary="probe-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           [[ "$canary" =~ ^probe-[0-9]+-[0-9]+-[0-9]+$ ]] || fail
           [[ ${#canary} -le 128 ]] || fail
-          probe_stdout="$(mktemp)" || fail
-          probe_stderr="$(mktemp)" || fail
-          cleanup() { rm -f "$probe_stdout" "$probe_stderr" || true; }
+          probe_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$probe_dir" || true; }
           trap cleanup EXIT
+          probe_stdout="$probe_dir/stdout"
+          probe_stderr="$probe_dir/stderr"
           expected_marker="image_tag_state=absent"
           if bash .probe-tools/.github/scripts/check-kavya-image-tag.sh "$image:$canary" >"$probe_stdout" 2>"$probe_stderr"; then probe_code=0; else probe_code=$?; fi
           [[ "$probe_code" -eq 0 ]] || fail
