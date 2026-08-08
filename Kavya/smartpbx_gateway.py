@@ -106,6 +106,7 @@ class SmartPBXSessionRegistry:
             raise ValueError("max_sessions must be between 1 and 4")
         self._max_sessions = max_sessions
         self._active_sessions = self._admitted_total = self._rejected_capacity_total = self._released_total = 0
+        self._frames_dropped_total = 0
         self._lock = asyncio.Lock()
 
     async def try_acquire(self) -> SessionLease | None:
@@ -116,6 +117,10 @@ class SmartPBXSessionRegistry:
             self._active_sessions += 1
             self._admitted_total = _saturating_increment(self._admitted_total)
             return SessionLease(self)
+
+    def record_frame_dropped(self) -> None:
+        """Count one outbound frame discarded by transport backpressure."""
+        self._frames_dropped_total = _saturating_increment(self._frames_dropped_total)
 
     async def _release(self) -> None:
         async with self._lock:
@@ -128,6 +133,7 @@ class SmartPBXSessionRegistry:
             "active_sessions": self._active_sessions, "max_sessions": self._max_sessions,
             "admitted_total": self._admitted_total, "rejected_capacity_total": self._rejected_capacity_total,
             "released_total": self._released_total,
+            "frames_dropped_total": self._frames_dropped_total,
         }
 
 
@@ -214,7 +220,9 @@ class SmartPBXGateway:
             if context.account_id != self._settings.account_id:
                 raise ProtocolViolation(POLICY_VIOLATION, "account mismatch", "account_mismatch")
             transport = SmartPBXMediaTransport(
-                websocket, context, max_queue_frames=self._settings.max_outbound_frames
+                websocket, context,
+                max_queue_frames=self._settings.max_outbound_frames,
+                on_frame_dropped=self._registry.record_frame_dropped,
             )
             transport.start()
             try:

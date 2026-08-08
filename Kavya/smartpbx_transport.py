@@ -7,7 +7,7 @@ import base64
 import contextlib
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from smartpbx_protocol import CallContext
 
@@ -15,6 +15,9 @@ from smartpbx_protocol import CallContext
 # g711_ulaw at 8 kHz carries one byte per sample, so a frame's wall-clock
 # duration is simply its length over this rate.
 _ULAW_BYTES_PER_SECOND = 8000
+
+# Matches the gateway's saturating admission counters.
+_MAX_COUNTER = (1 << 63) - 1
 
 
 @dataclass(frozen=True)
@@ -26,9 +29,18 @@ class _QueuedAudio:
 class SmartPBXMediaTransport:
     """Serialize bounded audio delivery for one active SmartPBX call."""
 
-    def __init__(self, websocket: Any, context: CallContext, *, max_queue_frames: int) -> None:
+    def __init__(
+        self,
+        websocket: Any,
+        context: CallContext,
+        *,
+        max_queue_frames: int,
+        on_frame_dropped: Callable[[], None] | None = None,
+    ) -> None:
         if isinstance(max_queue_frames, bool) or max_queue_frames < 1:
             raise ValueError("max_queue_frames must be positive")
+        self._on_frame_dropped = on_frame_dropped
+        self._frames_dropped = 0
         self._websocket = websocket
         self._context = context
         self._queue: asyncio.Queue[_QueuedAudio] = asyncio.Queue(max_queue_frames)
@@ -40,6 +52,11 @@ class SmartPBXMediaTransport:
     @property
     def is_active(self) -> bool:
         return not self._closed and self._sender_task is not None and not self._sender_task.done()
+
+    @property
+    def frames_dropped_total(self) -> int:
+        """Outbound frames discarded by backpressure, saturating."""
+        return self._frames_dropped
 
     @property
     def send_failed(self) -> bool:
@@ -63,6 +80,9 @@ class SmartPBXMediaTransport:
         if self._queue.full():
             self._queue.get_nowait()
             self._queue.task_done()
+            self._frames_dropped = min(self._frames_dropped + 1, _MAX_COUNTER)
+            if self._on_frame_dropped is not None:
+                self._on_frame_dropped()
         self._queue.put_nowait(_QueuedAudio(self._generation, bytes(audio)))
 
     async def send_mark(self, _name: str) -> None:
