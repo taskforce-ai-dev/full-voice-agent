@@ -129,8 +129,11 @@ class KavyaSmartPBXSession:
             if endpointing_handle is not None:
                 endpointing_handle.cancel()
                 pipeline._endpointing_handle = None
-            if getattr(pipeline, "_stt", None) is not None:
-                pipeline._stt.stop()
+            stt = getattr(pipeline, "_stt", None)
+            if stt is not None:
+                # stop() joins the STT worker thread for up to 5s. This loop is
+                # shared by every concurrent call, so it must not block here.
+                await asyncio.to_thread(stt.stop)
             if self._welcome_task is not None:
                 if not self._welcome_task.done():
                     self._welcome_task.cancel()
