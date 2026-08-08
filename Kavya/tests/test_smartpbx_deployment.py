@@ -971,6 +971,63 @@ def test_kavya_image_tag_probe_still_fails_closed_on_real_server_errors(tmp_path
     assert result.stdout == "image_tag_state=probe_failed\n"
 
 
+@pytest.mark.parametrize(
+    ("docker_exit", "output_bytes"),
+    [
+        # Docker failure: the NUL-free remainder is an exact allowlist match, so a
+        # command-substitution read would launder it into "absent" and exit 0.
+        (1, b"manifest unknown: " + KAVYA_IMAGE_TARGET.encode("ascii") + b"\x00"),
+        (1, b"\x00manifest unknown: " + KAVYA_IMAGE_TARGET.encode("ascii")),
+        (1, b"no such manifest: " + KAVYA_IMAGE_TARGET.encode("ascii") + b"\x00\n"),
+        # Docker success: a NUL must still fail closed rather than report existing.
+        (0, b"Name: " + KAVYA_IMAGE_TARGET.encode("ascii") + b"\x00\n"),
+        (0, b"\x00"),
+    ],
+)
+def test_kavya_image_tag_probe_rejects_nul_bearing_registry_captures(
+    tmp_path, docker_exit, output_bytes
+):
+    result = run_kavya_image_tag_probe(
+        tmp_path, docker_exit, "", output_bytes=output_bytes, binary=True
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == b"image_tag_state=probe_failed\n"
+    assert b"\x00" not in result.stdout
+    assert b"\x00" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "ghcr.io/taskforce-ai-dev/kavya:DEADBEE",
+        "ghcr.io/taskforce-ai-dev/Kavya:deadbee",
+        "GHCR.IO/taskforce-ai-dev/kavya:deadbee",
+    ],
+)
+def test_kavya_image_tag_probe_rejects_mixed_case_arguments(tmp_path, argument):
+    result = run_kavya_image_tag_probe(
+        tmp_path, 1, f"manifest unknown: {argument.lower()}", argument=argument
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == "image_tag_state=probe_failed\n"
+
+
+def test_kavya_image_tag_probe_documents_its_nul_and_case_contract():
+    script = KAVYA_IMAGE_TAG_PROBE.read_text(encoding="utf-8")
+
+    assert "LC_ALL=C od -An -tx1 -v" in script
+    assert "${TAG,,}" in script
+    assert 'registry_error=$(<"$captured_error")' in script
+    assert script.index("LC_ALL=C od -An -tx1 -v") < script.index(
+        'registry_error=$(<"$captured_error")'
+    )
+    assert script.index("LC_ALL=C od -An -tx1 -v") < script.index(
+        'echo "image_tag_state=existing"'
+    )
+
+
 def test_build_kavya_image_publisher_verifies_existing_tags_without_overwriting_them():
     _document, _job, steps, _text = build_kavya_image_job()
 
