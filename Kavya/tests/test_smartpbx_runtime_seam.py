@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import types
 import time
 
 import pytest
@@ -403,6 +404,113 @@ async def test_gateway_reports_dropped_frames_through_status(monkeypatch):
     )
     captured["on_frame_dropped"]()
     assert gateway.snapshot()["frames_dropped_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_kb_retrieval_runs_off_the_event_loop(monkeypatch):
+    import server
+
+    seen: dict[str, int] = {}
+
+    def blocking_retrieve(_text):
+        seen["thread"] = threading.get_ident()
+        time.sleep(0.05)
+        return ""
+
+    monkeypatch.setattr(server, "retrieve_context", blocking_retrieve)
+    session = server.MediaStreamSession(
+        websocket=None, lang="en", anthropic_client=None, openai_client=None,
+        gemini_client=None, media_transport=None, llm_provider="claude", model="m",
+    )
+
+    async def no_llm():
+        return ""
+
+    monkeypatch.setattr(session, "_run_llm_claude", no_llm)
+    await session._process_utterance_bound("do you have a room free")
+
+    assert seen.get("thread") is not None
+    assert seen["thread"] != threading.get_ident(), (
+        "retrieve_context embeds with sentence-transformers and queries Chroma: "
+        "tens of ms of CPU on the loop shared by every concurrent call"
+    )
+
+
+def _fake_google_speech(on_stream):
+    """Minimal stand-in for the google-cloud-speech surface _run_one_stream uses."""
+
+    class AudioEncoding:
+        MULAW = "MULAW"
+
+    class RecognitionConfig:
+        AudioEncoding = AudioEncoding
+
+        def __init__(self, **_kwargs):
+            pass
+
+    class StreamingRecognitionConfig:
+        def __init__(self, **_kwargs):
+            pass
+
+    class StreamingRecognizeRequest:
+        def __init__(self, **_kwargs):
+            pass
+
+    closed: list[int] = []
+
+    class SpeechClient:
+        def __init__(self):
+            self.closed = False
+
+        def streaming_recognize(self, **_kwargs):
+            return on_stream()
+
+        def close(self):
+            self.closed = True
+            closed.append(1)
+
+    return (
+        types.SimpleNamespace(
+            RecognitionConfig=RecognitionConfig,
+            StreamingRecognitionConfig=StreamingRecognitionConfig,
+            StreamingRecognizeRequest=StreamingRecognizeRequest,
+            SpeechClient=SpeechClient,
+        ),
+        closed,
+    )
+
+
+def test_stt_releases_its_speech_client_when_a_stream_fails(monkeypatch):
+    import server
+
+    def boom():
+        raise RuntimeError("stream broke")
+
+    fake, closed = _fake_google_speech(boom)
+    monkeypatch.setattr(server, "google_speech", fake)
+    stream = server.GoogleSTTStream(on_final_result=lambda *_: None, lang="en")
+    stream._running = True
+
+    with pytest.raises(RuntimeError):
+        stream._run_one_stream()
+
+    assert closed, (
+        "a fresh SpeechClient and gRPC channel per ~5min stream restart, never "
+        "closed, piles up fds and completion-queue threads until OOM"
+    )
+
+
+def test_stt_releases_its_speech_client_on_a_clean_stream(monkeypatch):
+    import server
+
+    fake, closed = _fake_google_speech(lambda: iter(()))
+    monkeypatch.setattr(server, "google_speech", fake)
+    stream = server.GoogleSTTStream(on_final_result=lambda *_: None, lang="en")
+    stream._running = True
+
+    stream._run_one_stream()
+
+    assert closed
 
 
 def _failing_stt_loop(monkeypatch, failures: int = 10_000):
