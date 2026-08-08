@@ -209,6 +209,14 @@ Before enabling the Dialog route, emit only the fixed protocol diagnostic with e
 4. Hold four authenticated calls: **4 accepted + 5th rejected**, then hang up
    and verify `/smartpbx/status` returns zero active sessions.
 5. Test endpoint-down fallback before shifting traffic.
+6. **Live barge-in.** Ask Kavya something that produces a long answer, then
+   interrupt her mid-sentence. Confirm she **stops speaking within about a
+   second** and responds to the interruption. Dialog has no `clear` wire event,
+   so the only thing that can cancel queued speech is the outbound queue still
+   holding it: audio is paced at realtime for exactly this reason. If she talks
+   over you to the end of the answer, pacing is not in effect — treat that as a
+   gate failure, not a cosmetic issue, because every interruption for the whole
+   call will behave the same way.
 
 ## Optional transfer activation and compulsory revoke
 

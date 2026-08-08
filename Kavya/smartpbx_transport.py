@@ -12,6 +12,11 @@ from typing import Any
 from smartpbx_protocol import CallContext
 
 
+# g711_ulaw at 8 kHz carries one byte per sample, so a frame's wall-clock
+# duration is simply its length over this rate.
+_ULAW_BYTES_PER_SECOND = 8000
+
+
 @dataclass(frozen=True)
 class _QueuedAudio:
     generation: int
@@ -61,8 +66,17 @@ class SmartPBXMediaTransport:
         self._queue.put_nowait(_QueuedAudio(self._generation, bytes(audio)))
 
     async def send_mark(self, _name: str) -> None:
-        """Acknowledge local speech completion; Dialog defines no mark wire event."""
-        return None
+        """Report speech completion once queued audio has reached the wire.
+
+        Dialog defines no mark wire event. The caller treats completion as "she
+        has stopped talking" and starts its re-prompt timer, so returning while
+        paced audio is still queued would arm that timer mid-sentence. A dead
+        sender, a barge-in, and close() all drain the queue, so this cannot
+        outlive the call.
+        """
+        if not self.is_active:
+            return
+        await self._queue.join()
 
     async def clear_audio(self) -> None:
         """Discard queued audio from the current generation without a wire event."""
@@ -86,24 +100,44 @@ class SmartPBXMediaTransport:
         self._drain_queue()
 
     async def _send_queued_audio(self) -> None:
+        loop = asyncio.get_running_loop()
+        next_send_at: float | None = None
         while True:
             queued = await self._queue.get()
             try:
-                if not self._closed and queued.generation == self._generation:
-                    payload = base64.b64encode(queued.audio).decode("ascii")
-                    try:
-                        await self._websocket.send_text(json.dumps({
-                            "event": "media",
-                            "callId": self._context.call_id,
-                            "accountId": self._context.account_id,
-                            "media": {"payload": payload},
-                        }))
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        # Never echo the wire error: it can carry payload bytes.
-                        self._record_send_failure()
-                        return
+                if self._closed or queued.generation != self._generation:
+                    # A dropped frame also disarms the cadence, so the first
+                    # frame after a barge-in still goes out immediately.
+                    next_send_at = None
+                    continue
+                now = loop.time()
+                if next_send_at is None or next_send_at <= now:
+                    next_send_at = now  # first frame of a reply, or behind
+                else:
+                    # Hold the queue at realtime so barge-in has audio left to
+                    # cancel; cancelled on close(), which then drains.
+                    await asyncio.sleep(next_send_at - now)
+                    # This frame was already claimed from the queue, so a
+                    # barge-in during the sleep could not drain it. Re-check, or
+                    # one stale frame escapes after clear_audio().
+                    if self._closed or queued.generation != self._generation:
+                        next_send_at = None
+                        continue
+                payload = base64.b64encode(queued.audio).decode("ascii")
+                try:
+                    await self._websocket.send_text(json.dumps({
+                        "event": "media",
+                        "callId": self._context.call_id,
+                        "accountId": self._context.account_id,
+                        "media": {"payload": payload},
+                    }))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Never echo the wire error: it can carry payload bytes.
+                    self._record_send_failure()
+                    return
+                next_send_at += len(queued.audio) / _ULAW_BYTES_PER_SECOND
             finally:
                 self._queue.task_done()
 
