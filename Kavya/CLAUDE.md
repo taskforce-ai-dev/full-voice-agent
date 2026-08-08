@@ -195,7 +195,7 @@ Typed input -> KB retrieval -> LLM tool-use loop -> text response -> TTS playbac
 
 **`smartpbx` — Dialog SmartPBX ("Client Connect") ingress, opt-in.** A second, narrower FastAPI app is built instead (`docs_url`/`redoc_url`/`openapi_url` all disabled), exposing exactly three routes:
 - `GET /health` — `{"status": "ok", "service_mode": "smartpbx"}`
-- `GET /smartpbx/status` — session counters (`active_sessions`, `admitted_total`, `rejected_capacity_total`, `released_total`), `enabled`, `configured`, `protocol_version`, `transfer_enabled` — no secrets, no PII
+- `GET /smartpbx/status` — session counters (`active_sessions`, `admitted_total`, `rejected_capacity_total`, `released_total`, `frames_dropped_total`), `enabled`, `configured`, `protocol_version`, `transfer_enabled` — no secrets, no PII. **Requires the same `X-Kavya-SmartPBX-Token` header as the media socket** (constant-time compare): the counters are a live occupancy oracle and a call-volume signal, so they are not publicly readable. `/health` stays unauthenticated for liveness probes; point uptime monitoring there.
 - `WS /ws/v1/smartpbx/media` — the Dialog media socket, gated by a required `X-Kavya-SmartPBX-Token` header (constant-time compare) checked before `websocket.accept()`
 
 Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8000` Hz only — any other codec/rate is rejected at the `start` event. Capacity is hard-capped at **4 concurrent calls** (a 5th is rejected before the socket is even accepted; `SmartPBXSessionRegistry` cannot be constructed outside 1–4).
@@ -203,7 +203,7 @@ Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8
 **Module map** (`Kavya/smartpbx_*.py`):
 - `smartpbx_protocol.py` — strict, transport-independent parser for the Dialog wire events (`connected`/`start`/`media`/`dtmf`/`hangup`/`stop`, else `Unsupported`) into a closed dataclass union; fail-closed on anything malformed.
 - `smartpbx_gateway.py` — `SmartPBXSettings` (env validation), `SmartPBXSessionRegistry` (the 4-call admission counter), and `SmartPBXGateway` (auth → admit → start session → event loop → cleanup-once, emitting the `smartpbx_protocol_diagnostic` log line).
-- `smartpbx_transport.py` — `SmartPBXMediaTransport`, the bounded outbound audio queue serializing `media` frames back to Dialog (drops oldest frame on backpressure; generation-fenced so barge-in can't leak stale audio).
+- `smartpbx_transport.py` — `SmartPBXMediaTransport`, the bounded outbound audio queue serializing `media` frames back to Dialog. Frames are **paced at realtime** so barge-in has queued audio left to cancel (Dialog defines no `clear` wire event); on overflow it **refuses the newest frame**, cutting the tail of a reply rather than decimating it; generation-fenced so barge-in can't leak stale audio; and a dead sender raises a failure signal so the gateway ends the call instead of leaving the guest in silence.
 - `smartpbx_session.py` — `KavyaSmartPBXSession`, the adapter wiring one Dialog call into Kavya's existing `MediaStreamSession` pipeline (STT → KB/PMS tools → LLM → TTS), forcing `lang="en"` and binding transfer/handover context.
 - `smartpbx_mcp.py` — fail-closed Dialog MCP call control: `DialogMCPSettings.from_env()` and `DialogMCPCallControl.transfer_call()`, restricted to operator-configured `tel:`/`sip:` destinations.
 - `smartpbx_handover.py` — `SmartPBXHandoverCoordinator`, the call-local state machine that attempts the MCP transfer and, on failure, falls back to the existing WhatsApp handover notification.
@@ -247,7 +247,7 @@ Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8
 
 ### server.py — SmartPBX service mode (`KAVYA_SERVICE_MODE=smartpbx`, opt-in — see Service Modes above)
 - `GET /health` — `{status, service_mode}` only (no LLM/KB/STT flags — those belong to the Twilio app)
-- `GET /smartpbx/status` — session counters + `transfer_enabled`
+- `GET /smartpbx/status` — session counters + `transfer_enabled`; requires the `X-Kavya-SmartPBX-Token` header (401 without it)
 - `WebSocket /ws/v1/smartpbx/media` — Dialog media socket, requires `X-Kavya-SmartPBX-Token` header, `g711_ulaw`/8000 Hz only, events `connected`/`start`/`media`/`dtmf`/`hangup`/`stop`
 
 ## Server Constants

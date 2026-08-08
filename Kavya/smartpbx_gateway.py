@@ -384,6 +384,9 @@ class SmartPBXGateway:
             return result
 
         done, _ = await asyncio.wait(waited, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        # Worst case a call waits idle_timeout and then the full transfer ceiling
+        # (~390s at defaults), because the transfer can be acknowledged just as the
+        # idle deadline expires. That is bounded and acceptable; it is not 300s.
         if not done and not pending and getattr(session, "transfer_pending", False):
             # The transfer was acknowledged while we were waiting: re-wait on the
             # transfer ceiling rather than closing on the ordinary idle deadline.
