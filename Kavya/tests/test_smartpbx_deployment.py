@@ -954,12 +954,18 @@ class FakeDeployHost:
         environment = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state)}
         command = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; APP_DIR={self.app}; LOCK_FILE={self.root / 'lock'}; main \"$@\""
         root_environment = [f"{key}={value}" for key, value in environment.items()]
-        return subprocess.Popen(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return subprocess.Popen(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
 
     def deploy(self, **env): return self.run(self.sha[:7], self.sha, self.digest, **env)
     def logs(self): return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
     def compose_count(self): return self.logs().count("up -d --force-recreate --pull never kavya-smartpbx")
-    def current(self): return json.loads(self.state.read_text(encoding="utf-8"))
+    def current(self):
+        for _ in range(20):
+            try:
+                return json.loads(self.state.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                time.sleep(0.005)
+        return json.loads(self.state.read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize("state,environment", [
