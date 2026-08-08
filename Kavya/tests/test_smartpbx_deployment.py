@@ -2575,3 +2575,28 @@ def test_publisher_resolve_digest_handles_the_existing_mode(tmp_path):
 
     assert result.returncode == 0
     assert outputs.strip() == f"digest={PUBLISHER_BUILT_DIGEST}"
+
+
+PUBLISHER_RESOLVE_FAILURES = [
+    ({"BUILT_DIGEST": "not-a-digest"}, "built_digest_malformed"),
+    ({"DIGEST_CODE": 1}, "registry_inspect_failed"),
+    ({"DIGEST_OUT": "not-a-digest"}, "pushed_digest_malformed"),
+    ({"DIGEST_OUT": "sha256:" + "b" * 64}, "pushed_digest_mismatch"),
+    ({"MODE": "sideways"}, "unrecognized_image_mode"),
+]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "marker"), PUBLISHER_RESOLVE_FAILURES,
+    ids=[marker for _overrides, marker in PUBLISHER_RESOLVE_FAILURES],
+)
+def test_publisher_resolve_digest_says_which_check_failed(tmp_path, overrides, marker):
+    # The first live publish failed here and the log could not say which of the
+    # four checks tripped, which cost a diagnostic round trip.
+    result, outputs, _log = run_publisher_workflow_step(
+        tmp_path, "Resolve image digest", **overrides
+    )
+
+    assert result.returncode == 1
+    assert f"resolve_digest={marker}" in result.stderr, result.stderr
+    assert outputs == ""
