@@ -719,20 +719,20 @@ def test_smartpbx_image_deploy_helper_completes_all_preflights_before_arming_rol
         "check_env_files",
         "validate_english_voice_env.sh",
         "canonical_voice_match=ok",
-        "check_legacy_flico",
-        "docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null 2>&1",
-        "docker pull \"$IMAGE@$EXPECTED_DIGEST\" > /dev/null 2>&1",
+        "capture_isolation_baseline",
+        "docker compose --env-file .env.smartpbx --profile smartpbx config >/dev/null",
+        "docker pull \"$IMAGE@$EXPECTED_DIGEST\" >/dev/null",
         "verify_candidate_image",
     ):
         assert required in script
-    main_block = script.split("main(){", 1)[1].split("\nif [[", 1)[0]
-    assert "trap rollback ERR" in main_block
-    assert main_block.find("verify_candidate_image") < main_block.find("trap rollback ERR") < main_block.find("recreate_smartpbx")
+    main_block = script.split("main() {", 1)[1].split("\nif [[", 1)[0]
+    assert "arm_rollback" in main_block
+    assert main_block.find("verify_candidate_image") < main_block.find("arm_rollback") < main_block.find("recreate_smartpbx")
     assert "ROLLBACK_TAG=" in script
     assert "ROLLBACK_DIGEST=" in script
     assert "ROLLBACK_REVISION=" in script
     assert "docker image tag \"$ROLLBACK_IMAGE_ID\" \"$IMAGE:$ROLLBACK_TAG\"" in script
-    assert "verify_local_rollback" in script
+    assert "rollback_once" in script
 
 
 def test_smartpbx_image_deploy_helper_recreates_only_smartpbx_and_checks_json_readiness():
@@ -746,9 +746,9 @@ def test_smartpbx_image_deploy_helper_recreates_only_smartpbx_and_checks_json_re
     assert "http://127.0.0.1:8006/smartpbx/status" in script
     assert ".status == \"ok\" and .service_mode == \"smartpbx\"" in script
     assert ".active_sessions == 0 and .transfer_enabled == false" in script
-    assert "docker inspect --format \"{{.Image}}\" kavya-smartpbx" in script
+    assert "docker inspect --format '{{.Image}}' kavya-smartpbx" in script
     assert "verify_running_image" in script
-    assert "verify_legacy_flico_unchanged" in script
+    assert "verify_isolation_baseline" in script
     for forbidden in (
         "docker system prune",
         "docker image prune",
@@ -766,11 +766,11 @@ def test_smartpbx_image_deploy_helper_recreates_only_smartpbx_and_checks_json_re
 def test_smartpbx_image_deploy_helper_rolls_back_exact_local_baseline_without_sensitive_output():
     script = read_smartpbx_image_deploy_script()
 
-    assert "rollback()" in script
+    assert "rollback_once()" in script
     assert "TAG=$ROLLBACK_TAG" in script
     assert "wait_for_smartpbx_ready" in script
     assert "SMARTPBX_ROLLBACK_ESCALATION_REQUIRED" in script
-    assert "return 1" in script[script.find("rollback()"):]
+    assert "return 1" in script[script.find("rollback_once()") :]
     for forbidden in (
         "cat .env",
         "printenv",

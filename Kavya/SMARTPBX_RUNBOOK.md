@@ -278,4 +278,26 @@ curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e '.transfer_enabled == 
 
 ## Guarded immutable image deployment
 
-Use `deploy_smartpbx_image.sh NEW_TAG EXPECTED_SHA EXPECTED_DIGEST` only after an authenticated integration probe; it validates the local baseline before recreating only `kavya-smartpbx`.
+Use the guarded helper only after an authenticated integration probe and an
+approved immutable-image review record. Its three arguments are the exact
+lowercase CI short tag, the full reviewed OCI revision, and the image digest;
+the short tag must be the first seven characters of that revision.
+
+Prerequisites: run as root on the target host, keep `/opt/kavya/.env` and
+`/opt/kavya/.env.smartpbx` owned by `root:root` with mode `0600`, retain a
+healthy `flico-voice-agent` and `kavya-voice-agent`, and ensure the reviewed
+GHCR digest is pullable. The helper checks the existing SmartPBX image ID,
+repository digest, and OCI revision, then records a local rollback alias before
+it recreates only `kavya-smartpbx`.
+
+```sh
+# As root: deploy_smartpbx_image.sh NEW_TAG EXPECTED_SHA EXPECTED_DIGEST
+/opt/kavya/scripts/deploy_smartpbx_image.sh "$NEW_TAG" "$EXPECTED_SHA" "$EXPECTED_DIGEST"
+```
+
+It rolls back once for ordinary errors and `INT`, `TERM`, or `HUP`, and verifies
+the restored image identity and the unchanged healthy Flico and legacy Kavya
+containers. `SIGKILL`, kernel panic, power loss, and host loss cannot run a
+shell trap; an operator must inspect and recover those cases from the recorded
+baseline/rollback alias. The helper never manages Nginx, prunes images, or
+mutates another service.
