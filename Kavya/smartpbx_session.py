@@ -138,6 +138,9 @@ class KavyaSmartPBXSession:
                 if not self._welcome_task.done():
                     self._welcome_task.cancel()
                 await asyncio.gather(self._welcome_task, return_exceptions=True)
+            # No-op for Dialog calls: only MediaStreamSession.run() appends to
+            # _audio_dump, and the SmartPBX path never runs it. STT_DEBUG_DUMP
+            # produces no wavs here -- do not debug STT waiting for them.
             pipeline._write_audio_dump()
             if self._smartpbx_transfer_context is not None and self._smartpbx_transfer_context.coordinator is not None:
                 await self._smartpbx_transfer_context.coordinator.finalize_notification_retry()

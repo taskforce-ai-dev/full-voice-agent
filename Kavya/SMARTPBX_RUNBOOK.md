@@ -214,7 +214,13 @@ Before enabling the Dialog route, emit only the fixed protocol diagnostic with e
 3. Exercise a KB answer and PMS tool, then verify a post-call record reaches the
    dashboard/webhook.
 4. Hold four authenticated calls: **4 accepted + 5th rejected**, then hang up
-   and verify `/smartpbx/status` returns zero active sessions.
+   and verify `/smartpbx/status` returns zero active sessions. Note that a
+   pre-accept rejection closes before the WebSocket handshake completes, so the
+   close codes (`1008` policy violation, `1013` capacity) never reach the wire —
+   Dialog sees a bare HTTP `403` and cannot distinguish "wrong token" from "at
+   capacity". Record what Dialog actually observes for the capacity rejection,
+   and use the `failure_class` in our own diagnostic stream (`authentication` vs
+   `capacity`) as the authoritative signal.
 5. Test endpoint-down fallback before shifting traffic.
 6. **Live barge-in.** Ask Kavya something that produces a long answer, then
    interrupt her mid-sentence. Confirm she **stops speaking within about a

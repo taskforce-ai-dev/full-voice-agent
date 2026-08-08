@@ -175,6 +175,13 @@ def _parse_context(message: Mapping[object, object]) -> CallContext:
 
 
 def _parse_media(message: Mapping[object, object], *, max_audio_bytes: int) -> MediaEvent:
+    # Hot path: ~50 frames/sec/call, so ~200/sec at the four-call cap. Two costs
+    # are accepted here deliberately. The json.dumps below re-serialises the
+    # message only to bound the payload length, and the b64 round-trip re-encodes
+    # every frame to reject non-canonical base64. Both are kept: the round-trip is
+    # real validation, not a formality, and weakening either to save CPU would
+    # trade a correctness guarantee for microseconds. Revisit only with a profile
+    # showing this is the actual bottleneck, and keep the round-trip if so.
     media = _required_mapping(message, "media")
     payload = _required_text(media, "payload", len(json.dumps(message)))
     try:

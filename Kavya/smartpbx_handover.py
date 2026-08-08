@@ -147,6 +147,24 @@ class SmartPBXHandoverCoordinator:
         except Exception:
             return
 
+    def _emit_handover_diagnostic(self) -> None:
+        """Report that no human was reached, without touching call state."""
+        from smartpbx_diagnostics import (
+            DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage,
+        )
+
+        sink = getattr(self._pipeline, "_smartpbx_diagnostic_sink", None)
+        if sink is None:
+            return
+        try:
+            sink(
+                DiagnosticStage.HANDOVER,
+                DiagnosticOutcome.DEGRADED,
+                DiagnosticFailureClass.HANDOVER_NOT_ACTIONABLE,
+            )
+        except Exception:
+            return
+
     async def _deliver_notification(self) -> str:
         if self._notification_state == "sent":
             return "sent"
@@ -154,11 +172,15 @@ class SmartPBXHandoverCoordinator:
             return self._notification_state or "failed"
         if self._notification_sender is None:
             self._notification_state = "not_actionable"
+            self._emit_handover_diagnostic()
             return self._notification_state
         from handover import normalize_whatsapp
 
         if not normalize_whatsapp(self._caller_phone) or not normalize_whatsapp(self._human_agent_whatsapp):
+            # A withheld or landline CLI ends here and nobody is notified at all.
+            # Make that visible rather than letting the lead vanish silently.
             self._notification_state = "not_actionable"
+            self._emit_handover_diagnostic()
             return self._notification_state
         self._notification_attempts += 1
         self._notification_state = "failed"

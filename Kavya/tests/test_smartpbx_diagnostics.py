@@ -15,7 +15,7 @@ def test_diagnostics_enums_are_exact_str_enums_with_stable_values():
     diagnostics = load_diagnostics_module()
     expected = {
         "DiagnosticStage": (
-            "SCHEMA_ADMISSION", "CONTEXT_VALIDATION", "SESSION_START", "AUDIO_INGESTION", "TTS", "TERMINAL_CLEANUP",
+            "SCHEMA_ADMISSION", "CONTEXT_VALIDATION", "SESSION_START", "AUDIO_INGESTION", "TTS", "HANDOVER", "TERMINAL_CLEANUP",
         ),
         "DiagnosticOutcome": (
             "REJECTED", "OBSERVED", "COMPLETED", "DISCONNECTED", "CANCELLED", "FAILED", "DEGRADED",
@@ -27,7 +27,7 @@ def test_diagnostics_enums_are_exact_str_enums_with_stable_values():
             "START_TIMEOUT", "IDLE_TIMEOUT", "TRANSFER_PENDING_TIMEOUT",
             "SESSION_FACTORY", "SESSION_START", "AUDIO_INGESTION",
             "TTS_MISSING_API_KEY", "TTS_PROFILE_FAILURE", "TTS_HTTP_STATUS", "TTS_TIMEOUT", "TTS_EXCEPTION",
-            "TRANSPORT_DISCONNECT", "TRANSPORT_SEND",
+            "HANDOVER_NOT_ACTIONABLE", "TRANSPORT_DISCONNECT", "TRANSPORT_SEND",
             "CANCELLED", "SESSION_CLEANUP", "TRANSPORT_CLEANUP", "LEASE_CLEANUP",
             "WEBSOCKET_CLOSE", "INTERNAL_ERROR",
         ),

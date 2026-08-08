@@ -10,6 +10,7 @@ class DiagnosticStage(StrEnum):
     SESSION_START = "session_start"
     AUDIO_INGESTION = "audio_ingestion"
     TTS = "tts"
+    HANDOVER = "handover"
     TERMINAL_CLEANUP = "terminal_cleanup"
 
 
@@ -51,6 +52,7 @@ class DiagnosticFailureClass(StrEnum):
     TTS_HTTP_STATUS = "tts_http_status"
     TTS_TIMEOUT = "tts_timeout"
     TTS_EXCEPTION = "tts_exception"
+    HANDOVER_NOT_ACTIONABLE = "handover_not_actionable"
     TRANSPORT_DISCONNECT = "transport_disconnect"
     TRANSPORT_SEND = "transport_send"
     CANCELLED = "cancelled"

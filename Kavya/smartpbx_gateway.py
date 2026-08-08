@@ -400,6 +400,9 @@ class SmartPBXGateway:
             await _settle(None)
             raise _TransportSendFailure
         if terminal in done:
+            # Terminal wins a same-tick race and the pending message is dropped.
+            # That is intended: the session has already finished, so the only
+            # messages that can arrive here are teardown ones we would ignore.
             await _settle(None)
             terminal.result()
             return None
