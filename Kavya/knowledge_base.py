@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 import re
 from functools import lru_cache
 from typing import Dict, List, Optional
@@ -64,6 +65,14 @@ DEFAULT_DOCS_DIRECTORY: str = "knowledge_docs"
 _chroma_client = None
 _embedding_model = None
 
+# retrieve_context runs under asyncio.to_thread, so these loaders can be
+# entered concurrently on a cold start. Without these locks two callers each
+# build their own embedding model -- 400MB-1GB apiece inside a 1536m
+# container -- and the resulting OOM takes every live call with it. The fast
+# path stays lock-free once the singleton is set.
+_chroma_lock = threading.Lock()
+_embedding_lock = threading.Lock()
+
 
 def _get_chroma_client():
     """Return (or create) a persistent ChromaDB client â€” lazy singleton."""
@@ -74,6 +83,16 @@ def _get_chroma_client():
     if not CHROMADB_AVAILABLE:
         logger.warning("chromadb is not installed â€” knowledge base disabled.")
         return None
+
+    with _chroma_lock:
+        if _chroma_client is not None:
+            return _chroma_client
+        return _create_chroma_client()
+
+
+def _create_chroma_client():
+    """Build the persistent client. Callers must hold _chroma_lock."""
+    global _chroma_client
 
     os.makedirs(PERSIST_DIRECTORY, exist_ok=True)
 
@@ -118,6 +137,16 @@ def _get_embedding_model():
             "sentence-transformers is not installed â€” embeddings unavailable."
         )
         return None
+
+    with _embedding_lock:
+        if _embedding_model is not None:
+            return _embedding_model
+        return _load_embedding_model()
+
+
+def _load_embedding_model():
+    """Load the model. Callers must hold _embedding_lock."""
+    global _embedding_model
 
     try:
         _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
