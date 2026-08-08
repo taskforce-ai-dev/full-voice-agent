@@ -320,6 +320,67 @@ async def test_close_drains_paced_audio_promptly():
     assert transport._queue.empty()
 
 
+class PayloadSocket:
+    """Records the decoded audio of every outbound frame, in order."""
+
+    def __init__(self) -> None:
+        self.audio: list[bytes] = []
+
+    async def send_text(self, message: str) -> None:
+        import base64
+
+        self.audio.append(base64.b64decode(json.loads(message)["media"]["payload"]))
+
+
+@pytest.mark.asyncio
+async def test_queue_overflow_truncates_the_tail_instead_of_decimating():
+    from smartpbx_transport import SmartPBXMediaTransport
+
+    socket = PayloadSocket()
+    transport = SmartPBXMediaTransport(socket, CONTEXT, max_queue_frames=8)
+    transport.start()
+
+    # TTS outruns realtime, so a long reply overflows the queue. Evicting the
+    # oldest frame throws away the one that was next due, so playback jumps
+    # forward again and again: garble spread through the whole reply. Refusing
+    # the newest frame instead degrades to a clean cut of the tail.
+    frames = [bytes([index]) * 160 for index in range(40)]
+    for frame in frames:
+        await transport.send_audio(frame)
+    await asyncio.sleep(0.35)
+    sent, queued = len(socket.audio), transport._queue.qsize()
+    dropped = transport.frames_dropped_total
+    await transport.close()
+
+    assert socket.audio, "some audio must still be delivered"
+    assert socket.audio == frames[:sent], (
+        "delivered audio must be a contiguous prefix of the reply, not a "
+        f"decimated sample of it (got indices {[a[0] for a in socket.audio]})"
+    )
+    assert sent + queued + dropped == len(frames), (
+        f"every frame must be accounted for: {sent} sent + {queued} queued + "
+        f"{dropped} dropped != {len(frames)}"
+    )
+    assert dropped > 0, "this reply must genuinely overflow the queue"
+
+
+def test_outbound_queue_holds_a_long_reply():
+    from smartpbx_gateway import SmartPBXSettings
+
+    base = {
+        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+    }
+    # 512 frames of 640 bytes is ~40s of speech and ~320KB per call, so the
+    # queue stops being the binding constraint on ordinary long replies.
+    assert SmartPBXSettings.from_env(base).max_outbound_frames == 512
+    assert SmartPBXSettings.from_env(base | {
+        "SMARTPBX_MAX_OUTBOUND_FRAMES": "512",
+    }).max_outbound_frames == 512
+    with pytest.raises(ValueError):
+        SmartPBXSettings.from_env(base | {"SMARTPBX_MAX_OUTBOUND_FRAMES": "513"})
+
+
 @pytest.mark.asyncio
 async def test_dropped_frames_are_counted_rather_than_silently_discarded():
     from smartpbx_transport import SmartPBXMediaTransport
