@@ -564,6 +564,13 @@ STT_ALTERNATIVES: dict[str, list[str]] = {
 # Silence (seconds) after last STT result before utterance is considered complete
 ENDPOINTING_SILENCE: float = 1.5
 
+# Bounds on restarting a failed STT stream. Google caps a streaming_recognize
+# call at ~5 minutes, so healthy restarts are normal and must stay cheap; a
+# persistent failure (rotated credentials, quota) must not become a tight spin.
+STT_RESTART_BACKOFF_BASE: float = 0.25
+STT_RESTART_BACKOFF_MAX: float = 5.0
+STT_MAX_CONSECUTIVE_FAILURES: int = 8
+
 # Silence (seconds) after greeting / agent turn before we re-prompt the caller.
 # If the caller never speaks, we re-greet them or ask if they're still online,
 # up to MAX_REPROMPTS times. After that we stop re-prompting.
@@ -2387,13 +2394,35 @@ class GoogleSTTStream:
             yield chunk
 
     def _loop(self):
+        # A synchronous failure (rotated credentials, quota, network) would
+        # otherwise restart with no delay and no ceiling: a tight spin that
+        # writes one traceback per iteration and destroys the log ring.
+        consecutive_failures = 0
         while self._running:
             try:
                 self._run_one_stream()
+                consecutive_failures = 0
             except Exception as exc:
                 if not self._running:
                     break
-                logger.warning("STT stream ended (%s) — restarting...", exc, exc_info=True)
+                consecutive_failures += 1
+                if consecutive_failures >= STT_MAX_CONSECUTIVE_FAILURES:
+                    self._running = False
+                    logger.error(
+                        "STT stream failed %d times consecutively (%s) — giving up so the call can end",
+                        consecutive_failures, exc,
+                    )
+                    break
+                backoff = min(
+                    STT_RESTART_BACKOFF_BASE * (2 ** (consecutive_failures - 1)),
+                    STT_RESTART_BACKOFF_MAX,
+                )
+                logger.warning(
+                    "STT stream ended (%s) — restart %d/%d in %.1fs",
+                    exc, consecutive_failures, STT_MAX_CONSECUTIVE_FAILURES, backoff,
+                    exc_info=consecutive_failures == 1,
+                )
+                time.sleep(backoff)
 
     def _run_one_stream(self):
         client = google_speech.SpeechClient()
