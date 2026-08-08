@@ -31,7 +31,7 @@
 - Existing-tag probe must accept only exit `10` and exactly one line `image_tag_state=existing`; canary probe must accept only exit `0` and exactly one line `image_tag_state=absent`.
 - Capture and suppress all probe, pull, and inspect stdout/stderr. Emit fixed markers only; never print registry errors, tokens, layer progress, image configuration, secrets, or environment dumps.
 - Prohibit package writes, build/build-push/push/tag mutation, SSH, rsync, Nginx, systemctl, compose, environment mutation, deploy commands, and host/dashboard actions.
-- No publisher dispatch is permitted until the main-branch probe succeeds with tag `37bfaf0` and revision `37bfaf02f04ce7614b9674b1c867b78ab3c7d414`. This is enforced mechanically: the publisher hard-fails before any credentialed step unless a completed, successful run of `probe-kavya-image.yml` exists on `main` at the publisher's own `github.sha`, finished within 24 hours. Its `permissions` therefore include `actions: read` alongside `contents: read` and `packages: write`.
+- No publisher dispatch is permitted until the main-branch probe succeeds for the revision being published. The **first** publish uses bootstrap mode, because the registry is empty and a strict probe cannot pass against a tag nobody has pushed (see the design document's "Bootstrap mode and the first-image deadlock"); the stale `37bfaf0` / `37bfaf02f04ce7614b9674b1c867b78ab3c7d414` pair never had a published image and is not the acceptance input. Enforcement is mechanical: the publisher hard-fails before any credentialed step unless a completed, successful run of `probe-kavya-image.yml` exists on `main` at the publisher's own `github.sha`, finished within 24 hours. Its `permissions` therefore include `actions: read` alongside `contents: read` and `packages: write`.
 
 ---
 
@@ -767,24 +767,41 @@ gh api repos/taskforce-ai-dev/full-voice-agent/branches/main --jq '.protected'
 
 Expected: `true`. If it prints `false`, enable branch protection first — do not work around the check.
 
-**Expect the first probe to fail at `canary_state`.** The helper's absent-message allowlist was never verified against live GHCR (see the design document's "The absent-message allowlist is unverified against live GHCR"). A helper exit of `2` / `image_tag_state=probe_unrecognized` and the `helper_result=unrecognized_registry_message` marker in the step log means exactly that. The remedy is to read the real capture from the failed run and add that exact message to the allowlist in a reviewed PR citing the run URL — never to loosen the matching.
+**The allowlist gap has been hit and partly closed.** The first dispatch failed exit `2` at the **existing-tag** step (run 31267746235). The wording was captured deliberately and `"error: $TAG: not found"` is now allowlisted — see the design document's provenance note. If a future run reports `probe_unrecognized` again, the remedy is unchanged: capture the real bytes, add that exact whole-capture string in a reviewed PR citing the run URL, never loosen the matching.
 
-The first operational acceptance uses existing tag `37bfaf0` and expected revision `37bfaf02f04ce7614b9674b1c867b78ab3c7d414`. Send the documented repository dispatch — it carries no ref or SHA selector, and GitHub selects the default-branch copy of the workflow:
+**The first acceptance runs in bootstrap mode.** Nothing has ever been published, so a strict probe cannot pass. Use the current `main` revision, not the stale `37bfaf0` pair. Send the documented repository dispatch — it carries no ref or SHA selector, and GitHub selects the default-branch copy of the workflow:
 
 ```bash
-gh api --method POST repos/taskforce-ai-dev/full-voice-agent/dispatches \
+set -Eeuo pipefail
+fail() { printf '%s\n' 'dispatcher_validation=fail' >&2; exit 1; }
+
+repo='taskforce-ai-dev/full-voice-agent'
+expected_revision=$(git rev-parse origin/main)
+existing_tag=${expected_revision:0:7}
+
+[[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]] || fail
+[[ "$existing_tag" =~ ^[0-9a-f]{7}$ ]] || fail
+
+# bootstrap=true is accepted only as this exact string, and only while no image
+# exists. Drop the flag entirely for every probe after the first publish.
+gh api --method POST "repos/$repo/dispatches" \
   -f event_type=kavya_image_read_only_probe \
-  -f 'client_payload[existing_tag]=37bfaf0' \
-  -f 'client_payload[expected_revision]=37bfaf02f04ce7614b9674b1c867b78ab3c7d414'
+  -f "client_payload[existing_tag]=$existing_tag" \
+  -f "client_payload[expected_revision]=$expected_revision" \
+  -f 'client_payload[bootstrap]=true'
 ```
 
 Run the design document's full fail-fast dispatcher (it validates both values before `gh api`) rather than the bare call when dispatching by hand.
 
-Expected: the completed run records exactly the fifteen safe-summary keys, including `existing_tag_state=pass`, `existing_revision=pass`, `canary_state=pass`, `probe_version=1`, and `probe_result=pass`, together with the workflow commit SHA, the three pinned action identifiers, `runner_label=ubuntu-24.04` with the documented `runner_os` / `runner_arch`, and the actual Buildx version. Inspect GitHub's setup-action logs and confirm the resolved action commit SHAs match the pins; the summary records the pinned identifiers but does not itself cryptographically prove resolution. A changed action resolution or an unexpected runner or Buildx version fails acceptance.
+Expected for a **bootstrap** run: `probe_mode=bootstrap`, `existing_tag_state=absent_bootstrap`, `existing_revision=skipped_no_image`, and still `canary_state=pass`, `probe_version=1`, `probe_result=pass`. Expected for every **strict** run afterwards: `probe_mode=strict`, `existing_tag_state=pass`, `existing_revision=pass`, `canary_state=pass`, `probe_version=1`, `probe_result=pass`. Either way the run records together with the workflow commit SHA, the three pinned action identifiers, `runner_label=ubuntu-24.04` with the documented `runner_os` / `runner_arch`, and the actual Buildx version. Inspect GitHub's setup-action logs and confirm the resolved action commit SHAs match the pins; the summary records the pinned identifiers but does not itself cryptographically prove resolution. A changed action resolution or an unexpected runner or Buildx version fails acceptance.
 
 - [ ] **Step 9: Gate publisher authority on the accepted probe.**
 
-Do not dispatch the immutable publisher for `69ec0b3` unless Step 8 passed and its safe evidence was accepted. The publisher now enforces this itself and will fail closed without a fresh same-commit probe, but the human acceptance of the probe's evidence in Step 8 is still required — the gate checks that a probe *succeeded*, not that anyone read it. Note the 24-hour window and the `github.sha` binding: if a commit lands on `main` after the probe, or more than a day passes, re-run the probe before dispatching. A probe failure, malformed marker, existing canary, missing provenance label, metadata mismatch, or uncertain registry result stops the release; correct the reviewed workflow or tests in a new PR and repeat Tasks 1 through 8.
+Do not dispatch the immutable publisher unless Step 8 passed and its safe evidence was accepted. Publish the **current `main`** revision, not the stale `69ec0b3`. A bootstrap-green probe satisfies the gate honestly, but read the summary: `probe_mode=bootstrap` with `existing_revision=skipped_no_image` means no image was verified because none existed, which is exactly the expected state for a first publish and must never be accepted as evidence for a later one. The publisher now enforces this itself and will fail closed without a fresh same-commit probe, but the human acceptance of the probe's evidence in Step 8 is still required — the gate checks that a probe *succeeded*, not that anyone read it. Note the 24-hour window and the `github.sha` binding: if a commit lands on `main` after the probe, or more than a day passes, re-run the probe before dispatching. A probe failure, malformed marker, existing canary, missing provenance label, metadata mismatch, or uncertain registry result stops the release; correct the reviewed workflow or tests in a new PR and repeat Tasks 1 through 8.
+
+- [ ] **Step 10: Re-probe strict against the newly published tag.**
+
+Once the publisher has pushed, dispatch the probe again **without** `bootstrap`, using the published revision. This is the run that actually proves the image's `org.opencontainers.image.revision` label, and it is the evidence the gate should be carrying from then on. Expect `probe_mode=strict`, `existing_tag_state=pass`, `existing_revision=pass`. A failure here means the published image does not match what was reviewed — stop and investigate rather than re-running bootstrap.
 
 ## Plan Self-Check
 

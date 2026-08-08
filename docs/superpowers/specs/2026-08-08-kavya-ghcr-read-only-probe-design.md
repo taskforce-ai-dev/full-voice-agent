@@ -343,9 +343,10 @@ contains exactly these keys and no others:
 | `existing_tag` | a value matching `^[0-9a-f]{7}$` |
 | `expected_revision` | a value matching `^[0-9a-f]{40}$` |
 | `probe_version` | `1` |
-| `existing_tag_state` | `pass` |
-| `existing_revision` | `pass` |
+| `existing_tag_state` | `pass`, or `absent_bootstrap` in bootstrap mode |
+| `existing_revision` | `pass`, or `skipped_no_image` when no image exists |
 | `canary_state` | `pass` |
+| `probe_mode` | `strict` or `bootstrap` |
 | `probe_result` | `pass` on success or `fail` as the sole generic workflow-authored failure marker |
 
 `buildx_version` is the validated version token, not the raw `docker buildx
@@ -391,11 +392,36 @@ most likely arrives as an `ERROR: `-prefixed line that matches no allowlist
 entry. A second code path in the same file prints `"ERROR: %+v"` with a stack
 formatter and no trailing newline when debug output is enabled.
 
-The `ERROR: ` prefix is therefore confirmed from source, but the message tail is
-resolver-dependent and is **not** confirmed. Because the allowlist compares the
-entire capture byte-for-byte, a partially-known string cannot be added safely, so
-no `ERROR: ` variants are pre-registered. Guessing them would either miss anyway
-or, worse, match something that is not an absent tag.
+The `ERROR: ` prefix is therefore confirmed from source, but the message tail was
+resolver-dependent and initially unconfirmed, so no `ERROR: ` variant was
+pre-registered.
+
+**Observed 2026-08-08 and now allowlisted.** The first live dispatch failed
+exactly as predicted below, at the existing-tag step. The wording was then
+captured deliberately by a throwaway diagnostic workflow that replicated this
+helper's capture byte-for-byte (combined stdout+stderr, then the same load and
+case-fold), in
+[run 31269079235/31269079259](https://github.com/taskforce-ai-dev/full-voice-agent/actions/runs/31269079259)
+on branch `diag/ghcr-capture` (PR #213, closed unmerged, branch deleted). Both an
+acceptance-shaped and a canary-shaped reference produced the identical shape, 57
+and 61 bytes, single line, no NUL:
+
+```text
+ERROR: ghcr.io/taskforce-ai-dev/kavya:37bfaf0: not found
+ERROR: ghcr.io/taskforce-ai-dev/kavya:probe-0-0-0: not found
+```
+
+After the helper's load and case-fold the compared form is
+`error: <ref>: not found`, so a single entry `"error: $TAG: not found"`
+reproduces both observations exactly. That entry is now in the allowlist. It
+remains a whole-capture equality match anchored on `$TAG`; other `ERROR: `
+shapes stay `probe_unrecognized` until they are themselves observed.
+
+One caveat on that provenance: at capture time the package did not exist at all.
+A missing tag inside a package that *does* exist may word differently (the
+already-present `manifest unknown: $TAG` and `no such manifest: $TAG` entries
+anticipate that). Treat a future `probe_unrecognized` the same way — capture,
+then widen on the exact string.
 
 **Expected first-dispatch failure.** The most likely outcome of the first live
 probe at plan Step 8 is `canary_state` failing with the helper exiting `2`
@@ -415,6 +441,63 @@ printing captured bytes: exit `2` means the registry said something unrecognised
 and widening may be appropriate; exit `1` means the helper rejected the argument
 or the capture structurally (bad argument, mixed case, NUL bytes) and widening is
 never the answer.
+
+## Bootstrap mode and the first-image deadlock
+
+The design as originally written could never publish a first image. The probe
+requires the caller's `existing_tag` to already exist in the registry, and the
+publisher's gate requires a green probe run at the publisher's own `head_sha`.
+With an empty package neither can go first. The acceptance premise below --
+validate `37bfaf0` -- was therefore unsatisfiable: the publisher has never run,
+so no image for that revision was ever pushed.
+
+`client_payload` accepts one further **optional** field to break this:
+
+| Field | Required format | Meaning |
+| --- | --- | --- |
+| `bootstrap` | absent, or exactly the string `"true"` | this dispatch may pass with no image published yet |
+
+Validation is deliberately unforgiving. Exactly one spelling asks for bootstrap
+and exactly one omission declines it; `"false"`, `"TRUE"`, `"1"`, whitespace
+variants, `null`, and any non-string type all fail the dispatch before any
+`uses:` action. A typo must be loud, never a silent fall back to a mode the
+operator did not choose. The permitted key sets are therefore exactly
+`["existing_tag", "expected_revision"]` or
+`["bootstrap", "existing_tag", "expected_revision"]`.
+
+What bootstrap changes, and nothing more:
+
+- the existing-tag step additionally accepts a classified `absent` (helper exit
+  `0`, stdout byte-equal to `image_tag_state=absent\n`) and records
+  `existing_tag_state=absent_bootstrap`;
+- if the tag *does* exist, it is verified exactly as in strict mode and records
+  `existing_tag_state=pass`, so bootstrap never skips a check it could perform;
+- the revision step, when there is no image, records
+  `existing_revision=skipped_no_image` and makes no registry call at all;
+- the summary records `probe_mode=bootstrap`.
+
+What bootstrap does **not** change: every terminal trust check, the exact-state
+requirement (an unrecognised message, a `probe_failed`, wrong bytes, or an
+unexpected exit code all still fail through an explicit `else`), the absent-canary
+negative control, the closed summary allowlist, and strict mode itself.
+
+### What a bootstrap-green probe establishes
+
+Less than a strict-green one, and the summary says so. It establishes that the
+workflow ran from protected `main` at its own workflow commit having passed every
+trust check, that the shared classifier and the read path work (the canary is
+still proven absent), and that the caller-selected tag was **confirmed absent**.
+It establishes **nothing whatsoever** about image contents or provenance, because
+there is no image. `existing_revision=skipped_no_image` is the honest record of
+that: the revision label was not verified because none exists.
+
+The publisher gate needs no change. It requires a completed, successful probe run
+on `main` at the publisher's own `head_sha` within the freshness window, and a
+bootstrap-green run satisfies that honestly — its own summary discloses
+`probe_mode=bootstrap` and `existing_revision=skipped_no_image`, so a reviewer
+reading the evidence cannot mistake it for a verified-image pass. Bootstrap is
+expected to be used **once**, for the first publish; every later probe runs
+strict against the tag the publisher created.
 
 ## Runner and Buildx evidence
 
@@ -497,9 +580,18 @@ NUL-induced `probe_failed`, block writing. No dynamic registry test is added.
 
 After exact-head CI, secret scanning, and independent review approve the
 merged protected-main revision, the trusted operator sends the documented
-dispatch without a ref selector. Acceptance requires the validated
-`existing_tag=37bfaf0`,
-`expected_revision=37bfaf02f04ce7614b9674b1c867b78ab3c7d414`, every fixed pass
+dispatch without a ref selector.
+
+**First acceptance runs in bootstrap mode.** The registry is empty, so the
+sequence is: a bootstrap probe on `main`, then the publisher for the current
+`main` revision, then every subsequent probe strict against the tag the publisher
+created. The `37bfaf0` pair is not the acceptance input — it never had a
+published image. Use the current `main` revision, and expect
+`existing_tag_state=absent_bootstrap` plus
+`existing_revision=skipped_no_image` in that first run.
+
+Acceptance thereafter requires the validated `existing_tag` and
+`expected_revision` for a published revision, every fixed pass
 marker, the pinned-action resolution, the requested runner label and documented
 runner context values, Buildx diagnostic, and the GitHub-generated `Set up job`
 image/version block. This evidence is point-in-time only and does not establish
