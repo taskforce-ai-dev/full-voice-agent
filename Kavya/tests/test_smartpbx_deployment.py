@@ -1046,12 +1046,15 @@ def test_build_kavya_image_publisher_is_dispatch_only_and_least_privilege():
     document, job, steps, text = build_kavya_image_job()
 
     assert document["name"] == "Build Kavya image (no deploy)"
+    # The parsed trigger set is the authoritative check that no other event -- a
+    # `workflow_run` chain in particular -- can start the publisher.
     assert set(document["on"]) == {"workflow_dispatch"}
     inputs = document["on"]["workflow_dispatch"]["inputs"]
     assert set(inputs) == {"ref", "expected_sha"}
     assert inputs["ref"]["required"] == "true"
     assert inputs["expected_sha"]["required"] == "true"
-    assert job["permissions"] == {"contents": "read", "packages": "write"}
+    # actions: read is the smallest grant that can list the probe workflow's runs.
+    assert job["permissions"] == {"contents": "read", "packages": "write", "actions": "read"}
     assert "environment" not in job
 
     login = workflow_step(steps, "Log in to GHCR")
@@ -1061,10 +1064,9 @@ def test_build_kavya_image_publisher_is_dispatch_only_and_least_privilege():
         "username": "${{ github.actor }}",
         "password": "${{ secrets.GITHUB_TOKEN }}",
     }
-    assert re.findall(r"secrets\.([A-Za-z0-9_]+)", text) == ["GITHUB_TOKEN"]
+    assert set(re.findall(r"secrets\.([A-Za-z0-9_]+)", text)) == {"GITHUB_TOKEN"}
 
     for forbidden in (
-        "workflow_run",
         "docker compose",
         "systemctl",
         "nginx",
@@ -1076,6 +1078,284 @@ def test_build_kavya_image_publisher_is_dispatch_only_and_least_privilege():
         "VPS_USER",
     ):
         assert forbidden not in text
+
+
+PUBLISHER_SHA = "c" * 40
+PUBLISHER_WORKFLOW_REF = f"{PROBE_REPOSITORY}/.github/workflows/build-kavya-image.yml@refs/heads/main"
+PUBLISHER_TRUST_STEP = "Validate publisher dispatch trust"
+PUBLISHER_GATE_STEP = "Require a fresh successful read-only probe"
+PUBLISHER_GATE_WINDOW_SECONDS = 86400
+
+
+def test_build_kavya_image_publisher_binds_execution_to_protected_default_branch():
+    document, _job, steps, _text = build_kavya_image_job()
+    trust = workflow_step(steps, PUBLISHER_TRUST_STEP)
+
+    assert steps.index(trust) == 0
+    assert trust["id"] == "trust"
+    assert "uses" not in trust
+    assert all(steps.index(step) > 0 for step in steps if "uses" in step)
+    assert trust["env"] == {
+        "PUBLISHER_EVENT_NAME": "${{ github.event_name }}",
+        "PUBLISHER_REPOSITORY": "${{ github.repository }}",
+        "PUBLISHER_REF": "${{ github.ref }}",
+        "PUBLISHER_REF_NAME": "${{ github.ref_name }}",
+        "PUBLISHER_REF_TYPE": "${{ github.ref_type }}",
+        "PUBLISHER_REF_PROTECTED": "${{ github.ref_protected }}",
+        "PUBLISHER_SHA": "${{ github.sha }}",
+        "PUBLISHER_WORKFLOW_SHA": "${{ github.workflow_sha }}",
+        "PUBLISHER_WORKFLOW_REF": "${{ github.workflow_ref }}",
+    }
+    # Without this the probe-run comparison would be meaningless: a contributor
+    # could dispatch a weakened publisher from their own branch.
+    for check in (
+        "[[ \"$PUBLISHER_EVENT_NAME\" == 'workflow_dispatch' ]] || fail",
+        '[[ "$PUBLISHER_REPOSITORY" == "$repository" ]] || fail',
+        "[[ \"$PUBLISHER_REF\" == 'refs/heads/main' ]] || fail",
+        "[[ \"$PUBLISHER_REF_NAME\" == 'main' ]] || fail",
+        "[[ \"$PUBLISHER_REF_TYPE\" == 'branch' ]] || fail",
+        "[[ \"$PUBLISHER_REF_PROTECTED\" == 'true' ]] || fail",
+        '[[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]] || fail',
+        '[[ "$PUBLISHER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || fail',
+        '[[ "$PUBLISHER_SHA" == "$PUBLISHER_WORKFLOW_SHA" ]] || fail',
+        '[[ "$PUBLISHER_WORKFLOW_REF" == "$repository/.github/workflows/build-kavya-image.yml@refs/heads/main" ]] || fail',
+    ):
+        assert check in trust["run"], check
+    assert "gate_sha=%s" in trust["run"]
+
+
+def test_build_kavya_image_publisher_requires_a_green_probe_before_any_credentialed_step():
+    document, _job, steps, text = build_kavya_image_job()
+    gate = workflow_step(steps, PUBLISHER_GATE_STEP)
+    trust = workflow_step(steps, PUBLISHER_TRUST_STEP)
+
+    assert steps.index(trust) < steps.index(gate)
+    assert "uses" not in gate
+    # Nothing credentialed -- not even a checkout -- may run before the gate.
+    assert all(steps.index(step) > steps.index(gate) for step in steps if "uses" in step)
+    assert gate["id"] == "probe_gate"
+    assert gate["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "GATE_REPOSITORY": "${{ github.repository }}",
+        "GATE_SHA": "${{ steps.trust.outputs.gate_sha }}",
+    }
+    run = gate["run"]
+    # `gh api -f` on a GET either 404s or is silently dropped as a filter, so the
+    # query string must be part of the URL for the server-side filter to apply.
+    assert "-f head_sha" not in run
+    assert "-f branch" not in run
+    assert 'actions/workflows/probe-kavya-image.yml/runs?' in run
+    assert "branch=main" in run
+    assert "status=success" in run
+    assert "head_sha=$GATE_SHA" in run
+    for check in (
+        '[[ "$GATE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail',
+        '[[ "$total" =~ ^[0-9]+$ ]] || fail',
+        '[[ "$total" -ge 1 ]] || fail',
+        '[[ "$total" -le 100 ]] || fail',
+        f'cutoff="$(( $(date -u +%s) - {PUBLISHER_GATE_WINDOW_SECONDS} ))"',
+        '.path == ".github/workflows/probe-kavya-image.yml"',
+        '.head_branch == "main"',
+        '.status == "completed"',
+        '.conclusion == "success"',
+        '[[ "$gate_run_id" =~ ^[0-9]+$ ]] || fail',
+    ):
+        assert check in run, check
+    # The captured API response is never echoed.
+    assert "cat " not in run
+    assert all("${{" not in value for value in workflow_run_strings(document))
+    assert "probe_gate=pass" in run
+
+
+def probe_run_entry(
+    run_id=4242,
+    head_sha=PUBLISHER_SHA,
+    age_seconds=3600,
+    branch="main",
+    status="completed",
+    conclusion="success",
+    path=".github/workflows/probe-kavya-image.yml",
+    updated_at=None,
+):
+    if updated_at is None:
+        updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_seconds))
+    return {
+        "id": run_id,
+        "head_sha": head_sha,
+        "head_branch": branch,
+        "status": status,
+        "conclusion": conclusion,
+        "path": path,
+        "updated_at": updated_at,
+        "note": "SENTINEL_API_BODY",
+    }
+
+
+def probe_runs_json(entries, total_count=None):
+    entries = list(entries)
+    return json.dumps(
+        {
+            "total_count": len(entries) if total_count is None else total_count,
+            "workflow_runs": entries,
+        }
+    )
+
+
+def run_publisher_workflow_step(tmp_path, name, gh_stdout=None, **values):
+    _document, _job, steps, _text = build_kavya_image_job()
+    script = workflow_step(steps, name)["run"]
+    log = tmp_path / "tools.log"
+    outputs = tmp_path / "outputs"
+    summary = tmp_path / "summary"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    gh = fake_bin / "gh"
+    gh.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+        printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
+        if [[ -n "${GH_OUT_FILE:-}" ]]; then cat "$GH_OUT_FILE"; fi
+        printf '%s' "${GH_ERR:-}" >&2
+        exit "$GH_CODE"
+    """), encoding="utf-8")
+    gh.chmod(0o755)
+    payload = tmp_path / "gh-stdout.json"
+    payload.write_text(
+        probe_runs_json([probe_run_entry()]) if gh_stdout is None else gh_stdout,
+        encoding="utf-8",
+    )
+    env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "FAKE_LOG": str(log), "GITHUB_OUTPUT": str(outputs), "GITHUB_STEP_SUMMARY": str(summary),
+        "GH_OUT_FILE": str(payload), "GH_CODE": "0", "GH_ERR": "SENTINEL_GH_STDERR",
+        "GH_TOKEN": "SENTINEL_TOKEN",
+        "PUBLISHER_EVENT_NAME": "workflow_dispatch",
+        "PUBLISHER_REPOSITORY": PROBE_REPOSITORY,
+        "PUBLISHER_REF": "refs/heads/main", "PUBLISHER_REF_NAME": "main",
+        "PUBLISHER_REF_TYPE": "branch", "PUBLISHER_REF_PROTECTED": "true",
+        "PUBLISHER_SHA": PUBLISHER_SHA, "PUBLISHER_WORKFLOW_SHA": PUBLISHER_SHA,
+        "PUBLISHER_WORKFLOW_REF": PUBLISHER_WORKFLOW_REF,
+        "GATE_REPOSITORY": PROBE_REPOSITORY, "GATE_SHA": PUBLISHER_SHA,
+    } | {key: str(value) for key, value in values.items()}
+    result = subprocess.run(["bash", "-c", script], cwd=tmp_path, env=env, text=True, capture_output=True, check=False)
+    return (
+        result,
+        outputs.read_text(encoding="utf-8") if outputs.exists() else "",
+        log.read_text(encoding="utf-8") if log.exists() else "",
+    )
+
+
+PUBLISHER_UNTRUSTED_CONTEXTS = [
+    {"PUBLISHER_EVENT_NAME": "repository_dispatch"},
+    {"PUBLISHER_EVENT_NAME": "push"},
+    {"PUBLISHER_REPOSITORY": "attacker/full-voice-agent"},
+    {"PUBLISHER_REF": "refs/heads/rakesh"},
+    {"PUBLISHER_REF": "refs/tags/v1"},
+    {"PUBLISHER_REF_NAME": "rakesh"},
+    {"PUBLISHER_REF_TYPE": "tag"},
+    {"PUBLISHER_REF_PROTECTED": "false"},
+    {"PUBLISHER_REF_PROTECTED": ""},
+    {"PUBLISHER_SHA": "d" * 40},
+    {"PUBLISHER_SHA": "C" * 40, "PUBLISHER_WORKFLOW_SHA": "C" * 40},
+    {"PUBLISHER_SHA": "c" * 39},
+    {"PUBLISHER_WORKFLOW_SHA": "d" * 40},
+    {"PUBLISHER_WORKFLOW_REF": f"{PROBE_REPOSITORY}/.github/workflows/build-kavya-image.yml@refs/heads/rakesh"},
+    {"PUBLISHER_WORKFLOW_REF": f"{PROBE_REPOSITORY}/.github/workflows/other.yml@refs/heads/main"},
+    {"PUBLISHER_WORKFLOW_REF": ""},
+]
+
+
+@pytest.mark.parametrize(
+    "overrides", PUBLISHER_UNTRUSTED_CONTEXTS, ids=range(len(PUBLISHER_UNTRUSTED_CONTEXTS))
+)
+def test_build_kavya_image_publisher_trust_step_rejects_untrusted_context(tmp_path, overrides):
+    result, outputs, log = run_publisher_workflow_step(tmp_path, PUBLISHER_TRUST_STEP, **overrides)
+
+    assert result.returncode == 1
+    assert log == ""
+    assert outputs == ""
+
+
+def test_build_kavya_image_publisher_trust_step_publishes_the_verified_sha(tmp_path):
+    result, outputs, log = run_publisher_workflow_step(tmp_path, PUBLISHER_TRUST_STEP)
+
+    assert result.returncode == 0
+    assert log == ""
+    assert outputs.splitlines() == [f"gate_sha={PUBLISHER_SHA}"]
+
+
+PUBLISHER_GATE_CASES = [
+    # (description, gh_stdout, gh_code, expected returncode)
+    ("fresh matching run", None, 0, 0),
+    ("api call fails", None, 1, 1),
+    ("api returns html", "<html>bad gateway</html>", 0, 1),
+    ("api returns nothing", "", 0, 1),
+    ("api returns truncated json", '{"total_count": 1, "workflow_runs": [', 0, 1),
+    ("no runs at all", probe_runs_json([]), 0, 1),
+    ("total_count missing", json.dumps({"workflow_runs": []}), 0, 1),
+    ("pagination ambiguity", probe_runs_json([probe_run_entry()], total_count=101), 0, 1),
+    ("run failed", probe_runs_json([probe_run_entry(conclusion="failure")]), 0, 1),
+    ("run cancelled", probe_runs_json([probe_run_entry(conclusion="cancelled")]), 0, 1),
+    ("run still going", probe_runs_json([probe_run_entry(status="in_progress")]), 0, 1),
+    ("different commit", probe_runs_json([probe_run_entry(head_sha="d" * 40)]), 0, 1),
+    ("different branch", probe_runs_json([probe_run_entry(branch="rakesh")]), 0, 1),
+    ("different workflow", probe_runs_json([probe_run_entry(path=".github/workflows/deploy.yml")]), 0, 1),
+    ("stale by an hour", probe_runs_json([probe_run_entry(age_seconds=PUBLISHER_GATE_WINDOW_SECONDS + 3600)]), 0, 1),
+    ("unparseable timestamp", probe_runs_json([probe_run_entry(updated_at="yesterday")]), 0, 1),
+    ("empty timestamp", probe_runs_json([probe_run_entry(updated_at="")]), 0, 1),
+    (
+        "one fresh run among stale and failed ones",
+        probe_runs_json([
+            probe_run_entry(run_id=1, age_seconds=PUBLISHER_GATE_WINDOW_SECONDS + 60),
+            probe_run_entry(run_id=2, conclusion="failure"),
+            probe_run_entry(run_id=3, age_seconds=120),
+        ]),
+        0,
+        0,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("gh_stdout", "gh_code", "code"),
+    [case[1:] for case in PUBLISHER_GATE_CASES],
+    ids=[case[0] for case in PUBLISHER_GATE_CASES],
+)
+def test_build_kavya_image_publisher_probe_gate_fails_closed(tmp_path, gh_stdout, gh_code, code):
+    result, outputs, log = run_publisher_workflow_step(
+        tmp_path, PUBLISHER_GATE_STEP, gh_stdout=gh_stdout, GH_CODE=gh_code
+    )
+    combined = result.stdout + result.stderr + outputs
+
+    assert result.returncode == code
+    assert "SENTINEL" not in combined, "the API response and token must never be echoed"
+    if code:
+        assert "probe_gate=pass" not in outputs
+    else:
+        assert "probe_gate=pass" in outputs
+    assert log.startswith("gh api ") or log == ""
+
+
+def test_build_kavya_image_publisher_probe_gate_queries_the_bound_commit(tmp_path):
+    result, outputs, log = run_publisher_workflow_step(tmp_path, PUBLISHER_GATE_STEP)
+
+    assert result.returncode == 0
+    assert log.splitlines() == [
+        "gh api "
+        f"repos/{PROBE_REPOSITORY}/actions/workflows/probe-kavya-image.yml/runs"
+        f"?per_page=100&branch=main&status=success&head_sha={PUBLISHER_SHA}"
+    ]
+    assert outputs.splitlines() == ["probe_gate=pass", "probe_run_id=4242"]
+
+
+def test_build_kavya_image_publisher_summary_records_the_probe_gate_evidence():
+    _document, _job, steps, _text = build_kavya_image_job()
+    summary = workflow_step(steps, "Write safe build summary")
+
+    assert summary["env"]["PROBE_GATE"] == "${{ steps.probe_gate.outputs.probe_gate }}"
+    assert summary["env"]["PROBE_RUN_ID"] == "${{ steps.probe_gate.outputs.probe_run_id }}"
+    assert 'echo "- probe_gate: ${PROBE_GATE:-unavailable}"' in summary["run"]
+    assert 'echo "- probe_run_id: ${PROBE_RUN_ID:-unavailable}"' in summary["run"]
 
 
 def test_build_kavya_image_publisher_validates_the_checked_out_review_before_registry_access():
