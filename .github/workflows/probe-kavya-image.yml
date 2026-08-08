@@ -53,19 +53,30 @@ jobs:
           cleanup() { rm -rf -- "$payload_dir" || true; }
           trap cleanup EXIT
           printf '%s' "$PROBE_EVENT" > "$payload_dir/event.json" || fail
+          # `bootstrap` is optional and, when present, must be exactly the string
+          # "true". jq sorts keys, so "bootstrap" precedes the other two. There is
+          # one spelling that asks for bootstrap and one omission that declines it:
+          # anything else fails the dispatch rather than silently choosing a mode.
           jq -e '(.client_payload | type) == "object"
-            and (.client_payload | keys) == ["existing_tag", "expected_revision"]
+            and ((.client_payload | keys) == ["existing_tag", "expected_revision"]
+                 or (.client_payload | keys) == ["bootstrap", "existing_tag", "expected_revision"])
             and (.client_payload.existing_tag | type) == "string"
-            and (.client_payload.expected_revision | type) == "string"' \
+            and (.client_payload.expected_revision | type) == "string"
+            and (if (.client_payload | has("bootstrap"))
+                 then (.client_payload.bootstrap == "true")
+                 else true end)' \
             "$payload_dir/event.json" >/dev/null 2>&1 || fail
           existing_tag="$(jq -r '.client_payload.existing_tag' "$payload_dir/event.json" 2>/dev/null)" || fail
           expected_revision="$(jq -r '.client_payload.expected_revision' "$payload_dir/event.json" 2>/dev/null)" || fail
+          bootstrap="$(jq -r 'if (.client_payload | has("bootstrap")) then "true" else "false" end' "$payload_dir/event.json" 2>/dev/null)" || fail
           [[ "$existing_tag" =~ ^[0-9a-f]{7}$ ]] || fail
           [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]] || fail
           [[ "$existing_tag" == "${expected_revision:0:7}" ]] || fail
+          [[ "$bootstrap" == 'true' || "$bootstrap" == 'false' ]] || fail
           {
             printf 'existing_tag=%s\n' "$existing_tag"
             printf 'expected_revision=%s\n' "$expected_revision"
+            printf 'bootstrap=%s\n' "$bootstrap"
           } >> "$GITHUB_OUTPUT" || fail
       - name: Checkout trusted probe tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -111,12 +122,15 @@ jobs:
             printf 'buildx_version=%s\n' "$buildx_version"
           } >> "$GITHUB_STEP_SUMMARY" || fail
       - name: Probe known existing tag
+        id: existing
         env:
           EXISTING_TAG: ${{ steps.validate.outputs.existing_tag }}
+          PROBE_BOOTSTRAP: ${{ steps.validate.outputs.bootstrap }}
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           [[ "$EXISTING_TAG" =~ ^[0-9a-f]{7}$ ]] || fail
+          [[ "$PROBE_BOOTSTRAP" == 'true' || "$PROBE_BOOTSTRAP" == 'false' ]] || fail
           image="ghcr.io/taskforce-ai-dev/kavya"
           image="${image}:${EXISTING_TAG}"
           probe_dir="$(mktemp -d)" || fail
@@ -125,19 +139,37 @@ jobs:
           probe_stdout="$probe_dir/stdout"
           probe_stderr="$probe_dir/stderr"
           expected_stdout="$probe_dir/expected"
+          expected_absent="$probe_dir/expected_absent"
           printf 'image_tag_state=existing\n' > "$expected_stdout" || fail
+          printf 'image_tag_state=absent\n' > "$expected_absent" || fail
           if bash .probe-tools/.github/scripts/check-kavya-image-tag.sh "$image" >"$probe_stdout" 2>"$probe_stderr"; then probe_code=0; else probe_code=$?; fi
           if [[ "$probe_code" -eq 2 ]]; then printf '%s\n' 'helper_result=unrecognized_registry_message' >&2; fi
-          [[ "$probe_code" -eq 10 ]] || fail
-          cmp -s "$probe_stdout" "$expected_stdout" || fail
-          printf 'existing_tag_state=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
+          if [[ "$probe_code" -eq 10 ]] && cmp -s "$probe_stdout" "$expected_stdout"; then
+            printf 'existing_image=present\n' >> "$GITHUB_OUTPUT" || fail
+            printf 'existing_tag_state=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
+          elif [[ "$PROBE_BOOTSTRAP" == 'true' && "$probe_code" -eq 0 ]] && cmp -s "$probe_stdout" "$expected_absent"; then
+            # Bootstrap only relaxes the premise that an image already exists. The
+            # state still has to be classified exactly, and the summary says so.
+            printf 'existing_image=absent\n' >> "$GITHUB_OUTPUT" || fail
+            printf 'existing_tag_state=absent_bootstrap\n' >> "$GITHUB_STEP_SUMMARY" || fail
+          else
+            fail
+          fi
       - name: Verify existing OCI revision
         env:
           EXISTING_TAG: ${{ steps.validate.outputs.existing_tag }}
           EXPECTED_REVISION: ${{ steps.validate.outputs.expected_revision }}
+          PROBE_EXISTING_IMAGE: ${{ steps.existing.outputs.existing_image }}
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [[ "$PROBE_EXISTING_IMAGE" == 'present' || "$PROBE_EXISTING_IMAGE" == 'absent' ]] || fail
+          if [[ "$PROBE_EXISTING_IMAGE" == 'absent' ]]; then
+            # Nothing was published yet, so there is no revision label to verify.
+            # Recorded as a skip with its reason, never as a pass.
+            printf 'existing_revision=skipped_no_image\n' >> "$GITHUB_STEP_SUMMARY" || fail
+            exit 0
+          fi
           [[ "$EXISTING_TAG" =~ ^[0-9a-f]{7}$ ]] || fail
           [[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail
           repository="ghcr.io/taskforce-ai-dev/kavya"
@@ -193,12 +225,21 @@ jobs:
         env:
           EXISTING_TAG: ${{ steps.validate.outputs.existing_tag }}
           EXPECTED_REVISION: ${{ steps.validate.outputs.expected_revision }}
+          PROBE_BOOTSTRAP: ${{ steps.validate.outputs.bootstrap }}
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           [[ "$EXISTING_TAG" =~ ^[0-9a-f]{7}$ ]] || fail
           [[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail
+          case "$PROBE_BOOTSTRAP" in
+            true) probe_mode=bootstrap ;;
+            false) probe_mode=strict ;;
+            *) fail ;;
+          esac
           {
+            # The publisher gate accepts any green probe at its own head_sha, so
+            # the evidence has to state which mode produced this pass.
+            printf 'probe_mode=%s\n' "$probe_mode"
             printf 'existing_tag=%s\n' "$EXISTING_TAG"
             printf 'expected_revision=%s\n' "$EXPECTED_REVISION"
             printf '%s\n' 'probe_version=1'
