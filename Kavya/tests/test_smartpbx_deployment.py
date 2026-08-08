@@ -8,7 +8,6 @@ import json
 import textwrap
 import signal
 import time
-import textwrap
 
 import pytest
 import yaml
@@ -823,22 +822,6 @@ def test_smartpbx_image_deploy_functions_fail_closed_under_fake_path(tmp_path):
     assert unrelated.returncode != 0
 
 
-@pytest.mark.parametrize("arguments", [(), ("deadbee",), ("deadbee", "f" * 40), ("deadbee", "f" * 40, "sha256:" + "a" * 64, "extra")])
-def test_deploy_helper_requires_exactly_three_arguments_before_mutation(tmp_path, arguments):
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    log = tmp_path / "commands"
-    for name in ("docker", "curl", "jq", "flock", "stat"):
-        command = fake_bin / name
-        command.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$0 $*\" >> \"$FAKE_LOG\"\nexit 0\n", encoding="utf-8")
-        command.chmod(0o755)
-    env = os.environ | {"PATH": str(fake_bin) + ":" + os.environ["PATH"], "FAKE_LOG": str(log)}
-    command = "source %s; main %s" % (SMARTPBX_IMAGE_DEPLOY_SCRIPT, " ".join(arguments))
-    result = subprocess.run(["bash", "-c", command], env=env, text=True, capture_output=True, check=False)
-    assert result.returncode != 0
-    assert not log.exists() or " compose " not in log.read_text(encoding="utf-8")
-
-
 class FakeDeployHost:
     """A stateful fake PATH that executes the deploy helper without Docker."""
 
@@ -901,12 +884,22 @@ class FakeDeployHost:
         path = self.bin / "docker"
         path.write_text(textwrap.dedent("""\
             #!/usr/bin/env python3
-            import json, os, signal, sys, time
+            import json, os, signal, sys, tempfile, time
             state_path=os.environ['FAKE_STATE']; state=json.load(open(state_path))
             args=sys.argv[1:]
             with open(os.environ['FAKE_LOG'],'a') as log:
                 log.write('docker ' + ' '.join(args) + '\\n')
-            def save(): json.dump(state, open(state_path,'w'))
+            def save():
+                descriptor, temporary = tempfile.mkstemp(prefix='.deploy-state-', suffix='.tmp', dir=os.path.dirname(state_path))
+                try:
+                    with os.fdopen(descriptor, 'w') as handle:
+                        json.dump(state, handle); handle.flush(); os.fsync(handle.fileno())
+                    os.chmod(temporary, 0o644)
+                    os.replace(temporary, state_path)
+                except BaseException:
+                    try: os.unlink(temporary)
+                    except FileNotFoundError: pass
+                    raise
             def image_for(ref):
                 if ref == state['baseline_id'] or ref.endswith(':rollback-local'):
                     revision=state['baseline_revision']
@@ -984,12 +977,13 @@ class FakeDeployHost:
     def logs(self): return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
     def compose_count(self): return self.logs().count("up -d --force-recreate --pull never kavya-smartpbx")
     def current(self):
-        for _ in range(20):
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
             try:
                 return json.loads(self.state.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+            except (FileNotFoundError, PermissionError, json.JSONDecodeError):
                 time.sleep(0.005)
-        return json.loads(self.state.read_text(encoding="utf-8"))
+        raise AssertionError("fake Docker state was not atomically readable before deadline")
 
 
 @pytest.mark.parametrize("state,environment", [
@@ -1064,7 +1058,7 @@ def test_deploy_flico_absent_or_unhealthy_blocks_before_mutation(tmp_path, envir
 ])
 def test_deploy_root_path_exercises_invalid_argument_rejection(tmp_path, arguments):
     host = FakeDeployHost(tmp_path); result = host.run(*arguments)
-    assert result.returncode != 0 and host.compose_count() == 0
+    assert result.returncode != 0 and host.compose_count() == 0 and host.logs() == ""
 
 
 @pytest.mark.parametrize("environment,protected", [
@@ -1108,7 +1102,8 @@ def test_deploy_signals_after_mutation_roll_back_once(tmp_path, signal_name):
     assert process.returncode != 0 and host.compose_count() == 2
 
 
-def test_traps_precede_arming_and_second_signal_cannot_interrupt_rollback(tmp_path):
+@pytest.mark.parametrize("attempt", range(10))
+def test_traps_precede_arming_and_second_signal_cannot_interrupt_rollback(tmp_path, attempt):
     script = read_smartpbx_image_deploy_script()
     arm = script.split("arm_rollback()", 1)[1].split("disarm_rollback()", 1)[0]
     assert arm.find("trap 'on_error") < arm.find("ROLLBACK_ARMED=1")
