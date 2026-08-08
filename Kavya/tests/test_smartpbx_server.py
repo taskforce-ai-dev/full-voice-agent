@@ -1941,3 +1941,69 @@ async def test_direct_tts_done_mark_then_queued_bargein_cancels_reprompt():
         transport.release_mark.set()
         await asyncio.gather(completion, return_exceptions=True)
         pipeline._cancel_reprompt()
+
+
+def _fake_request(headers):
+    import types
+
+    return types.SimpleNamespace(headers=headers)
+
+
+def test_smartpbx_status_requires_the_shared_token():
+    import server
+    from fastapi import HTTPException
+
+    app = server.build_service_app("smartpbx", {
+        "ENABLE_SMARTPBX_WSS": "true",
+        "SMARTPBX_WS_TOKEN": "status-token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+    })
+    status = {route.path: route for route in app.routes}["/smartpbx/status"].endpoint
+
+    allowed = status(_fake_request({"X-Kavya-SmartPBX-Token": "status-token"}))
+    assert allowed["active_sessions"] == 0
+    assert allowed["max_sessions"] == 4
+
+    # active_sessions vs the cap of 4 is a live occupancy oracle, and
+    # admitted_total is a call-volume counter. Neither may be internet-readable.
+    for headers in (
+        {},
+        {"X-Kavya-SmartPBX-Token": ""},
+        {"X-Kavya-SmartPBX-Token": "wrong-token12"},
+        {"X-Kavya-SmartPBX-Token": "status-toke"},
+        {"X-Kavya-SmartPBX-Token": "status-tokenn"},
+    ):
+        with pytest.raises(HTTPException) as raised:
+            status(_fake_request(headers))
+        assert raised.value.status_code == 401
+        assert "status-token" not in str(raised.value.detail or "")
+
+
+def test_smartpbx_status_honours_a_renamed_auth_header():
+    import server
+    from fastapi import HTTPException
+
+    app = server.build_service_app("smartpbx", {
+        "ENABLE_SMARTPBX_WSS": "true",
+        "SMARTPBX_WS_TOKEN": "status-token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+        "SMARTPBX_AUTH_HEADER_NAME": "X-Renamed-Token",
+    })
+    status = {route.path: route for route in app.routes}["/smartpbx/status"].endpoint
+
+    assert status(_fake_request({"X-Renamed-Token": "status-token"}))["enabled"] is True
+    with pytest.raises(HTTPException):
+        status(_fake_request({"X-Kavya-SmartPBX-Token": "status-token"}))
+
+
+def test_smartpbx_health_stays_open_for_liveness_probes():
+    import server
+
+    app = server.build_service_app("smartpbx", {
+        "ENABLE_SMARTPBX_WSS": "true",
+        "SMARTPBX_WS_TOKEN": "status-token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+    })
+    health = {route.path: route for route in app.routes}["/health"].endpoint
+
+    assert health() == {"status": "ok", "service_mode": "smartpbx"}
