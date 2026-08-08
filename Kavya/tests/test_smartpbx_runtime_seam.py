@@ -41,6 +41,12 @@ class Pipeline:
     def _write_audio_dump(self) -> None:
         pass
 
+    def _on_stt_result(self, _text) -> None:
+        pass
+
+    def _on_stt_interim(self, _text) -> None:
+        pass
+
 
 class BlockingSTT:
     """Stand-in for GoogleSTTStream.stop(), which joins a thread for up to 5s."""
@@ -574,12 +580,78 @@ def test_stt_releases_its_speech_client_on_a_clean_stream(monkeypatch):
     assert closed
 
 
-def _failing_stt_loop(monkeypatch, failures: int = 10_000):
+def test_stt_inbound_queue_is_bounded(monkeypatch):
+    import server
+
+    stream = server.GoogleSTTStream(on_final_result=lambda *_: None, lang="en")
+    # Nothing consumes the queue: _loop was never started. An unbounded queue
+    # grows for as long as the caller keeps talking.
+    for _ in range(server.STT_QUEUE_MAX_CHUNKS + 500):
+        stream.feed(b"\xff" * 160)
+
+    assert stream._audio_q.qsize() <= server.STT_QUEUE_MAX_CHUNKS, (
+        "a consumerless STT queue must not grow without bound"
+    )
+
+
+def test_stt_failure_cap_reports_a_fatal_signal(monkeypatch):
+    fatal: list[int] = []
+    stream, attempts, _sleeps = _failing_stt_loop(monkeypatch, on_fatal=lambda: fatal.append(1))
+
+    assert attempts() < 10_000
+    assert fatal == [1], (
+        "when the restart cap trips the call must be told, or the guest sits in "
+        "silence until the 90s idle timeout"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_ends_the_call_when_stt_gives_up():
+    from smartpbx_diagnostics import (
+        DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage,
+    )
+
+    emitted = []
+
+    class STT:
+        def __init__(self):
+            self.on_fatal = None
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    stt = STT()
+    pipeline = Pipeline(stt)
+    pipeline.lang = "en"
+    session = KavyaSmartPBXSession(
+        CONTEXT, Transport(), pipeline=pipeline, stt_factory=lambda **_: stt,
+        post_call_processor=None, welcome_text="", llm_provider="openai", model="m",
+        diagnostic_sink=lambda stage, outcome, failure: emitted.append((stage, outcome, failure)),
+    )
+    await session.start()
+
+    assert callable(stt.on_fatal), "the session must wire the STT fatal signal"
+    stt.on_fatal()  # invoked from the STT worker thread in production
+    await asyncio.wait_for(session.terminal_future, timeout=2)
+
+    assert emitted == [(
+        DiagnosticStage.AUDIO_INGESTION,
+        DiagnosticOutcome.FAILED,
+        DiagnosticFailureClass.STT_UNAVAILABLE,
+    )]
+
+
+def _failing_stt_loop(monkeypatch, failures: int = 10_000, on_fatal=None):
     """Drive GoogleSTTStream._loop with a stream that always fails immediately."""
     import server
 
     stream = server.GoogleSTTStream(on_final_result=lambda *_: None, lang="en")
     stream._running = True
+    if on_fatal is not None:
+        stream.on_fatal = on_fatal
     attempts = 0
 
     def boom():
