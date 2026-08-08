@@ -112,6 +112,7 @@ class KavyaSmartPBXSession:
             lang="en",
             privacy_safe=True,
         )
+        self._wire_stt_fatal_signal(pipeline._stt)
         pipeline._stt.start()
         if self._welcome_text:
             self._welcome_task = asyncio.create_task(
@@ -166,6 +167,39 @@ class KavyaSmartPBXSession:
         finally:
             if not self._terminal_future.done():
                 self._terminal_future.set_result(None)
+
+    def _wire_stt_fatal_signal(self, stt: Any) -> None:
+        """Let a terminally failed STT stream end the call in seconds.
+
+        Without this the STT thread gives up quietly and the guest hears nothing
+        until the gateway's idle timeout, 90 seconds later.
+        """
+        loop = asyncio.get_running_loop()
+
+        def on_fatal() -> None:
+            # Invoked from the STT worker thread, so hop back onto the loop.
+            loop.call_soon_threadsafe(self._end_call_without_stt)
+
+        try:
+            stt.on_fatal = on_fatal
+        except (AttributeError, TypeError):
+            return
+
+    def _end_call_without_stt(self) -> None:
+        from smartpbx_diagnostics import (
+            DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage,
+        )
+
+        try:
+            self._diagnostic_sink(
+                DiagnosticStage.AUDIO_INGESTION,
+                DiagnosticOutcome.FAILED,
+                DiagnosticFailureClass.STT_UNAVAILABLE,
+            )
+        except Exception:
+            pass
+        if not self._terminal_future.done():
+            self._terminal_future.set_result(None)
 
     def _load_runtime_defaults(self) -> None:
         import server

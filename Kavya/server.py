@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import audioop
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -570,6 +571,9 @@ ENDPOINTING_SILENCE: float = 1.5
 STT_RESTART_BACKOFF_BASE: float = 0.25
 STT_RESTART_BACKOFF_MAX: float = 5.0
 STT_MAX_CONSECUTIVE_FAILURES: int = 8
+# Inbound audio waiting for the STT worker. Bounded so a stopped or wedged
+# consumer cannot grow it for the length of the call.
+STT_QUEUE_MAX_CHUNKS: int = 1000
 
 # Silence (seconds) after greeting / agent turn before we re-prompt the caller.
 # If the caller never speaks, we re-greet them or ask if they're still online,
@@ -2357,10 +2361,14 @@ class GoogleSTTStream:
         self._on_interim = on_interim_result
         self._lang = lang
         self._privacy_safe = privacy_safe
-        self._audio_q: queue.Queue[bytes | None] = queue.Queue()
+        self._audio_q: queue.Queue[bytes | None] = queue.Queue(STT_QUEUE_MAX_CHUNKS)
         self._running = False
         self._thread: threading.Thread | None = None
         self._chunk_count = 0
+        self._dropped_chunks = 0
+        # Set by the owning session; called from this thread when the restart
+        # cap trips so the call can end instead of sitting in silence.
+        self.on_fatal: Any = None
 
     def start(self):
         if not GOOGLE_STT_AVAILABLE:
@@ -2373,12 +2381,29 @@ class GoogleSTTStream:
 
     def stop(self):
         self._running = False
-        self._audio_q.put(None)
+        try:
+            self._audio_q.put_nowait(None)
+        except queue.Full:
+            # Make room for the sentinel; _running=False already ends the loop.
+            with contextlib.suppress(queue.Empty):
+                self._audio_q.get_nowait()
+            with contextlib.suppress(queue.Full):
+                self._audio_q.put_nowait(None)
         if self._thread:
             self._thread.join(timeout=5)
 
     def feed(self, mulaw_bytes: bytes):
-        self._audio_q.put(mulaw_bytes)
+        try:
+            # Never block: this is called from the shared event loop.
+            self._audio_q.put_nowait(mulaw_bytes)
+        except queue.Full:
+            self._dropped_chunks += 1
+            if self._dropped_chunks % 200 == 1:
+                logger.warning(
+                    "STT queue full — dropped %d inbound chunks (lang=%s)",
+                    self._dropped_chunks, self._lang,
+                )
+            return
         self._chunk_count += 1
         if self._chunk_count % 200 == 0:  # log every ~4s of audio
             logger.info("STT audio feed: %d chunks (lang=%s)", self._chunk_count, self._lang)
@@ -2412,6 +2437,7 @@ class GoogleSTTStream:
                         "STT stream failed %d times consecutively (%s) — giving up so the call can end",
                         consecutive_failures, exc,
                     )
+                    self._signal_fatal()
                     break
                 backoff = min(
                     STT_RESTART_BACKOFF_BASE * (2 ** (consecutive_failures - 1)),
@@ -2423,6 +2449,16 @@ class GoogleSTTStream:
                     exc_info=consecutive_failures == 1,
                 )
                 time.sleep(backoff)
+
+    def _signal_fatal(self) -> None:
+        """Tell the owning session STT is gone. Must never raise into the loop."""
+        on_fatal = self.on_fatal
+        if on_fatal is None:
+            return
+        try:
+            on_fatal()
+        except Exception:
+            logger.warning("STT fatal signal failed", exc_info=True)
 
     def _run_one_stream(self):
         # Google caps a streaming_recognize call at ~5 minutes, so this runs many
