@@ -47,3 +47,116 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Record safe runtime metadata
+        run: |
+          set -Eeuo pipefail
+          fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          GITHUB_WORKFLOW_SHA="${GITHUB_WORKFLOW_SHA:-}"
+          workflow_commit=$GITHUB_WORKFLOW_SHA
+          workflow_sha="$workflow_commit"
+          runner_image="${ImageOS:-}"
+          runner_version="${ImageVersion:-}"
+          [[ "$workflow_sha" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$runner_image" =~ ^[A-Za-z0-9._-]+$ ]] || fail
+          [[ "$runner_version" =~ ^[A-Za-z0-9._-]+$ ]] || fail
+          buildx_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$buildx_dir" || true; }
+          trap cleanup EXIT
+          docker buildx version >"$buildx_dir/stdout" 2>"$buildx_dir/stderr" || fail
+          buildx_version="$(awk '{print $2}' "$buildx_dir/stdout")" || fail
+          [[ "$runner_image" =~ ^[A-Za-z0-9._-]+$ ]] || fail
+          [[ "$runner_version" =~ ^[A-Za-z0-9._-]+$ ]] || fail
+          [[ "$buildx_version" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || fail
+          {
+            printf 'workflow_commit=%s\n' "$workflow_sha"
+            printf '%s\n' 'checkout_action=actions/checkout@v7'
+            printf '%s\n' 'buildx_action=docker/setup-buildx-action@v4'
+            printf '%s\n' 'login_action=docker/login-action@v4'
+            printf 'runner_image=%s\n' "$runner_image"
+            printf 'runner_image_version=%s\n' "$runner_version"
+            printf 'buildx_version=%s\n' "$buildx_version"
+          } >> "$GITHUB_STEP_SUMMARY" || fail
+      - name: Probe known existing tag
+        env:
+          EXISTING_TAG: ${{ inputs.existing_tag }}
+        run: |
+          set -Eeuo pipefail
+          fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          image="ghcr.io/taskforce-ai-dev/kavya"
+          image="${image}:${EXISTING_TAG}"
+          probe_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$probe_dir" || true; }
+          trap cleanup EXIT
+          probe_stdout="$probe_dir/stdout"
+          probe_stderr="$probe_dir/stderr"
+          expected_marker="image_tag_state=existing"
+          if bash .probe-tools/.github/scripts/check-kavya-image-tag.sh "$image" >"$probe_stdout" 2>"$probe_stderr"; then probe_code=0; else probe_code=$?; fi
+          [[ "$probe_code" -eq 10 ]] || fail
+          probe_lines="$(wc -l < "$probe_stdout")" || fail
+          probe_marker="$(cat "$probe_stdout")" || fail
+          [[ "$probe_lines" -eq 1 ]] || fail
+          [[ "$probe_marker" == "$expected_marker" ]] || fail
+          printf 'existing_tag_state=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
+      - name: Verify existing OCI revision
+        env:
+          EXISTING_TAG: ${{ inputs.existing_tag }}
+          EXPECTED_REVISION: ${{ inputs.expected_revision }}
+        run: |
+          set -Eeuo pipefail
+          fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          image="ghcr.io/taskforce-ai-dev/kavya:${EXISTING_TAG}"
+          probe_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$probe_dir" || true; }
+          trap cleanup EXIT
+          pull_stdout="$probe_dir/pull.stdout"
+          pull_stderr="$probe_dir/pull.stderr"
+          inspect_stdout="$probe_dir/inspect.stdout"
+          inspect_stderr="$probe_dir/inspect.stderr"
+          docker pull "$image" >"$pull_stdout" 2>"$pull_stderr" || fail
+          docker image inspect "$image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' >"$inspect_stdout" 2>"$inspect_stderr" || fail
+          inspect_lines="$(wc -l < "$inspect_stdout")" || fail
+          revision="$(cat "$inspect_stdout")" || fail
+          [[ "$inspect_lines" -eq 1 ]] || fail
+          [[ "$revision" == "$EXPECTED_REVISION" ]] || fail
+          printf 'existing_revision=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
+      - name: Probe generated absent canary
+        run: |
+          set -Eeuo pipefail
+          fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          image="ghcr.io/taskforce-ai-dev/kavya"
+          repository_id="${GITHUB_REPOSITORY_ID:-}"
+          run_id="${GITHUB_RUN_ID:-}"
+          attempt="${GITHUB_RUN_ATTEMPT:-}"
+          [[ "$repository_id" =~ ^[0-9]+$ ]] || fail
+          [[ "$run_id" =~ ^[0-9]+$ ]] || fail
+          [[ "$attempt" =~ ^[0-9]+$ ]] || fail
+          GITHUB_REPOSITORY_ID="$repository_id"
+          GITHUB_RUN_ID="$run_id"
+          GITHUB_RUN_ATTEMPT="$attempt"
+          canary="probe-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "$canary" =~ ^probe-[0-9]+-[0-9]+-[0-9]+$ ]] || fail
+          [[ ${#canary} -le 128 ]] || fail
+          probe_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$probe_dir" || true; }
+          trap cleanup EXIT
+          probe_stdout="$probe_dir/stdout"
+          probe_stderr="$probe_dir/stderr"
+          expected_marker="image_tag_state=absent"
+          if bash .probe-tools/.github/scripts/check-kavya-image-tag.sh "$image:$canary" >"$probe_stdout" 2>"$probe_stderr"; then probe_code=0; else probe_code=$?; fi
+          [[ "$probe_code" -eq 0 ]] || fail
+          probe_lines="$(wc -l < "$probe_stdout")" || fail
+          probe_marker="$(cat "$probe_stdout")" || fail
+          [[ "$probe_lines" -eq 1 ]] || fail
+          [[ "$probe_marker" == "$expected_marker" ]] || fail
+          printf 'canary_state=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
+      - name: Write safe probe summary
+        run: |
+          set -Eeuo pipefail
+          fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          {
+            printf '%s\n' 'probe_version=1'
+            printf '%s\n' 'existing_tag_state=pass'
+            printf '%s\n' 'existing_revision=pass'
+            printf '%s\n' 'canary_state=pass'
+            printf '%s\n' 'probe_result=pass'
+          } >> "$GITHUB_STEP_SUMMARY" || fail
