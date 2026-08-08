@@ -49,5 +49,10 @@ if [[ "$registry_error" == "manifest unknown: $TAG" || "$registry_error" == "no 
   exit 0
 fi
 
-echo "image_tag_state=probe_failed"
-exit 1
+# Exit 2 is reserved for "the registry said something this allowlist does not
+# cover". It is distinct from the exit 1 rejections above so a failed run states
+# which remedy applies: read the real capture from the run and widen the
+# allowlist in a reviewed change. Never widen by substring. Every caller still
+# treats this as a hard failure.
+echo "image_tag_state=probe_unrecognized"
+exit 2

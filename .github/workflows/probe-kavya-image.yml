@@ -127,6 +127,7 @@ jobs:
           expected_stdout="$probe_dir/expected"
           printf 'image_tag_state=existing\n' > "$expected_stdout" || fail
           if bash .probe-tools/.github/scripts/check-kavya-image-tag.sh "$image" >"$probe_stdout" 2>"$probe_stderr"; then probe_code=0; else probe_code=$?; fi
+          if [[ "$probe_code" -eq 2 ]]; then printf '%s\n' 'helper_result=unrecognized_registry_message' >&2; fi
           [[ "$probe_code" -eq 10 ]] || fail
           cmp -s "$probe_stdout" "$expected_stdout" || fail
           printf 'existing_tag_state=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
@@ -184,6 +185,7 @@ jobs:
           expected_stdout="$probe_dir/expected"
           printf 'image_tag_state=absent\n' > "$expected_stdout" || fail
           if bash .probe-tools/.github/scripts/check-kavya-image-tag.sh "$image:$canary" >"$probe_stdout" 2>"$probe_stderr"; then probe_code=0; else probe_code=$?; fi
+          if [[ "$probe_code" -eq 2 ]]; then printf '%s\n' 'helper_result=unrecognized_registry_message' >&2; fi
           [[ "$probe_code" -eq 0 ]] || fail
           cmp -s "$probe_stdout" "$expected_stdout" || fail
           printf 'canary_state=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
