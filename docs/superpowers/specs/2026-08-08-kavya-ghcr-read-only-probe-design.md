@@ -442,6 +442,49 @@ and widening may be appropriate; exit `1` means the helper rejected the argument
 or the capture structurally (bad argument, mixed case, NUL bytes) and widening is
 never the answer.
 
+## Reading a pushed digest
+
+Both the probe's tag-to-digest resolution and the publisher's push verification
+read the digest with:
+
+```bash
+docker buildx imagetools inspect "$ref" --format '{{ .Manifest.Digest }}'
+```
+
+`.Manifest.Digest`, never a bare `.Digest`. The template is evaluated against
+`imagetools.tplInput`, which exposes `.Manifest` and `.Image`; a bare `.Digest`
+is not a field on it and the command **exits 1** rather than printing an empty
+string:
+
+```text
+ERROR: template: :1:2: executing "" at <.Digest>:
+       can't evaluate field Digest in type imagetools.tplInput
+```
+
+Both sites used the bare form and therefore aborted at the command itself, not
+at the comparison they appeared to fail — the publisher under `set -e` at the
+assignment, the probe at its `|| fail`. Verified against the real published
+image in
+[run 31281453563](https://github.com/taskforce-ai-dev/full-voice-agent/actions/runs/31281453563).
+
+The tag resolves to an **OCI image index**, not a single manifest, because
+`docker/build-push-action` attaches a provenance attestation: the index holds the
+`linux/amd64` image plus an `attestation-manifest` entry. Provenance is
+deliberately left enabled. The index digest is exactly what the action reports as
+its own `digest` output, so `{{ .Manifest.Digest }}` and `BUILT_DIGEST` agree
+byte-for-byte, and pulling the index digest resolves to the platform image whose
+config carries `org.opencontainers.image.revision`. Nothing has to be disabled
+for the comparison to hold.
+
+Two details this rules out, both confirmed rather than assumed: the revision
+label is present and correct, and `docker image inspect --format` emits the value
+followed by exactly one newline, which is byte-identical to the expected file the
+probe writes with `printf '%s\n'`. The byte-exact `cmp -s` comparison is sound.
+
+Test doubles for `docker` must evaluate `--format` the same way. A fake that
+accepts any template agrees with itself and hides a template that can never work
+against a registry, which is precisely how the bare form reached production.
+
 ## Bootstrap mode and the first-image deadlock
 
 The design as originally written could never publish a first image. The probe

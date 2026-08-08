@@ -200,23 +200,27 @@ jobs:
           BUILT_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
+          # Name the failing check. Registry stderr stays suppressed, but which
+          # of these tripped is not sensitive and not knowing it costs a round
+          # trip -- as it did on the first live publish.
+          fail_with() { printf 'resolve_digest=%s\n' "$1" >&2; exit 1; }
           case "$MODE" in
             absent)
-              [[ $BUILT_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ $BUILT_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || fail_with built_digest_malformed
               # .Manifest.Digest, not .Digest: the bare field does not exist on
               # imagetools.tplInput and exits 1. This is the index digest, which
               # is what build-push-action reports as its own digest output.
-              pushed_digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Manifest.Digest}}" 2>/dev/null)"
-              [[ $pushed_digest =~ ^sha256:[0-9a-f]{64}$ ]]
-              test "$pushed_digest" = "$BUILT_DIGEST"
+              pushed_digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Manifest.Digest}}" 2>/dev/null)" || fail_with registry_inspect_failed
+              [[ $pushed_digest =~ ^sha256:[0-9a-f]{64}$ ]] || fail_with pushed_digest_malformed
+              test "$pushed_digest" = "$BUILT_DIGEST" || fail_with pushed_digest_mismatch
               digest="$pushed_digest"
               ;;
             existing)
-              digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Manifest.Digest}}" 2>/dev/null)"
+              digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Manifest.Digest}}" 2>/dev/null)" || fail_with registry_inspect_failed
               ;;
-            *) echo "unrecognized image mode" >&2; exit 1 ;;
+            *) fail_with unrecognized_image_mode ;;
           esac
-          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || fail_with digest_malformed
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Verify pushed digest and revision
