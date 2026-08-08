@@ -43,14 +43,14 @@ trusted operator
   | POST repository_dispatch {existing_tag, expected_revision}
   v
 default-branch workflow selected by GitHub
-  |-- terminal trust and payload validation before any action/tool
+  |-- terminal trust and payload validation before any `uses:` action or registry/network command
   v
 GitHub-hosted read-only probe
   |-- trusted helper at github.workflow_sha
   |-- byte-exact existing-tag and revision checks
   `-- byte-exact absent internally-derived canary check
   v
-validated existing_tag + expected_revision and fixed pass markers only
+closed workflow-authored safe summary only
 ```
 
 The trigger is exactly:
@@ -63,9 +63,9 @@ on:
 
 GitHub documents that `repository_dispatch` runs only when the workflow file is
 on the default branch and sets its ref and SHA to that branch and its latest
-commit. The first shell step nevertheless fails before checkout, setup, login,
-registry access, or any other tool unless every one of these terminal checks
-passes:
+commit. The first shell step uses Bash and `jq` for validation; it nevertheless
+fails before checkout, setup, login, or any `uses:` action or registry/network
+command unless every one of these terminal checks passes:
 
 - `github.event_name == repository_dispatch` and
   `github.event.action == kavya_image_read_only_probe`;
@@ -81,10 +81,14 @@ passes:
 
 The workflow must pass those values to the first step through named environment
 variables, including a serialized `github.event` for structural payload
-validation. It must not use `github.event.branch`: that is not a documented
-Actions context property and is not a security input. Every negative case exits
-through one generic fixed failure marker before any `uses:` step or command that
-can contact the registry.
+validation. The `repository_dispatch` webhook payload exposes `branch`, and it
+is therefore accessible as `github.event.branch`; however, GitHub does not
+document security, protection, or workflow-selection semantics for that field.
+The workflow deliberately ignores it and binds execution using the documented
+`github.ref`, `github.ref_name`, `github.ref_type`, `github.ref_protected`,
+`github.sha`, `github.workflow_ref`, and `github.workflow_sha` values instead.
+Every negative case exits through one generic fixed failure marker before any
+`uses:` action or registry/network command.
 
 The probe job is one GitHub-hosted job with this static shape:
 
@@ -103,8 +107,11 @@ Concurrency remains static: group `kavya-image-read-only-probe` with
 
 Dispatch authorization belongs to the trusted operator credential, not the
 job's `GITHUB_TOKEN`. A repository-authorized maintainer uses the documented
-repository-dispatch permission from a trusted machine. The credential never
-appears in workflow inputs, repository secrets, logs, or summaries.
+repository-dispatch permission from a trusted machine. A fine-grained PAT or
+GitHub App user/installation token must be scoped to this repository with
+repository `Contents: write`; a classic PAT must have the `repo` scope. The
+credential never appears in workflow inputs, repository secrets, logs, or
+summaries.
 
 The dispatcher is terminal and fail-fast before `gh api`; it sends no ref or
 SHA selector:
@@ -213,22 +220,45 @@ through command substitution or line counting; expected bytes are written with
    and maximum tag length, run the helper, require exit `0`, and compare stdout
    byte-for-byte to `image_tag_state=absent\n`; the same byte-exact failure
    rules apply.
-6. Only after every check succeeds, emit the validated non-secret
-   `existing_tag` and `expected_revision` values and the fixed markers
-   `probe_version=1`, `existing_tag_state=pass`, `existing_revision=pass`,
-   `canary_state=pass`, and `probe_result=pass`.
+6. Only after every check succeeds, emit the exact workflow-authored safe
+   summary contract below. Any failure emits only `probe_result=fail` from
+   workflow-authored summary logic.
 
-The complete payload-derived output contract is therefore the two validated
-forms `existing_tag=[0-9a-f]{7}` and `expected_revision=[0-9a-f]{40}` plus the
-fixed markers above. Safe runtime-evidence lines are limited separately to the
-fixed requested runner label, the constrained documented runner OS/architecture,
-and the restricted Buildx-version format. It must not emit raw JSON, any other
-payload field, registry output, token material, layer progress, image
-configuration, or captured bytes. Any unexpected exit, differing byte,
-malformed metadata, authentication/authorization error, or network, DNS, TLS,
-rate-limit, server, or ambiguous registry result fails closed with only generic
-fixed failure output. An existing canary fails without overwrite, deletion, or
+The workflow-authored safe summary is a closed, line-oriented allowlist. It
+contains exactly these keys and no others:
+
+| Key | Exact permitted value/form |
+| --- | --- |
+| `workflow_commit` | the verified `github.workflow_sha`, matching `^[0-9a-f]{40}$` |
+| `checkout_action` | `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` |
+| `setup_buildx_action` | `docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c` |
+| `login_action` | `docker/login-action@dbcb813823bdd20940b903addbd779551569679f` |
+| `runner_label` | `ubuntu-24.04` |
+| `runner_os` | `Linux` |
+| `runner_arch` | `X64` |
+| `buildx_version` | a value matching `^v[0-9][A-Za-z0-9._+-]{0,62}$`; the value is ASCII and at most 64 bytes |
+| `existing_tag` | a value matching `^[0-9a-f]{7}$` |
+| `expected_revision` | a value matching `^[0-9a-f]{40}$` |
+| `probe_version` | `1` |
+| `existing_tag_state` | `pass` |
+| `existing_revision` | `pass` |
+| `canary_state` | `pass` |
+| `probe_result` | `pass` on success or `fail` as the sole generic workflow-authored failure marker |
+
+`buildx_version` is the validated version token, not the raw `docker buildx
+version` output: the documented/observed output begins with the Buildx name and
+then a `v`-prefixed version token (for example, `v0.27.0`), which satisfies the
+stated ASCII expression. The workflow rejects an output from which it cannot
+extract exactly one such token. It must not emit raw JSON, any other payload
+field, registry output, token material, layer progress, image configuration, or
+captured bytes. An existing canary fails without overwrite, deletion, or
 cleanup.
+
+Workflow-authored summaries and the captured helper, pull, inspect, and
+Buildx-version streams emit only the specified safe lines or a generic failure
+marker. GitHub runner infrastructure and pinned actions may emit their own
+operational or failure logs; those logs are outside this allowlist and remain
+part of the residual GitHub/action trust boundary.
 
 ## Shared helper hardening
 
@@ -254,9 +284,10 @@ the fixed requested label and the documented `${{ runner.os }}` and
 `ImageOS` or `ImageVersion` environment variables.
 
 The Buildx provenance is the pinned `docker/setup-buildx-action` commit above.
-The workflow records the successful `docker buildx version` result in a
-restricted safe format as diagnostic evidence of what that pinned setup action
-installed; no post-run metadata proves an uncompromised action or runner.
+The workflow captures `docker buildx version`, validates and records only the
+`buildx_version` token defined by the summary contract, as diagnostic evidence
+of what that pinned setup action installed; no post-run metadata proves an
+uncompromised action or runner.
 Acceptance also retains GitHub's generated `Set up job` log block, including
 its image/version information, as run evidence only. The hosted runner image
 remains mutable residual trust and the design makes no immutability claim for
@@ -277,14 +308,20 @@ cover:
 - the exact dispatch-only trigger/type and each terminal trust check, including
   negative tests for either repository identity mismatch, non-main default
   branch/ref/ref name/ref type, false protection, non-lowercase/non-40-hex or
-  unequal SHA values, and incorrect workflow ref; it rejects any use of
-  `github.event.branch` and proves every failure precedes checkout, setup,
-  login, or registry tooling;
+  unequal SHA values, and incorrect workflow ref; it proves that varying the
+  webhook-payload `github.event.branch` neither authorizes nor changes workflow
+  selection or validation, and proves every failure precedes checkout, setup,
+  login, or any `uses:` action or registry/network command (the validation
+  itself may use Bash and `jq`);
 - the dispatcher has `set -Eeuo pipefail`, terminal validation before `gh api`,
   no ref/SHA selector, and exactly the validated payload keys;
-- exact payload object/schema/binding checks, and a summary allowlist that
-  accepts only the two validated forms and fixed markers while rejecting
-  unvalidated or additional payload output;
+- exact payload object/schema/binding checks, and the complete safe-summary
+  allowlist: every listed key/value form, including the lower-40-hex
+  `workflow_commit`, three fixed action identifiers, fixed runner values,
+  `buildx_version` regex and 64-byte maximum, validated `existing_tag` and
+  `expected_revision`, and each fixed pass/fail marker; it rejects every
+  unlisted key, overlong value, unvalidated payload value, and additional
+  workflow-authored output;
 - one probe job, static concurrency, `ubuntu-24.04`, `timeout-minutes: 30`,
   exactly the two read permissions, `github.workflow_sha` tooling checkout,
   no source/input checkout, and no `ImageOS`/`ImageVersion` contract;
@@ -330,14 +367,18 @@ registry or production state to undo.
   contexts: https://docs.github.com/en/actions/reference/workflows-and-actions/contexts
 - GitHub secure-use guidance for full-length action commit SHAs: https://docs.github.com/en/actions/how-tos/security-for-github-actions/security-guides/security-hardening-your-deployments
 - GitHub token permissions and access model: https://docs.github.com/en/actions/concepts/security/github_token
+- GitHub REST Create a repository dispatch event endpoint and its token
+  permissions: https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event
 - GitHub CLI `gh api` manual: https://cli.github.com/manual/gh_api
 - GitHub-hosted runner labels and lifecycle: https://docs.github.com/en/actions/reference/runners/github-hosted-runners
 - Official tag sources, resolved on 2026-08-08: https://github.com/actions/checkout/tree/v7, https://github.com/docker/setup-buildx-action/tree/v4, https://github.com/docker/login-action/tree/v4, and https://github.com/docker/build-push-action/tree/v7
 
 ## Self-review
 
-There are no placeholders. Scope, trust validation, dispatcher fail-fast
-behavior, token claims, full action pins, explicit runner/timeout, byte-exact
-and NUL protections, safe acceptance output, point-in-time tag evidence,
-publisher constraints, tests, acceptance, rollback, and official sources agree.
-The probe has no registry write, deploy, host, transfer, or MCP scope.
+There are no placeholders. Scope, documented-context trust validation and
+deliberate non-reliance on webhook `branch`, dispatcher fail-fast behavior and
+credential scopes, full action pins, explicit runner/timeout, byte-exact and
+NUL protections, closed workflow-authored safe-summary contract, residual
+GitHub/action log trust, point-in-time tag evidence, publisher constraints,
+tests, acceptance, rollback, and official sources agree. The probe has no
+registry write, deploy, host, transfer, or MCP scope.
