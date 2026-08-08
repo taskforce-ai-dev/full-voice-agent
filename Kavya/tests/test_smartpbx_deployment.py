@@ -815,3 +815,19 @@ def test_smartpbx_image_deploy_functions_fail_closed_under_fake_path(tmp_path):
         check=False,
     )
     assert unrelated.returncode != 0
+
+
+@pytest.mark.parametrize("arguments", [(), ("deadbee",), ("deadbee", "f" * 40), ("deadbee", "f" * 40, "sha256:" + "a" * 64, "extra")])
+def test_deploy_helper_requires_exactly_three_arguments_before_mutation(tmp_path, arguments):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "commands"
+    for name in ("docker", "curl", "jq", "flock", "stat"):
+        command = fake_bin / name
+        command.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$0 $*\" >> \"$FAKE_LOG\"\nexit 0\n", encoding="utf-8")
+        command.chmod(0o755)
+    env = os.environ | {"PATH": str(fake_bin) + ":" + os.environ["PATH"], "FAKE_LOG": str(log)}
+    command = "source %s; main %s" % (SMARTPBX_IMAGE_DEPLOY_SCRIPT, " ".join(arguments))
+    result = subprocess.run(["bash", "-c", command], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert not log.exists() or " compose " not in log.read_text(encoding="utf-8")
