@@ -997,7 +997,9 @@ def test_smartpbx_mode_exposes_only_bounded_routes():
     assert "/ws/conversation" not in routes
     assert "/ws/media-stream/{lang}" not in routes
 
-    status = routes["/smartpbx/status"].endpoint()
+    status = routes["/smartpbx/status"].endpoint(
+        _fake_request({"X-Kavya-SmartPBX-Token": "do-not-expose"})
+    )
     assert status["enabled"] is True
     assert status["configured"] is True
     assert status["transfer_enabled"] is False
@@ -1024,7 +1026,9 @@ def test_smartpbx_status_reports_transfer_enabled_only_for_complete_allowlisted_
     app = server.build_service_app("smartpbx", environment)
     routes = {route.path: route for route in app.routes}
 
-    assert routes["/smartpbx/status"].endpoint()["transfer_enabled"] is True
+    assert routes["/smartpbx/status"].endpoint(
+        _fake_request({"X-Kavya-SmartPBX-Token": "test-token"})
+    )["transfer_enabled"] is True
 
 
 def test_unknown_service_mode_fails_closed():

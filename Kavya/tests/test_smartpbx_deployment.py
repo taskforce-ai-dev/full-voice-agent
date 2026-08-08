@@ -74,7 +74,14 @@ def test_nginx_exposes_only_the_bounded_smartpbx_surface_with_tls():
 
     assert "server_name smartpbx-kavya.taskforceai.tech;" in nginx
     assert "ssl_protocols TLSv1.2 TLSv1.3;" in nginx
-    assert "access_log off;" in nginx
+    # Unauthenticated connect/close cycling floods the diagnostic log ring with
+    # one JSON line per rejection and no nginx record of the source.
+    assert "access_log off;" not in nginx
+    assert "access_log /var/log/nginx/smartpbx-kavya-access.log" in nginx
+    assert "limit_req_zone $binary_remote_addr zone=kavya_smartpbx_req:10m rate=30r/m;" in nginx
+    media = nginx.split("location = /ws/v1/smartpbx/media", 1)[1].split("location =", 1)[0]
+    assert "limit_req zone=kavya_smartpbx_req burst=5 nodelay;" in media
+    assert "limit_req_status 429;" in nginx
     assert nginx.count("location = /ws/v1/smartpbx/media") == 1
     assert nginx.count("location = /health") == 1
     assert nginx.count("location = /smartpbx/status") == 1
@@ -1941,7 +1948,12 @@ class FakeDeployHost:
         self.root, self.bin, self.app = tmp_path, tmp_path / "bin", tmp_path / "app"
         self.bin.mkdir(); self.app.mkdir()
         (self.app / ".env").write_text("SENTINEL_LOCAL_SECRET\n", encoding="utf-8")
-        (self.app / ".env.smartpbx").write_text("SENTINEL_SMARTPBX_SECRET\n", encoding="utf-8")
+        # The status endpoint is token-gated, so the deploy script must read the
+        # token from here. Sentinel-named so the no-leak assertions cover it.
+        (self.app / ".env.smartpbx").write_text(
+            "SENTINEL_SMARTPBX_SECRET\nSMARTPBX_WS_TOKEN=SENTINEL_STATUS_TOKEN\n",
+            encoding="utf-8",
+        )
         scripts = self.app / "scripts"; scripts.mkdir()
         validator = scripts / "validate_english_voice_env.sh"
         validator.write_text("#!/usr/bin/env bash\n[[ ${VOICE_FAIL:-0} == 0 ]] || exit 1\nprintf '%s\\n' canonical_voice_match=ok\n", encoding="utf-8")
