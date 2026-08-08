@@ -18,24 +18,111 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
+      # Least grant that can list the read-only probe workflow's run history.
+      actions: read
     outputs:
       digest: ${{ steps.verify.outputs.digest }}
       tag: ${{ steps.identity.outputs.tag }}
       revision: ${{ steps.identity.outputs.actual_sha }}
     steps:
+      - name: Validate publisher dispatch trust
+        id: trust
+        env:
+          PUBLISHER_EVENT_NAME: ${{ github.event_name }}
+          PUBLISHER_REPOSITORY: ${{ github.repository }}
+          PUBLISHER_REF: ${{ github.ref }}
+          PUBLISHER_REF_NAME: ${{ github.ref_name }}
+          PUBLISHER_REF_TYPE: ${{ github.ref_type }}
+          PUBLISHER_REF_PROTECTED: ${{ github.ref_protected }}
+          PUBLISHER_SHA: ${{ github.sha }}
+          PUBLISHER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PUBLISHER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -Eeuo pipefail
+          fail() { printf '%s\n' 'publisher_trust=fail' >&2; exit 1; }
+          repository='taskforce-ai-dev/full-voice-agent'
+          # GitHub runs the selected ref's copy of this file, so the probe-run
+          # comparison below only means something if this run is itself pinned to
+          # protected main at its own workflow commit.
+          [[ "$PUBLISHER_EVENT_NAME" == 'workflow_dispatch' ]] || fail
+          [[ "$PUBLISHER_REPOSITORY" == "$repository" ]] || fail
+          [[ "$PUBLISHER_REF" == 'refs/heads/main' ]] || fail
+          [[ "$PUBLISHER_REF_NAME" == 'main' ]] || fail
+          [[ "$PUBLISHER_REF_TYPE" == 'branch' ]] || fail
+          [[ "$PUBLISHER_REF_PROTECTED" == 'true' ]] || fail
+          [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$PUBLISHER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$PUBLISHER_SHA" == "$PUBLISHER_WORKFLOW_SHA" ]] || fail
+          [[ "$PUBLISHER_WORKFLOW_REF" == "$repository/.github/workflows/build-kavya-image.yml@refs/heads/main" ]] || fail
+          printf 'gate_sha=%s\n' "$PUBLISHER_SHA" >> "$GITHUB_OUTPUT" || fail
+
+      - name: Require a fresh successful read-only probe
+        id: probe_gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATE_REPOSITORY: ${{ github.repository }}
+          GATE_SHA: ${{ steps.trust.outputs.gate_sha }}
+        run: |
+          set -Eeuo pipefail
+          fail() { printf '%s\n' 'probe_gate=fail' >&2; exit 1; }
+          [[ "$GATE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$GATE_REPOSITORY" == 'taskforce-ai-dev/full-voice-agent' ]] || fail
+          gate_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$gate_dir" || true; }
+          trap cleanup EXIT
+          # The filters must live in the URL query string. `gh api -f` on a GET is
+          # either rejected outright or silently dropped, which would leave the
+          # response unfiltered.
+          gh api \
+            "repos/$GATE_REPOSITORY/actions/workflows/probe-kavya-image.yml/runs?per_page=100&branch=main&status=success&head_sha=$GATE_SHA" \
+            >"$gate_dir/runs.json" 2>"$gate_dir/runs.err" || fail
+          jq -e 'type == "object"' "$gate_dir/runs.json" >/dev/null 2>&1 || fail
+          total="$(jq -r '.total_count // empty' "$gate_dir/runs.json" 2>/dev/null)" || fail
+          [[ "$total" =~ ^[0-9]+$ ]] || fail
+          [[ "$total" -ge 1 ]] || fail
+          # A full page cannot be reasoned about without paginating; fail closed.
+          [[ "$total" -le 100 ]] || fail
+          cutoff="$(( $(date -u +%s) - 86400 ))" || fail
+          # Re-verify every server-side filter locally rather than trusting them.
+          # Freshness keys on run_started_at: a re-run bumps updated_at without
+          # re-establishing the evidence, which would make stale evidence look current.
+          jq -r '.workflow_runs[]
+            | select(.head_sha == $sha and .head_branch == "main"
+                and .status == "completed" and .conclusion == "success"
+                and .path == ".github/workflows/probe-kavya-image.yml")
+            | "\(.id) \(.run_started_at)"' \
+            --arg sha "$GATE_SHA" "$gate_dir/runs.json" >"$gate_dir/candidates" 2>/dev/null || fail
+          gate_run_id=""
+          while read -r candidate_id candidate_stamp; do
+            [[ "$candidate_id" =~ ^[0-9]+$ ]] || continue
+            # Strict Z-suffix on purpose: a +00:00 offset form is rejected, not parsed.
+            [[ "$candidate_stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || continue
+            candidate_epoch="$(date -u -d "$candidate_stamp" +%s 2>/dev/null)" || continue
+            [[ "$candidate_epoch" =~ ^[0-9]+$ ]] || continue
+            [[ "$candidate_epoch" -ge "$cutoff" ]] || continue
+            gate_run_id="$candidate_id"
+            break
+          done < "$gate_dir/candidates"
+          [[ "$gate_run_id" =~ ^[0-9]+$ ]] || fail
+          {
+            printf '%s\n' 'probe_gate=pass'
+            printf 'probe_run_id=%s\n' "$gate_run_id"
+          } >> "$GITHUB_OUTPUT" || fail
+
       - name: Checkout trusted publisher tooling
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.workflow_sha }}
           path: .publisher
           persist-credentials: false
 
       - name: Checkout reviewed source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.ref }}
           path: source
@@ -65,10 +152,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -87,6 +174,7 @@ jobs:
           case "$probe_code" in
             0) mode=absent ;;
             10) mode=existing ;;
+            2) echo "registry tag probe returned an unrecognized message; read the failed run's capture and widen the helper allowlist in a reviewed change" >&2; exit 1 ;;
             *) echo "registry tag probe failed" >&2; exit 1 ;;
           esac
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
@@ -96,7 +184,7 @@ jobs:
       - name: Build and push immutable image
         id: build
         if: "${{ steps.probe.outputs.mode == 'absent' }}"
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: source/Kavya
           file: source/Kavya/Dockerfile
@@ -154,6 +242,8 @@ jobs:
           DIGEST: ${{ steps.verify.outputs.digest }}
           RUN_ID: ${{ github.run_id }}
           STATUS: ${{ job.status }}
+          PROBE_GATE: ${{ steps.probe_gate.outputs.probe_gate }}
+          PROBE_RUN_ID: ${{ steps.probe_gate.outputs.probe_run_id }}
         run: |
           {
             echo "## Kavya image build"
@@ -162,4 +252,6 @@ jobs:
             echo "- digest: ${DIGEST:-unavailable}"
             echo "- run_id: $RUN_ID"
             echo "- status: $STATUS"
+            echo "- probe_gate: ${PROBE_GATE:-unavailable}"
+            echo "- probe_run_id: ${PROBE_RUN_ID:-unavailable}"
           } >> "$GITHUB_STEP_SUMMARY"

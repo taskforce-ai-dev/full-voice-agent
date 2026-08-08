@@ -18,6 +18,8 @@ The agent persona is **Kavya** — a reservations agent. **As of 2026-07-28 the 
 - `server.py` — **Unified production server** (IVR DTMF menu: English→ConversationRelay+ElevenLabs, Arabic→Media Streams+ElevenLabs multilingual, Sinhala→Media Streams+OpenAI `gpt-4o-mini-tts`; Tamil→Media Streams+ElevenLabs is implemented but unlisted in the menu)
 - `media_stream_server.py` — **Standalone Media Streams** (Anthropic Claude, ElevenLabs multilingual TTS, Google Cloud STT, barge-in — kept as reference/alternative)
 
+This "two server modes" split is orthogonal to a second, more recent gate: `server.py` itself now builds one of **two mutually exclusive service-mode apps** (Twilio vs Dialog SmartPBX) via `KAVYA_SERVICE_MODE` — see **Service Modes** below.
+
 ## Project File Map
 
 ```
@@ -185,6 +187,34 @@ When a call ends (WebSocket disconnect), `server.py` fires `asyncio.create_task(
 **Local demos** (`test_voice_elevenlabs.py`, `test_voice.py`):
 Typed input -> KB retrieval -> LLM tool-use loop -> text response -> TTS playback. ElevenLabs version sends full response as one TTS call (splitting into sentences causes prosody resets). Azure version splits by sentence with per-language voice selection.
 
+## Service Modes
+
+`server.py` builds **one of two mutually exclusive FastAPI apps**, selected by `KAVYA_SERVICE_MODE` (env var, `"twilio"` default) via `build_service_app(service_mode, environ)` at the bottom of the file. The two modes never run in the same process — `build_service_app` returns exactly one `FastAPI` instance, and `lifespan()` skips all Twilio REST-client / handoff startup when the mode is `smartpbx`.
+
+**`twilio` (default) — production.** Everything documented above (ConversationRelay, Media Streams, `/voice/*`, Twilio `<Dial>` handover) is `app` unchanged. This is what serves real Hatton Hills calls today and **remains production default until a deliberate Dialog cutover is decided and executed** via `SMARTPBX_RUNBOOK.md`.
+
+**`smartpbx` — Dialog SmartPBX ("Client Connect") ingress, opt-in.** A second, narrower FastAPI app is built instead (`docs_url`/`redoc_url`/`openapi_url` all disabled), exposing exactly three routes:
+- `GET /health` — `{"status": "ok", "service_mode": "smartpbx"}`
+- `GET /smartpbx/status` — session counters (`active_sessions`, `admitted_total`, `rejected_capacity_total`, `released_total`), `enabled`, `configured`, `protocol_version`, `transfer_enabled` — no secrets, no PII
+- `WS /ws/v1/smartpbx/media` — the Dialog media socket, gated by a required `X-Kavya-SmartPBX-Token` header (constant-time compare) checked before `websocket.accept()`
+
+Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8000` Hz only — any other codec/rate is rejected at the `start` event. Capacity is hard-capped at **4 concurrent calls** (a 5th is rejected before the socket is even accepted; `SmartPBXSessionRegistry` cannot be constructed outside 1–4).
+
+**Module map** (`Kavya/smartpbx_*.py`):
+- `smartpbx_protocol.py` — strict, transport-independent parser for the Dialog wire events (`connected`/`start`/`media`/`dtmf`/`hangup`/`stop`, else `Unsupported`) into a closed dataclass union; fail-closed on anything malformed.
+- `smartpbx_gateway.py` — `SmartPBXSettings` (env validation), `SmartPBXSessionRegistry` (the 4-call admission counter), and `SmartPBXGateway` (auth → admit → start session → event loop → cleanup-once, emitting the `smartpbx_protocol_diagnostic` log line).
+- `smartpbx_transport.py` — `SmartPBXMediaTransport`, the bounded outbound audio queue serializing `media` frames back to Dialog (drops oldest frame on backpressure; generation-fenced so barge-in can't leak stale audio).
+- `smartpbx_session.py` — `KavyaSmartPBXSession`, the adapter wiring one Dialog call into Kavya's existing `MediaStreamSession` pipeline (STT → KB/PMS tools → LLM → TTS), forcing `lang="en"` and binding transfer/handover context.
+- `smartpbx_mcp.py` — fail-closed Dialog MCP call control: `DialogMCPSettings.from_env()` and `DialogMCPCallControl.transfer_call()`, restricted to operator-configured `tel:`/`sip:` destinations.
+- `smartpbx_handover.py` — `SmartPBXHandoverCoordinator`, the call-local state machine that attempts the MCP transfer and, on failure, falls back to the existing WhatsApp handover notification.
+- `smartpbx_diagnostics.py` — the enum vocabulary (`DiagnosticStage`/`DiagnosticOutcome`/`DiagnosticFailureClass`) for the seven-field diagnostic log line.
+
+**Handover in SmartPBX mode.** Twilio `<Dial>`/REST redirect/dial-status callbacks do not exist on a Dialog call, so they are not reused. `transfer_to_human` instead invokes the Dialog MCP `transfer_call` tool against the call's `otherLegCallId`. The path is fail-closed end to end: MCP endpoint/API key/account ID/account-header spelling are environment-only, `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` disables transfer entirely (the base/default state), validation/auth failures never retry, and bounded network/server failures retry once. If the MCP transfer does not succeed, `SmartPBXHandoverCoordinator` reuses the existing `handover.py` WhatsApp notification path (same `normalize_whatsapp`, same n8n webhook shape) as an operational fallback — it notifies the manager but is never treated as evidence of a successful live transfer.
+
+**Deployment shape.** SmartPBX runs as a separate Compose profile (`docker-compose.yml`, profile `smartpbx`, service `kavya-smartpbx`) alongside — not instead of — the existing `kavya` Twilio service: its own container, its own loopback port `127.0.0.1:8006`, its own Chroma volume (`./chroma_db_smartpbx`, never shared with the Twilio service's writable store), and an explicit environment allowlist (no `env_file: .env` — Twilio credentials and `HUMAN_AGENT_PHONE` must never reach this container). The image tag is pinned via `SMARTPBX_IMAGE_TAG` (default `disabled`, which cannot pull anything); secrets live in root-only `/opt/kavya/.env.smartpbx` (`chmod 600`), never `.env`. Public TLS terminates at a dedicated Nginx vhost, `smartpbx-kavya.taskforceai.tech`, in front of the loopback port. Image provenance is enforced in CI: `.github/workflows/build-kavya-image.yml` (publisher) and `probe-kavya-image.yml` (read-only probe) gate which image tag/digest is trustworthy to deploy — the runbook's guarded deploy script cross-checks the reviewed short SHA against the image's OCI revision label before recreating the container.
+
+**Full cutover/rollback procedure:** `SMARTPBX_RUNBOOK.md` — preconditions and immutable image identity, `.env.smartpbx` provisioning, TLS bootstrap, the five cutover gates (bad/missing auth rejected, bidirectional audio + LLM turn, KB/PMS answer + post-call record, 4-accepted/5th-rejected capacity, endpoint-down fallback), optional transfer drill with compulsory revoke, and drain-before-stop withdrawal/rollback.
+
 ## Key Design Decisions
 
 - **Pluggable LLM**: `LLM_PROVIDER` env var switches between Claude (default), OpenAI, and Gemini. Each has its own client singleton, streaming functions, and tool format. History is stored in provider-native format; Gemini uses a converter `_history_to_gemini()` since it stores in OpenAI format internally.
@@ -214,6 +244,11 @@ Typed input -> KB retrieval -> LLM tool-use loop -> text response -> TTS playbac
 - `POST /voice/incoming` — Returns TwiML with `<Stream>`
 - `WebSocket /ws/media-stream` — Handles: `start`, `media`, `mark`, `stop`
 - `GET /health` — `status`, `mode`, `ezee_configured`, `kb_loaded`, `stt_available`, `tts_configured`, `model`
+
+### server.py — SmartPBX service mode (`KAVYA_SERVICE_MODE=smartpbx`, opt-in — see Service Modes above)
+- `GET /health` — `{status, service_mode}` only (no LLM/KB/STT flags — those belong to the Twilio app)
+- `GET /smartpbx/status` — session counters + `transfer_enabled`
+- `WebSocket /ws/v1/smartpbx/media` — Dialog media socket, requires `X-Kavya-SmartPBX-Token` header, `g711_ulaw`/8000 Hz only, events `connected`/`start`/`media`/`dtmf`/`hangup`/`stop`
 
 ## Server Constants
 
@@ -781,6 +816,49 @@ completely broken detector because they hand-built `dial_events` with an
 `200 OK` at ~333 ms PDD with no `180 Ringing`. Twilio's side is clean, and it is
 **not** caller-ID filtering (see the correction at the top of v0.18). Needs a
 Twilio carrier-ops ticket, not a code change.
+
+### v0.22 — Dialog SmartPBX ("Client Connect") service mode (opt-in, Twilio unchanged)
+**Reason:** Dialog needed a direct WebSocket media integration as an alternative ingress to
+Twilio, modeled on Flico's existing Dialog integration and adapted to Kavya's English-only
+pipeline and Yanolja PMS tools. See
+`docs/superpowers/specs/2026-08-06-kavya-client-connect-design.md` (migration design) and
+`docs/superpowers/specs/2026-08-07-kavya-smartpbx-parity-repair-design.md` (voice/protocol
+corrections — the direct route was initially using the wrong ElevenLabs voice/model and an
+over-strict `hangup` parser; both fixed to match Kavya's established English identity and the
+supplied Dialog v06 extraction).
+
+**Changes:**
+- `server.py`: new `KAVYA_SERVICE_MODE` env var (`"twilio"` default | `"smartpbx"`) and
+  `build_service_app()`, returning one of two mutually exclusive FastAPI apps — never both.
+  `lifespan()` skips Twilio REST-client/handoff startup entirely when the mode is `smartpbx`.
+  The SmartPBX app exposes exactly `/health`, `/smartpbx/status`, and `WS /ws/v1/smartpbx/media`,
+  with `docs_url`/`redoc_url`/`openapi_url` disabled.
+- Seven new modules: `smartpbx_protocol.py`, `smartpbx_gateway.py`, `smartpbx_transport.py`,
+  `smartpbx_session.py`, `smartpbx_mcp.py`, `smartpbx_handover.py`, `smartpbx_diagnostics.py` —
+  see **Service Modes** above for what each does.
+- `MediaStreamSession` gained `_is_smartpbx_session()` / `_is_direct_smartpbx_english()` checks
+  threaded through its STT/LLM/TTS/tool-execution paths, purely for SmartPBX-flavored structured
+  logging (`smartpbx_media event=...`) and to gate the pre-tool filler differently on the direct
+  English path; the underlying Twilio behavior is unchanged.
+- `docker-compose.yml`: new `kavya-smartpbx` service under Compose profile `smartpbx` — loopback
+  `127.0.0.1:8006`, explicit env allowlist (no `env_file`, no Twilio creds, no
+  `HUMAN_AGENT_PHONE`), dedicated `./chroma_db_smartpbx` volume, `SMARTPBX_IMAGE_TAG` (default
+  `disabled`), `mem_limit`/`cpus`/`pids_limit` caps.
+- `SMARTPBX_RUNBOOK.md`: full cutover/rollback runbook — immutable image identity verification,
+  `.env.smartpbx` provisioning, TLS bootstrap for `smartpbx-kavya.taskforceai.tech`, the five
+  cutover gates, optional transfer drill with compulsory revoke, drain-before-stop rollback, and
+  a guarded image-deploy script.
+- `.github/workflows/build-kavya-image.yml` + `probe-kavya-image.yml`: publisher/probe pair
+  gating which image tag+digest is trustworthy to deploy to the SmartPBX profile.
+- Dialog MCP `transfer_call` replaces Twilio `<Dial>` for human handover on this path; the
+  existing WhatsApp handover notification (`handover.py`) is reused as the fail-closed fallback.
+
+**Not changed:** the Twilio `kavya` service, `/voice/*` routes, ConversationRelay, Media Streams,
+and Twilio-based handover all remain the production default, untouched by this mode. The two
+service modes are architecturally incapable of running in one process.
+
+**How to test:** `pytest Kavya/tests/test_smartpbx_*.py`. Live cutover: follow
+`SMARTPBX_RUNBOOK.md` in full — do not shortcut its gates.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 
