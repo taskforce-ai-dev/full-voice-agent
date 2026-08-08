@@ -203,13 +203,16 @@ jobs:
           case "$MODE" in
             absent)
               [[ $BUILT_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]
-              pushed_digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Digest}}" 2>/dev/null)"
+              # .Manifest.Digest, not .Digest: the bare field does not exist on
+              # imagetools.tplInput and exits 1. This is the index digest, which
+              # is what build-push-action reports as its own digest output.
+              pushed_digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Manifest.Digest}}" 2>/dev/null)"
               [[ $pushed_digest =~ ^sha256:[0-9a-f]{64}$ ]]
               test "$pushed_digest" = "$BUILT_DIGEST"
               digest="$pushed_digest"
               ;;
             existing)
-              digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Digest}}" 2>/dev/null)"
+              digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Manifest.Digest}}" 2>/dev/null)"
               ;;
             *) echo "unrecognized image mode" >&2; exit 1 ;;
           esac

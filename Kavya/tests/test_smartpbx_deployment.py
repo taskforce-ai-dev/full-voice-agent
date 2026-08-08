@@ -932,7 +932,7 @@ def test_kavya_image_probe_accepts_only_exact_probe_states(tmp_path, step, overr
 
 PROBE_DIGEST_INSPECT_LOG = (
     f"docker buildx imagetools inspect ghcr.io/taskforce-ai-dev/kavya:{PROBE_EXISTING_TAG}"
-    " --format {{ .Digest }}"
+    " --format {{ .Manifest.Digest }}"
 )
 PROBE_PULL_LOG = f"docker pull ghcr.io/taskforce-ai-dev/kavya@{PROBE_CANARY_DIGEST}"
 PROBE_IMAGE_INSPECT_LOG = (
