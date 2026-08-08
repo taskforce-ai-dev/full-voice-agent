@@ -1,16 +1,8 @@
 name: Probe Kavya image (read-only)
 
 on:
-  workflow_dispatch:
-    inputs:
-      existing_tag:
-        description: Existing immutable Kavya image tag
-        required: true
-        type: string
-      expected_revision:
-        description: Expected lowercase OCI revision
-        required: true
-        type: string
+  repository_dispatch:
+    types: [kavya_image_read_only_probe]
 
 concurrency:
   group: kavya-image-read-only-probe
@@ -24,16 +16,57 @@ jobs:
       contents: read
       packages: read
     steps:
-      - name: Validate probe inputs
+      - name: Validate dispatch trust and payload
+        id: validate
         env:
-          EXISTING_TAG: ${{ inputs.existing_tag }}
-          EXPECTED_REVISION: ${{ inputs.expected_revision }}
+          PROBE_EVENT_NAME: ${{ github.event_name }}
+          PROBE_EVENT_ACTION: ${{ github.event.action }}
+          PROBE_REPOSITORY: ${{ github.repository }}
+          PROBE_EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          PROBE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PROBE_REF: ${{ github.ref }}
+          PROBE_REF_NAME: ${{ github.ref_name }}
+          PROBE_REF_TYPE: ${{ github.ref_type }}
+          PROBE_REF_PROTECTED: ${{ github.ref_protected }}
+          PROBE_SHA: ${{ github.sha }}
+          PROBE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PROBE_WORKFLOW_REF: ${{ github.workflow_ref }}
+          PROBE_EVENT: ${{ toJSON(github.event) }}
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
-          [[ "$EXISTING_TAG" =~ ^[0-9a-f]{7}$ ]] || fail
-          [[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail
-          [[ "$EXISTING_TAG" == "${EXPECTED_REVISION:0:7}" ]] || fail
+          repository='taskforce-ai-dev/full-voice-agent'
+          [[ "$PROBE_EVENT_NAME" == 'repository_dispatch' ]] || fail
+          [[ "$PROBE_EVENT_ACTION" == 'kavya_image_read_only_probe' ]] || fail
+          [[ "$PROBE_REPOSITORY" == "$repository" ]] || fail
+          [[ "$PROBE_EVENT_REPOSITORY" == "$repository" ]] || fail
+          [[ "$PROBE_DEFAULT_BRANCH" == 'main' ]] || fail
+          [[ "$PROBE_REF" == 'refs/heads/main' ]] || fail
+          [[ "$PROBE_REF_NAME" == 'main' ]] || fail
+          [[ "$PROBE_REF_TYPE" == 'branch' ]] || fail
+          [[ "$PROBE_REF_PROTECTED" == 'true' ]] || fail
+          [[ "$PROBE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$PROBE_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$PROBE_SHA" == "$PROBE_WORKFLOW_SHA" ]] || fail
+          [[ "$PROBE_WORKFLOW_REF" == "$repository/.github/workflows/probe-kavya-image.yml@refs/heads/main" ]] || fail
+          payload_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$payload_dir" || true; }
+          trap cleanup EXIT
+          printf '%s' "$PROBE_EVENT" > "$payload_dir/event.json" || fail
+          jq -e '(.client_payload | type) == "object"
+            and (.client_payload | keys) == ["existing_tag", "expected_revision"]
+            and (.client_payload.existing_tag | type) == "string"
+            and (.client_payload.expected_revision | type) == "string"' \
+            "$payload_dir/event.json" >/dev/null 2>&1 || fail
+          existing_tag="$(jq -r '.client_payload.existing_tag' "$payload_dir/event.json" 2>/dev/null)" || fail
+          expected_revision="$(jq -r '.client_payload.expected_revision' "$payload_dir/event.json" 2>/dev/null)" || fail
+          [[ "$existing_tag" =~ ^[0-9a-f]{7}$ ]] || fail
+          [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$existing_tag" == "${expected_revision:0:7}" ]] || fail
+          {
+            printf 'existing_tag=%s\n' "$existing_tag"
+            printf 'expected_revision=%s\n' "$expected_revision"
+          } >> "$GITHUB_OUTPUT" || fail
       - name: Checkout trusted probe tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -49,40 +82,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Record safe runtime metadata
+        env:
+          PROBE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PROBE_RUNNER_LABEL: ubuntu-24.04
+          PROBE_RUNNER_OS: ${{ runner.os }}
+          PROBE_RUNNER_ARCH: ${{ runner.arch }}
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
-          GITHUB_WORKFLOW_SHA="${GITHUB_WORKFLOW_SHA:-}"
-          workflow_commit=$GITHUB_WORKFLOW_SHA
-          workflow_sha="$workflow_commit"
-          runner_image="${ImageOS:-}"
-          runner_version="${ImageVersion:-}"
-          [[ "$workflow_sha" =~ ^[0-9a-f]{40}$ ]] || fail
-          [[ "$runner_image" =~ ^[A-Za-z0-9._-]+$ ]] || fail
-          [[ "$runner_version" =~ ^[A-Za-z0-9._-]+$ ]] || fail
+          [[ "$PROBE_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$PROBE_RUNNER_LABEL" == 'ubuntu-24.04' ]] || fail
+          [[ "$PROBE_RUNNER_OS" == 'Linux' ]] || fail
+          [[ "$PROBE_RUNNER_ARCH" == 'X64' ]] || fail
           buildx_dir="$(mktemp -d)" || fail
           cleanup() { rm -rf -- "$buildx_dir" || true; }
           trap cleanup EXIT
           docker buildx version >"$buildx_dir/stdout" 2>"$buildx_dir/stderr" || fail
-          buildx_version="$(awk '{print $2}' "$buildx_dir/stdout")" || fail
-          [[ "$runner_image" =~ ^[A-Za-z0-9._-]+$ ]] || fail
-          [[ "$runner_version" =~ ^[A-Za-z0-9._-]+$ ]] || fail
-          [[ "$buildx_version" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || fail
+          buildx_version="$(awk 'NR==1{print $2}' "$buildx_dir/stdout")" || fail
+          [[ "$buildx_version" =~ ^v[0-9][A-Za-z0-9._+-]{0,62}$ ]] || fail
           {
-            printf 'workflow_commit=%s\n' "$workflow_sha"
-            printf '%s\n' 'checkout_action=actions/checkout@v7'
-            printf '%s\n' 'buildx_action=docker/setup-buildx-action@v4'
-            printf '%s\n' 'login_action=docker/login-action@v4'
-            printf 'runner_image=%s\n' "$runner_image"
-            printf 'runner_image_version=%s\n' "$runner_version"
+            printf 'workflow_commit=%s\n' "$PROBE_WORKFLOW_SHA"
+            printf '%s\n' 'checkout_action=actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
+            printf '%s\n' 'setup_buildx_action=docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c'
+            printf '%s\n' 'login_action=docker/login-action@dbcb813823bdd20940b903addbd779551569679f'
+            printf 'runner_label=%s\n' "$PROBE_RUNNER_LABEL"
+            printf 'runner_os=%s\n' "$PROBE_RUNNER_OS"
+            printf 'runner_arch=%s\n' "$PROBE_RUNNER_ARCH"
             printf 'buildx_version=%s\n' "$buildx_version"
           } >> "$GITHUB_STEP_SUMMARY" || fail
       - name: Probe known existing tag
         env:
-          EXISTING_TAG: ${{ inputs.existing_tag }}
+          EXISTING_TAG: ${{ steps.validate.outputs.existing_tag }}
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [[ "$EXISTING_TAG" =~ ^[0-9a-f]{7}$ ]] || fail
           image="ghcr.io/taskforce-ai-dev/kavya"
           image="${image}:${EXISTING_TAG}"
           probe_dir="$(mktemp -d)" || fail
@@ -90,35 +124,43 @@ jobs:
           trap cleanup EXIT
           probe_stdout="$probe_dir/stdout"
           probe_stderr="$probe_dir/stderr"
-          expected_marker="image_tag_state=existing"
+          expected_stdout="$probe_dir/expected"
+          printf 'image_tag_state=existing\n' > "$expected_stdout" || fail
           if bash .probe-tools/.github/scripts/check-kavya-image-tag.sh "$image" >"$probe_stdout" 2>"$probe_stderr"; then probe_code=0; else probe_code=$?; fi
           [[ "$probe_code" -eq 10 ]] || fail
-          probe_lines="$(wc -l < "$probe_stdout")" || fail
-          probe_marker="$(cat "$probe_stdout")" || fail
-          [[ "$probe_lines" -eq 1 ]] || fail
-          [[ "$probe_marker" == "$expected_marker" ]] || fail
+          cmp -s "$probe_stdout" "$expected_stdout" || fail
           printf 'existing_tag_state=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
       - name: Verify existing OCI revision
         env:
-          EXISTING_TAG: ${{ inputs.existing_tag }}
-          EXPECTED_REVISION: ${{ inputs.expected_revision }}
+          EXISTING_TAG: ${{ steps.validate.outputs.existing_tag }}
+          EXPECTED_REVISION: ${{ steps.validate.outputs.expected_revision }}
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
-          image="ghcr.io/taskforce-ai-dev/kavya:${EXISTING_TAG}"
+          [[ "$EXISTING_TAG" =~ ^[0-9a-f]{7}$ ]] || fail
+          [[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail
+          repository="ghcr.io/taskforce-ai-dev/kavya"
+          image="${repository}:${EXISTING_TAG}"
           probe_dir="$(mktemp -d)" || fail
           cleanup() { rm -rf -- "$probe_dir" || true; }
           trap cleanup EXIT
+          digest_stdout="$probe_dir/digest.stdout"
+          digest_stderr="$probe_dir/digest.stderr"
           pull_stdout="$probe_dir/pull.stdout"
           pull_stderr="$probe_dir/pull.stderr"
           inspect_stdout="$probe_dir/inspect.stdout"
           inspect_stderr="$probe_dir/inspect.stderr"
-          docker pull "$image" >"$pull_stdout" 2>"$pull_stderr" || fail
-          docker image inspect "$image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' >"$inspect_stdout" 2>"$inspect_stderr" || fail
-          inspect_lines="$(wc -l < "$inspect_stdout")" || fail
-          revision="$(cat "$inspect_stdout")" || fail
-          [[ "$inspect_lines" -eq 1 ]] || fail
-          [[ "$revision" == "$EXPECTED_REVISION" ]] || fail
+          expected_stdout="$probe_dir/expected"
+          printf '%s\n' "$EXPECTED_REVISION" > "$expected_stdout" || fail
+          # Resolve the mutable tag to a digest once, then read only that digest,
+          # so the pull and the label inspection cannot see two different images.
+          docker buildx imagetools inspect "$image" --format '{{ .Digest }}' >"$digest_stdout" 2>"$digest_stderr" || fail
+          digest="$(<"$digest_stdout")" || fail
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail
+          image_ref="${repository}@${digest}"
+          docker pull "$image_ref" >"$pull_stdout" 2>"$pull_stderr" || fail
+          docker image inspect "$image_ref" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' >"$inspect_stdout" 2>"$inspect_stderr" || fail
+          cmp -s "$inspect_stdout" "$expected_stdout" || fail
           printf 'existing_revision=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
       - name: Probe generated absent canary
         run: |
@@ -131,10 +173,7 @@ jobs:
           [[ "$repository_id" =~ ^[0-9]+$ ]] || fail
           [[ "$run_id" =~ ^[0-9]+$ ]] || fail
           [[ "$attempt" =~ ^[0-9]+$ ]] || fail
-          GITHUB_REPOSITORY_ID="$repository_id"
-          GITHUB_RUN_ID="$run_id"
-          GITHUB_RUN_ATTEMPT="$attempt"
-          canary="probe-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          canary="probe-${repository_id}-${run_id}-${attempt}"
           [[ "$canary" =~ ^probe-[0-9]+-[0-9]+-[0-9]+$ ]] || fail
           [[ ${#canary} -le 128 ]] || fail
           probe_dir="$(mktemp -d)" || fail
@@ -142,22 +181,24 @@ jobs:
           trap cleanup EXIT
           probe_stdout="$probe_dir/stdout"
           probe_stderr="$probe_dir/stderr"
-          expected_marker="image_tag_state=absent"
+          expected_stdout="$probe_dir/expected"
+          printf 'image_tag_state=absent\n' > "$expected_stdout" || fail
           if bash .probe-tools/.github/scripts/check-kavya-image-tag.sh "$image:$canary" >"$probe_stdout" 2>"$probe_stderr"; then probe_code=0; else probe_code=$?; fi
           [[ "$probe_code" -eq 0 ]] || fail
-          probe_lines="$(wc -l < "$probe_stdout")" || fail
-          probe_marker="$(cat "$probe_stdout")" || fail
-          [[ "$probe_lines" -eq 1 ]] || fail
-          [[ "$probe_marker" == "$expected_marker" ]] || fail
+          cmp -s "$probe_stdout" "$expected_stdout" || fail
           printf 'canary_state=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
       - name: Write safe probe summary
+        env:
+          EXISTING_TAG: ${{ steps.validate.outputs.existing_tag }}
+          EXPECTED_REVISION: ${{ steps.validate.outputs.expected_revision }}
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [[ "$EXISTING_TAG" =~ ^[0-9a-f]{7}$ ]] || fail
+          [[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail
           {
+            printf 'existing_tag=%s\n' "$EXISTING_TAG"
+            printf 'expected_revision=%s\n' "$EXPECTED_REVISION"
             printf '%s\n' 'probe_version=1'
-            printf '%s\n' 'existing_tag_state=pass'
-            printf '%s\n' 'existing_revision=pass'
-            printf '%s\n' 'canary_state=pass'
             printf '%s\n' 'probe_result=pass'
           } >> "$GITHUB_STEP_SUMMARY" || fail
