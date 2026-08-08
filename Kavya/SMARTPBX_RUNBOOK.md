@@ -222,7 +222,12 @@ Before enabling the Dialog route, emit only the fixed protocol diagnostic with e
    and use the `failure_class` in our own diagnostic stream (`authentication` vs
    `capacity`) as the authoritative signal.
 5. Test endpoint-down fallback before shifting traffic.
-6. **Live barge-in.** Ask Kavya something that produces a long answer, then
+6. **Live barge-in.** Also confirm Dialog's reconnect behaviour here: nginx now
+   rate-limits the media location (30r/m, burst 10) and returns `429` beyond
+   that. Restart the container and watch how Dialog re-establishes its sockets —
+   record whether it retries on `429` and how quickly, and raise the burst if a
+   normal reconnect storm trips it.
+   Ask Kavya something that produces a long answer, then
    interrupt her mid-sentence. Confirm she **stops speaking within about a
    second** and responds to the interruption. Dialog has no `clear` wire event,
    so the only thing that can cancel queued speech is the outbound queue still
@@ -323,10 +328,19 @@ nothing beyond liveness and the service mode. If SmartPBX is not configured ther
 is no token, so status fails closed rather than exposing counters — use `/health`
 to distinguish "down" from "not configured".
 
-`frames_dropped_total` is a saturating count of outbound audio frames discarded
-by transport backpressure. A steadily rising value means callers are hearing
-truncated speech: check container CPU and the Dialog socket's health before
-assuming a TTS fault.
+`frames_dropped_total` is a saturating count of outbound audio frames refused by
+transport backpressure. A non-zero value means some replies were **cut short** —
+delivery is a contiguous prefix, so the guest hears the start of the answer and
+then silence, not garbled speech.
+
+The dominant trigger is **reply length against queue depth**, not CPU or socket
+health. Outbound audio is paced at realtime while TTS produces it faster, so the
+queue holds the backlog; a reply longer than the queue can hold overflows it. At
+the default 512 frames that is roughly 40 seconds of continuous speech. Read a
+rising counter as "Kavya is answering at unusual length" and look at the prompt
+and the KB content first. Raise `SMARTPBX_MAX_OUTBOUND_FRAMES` (ceiling 512) only
+if it is already below the default. Investigate CPU or the Dialog socket only
+once reply length has been ruled out.
 
 ## Withdraw and rollback without dropping calls
 

@@ -78,11 +78,14 @@ class SmartPBXMediaTransport:
         if not self.is_active:
             return
         if self._queue.full():
-            self._queue.get_nowait()
-            self._queue.task_done()
+            # Drop the newest frame, never the oldest. Evicting the head discards
+            # the frame that was next due, so playback jumps forward repeatedly
+            # and the reply garbles throughout; refusing the tail degrades to a
+            # clean early cut, which is far easier for a guest to recover from.
             self._frames_dropped = min(self._frames_dropped + 1, _MAX_COUNTER)
             if self._on_frame_dropped is not None:
                 self._on_frame_dropped()
+            return
         self._queue.put_nowait(_QueuedAudio(self._generation, bytes(audio)))
 
     async def send_mark(self, _name: str) -> None:

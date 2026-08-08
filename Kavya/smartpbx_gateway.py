@@ -31,7 +31,9 @@ _INTEGER_SETTINGS = {
     "SMARTPBX_MAX_CALLS": ("max_calls", 4, 1, 4),
     "SMARTPBX_MAX_MESSAGE_CHARS": ("max_message_chars", 65536, 1024, 65536),
     "SMARTPBX_MAX_AUDIO_BYTES": ("max_audio_bytes", 32768, 160, 32768),
-    "SMARTPBX_MAX_OUTBOUND_FRAMES": ("max_outbound_frames", 128, 1, 128),
+    # ~640B per frame, so 512 frames is ~40s of speech and ~320KB per call.
+    # Deep enough that pacing never makes the queue the binding constraint.
+    "SMARTPBX_MAX_OUTBOUND_FRAMES": ("max_outbound_frames", 512, 1, 512),
     "SMARTPBX_START_TIMEOUT_SECONDS": ("start_timeout_seconds", 10, 1, 30),
     "SMARTPBX_IDLE_TIMEOUT_SECONDS": ("idle_timeout_seconds", 90, 10, 300),
     # An acknowledged transfer legitimately outlives ordinary idleness, but a

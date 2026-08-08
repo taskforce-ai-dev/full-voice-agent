@@ -80,7 +80,7 @@ def test_nginx_exposes_only_the_bounded_smartpbx_surface_with_tls():
     assert "access_log /var/log/nginx/smartpbx-kavya-access.log" in nginx
     assert "limit_req_zone $binary_remote_addr zone=kavya_smartpbx_req:10m rate=30r/m;" in nginx
     media = nginx.split("location = /ws/v1/smartpbx/media", 1)[1].split("location =", 1)[0]
-    assert "limit_req zone=kavya_smartpbx_req burst=5 nodelay;" in media
+    assert "limit_req zone=kavya_smartpbx_req burst=10 nodelay;" in media
     assert "limit_req_status 429;" in nginx
     assert nginx.count("location = /ws/v1/smartpbx/media") == 1
     assert nginx.count("location = /health") == 1

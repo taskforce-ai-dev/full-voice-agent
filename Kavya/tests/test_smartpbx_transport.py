@@ -51,7 +51,13 @@ async def test_sends_only_the_documented_media_envelope():
 
 
 @pytest.mark.asyncio
-async def test_serialized_sender_drops_oldest_when_bounded_queue_overflows():
+async def test_serialized_sender_drops_newest_when_bounded_queue_overflows():
+    """Overflow must truncate the tail, not decimate what is already queued.
+
+    Evicting the oldest frame discards the one that was next due, so the guest
+    hears playback jump forward again and again. Refusing the newest frame keeps
+    the delivered audio a contiguous prefix and simply ends it early.
+    """
     websocket = FakeWebSocket()
     websocket.allow_send.clear()
     transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=2)
@@ -65,8 +71,9 @@ async def test_serialized_sender_drops_oldest_when_bounded_queue_overflows():
     await asyncio.wait_for(wait_for_sent(websocket, 3), timeout=1)
 
     assert [json.loads(item)["media"]["payload"] for item in websocket.sent] == [
-        base64.b64encode(audio).decode("ascii") for audio in (b"in-flight", b"newest", b"latest")
+        base64.b64encode(audio).decode("ascii") for audio in (b"in-flight", b"oldest", b"newest")
     ]
+    assert transport.frames_dropped_total == 1
     await transport.close()
 
 

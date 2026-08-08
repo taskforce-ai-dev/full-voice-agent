@@ -110,7 +110,7 @@ def test_settings_default_to_the_kavya_token_header_and_documented_bounds():
 
     assert configuration.auth_header_name == "X-Kavya-SmartPBX-Token"
     assert (configuration.max_calls, configuration.start_timeout_seconds, configuration.idle_timeout_seconds) == (4, 10, 90)
-    assert (configuration.max_message_chars, configuration.max_audio_bytes, configuration.max_outbound_frames) == (65536, 32768, 128)
+    assert (configuration.max_message_chars, configuration.max_audio_bytes, configuration.max_outbound_frames) == (65536, 32768, 512)
     assert "test-token" not in repr(configuration)
 
 
