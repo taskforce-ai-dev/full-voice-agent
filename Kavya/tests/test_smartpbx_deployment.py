@@ -862,6 +862,8 @@ class FakeDeployHost:
             "baseline_id": self.baseline, "baseline_digest": f"{self.image}@sha256:" + "b" * 64,
             "baseline_revision": "a" * 40, "candidate_id": self.candidate,
             "candidate_digest": f"{self.image}@{self.digest}", "candidate_revision": self.sha,
+            "baseline_digests": [f"{self.image}@sha256:" + "b" * 64],
+            "candidate_digests": [f"{self.image}@{self.digest}"], "alias_checks": 0,
             "current_id": self.baseline, "alias_id": "", "tag_id": "", "mutated": False,
             "flico_id": "f" * 64, "legacy_id": "e" * 64,
             "flico_health": "healthy", "legacy_health": "healthy",
@@ -897,7 +899,7 @@ class FakeDeployHost:
         path = self.bin / "docker"
         path.write_text(textwrap.dedent("""\
             #!/usr/bin/env python3
-            import json, os, signal, sys
+            import json, os, signal, sys, time
             state_path=os.environ['FAKE_STATE']; state=json.load(open(state_path))
             args=sys.argv[1:]
             with open(os.environ['FAKE_LOG'],'a') as log:
@@ -923,6 +925,7 @@ class FakeDeployHost:
                 tag=os.getenv('SMARTPBX_IMAGE_TAG')
                 if tag == 'rollback-local':
                     if os.getenv('ROLLBACK_RECREATE_BAD') == '1': sys.exit(1)
+                    if os.getenv('ROLLBACK_DELAY'): time.sleep(float(os.getenv('ROLLBACK_DELAY')))
                     state['current_id']=state['alias_id']
                 else:
                     state['mutated']=True; state['current_id']=state['candidate_id']
@@ -946,7 +949,15 @@ class FakeDeployHost:
                 save(); sys.exit(0)
             if args[:2] == ['image','inspect']:
                 ref,fmt=args[2],args[4]; image_id,digest,revision=image_for(ref)
-                print(image_id if fmt == '{{.Id}}' else digest if 'RepoDigests' in fmt else revision if 'Config.Labels' in fmt else '')
+                if 'RepoDigests' in fmt:
+                    digests=state['baseline_digests'] if ref == state['baseline_id'] or ref.endswith(':rollback-local') else state['candidate_digests']
+                    print('\\n'.join(digests))
+                else:
+                    if ref.endswith(':rollback-local'):
+                        state['alias_checks'] += 1
+                        if os.getenv('ALIAS_RECHECK_BAD') == '1' and state['alias_checks'] > 1: image_id='sha256:'+'8'*64
+                        save()
+                    print(image_id if fmt == '{{.Id}}' else revision if 'Config.Labels' in fmt else '')
                 sys.exit(0)
             sys.exit(98)
         """), encoding="utf-8")
@@ -959,8 +970,8 @@ class FakeDeployHost:
         root_environment = [f"{key}={value}" for key, value in environment.items()]
         return subprocess.run(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, capture_output=True, check=False)
 
-    def start(self, *args):
-        environment = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state)}
+    def start(self, *args, **env):
+        environment = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state)} | {key: str(value) for key, value in env.items()}
         command = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; APP_DIR={self.app}; LOCK_FILE={self.root / 'lock'}; main \"$@\""
         root_environment = [f"{key}={value}" for key, value in environment.items()]
         return subprocess.Popen(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -993,6 +1004,24 @@ def test_deploy_baseline_metadata_or_alias_mismatch_never_mutates(tmp_path, stat
 ])
 def test_deploy_candidate_pull_or_tag_identity_mismatch_never_mutates(tmp_path, environment):
     host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+def test_deploy_accepts_expected_digest_when_repo_digests_are_out_of_order(tmp_path):
+    host = FakeDeployHost(tmp_path, candidate_digests=["other.example/kavya@sha256:" + "9" * 64, f"{FakeDeployHost.image}@{FakeDeployHost.digest}"], baseline_digests=["other.example/kavya@sha256:" + "8" * 64, f"{FakeDeployHost.image}@sha256:" + "b" * 64])
+    result = host.deploy()
+    assert result.returncode == 0 and host.compose_count() == 1
+
+
+def test_deploy_rejects_missing_expected_digest_before_mutation(tmp_path):
+    host = FakeDeployHost(tmp_path, candidate_digests=["other.example/kavya@sha256:" + "9" * 64])
+    result = host.deploy()
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+def test_deploy_rechecks_rollback_alias_before_forward_mutation(tmp_path):
+    host = FakeDeployHost(tmp_path)
+    result = host.deploy(ALIAS_RECHECK_BAD=1)
     assert result.returncode != 0 and host.compose_count() == 0
 
 
@@ -1073,6 +1102,23 @@ def test_deploy_signals_after_mutation_roll_back_once(tmp_path, signal_name):
     process.send_signal(getattr(signal, f"SIG{signal_name}"))
     process.communicate(timeout=5)
     assert process.returncode != 0 and host.compose_count() == 2
+
+
+def test_traps_precede_arming_and_second_signal_cannot_interrupt_rollback(tmp_path):
+    script = read_smartpbx_image_deploy_script()
+    arm = script.split("arm_rollback()", 1)[1].split("disarm_rollback()", 1)[0]
+    assert arm.find("trap 'on_error") < arm.find("ROLLBACK_ARMED=1")
+    host = FakeDeployHost(tmp_path)
+    process = host.start(host.sha[:7], host.sha, host.digest, ROLLBACK_DELAY=1)
+    deadline = time.monotonic() + 5
+    while not host.current()["mutated"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    process.send_signal(signal.SIGTERM)
+    time.sleep(0.1)
+    process.send_signal(signal.SIGINT)
+    _, stderr = process.communicate(timeout=5)
+    assert process.returncode != 0 and host.compose_count() == 2
+    assert "SMARTPBX_ROLLBACK_ESCALATION_REQUIRED" not in stderr
 
 
 def test_deploy_mutates_only_the_pinned_service_and_never_prints_sentinels(tmp_path):
