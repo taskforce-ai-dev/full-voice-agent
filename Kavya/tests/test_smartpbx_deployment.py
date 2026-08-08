@@ -621,7 +621,15 @@ def test_kavya_image_probe_requires_exact_states_provenance_and_internal_canary(
         assert expected in step["run"], expected
         assert 'cmp -s "$' in step["run"]
         assert "wc -l" not in step["run"]
-    assert 'cmp -s "$probe_stdout" "$expected_stdout" || fail' in existing["run"]
+    # The existing-tag step branches on mode, so its comparisons gate an `if`
+    # rather than trailing `|| fail`; both arms still compare byte-for-byte
+    # against a printf-written file, and the else arm fails closed.
+    assert 'cmp -s "$probe_stdout" "$expected_stdout"' in existing["run"]
+    assert 'cmp -s "$probe_stdout" "$expected_absent"' in existing["run"]
+    assert "printf 'image_tag_state=absent\\n' > \"$expected_absent\" || fail" in existing["run"]
+    assert [line.strip() for line in existing["run"].strip().splitlines()][-3:] == [
+        "else", "fail", "fi",
+    ], "any unclassified existing-tag state must still fail closed"
     assert 'cmp -s "$probe_stdout" "$expected_stdout" || fail' in canary["run"]
     assert 'cmp -s "$inspect_stdout" "$expected_stdout" || fail' in verify["run"]
     assert all("wc -l" not in run for run in workflow_run_strings(document))
@@ -797,6 +805,7 @@ def test_kavya_image_probe_validation_binds_identity_before_tools(tmp_path, tag,
         assert outputs.read_text(encoding="utf-8").splitlines() == [
             f"existing_tag={tag}",
             f"expected_revision={revision}",
+            "bootstrap=false",
         ]
 
 
@@ -869,6 +878,7 @@ def test_kavya_image_probe_ignores_the_webhook_branch_field(tmp_path, branch):
     assert (tmp_path / "outputs").read_text(encoding="utf-8").splitlines() == [
         f"existing_tag={PROBE_EXISTING_TAG}",
         f"expected_revision={PROBE_EXPECTED_REVISION}",
+        "bootstrap=false",
     ]
 
 
@@ -1049,6 +1059,7 @@ def test_kavya_image_probe_run_scripts_parse_and_summary_is_allowlisted(tmp_path
         "existing_tag_state=pass",
         "existing_revision=pass",
         "canary_state=pass",
+        "probe_mode=strict",
         f"existing_tag={PROBE_EXISTING_TAG}",
         f"expected_revision={PROBE_EXPECTED_REVISION}",
         "probe_version=1",
