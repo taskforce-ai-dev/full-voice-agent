@@ -729,9 +729,26 @@ def run_probe_workflow_step(tmp_path, name, output_files=None, **values):
         #!/usr/bin/env bash
         set -Eeuo pipefail
         printf 'docker %s\\n' "$*" >> "$FAKE_LOG"
+        # Real buildx evaluates --format against imagetools.tplInput, which has
+        # .Manifest and .Image but no bare .Digest. A fake that accepts any
+        # template agrees with itself and hides a broken one; this one does not.
+        check_imagetools_format() {
+          local fmt="" previous=""
+          for argument in "$@"; do
+            if [[ "$previous" == "--format" ]]; then fmt="$argument"; fi
+            previous="$argument"
+          done
+          [[ -z "$fmt" ]] && return 0
+          if [[ "$fmt" != *".Manifest"* && "$fmt" != *".Image"* ]]; then
+            printf 'ERROR: template: :1:2: executing "" at <%s>: cannot evaluate field in type imagetools.tplInput\\n' "$fmt" >&2
+            return 1
+          fi
+          return 0
+        }
         case "$1 ${2:-} ${3:-}" in
           "buildx version ") printf 'github.com/docker/buildx %s\\n' "$BUILDX_VERSION"; exit "$BUILDX_CODE" ;;
           "buildx imagetools inspect")
+            check_imagetools_format "$@" || exit 1
             if [[ -n "${DIGEST_OUT_FILE:-}" ]]; then cat "$DIGEST_OUT_FILE"; else printf '%s' "$DIGEST_OUT"; fi
             printf '%s' "$DIGEST_ERR" >&2; exit "$DIGEST_CODE" ;;
         esac
@@ -915,7 +932,7 @@ def test_kavya_image_probe_accepts_only_exact_probe_states(tmp_path, step, overr
 
 PROBE_DIGEST_INSPECT_LOG = (
     f"docker buildx imagetools inspect ghcr.io/taskforce-ai-dev/kavya:{PROBE_EXISTING_TAG}"
-    " --format {{ .Digest }}"
+    " --format {{ .Manifest.Digest }}"
 )
 PROBE_PULL_LOG = f"docker pull ghcr.io/taskforce-ai-dev/kavya@{PROBE_CANARY_DIGEST}"
 PROBE_IMAGE_INSPECT_LOG = (
@@ -1116,6 +1133,8 @@ PUBLISHER_WORKFLOW_REF = f"{PROBE_REPOSITORY}/.github/workflows/build-kavya-imag
 PUBLISHER_TRUST_STEP = "Validate publisher dispatch trust"
 PUBLISHER_GATE_STEP = "Require a fresh successful read-only probe"
 PUBLISHER_GATE_WINDOW_SECONDS = 86400
+# The real index digest build-push-action reported for kavya:db7d0d1.
+PUBLISHER_BUILT_DIGEST = "sha256:3d7f73715d934dbb30e7ac09f240162830ee9d8038b04a73554e9539247d88a7"
 
 
 def test_build_kavya_image_publisher_binds_execution_to_protected_default_branch():
@@ -1256,6 +1275,28 @@ def run_publisher_workflow_step(tmp_path, name, gh_stdout=None, **values):
         exit "$GH_CODE"
     """), encoding="utf-8")
     gh.chmod(0o755)
+    docker = fake_bin / "docker"
+    docker.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+        printf 'docker %s\\n' "$*" >> "$FAKE_LOG"
+        # Same fidelity rule as the probe's fake: a --format template that does
+        # not resolve against imagetools.tplInput must fail like the real one.
+        fmt=""; previous=""
+        for argument in "$@"; do
+          if [[ "$previous" == "--format" ]]; then fmt="$argument"; fi
+          previous="$argument"
+        done
+        if [[ -n "$fmt" && "$fmt" != *".Manifest"* && "$fmt" != *".Image"* && "$fmt" != *".Config"* && "$fmt" != *".Id"* && "$fmt" != *".State"* ]]; then
+          printf 'ERROR: template: :1:2: executing "" at <%s>: cannot evaluate field in type imagetools.tplInput\\n' "$fmt" >&2
+          exit 1
+        fi
+        if [[ "$1 ${2:-} ${3:-}" == "buildx imagetools inspect" ]]; then
+          printf '%s\\n' "$DIGEST_OUT"; exit "$DIGEST_CODE"
+        fi
+        exit 97
+    """), encoding="utf-8")
+    docker.chmod(0o755)
     payload = tmp_path / "gh-stdout.json"
     payload.write_text(
         probe_runs_json([probe_run_entry()]) if gh_stdout is None else gh_stdout,
@@ -1273,6 +1314,9 @@ def run_publisher_workflow_step(tmp_path, name, gh_stdout=None, **values):
         "PUBLISHER_SHA": PUBLISHER_SHA, "PUBLISHER_WORKFLOW_SHA": PUBLISHER_SHA,
         "PUBLISHER_WORKFLOW_REF": PUBLISHER_WORKFLOW_REF,
         "GATE_REPOSITORY": PROBE_REPOSITORY, "GATE_SHA": PUBLISHER_SHA,
+        "MODE": "absent", "TAG": "ghcr.io/taskforce-ai-dev/kavya:db7d0d1",
+        "BUILT_DIGEST": PUBLISHER_BUILT_DIGEST, "DIGEST_OUT": PUBLISHER_BUILT_DIGEST,
+        "DIGEST_CODE": "0",
     } | {key: str(value) for key, value in values.items()}
     result = subprocess.run(["bash", "-c", script], cwd=tmp_path, env=env, text=True, capture_output=True, check=False)
     return (
@@ -2475,3 +2519,84 @@ def test_kavya_image_probe_summary_discloses_the_mode(tmp_path, bootstrap, expec
 
     assert result.returncode == 0
     assert f"probe_mode={expected_mode}" in summary
+
+
+# --- Registry template fidelity -------------------------------------------
+# `docker buildx imagetools inspect --format` evaluates against
+# imagetools.tplInput, which exposes .Manifest but has no bare .Digest.
+# Observed live in run 31281453563:
+#   --format '{{.Digest}}'          -> ERROR ... can't evaluate field Digest   (exit 1)
+#   --format '{{.Manifest.Digest}}' -> sha256:3d7f7371...                      (exit 0)
+# Both the publisher's push verification and the probe's digest resolution used
+# the invalid form, so each aborted before the comparison it appeared to fail.
+
+
+@pytest.mark.parametrize(
+    "workflow", [KAVYA_IMAGE_PROBE_WORKFLOW, BUILD_KAVYA_IMAGE_WORKFLOW], ids=["probe", "publisher"]
+)
+def test_imagetools_digest_is_read_through_the_manifest_field(workflow):
+    text = workflow.read_text(encoding="utf-8")
+
+    for line in text.splitlines():
+        if "imagetools inspect" not in line or "--format" not in line:
+            continue
+        assert ".Manifest.Digest" in line or ".Manifest" in line, (
+            f"imagetools --format must resolve against .Manifest: {line.strip()}"
+        )
+    assert not re.search(r"\{\{\s*\.Digest\s*\}\}", text), (
+        "a bare {{.Digest}} is not a field of imagetools.tplInput and exits 1"
+    )
+
+
+def test_publisher_resolve_digest_accepts_a_matching_pushed_digest(tmp_path):
+    result, outputs, log = run_publisher_workflow_step(tmp_path, "Resolve image digest")
+
+    assert result.returncode == 0, (
+        "the real registry template must resolve; this step had no dynamic test "
+        "before, which is how the invalid one reached production"
+    )
+    assert outputs.strip() == f"digest={PUBLISHER_BUILT_DIGEST}"
+    assert "imagetools inspect" in log
+
+
+def test_publisher_resolve_digest_rejects_a_digest_that_differs_from_the_build(tmp_path):
+    result, outputs, _log = run_publisher_workflow_step(
+        tmp_path, "Resolve image digest", DIGEST_OUT="sha256:" + "b" * 64,
+    )
+
+    assert result.returncode == 1, "a pushed digest that is not the built one must stop the release"
+    assert outputs == ""
+
+
+def test_publisher_resolve_digest_handles_the_existing_mode(tmp_path):
+    result, outputs, _log = run_publisher_workflow_step(
+        tmp_path, "Resolve image digest", MODE="existing",
+    )
+
+    assert result.returncode == 0
+    assert outputs.strip() == f"digest={PUBLISHER_BUILT_DIGEST}"
+
+
+PUBLISHER_RESOLVE_FAILURES = [
+    ({"BUILT_DIGEST": "not-a-digest"}, "built_digest_malformed"),
+    ({"DIGEST_CODE": 1}, "registry_inspect_failed"),
+    ({"DIGEST_OUT": "not-a-digest"}, "pushed_digest_malformed"),
+    ({"DIGEST_OUT": "sha256:" + "b" * 64}, "pushed_digest_mismatch"),
+    ({"MODE": "sideways"}, "unrecognized_image_mode"),
+]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "marker"), PUBLISHER_RESOLVE_FAILURES,
+    ids=[marker for _overrides, marker in PUBLISHER_RESOLVE_FAILURES],
+)
+def test_publisher_resolve_digest_says_which_check_failed(tmp_path, overrides, marker):
+    # The first live publish failed here and the log could not say which of the
+    # four checks tripped, which cost a diagnostic round trip.
+    result, outputs, _log = run_publisher_workflow_step(
+        tmp_path, "Resolve image digest", **overrides
+    )
+
+    assert result.returncode == 1
+    assert f"resolve_digest={marker}" in result.stderr, result.stderr
+    assert outputs == ""

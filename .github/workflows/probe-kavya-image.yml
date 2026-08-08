@@ -187,7 +187,11 @@ jobs:
           printf '%s\n' "$EXPECTED_REVISION" > "$expected_stdout" || fail
           # Resolve the mutable tag to a digest once, then read only that digest,
           # so the pull and the label inspection cannot see two different images.
-          docker buildx imagetools inspect "$image" --format '{{ .Digest }}' >"$digest_stdout" 2>"$digest_stderr" || fail
+          # imagetools evaluates --format against imagetools.tplInput, which has
+          # .Manifest but no bare .Digest; the bare form exits 1. For a tag whose
+          # index carries a provenance attestation this is the index digest, which
+          # is also what build-push-action reports.
+          docker buildx imagetools inspect "$image" --format '{{ .Manifest.Digest }}' >"$digest_stdout" 2>"$digest_stderr" || fail
           digest="$(<"$digest_stdout")" || fail
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail
           image_ref="${repository}@${digest}"
