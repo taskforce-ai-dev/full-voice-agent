@@ -41,13 +41,9 @@ as if it did:
   verified digest where that property matters; and
 - that the hosted runner or the pinned actions are uncompromised.
 
-The gate is also **procedural, not mechanically enforced**. Nothing in this
-repository makes the publisher depend on a probe result: the publisher has no
-`needs:`, no probe-result query, and no environment with required reviewers. A
-maintainer with write access can dispatch the publisher without the probe ever
-having run. Whether to add mechanical enforcement is an open decision and is
-deliberately out of scope here; until it is made, "the probe must pass first" is
-a review-and-operator convention.
+The gate is **mechanically enforced** on the publisher, not merely a convention.
+See "Mechanical publisher gate" below for what that enforcement does and does
+not cover.
 
 ## Scope and non-goals
 
@@ -63,9 +59,11 @@ push, create, overwrite, delete, or otherwise mutate an image or tag. It does
 not deploy, use environments, SSH, access a host or dashboard, read deploy
 secrets, change Nginx, or activate transfer or MCP functionality.
 
-The only publisher changes in scope are the action pins, explicit runner label,
-and timeout described below. There is no publisher dispatch change. No other
-workflow is broadened into scope. The shared helper is stricter by rejecting
+The publisher changes in scope are the action pins, explicit runner label,
+timeout, and the terminal trust and probe-gate steps described under "Mechanical
+publisher gate". The publisher's trigger is unchanged: it remains
+`workflow_dispatch` with the same two inputs. No other workflow is broadened
+into scope. The shared helper is stricter by rejecting
 NUL-bearing registry captures; that can make the publisher fail closed with
 `probe_failed`, but never permits a write.
 
@@ -178,6 +176,78 @@ push equally. `persist-credentials: false` prevents checkout from persisting
 its credential in local Git configuration; it does not revoke `github.token` or
 prevent other actions from accessing the context token. The probe never grants
 `packages: write`; the publisher retains that distinct write permission.
+
+## Mechanical publisher gate
+
+`build-kavya-image.yml` enforces the probe rather than assuming it. Two terminal
+steps run first, before any `uses:` action -- including both checkouts -- so no
+credentialed step executes when the gate fails.
+
+**Step 1, publisher trust.** The publisher applies the same ref binding as the
+probe: `github.event_name == workflow_dispatch`, `github.repository`,
+`github.ref == refs/heads/main`, `github.ref_name == main`,
+`github.ref_type == branch`, `github.ref_protected == true`, lowercase-40-hex and
+byte-equal `github.sha` and `github.workflow_sha`, and
+`github.workflow_ref == taskforce-ai-dev/full-voice-agent/.github/workflows/build-kavya-image.yml@refs/heads/main`.
+This is load-bearing, not decoration. GitHub executes the *selected ref's* copy
+of a workflow, so a gate inside an unpinned publisher could simply be deleted on
+a branch and dispatched from there. Binding the publisher to protected main is
+what makes the commit comparison below mean anything. It constrains only where
+the workflow definition comes from; `inputs.ref` still selects the source built.
+
+**Step 2, probe gate.** Using the job's `GITHUB_TOKEN`, the publisher lists the
+probe workflow's runs and requires at least one run that is `completed` with
+conclusion `success`, on `head_branch` `main`, with `path`
+`.github/workflows/probe-kavya-image.yml`, whose `head_sha` is byte-equal to the
+publisher's own verified `github.sha`, and whose `updated_at` is within the
+freshness window. Both workflows independently prove they ran at that commit, so
+equality of the two SHAs means the probe validated the same tooling revision this
+publisher run is executing.
+
+The request filters live in the URL query string:
+
+```
+repos/<owner>/<repo>/actions/workflows/probe-kavya-image.yml/runs?per_page=100&branch=main&status=success&head_sha=<sha>
+```
+
+This form is required, not stylistic. `gh api -f key=value` on a GET request is
+either rejected outright (HTTP 404) or accepted while the parameter is silently
+dropped as a filter, which would hand the gate an unfiltered result set that
+happens to contain successful runs of other commits. Every server-side filter is
+therefore re-verified locally with `jq` against each returned run, and the
+`head_sha` is validated as lowercase 40-hex before it is interpolated into the
+URL.
+
+**Freshness window: 24 hours**, measured from the run's `updated_at` (the
+completion time of a finished run) to the publisher's clock. The probe's evidence
+is explicitly point-in-time: it shows the tag resolved and the canary was absent
+*at probe time*, and a tag can be moved out of band afterwards. A window long
+enough to cover an ordinary review-then-publish cycle within one working day, but
+short enough that a months-old probe cannot be reused as if it were current, is
+the trade-off; 24 hours is that compromise. Re-running the probe is cheap and
+read-only, so a stale gate costs one dispatch.
+
+**Failure modes, all fail-closed.** The gate exits non-zero, with no captured
+bytes echoed, when: the trust step rejects the context; `GATE_SHA` is not
+lowercase 40-hex; the `gh api` call fails; the response is not a JSON object,
+is truncated, or is empty; `total_count` is absent, non-numeric, or zero; the
+response is a full page of 100 (which cannot be disambiguated without
+paginating); no returned run satisfies every re-verified field; every matching
+run is older than the window; or a candidate `updated_at` does not parse. The
+response body is captured to a temporary directory removed by a trap and is
+never printed; the summary records only `probe_gate` and the matched
+`probe_run_id`.
+
+**Permissions.** The publisher gains `actions: read` and nothing else. That is
+the least grant that can read workflow run history; it confers no write of any
+kind. The publisher retains `contents: read` and `packages: write`. No
+environment and no required reviewers are introduced.
+
+**What the gate does not do.** It does not verify that `inputs.ref` or
+`expected_sha` were reviewed -- it binds the *tooling* commit, not the source
+being built. It cannot detect a tag moved between the probe and the publisher
+run, which is why the publisher still re-probes the tag and verifies the pushed
+digest. And it inherits the probe's own evidentiary limits set out in Purpose.
 
 ## Payload, trusted tooling, and action pins
 
@@ -389,10 +459,13 @@ image/version block. This evidence is point-in-time only and does not establish
 future tag immutability or action/runner compromise resistance.
 
 Only then may the separately reviewed publisher be considered for SHA
-`69ec0b3`. That sequencing is a procedural rule for the operator and the
-reviewer; as stated in Purpose, nothing in the repository enforces it
-mechanically, and a publisher run started without a green probe will not be
-blocked. Rollback is to stop using the probe, correct it in a reviewed
+`69ec0b3`. That sequencing is enforced by the publisher's own probe
+gate described above: a publisher run started without a fresh, successful,
+same-commit probe fails before any credentialed step. Because the gate binds on
+`github.sha`, a commit landing on `main` between the probe and the publisher
+dispatch invalidates the evidence and requires a fresh probe -- which is the
+intended behaviour, since the tooling would no longer be the revision the probe
+validated. Rollback is to stop using the probe, correct it in a reviewed
 protected-main change, and rerun the read-only gate. There is no probe-created
 registry or production state to undo.
 

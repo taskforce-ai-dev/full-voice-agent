@@ -9,9 +9,11 @@
 > resolved to a manifest whose `org.opencontainers.image.revision` label matched
 > the supplied revision at probe time, and that the derived canary was absent. It
 > does **not** establish that the revision is reviewed or reachable from `main`,
-> anything about image contents, or continuing tag immutability — and the "probe
-> before publisher" rule is procedural: nothing makes the publisher depend on it.
-> See the design document's Purpose section for the full statement.
+> anything about image contents, or continuing tag immutability. The "probe before
+> publisher" rule IS mechanically enforced by the publisher's own gate (see the
+> design document's "Mechanical publisher gate"), but that gate binds the *tooling*
+> commit, not the source being built. See the design document's Purpose section for
+> the full statement.
 
 **Architecture:** A single GitHub-hosted probe job validates two tightly typed inputs before any registry-affecting setup, then checks out only workflow-revision tooling into `.probe-tools`. It uses that trusted tag-probe script to prove a known immutable tag exists and an internally derived canary is absent, while a separate read-only pull verifies the known image's OCI revision label. The job has no source checkout, build context, registry write operation, or deployment capability.
 
@@ -29,7 +31,7 @@
 - Existing-tag probe must accept only exit `10` and exactly one line `image_tag_state=existing`; canary probe must accept only exit `0` and exactly one line `image_tag_state=absent`.
 - Capture and suppress all probe, pull, and inspect stdout/stderr. Emit fixed markers only; never print registry errors, tokens, layer progress, image configuration, secrets, or environment dumps.
 - Prohibit package writes, build/build-push/push/tag mutation, SSH, rsync, Nginx, systemctl, compose, environment mutation, deploy commands, and host/dashboard actions.
-- No publisher dispatch is permitted until the main-branch probe succeeds with tag `37bfaf0` and revision `37bfaf02f04ce7614b9674b1c867b78ab3c7d414`.
+- No publisher dispatch is permitted until the main-branch probe succeeds with tag `37bfaf0` and revision `37bfaf02f04ce7614b9674b1c867b78ab3c7d414`. This is enforced mechanically: the publisher hard-fails before any credentialed step unless a completed, successful run of `probe-kavya-image.yml` exists on `main` at the publisher's own `github.sha`, finished within 24 hours. Its `permissions` therefore include `actions: read` alongside `contents: read` and `packages: write`.
 
 ---
 
@@ -37,7 +39,7 @@
 
 - Create: `.github/workflows/probe-kavya-image.yml` — the single repository-dispatched read-only probe job.
 - Modify: `Kavya/tests/test_smartpbx_deployment.py` — static workflow contract tests and BaseLoader parser helpers.
-- Modify: `.github/workflows/build-kavya-image.yml` — action SHA pins, runner label, and job timeout only; no dispatch change.
+- Modify: `.github/workflows/build-kavya-image.yml` — action SHA pins, runner label, job timeout, and the terminal trust + probe-gate steps; no dispatch change.
 - Read only: `.github/scripts/check-kavya-image-tag.sh` — executable probe contract: existing is exit `10`, absent is exit `0`, all uncertain cases exit `1`.
 
 ## Interfaces
@@ -772,7 +774,7 @@ Expected: the completed run records exactly the fifteen safe-summary keys, inclu
 
 - [ ] **Step 9: Gate publisher authority on the accepted probe.**
 
-Do not dispatch the immutable publisher for `69ec0b3` unless Step 8 passed and its safe evidence was accepted. This is an operator and reviewer rule, not a mechanical one: the publisher has no `needs:`, no probe-result query, and no required-reviewer environment, so nothing blocks a publisher run started without a green probe. A probe failure, malformed marker, existing canary, missing provenance label, metadata mismatch, or uncertain registry result stops the release; correct the reviewed workflow or tests in a new PR and repeat Tasks 1 through 8.
+Do not dispatch the immutable publisher for `69ec0b3` unless Step 8 passed and its safe evidence was accepted. The publisher now enforces this itself and will fail closed without a fresh same-commit probe, but the human acceptance of the probe's evidence in Step 8 is still required — the gate checks that a probe *succeeded*, not that anyone read it. Note the 24-hour window and the `github.sha` binding: if a commit lands on `main` after the probe, or more than a day passes, re-run the probe before dispatching. A probe failure, malformed marker, existing canary, missing provenance label, metadata mismatch, or uncertain registry result stops the release; correct the reviewed workflow or tests in a new PR and repeat Tasks 1 through 8.
 
 ## Plan Self-Check
 
