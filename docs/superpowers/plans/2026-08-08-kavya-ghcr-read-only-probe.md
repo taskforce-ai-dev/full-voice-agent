@@ -407,6 +407,29 @@ def test_kavya_image_probe_provenance_and_metadata_suppress_sentinels(tmp_path, 
     assert "PATH=" not in metadata.stdout + metadata.stderr + metadata_summary
 
 
+@pytest.mark.parametrize(("repository_id", "run_id", "attempt"), [("", "456", "1"), ("abc", "456", "1"), ("123" * 50, "456", "1"), ("123", "", "1"), ("123", "456", "x")])
+def test_kavya_image_probe_canary_identifier_table_fails_before_fake_tools(tmp_path, repository_id, run_id, attempt):
+    result, summary, log = run_probe_workflow_step(tmp_path, "Probe generated absent canary", GITHUB_REPOSITORY_ID=repository_id, GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt)
+    assert result.returncode != 0
+    assert log == ""
+    assert "probe_result=fail" in summary
+    assert repository_id not in result.stdout + result.stderr + summary
+
+
+@pytest.mark.parametrize(("workflow_sha", "image_os", "image_version", "buildx_code", "buildx_version", "code"), [
+    ("a" * 40, "ubuntu24", "20240825.1", 0, "v0.16.2", 0), ("", "ubuntu24", "20240825.1", 0, "v0.16.2", 1),
+    ("A" * 40, "ubuntu24", "20240825.1", 0, "v0.16.2", 1), ("a" * 40, "", "20240825.1", 0, "v0.16.2", 1),
+    ("a" * 40, "ubuntu 24", "20240825.1", 0, "v0.16.2", 1), ("a" * 40, "ubuntu24", "", 0, "v0.16.2", 1),
+    ("a" * 40, "ubuntu24", "bad value", 0, "v0.16.2", 1), ("a" * 40, "ubuntu24", "20240825.1", 1, "v0.16.2", 1),
+    ("a" * 40, "ubuntu24", "20240825.1", 0, "bad value", 1),
+])
+def test_kavya_image_probe_metadata_table_is_safe(tmp_path, workflow_sha, image_os, image_version, buildx_code, buildx_version, code):
+    result, summary, _log = run_probe_workflow_step(tmp_path, "Record safe runtime metadata", GITHUB_WORKFLOW_SHA=workflow_sha, ImageOS=image_os, ImageVersion=image_version, BUILDX_CODE=buildx_code, BUILDX_VERSION=buildx_version)
+    assert result.returncode == code
+    assert "PATH=" not in result.stdout + result.stderr + summary
+    assert "SENTINEL" not in result.stdout + result.stderr + summary
+
+
 def test_kavya_image_probe_run_scripts_parse_and_summary_is_allowlisted(tmp_path):
     document, _job, _steps, _text = kavya_image_probe_job()
     for script in workflow_run_strings(document):
@@ -511,22 +534,29 @@ jobs:
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
-          [[ "$GITHUB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
-          runner_image="${ImageOS:-unknown}"
-          runner_version="${ImageVersion:-unknown}"
-          buildx_version="$(docker buildx version 2>/dev/null | awk '{print $2}')" || fail
+          workflow_sha="${GITHUB_WORKFLOW_SHA:-}"
+          runner_image="${ImageOS:-}"
+          runner_version="${ImageVersion:-}"
+          [[ "$workflow_sha" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$runner_image" =~ ^[A-Za-z0-9._-]+$ ]] || fail
+          [[ "$runner_version" =~ ^[A-Za-z0-9._-]+$ ]] || fail
+          buildx_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$buildx_dir" || true; }
+          trap cleanup EXIT
+          docker buildx version >"$buildx_dir/stdout" 2>"$buildx_dir/stderr" || fail
+          buildx_version="$(awk '{print $2}' "$buildx_dir/stdout")" || fail
           [[ "$runner_image" =~ ^[A-Za-z0-9._-]+$ ]] || fail
           [[ "$runner_version" =~ ^[A-Za-z0-9._-]+$ ]] || fail
           [[ "$buildx_version" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || fail
           {
-            printf 'workflow_commit=%s\n' "$GITHUB_WORKFLOW_SHA"
+            printf 'workflow_commit=%s\n' "$workflow_sha"
             printf '%s\n' 'checkout_action=actions/checkout@v7'
             printf '%s\n' 'buildx_action=docker/setup-buildx-action@v4'
             printf '%s\n' 'login_action=docker/login-action@v4'
             printf 'runner_image=%s\n' "$runner_image"
             printf 'runner_image_version=%s\n' "$runner_version"
             printf 'buildx_version=%s\n' "$buildx_version"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY" || fail
       - name: Probe known existing tag
         env:
           EXISTING_TAG: ${{ inputs.existing_tag }}
@@ -564,16 +594,23 @@ jobs:
           inspect_stderr="$probe_dir/inspect.stderr"
           docker pull "$image" >"$pull_stdout" 2>"$pull_stderr" || fail
           docker image inspect "$image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' >"$inspect_stdout" 2>"$inspect_stderr" || fail
-          [[ "$(wc -l < "$inspect_stdout")" -eq 1 ]] || fail
-          revision="$(cat "$inspect_stdout")"
+          inspect_lines="$(wc -l < "$inspect_stdout")" || fail
+          revision="$(cat "$inspect_stdout")" || fail
+          [[ "$inspect_lines" -eq 1 ]] || fail
           [[ "$revision" == "$EXPECTED_REVISION" ]] || fail
-          printf 'existing_revision=pass\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'existing_revision=pass\n' >> "$GITHUB_STEP_SUMMARY" || fail
       - name: Probe generated absent canary
         run: |
           set -Eeuo pipefail
           fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           image="ghcr.io/taskforce-ai-dev/kavya"
-          canary="probe-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          repository_id="${GITHUB_REPOSITORY_ID:-}"
+          run_id="${GITHUB_RUN_ID:-}"
+          attempt="${GITHUB_RUN_ATTEMPT:-}"
+          [[ "$repository_id" =~ ^[0-9]+$ ]] || fail
+          [[ "$run_id" =~ ^[0-9]+$ ]] || fail
+          [[ "$attempt" =~ ^[0-9]+$ ]] || fail
+          canary="probe-${repository_id}-${run_id}-${attempt}"
           [[ "$canary" =~ ^probe-[0-9]+-[0-9]+-[0-9]+$ ]] || fail
           [[ ${#canary} -le 128 ]] || fail
           probe_dir="$(mktemp -d)" || fail
@@ -592,10 +629,11 @@ jobs:
       - name: Write safe probe summary
         run: |
           set -Eeuo pipefail
+          fail() { printf 'probe_result=fail\n' >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           {
             printf '%s\n' 'probe_version=1'
             printf '%s\n' 'probe_result=pass'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY" || fail
 ```
 
 - [ ] **Step 2: Run focused GREEN semantic and structural tests.**
