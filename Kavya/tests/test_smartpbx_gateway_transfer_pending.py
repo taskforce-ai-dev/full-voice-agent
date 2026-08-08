@@ -1,4 +1,10 @@
-"""Gateway must leave an acknowledged Dialog transfer open for carrier events."""
+"""An acknowledged Dialog transfer waits past normal idleness, but not forever.
+
+`transfer_pending` is never reset and ACKNOWLEDGED is terminal, so a transfer
+whose carrier terminal event never arrives used to pin its capacity slot for the
+life of the container. Four of those stop the hotel receiving calls. The wait is
+therefore generous but bounded, and the ceiling ends the call cleanly.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +22,26 @@ START = {"event": "start", "start": {
     "callerIdNumber": "caller", "calleeIdNumber": "callee", "accountId": "account-1",
     "mediaFormat": {"encoding": "g711_ulaw", "sampleRate": 8000},
 }}
+
+
+def settings(**overrides):
+    base = SmartPBXSettings.from_env({
+        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+    })
+    return replace(base, **overrides)
+
+
+def diagnostics(caplog):
+    records = []
+    for record in caplog.records:
+        try:
+            payload = json.loads(record.getMessage())
+        except ValueError:
+            continue
+        if payload.get("event") == "smartpbx_protocol_diagnostic":
+            records.append(payload)
+    return records
 
 
 class Socket:
@@ -55,21 +81,22 @@ class Session:
         self.finishes += int(schedule_post_call)
 
 
-@pytest.mark.asyncio
-async def test_transfer_pending_waits_for_dialog_terminal_event_past_normal_idle_timeout():
-    settings = replace(SmartPBXSettings.from_env({
-        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
-        "SMARTPBX_ACCOUNT_ID": "account-1",
-    }), idle_timeout_seconds=0.01)
-    session = Session()
-
+def _factory(session):
     async def factory(_context, _transport, sink=None):
         assert sink is None or callable(sink)
         return session
+    return factory
 
+
+@pytest.mark.asyncio
+async def test_transfer_pending_waits_for_dialog_terminal_event_past_normal_idle_timeout():
+    session = Session()
     socket = Socket()
-    gateway = SmartPBXGateway(settings, SmartPBXSessionRegistry(4))
-    task = asyncio.create_task(gateway.handle(socket, factory))
+    gateway = SmartPBXGateway(
+        settings(idle_timeout_seconds=0.01, transfer_pending_timeout_seconds=30),
+        SmartPBXSessionRegistry(4),
+    )
+    task = asyncio.create_task(gateway.handle(socket, _factory(session)))
     await asyncio.sleep(0.03)
     assert not task.done(), "ordinary AI idleness must not close an acknowledged transfer"
     socket.messages.put_nowait(json.dumps({"event": "stop"}))
@@ -81,20 +108,14 @@ async def test_transfer_pending_waits_for_dialog_terminal_event_past_normal_idle
 
 @pytest.mark.asyncio
 async def test_transfer_becoming_pending_during_receive_rechecks_the_idle_deadline():
-    settings = replace(SmartPBXSettings.from_env({
-        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
-        "SMARTPBX_ACCOUNT_ID": "account-1",
-    }), idle_timeout_seconds=0.03)
     session = Session()
     session.transfer_pending = False
-
-    async def factory(_context, _transport, sink=None):
-        assert sink is None or callable(sink)
-        return session
-
     socket = Socket()
-    gateway = SmartPBXGateway(settings, SmartPBXSessionRegistry(4))
-    task = asyncio.create_task(gateway.handle(socket, factory))
+    gateway = SmartPBXGateway(
+        settings(idle_timeout_seconds=0.03, transfer_pending_timeout_seconds=30),
+        SmartPBXSessionRegistry(4),
+    )
+    task = asyncio.create_task(gateway.handle(socket, _factory(session)))
     await asyncio.sleep(0.01)
     session.transfer_pending = True
     await asyncio.sleep(0.04)
@@ -102,3 +123,50 @@ async def test_transfer_becoming_pending_during_receive_rechecks_the_idle_deadli
     socket.messages.put_nowait(json.dumps({"event": "hangup"}))
     await task
     assert session.finishes == 1
+
+
+@pytest.mark.asyncio
+async def test_transfer_pending_without_a_terminal_event_releases_the_slot(caplog):
+    session = Session()
+    socket = Socket()
+    registry = SmartPBXSessionRegistry(4)
+    gateway = SmartPBXGateway(
+        settings(idle_timeout_seconds=10, transfer_pending_timeout_seconds=0.05), registry
+    )
+    with caplog.at_level("INFO"):
+        await asyncio.wait_for(gateway.handle(socket, _factory(session)), timeout=5)
+
+    assert registry.snapshot()["active_sessions"] == 0, (
+        "a transfer whose terminal event never arrives must not pin its capacity "
+        "slot; four stuck transfers would stop the hotel receiving calls"
+    )
+    assert session.finishes == 1
+    assert socket.close_calls, "the ceiling must end the call, not just stop waiting"
+    failures = [record["failure_class"] for record in diagnostics(caplog)]
+    assert "transfer_pending_timeout" in failures, (
+        f"the ceiling needs its own diagnostic, not idle_timeout: {failures}"
+    )
+    assert "idle_timeout" not in failures
+
+
+@pytest.mark.asyncio
+async def test_transfer_pending_ceiling_is_bounded_and_env_tunable():
+    assert SmartPBXSettings.from_env({
+        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+    }).transfer_pending_timeout_seconds == 300
+
+    tuned = SmartPBXSettings.from_env({
+        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+        "SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS": "120",
+    })
+    assert tuned.transfer_pending_timeout_seconds == 120
+
+    for rejected in ("0", "29", "1801", "-1", "", "abc", "300.5"):
+        with pytest.raises(ValueError):
+            SmartPBXSettings.from_env({
+                "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+                "SMARTPBX_ACCOUNT_ID": "account-1",
+                "SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS": rejected,
+            })

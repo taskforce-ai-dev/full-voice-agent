@@ -22,6 +22,8 @@ _MAX_REASON = 500
 _MAX_TRANSCRIPT_MESSAGES = 8
 _MAX_TRANSCRIPT_CHARS = 3000
 _MAX_TRANSCRIPT_MESSAGE_CHARS = 512
+# The gateway gives the whole session cleanup 5s; leave room for the rest.
+_FINALIZE_RETRY_TIMEOUT = 2.0
 
 
 def bound_reason(value: Any) -> str:
@@ -108,9 +110,22 @@ class SmartPBXHandoverCoordinator:
             return self._result
 
     async def finalize_notification_retry(self) -> None:
-        async with self._lock:
-            if self._phase is HandoverPhase.IMMEDIATE_FAILED and self._notification_state == "failed":
-                await self._deliver_notification()
+        """Best-effort last retry, bounded against the caller's cleanup budget.
+
+        This runs inside the shielded _finish_once, which the gateway allows 5s in
+        total. Acquiring the lock is inside the timeout on purpose: an in-flight
+        attempt() can hold it through its MCP retries, and waiting that out would
+        keep the whole pipeline alive long after the guest hung up.
+        """
+        try:
+            async with asyncio.timeout(_FINALIZE_RETRY_TIMEOUT):
+                async with self._lock:
+                    if self._phase is HandoverPhase.IMMEDIATE_FAILED and self._notification_state == "failed":
+                        await self._deliver_notification()
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            return
 
     async def _enter_pending(self) -> None:
         entered = getattr(self._pipeline, "enter_transfer_pending", None)
@@ -132,6 +147,24 @@ class SmartPBXHandoverCoordinator:
         except Exception:
             return
 
+    def _emit_handover_diagnostic(self) -> None:
+        """Report that no human was reached, without touching call state."""
+        from smartpbx_diagnostics import (
+            DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage,
+        )
+
+        sink = getattr(self._pipeline, "_smartpbx_diagnostic_sink", None)
+        if sink is None:
+            return
+        try:
+            sink(
+                DiagnosticStage.HANDOVER,
+                DiagnosticOutcome.DEGRADED,
+                DiagnosticFailureClass.HANDOVER_NOT_ACTIONABLE,
+            )
+        except Exception:
+            return
+
     async def _deliver_notification(self) -> str:
         if self._notification_state == "sent":
             return "sent"
@@ -139,11 +172,15 @@ class SmartPBXHandoverCoordinator:
             return self._notification_state or "failed"
         if self._notification_sender is None:
             self._notification_state = "not_actionable"
+            self._emit_handover_diagnostic()
             return self._notification_state
         from handover import normalize_whatsapp
 
         if not normalize_whatsapp(self._caller_phone) or not normalize_whatsapp(self._human_agent_whatsapp):
+            # A withheld or landline CLI ends here and nobody is notified at all.
+            # Make that visible rather than letting the lead vanish silently.
             self._notification_state = "not_actionable"
+            self._emit_handover_diagnostic()
             return self._notification_state
         self._notification_attempts += 1
         self._notification_state = "failed"

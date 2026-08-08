@@ -52,11 +52,27 @@ check_env_files() {
   [[ $(stat -c '%U:%G:%a' .env.smartpbx) == root:root:600 ]] || return 1
 }
 
+smartpbx_status_token() {
+  # Read-only and never echoed. Passed to curl on standard input rather than as
+  # an argument so it cannot appear in the process list.
+  local token
+  token=$(sed -n 's/^SMARTPBX_WS_TOKEN=//p' .env.smartpbx | head -n 1) || return 1
+  [[ -n $token ]] || return 1
+  printf '%s' "$token"
+}
+
+smartpbx_status_json() {
+  local token
+  token=$(smartpbx_status_token) || return 1
+  printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$token" \
+    | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config -
+}
+
 check_loopback_preflight() {
   local health_json status_json
   health_json=$(curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health) || return 1
   jq -e '.status == "ok" and .service_mode == "smartpbx"' >/dev/null <<<"$health_json" || return 1
-  status_json=$(curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status) || return 1
+  status_json=$(smartpbx_status_json) || return 1
   jq -e '.active_sessions == 0 and .transfer_enabled == false' >/dev/null <<<"$status_json" || return 1
 }
 

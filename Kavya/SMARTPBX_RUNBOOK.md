@@ -102,9 +102,10 @@ SMARTPBX_WS_TOKEN=
 SMARTPBX_ACCOUNT_ID=
 SMARTPBX_MAX_MESSAGE_CHARS=65536
 SMARTPBX_MAX_AUDIO_BYTES=32768
-SMARTPBX_MAX_OUTBOUND_FRAMES=128
+SMARTPBX_MAX_OUTBOUND_FRAMES=512
 SMARTPBX_START_TIMEOUT_SECONDS=10
 SMARTPBX_IDLE_TIMEOUT_SECONDS=90
+SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS=300
 SMARTPBX_HUMAN_AGENT_WHATSAPP=
 SMARTPBX_MCP_URL=https://dialog.cybergate.lk:9443/ucp/v2/mcp
 SMARTPBX_API_KEY=
@@ -173,10 +174,16 @@ test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/fullchain.pem
 test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/privkey.pem
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+smartpbx_status_token() {
+  # Read-only, never echoed. The status endpoint requires the same shared
+  # token as the media socket, so readiness checks must present it.
+  sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1
+}
 wait_for_smartpbx_ready() {
   deadline=$((SECONDS + 90))
   while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health >/dev/null \
-    || ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+    || ! printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+      | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config - >/dev/null; do
     if (( SECONDS >= deadline )); then
       echo "SmartPBX did not become ready within 90 seconds" >&2
       exit 1
@@ -189,7 +196,8 @@ sudo install -m 0644 nginx-smartpbx.conf /etc/nginx/sites-available/kavya-smartp
 sudo nginx -t
 sudo systemctl reload nginx
 curl --fail https://smartpbx-kavya.taskforceai.tech/health
-curl --fail https://smartpbx-kavya.taskforceai.tech/smartpbx/status
+printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+  | curl --fail https://smartpbx-kavya.taskforceai.tech/smartpbx/status --config -
 ```
 
 `config > /dev/null` validates Compose without printing secrets. `--pull never`
@@ -207,8 +215,27 @@ Before enabling the Dialog route, emit only the fixed protocol diagnostic with e
 3. Exercise a KB answer and PMS tool, then verify a post-call record reaches the
    dashboard/webhook.
 4. Hold four authenticated calls: **4 accepted + 5th rejected**, then hang up
-   and verify `/smartpbx/status` returns zero active sessions.
+   and verify `/smartpbx/status` returns zero active sessions. Note that a
+   pre-accept rejection closes before the WebSocket handshake completes, so the
+   close codes (`1008` policy violation, `1013` capacity) never reach the wire —
+   Dialog sees a bare HTTP `403` and cannot distinguish "wrong token" from "at
+   capacity". Record what Dialog actually observes for the capacity rejection,
+   and use the `failure_class` in our own diagnostic stream (`authentication` vs
+   `capacity`) as the authoritative signal.
 5. Test endpoint-down fallback before shifting traffic.
+6. **Live barge-in.** Also confirm Dialog's reconnect behaviour here: nginx now
+   rate-limits the media location (30r/m, burst 10) and returns `429` beyond
+   that. Restart the container and watch how Dialog re-establishes its sockets —
+   record whether it retries on `429` and how quickly, and raise the burst if a
+   normal reconnect storm trips it.
+   Ask Kavya something that produces a long answer, then
+   interrupt her mid-sentence. Confirm she **stops speaking within about a
+   second** and responds to the interruption. Dialog has no `clear` wire event,
+   so the only thing that can cancel queued speech is the outbound queue still
+   holding it: audio is paced at realtime for exactly this reason. If she talks
+   over you to the end of the answer, pacing is not in effect — treat that as a
+   gate failure, not a cosmetic issue, because every interruption for the whole
+   call will behave the same way.
 
 ## Optional transfer activation and compulsory revoke
 
@@ -225,10 +252,16 @@ Edit `.env.smartpbx` to add only that test destination, then apply it:
 set -euo pipefail
 cd /opt/kavya
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+smartpbx_status_token() {
+  # Read-only, never echoed. The status endpoint requires the same shared
+  # token as the media socket, so readiness checks must present it.
+  sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1
+}
 wait_for_smartpbx_ready() {
   deadline=$((SECONDS + 90))
   while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health >/dev/null \
-    || ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+    || ! printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+      | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config - >/dev/null; do
     if (( SECONDS >= deadline )); then
       echo "SmartPBX did not become ready within 90 seconds" >&2
       exit 1
@@ -247,10 +280,16 @@ configuration reached the running process before considering the drill revoked:
 set -euo pipefail
 cd /opt/kavya
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+smartpbx_status_token() {
+  # Read-only, never echoed. The status endpoint requires the same shared
+  # token as the media socket, so readiness checks must present it.
+  sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1
+}
 wait_for_smartpbx_ready() {
   deadline=$((SECONDS + 90))
   while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health >/dev/null \
-    || ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+    || ! printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+      | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config - >/dev/null; do
     if (( SECONDS >= deadline )); then
       echo "SmartPBX did not become ready within 90 seconds" >&2
       exit 1
@@ -259,8 +298,50 @@ wait_for_smartpbx_ready() {
   done
 }
 wait_for_smartpbx_ready
-curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e '.transfer_enabled == false'
+printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+  | curl --fail http://127.0.0.1:8006/smartpbx/status --config - | jq -e '.transfer_enabled == false'
 ```
+
+## Monitoring `/smartpbx/status`
+
+`/smartpbx/status` requires the same `X-Kavya-SmartPBX-Token` header as the media
+socket. It is not publicly readable: `active_sessions` against the cap of four is
+a live occupancy oracle, `admitted_total` is a call-volume counter, and
+`transfer_enabled` reveals whether live transfer is armed. An unauthenticated or
+wrong-token request gets `401` with no body.
+
+Pass the token on standard input, never as a command argument, so it cannot
+appear in the process list or shell history:
+
+```sh
+set -euo pipefail
+smartpbx_status_token() {
+  sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1
+}
+printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+  | curl --fail --silent http://127.0.0.1:8006/smartpbx/status --config - \
+  | jq '{active_sessions, max_sessions, frames_dropped_total, transfer_enabled}'
+```
+
+Reading it requires root on the host, because `.env.smartpbx` is `root:root 600`.
+Point uptime monitoring at `/health`, which stays unauthenticated and reveals
+nothing beyond liveness and the service mode. If SmartPBX is not configured there
+is no token, so status fails closed rather than exposing counters — use `/health`
+to distinguish "down" from "not configured".
+
+`frames_dropped_total` is a saturating count of outbound audio frames refused by
+transport backpressure. A non-zero value means some replies were **cut short** —
+delivery is a contiguous prefix, so the guest hears the start of the answer and
+then silence, not garbled speech.
+
+The dominant trigger is **reply length against queue depth**, not CPU or socket
+health. Outbound audio is paced at realtime while TTS produces it faster, so the
+queue holds the backlog; a reply longer than the queue can hold overflows it. At
+the default 512 frames that is roughly 40 seconds of continuous speech. Read a
+rising counter as "Kavya is answering at unusual length" and look at the prompt
+and the KB content first. Raise `SMARTPBX_MAX_OUTBOUND_FRAMES` (ceiling 512) only
+if it is already below the default. Investigate CPU or the Dialog socket only
+once reply length has been ruled out.
 
 ## Withdraw and rollback without dropping calls
 

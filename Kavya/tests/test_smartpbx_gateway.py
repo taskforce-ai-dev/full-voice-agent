@@ -110,7 +110,7 @@ def test_settings_default_to_the_kavya_token_header_and_documented_bounds():
 
     assert configuration.auth_header_name == "X-Kavya-SmartPBX-Token"
     assert (configuration.max_calls, configuration.start_timeout_seconds, configuration.idle_timeout_seconds) == (4, 10, 90)
-    assert (configuration.max_message_chars, configuration.max_audio_bytes, configuration.max_outbound_frames) == (65536, 32768, 128)
+    assert (configuration.max_message_chars, configuration.max_audio_bytes, configuration.max_outbound_frames) == (65536, 32768, 512)
     assert "test-token" not in repr(configuration)
 
 
@@ -343,11 +343,14 @@ async def test_gateway_four_calls_have_unique_opaque_correlations(caplog):
 
 
 class _FaultTransport:
-    def __init__(self, _websocket, _context, *, max_queue_frames):
+    def __init__(self, _websocket, _context, *, max_queue_frames, on_frame_dropped=None):
         self.close_calls = 0
         self.fail = _FAULT_STATE["transport"]
+        self._send_failed = asyncio.Event()
     def start(self):
         pass
+    async def wait_send_failed(self):
+        await self._send_failed.wait()
     async def close(self):
         self.close_calls += 1
         _FAULT_STATE["order"].append("transport")

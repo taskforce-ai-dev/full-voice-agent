@@ -31,9 +31,14 @@ _INTEGER_SETTINGS = {
     "SMARTPBX_MAX_CALLS": ("max_calls", 4, 1, 4),
     "SMARTPBX_MAX_MESSAGE_CHARS": ("max_message_chars", 65536, 1024, 65536),
     "SMARTPBX_MAX_AUDIO_BYTES": ("max_audio_bytes", 32768, 160, 32768),
-    "SMARTPBX_MAX_OUTBOUND_FRAMES": ("max_outbound_frames", 128, 1, 128),
+    # ~640B per frame, so 512 frames is ~40s of speech and ~320KB per call.
+    # Deep enough that pacing never makes the queue the binding constraint.
+    "SMARTPBX_MAX_OUTBOUND_FRAMES": ("max_outbound_frames", 512, 1, 512),
     "SMARTPBX_START_TIMEOUT_SECONDS": ("start_timeout_seconds", 10, 1, 30),
     "SMARTPBX_IDLE_TIMEOUT_SECONDS": ("idle_timeout_seconds", 90, 10, 300),
+    # An acknowledged transfer legitimately outlives ordinary idleness, but a
+    # carrier terminal event that never arrives must not pin the slot forever.
+    "SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS": ("transfer_pending_timeout_seconds", 300, 30, 1800),
 }
 
 
@@ -48,6 +53,7 @@ class SmartPBXSettings:
     max_outbound_frames: int
     start_timeout_seconds: int
     idle_timeout_seconds: int
+    transfer_pending_timeout_seconds: int
     auth_header_name: str = "X-Kavya-SmartPBX-Token"
 
     @classmethod
@@ -102,6 +108,7 @@ class SmartPBXSessionRegistry:
             raise ValueError("max_sessions must be between 1 and 4")
         self._max_sessions = max_sessions
         self._active_sessions = self._admitted_total = self._rejected_capacity_total = self._released_total = 0
+        self._frames_dropped_total = 0
         self._lock = asyncio.Lock()
 
     async def try_acquire(self) -> SessionLease | None:
@@ -112,6 +119,10 @@ class SmartPBXSessionRegistry:
             self._active_sessions += 1
             self._admitted_total = _saturating_increment(self._admitted_total)
             return SessionLease(self)
+
+    def record_frame_dropped(self) -> None:
+        """Count one outbound frame discarded by transport backpressure."""
+        self._frames_dropped_total = _saturating_increment(self._frames_dropped_total)
 
     async def _release(self) -> None:
         async with self._lock:
@@ -124,12 +135,21 @@ class SmartPBXSessionRegistry:
             "active_sessions": self._active_sessions, "max_sessions": self._max_sessions,
             "admitted_total": self._admitted_total, "rejected_capacity_total": self._rejected_capacity_total,
             "released_total": self._released_total,
+            "frames_dropped_total": self._frames_dropped_total,
         }
 
 
 def smartpbx_status(settings: SmartPBXSettings, registry: SmartPBXSessionRegistry) -> dict[str, bool | int | str]:
     """Return only safe bounded operational values."""
     return {"enabled": settings.enabled, "configured": settings.configured, **registry.snapshot(), "protocol_version": SMARTPBX_PROTOCOL_VERSION}
+
+
+class _TransferPendingTimeout(Exception):
+    """An acknowledged transfer produced no terminal event within the ceiling."""
+
+
+class _TransportSendFailure(Exception):
+    """The outbound sender died; the guest can no longer hear anything."""
 
 
 class _GatewaySession(Protocol):
@@ -202,7 +222,9 @@ class SmartPBXGateway:
             if context.account_id != self._settings.account_id:
                 raise ProtocolViolation(POLICY_VIOLATION, "account mismatch", "account_mismatch")
             transport = SmartPBXMediaTransport(
-                websocket, context, max_queue_frames=self._settings.max_outbound_frames
+                websocket, context,
+                max_queue_frames=self._settings.max_outbound_frames,
+                on_frame_dropped=self._registry.record_frame_dropped,
             )
             transport.start()
             try:
@@ -220,7 +242,7 @@ class SmartPBXGateway:
             sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
 
             while True:
-                raw = await self._receive_or_terminal(websocket, session)
+                raw = await self._receive_or_terminal(websocket, session, transport)
                 if raw is None:
                     close_outcome = (1000, "call ended")
                     completed_normally = True
@@ -263,6 +285,12 @@ class SmartPBXGateway:
             else:
                 sink(DiagnosticStage.AUDIO_INGESTION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.IDLE_TIMEOUT)
                 close_outcome = (POLICY_VIOLATION, "idle timeout")
+        except _TransferPendingTimeout:
+            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSFER_PENDING_TIMEOUT)
+            close_outcome = (POLICY_VIOLATION, "transfer timeout")
+        except _TransportSendFailure:
+            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSPORT_SEND)
+            close_outcome = (1011, "internal error")
         except WebSocketDisconnect:
             disconnected = True
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DISCONNECTED, DiagnosticFailureClass.TRANSPORT_DISCONNECT)
@@ -326,25 +354,68 @@ class SmartPBXGateway:
                 continue
             raise ProtocolViolation(POLICY_VIOLATION, "start required", "start_required")
 
-    async def _receive_or_terminal(self, websocket: Any, session: _GatewaySession) -> str | None:
-        timeout = None if getattr(session, "transfer_pending", False) else self._settings.idle_timeout_seconds
+    async def _receive_or_terminal(
+        self,
+        websocket: Any,
+        session: _GatewaySession,
+        transport: SmartPBXMediaTransport | None = None,
+    ) -> str | None:
+        pending = bool(getattr(session, "transfer_pending", False))
+        timeout = self._settings.transfer_pending_timeout_seconds if pending else self._settings.idle_timeout_seconds
         terminal = getattr(session, "terminal_future", None)
         if terminal is None:
             return await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
         receive_task = asyncio.create_task(websocket.receive_text())
-        done, _ = await asyncio.wait({receive_task, terminal}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-        if not done and getattr(session, "transfer_pending", False):
-            done, _ = await asyncio.wait({receive_task, terminal}, return_when=asyncio.FIRST_COMPLETED)
+        # A dead outbound sender leaves the guest in silence; wait on it too so
+        # the call ends now instead of at the idle timeout.
+        failure_task = (
+            None if transport is None else asyncio.create_task(transport.wait_send_failed())
+        )
+        waited = {receive_task, terminal} | ({failure_task} if failure_task else set())
+
+        async def _settle(result: str | None) -> str | None:
+            for task in (receive_task, failure_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (receive_task, failure_task) if task is not None),
+                return_exceptions=True,
+            )
+            return result
+
+        done, _ = await asyncio.wait(waited, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        # Worst case a call waits idle_timeout and then the full transfer ceiling
+        # (~390s at defaults), because the transfer can be acknowledged just as the
+        # idle deadline expires. That is bounded and acceptable; it is not 300s.
+        if not done and not pending and getattr(session, "transfer_pending", False):
+            # The transfer was acknowledged while we were waiting: re-wait on the
+            # transfer ceiling rather than closing on the ordinary idle deadline.
+            pending = True
+            done, _ = await asyncio.wait(
+                waited,
+                timeout=self._settings.transfer_pending_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         if not done:
-            receive_task.cancel()
-            await asyncio.gather(receive_task, return_exceptions=True)
+            await _settle(None)
+            if pending:
+                raise _TransferPendingTimeout
             raise asyncio.TimeoutError
+        if failure_task is not None and failure_task in done:
+            await _settle(None)
+            raise _TransportSendFailure
         if terminal in done:
-            receive_task.cancel()
-            await asyncio.gather(receive_task, return_exceptions=True)
+            # Terminal wins a same-tick race and the pending message is dropped.
+            # That is intended: the session has already finished, so the only
+            # messages that can arrive here are teardown ones we would ignore.
+            await _settle(None)
             terminal.result()
             return None
-        return receive_task.result()
+        raw = receive_task.result()
+        if failure_task is not None:
+            failure_task.cancel()
+            await asyncio.gather(failure_task, return_exceptions=True)
+        return raw
 
     async def _cleanup(
         self,

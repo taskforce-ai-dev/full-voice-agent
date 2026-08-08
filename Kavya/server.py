@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import audioop
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -65,7 +66,7 @@ from urllib.parse import quote as url_quote
 import httpx
 from anthropic import AsyncAnthropic, NOT_GIVEN
 from openai import AsyncOpenAI
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from twilio.rest import Client as TwilioRestClient
 
@@ -563,6 +564,16 @@ STT_ALTERNATIVES: dict[str, list[str]] = {
 
 # Silence (seconds) after last STT result before utterance is considered complete
 ENDPOINTING_SILENCE: float = 1.5
+
+# Bounds on restarting a failed STT stream. Google caps a streaming_recognize
+# call at ~5 minutes, so healthy restarts are normal and must stay cheap; a
+# persistent failure (rotated credentials, quota) must not become a tight spin.
+STT_RESTART_BACKOFF_BASE: float = 0.25
+STT_RESTART_BACKOFF_MAX: float = 5.0
+STT_MAX_CONSECUTIVE_FAILURES: int = 8
+# Inbound audio waiting for the STT worker. Bounded so a stopped or wedged
+# consumer cannot grow it for the length of the call.
+STT_QUEUE_MAX_CHUNKS: int = 1000
 
 # Silence (seconds) after greeting / agent turn before we re-prompt the caller.
 # If the caller never speaks, we re-greet them or ask if they're still online,
@@ -2350,10 +2361,14 @@ class GoogleSTTStream:
         self._on_interim = on_interim_result
         self._lang = lang
         self._privacy_safe = privacy_safe
-        self._audio_q: queue.Queue[bytes | None] = queue.Queue()
+        self._audio_q: queue.Queue[bytes | None] = queue.Queue(STT_QUEUE_MAX_CHUNKS)
         self._running = False
         self._thread: threading.Thread | None = None
         self._chunk_count = 0
+        self._dropped_chunks = 0
+        # Set by the owning session; called from this thread when the restart
+        # cap trips so the call can end instead of sitting in silence.
+        self.on_fatal: Any = None
 
     def start(self):
         if not GOOGLE_STT_AVAILABLE:
@@ -2366,12 +2381,29 @@ class GoogleSTTStream:
 
     def stop(self):
         self._running = False
-        self._audio_q.put(None)
+        try:
+            self._audio_q.put_nowait(None)
+        except queue.Full:
+            # Make room for the sentinel; _running=False already ends the loop.
+            with contextlib.suppress(queue.Empty):
+                self._audio_q.get_nowait()
+            with contextlib.suppress(queue.Full):
+                self._audio_q.put_nowait(None)
         if self._thread:
             self._thread.join(timeout=5)
 
     def feed(self, mulaw_bytes: bytes):
-        self._audio_q.put(mulaw_bytes)
+        try:
+            # Never block: this is called from the shared event loop.
+            self._audio_q.put_nowait(mulaw_bytes)
+        except queue.Full:
+            self._dropped_chunks += 1
+            if self._dropped_chunks % 200 == 1:
+                logger.warning(
+                    "STT queue full — dropped %d inbound chunks (lang=%s)",
+                    self._dropped_chunks, self._lang,
+                )
+            return
         self._chunk_count += 1
         if self._chunk_count % 200 == 0:  # log every ~4s of audio
             logger.info("STT audio feed: %d chunks (lang=%s)", self._chunk_count, self._lang)
@@ -2387,16 +2419,63 @@ class GoogleSTTStream:
             yield chunk
 
     def _loop(self):
+        # A synchronous failure (rotated credentials, quota, network) would
+        # otherwise restart with no delay and no ceiling: a tight spin that
+        # writes one traceback per iteration and destroys the log ring.
+        consecutive_failures = 0
         while self._running:
             try:
                 self._run_one_stream()
+                consecutive_failures = 0
             except Exception as exc:
                 if not self._running:
                     break
-                logger.warning("STT stream ended (%s) — restarting...", exc, exc_info=True)
+                consecutive_failures += 1
+                if consecutive_failures >= STT_MAX_CONSECUTIVE_FAILURES:
+                    self._running = False
+                    logger.error(
+                        "STT stream failed %d times consecutively (%s) — giving up so the call can end",
+                        consecutive_failures, exc,
+                    )
+                    self._signal_fatal()
+                    break
+                backoff = min(
+                    STT_RESTART_BACKOFF_BASE * (2 ** (consecutive_failures - 1)),
+                    STT_RESTART_BACKOFF_MAX,
+                )
+                logger.warning(
+                    "STT stream ended (%s) — restart %d/%d in %.1fs",
+                    exc, consecutive_failures, STT_MAX_CONSECUTIVE_FAILURES, backoff,
+                    exc_info=consecutive_failures == 1,
+                )
+                time.sleep(backoff)
+
+    def _signal_fatal(self) -> None:
+        """Tell the owning session STT is gone. Must never raise into the loop."""
+        on_fatal = self.on_fatal
+        if on_fatal is None:
+            return
+        try:
+            on_fatal()
+        except Exception:
+            logger.warning("STT fatal signal failed", exc_info=True)
 
     def _run_one_stream(self):
+        # Google caps a streaming_recognize call at ~5 minutes, so this runs many
+        # times per long call. Each client owns a gRPC channel, fds and
+        # completion-queue threads, so it must be released every time.
         client = google_speech.SpeechClient()
+        try:
+            self._stream_until_closed(client)
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.warning("STT client close failed", exc_info=True)
+
+    def _stream_until_closed(self, client):
         primary = STT_PRIMARY.get(self._lang, "si-LK")
         alternatives = STT_ALTERNATIVES.get(self._lang, ["en-US"])
         config = google_speech.StreamingRecognitionConfig(
@@ -3047,7 +3126,9 @@ class MediaStreamSession:
 
     async def _process_utterance_bound(self, text: str):
         try:
-            kb_context = retrieve_context(text)
+            # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
+            # this loop is shared by every concurrent call, so keep it off-loop.
+            kb_context = await asyncio.to_thread(retrieve_context, text)
         except Exception:
             logger.exception("KB retrieval failed")
             kb_context = ""
@@ -5074,7 +5155,16 @@ def build_service_app(
     def smartpbx_health() -> dict[str, str]:
         return {"status": "ok", "service_mode": "smartpbx"}
 
-    def status() -> dict[str, bool | int | str]:
+    def status(request: Request) -> dict[str, bool | int | str]:
+        # active_sessions against the cap is a live occupancy oracle and
+        # admitted_total is a call-volume counter, so this needs the same shared
+        # token as the media socket. Constant-time compare via token_matches.
+        # When SmartPBX is unconfigured there is no token, so this fails closed;
+        # /health stays open for liveness.
+        if not settings.token_matches(
+            request.headers.get(settings.auth_header_name, "")
+        ):
+            raise HTTPException(status_code=401)
         return {**gateway.snapshot(), "transfer_enabled": transfer_settings.enabled}
 
     async def smartpbx_media(websocket: WebSocket) -> None:
