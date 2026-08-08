@@ -1001,6 +1001,32 @@ def test_deploy_preflight_failures_never_mutate(tmp_path, environment):
     assert result.returncode != 0 and host.compose_count() == 0
 
 
+@pytest.mark.parametrize("bad_path", [".env", ".env.smartpbx"])
+def test_deploy_each_env_file_failure_is_terminal_under_conditional_main_call(tmp_path, bad_path):
+    host = FakeDeployHost(tmp_path)
+    result = host.deploy(BAD_STAT_PATH=bad_path)
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+@pytest.mark.parametrize("environment,state", [({"FLICO_ABSENT": 1}, {}), ({}, {"flico_health": "unhealthy"})])
+def test_deploy_flico_absent_or_unhealthy_blocks_before_mutation(tmp_path, environment, state):
+    host = FakeDeployHost(tmp_path, **state); result = host.deploy(**environment)
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+@pytest.mark.parametrize("arguments", [
+    (), ("abcdef0",), ("abcdef0", FakeDeployHost.sha),
+    ("7654321", FakeDeployHost.sha, FakeDeployHost.digest),
+    ("ABCDEF0", FakeDeployHost.sha, FakeDeployHost.digest),
+    ("abcdef0", FakeDeployHost.sha.upper(), FakeDeployHost.digest),
+    ("abcdef0", FakeDeployHost.sha, FakeDeployHost.digest.upper()),
+    ("abcdef0", FakeDeployHost.sha, FakeDeployHost.digest, "extra"),
+])
+def test_deploy_root_path_exercises_invalid_argument_rejection(tmp_path, arguments):
+    host = FakeDeployHost(tmp_path); result = host.run(*arguments)
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
 @pytest.mark.parametrize("environment", [{"FORWARD_ID_BAD": 1}, {"FORWARD_DIGEST_BAD": 1}, {"FORWARD_REVISION_BAD": 1}, {"FLICO_CHANGED": 1}, {"LEGACY_CHANGED": 1}])
 def test_deploy_bad_forward_identity_or_isolation_rolls_back_once(tmp_path, environment):
     host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
