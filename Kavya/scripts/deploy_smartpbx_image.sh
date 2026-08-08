@@ -78,20 +78,20 @@ capture_baseline() {
   ROLLBACK_REVISION=$(image_revision "$ROLLBACK_IMAGE_ID") || return 1
   valid_repo_digest "$ROLLBACK_DIGEST" || return 1
   valid_revision "$ROLLBACK_REVISION" || return 1
-  docker image tag "$ROLLBACK_IMAGE_ID" "$IMAGE:$ROLLBACK_TAG" >/dev/null
+  docker image tag "$ROLLBACK_IMAGE_ID" "$IMAGE:$ROLLBACK_TAG" >/dev/null || return 1
   [[ $(image_id "$IMAGE:$ROLLBACK_TAG") == "$ROLLBACK_IMAGE_ID" ]] || return 1
   capture_isolation_baseline
 }
 
 verify_candidate_image() {
-  docker pull "$IMAGE@$EXPECTED_DIGEST" >/dev/null
+  docker pull "$IMAGE@$EXPECTED_DIGEST" >/dev/null || return 1
   CANDIDATE_ID=$(image_id "$IMAGE@$EXPECTED_DIGEST") || return 1
   CANDIDATE_DIGEST=$(image_digest "$CANDIDATE_ID") || return 1
   CANDIDATE_REVISION=$(image_revision "$CANDIDATE_ID") || return 1
   valid_image_id "$CANDIDATE_ID" || return 1
   [[ $CANDIDATE_DIGEST == "$IMAGE@$EXPECTED_DIGEST" ]] || return 1
   [[ $CANDIDATE_REVISION == "$EXPECTED_SHA" ]] || return 1
-  docker image tag "$CANDIDATE_ID" "$IMAGE:$NEW_TAG" >/dev/null
+  docker image tag "$CANDIDATE_ID" "$IMAGE:$NEW_TAG" >/dev/null || return 1
   [[ $(image_id "$IMAGE:$NEW_TAG") == "$CANDIDATE_ID" ]]
 }
 
@@ -148,18 +148,18 @@ disarm_rollback() {
 }
 
 main() {
-  [[ $EUID -eq 0 ]] || fail
-  validate_inputs "$@" || fail
+  [[ $EUID -eq 0 ]] || { fail; return 1; }
+  validate_inputs "$@" || { fail; return 1; }
   cd "$APP_DIR"
   exec 9>"$LOCK_FILE"
-  flock -n 9 || fail
-  capture_baseline || fail
-  check_loopback_preflight || fail
-  check_env_files || fail
-  voice_validation=$("$APP_DIR/scripts/validate_english_voice_env.sh" .env .env.smartpbx) || fail
-  [[ $voice_validation == canonical_voice_match=ok ]] || fail
-  docker compose --env-file .env.smartpbx --profile smartpbx config >/dev/null || fail
-  verify_candidate_image || fail
+  flock -n 9 || { fail; return 1; }
+  capture_baseline || { fail; return 1; }
+  check_loopback_preflight || { fail; return 1; }
+  check_env_files || { fail; return 1; }
+  voice_validation=$("$APP_DIR/scripts/validate_english_voice_env.sh" .env .env.smartpbx) || { fail; return 1; }
+  [[ $voice_validation == canonical_voice_match=ok ]] || { fail; return 1; }
+  docker compose --env-file .env.smartpbx --profile smartpbx config >/dev/null || { fail; return 1; }
+  verify_candidate_image || { fail; return 1; }
   arm_rollback
   TAG=$NEW_TAG
   recreate_smartpbx

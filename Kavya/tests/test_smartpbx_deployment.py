@@ -6,6 +6,8 @@ import subprocess
 import re
 import json
 import textwrap
+import signal
+import time
 import textwrap
 
 import pytest
@@ -864,7 +866,10 @@ class FakeDeployHost:
             "flico_id": "f" * 64, "legacy_id": "e" * 64,
             "flico_health": "healthy", "legacy_health": "healthy",
         }
-        defaults.update(state); self.state.write_text(json.dumps(defaults), encoding="utf-8")
+        defaults.update(state)
+        if "baseline_id" in state:
+            defaults["current_id"] = state["baseline_id"]
+        self.state.write_text(json.dumps(defaults), encoding="utf-8")
         self._fake("flock", "exit 0\n"); self._fake("stat", "printf '%s\\n' root:root:600\n")
         self._fake("jq", "exec /usr/bin/jq \"$@\"\n")
         self._fake("curl", """
@@ -945,6 +950,12 @@ class FakeDeployHost:
         root_environment = [f"{key}={value}" for key, value in environment.items() if key in {"PATH", "FAKE_LOG", "FAKE_STATE", *env}]
         return subprocess.run(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, capture_output=True, check=False)
 
+    def start(self, *args):
+        environment = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state)}
+        command = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; APP_DIR={self.app}; LOCK_FILE={self.root / 'lock'}; main \"$@\""
+        root_environment = [f"{key}={value}" for key, value in environment.items()]
+        return subprocess.Popen(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     def deploy(self, **env): return self.run(self.sha[:7], self.sha, self.digest, **env)
     def logs(self): return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
     def compose_count(self): return self.logs().count("up -d --force-recreate --pull never kavya-smartpbx")
@@ -1006,8 +1017,15 @@ def test_deploy_rollback_failures_emit_escalation_marker(tmp_path, environment, 
 
 @pytest.mark.parametrize("signal_name", ["TERM", "INT", "HUP"])
 def test_deploy_signals_after_mutation_roll_back_once(tmp_path, signal_name):
-    host = FakeDeployHost(tmp_path); result = host.deploy(SIGNAL_AFTER=signal_name)
-    assert result.returncode != 0 and host.compose_count() == 2
+    host = FakeDeployHost(tmp_path)
+    process = host.start(host.sha[:7], host.sha, host.digest)
+    deadline = time.monotonic() + 5
+    while not host.current()["mutated"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert host.current()["mutated"]
+    process.send_signal(getattr(signal, f"SIG{signal_name}"))
+    process.communicate(timeout=5)
+    assert process.returncode != 0 and host.compose_count() == 2
 
 
 def test_deploy_mutates_only_the_pinned_service_and_never_prints_sentinels(tmp_path):
