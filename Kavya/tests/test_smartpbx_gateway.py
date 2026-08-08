@@ -343,11 +343,14 @@ async def test_gateway_four_calls_have_unique_opaque_correlations(caplog):
 
 
 class _FaultTransport:
-    def __init__(self, _websocket, _context, *, max_queue_frames):
+    def __init__(self, _websocket, _context, *, max_queue_frames, on_frame_dropped=None):
         self.close_calls = 0
         self.fail = _FAULT_STATE["transport"]
+        self._send_failed = asyncio.Event()
     def start(self):
         pass
+    async def wait_send_failed(self):
+        await self._send_failed.wait()
     async def close(self):
         self.close_calls += 1
         _FAULT_STATE["order"].append("transport")

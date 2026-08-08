@@ -132,6 +132,10 @@ def smartpbx_status(settings: SmartPBXSettings, registry: SmartPBXSessionRegistr
     return {"enabled": settings.enabled, "configured": settings.configured, **registry.snapshot(), "protocol_version": SMARTPBX_PROTOCOL_VERSION}
 
 
+class _TransportSendFailure(Exception):
+    """The outbound sender died; the guest can no longer hear anything."""
+
+
 class _GatewaySession(Protocol):
     @property
     def terminal_future(self) -> asyncio.Future[None]: ...
@@ -220,7 +224,7 @@ class SmartPBXGateway:
             sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
 
             while True:
-                raw = await self._receive_or_terminal(websocket, session)
+                raw = await self._receive_or_terminal(websocket, session, transport)
                 if raw is None:
                     close_outcome = (1000, "call ended")
                     completed_normally = True
@@ -263,6 +267,9 @@ class SmartPBXGateway:
             else:
                 sink(DiagnosticStage.AUDIO_INGESTION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.IDLE_TIMEOUT)
                 close_outcome = (POLICY_VIOLATION, "idle timeout")
+        except _TransportSendFailure:
+            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSPORT_SEND)
+            close_outcome = (1011, "internal error")
         except WebSocketDisconnect:
             disconnected = True
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DISCONNECTED, DiagnosticFailureClass.TRANSPORT_DISCONNECT)
@@ -326,25 +333,52 @@ class SmartPBXGateway:
                 continue
             raise ProtocolViolation(POLICY_VIOLATION, "start required", "start_required")
 
-    async def _receive_or_terminal(self, websocket: Any, session: _GatewaySession) -> str | None:
+    async def _receive_or_terminal(
+        self,
+        websocket: Any,
+        session: _GatewaySession,
+        transport: SmartPBXMediaTransport | None = None,
+    ) -> str | None:
         timeout = None if getattr(session, "transfer_pending", False) else self._settings.idle_timeout_seconds
         terminal = getattr(session, "terminal_future", None)
         if terminal is None:
             return await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
         receive_task = asyncio.create_task(websocket.receive_text())
-        done, _ = await asyncio.wait({receive_task, terminal}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        # A dead outbound sender leaves the guest in silence; wait on it too so
+        # the call ends now instead of at the idle timeout.
+        failure_task = (
+            None if transport is None else asyncio.create_task(transport.wait_send_failed())
+        )
+        waited = {receive_task, terminal} | ({failure_task} if failure_task else set())
+
+        async def _settle(result: str | None) -> str | None:
+            for task in (receive_task, failure_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (receive_task, failure_task) if task is not None),
+                return_exceptions=True,
+            )
+            return result
+
+        done, _ = await asyncio.wait(waited, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         if not done and getattr(session, "transfer_pending", False):
-            done, _ = await asyncio.wait({receive_task, terminal}, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(waited, return_when=asyncio.FIRST_COMPLETED)
         if not done:
-            receive_task.cancel()
-            await asyncio.gather(receive_task, return_exceptions=True)
+            await _settle(None)
             raise asyncio.TimeoutError
+        if failure_task is not None and failure_task in done:
+            await _settle(None)
+            raise _TransportSendFailure
         if terminal in done:
-            receive_task.cancel()
-            await asyncio.gather(receive_task, return_exceptions=True)
+            await _settle(None)
             terminal.result()
             return None
-        return receive_task.result()
+        raw = receive_task.result()
+        if failure_task is not None:
+            failure_task.cancel()
+            await asyncio.gather(failure_task, return_exceptions=True)
+        return raw
 
     async def _cleanup(
         self,

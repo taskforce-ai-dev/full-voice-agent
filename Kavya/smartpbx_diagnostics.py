@@ -51,6 +51,7 @@ class DiagnosticFailureClass(StrEnum):
     TTS_TIMEOUT = "tts_timeout"
     TTS_EXCEPTION = "tts_exception"
     TRANSPORT_DISCONNECT = "transport_disconnect"
+    TRANSPORT_SEND = "transport_send"
     CANCELLED = "cancelled"
     SESSION_CLEANUP = "session_cleanup"
     TRANSPORT_CLEANUP = "transport_cleanup"
