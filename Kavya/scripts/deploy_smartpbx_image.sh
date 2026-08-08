@@ -26,13 +26,30 @@ validate_inputs() {
   [[ $NEW_TAG == "${EXPECTED_SHA:0:7}" ]]
 }
 
-image_digest() { docker image inspect "$1" --format '{{index .RepoDigests 0}}'; }
+image_digests() { docker image inspect "$1" --format '{{range .RepoDigests}}{{println .}}{{end}}'; }
 image_revision() { docker image inspect "$1" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'; }
 image_id() { docker image inspect "$1" --format '{{.Id}}'; }
 
+select_repo_digest() {
+  local image=$1 digests digest
+  digests=$(image_digests "$image") || return 1
+  while IFS= read -r digest; do
+    valid_repo_digest "$digest" || continue
+    printf '%s\n' "$digest"
+    return 0
+  done <<<"$digests"
+  return 1
+}
+
+has_repo_digest() {
+  local image=$1 expected=$2 digests
+  digests=$(image_digests "$image") || return 1
+  grep -Fx -- "$expected" <<<"$digests" >/dev/null || return 1
+}
+
 check_env_files() {
-  [[ $(stat -c '%U:%G:%a' .env) == root:root:600 ]]
-  [[ $(stat -c '%U:%G:%a' .env.smartpbx) == root:root:600 ]]
+  [[ $(stat -c '%U:%G:%a' .env) == root:root:600 ]] || return 1
+  [[ $(stat -c '%U:%G:%a' .env.smartpbx) == root:root:600 ]] || return 1
 }
 
 check_loopback_preflight() {
@@ -56,43 +73,43 @@ capture_service_snapshot() {
   id=$(docker inspect --format '{{.Id}}' "$service") || return 1
   health=$(docker inspect --format '{{.State.Health.Status}}' "$service") || return 1
   [[ $id =~ ^[0-9a-f]{12,64}$ && $health == healthy ]] || return 1
-  printf -v "${prefix}_ID" '%s' "$id"
+  printf -v "${prefix}_ID" '%s' "$id" || return 1
 }
 
 capture_isolation_baseline() {
-  capture_service_snapshot flico-voice-agent FLICO
-  capture_service_snapshot kavya-voice-agent LEGACY
+  capture_service_snapshot flico-voice-agent FLICO || return 1
+  capture_service_snapshot kavya-voice-agent LEGACY || return 1
 }
 
 verify_isolation_baseline() {
-  [[ $(docker inspect --format '{{.Id}}' flico-voice-agent) == "$FLICO_ID" ]]
-  [[ $(docker inspect --format '{{.State.Health.Status}}' flico-voice-agent) == healthy ]]
-  [[ $(docker inspect --format '{{.Id}}' kavya-voice-agent) == "$LEGACY_ID" ]]
-  [[ $(docker inspect --format '{{.State.Health.Status}}' kavya-voice-agent) == healthy ]]
+  [[ $(docker inspect --format '{{.Id}}' flico-voice-agent) == "$FLICO_ID" ]] || return 1
+  [[ $(docker inspect --format '{{.State.Health.Status}}' flico-voice-agent) == healthy ]] || return 1
+  [[ $(docker inspect --format '{{.Id}}' kavya-voice-agent) == "$LEGACY_ID" ]] || return 1
+  [[ $(docker inspect --format '{{.State.Health.Status}}' kavya-voice-agent) == healthy ]] || return 1
 }
 
 capture_baseline() {
   ROLLBACK_IMAGE_ID=$(docker inspect --format '{{.Image}}' kavya-smartpbx) || return 1
   valid_image_id "$ROLLBACK_IMAGE_ID" || return 1
-  ROLLBACK_DIGEST=$(image_digest "$ROLLBACK_IMAGE_ID") || return 1
+  ROLLBACK_DIGEST=$(select_repo_digest "$ROLLBACK_IMAGE_ID") || return 1
   ROLLBACK_REVISION=$(image_revision "$ROLLBACK_IMAGE_ID") || return 1
   valid_repo_digest "$ROLLBACK_DIGEST" || return 1
   valid_revision "$ROLLBACK_REVISION" || return 1
   docker image tag "$ROLLBACK_IMAGE_ID" "$IMAGE:$ROLLBACK_TAG" >/dev/null || return 1
   [[ $(image_id "$IMAGE:$ROLLBACK_TAG") == "$ROLLBACK_IMAGE_ID" ]] || return 1
-  capture_isolation_baseline
+  capture_isolation_baseline || return 1
 }
 
 verify_candidate_image() {
   docker pull "$IMAGE@$EXPECTED_DIGEST" >/dev/null || return 1
   CANDIDATE_ID=$(image_id "$IMAGE@$EXPECTED_DIGEST") || return 1
-  CANDIDATE_DIGEST=$(image_digest "$CANDIDATE_ID") || return 1
   CANDIDATE_REVISION=$(image_revision "$CANDIDATE_ID") || return 1
   valid_image_id "$CANDIDATE_ID" || return 1
-  [[ $CANDIDATE_DIGEST == "$IMAGE@$EXPECTED_DIGEST" ]] || return 1
+  CANDIDATE_DIGEST="$IMAGE@$EXPECTED_DIGEST"
+  has_repo_digest "$CANDIDATE_ID" "$CANDIDATE_DIGEST" || return 1
   [[ $CANDIDATE_REVISION == "$EXPECTED_SHA" ]] || return 1
   docker image tag "$CANDIDATE_ID" "$IMAGE:$NEW_TAG" >/dev/null || return 1
-  [[ $(image_id "$IMAGE:$NEW_TAG") == "$CANDIDATE_ID" ]]
+  [[ $(image_id "$IMAGE:$NEW_TAG") == "$CANDIDATE_ID" ]] || return 1
 }
 
 recreate_smartpbx() {
@@ -103,15 +120,16 @@ verify_running_image() {
   local expected_id=$1 expected_digest=$2 expected_revision=$3 current_id current_digest current_revision
   current_id=$(docker inspect --format '{{.Image}}' kavya-smartpbx) || return 1
   [[ $current_id == "$expected_id" ]] || return 1
-  current_digest=$(image_digest "$current_id") || return 1
   current_revision=$(image_revision "$current_id") || return 1
-  [[ $current_digest == "$expected_digest" && $current_revision == "$expected_revision" ]]
+  has_repo_digest "$current_id" "$expected_digest" || return 1
+  [[ $current_revision == "$expected_revision" ]] || return 1
 }
 
 rollback_once() {
   [[ $ROLLBACK_ARMED -eq 1 && $ROLLBACK_RUNNING -eq 0 ]] || return 0
   ROLLBACK_RUNNING=1
-  trap - ERR EXIT INT TERM HUP
+  trap - ERR EXIT
+  trap '' INT TERM HUP
   TAG=$ROLLBACK_TAG
   if ! recreate_smartpbx || ! wait_for_smartpbx_ready || ! verify_running_image "$ROLLBACK_IMAGE_ID" "$ROLLBACK_DIGEST" "$ROLLBACK_REVISION" || ! verify_isolation_baseline; then
     printf '%s\n' SMARTPBX_ROLLBACK_ESCALATION_REQUIRED >&2
@@ -136,10 +154,10 @@ on_signal() {
 }
 
 arm_rollback() {
-  ROLLBACK_ARMED=1
   trap 'on_error $?' ERR
   trap 'on_exit $?' EXIT
   trap 'on_signal' INT TERM HUP
+  ROLLBACK_ARMED=1
 }
 
 disarm_rollback() {

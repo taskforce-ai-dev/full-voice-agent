@@ -870,7 +870,11 @@ class FakeDeployHost:
         if "baseline_id" in state:
             defaults["current_id"] = state["baseline_id"]
         self.state.write_text(json.dumps(defaults), encoding="utf-8")
-        self._fake("flock", "exit 0\n"); self._fake("stat", "printf '%s\\n' root:root:600\n")
+        self._fake("flock", "exit 0\n")
+        self._fake("stat", """
+            [[ ${BAD_STAT_PATH:-} != "${3:-}" ]] || exit 1
+            printf '%s\\n' root:root:600
+        """)
         self._fake("jq", "exec /usr/bin/jq \"$@\"\n")
         self._fake("curl", """
             printf 'curl %s\\n' "$*" >> "$FAKE_LOG"
@@ -924,12 +928,15 @@ class FakeDeployHost:
                     state['mutated']=True; state['current_id']=state['candidate_id']
                     if os.getenv('FORWARD_ID_BAD') == '1': state['current_id']='sha256:'+'9'*64
                     if os.getenv('FLICO_CHANGED') == '1': state['flico_health']='unhealthy'
+                    if os.getenv('FLICO_ID_CHANGED') == '1': state['flico_id']='9'*64
                     if os.getenv('LEGACY_CHANGED') == '1': state['legacy_id']='9'*64
+                    if os.getenv('LEGACY_HEALTH_CHANGED') == '1': state['legacy_health']='unhealthy'
                 save()
                 if os.getenv('SIGNAL_AFTER') and tag != 'rollback-local': os.kill(os.getppid(), getattr(signal, 'SIG'+os.getenv('SIGNAL_AFTER')))
                 sys.exit(0)
             if args[:2] == ['inspect', '--format']:
                 fmt, name=args[2], args[3]
+                if name == 'flico-voice-agent' and os.getenv('FLICO_ABSENT') == '1': sys.exit(1)
                 values={'kavya-smartpbx': {'{{.Image}}':state['current_id']}, 'flico-voice-agent': {'{{.Id}}':state['flico_id'],'{{.State.Health.Status}}':state['flico_health']}, 'kavya-voice-agent': {'{{.Id}}':state['legacy_id'],'{{.State.Health.Status}}':state['legacy_health']}}
                 print(values.get(name,{}).get(fmt,'')); sys.exit(0 if fmt in values.get(name,{}) else 1)
             if args[:2] == ['image','tag']:
@@ -949,7 +956,7 @@ class FakeDeployHost:
         environment = os.environ | {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state)} | {key: str(value) for key, value in env.items()}
         override = f"{prelude}; " if prelude else ""
         command = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; APP_DIR={self.app}; LOCK_FILE={self.root / 'lock'}; {override}main \"$@\""
-        root_environment = [f"{key}={value}" for key, value in environment.items() if key in {"PATH", "FAKE_LOG", "FAKE_STATE", *env}]
+        root_environment = [f"{key}={value}" for key, value in environment.items()]
         return subprocess.run(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, capture_output=True, check=False)
 
     def start(self, *args):
@@ -1027,11 +1034,17 @@ def test_deploy_root_path_exercises_invalid_argument_rejection(tmp_path, argumen
     assert result.returncode != 0 and host.compose_count() == 0
 
 
-@pytest.mark.parametrize("environment", [{"FORWARD_ID_BAD": 1}, {"FORWARD_DIGEST_BAD": 1}, {"FORWARD_REVISION_BAD": 1}, {"FLICO_CHANGED": 1}, {"LEGACY_CHANGED": 1}])
-def test_deploy_bad_forward_identity_or_isolation_rolls_back_once(tmp_path, environment):
+@pytest.mark.parametrize("environment,protected", [
+    ({"FORWARD_ID_BAD": 1}, None), ({"FORWARD_DIGEST_BAD": 1}, None), ({"FORWARD_REVISION_BAD": 1}, None),
+    ({"FLICO_ID_CHANGED": 1}, "flico_id"), ({"FLICO_CHANGED": 1}, "flico_health"),
+    ({"LEGACY_CHANGED": 1}, "legacy_id"), ({"LEGACY_HEALTH_CHANGED": 1}, "legacy_health"),
+])
+def test_deploy_bad_forward_identity_or_isolation_rolls_back_once(tmp_path, environment, protected):
     host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
     assert result.returncode != 0 and host.compose_count() == 2
     assert host.current()["current_id"] == host.baseline
+    if protected:
+        assert "SMARTPBX_ROLLBACK_ESCALATION_REQUIRED" in result.stderr
 
 
 def test_deploy_readiness_timeout_rolls_back_exactly_once(tmp_path):
