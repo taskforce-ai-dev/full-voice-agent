@@ -869,6 +869,8 @@ class FakeDeployHost:
             "flico_health": "healthy", "legacy_health": "healthy",
         }
         defaults.update(state)
+        if "baseline_digest" in state:
+            defaults["baseline_digests"] = [state["baseline_digest"]]
         if "baseline_id" in state:
             defaults["current_id"] = state["baseline_id"]
         self.state.write_text(json.dumps(defaults), encoding="utf-8")
@@ -951,6 +953,8 @@ class FakeDeployHost:
                 ref,fmt=args[2],args[4]; image_id,digest,revision=image_for(ref)
                 if 'RepoDigests' in fmt:
                     digests=state['baseline_digests'] if ref == state['baseline_id'] or ref.endswith(':rollback-local') else state['candidate_digests']
+                    if not state['mutated'] and os.getenv('CANDIDATE_DIGEST_BAD') == '1': digests=['other.example/kavya@sha256:'+'9'*64]
+                    if state['mutated'] and ref == state['current_id'] and os.getenv('FORWARD_DIGEST_BAD') == '1': digests=['other.example/kavya@sha256:'+'9'*64]
                     print('\\n'.join(digests))
                 else:
                     if ref.endswith(':rollback-local'):
