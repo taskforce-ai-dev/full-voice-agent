@@ -12,12 +12,11 @@ MESSAGE_TOO_BIG = 1009
 INTERNAL_ERROR = 1011
 TRY_AGAIN_LATER = 1013
 
-_MAX_EVENT_NAME_CHARS = 64
 _MAX_IDENTIFIER_CHARS = 256
 _MAX_PHONE_CHARS = 64
 _MAX_HANGUP_REASON_CHARS = 256
 _MAX_DTMF_DURATION_MS = 10_000
-_ALLOWED_DTMF_DIGITS = frozenset("0123456789*#")
+_ALLOWED_DTMF_DIGITS = frozenset("0123456789*#ABCD")
 
 
 @dataclass
@@ -78,6 +77,8 @@ class MediaEvent:
 
 @dataclass(frozen=True)
 class DtmfEvent:
+    call_id: str
+    other_leg_call_id: str
     digit: str
     duration: int | None
 
@@ -86,8 +87,7 @@ class DtmfEvent:
 class HangupEvent:
     call_id: str
     other_leg_call_id: str
-    account_id: str
-    reason: str
+    reason: str | None
 
 
 @dataclass(frozen=True)
@@ -96,12 +96,12 @@ class StopEvent:
 
 
 @dataclass(frozen=True)
-class UnknownEvent:
-    name: str
+class UnsupportedEvent:
+    pass
 
 
 SmartPBXEvent: TypeAlias = (
-    ConnectedEvent | StartEvent | MediaEvent | DtmfEvent | HangupEvent | StopEvent | UnknownEvent
+    ConnectedEvent | StartEvent | MediaEvent | DtmfEvent | HangupEvent | StopEvent | UnsupportedEvent
 )
 
 
@@ -136,17 +136,19 @@ def parse_smartpbx_event(raw: str, *, max_message_chars: int, max_audio_bytes: i
         return _parse_hangup(message)
     if event_name == "stop":
         return StopEvent()
-    return UnknownEvent(name=event_name[:_MAX_EVENT_NAME_CHARS])
+    return UnsupportedEvent()
 
 
 def validate_event_context(event: SmartPBXEvent, context: CallContext) -> None:
-    """Reject a duplicate start or hangup that belongs to another call."""
+    """Reject a duplicate start or control event that belongs to another call."""
     if isinstance(event, StartEvent):
         call_id, other_leg_call_id, account_id = (
             event.context.call_id, event.context.other_leg_call_id, event.context.account_id
         )
-    elif isinstance(event, HangupEvent):
-        call_id, other_leg_call_id, account_id = event.call_id, event.other_leg_call_id, event.account_id
+    elif isinstance(event, (DtmfEvent, HangupEvent)):
+        if (event.call_id, event.other_leg_call_id) != (context.call_id, context.other_leg_call_id):
+            raise ProtocolViolation(POLICY_VIOLATION, "event context mismatch", "context_mismatch")
+        return
     else:
         return
     if (call_id, other_leg_call_id, account_id) != (
@@ -188,24 +190,26 @@ def _parse_media(message: Mapping[object, object], *, max_audio_bytes: int) -> M
 
 def _parse_dtmf(message: Mapping[object, object]) -> DtmfEvent:
     dtmf = _required_mapping(message, "dtmf")
+    call_id = _required_text(dtmf, "callId", _MAX_IDENTIFIER_CHARS)
+    other_leg_call_id = _required_text(dtmf, "otherLegCallId", _MAX_IDENTIFIER_CHARS)
     digit = _required_text(dtmf, "digit", 1)
     if digit not in _ALLOWED_DTMF_DIGITS:
         raise ProtocolViolation(POLICY_VIOLATION, "invalid DTMF event", "invalid_dtmf")
     if "duration" not in dtmf:
-        return DtmfEvent(digit=digit, duration=None)
+        return DtmfEvent(call_id=call_id, other_leg_call_id=other_leg_call_id, digit=digit, duration=None)
     duration = dtmf["duration"]
     if isinstance(duration, bool) or not isinstance(duration, int) or not 0 <= duration <= _MAX_DTMF_DURATION_MS:
         raise ProtocolViolation(POLICY_VIOLATION, "invalid DTMF event", "invalid_dtmf")
-    return DtmfEvent(digit=digit, duration=duration)
+    return DtmfEvent(call_id=call_id, other_leg_call_id=other_leg_call_id, digit=digit, duration=duration)
 
 
 def _parse_hangup(message: Mapping[object, object]) -> HangupEvent:
     hangup = _required_mapping(message, "hangup")
+    reason = None if "reason" not in hangup else _required_text(hangup, "reason", _MAX_HANGUP_REASON_CHARS)
     return HangupEvent(
         call_id=_required_text(hangup, "callId", _MAX_IDENTIFIER_CHARS),
         other_leg_call_id=_required_text(hangup, "otherLegCallId", _MAX_IDENTIFIER_CHARS),
-        account_id=_required_text(hangup, "accountId", _MAX_IDENTIFIER_CHARS),
-        reason=_required_text(hangup, "reason", _MAX_HANGUP_REASON_CHARS),
+        reason=reason,
     )
 
 

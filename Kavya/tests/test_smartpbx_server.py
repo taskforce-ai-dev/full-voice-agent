@@ -1,6 +1,7 @@
 """Kavya SmartPBX media-session and service-mode contract tests."""
 
 import asyncio
+import json
 import logging
 from types import SimpleNamespace
 
@@ -24,6 +25,18 @@ class FakeTransport:
 
     async def send_mark(self, name):
         self.marks.append(name)
+
+
+class BlockingMarkTransport(FakeTransport):
+    def __init__(self):
+        super().__init__()
+        self.mark_entered = asyncio.Event()
+        self.release_mark = asyncio.Event()
+
+    async def send_mark(self, name):
+        self.marks.append(name)
+        self.mark_entered.set()
+        await self.release_mark.wait()
 
 
 class FakeSTT:
@@ -75,6 +88,410 @@ class FakePipeline:
 
     async def _speak(self, text):
         self.spoken.append(text)
+
+
+class CapturingTTSResponse:
+    status_code = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return False
+
+    async def aread(self):
+        return b""
+
+    async def aiter_bytes(self, chunk_size):
+        assert chunk_size == 640
+        yield b"ulaw-frame"
+
+
+class CapturingTTSClient:
+    def __init__(self):
+        self.requests = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def stream(self, method, url, *, json, headers, timeout):
+        self.requests.append({"method": method, "url": url, "json": json, "headers": headers, "timeout": timeout})
+        return CapturingTTSResponse()
+
+
+class FailingTTSResponse(CapturingTTSResponse):
+    def __init__(self, status_code, body=b""):
+        self.status_code = status_code
+        self.body = body
+
+    async def aread(self):
+        return self.body
+
+
+class FailingTTSClient(CapturingTTSClient):
+    def __init__(self, response):
+        super().__init__()
+        self.response = response
+
+    def stream(self, method, url, *, json, headers, timeout):
+        self.requests.append({"method": method, "url": url, "json": json, "headers": headers, "timeout": timeout})
+        return self.response
+
+
+class RaisingTTSResponse:
+    def __init__(self, exception):
+        self.exception = exception
+
+    async def __aenter__(self):
+        raise self.exception
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+def smartpbx_tts_pipeline(server, sink):
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+
+    def record(stage, outcome, failure_class):
+        sink((stage, outcome, failure_class))
+
+    pipeline._smartpbx_diagnostic_sink = record
+    return pipeline
+
+
+def assert_no_tts_secret_leakage(caplog, *secrets):
+    for secret in secrets:
+        assert secret not in caplog.text
+
+
+def raising_tts_sink(records, exception):
+    def sink(event):
+        records.append(event)
+        raise RuntimeError(exception)
+
+    return sink
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_uses_profile_without_general_voice(monkeypatch):
+    import server
+    from english_voice_profile import load_kavya_english_voice_profile
+
+    client = CapturingTTSClient()
+    profile = load_kavya_english_voice_profile({"KAVYA_EN_ELEVENLABS_VOICE_ID": "unit-test-canonical-voice"})
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "unit-test-api-key")
+    monkeypatch.setattr(server, "ELEVENLABS_VOICE_ID", "")
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    await pipeline._tts_elevenlabs("Hello from Kavya.")
+    request = client.requests[0]
+    assert request["url"] == "https://api.elevenlabs.io/v1/text-to-speech/unit-test-canonical-voice/stream?output_format=ulaw_8000"
+    assert request["json"] == {"text": "Hello from Kavya.", "model_id": "eleven_flash_v2_5", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}}
+    assert "output_format" not in request["json"]
+    assert "mp3" not in request["url"]
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_fails_closed_when_profile_is_unavailable(monkeypatch):
+    import server
+
+    client = CapturingTTSClient()
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "unit-test-api-key")
+    monkeypatch.setattr(server, "ELEVENLABS_VOICE_ID", "unit-test-general-voice")
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: (_ for _ in ()).throw(ValueError("KAVYA_EN_ELEVENLABS_VOICE_ID must be configured")))
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    await pipeline._tts_elevenlabs("Hello from Kavya.")
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_retained_non_english_tts_still_requires_general_voice(monkeypatch):
+    import server
+
+    client = CapturingTTSClient()
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "unit-test-api-key")
+    monkeypatch.setattr(server, "ELEVENLABS_VOICE_ID", "")
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = server.MediaStreamSession(websocket=None, lang="ta", media_transport=FakeTransport())
+    await pipeline._tts_elevenlabs("vanakkam")
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_missing_api_key_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    text = "spoken-text-secret"
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "")
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_MISSING_API_KEY)]
+    assert_no_tts_secret_leakage(caplog, api_key, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_profile_failure_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    exception = "profile-exception-secret"
+    text = "spoken-text-secret"
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(
+        server,
+        "load_kavya_english_voice_profile",
+        lambda: (_ for _ in ()).throw(ValueError(f"{voice} {exception}")),
+    )
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_PROFILE_FAILURE)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_http_failure_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    body = "response-body-secret"
+    text = "spoken-text-secret"
+    profile = SimpleNamespace(voice_id=voice, model_id="test-model", request_voice_settings={})
+    client = FailingTTSClient(FailingTTSResponse(599, body.encode()))
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.ERROR):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_HTTP_STATUS)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, body, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_timeout_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    exception = "timeout-exception-secret"
+    text = "spoken-text-secret"
+    profile = SimpleNamespace(voice_id=voice, model_id="test-model", request_voice_settings={})
+    client = FailingTTSClient(RaisingTTSResponse(server.httpx.TimeoutException(exception)))
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.ERROR):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_TIMEOUT)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_exception_emits_finite_diagnostic(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    exception = "generic-exception-secret"
+    text = "spoken-text-secret"
+    profile = SimpleNamespace(voice_id=voice, model_id="test-model", request_voice_settings={})
+    client = FailingTTSClient(RaisingTTSResponse(RuntimeError(exception)))
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = smartpbx_tts_pipeline(server, records.append)
+
+    with caplog.at_level(logging.ERROR):
+        await pipeline._tts_elevenlabs(text)
+
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_EXCEPTION)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_missing_api_key_isolates_raising_diagnostic_sink(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    callback_exception = "diagnostic-sink-exception-secret"
+    text = "spoken-text-secret"
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "")
+    pipeline = smartpbx_tts_pipeline(server, raising_tts_sink(records, callback_exception))
+
+    with caplog.at_level(logging.WARNING):
+        result = await pipeline._tts_elevenlabs(text)
+
+    assert result is None
+    assert pipeline._is_speaking is False
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_MISSING_API_KEY)]
+    assert_no_tts_secret_leakage(caplog, callback_exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_profile_failure_isolates_raising_diagnostic_sink(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    profile_exception = "profile-exception-secret"
+    callback_exception = "diagnostic-sink-exception-secret"
+    text = "spoken-text-secret"
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(
+        server,
+        "load_kavya_english_voice_profile",
+        lambda: (_ for _ in ()).throw(ValueError(f"{voice} {profile_exception}")),
+    )
+    pipeline = smartpbx_tts_pipeline(server, raising_tts_sink(records, callback_exception))
+
+    with caplog.at_level(logging.WARNING):
+        result = await pipeline._tts_elevenlabs(text)
+
+    assert result is None
+    assert pipeline._is_speaking is False
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_PROFILE_FAILURE)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, profile_exception, callback_exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_http_failure_isolates_raising_diagnostic_sink(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    body = "response-body-secret"
+    callback_exception = "diagnostic-sink-exception-secret"
+    text = "spoken-text-secret"
+    profile = SimpleNamespace(voice_id=voice, model_id="test-model", request_voice_settings={})
+    client = FailingTTSClient(FailingTTSResponse(599, body.encode()))
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = smartpbx_tts_pipeline(server, raising_tts_sink(records, callback_exception))
+
+    with caplog.at_level(logging.ERROR):
+        result = await pipeline._tts_elevenlabs(text)
+
+    assert result is None
+    assert pipeline._is_speaking is False
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_HTTP_STATUS)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, body, callback_exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_timeout_isolates_raising_diagnostic_sink(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    timeout_exception = "timeout-exception-secret"
+    callback_exception = "diagnostic-sink-exception-secret"
+    text = "spoken-text-secret"
+    profile = SimpleNamespace(voice_id=voice, model_id="test-model", request_voice_settings={})
+    client = FailingTTSClient(RaisingTTSResponse(server.httpx.TimeoutException(timeout_exception)))
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = smartpbx_tts_pipeline(server, raising_tts_sink(records, callback_exception))
+
+    with caplog.at_level(logging.ERROR):
+        result = await pipeline._tts_elevenlabs(text)
+
+    assert result is None
+    assert pipeline._is_speaking is False
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_TIMEOUT)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, timeout_exception, callback_exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_exception_isolates_raising_diagnostic_sink(monkeypatch, caplog):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    records = []
+    api_key = "api-key-secret"
+    voice = "voice-secret"
+    tts_exception = "generic-exception-secret"
+    callback_exception = "diagnostic-sink-exception-secret"
+    text = "spoken-text-secret"
+    profile = SimpleNamespace(voice_id=voice, model_id="test-model", request_voice_settings={})
+    client = FailingTTSClient(RaisingTTSResponse(RuntimeError(tts_exception)))
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", api_key)
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: profile)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    pipeline = smartpbx_tts_pipeline(server, raising_tts_sink(records, callback_exception))
+
+    with caplog.at_level(logging.ERROR):
+        result = await pipeline._tts_elevenlabs(text)
+
+    assert result is None
+    assert pipeline._is_speaking is False
+    assert records == [(DiagnosticStage.TTS, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TTS_EXCEPTION)]
+    assert_no_tts_secret_leakage(caplog, api_key, voice, tts_exception, callback_exception, text)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_english_tts_without_sink_keeps_existing_failure_behavior(monkeypatch):
+    import server
+
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "")
+
+    await pipeline._tts_elevenlabs("spoken-text-secret")
+
+    assert pipeline._is_speaking is False
+
+
+@pytest.mark.asyncio
+async def test_non_smartpbx_tts_failure_does_not_emit_smartpbx_diagnostic(monkeypatch):
+    import server
+
+    records = []
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_diagnostic_sink = records.append
+    monkeypatch.setattr(server, "ELEVENLABS_API_KEY", "")
+
+    await pipeline._tts_elevenlabs("spoken-text-secret")
+
+    assert records == []
 
 
 def context(**overrides):
@@ -615,3 +1032,912 @@ def test_unknown_service_mode_fails_closed():
 
     with pytest.raises(ValueError, match="invalid KAVYA_SERVICE_MODE"):
         server.build_service_app("both", {})
+
+
+def test_smartpbx_session_declares_optional_diagnostic_sink_and_installs_before_welcome():
+    import inspect
+
+    parameters = inspect.signature(KavyaSmartPBXSession).parameters
+    assert "diagnostic_sink" in parameters
+    assert parameters["diagnostic_sink"].default is not inspect.Parameter.empty
+
+
+@pytest.mark.asyncio
+async def test_server_smartpbx_factory_declares_and_forwards_diagnostic_sink_contract():
+    import inspect
+    import server
+
+    parameters = inspect.signature(server._new_smartpbx_session).parameters
+    assert list(parameters) == ["context", "transport", "diagnostic_sink"]
+
+    sentinel_sink = lambda *_values: None
+    session = await server._new_smartpbx_session(context(), FakeTransport(), sentinel_sink)
+    assert getattr(session, "_diagnostic_sink", None) is sentinel_sink
+
+@pytest.mark.asyncio
+async def test_smartpbx_session_installs_default_noop_sink_on_pipeline_before_welcome():
+    async def process_post_call(**_metadata):
+        pass
+
+    session, pipeline, _, _ = make_session(post_call_processor=process_post_call)
+    await session.start()
+    try:
+        sink = getattr(pipeline, "_smartpbx_diagnostic_sink", None)
+        assert callable(sink)
+        assert pipeline.spoken == ["Welcome to Hatton Hills."]
+    finally:
+        await session.finish(False)
+
+
+class SinkObservingPipeline(FakePipeline):
+    def __init__(self):
+        super().__init__()
+        self.sinks_seen_at_speak = []
+    async def _speak(self, text):
+        self.sinks_seen_at_speak.append(getattr(self, "_smartpbx_diagnostic_sink", None))
+        await super()._speak(text)
+
+
+@pytest.mark.asyncio
+async def test_default_diagnostic_sink_is_callable_before_welcome_speak():
+    async def process_post_call(**_metadata):
+        pass
+    pipeline = SinkObservingPipeline()
+    session, _, _, _ = make_session(post_call_processor=process_post_call, pipeline=pipeline)
+    await session.start()
+    try:
+        assert pipeline.spoken == ["Welcome to Hatton Hills."]
+        assert len(pipeline.sinks_seen_at_speak) == 1
+        assert callable(pipeline.sinks_seen_at_speak[0])
+    finally:
+        await session.finish(False)
+
+
+@pytest.mark.asyncio
+async def test_explicit_diagnostic_sink_reaches_pipeline_before_welcome_by_identity():
+    import inspect
+    async def process_post_call(**_metadata):
+        pass
+    explicit_sink = lambda *_values: None
+    parameters = inspect.signature(KavyaSmartPBXSession).parameters
+    assert "diagnostic_sink" in parameters
+    pipeline = SinkObservingPipeline()
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), pipeline=pipeline, stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=process_post_call, welcome_text="Welcome to Hatton Hills.",
+        llm_provider="claude", model="test-model", diagnostic_sink=explicit_sink,
+    )
+    await session.start()
+    try:
+        assert pipeline.sinks_seen_at_speak == [explicit_sink]
+    finally:
+        await session.finish(False)
+
+
+@pytest.mark.asyncio
+async def test_explicit_falsey_diagnostic_sink_is_preserved_and_used_before_welcome():
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    class FalseySink:
+        def __init__(self):
+            self.calls = []
+
+        def __bool__(self):
+            return False
+
+        def __call__(self, stage, outcome, failure_class):
+            self.calls.append((stage, outcome, failure_class))
+
+    async def process_post_call(**_metadata):
+        pass
+
+    explicit_sink = FalseySink()
+    pipeline = SinkObservingPipeline()
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), pipeline=pipeline, stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=process_post_call, welcome_text="Welcome to Hatton Hills.",
+        llm_provider="claude", model="test-model", diagnostic_sink=explicit_sink,
+    )
+    await session.start()
+    try:
+        assert pipeline.sinks_seen_at_speak == [explicit_sink]
+        pipeline._smartpbx_diagnostic_sink(
+            DiagnosticStage.SESSION_START,
+            DiagnosticOutcome.COMPLETED,
+            DiagnosticFailureClass.NONE,
+        )
+        assert explicit_sink.calls == [(
+            DiagnosticStage.SESSION_START,
+            DiagnosticOutcome.COMPLETED,
+            DiagnosticFailureClass.NONE,
+        )]
+    finally:
+        await session.finish(False)
+
+
+async def _native_one_event_stream(event):
+    yield event
+
+
+class NativeRecordingOpenAI:
+    def __init__(self, events=None):
+        self.requests = []
+        self.events = events
+        self.chat = SimpleNamespace(completions=self)
+
+    async def create(self, **kwargs):
+        self.requests.append(kwargs)
+        if self.events is not None:
+            self.events.append("openai-dispatch")
+        return _native_one_event_stream(
+            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="native response", tool_calls=None))])
+        )
+
+
+class NativeRecordingGeminiModels:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def generate_content_stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        if self.owner.events is not None:
+            self.owner.events.append("gemini-dispatch")
+        return _native_one_event_stream(
+            SimpleNamespace(candidates=[SimpleNamespace(
+                finish_reason=None,
+                content=SimpleNamespace(parts=[SimpleNamespace(text="native response", function_call=None)]),
+            )])
+        )
+
+
+class NativeRecordingGemini:
+    def __init__(self, events=None):
+        self.requests = []
+        self.events = events
+        self.aio = SimpleNamespace(models=NativeRecordingGeminiModels(self))
+
+
+class NativeRecordingClaudeStream:
+    def __init__(self, event):
+        self.event = event
+
+    async def __aenter__(self):
+        return _native_one_event_stream(self.event)
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class NativeRecordingClaudeMessages:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        if self.owner.events is not None:
+            self.owner.events.append("claude-dispatch")
+        return NativeRecordingClaudeStream(
+            SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="text_delta", text="native response"))
+        )
+
+
+class NativeRecordingClaude:
+    def __init__(self, events=None):
+        self.requests = []
+        self.events = events
+        self.messages = NativeRecordingClaudeMessages(self)
+
+
+def native_provider_clients(events=None):
+    return {
+        "claude": NativeRecordingClaude(events),
+        "gemini": NativeRecordingGemini(events),
+        "openai": NativeRecordingOpenAI(events),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_media_session_uses_explicit_native_provider_model_and_schema(monkeypatch, provider):
+    import server
+
+    clients = native_provider_clients()
+    schemas = {
+        "claude": [{"name": "claude_native_tool"}],
+        "gemini": [{"function_declarations": [{"name": "gemini_native_tool"}]}],
+        "openai": [{"type": "function", "function": {"name": "openai_native_tool"}}],
+    }
+    factory_calls = []
+
+    def provider_factory(name):
+        def factory():
+            factory_calls.append(name)
+            return schemas[name]
+
+        return factory
+
+    monkeypatch.setattr(server, "get_tools", provider_factory("claude"))
+    monkeypatch.setattr(server, "get_tools_gemini", provider_factory("gemini"))
+    monkeypatch.setattr(server, "get_tools_openai", provider_factory("openai"))
+    expected_tools = schemas[provider]
+    pipeline = server.MediaStreamSession(
+        websocket=None,
+        lang="en",
+        anthropic_client=clients["claude"],
+        gemini_client=clients["gemini"],
+        openai_client=clients["openai"],
+        media_transport=FakeTransport(),
+        llm_provider=provider,
+        model=f"{provider}-instance-model",
+    )
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("provider-turn")
+
+    assert pipeline.tools is expected_tools
+    assert factory_calls == [provider]
+    assert len(clients[provider].requests) == 1
+    for other_provider, client in clients.items():
+        if other_provider != provider:
+            assert client.requests == []
+    request = clients[provider].requests[0]
+    assert request["model"] == f"{provider}-instance-model"
+    if provider == "gemini":
+        assert request["config"]["tools"] is expected_tools
+    else:
+        assert request["tools"] is expected_tools
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_runtime_pipeline_forwards_resolved_provider_and_model(monkeypatch):
+    import server
+
+    captured = {}
+    gemini_client = object()
+
+    class CapturingPipeline:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(server, "LLM_PROVIDER", "claude")
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: (_ for _ in ()).throw(AssertionError("wrong client")))
+    monkeypatch.setattr(server, "_get_gemini_client", lambda: gemini_client)
+    monkeypatch.setattr(server, "_get_client", lambda: (_ for _ in ()).throw(AssertionError("wrong client")))
+    monkeypatch.setattr(server, "MediaStreamSession", CapturingPipeline)
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0), welcome_text="",
+        llm_provider="gemini", model="adapter-instance-model",
+    )
+
+    session._load_runtime_defaults()
+
+    assert captured["llm_provider"] == "gemini"
+    assert captured["model"] == "adapter-instance-model"
+    assert captured["gemini_client"] is gemini_client
+
+
+@pytest.mark.asyncio
+async def test_media_session_retrieves_reference_before_selected_provider_dispatch(monkeypatch):
+    import server
+
+    events = []
+    clients = native_provider_clients(events)
+    pipeline = server.MediaStreamSession(
+        websocket=None,
+        lang="en",
+        openai_client=clients["openai"],
+        media_transport=FakeTransport(),
+        llm_provider="openai",
+        model="rag-instance-model",
+    )
+
+    def retrieve(_text):
+        events.append("retrieve")
+        return "reference-marker"
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", retrieve)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("guest-marker")
+
+    assert events.index("retrieve") < events.index("openai-dispatch")
+    assert "reference-marker" in str(clients["openai"].requests[0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_start_uses_exact_configured_stt_factory_with_private_english_inputs():
+    async def process_post_call(**_metadata):
+        return None
+
+    calls = []
+    stt = FakeSTT()
+
+    def configured_factory(**kwargs):
+        calls.append(kwargs)
+        return stt
+
+    pipeline = FakePipeline()
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), pipeline=pipeline, stt_factory=configured_factory,
+        post_call_processor=process_post_call, welcome_text="",
+        llm_provider="claude", model="stt-instance-model",
+    )
+
+    await session.start()
+    try:
+        assert session._stt_factory is configured_factory
+        assert len(calls) == 1
+        assert calls[0]["lang"] == "en"
+        assert calls[0]["privacy_safe"] is True
+        assert calls[0]["on_final_result"].__self__ is pipeline
+        assert calls[0]["on_interim_result"].__self__ is pipeline
+    finally:
+        await session.finish(False)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_runtime_invalid_provider_fails_before_client_pipeline_or_stt(monkeypatch, caplog):
+    import server
+
+    client_factory_calls = []
+    pipeline_constructions = []
+    stt_calls = []
+    real_media_session = server.MediaStreamSession
+
+    def recording_client_factory(name):
+        def factory():
+            client_factory_calls.append(name)
+            return object()
+
+        return factory
+
+    def recording_media_session(*args, **kwargs):
+        pipeline_constructions.append((args, kwargs))
+        return real_media_session(*args, **kwargs)
+
+    def configured_stt_factory(**kwargs):
+        stt_calls.append(kwargs)
+        return FakeSTT()
+
+    async def process_post_call(**_metadata):
+        return None
+
+    monkeypatch.setattr(server, "_get_anthropic_client", recording_client_factory("claude"))
+    monkeypatch.setattr(server, "_get_gemini_client", recording_client_factory("gemini"))
+    monkeypatch.setattr(server, "_get_client", recording_client_factory("openai"))
+    monkeypatch.setattr(server, "MediaStreamSession", recording_media_session)
+    invalid_provider = "private-invalid-provider-sentinel-abcdefghijklmnopqrstuvwxyz"
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), stt_factory=configured_stt_factory,
+        post_call_processor=process_post_call, welcome_text="",
+        llm_provider=invalid_provider, model="invalid-provider-model",
+    )
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(ValueError) as exc_info:
+            await session.start()
+
+    assert str(exc_info.value) == "invalid LLM provider"
+    assert invalid_provider not in str(exc_info.value)
+    assert invalid_provider not in caplog.text
+    assert client_factory_calls == []
+    assert pipeline_constructions == []
+    assert stt_calls == []
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_fully_injected_invalid_provider_fails_before_any_start_side_effect(caplog):
+    private_provider = "private-injected-provider-sentinel-abcdefghijklmnopqrstuvwxyz"
+    stt_calls = []
+    pipeline = FakePipeline()
+
+    def configured_stt_factory(**kwargs):
+        stt_calls.append(kwargs)
+        return FakeSTT()
+
+    async def process_post_call(**_metadata):
+        return None
+
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), pipeline=pipeline, stt_factory=configured_stt_factory,
+        post_call_processor=process_post_call, welcome_text="private-welcome-marker",
+        llm_provider=private_provider, model="fully-injected-model",
+    )
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(ValueError) as exc_info:
+            await session.start()
+
+    assert str(exc_info.value) == "invalid LLM provider"
+    assert private_provider not in str(exc_info.value)
+    assert private_provider not in caplog.text
+    assert stt_calls == []
+    assert pipeline._stt is None
+    assert pipeline.spoken == []
+    assert getattr(pipeline, "_smartpbx_transfer_context", None) is None
+
+
+async def _direct_tool_event_stream(events):
+    for event in events:
+        yield event
+
+
+class DirectToolOpenAI:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.chat = SimpleNamespace(completions=self)
+
+    async def create(self, **kwargs):
+        self.requests.append(kwargs)
+        return _direct_tool_event_stream(self.rounds.pop(0))
+
+
+class DirectToolGeminiModels:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def generate_content_stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        return _direct_tool_event_stream(self.owner.rounds.pop(0))
+
+
+class DirectToolGemini:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.aio = SimpleNamespace(models=DirectToolGeminiModels(self))
+
+
+class DirectToolClaudeStream:
+    def __init__(self, events):
+        self.events = events
+
+    async def __aenter__(self):
+        return _direct_tool_event_stream(self.events)
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class DirectToolClaudeMessages:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        return DirectToolClaudeStream(self.owner.rounds.pop(0))
+
+
+class DirectToolClaude:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.messages = DirectToolClaudeMessages(self)
+
+
+def direct_tool_round(provider, arguments, preamble=None):
+    if provider == "openai":
+        return [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+            content=preamble,
+            tool_calls=[SimpleNamespace(
+                index=0, id="tool-1",
+                function=SimpleNamespace(name="create_booking", arguments=json.dumps(arguments)),
+            )],
+        ))])]
+    if provider == "gemini":
+        parts = []
+        if preamble is not None:
+            parts.append(SimpleNamespace(text=preamble, function_call=None))
+        parts.append(SimpleNamespace(
+            text=None,
+            function_call=SimpleNamespace(name="create_booking", args=arguments),
+        ))
+        return [SimpleNamespace(candidates=[SimpleNamespace(
+            finish_reason=None, content=SimpleNamespace(parts=parts),
+        )])]
+    events = []
+    if preamble is not None:
+        events.append(SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text=preamble),
+        ))
+    events.extend([
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(type="tool_use", id="tool-1", name="create_booking"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json=json.dumps(arguments)),
+        ),
+        SimpleNamespace(type="content_block_stop"),
+    ])
+    return events
+
+
+def direct_text_round(provider, text):
+    if provider == "openai":
+        return [SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(content=text, tool_calls=None),
+        )])]
+    if provider == "gemini":
+        return [SimpleNamespace(candidates=[SimpleNamespace(
+            finish_reason=None,
+            content=SimpleNamespace(parts=[SimpleNamespace(text=text, function_call=None)]),
+        )])]
+    return [SimpleNamespace(
+        type="content_block_delta",
+        delta=SimpleNamespace(type="text_delta", text=text),
+    )]
+
+
+def direct_tool_client(provider, rounds):
+    if provider == "openai":
+        return DirectToolOpenAI(rounds)
+    if provider == "gemini":
+        return DirectToolGemini(rounds)
+    return DirectToolClaude(rounds)
+
+
+def direct_tool_pipeline(server, provider, client, lang="en"):
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang=lang, media_transport=FakeTransport(),
+        anthropic_client=client if provider == "claude" else None,
+        gemini_client=client if provider == "gemini" else None,
+        openai_client=client if provider == "openai" else None,
+        llm_provider=provider, model=f"{provider}-tool-model",
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline.tools = [{"provider": provider}]
+    return pipeline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_direct_english_tool_failure_uses_one_filler_and_opaque_recovery(monkeypatch, caplog, provider):
+    import server
+
+    private_arguments = {"private_tool_argument": "private-tool-argument-sentinel"}
+    private_exception = "private-tool-exception-sentinel"
+    recovery = "Recovery is ready."
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, private_arguments),
+        direct_text_round(provider, recovery),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    spoken = []
+    order = []
+    executions = []
+
+    async def speak(text, generation=-1):
+        spoken.append((text, generation))
+        order.append("filler" if text == server.TOOL_FILLERS["create_booking"] else "speech")
+
+    async def fail_tool(name, arguments):
+        executions.append((name, arguments))
+        order.append("execute")
+        raise RuntimeError(private_exception)
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", fail_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        await pipeline._process_utterance_bound("safe guest turn")
+
+    filler = server.TOOL_FILLERS["create_booking"]
+    assert spoken[0] == (filler, 0)
+    assert sum(text == filler for text, _generation in spoken) == 1
+    assert order.index("filler") < order.index("execute")
+    assert [name for name, _arguments in executions] == ["create_booking"]
+    assert recovery in [text for text, _generation in spoken]
+    second_request = repr(client.requests[1])
+    if provider == "gemini":
+        response = client.requests[1]["contents"][-1]["parts"][0]["function_response"]["response"]
+        assert response == {"error": "tool_execution_failed"}
+    else:
+        assert json.dumps({"error": "tool_execution_failed"}) in second_request
+    for private_value in (private_exception, private_arguments["private_tool_argument"]):
+        assert private_value not in second_request
+        assert private_value not in repr(pipeline.history)
+        assert private_value not in repr(pipeline.full_transcript)
+        assert private_value not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_direct_english_tool_preamble_skips_canned_filler_and_recovers(monkeypatch, provider):
+    import server
+
+    private_arguments = {"private_tool_argument": "private-tool-argument-sentinel"}
+    preamble = "I will take care of that."
+    recovery = "Recovery is ready."
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, private_arguments, preamble=preamble),
+        direct_text_round(provider, recovery),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    spoken = []
+    executions = []
+
+    async def speak(text, generation=-1):
+        spoken.append((text, generation))
+
+    async def fail_tool(name, arguments):
+        executions.append((name, arguments))
+        raise RuntimeError("private-tool-exception-sentinel")
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", fail_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    await pipeline._process_utterance_bound("safe guest turn")
+
+    filler = server.TOOL_FILLERS["create_booking"]
+    assert preamble in [text for text, _generation in spoken]
+    assert filler not in [text for text, _generation in spoken]
+    assert [name for name, _arguments in executions] == ["create_booking"]
+    assert recovery in [text for text, _generation in spoken]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_direct_english_multiround_transcript_joins_text_with_existing_separator(monkeypatch, provider):
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"safe": "value"}, preamble="Preamble."),
+        direct_text_round(provider, "Recovery."),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    async def successful_tool(_name, _arguments):
+        return "ok"
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("safe guest turn")
+
+    assert pipeline.full_transcript[-1] == {"role": "assistant", "text": "Preamble. Recovery."}
+
+
+@pytest.mark.asyncio
+async def test_retained_non_english_direct_tool_uses_existing_media_stream_filler(monkeypatch):
+    import server
+
+    client = direct_tool_client("openai", [
+        direct_tool_round("openai", {"safe": "value"}),
+        direct_text_round("openai", "Recovery."),
+    ])
+    pipeline = direct_tool_pipeline(server, "openai", client, lang="ta")
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append((text, generation))
+
+    async def successful_tool(_name, _arguments):
+        return "ok"
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    await pipeline._process_utterance_bound("safe guest turn")
+
+    assert server.MEDIA_STREAM_FILLERS["ta"]["create_booking"] in [text for text, _generation in spoken]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_retained_non_english_multiround_transcript_preserves_legacy_concatenation(monkeypatch, provider):
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"safe": "value"}, preamble="Preamble."),
+        direct_text_round(provider, "Recovery."),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client, lang="ta")
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    async def successful_tool(_name, _arguments):
+        return "ok"
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("safe guest turn")
+
+    assert pipeline.full_transcript[-1] == {"role": "assistant", "text": "Preamble.Recovery."}
+
+
+@pytest.mark.asyncio
+async def test_direct_tts_done_bargein_during_mark_does_not_rearm_reprompt():
+    import server
+
+    transport = BlockingMarkTransport()
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=transport)
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._is_speaking = True
+    starting_generation = pipeline._speak_generation
+    completion = asyncio.create_task(pipeline._send_tts_done())
+
+    try:
+        await asyncio.wait_for(transport.mark_entered.wait(), timeout=1)
+        await pipeline._handle_bargein()
+        assert pipeline._speak_generation == starting_generation + 1
+        assert transport.clears == 1
+
+        transport.release_mark.set()
+        await asyncio.wait_for(completion, timeout=1)
+
+        assert transport.marks == ["tts_done"]
+        assert pipeline._reprompt_task is None
+        assert pipeline._is_speaking is False
+    finally:
+        transport.release_mark.set()
+        await asyncio.gather(completion, return_exceptions=True)
+        pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_direct_tts_done_transfer_during_mark_does_not_rearm_reprompt():
+    import server
+
+    transport = BlockingMarkTransport()
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=transport)
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._is_speaking = True
+    completion = asyncio.create_task(pipeline._send_tts_done())
+
+    try:
+        await asyncio.wait_for(transport.mark_entered.wait(), timeout=1)
+        await pipeline.enter_transfer_pending()
+        assert transport.clears == 1
+
+        transport.release_mark.set()
+        await asyncio.wait_for(completion, timeout=1)
+
+        assert transport.marks == ["tts_done"]
+        assert pipeline.transfer_pending is True
+        assert pipeline._reprompt_task is None
+        assert pipeline._is_speaking is False
+    finally:
+        transport.release_mark.set()
+        await asyncio.gather(completion, return_exceptions=True)
+        pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_direct_bargein_rejects_stale_generation_but_allows_current_generation():
+    import server
+
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=transport)
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._is_speaking = True
+    old_generation = pipeline._speak_generation
+    spoken = []
+
+    async def tts(text):
+        spoken.append(text)
+
+    pipeline._tts_elevenlabs = tts
+    await pipeline._handle_bargein()
+    await pipeline._speak("stale", generation=old_generation)
+    await pipeline._speak("current", generation=pipeline._speak_generation)
+
+    assert transport.clears == 1
+    assert spoken == ["current"]
+
+
+@pytest.mark.asyncio
+async def test_direct_reprompt_lifecycle_replaces_cancels_resets_and_suppresses_transfer(monkeypatch):
+    import server
+
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._event_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(server, "SILENCE_REPROMPT_DELAY", 0)
+    monkeypatch.setattr(server, "MAX_REPROMPTS", 1)
+    nudged = asyncio.Event()
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+        nudged.set()
+
+    pipeline._speak = speak
+    await pipeline._send_tts_done()
+    await asyncio.wait_for(nudged.wait(), timeout=1)
+    assert len(spoken) == 1
+    assert pipeline._reprompt_count == 1
+
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+
+    async def wait_for_reprompt():
+        started.set()
+        await blocker.wait()
+
+    pipeline._reprompt_after_silence = wait_for_reprompt
+    pipeline._schedule_reprompt()
+    await asyncio.wait_for(started.wait(), timeout=1)
+    first = pipeline._reprompt_task
+    pipeline._schedule_reprompt()
+    second = pipeline._reprompt_task
+    await asyncio.gather(first, return_exceptions=True)
+    assert first is not second
+    assert first.cancelled()
+
+    pipeline._reprompt_count = 1
+    await pipeline._accumulate_transcript("final caller speech")
+    await asyncio.gather(second, return_exceptions=True)
+    assert pipeline._reprompt_task is None
+    assert pipeline._reprompt_count == 0
+
+    pipeline._schedule_reprompt()
+    third = pipeline._reprompt_task
+    pipeline._reprompt_count = 1
+    await pipeline._set_transcript_interim("interim caller speech")
+    await asyncio.gather(third, return_exceptions=True)
+    assert pipeline._reprompt_task is None
+    assert pipeline._reprompt_count == 0
+
+    pipeline.transfer_pending = True
+    pipeline._schedule_reprompt()
+    assert pipeline._reprompt_task is None
+    if pipeline._endpointing_handle:
+        pipeline._endpointing_handle.cancel()
+        pipeline._endpointing_handle = None
+    blocker.set()
+
+
+@pytest.mark.asyncio
+async def test_direct_tts_done_mark_then_queued_bargein_cancels_reprompt():
+    import server
+
+    transport = BlockingMarkTransport()
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=transport)
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._event_loop = asyncio.get_running_loop()
+    pipeline._is_speaking = True
+    starting_generation = pipeline._speak_generation
+    barge_finished = asyncio.Event()
+    original_bargein = pipeline._handle_bargein
+
+    async def tracked_bargein():
+        try:
+            await original_bargein()
+        finally:
+            barge_finished.set()
+
+    pipeline._handle_bargein = tracked_bargein
+    completion = asyncio.create_task(pipeline._send_tts_done())
+
+    try:
+        await asyncio.wait_for(transport.mark_entered.wait(), timeout=1)
+        transport.release_mark.set()
+        pipeline._on_stt_result("caller interrupted")
+        await asyncio.wait_for(completion, timeout=1)
+        await asyncio.wait_for(barge_finished.wait(), timeout=1)
+
+        assert transport.marks == ["tts_done"]
+        assert transport.clears == 1
+        assert pipeline._speak_generation == starting_generation + 1
+        assert pipeline._is_speaking is False
+        assert pipeline._reprompt_task is None
+    finally:
+        transport.release_mark.set()
+        await asyncio.gather(completion, return_exceptions=True)
+        pipeline._cancel_reprompt()

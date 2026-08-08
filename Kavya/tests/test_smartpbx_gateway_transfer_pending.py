@@ -63,7 +63,8 @@ async def test_transfer_pending_waits_for_dialog_terminal_event_past_normal_idle
     }), idle_timeout_seconds=0.01)
     session = Session()
 
-    async def factory(_context, _transport):
+    async def factory(_context, _transport, sink=None):
+        assert sink is None or callable(sink)
         return session
 
     socket = Socket()
@@ -87,7 +88,8 @@ async def test_transfer_becoming_pending_during_receive_rechecks_the_idle_deadli
     session = Session()
     session.transfer_pending = False
 
-    async def factory(_context, _transport):
+    async def factory(_context, _transport, sink=None):
+        assert sink is None or callable(sink)
         return session
 
     socket = Socket()

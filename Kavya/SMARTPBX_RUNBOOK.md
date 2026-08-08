@@ -79,6 +79,7 @@ OPENAI_TTS_MODEL=gpt-4o-mini-tts
 OPENAI_TTS_VOICE=nova
 OPENAI_TTS_INSTRUCTIONS=
 ELEVENLABS_API_KEY=
+KAVYA_EN_ELEVENLABS_VOICE_ID=
 ELEVENLABS_VOICE_ID=
 ELEVENLABS_VOICE_ID_AR=
 STT_PROVIDER=azure
@@ -114,6 +115,25 @@ SMARTPBX_MCP_READ_TIMEOUT_SECONDS=15
 SMARTPBX_MCP_MAX_RESPONSE_BYTES=1048576
 SMARTPBX_MCP_RETRIES=1
 ```
+
+## Canonical English voice provisioning
+
+Retrieve Kavya's established English voice identity only from the approved root-only secret source. Do not copy it from source code, a log, the dashboard, or this runbook. Do not rotate `ELEVENLABS_API_KEY` or alter `ELEVENLABS_VOICE_ID`. Set the same protected value in both files with `sudoedit`; never place it in a command argument, commit, ticket, or screen share.
+
+```sh
+set -euo pipefail
+cd /opt/kavya
+sudo test -f /opt/kavya/.env
+sudo touch /opt/kavya/.env.smartpbx
+sudo chown root:root /opt/kavya/.env /opt/kavya/.env.smartpbx
+sudo chmod 600 /opt/kavya/.env /opt/kavya/.env.smartpbx
+sudoedit /opt/kavya/.env
+sudoedit /opt/kavya/.env.smartpbx
+sudo /opt/kavya/scripts/validate_english_voice_env.sh /opt/kavya/.env /opt/kavya/.env.smartpbx
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
+```
+
+`canonical_voice_match=ok` proves only that both root-only files contain an equal nonblank protected value; it does not print the value. The configuration check prints no secrets. This preflight does not start, stop, recreate, or reroute any service, and it preserves `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` with MCP transfer-disabled. If either command fails, do not run a Compose `up`; leave containers unchanged, restore both files to their prior root-only state with `sudoedit`, and rerun the preflight before any later approved deployment.
 
 Kavya accepts `SMARTPBX_MCP_ACCOUNT_HEADER=account_id` and
 `SMARTPBX_MCP_ACCOUNT_HEADER=X-Account-ID`; Dialog must approve exactly one.
@@ -179,8 +199,7 @@ it requires both loopback endpoints before the final TLS vhost is installed.
 
 ## Cutover gates
 
-Before enabling the Dialog route, record privacy-safe call fingerprints and
-outcomes, never raw call IDs or credentials:
+Before enabling the Dialog route, emit only the fixed protocol diagnostic with exactly seven fields: `event=smartpbx_protocol_diagnostic`, `correlation_id`, `stage`, `outcome`, `failure_class`, `active_sessions`, and `duration_ms`. The `correlation_id` is opaque, local, randomly generated, and never derived from Dialog. No additional event names, fields, values, or measurements are permitted.
 
 1. Bad or missing WSS auth is rejected.
 2. A bidirectional call proves caller audio reaches STT, an LLM turn completes,
@@ -256,3 +275,29 @@ curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e '.transfer_enabled == 
    cd /opt/kavya
    SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx stop kavya-smartpbx
    ```
+
+## Guarded immutable image deployment
+
+Use the guarded helper only after an authenticated integration probe and an
+approved immutable-image review record. Its three arguments are the exact
+lowercase CI short tag, the full reviewed OCI revision, and the image digest;
+the short tag must be the first seven characters of that revision.
+
+Prerequisites: run as root on the target host, keep `/opt/kavya/.env` and
+`/opt/kavya/.env.smartpbx` owned by `root:root` with mode `0600`, retain a
+healthy `flico-voice-agent` and `kavya-voice-agent`, and ensure the reviewed
+GHCR digest is pullable. The helper checks the existing SmartPBX image ID,
+repository digest, and OCI revision, then records a local rollback alias before
+it recreates only `kavya-smartpbx`.
+
+```sh
+# As root: deploy_smartpbx_image.sh NEW_TAG EXPECTED_SHA EXPECTED_DIGEST
+/opt/kavya/scripts/deploy_smartpbx_image.sh "$NEW_TAG" "$EXPECTED_SHA" "$EXPECTED_DIGEST"
+```
+
+It rolls back once for ordinary errors and `INT`, `TERM`, or `HUP`, and verifies
+the restored image identity and the unchanged healthy Flico and legacy Kavya
+containers. `SIGKILL`, kernel panic, power loss, and host loss cannot run a
+shell trap; an operator must inspect and recover those cases from the recorded
+baseline/rollback alias. The helper never manages Nginx, prunes images, or
+mutates another service.

@@ -262,6 +262,14 @@ jobs:
           # hang exactly as readily as a real test failure.
           pytest tests
 
+      - name: Build and import Kavya image
+        if: matrix.agent == 'Kavya'
+        working-directory: Kavya
+        run: |
+          image="kavya-english-voice-profile-ci"
+          docker build -t "$image" .
+          docker run --rm --entrypoint python "$image" -c "import english_voice_profile; import server"
+
   # ---------------------------------------------------------------------------
   # 5. deps-resolve — can each agent's production lock actually be installed?
   #

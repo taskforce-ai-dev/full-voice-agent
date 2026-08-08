@@ -1,0 +1,165 @@
+name: Build Kavya image (no deploy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to check out and build
+        required: true
+        type: string
+      expected_sha:
+        description: Exact 40-character reviewed commit SHA
+        required: true
+        type: string
+
+concurrency:
+  group: kavya-image-publisher
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.verify.outputs.digest }}
+      tag: ${{ steps.identity.outputs.tag }}
+      revision: ${{ steps.identity.outputs.actual_sha }}
+    steps:
+      - name: Checkout trusted publisher tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .publisher
+          persist-credentials: false
+
+      - name: Checkout reviewed source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          path: source
+          persist-credentials: false
+
+      - name: Validate reviewed checkout
+        id: identity
+        working-directory: source
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          expected_sha="$EXPECTED_SHA"
+          if ! [[ $expected_sha =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected SHA format is invalid" >&2
+            exit 1
+          fi
+          actual_sha="$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain)"
+          test "$actual_sha" = "$expected_sha"
+          image="ghcr.io/taskforce-ai-dev/kavya"
+          tag="${image}:${actual_sha::7}"
+          {
+            echo "actual_sha=$actual_sha"
+            echo "image=$image"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Probe immutable tag
+        id: probe
+        env:
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+          set +e
+          bash .publisher/.github/scripts/check-kavya-image-tag.sh "$TAG" >/dev/null
+          probe_code=$?
+          set -e
+          case "$probe_code" in
+            0) mode=absent ;;
+            10) mode=existing ;;
+            *) echo "registry tag probe failed" >&2; exit 1 ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+      # This workflow serializes itself, but out-of-band writers are possible;
+      # consumers use the verified digest emitted below rather than a mutable tag.
+      - name: Build and push immutable image
+        id: build
+        if: "${{ steps.probe.outputs.mode == 'absent' }}"
+        uses: docker/build-push-action@v7
+        with:
+          context: source/Kavya
+          file: source/Kavya/Dockerfile
+          push: true
+          tags: ${{ steps.identity.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ steps.identity.outputs.actual_sha }}
+
+      - name: Resolve image digest
+        id: digest
+        env:
+          MODE: ${{ steps.probe.outputs.mode }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            absent)
+              [[ $BUILT_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]
+              pushed_digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Digest}}" 2>/dev/null)"
+              [[ $pushed_digest =~ ^sha256:[0-9a-f]{64}$ ]]
+              test "$pushed_digest" = "$BUILT_DIGEST"
+              digest="$pushed_digest"
+              ;;
+            existing)
+              digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Digest}}" 2>/dev/null)"
+              ;;
+            *) echo "unrecognized image mode" >&2; exit 1 ;;
+          esac
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify pushed digest and revision
+        id: verify
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ACTUAL_SHA: ${{ steps.identity.outputs.actual_sha }}
+        run: |
+          set -euo pipefail
+          [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_ref="${IMAGE}@${DIGEST}"
+          docker pull "$image_ref"
+          actual_revision="$(docker image inspect "$image_ref" --format "{{ index .Config.Labels \"org.opencontainers.image.revision\" }}")"
+          test -n "$actual_revision"
+          test "$actual_revision" = "$EXPECTED_SHA"
+          test "$actual_revision" = "$ACTUAL_SHA"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Write safe build summary
+        if: ${{ always() }}
+        env:
+          REVISION: ${{ steps.identity.outputs.actual_sha }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          DIGEST: ${{ steps.verify.outputs.digest }}
+          RUN_ID: ${{ github.run_id }}
+          STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## Kavya image build"
+            echo "- revision: ${REVISION:-unavailable}"
+            echo "- tag: ${TAG:-unavailable}"
+            echo "- digest: ${DIGEST:-unavailable}"
+            echo "- run_id: $RUN_ID"
+            echo "- status: $STATUS"
+          } >> "$GITHUB_STEP_SUMMARY"

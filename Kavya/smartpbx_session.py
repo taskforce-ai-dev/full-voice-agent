@@ -7,11 +7,19 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
+from smartpbx_diagnostics import SmartPBXDiagnosticSink
 from smartpbx_protocol import CallContext
 from smartpbx_transport import SmartPBXMediaTransport
 
 
 PostCallProcessor = Callable[..., Awaitable[None]]
+
+
+def _resolve_llm_provider(provider: str | None, default_provider: str) -> str:
+    resolved_provider = default_provider if provider is None else provider
+    if resolved_provider not in {"claude", "gemini", "openai"}:
+        raise ValueError("invalid LLM provider")
+    return resolved_provider
 
 
 class KavyaSmartPBXSession:
@@ -28,6 +36,7 @@ class KavyaSmartPBXSession:
         welcome_text: str | None = None,
         llm_provider: str | None = None,
         model: str | None = None,
+        diagnostic_sink: SmartPBXDiagnosticSink | None = None,
     ) -> None:
         self._context = context
         self._transport = transport
@@ -37,6 +46,7 @@ class KavyaSmartPBXSession:
         self._welcome_text = welcome_text
         self._llm_provider = llm_provider
         self._model = model
+        self._diagnostic_sink = diagnostic_sink if diagnostic_sink is not None else _noop_diagnostic
 
         loop = asyncio.get_running_loop()
         self._terminal_future: asyncio.Future[None] = loop.create_future()
@@ -95,6 +105,7 @@ class KavyaSmartPBXSession:
         self._call_start_time = datetime.now(timezone.utc).isoformat()
         pipeline.call_start_time = self._call_start_time
         pipeline._event_loop = asyncio.get_running_loop()
+        pipeline._smartpbx_diagnostic_sink = self._diagnostic_sink
         pipeline._stt = self._stt_factory(
             on_final_result=pipeline._on_stt_result,
             on_interim_result=pipeline._on_stt_interim,
@@ -106,6 +117,7 @@ class KavyaSmartPBXSession:
             self._welcome_task = asyncio.create_task(
                 pipeline._speak(self._welcome_text)
             )
+
 
     async def _finish_once(self, schedule_post_call: bool) -> None:
         try:
@@ -150,6 +162,11 @@ class KavyaSmartPBXSession:
                 self._terminal_future.set_result(None)
 
     def _load_runtime_defaults(self) -> None:
+        import server
+
+        self._llm_provider = _resolve_llm_provider(
+            self._llm_provider, server.LLM_PROVIDER
+        )
         if all(
             value is not None
             for value in (
@@ -163,13 +180,14 @@ class KavyaSmartPBXSession:
         ):
             return
 
-        import server
+        if self._model is None:
+            self._model = server.MODEL
 
         if self._pipeline is None:
             anthropic_client = openai_client = gemini_client = None
-            if server.LLM_PROVIDER == "claude":
+            if self._llm_provider == "claude":
                 anthropic_client = server._get_anthropic_client()
-            elif server.LLM_PROVIDER == "gemini":
+            elif self._llm_provider == "gemini":
                 gemini_client = server._get_gemini_client()
             else:
                 openai_client = server._get_client()
@@ -180,6 +198,8 @@ class KavyaSmartPBXSession:
                 openai_client=openai_client,
                 gemini_client=gemini_client,
                 media_transport=self._transport,
+                llm_provider=self._llm_provider,
+                model=self._model,
             )
         if self._stt_factory is None:
             self._stt_factory = server._make_stt
@@ -187,10 +207,6 @@ class KavyaSmartPBXSession:
             self._post_call_processor = server.process_post_call_data
         if self._welcome_text is None:
             self._welcome_text = server.LANGUAGE_CONFIGS["en"]["welcome_greeting"]
-        if self._llm_provider is None:
-            self._llm_provider = server.LLM_PROVIDER
-        if self._model is None:
-            self._model = server.MODEL
 
     def _require_pipeline(self) -> Any:
         if self._pipeline is None:
@@ -223,3 +239,7 @@ class KavyaSmartPBXSession:
         pipeline._smartpbx_caller_context = {
             "caller_phone": self._context.caller_number,
         }
+
+
+def _noop_diagnostic(*_args: object) -> None:
+    return None
