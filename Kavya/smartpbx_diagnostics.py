@@ -42,6 +42,7 @@ class DiagnosticFailureClass(StrEnum):
     CONNECTED_AFTER_START = "connected_after_start"
     START_TIMEOUT = "start_timeout"
     IDLE_TIMEOUT = "idle_timeout"
+    TRANSFER_PENDING_TIMEOUT = "transfer_pending_timeout"
     SESSION_FACTORY = "session_factory"
     SESSION_START = "session_start"
     AUDIO_INGESTION = "audio_ingestion"

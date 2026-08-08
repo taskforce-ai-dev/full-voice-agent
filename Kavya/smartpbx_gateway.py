@@ -34,6 +34,9 @@ _INTEGER_SETTINGS = {
     "SMARTPBX_MAX_OUTBOUND_FRAMES": ("max_outbound_frames", 128, 1, 128),
     "SMARTPBX_START_TIMEOUT_SECONDS": ("start_timeout_seconds", 10, 1, 30),
     "SMARTPBX_IDLE_TIMEOUT_SECONDS": ("idle_timeout_seconds", 90, 10, 300),
+    # An acknowledged transfer legitimately outlives ordinary idleness, but a
+    # carrier terminal event that never arrives must not pin the slot forever.
+    "SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS": ("transfer_pending_timeout_seconds", 300, 30, 1800),
 }
 
 
@@ -48,6 +51,7 @@ class SmartPBXSettings:
     max_outbound_frames: int
     start_timeout_seconds: int
     idle_timeout_seconds: int
+    transfer_pending_timeout_seconds: int
     auth_header_name: str = "X-Kavya-SmartPBX-Token"
 
     @classmethod
@@ -130,6 +134,10 @@ class SmartPBXSessionRegistry:
 def smartpbx_status(settings: SmartPBXSettings, registry: SmartPBXSessionRegistry) -> dict[str, bool | int | str]:
     """Return only safe bounded operational values."""
     return {"enabled": settings.enabled, "configured": settings.configured, **registry.snapshot(), "protocol_version": SMARTPBX_PROTOCOL_VERSION}
+
+
+class _TransferPendingTimeout(Exception):
+    """An acknowledged transfer produced no terminal event within the ceiling."""
 
 
 class _TransportSendFailure(Exception):
@@ -267,6 +275,9 @@ class SmartPBXGateway:
             else:
                 sink(DiagnosticStage.AUDIO_INGESTION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.IDLE_TIMEOUT)
                 close_outcome = (POLICY_VIOLATION, "idle timeout")
+        except _TransferPendingTimeout:
+            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSFER_PENDING_TIMEOUT)
+            close_outcome = (POLICY_VIOLATION, "transfer timeout")
         except _TransportSendFailure:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSPORT_SEND)
             close_outcome = (1011, "internal error")
@@ -339,7 +350,8 @@ class SmartPBXGateway:
         session: _GatewaySession,
         transport: SmartPBXMediaTransport | None = None,
     ) -> str | None:
-        timeout = None if getattr(session, "transfer_pending", False) else self._settings.idle_timeout_seconds
+        pending = bool(getattr(session, "transfer_pending", False))
+        timeout = self._settings.transfer_pending_timeout_seconds if pending else self._settings.idle_timeout_seconds
         terminal = getattr(session, "terminal_future", None)
         if terminal is None:
             return await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
@@ -362,10 +374,19 @@ class SmartPBXGateway:
             return result
 
         done, _ = await asyncio.wait(waited, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-        if not done and getattr(session, "transfer_pending", False):
-            done, _ = await asyncio.wait(waited, return_when=asyncio.FIRST_COMPLETED)
+        if not done and not pending and getattr(session, "transfer_pending", False):
+            # The transfer was acknowledged while we were waiting: re-wait on the
+            # transfer ceiling rather than closing on the ordinary idle deadline.
+            pending = True
+            done, _ = await asyncio.wait(
+                waited,
+                timeout=self._settings.transfer_pending_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         if not done:
             await _settle(None)
+            if pending:
+                raise _TransferPendingTimeout
             raise asyncio.TimeoutError
         if failure_task is not None and failure_task in done:
             await _settle(None)
