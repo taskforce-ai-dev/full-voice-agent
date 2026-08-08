@@ -389,6 +389,78 @@ def workflow_step(steps, name):
     return step
 
 
+KAVYA_IMAGE_PROBE_WORKFLOW = PROJECT_ROOT.parent / ".github/workflows/probe-kavya-image.yml"
+
+
+def read_kavya_image_probe_workflow():
+    assert KAVYA_IMAGE_PROBE_WORKFLOW.is_file(), "missing read-only Kavya image probe workflow"
+    text = KAVYA_IMAGE_PROBE_WORKFLOW.read_text(encoding="utf-8")
+    document = yaml.load(text, Loader=yaml.BaseLoader)
+    assert isinstance(document, dict)
+    return document, text
+
+
+def kavya_image_probe_job():
+    document, text = read_kavya_image_probe_workflow()
+    jobs = document.get("jobs", {})
+    assert set(jobs) == {"probe"}
+    job = jobs["probe"]
+    return document, job, job.get("steps", []), text
+
+
+def probe_workflow_step(steps, name):
+    step = next((step for step in steps if step.get("name") == name), None)
+    assert step is not None, f"missing probe workflow step: {name}"
+    return step
+
+
+def test_kavya_image_probe_workflow_has_read_only_dispatch_trust_contract():
+    document, job, steps, _text = kavya_image_probe_job()
+    _publisher_document, _publisher_job, publisher_steps, _publisher_text = build_kavya_image_job()
+
+    assert document["name"] == "Probe Kavya image (read-only)"
+    assert set(document["on"]) == {"workflow_dispatch"}
+    assert document["on"]["workflow_dispatch"]["inputs"] == {
+        "existing_tag": {"description": "Existing immutable Kavya image tag", "required": "true", "type": "string"},
+        "expected_revision": {"description": "Expected lowercase OCI revision", "required": "true", "type": "string"},
+    }
+    assert document["concurrency"] == {"group": "kavya-image-read-only-probe", "cancel-in-progress": "false"}
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["permissions"] == {"contents": "read", "packages": "read"}
+    assert "environment" not in job
+
+    checkout = probe_workflow_step(steps, "Checkout trusted probe tooling")
+    assert checkout["uses"] == workflow_step(publisher_steps, "Checkout trusted publisher tooling")["uses"]
+    assert checkout["with"] == {
+        "ref": "${{ github.workflow_sha }}",
+        "path": ".probe-tools",
+        "persist-credentials": "false",
+    }
+    assert probe_workflow_step(steps, "Set up Buildx")["uses"] == workflow_step(publisher_steps, "Set up Buildx")["uses"]
+    assert probe_workflow_step(steps, "Log in to GHCR")["uses"] == workflow_step(publisher_steps, "Log in to GHCR")["uses"]
+
+
+def test_kavya_image_probe_validation_precedes_all_tooling_and_has_no_source_checkout():
+    document, _job, steps, text = kavya_image_probe_job()
+    validation = probe_workflow_step(steps, "Validate probe inputs")
+    checkout = probe_workflow_step(steps, "Checkout trusted probe tooling")
+    buildx = probe_workflow_step(steps, "Set up Buildx")
+    login = probe_workflow_step(steps, "Log in to GHCR")
+
+    assert steps.index(validation) == 0
+    assert steps.index(validation) < steps.index(checkout) < steps.index(buildx) < steps.index(login)
+    assert validation["env"] == {
+        "EXISTING_TAG": "${{ inputs.existing_tag }}",
+        "EXPECTED_REVISION": "${{ inputs.expected_revision }}",
+    }
+    assert '[[ "$EXISTING_TAG" =~ ^[0-9a-f]{7}$ ]]' in validation["run"]
+    assert '[[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]]' in validation["run"]
+    assert '[[ "$EXISTING_TAG" == "${EXPECTED_REVISION:0:7}" ]]' in validation["run"]
+    assert "${{ inputs." not in "\n".join(workflow_run_strings(document))
+    assert all(step.get("with", {}).get("path") != "source" for step in steps if isinstance(step, dict))
+    assert "Checkout reviewed source" not in text
+
+
 def test_build_kavya_image_publisher_is_dispatch_only_and_least_privilege():
     document, job, steps, text = build_kavya_image_job()
 
