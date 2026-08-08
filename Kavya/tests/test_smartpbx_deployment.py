@@ -905,6 +905,8 @@ class FakeDeployHost:
                     if state['mutated'] and ref == state['current_id'] and os.getenv('ROLLBACK_IDENTITY_BAD') == '1': revision='9'*40
                     return state['alias_id'] if ref.endswith(':rollback-local') else state['baseline_id'], state['baseline_digest'], revision
                 image_id, digest, revision = state['candidate_id'], state['candidate_digest'], state['candidate_revision']
+                if not state['mutated'] and os.getenv('CANDIDATE_DIGEST_BAD') == '1': digest='ghcr.io/taskforce-ai-dev/kavya@sha256:'+'9'*64
+                if not state['mutated'] and os.getenv('CANDIDATE_REVISION_BAD') == '1': revision='9'*40
                 if state['mutated'] and ref == state['current_id']:
                     if os.getenv('FORWARD_DIGEST_BAD') == '1': digest='ghcr.io/taskforce-ai-dev/kavya@sha256:'+'9'*64
                     if os.getenv('FORWARD_REVISION_BAD') == '1': revision='9'*40
@@ -980,7 +982,7 @@ def test_deploy_baseline_metadata_or_alias_mismatch_never_mutates(tmp_path, stat
 
 
 @pytest.mark.parametrize("environment", [
-    {"PULL_FAIL": 1}, {"TAG_BAD": 1},
+    {"PULL_FAIL": 1}, {"CANDIDATE_DIGEST_BAD": 1}, {"CANDIDATE_REVISION_BAD": 1}, {"TAG_BAD": 1},
 ])
 def test_deploy_candidate_pull_or_tag_identity_mismatch_never_mutates(tmp_path, environment):
     host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
