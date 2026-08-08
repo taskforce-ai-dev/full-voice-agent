@@ -22,6 +22,8 @@ _MAX_REASON = 500
 _MAX_TRANSCRIPT_MESSAGES = 8
 _MAX_TRANSCRIPT_CHARS = 3000
 _MAX_TRANSCRIPT_MESSAGE_CHARS = 512
+# The gateway gives the whole session cleanup 5s; leave room for the rest.
+_FINALIZE_RETRY_TIMEOUT = 2.0
 
 
 def bound_reason(value: Any) -> str:
@@ -108,9 +110,22 @@ class SmartPBXHandoverCoordinator:
             return self._result
 
     async def finalize_notification_retry(self) -> None:
-        async with self._lock:
-            if self._phase is HandoverPhase.IMMEDIATE_FAILED and self._notification_state == "failed":
-                await self._deliver_notification()
+        """Best-effort last retry, bounded against the caller's cleanup budget.
+
+        This runs inside the shielded _finish_once, which the gateway allows 5s in
+        total. Acquiring the lock is inside the timeout on purpose: an in-flight
+        attempt() can hold it through its MCP retries, and waiting that out would
+        keep the whole pipeline alive long after the guest hung up.
+        """
+        try:
+            async with asyncio.timeout(_FINALIZE_RETRY_TIMEOUT):
+                async with self._lock:
+                    if self._phase is HandoverPhase.IMMEDIATE_FAILED and self._notification_state == "failed":
+                        await self._deliver_notification()
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            return
 
     async def _enter_pending(self) -> None:
         entered = getattr(self._pipeline, "enter_transfer_pending", None)
