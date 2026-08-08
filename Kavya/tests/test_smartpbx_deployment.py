@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import re
+import textwrap
 
 import pytest
 import yaml
@@ -743,7 +744,8 @@ def test_smartpbx_image_deploy_helper_recreates_only_smartpbx_and_checks_json_re
     assert "deadline=$((SECONDS + 90))" in script
     assert "http://127.0.0.1:8006/health" in script
     assert "http://127.0.0.1:8006/smartpbx/status" in script
-    assert "jq -e \".active_sessions == 0 and .transfer_enabled == false\"" in script
+    assert ".status == \"ok\" and .service_mode == \"smartpbx\"" in script
+    assert ".active_sessions == 0 and .transfer_enabled == false" in script
     assert "docker inspect --format \"{{.Image}}\" kavya-smartpbx" in script
     assert "verify_running_image" in script
     assert "verify_legacy_flico_unchanged" in script
@@ -797,7 +799,7 @@ def test_smartpbx_image_deploy_functions_fail_closed_under_fake_path(tmp_path):
         "echo status\n",
         encoding="utf-8",
     )
-    (fake_bin / "jq").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (fake_bin / "jq").write_text("#!/usr/bin/env bash\nexec /usr/bin/jq \"$@\"\n", encoding="utf-8")
     for command in (fake_bin / "curl", fake_bin / "jq"):
         command.chmod(0o755)
     env = os.environ | {"PATH": str(fake_bin) + ":" + os.environ["PATH"], "FAKE_HEALTH_FAIL": "1"}
