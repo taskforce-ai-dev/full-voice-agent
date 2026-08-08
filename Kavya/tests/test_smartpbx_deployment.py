@@ -627,6 +627,14 @@ def test_kavya_image_probe_requires_exact_states_provenance_and_internal_canary(
     assert 'docker pull "$image_ref" >"$pull_stdout" 2>"$pull_stderr"' in verify["run"]
     assert 'docker image inspect "$image_ref" --format' in verify["run"]
 
+    # An unrecognised registry message is surfaced as a fixed workflow-authored
+    # marker so the failed run says which remedy applies, without echoing bytes.
+    for step in (existing, canary):
+        assert (
+            "if [[ \"$probe_code\" -eq 2 ]]; then "
+            "printf '%s\\n' 'helper_result=unrecognized_registry_message' >&2; fi"
+        ) in step["run"]
+
     assert "workflow_commit=%s" in metadata["run"]
     assert "awk 'NR==1{print $2}'" in metadata["run"]
     assert "ImageOS" not in text
@@ -1159,8 +1167,11 @@ def test_build_kavya_image_publisher_requires_a_green_probe_before_any_credentia
         '.status == "completed"',
         '.conclusion == "success"',
         '[[ "$gate_run_id" =~ ^[0-9]+$ ]] || fail',
+        '.run_started_at',
     ):
         assert check in run, check
+    # A re-run bumps updated_at without re-running the probe's checks.
+    assert ".updated_at" not in run
     # The captured API response is never echoed.
     assert "cat " not in run
     assert all("${{" not in value for value in workflow_run_strings(document))
@@ -1175,10 +1186,12 @@ def probe_run_entry(
     status="completed",
     conclusion="success",
     path=".github/workflows/probe-kavya-image.yml",
-    updated_at=None,
+    run_started_at=None,
+    updated_at_age_seconds=None,
 ):
-    if updated_at is None:
-        updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_seconds))
+    if run_started_at is None:
+        run_started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_seconds))
+    updated_age = age_seconds if updated_at_age_seconds is None else updated_at_age_seconds
     return {
         "id": run_id,
         "head_sha": head_sha,
@@ -1186,7 +1199,8 @@ def probe_run_entry(
         "status": status,
         "conclusion": conclusion,
         "path": path,
-        "updated_at": updated_at,
+        "run_started_at": run_started_at,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - updated_age)),
         "note": "SENTINEL_API_BODY",
     }
 
@@ -1301,8 +1315,20 @@ PUBLISHER_GATE_CASES = [
     ("different branch", probe_runs_json([probe_run_entry(branch="rakesh")]), 0, 1),
     ("different workflow", probe_runs_json([probe_run_entry(path=".github/workflows/deploy.yml")]), 0, 1),
     ("stale by an hour", probe_runs_json([probe_run_entry(age_seconds=PUBLISHER_GATE_WINDOW_SECONDS + 3600)]), 0, 1),
-    ("unparseable timestamp", probe_runs_json([probe_run_entry(updated_at="yesterday")]), 0, 1),
-    ("empty timestamp", probe_runs_json([probe_run_entry(updated_at="")]), 0, 1),
+    ("unparseable timestamp", probe_runs_json([probe_run_entry(run_started_at="yesterday")]), 0, 1),
+    ("empty timestamp", probe_runs_json([probe_run_entry(run_started_at="")]), 0, 1),
+    # A re-run bumps updated_at without re-establishing the evidence, so freshness
+    # must key on run_started_at or stale evidence looks current.
+    (
+        "stale run whose updated_at was refreshed",
+        probe_runs_json([
+            probe_run_entry(age_seconds=PUBLISHER_GATE_WINDOW_SECONDS + 3600, updated_at_age_seconds=60)
+        ]),
+        0,
+        1,
+    ),
+    # Offset timestamps are rejected on purpose rather than parsed leniently.
+    ("non-Z timezone offset", probe_runs_json([probe_run_entry(run_started_at="2026-08-08T12:00:00+00:00")]), 0, 1),
     (
         "one fresh run among stale and failed ones",
         probe_runs_json([
@@ -1453,7 +1479,7 @@ def run_kavya_image_tag_probe(
     assert KAVYA_IMAGE_TAG_PROBE.is_file(), "missing executable Kavya image tag probe"
     assert os.access(KAVYA_IMAGE_TAG_PROBE, os.X_OK)
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
+    fake_bin.mkdir(parents=True, exist_ok=True)
     fake_docker = fake_bin / "docker"
     fake_docker.write_text(
         "#!/usr/bin/env bash\n"
@@ -1546,21 +1572,27 @@ def test_build_kavya_image_publisher_probes_registry_before_build_with_an_execut
         (1, f"manifest unknown: {KAVYA_IMAGE_TARGET}", 0, "absent"),
         (1, f"no such manifest: {KAVYA_IMAGE_TARGET}", 0, "absent"),
         (1, f"failed to resolve source metadata for {KAVYA_IMAGE_TARGET}: not found", 0, "absent"),
-        (1, f"denied: manifest unknown: {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
-        (1, f"authentication required: no such manifest: {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
-        (1, f"token expired: {KAVYA_IMAGE_TARGET}: not found", 1, "probe_failed"),
-        (1, f"proxy returned 404 for {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
-        (1, f"timeout: manifest unknown: {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
-        (1, f"dial tcp: lookup registry: no such host: {KAVYA_IMAGE_TARGET}: not found", 1, "probe_failed"),
-        (1, f"429 rate limit: no such manifest: {KAVYA_IMAGE_TARGET}", 1, "probe_failed"),
-        (1, f"500 internal server error: {KAVYA_IMAGE_TARGET}: not found", 1, "probe_failed"),
-        (1, "manifest unknown", 1, "probe_failed"),
-        (1, "no such manifest", 1, "probe_failed"),
-        (1, "not found", 1, "probe_failed"),
-        (1, "no such manifest: ghcr.io/taskforce-ai-dev/kavya:othertag", 1, "probe_failed"),
-        (1, "failed to resolve source metadata for ghcr.io/taskforce-ai-dev/kavya:othertag: not found", 1, "probe_failed"),
-        (1, "registry returned 404", 1, "probe_failed"),
-        (1, "malformed registry response", 1, "probe_failed"),
+        # Everything the allowlist does not match exactly is "unrecognised", which
+        # is a distinct, actionable outcome from a structural rejection.
+        (1, f"denied: manifest unknown: {KAVYA_IMAGE_TARGET}", 2, "probe_unrecognized"),
+        (1, f"authentication required: no such manifest: {KAVYA_IMAGE_TARGET}", 2, "probe_unrecognized"),
+        (1, f"token expired: {KAVYA_IMAGE_TARGET}: not found", 2, "probe_unrecognized"),
+        (1, f"proxy returned 404 for {KAVYA_IMAGE_TARGET}", 2, "probe_unrecognized"),
+        (1, f"timeout: manifest unknown: {KAVYA_IMAGE_TARGET}", 2, "probe_unrecognized"),
+        (1, f"dial tcp: lookup registry: no such host: {KAVYA_IMAGE_TARGET}: not found", 2, "probe_unrecognized"),
+        (1, f"429 rate limit: no such manifest: {KAVYA_IMAGE_TARGET}", 2, "probe_unrecognized"),
+        (1, f"500 internal server error: {KAVYA_IMAGE_TARGET}: not found", 2, "probe_unrecognized"),
+        (1, "manifest unknown", 2, "probe_unrecognized"),
+        (1, "no such manifest", 2, "probe_unrecognized"),
+        (1, "not found", 2, "probe_unrecognized"),
+        (1, "no such manifest: ghcr.io/taskforce-ai-dev/kavya:othertag", 2, "probe_unrecognized"),
+        (1, "failed to resolve source metadata for ghcr.io/taskforce-ai-dev/kavya:othertag: not found", 2, "probe_unrecognized"),
+        (1, "registry returned 404", 2, "probe_unrecognized"),
+        (1, "malformed registry response", 2, "probe_unrecognized"),
+        # buildx prints failures as "ERROR: %v" (docker/buildx cmd/buildx/main.go),
+        # so a real GHCR miss most likely looks like this and matches nothing.
+        (1, f"ERROR: {KAVYA_IMAGE_TARGET}: not found", 2, "probe_unrecognized"),
+        (1, f"ERROR: manifest unknown: {KAVYA_IMAGE_TARGET}", 2, "probe_unrecognized"),
     ],
 )
 def test_kavya_image_tag_probe_fails_closed_without_echoing_registry_errors(
@@ -1604,8 +1636,38 @@ def test_kavya_image_tag_probe_still_fails_closed_on_real_server_errors(tmp_path
         tmp_path, 1, "unexpected status from registry: 503 Service Unavailable", target=target
     )
 
-    assert result.returncode == 1
-    assert result.stdout == "image_tag_state=probe_failed\n"
+    assert result.returncode == 2
+    assert result.stdout == "image_tag_state=probe_unrecognized\n"
+
+
+def test_kavya_image_tag_probe_separates_unrecognised_messages_from_rejections(tmp_path):
+    # Exit 2 means "the registry said something the allowlist does not cover" --
+    # actionable by reading the real capture and widening it in a reviewed change.
+    # Exit 1 means the helper rejected the input or the capture structurally, which
+    # is never a reason to widen anything. Both fail closed for every caller.
+    unrecognised = run_kavya_image_tag_probe(
+        tmp_path / "a", 1, f"ERROR: {KAVYA_IMAGE_TARGET}: not found"
+    )
+    assert unrecognised.returncode == 2
+    assert unrecognised.stdout == "image_tag_state=probe_unrecognized\n"
+
+    nul_bearing = run_kavya_image_tag_probe(
+        tmp_path / "b", 1, "", output_bytes=b"manifest unknown: " + KAVYA_IMAGE_TARGET.encode() + b"\x00"
+    )
+    assert nul_bearing.returncode == 1
+    assert nul_bearing.stdout == "image_tag_state=probe_failed\n"
+
+    mixed_case = run_kavya_image_tag_probe(
+        tmp_path / "c", 1, "manifest unknown", argument=KAVYA_IMAGE_TARGET.upper()
+    )
+    assert mixed_case.returncode == 1
+    assert mixed_case.stdout == "image_tag_state=probe_failed\n"
+
+    no_argument = subprocess.run(
+        [str(KAVYA_IMAGE_TAG_PROBE)], text=True, capture_output=True, check=False
+    )
+    assert no_argument.returncode == 1
+    assert no_argument.stdout == "image_tag_state=probe_failed\n"
 
 
 @pytest.mark.parametrize(
