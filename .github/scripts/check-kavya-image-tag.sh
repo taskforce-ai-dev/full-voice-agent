@@ -16,11 +16,11 @@ fi
 
 registry_error=$(<"$captured_error")
 registry_error=${registry_error,,}
-if [[ "$registry_error" == *"denied"* || "$registry_error" == *"unauthorized"* || "$registry_error" == *"forbidden"* || "$registry_error" == *"auth"* || "$registry_error" == *"token"* || "$registry_error" == *"proxy"* || "$registry_error" == *"timeout"* || "$registry_error" == *"timed out"* || "$registry_error" == *"network"* || "$registry_error" == *"dns"* || "$registry_error" == *"dial tcp"* || "$registry_error" == *"no such host"* || "$registry_error" == *"429"* || "$registry_error" == *5[0-9][0-9]* ]]; then
-  echo "image_tag_state=probe_failed"
-  exit 1
-fi
-
+# Absent is claimed only on an exact allowlist match. Every other capture --
+# authorization, network, throttling, server, and unrecognised errors alike --
+# falls through to the fail-closed default below. Deny-list globs are
+# deliberately absent: an unanchored match against the whole capture also
+# matches the image reference, which carries caller-independent digit runs.
 if [[ "$registry_error" == "manifest unknown: $TAG" || "$registry_error" == "no such manifest: $TAG" || "$registry_error" == "failed to resolve source metadata for $TAG: not found" ]]; then
   echo "image_tag_state=absent"
   exit 0
