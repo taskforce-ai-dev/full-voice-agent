@@ -759,6 +759,16 @@ Check that CI and gitleaks report success for the PR's current head SHA, obtain 
 
 Run:
 
+**Precondition — branch protection must be enabled on `main`.** Both workflows check `github.ref_protected == true` as a terminal condition. If `main` is not a protected branch, that check fails and **both the probe and the publisher fail closed permanently**, with no message distinguishing "unprotected branch" from an attack. Confirm protection is on before dispatching:
+
+```bash
+gh api repos/taskforce-ai-dev/full-voice-agent/branches/main --jq '.protected'
+```
+
+Expected: `true`. If it prints `false`, enable branch protection first — do not work around the check.
+
+**Expect the first probe to fail at `canary_state`.** The helper's absent-message allowlist was never verified against live GHCR (see the design document's "The absent-message allowlist is unverified against live GHCR"). A helper exit of `2` / `image_tag_state=probe_unrecognized` and the `helper_result=unrecognized_registry_message` marker in the step log means exactly that. The remedy is to read the real capture from the failed run and add that exact message to the allowlist in a reviewed PR citing the run URL — never to loosen the matching.
+
 The first operational acceptance uses existing tag `37bfaf0` and expected revision `37bfaf02f04ce7614b9674b1c867b78ab3c7d414`. Send the documented repository dispatch — it carries no ref or SHA selector, and GitHub selects the default-branch copy of the workflow:
 
 ```bash

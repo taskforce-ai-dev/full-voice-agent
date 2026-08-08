@@ -378,6 +378,44 @@ command substitution cannot preserve NUL bytes. After that check, its exact
 absent-message allowlist and authorization/network/ambiguous-error rejection
 remain fail-closed, and it never echoes registry output.
 
+### The absent-message allowlist is unverified against live GHCR
+
+The three absent messages the allowlist matches -- `manifest unknown: <ref>`,
+`no such manifest: <ref>`, and
+`failed to resolve source metadata for <ref>: not found` -- were written from
+expectation, **not observed against live GHCR**. They are almost certainly
+incomplete. `docker buildx` prints command failures through
+`fmt.Fprintf(cmd.Err(), "ERROR: %v\n", err)` (`docker/buildx`,
+`cmd/buildx/main.go`), and the helper captures stderr via `2>&1`, so a real miss
+most likely arrives as an `ERROR: `-prefixed line that matches no allowlist
+entry. A second code path in the same file prints `"ERROR: %+v"` with a stack
+formatter and no trailing newline when debug output is enabled.
+
+The `ERROR: ` prefix is therefore confirmed from source, but the message tail is
+resolver-dependent and is **not** confirmed. Because the allowlist compares the
+entire capture byte-for-byte, a partially-known string cannot be added safely, so
+no `ERROR: ` variants are pre-registered. Guessing them would either miss anyway
+or, worse, match something that is not an absent tag.
+
+**Expected first-dispatch failure.** The most likely outcome of the first live
+probe at plan Step 8 is `canary_state` failing with the helper exiting `2`
+(`image_tag_state=probe_unrecognized`). That is the design working: it fails
+closed rather than guessing, and it blocks publishing until resolved.
+
+**The remedy, and the only permitted one.** Read the actual capture from the
+failed run's log, then add that exact, complete message to the allowlist in a
+reviewed pull request, with the run URL cited as its provenance. Do **not**
+reintroduce substring or glob matching to make it pass -- that is precisely the
+defect removed in this revision, where an unanchored `*5[0-9][0-9]*` matched the
+digits inside the image reference itself and misclassified ~82% of canaries.
+Widen only on an exact observed string, one message at a time.
+
+The distinct exit codes exist to make this decidable from the run log without
+printing captured bytes: exit `2` means the registry said something unrecognised
+and widening may be appropriate; exit `1` means the helper rejected the argument
+or the capture structurally (bad argument, mixed case, NUL bytes) and widening is
+never the answer.
+
 ## Runner and Buildx evidence
 
 Both workflows use `ubuntu-24.04` and `timeout-minutes: 30`. The probe records
@@ -395,6 +433,15 @@ Acceptance also retains GitHub's generated `Set up job` log block, including
 its image/version information, as run evidence only. The hosted runner image
 remains mutable residual trust and the design makes no immutability claim for
 it.
+
+Both workflows also depend on tooling preinstalled in that image rather than
+pinned by this design: `bash`, `jq`, `cmp`, `od`, `date`, the Docker CLI, and --
+for the publisher's probe gate -- the `gh` CLI. Their presence, versions, and
+behaviour are part of the same mutable runner trust. `jq` and `gh` are the two
+that carry security weight here: `jq` parses the dispatch payload and the probe
+run list, and `gh` performs the gate's authenticated query. A change in either
+could alter validation or gating outcomes, which is a further reason both are
+used only in fail-closed positions.
 
 The trust guarantees in this design are conditional on GitHub's execution
 environment and the pinned action commits being uncompromised. Pinning removes
