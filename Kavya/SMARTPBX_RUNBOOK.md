@@ -173,10 +173,16 @@ test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/fullchain.pem
 test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/privkey.pem
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+smartpbx_status_token() {
+  # Read-only, never echoed. The status endpoint requires the same shared
+  # token as the media socket, so readiness checks must present it.
+  sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1
+}
 wait_for_smartpbx_ready() {
   deadline=$((SECONDS + 90))
   while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health >/dev/null \
-    || ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+    || ! printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+      | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config - >/dev/null; do
     if (( SECONDS >= deadline )); then
       echo "SmartPBX did not become ready within 90 seconds" >&2
       exit 1
@@ -189,7 +195,8 @@ sudo install -m 0644 nginx-smartpbx.conf /etc/nginx/sites-available/kavya-smartp
 sudo nginx -t
 sudo systemctl reload nginx
 curl --fail https://smartpbx-kavya.taskforceai.tech/health
-curl --fail https://smartpbx-kavya.taskforceai.tech/smartpbx/status
+printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+  | curl --fail https://smartpbx-kavya.taskforceai.tech/smartpbx/status --config -
 ```
 
 `config > /dev/null` validates Compose without printing secrets. `--pull never`
@@ -233,10 +240,16 @@ Edit `.env.smartpbx` to add only that test destination, then apply it:
 set -euo pipefail
 cd /opt/kavya
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+smartpbx_status_token() {
+  # Read-only, never echoed. The status endpoint requires the same shared
+  # token as the media socket, so readiness checks must present it.
+  sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1
+}
 wait_for_smartpbx_ready() {
   deadline=$((SECONDS + 90))
   while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health >/dev/null \
-    || ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+    || ! printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+      | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config - >/dev/null; do
     if (( SECONDS >= deadline )); then
       echo "SmartPBX did not become ready within 90 seconds" >&2
       exit 1
@@ -255,10 +268,16 @@ configuration reached the running process before considering the drill revoked:
 set -euo pipefail
 cd /opt/kavya
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+smartpbx_status_token() {
+  # Read-only, never echoed. The status endpoint requires the same shared
+  # token as the media socket, so readiness checks must present it.
+  sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1
+}
 wait_for_smartpbx_ready() {
   deadline=$((SECONDS + 90))
   while ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health >/dev/null \
-    || ! curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status >/dev/null; do
+    || ! printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+      | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config - >/dev/null; do
     if (( SECONDS >= deadline )); then
       echo "SmartPBX did not become ready within 90 seconds" >&2
       exit 1
@@ -267,8 +286,41 @@ wait_for_smartpbx_ready() {
   done
 }
 wait_for_smartpbx_ready
-curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e '.transfer_enabled == false'
+printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+  | curl --fail http://127.0.0.1:8006/smartpbx/status --config - | jq -e '.transfer_enabled == false'
 ```
+
+## Monitoring `/smartpbx/status`
+
+`/smartpbx/status` requires the same `X-Kavya-SmartPBX-Token` header as the media
+socket. It is not publicly readable: `active_sessions` against the cap of four is
+a live occupancy oracle, `admitted_total` is a call-volume counter, and
+`transfer_enabled` reveals whether live transfer is armed. An unauthenticated or
+wrong-token request gets `401` with no body.
+
+Pass the token on standard input, never as a command argument, so it cannot
+appear in the process list or shell history:
+
+```sh
+set -euo pipefail
+smartpbx_status_token() {
+  sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1
+}
+printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$(smartpbx_status_token)" \
+  | curl --fail --silent http://127.0.0.1:8006/smartpbx/status --config - \
+  | jq '{active_sessions, max_sessions, frames_dropped_total, transfer_enabled}'
+```
+
+Reading it requires root on the host, because `.env.smartpbx` is `root:root 600`.
+Point uptime monitoring at `/health`, which stays unauthenticated and reveals
+nothing beyond liveness and the service mode. If SmartPBX is not configured there
+is no token, so status fails closed rather than exposing counters — use `/health`
+to distinguish "down" from "not configured".
+
+`frames_dropped_total` is a saturating count of outbound audio frames discarded
+by transport backpressure. A steadily rising value means callers are hearing
+truncated speech: check container CPU and the Dialog socket's health before
+assuming a TTS fault.
 
 ## Withdraw and rollback without dropping calls
 

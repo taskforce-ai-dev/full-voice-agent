@@ -65,7 +65,7 @@ from urllib.parse import quote as url_quote
 import httpx
 from anthropic import AsyncAnthropic, NOT_GIVEN
 from openai import AsyncOpenAI
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from twilio.rest import Client as TwilioRestClient
 
@@ -5119,7 +5119,16 @@ def build_service_app(
     def smartpbx_health() -> dict[str, str]:
         return {"status": "ok", "service_mode": "smartpbx"}
 
-    def status() -> dict[str, bool | int | str]:
+    def status(request: Request) -> dict[str, bool | int | str]:
+        # active_sessions against the cap is a live occupancy oracle and
+        # admitted_total is a call-volume counter, so this needs the same shared
+        # token as the media socket. Constant-time compare via token_matches.
+        # When SmartPBX is unconfigured there is no token, so this fails closed;
+        # /health stays open for liveness.
+        if not settings.token_matches(
+            request.headers.get(settings.auth_header_name, "")
+        ):
+            raise HTTPException(status_code=401)
         return {**gateway.snapshot(), "transfer_enabled": transfer_settings.enabled}
 
     async def smartpbx_media(websocket: WebSocket) -> None:
