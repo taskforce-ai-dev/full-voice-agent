@@ -178,6 +178,7 @@ main() {
   [[ $voice_validation == canonical_voice_match=ok ]] || { fail; return 1; }
   docker compose --env-file .env.smartpbx --profile smartpbx config >/dev/null || { fail; return 1; }
   verify_candidate_image || { fail; return 1; }
+  [[ $(image_id "$IMAGE:$ROLLBACK_TAG") == "$ROLLBACK_IMAGE_ID" ]] || { fail; return 1; }
   arm_rollback
   TAG=$NEW_TAG
   recreate_smartpbx
