@@ -414,6 +414,54 @@ def probe_workflow_step(steps, name):
     return step
 
 
+# The four full commit pins the finalized probe design fixes for both workflows,
+# with the version comment each `uses:` line must retain.
+KAVYA_WORKFLOW_ACTION_PINS = {
+    "actions/checkout": ("3d3c42e5aac5ba805825da76410c181273ba90b1", "v7"),
+    "docker/setup-buildx-action": ("bb05f3f5519dd87d3ba754cc423b652a5edd6d2c", "v4"),
+    "docker/login-action": ("dbcb813823bdd20940b903addbd779551569679f", "v4"),
+    "docker/build-push-action": ("53b7df96c91f9c12dcc8a07bcb9ccacbed38856a", "v7"),
+}
+
+
+def workflow_uses_strings(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "uses" and isinstance(child, str):
+                yield child
+            yield from workflow_uses_strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from workflow_uses_strings(child)
+
+
+@pytest.mark.parametrize(
+    "workflow", [KAVYA_IMAGE_PROBE_WORKFLOW, BUILD_KAVYA_IMAGE_WORKFLOW], ids=["probe", "publisher"]
+)
+def test_kavya_image_probe_and_publisher_pin_actions_to_full_commit_shas(workflow):
+    text = workflow.read_text(encoding="utf-8")
+    document = yaml.load(text, Loader=yaml.BaseLoader)
+    references = list(workflow_uses_strings(document))
+
+    assert references, "workflow declares no actions"
+    for reference in references:
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", reference), reference
+        owner_repo, _, sha = reference.partition("@")
+        assert owner_repo in KAVYA_WORKFLOW_ACTION_PINS, owner_repo
+        expected_sha, expected_version = KAVYA_WORKFLOW_ACTION_PINS[owner_repo]
+        assert sha == expected_sha, reference
+        assert f"uses: {reference} # {expected_version}\n" in text, reference
+
+
+def test_kavya_image_probe_and_publisher_fix_the_runner_label_and_job_timeout():
+    _probe_document, probe_job, _probe_steps, _probe_text = kavya_image_probe_job()
+    _build_document, build_job, _build_steps, _build_text = build_kavya_image_job()
+
+    for job in (probe_job, build_job):
+        assert job["runs-on"] == "ubuntu-24.04"
+        assert job["timeout-minutes"] == "30"
+
+
 def test_kavya_image_probe_workflow_has_read_only_dispatch_trust_contract():
     document, job, steps, _text = kavya_image_probe_job()
     _publisher_document, _publisher_job, publisher_steps, _publisher_text = build_kavya_image_job()
@@ -425,7 +473,6 @@ def test_kavya_image_probe_workflow_has_read_only_dispatch_trust_contract():
         "expected_revision": {"description": "Expected lowercase OCI revision", "required": "true", "type": "string"},
     }
     assert document["concurrency"] == {"group": "kavya-image-read-only-probe", "cancel-in-progress": "false"}
-    assert job["runs-on"] == "ubuntu-latest"
     assert job["permissions"] == {"contents": "read", "packages": "read"}
     assert "environment" not in job
 
