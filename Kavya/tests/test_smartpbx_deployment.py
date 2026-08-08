@@ -1659,7 +1659,7 @@ def test_kavya_image_tag_probe_separates_unrecognised_messages_from_rejections(t
     # Exit 1 means the helper rejected the input or the capture structurally, which
     # is never a reason to widen anything. Both fail closed for every caller.
     unrecognised = run_kavya_image_tag_probe(
-        tmp_path / "a", 1, f"ERROR: {KAVYA_IMAGE_TARGET}: not found"
+        tmp_path / "a", 1, f"ERROR: {KAVYA_IMAGE_TARGET}: unexpected status 418"
     )
     assert unrecognised.returncode == 2
     assert unrecognised.stdout == "image_tag_state=probe_unrecognized\n"

@@ -44,7 +44,11 @@ registry_error=${registry_error,,}
 # falls through to the fail-closed default below. Deny-list globs are
 # deliberately absent: an unanchored match against the whole capture also
 # matches the image reference, which carries caller-independent digit runs.
-if [[ "$registry_error" == "manifest unknown: $TAG" || "$registry_error" == "no such manifest: $TAG" || "$registry_error" == "failed to resolve source metadata for $TAG: not found" ]]; then
+# "error: $TAG: not found" is the wording GHCR actually returned to an
+# authenticated runner for a missing tag, observed 2026-08-08 in run
+# https://github.com/taskforce-ai-dev/full-voice-agent/actions/runs/31269079259
+# (buildx prints "ERROR: %v"; this is the case-folded whole capture).
+if [[ "$registry_error" == "manifest unknown: $TAG" || "$registry_error" == "no such manifest: $TAG" || "$registry_error" == "failed to resolve source metadata for $TAG: not found" || "$registry_error" == "error: $TAG: not found" ]]; then
   echo "image_tag_state=absent"
   exit 0
 fi
