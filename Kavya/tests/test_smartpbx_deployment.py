@@ -804,7 +804,15 @@ def workflow_run_strings(value):
             yield from workflow_run_strings(child)
 
 
-def run_kavya_image_tag_probe(tmp_path, docker_exit, docker_output):
+def run_kavya_image_tag_probe(
+    tmp_path,
+    docker_exit,
+    docker_output,
+    target=KAVYA_IMAGE_TARGET,
+    output_bytes=None,
+    binary=False,
+    argument=None,
+):
     assert KAVYA_IMAGE_TAG_PROBE.is_file(), "missing executable Kavya image tag probe"
     assert os.access(KAVYA_IMAGE_TAG_PROBE, os.X_OK)
     fake_bin = tmp_path / "bin"
@@ -817,7 +825,11 @@ def run_kavya_image_tag_probe(tmp_path, docker_exit, docker_output):
         "  echo unexpected-docker-invocation >&2\n"
         "  exit 99\n"
         "fi\n"
-        "echo \"$DOCKER_OUTPUT\" >&2\n"
+        "if [[ -n \"${DOCKER_OUTPUT_FILE:-}\" ]]; then\n"
+        "  cat \"$DOCKER_OUTPUT_FILE\" >&2\n"
+        "else\n"
+        "  echo \"$DOCKER_OUTPUT\" >&2\n"
+        "fi\n"
         "exit \"$DOCKER_EXIT\"\n",
         encoding="utf-8",
     )
@@ -826,15 +838,23 @@ def run_kavya_image_tag_probe(tmp_path, docker_exit, docker_output):
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "DOCKER_EXIT": str(docker_exit),
         "DOCKER_OUTPUT": docker_output,
-        "EXPECTED_TARGET": KAVYA_IMAGE_TARGET,
+        "EXPECTED_TARGET": target,
     }
+    if output_bytes is not None:
+        output_file = tmp_path / "docker-output.bin"
+        output_file.write_bytes(output_bytes)
+        environment["DOCKER_OUTPUT_FILE"] = str(output_file)
     return subprocess.run(
-        [str(KAVYA_IMAGE_TAG_PROBE), KAVYA_IMAGE_TARGET],
+        [str(KAVYA_IMAGE_TAG_PROBE), target if argument is None else argument],
         env=environment,
-        text=True,
+        text=not binary,
         capture_output=True,
         check=False,
     )
+
+
+CANARY_SHAPED_TARGET = "ghcr.io/taskforce-ai-dev/kavya:probe-1050123-17284593012-1"
+PUBLISHER_SHAPED_TARGET = "ghcr.io/taskforce-ai-dev/kavya:a5012bc"
 
 
 def test_build_kavya_image_publisher_uses_static_concurrency_and_env_only_input_flow():
@@ -915,6 +935,40 @@ def test_kavya_image_tag_probe_fails_closed_without_echoing_registry_errors(
     assert result.stdout == f"image_tag_state={expected_state}\n"
     assert docker_output not in result.stdout
     assert docker_output not in result.stderr
+
+
+@pytest.mark.parametrize("target", [CANARY_SHAPED_TARGET, PUBLISHER_SHAPED_TARGET])
+@pytest.mark.parametrize(
+    "message_template",
+    [
+        "manifest unknown: {target}",
+        "no such manifest: {target}",
+        "failed to resolve source metadata for {target}: not found",
+    ],
+)
+def test_kavya_image_tag_probe_classifies_digit_bearing_tags_as_absent(
+    tmp_path, target, message_template
+):
+    # A workflow canary embeds the repository/run identifiers and a publisher tag
+    # is a seven-hex commit prefix; both routinely contain a digit run that a
+    # deny-list heuristic would misread as an HTTP 5xx status.
+    result = run_kavya_image_tag_probe(
+        tmp_path, 1, message_template.format(target=target), target=target
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "image_tag_state=absent\n"
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("target", [CANARY_SHAPED_TARGET, PUBLISHER_SHAPED_TARGET])
+def test_kavya_image_tag_probe_still_fails_closed_on_real_server_errors(tmp_path, target):
+    result = run_kavya_image_tag_probe(
+        tmp_path, 1, "unexpected status from registry: 503 Service Unavailable", target=target
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == "image_tag_state=probe_failed\n"
 
 
 def test_build_kavya_image_publisher_verifies_existing_tags_without_overwriting_them():
