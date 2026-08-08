@@ -1579,6 +1579,9 @@ def test_build_kavya_image_publisher_probes_registry_before_build_with_an_execut
         (1, f"manifest unknown: {KAVYA_IMAGE_TARGET}", 0, "absent"),
         (1, f"no such manifest: {KAVYA_IMAGE_TARGET}", 0, "absent"),
         (1, f"failed to resolve source metadata for {KAVYA_IMAGE_TARGET}: not found", 0, "absent"),
+        # Observed against live GHCR on 2026-08-08, run 31269079259. buildx prints
+        # failures as "ERROR: %v", so this is the shape a real missing tag takes.
+        (1, f"ERROR: {KAVYA_IMAGE_TARGET}: not found", 0, "absent"),
         # Everything the allowlist does not match exactly is "unrecognised", which
         # is a distinct, actionable outcome from a structural rejection.
         (1, f"denied: manifest unknown: {KAVYA_IMAGE_TARGET}", 2, "probe_unrecognized"),
@@ -1596,10 +1599,13 @@ def test_build_kavya_image_publisher_probes_registry_before_build_with_an_execut
         (1, "failed to resolve source metadata for ghcr.io/taskforce-ai-dev/kavya:othertag: not found", 2, "probe_unrecognized"),
         (1, "registry returned 404", 2, "probe_unrecognized"),
         (1, "malformed registry response", 2, "probe_unrecognized"),
-        # buildx prints failures as "ERROR: %v" (docker/buildx cmd/buildx/main.go),
-        # so a real GHCR miss most likely looks like this and matches nothing.
-        (1, f"ERROR: {KAVYA_IMAGE_TARGET}: not found", 2, "probe_unrecognized"),
+        # buildx prints failures as "ERROR: %v" (docker/buildx cmd/buildx/main.go).
+        # Only the exact observed wording is allowlisted; other ERROR: shapes stay
+        # unrecognised until they are themselves observed.
         (1, f"ERROR: manifest unknown: {KAVYA_IMAGE_TARGET}", 2, "probe_unrecognized"),
+        (1, f"ERROR: {KAVYA_IMAGE_TARGET}: not found extra", 2, "probe_unrecognized"),
+        (1, f"prefix ERROR: {KAVYA_IMAGE_TARGET}: not found", 2, "probe_unrecognized"),
+        (1, "ERROR: ghcr.io/taskforce-ai-dev/kavya:othertag: not found", 2, "probe_unrecognized"),
     ],
 )
 def test_kavya_image_tag_probe_fails_closed_without_echoing_registry_errors(
@@ -2247,3 +2253,45 @@ def test_deploy_mutates_only_the_pinned_service_and_never_prints_sentinels(tmp_p
     mutation_lines = [line for line in host.logs().splitlines() if "up -d --force-recreate" in line]
     for forbidden in (" nginx", " prune", " down", " restart", " flico-voice-agent", " kavya-voice-agent"):
         assert all(forbidden not in line for line in mutation_lines)
+
+
+# Byte-exact captures from GHCR, observed 2026-08-08 in workflow run
+# https://github.com/taskforce-ai-dev/full-voice-agent/actions/runs/31269079259
+# on the throwaway diag/ghcr-capture branch (PR #213, closed unmerged).
+OBSERVED_GHCR_ABSENT_CAPTURES = {
+    "ghcr.io/taskforce-ai-dev/kavya:37bfaf0":
+        "RVJST1I6IGdoY3IuaW8vdGFza2ZvcmNlLWFpLWRldi9rYXZ5YTozN2JmYWYwOiBub3QgZm91bmQK",
+    "ghcr.io/taskforce-ai-dev/kavya:probe-0-0-0":
+        "RVJST1I6IGdoY3IuaW8vdGFza2ZvcmNlLWFpLWRldi9rYXZ5YTpwcm9iZS0wLTAtMDogbm90IGZvdW5kCg==",
+}
+
+
+@pytest.mark.parametrize("target", sorted(OBSERVED_GHCR_ABSENT_CAPTURES))
+def test_kavya_image_tag_probe_accepts_the_observed_ghcr_absent_capture(tmp_path, target):
+    """Pin the real registry bytes, not a paraphrase of them."""
+    import base64
+
+    captured = base64.b64decode(OBSERVED_GHCR_ABSENT_CAPTURES[target])
+    result = run_kavya_image_tag_probe(
+        tmp_path, 1, "", target=target, output_bytes=captured, binary=True
+    )
+
+    assert result.returncode == 0, (
+        f"the observed capture must classify as absent: {captured!r}"
+    )
+    assert result.stdout == b"image_tag_state=absent\n"
+
+
+def test_kavya_image_tag_probe_allowlist_entries_are_full_capture_matches():
+    script = KAVYA_IMAGE_TAG_PROBE.read_text(encoding="utf-8")
+    allowlist_line = next(
+        line for line in script.splitlines()
+        if 'image_tag_state=absent' not in line and '"$registry_error" ==' in line
+    )
+
+    # Every comparison is == against a whole-capture literal anchored on $TAG.
+    # A glob or substring here is the defect that misclassified ~82% of canaries.
+    for forbidden in ("==  *", '== *"', "=~", "*]]", '"*'):
+        assert forbidden not in allowlist_line, forbidden
+    assert allowlist_line.count('"$registry_error" == "') == allowlist_line.count("$TAG")
+    assert '"error: $TAG: not found"' in allowlist_line
