@@ -461,6 +461,219 @@ def test_kavya_image_probe_validation_precedes_all_tooling_and_has_no_source_che
     assert "Checkout reviewed source" not in text
 
 
+def test_kavya_image_probe_requires_exact_states_provenance_and_internal_canary():
+    document, _job, steps, text = kavya_image_probe_job()
+    existing = probe_workflow_step(steps, "Probe known existing tag")
+    verify = probe_workflow_step(steps, "Verify existing OCI revision")
+    canary = probe_workflow_step(steps, "Probe generated absent canary")
+    metadata = probe_workflow_step(steps, "Record safe runtime metadata")
+    summary = probe_workflow_step(steps, "Write safe probe summary")
+
+    assert KAVYA_IMAGE_TAG_PROBE.is_file()
+    assert ".probe-tools/.github/scripts/check-kavya-image-tag.sh" in existing["run"]
+    assert "probe_code" in existing["run"]
+    assert '[[ "$probe_code" -eq 10 ]]' in existing["run"]
+    assert 'expected_marker="image_tag_state=existing"' in existing["run"]
+    assert 'probe_lines="$(wc -l < "$probe_stdout")" || fail' in existing["run"]
+    assert 'probe_marker="$(cat "$probe_stdout")" || fail' in existing["run"]
+    assert '[[ "$probe_lines" -eq 1 ]] || fail' in existing["run"]
+    assert '[[ "$probe_marker" == "$expected_marker" ]] || fail' in existing["run"]
+    assert '[[ "$probe_code" -eq 0 ]]' in canary["run"]
+    assert 'expected_marker="image_tag_state=absent"' in canary["run"]
+    assert 'canary="probe-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in canary["run"]
+    assert '[[ "$canary" =~ ^probe-[0-9]+-[0-9]+-[0-9]+$ ]]' in canary["run"]
+    assert 'image="ghcr.io/taskforce-ai-dev/kavya"' in existing["run"]
+    assert 'docker pull "$image" >"$pull_stdout" 2>"$pull_stderr"' in verify["run"]
+    assert 'docker image inspect "$image" --format' in verify["run"]
+    assert '[[ "$revision" == "$EXPECTED_REVISION" ]]' in verify["run"]
+    assert "workflow_commit=$GITHUB_WORKFLOW_SHA" in metadata["run"]
+    assert "buildx_version=" in metadata["run"]
+    for marker in ("probe_version=1", "existing_tag_state=pass", "existing_revision=pass", "canary_state=pass", "probe_result=pass"):
+        assert marker in summary["run"]
+    assert "${{ inputs." not in "\n".join(workflow_run_strings(document))
+    assert "source/.github/scripts" not in text
+
+
+def test_kavya_image_probe_has_no_write_deploy_or_sensitive_output_surface():
+    _document, job, _steps, text = kavya_image_probe_job()
+    runs = "\n".join(workflow_run_strings(kavya_image_probe_job()[0]))
+
+    assert job["permissions"] == {"contents": "read", "packages": "read"}
+    assert re.findall(r"secrets\.([A-Za-z0-9_]+)", text) == ["GITHUB_TOKEN"]
+    for forbidden in ("packages: write", "docker/build-push-action@", "docker push", "docker build ", "docker tag ", "docker manifest", "docker compose", "ssh ", "rsync ", "nginx", "systemctl", "env |", "printenv", "set -x", "source/"):
+        assert forbidden not in text.lower()
+    assert "probe_result=fail" in runs
+    for forbidden in ('echo "$GITHUB_TOKEN"', 'cat "$probe_stderr"', 'cat "$pull_stderr"', 'cat "$inspect_stderr"', "--format '{{json .}}'"):
+        assert forbidden not in runs
+
+
+def run_probe_workflow_step(tmp_path, name, **values):
+    document, _job, steps, _text = kavya_image_probe_job()
+    script = probe_workflow_step(steps, name)["run"]
+    scripts = tmp_path / ".probe-tools" / ".github" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "tools.log"
+    summary = tmp_path / "summary"
+    (scripts / "check-kavya-image-tag.sh").write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+        printf 'probe %s\\n' "$1" >> "$FAKE_LOG"
+        if [[ "$1" == *":probe-"* ]]; then
+          printf '%s' "$CANARY_OUT"; printf '%s' "$CANARY_ERR" >&2; exit "$CANARY_CODE"
+        fi
+        printf '%s' "$EXISTING_OUT"; printf '%s' "$EXISTING_ERR" >&2; exit "$EXISTING_CODE"
+    """), encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    docker = fake_bin / "docker"
+    docker.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+        printf 'docker %s\\n' "$*" >> "$FAKE_LOG"
+        if [[ "$1 $2" == "buildx version" ]]; then printf 'github.com/docker/buildx %s\\n' "$BUILDX_VERSION"; exit "$BUILDX_CODE"; fi
+        if [[ "$1" == pull ]]; then printf '%s' "$PULL_OUT"; printf '%s' "$PULL_ERR" >&2; exit "$PULL_CODE"; fi
+        if [[ "$1 $2" == "image inspect" ]]; then printf '%s' "$INSPECT_OUT"; printf '%s' "$INSPECT_ERR" >&2; exit "$INSPECT_CODE"; fi
+        exit 97
+    """), encoding="utf-8")
+    docker.chmod(0o755)
+    env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}", "FAKE_LOG": str(log), "GITHUB_STEP_SUMMARY": str(summary),
+        "EXISTING_TAG": "37bfaf0", "EXPECTED_REVISION": "37bfaf02f04ce7614b9674b1c867b78ab3c7d414",
+        "GITHUB_WORKFLOW_SHA": "a" * 40, "GITHUB_REPOSITORY_ID": "123", "GITHUB_RUN_ID": "456", "GITHUB_RUN_ATTEMPT": "1",
+        "ImageOS": "ubuntu24", "ImageVersion": "20240825.1", "BUILDX_VERSION": "v0.16.2", "BUILDX_CODE": "0",
+        "EXISTING_OUT": "image_tag_state=existing\n", "EXISTING_ERR": "", "EXISTING_CODE": "10",
+        "CANARY_OUT": "image_tag_state=absent\n", "CANARY_ERR": "", "CANARY_CODE": "0",
+        "PULL_OUT": "", "PULL_ERR": "", "PULL_CODE": "0",
+        "INSPECT_OUT": "37bfaf02f04ce7614b9674b1c867b78ab3c7d414\n", "INSPECT_ERR": "", "INSPECT_CODE": "0",
+    } | {key: str(value) for key, value in values.items()}
+    result = subprocess.run(["bash", "-c", script], cwd=tmp_path, env=env, text=True, capture_output=True, check=False)
+    return result, summary.read_text(encoding="utf-8") if summary.exists() else "", log.read_text(encoding="utf-8") if log.exists() else ""
+
+@pytest.mark.parametrize(
+    ("tag", "revision", "code"),
+    [
+        ("37bfaf0", "37bfaf02f04ce7614b9674b1c867b78ab3c7d414", 0),
+        ("", "37bfaf02f04ce7614b9674b1c867b78ab3c7d414", 1),
+        ("37BFAF0", "37bfaf02f04ce7614b9674b1c867b78ab3c7d414", 1),
+        ("37bfaf00", "37bfaf02f04ce7614b9674b1c867b78ab3c7d414", 1),
+        ("37bfaf0", "37BFAF02f04ce7614b9674b1c867b78ab3c7d414", 1),
+        ("37bfaf0", "37bfaf02f04ce7614b9674b1c867b78ab3c7d4140", 1),
+        ("37bfaf0", "47bfaf02f04ce7614b9674b1c867b78ab3c7d414", 1),
+        ("37bfaf0", "", 1),
+    ],
+)
+def test_kavya_image_probe_validation_binds_identity_before_tools(tmp_path, tag, revision, code):
+    result, _summary, log = run_probe_workflow_step(tmp_path, "Validate probe inputs", EXISTING_TAG=tag, EXPECTED_REVISION=revision)
+    assert result.returncode == code
+    assert log == ""
+
+
+@pytest.mark.parametrize(
+    ("step", "overrides", "code"),
+    [
+        ("Probe known existing tag", {"EXISTING_CODE": 10, "EXISTING_OUT": "image_tag_state=existing\n"}, 0),
+        ("Probe known existing tag", {"EXISTING_CODE": 0, "EXISTING_OUT": "image_tag_state=existing\n"}, 1),
+        ("Probe known existing tag", {"EXISTING_CODE": 1, "EXISTING_OUT": "image_tag_state=existing\n"}, 1),
+        ("Probe known existing tag", {"EXISTING_CODE": 99, "EXISTING_OUT": "image_tag_state=existing\n"}, 1),
+        ("Probe known existing tag", {"EXISTING_CODE": 10, "EXISTING_OUT": "image_tag_state=existing\nextra\n"}, 1),
+        ("Probe known existing tag", {"EXISTING_CODE": 10, "EXISTING_OUT": "wrong\n"}, 1),
+        ("Probe known existing tag", {"EXISTING_CODE": 10, "EXISTING_OUT": ""}, 1),
+        ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "image_tag_state=absent\n"}, 0),
+        ("Probe generated absent canary", {"CANARY_CODE": 1, "CANARY_OUT": "image_tag_state=absent\n"}, 1),
+        ("Probe generated absent canary", {"CANARY_CODE": 99, "CANARY_OUT": "image_tag_state=absent\n"}, 1),
+        ("Probe generated absent canary", {"CANARY_CODE": 10, "CANARY_OUT": "image_tag_state=absent\n"}, 1),
+        ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "image_tag_state=existing\n"}, 1),
+        ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "wrong\n"}, 1),
+        ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": ""}, 1),
+    ],
+)
+def test_kavya_image_probe_accepts_only_exact_probe_states(tmp_path, step, overrides, code):
+    result, summary, log = run_probe_workflow_step(tmp_path, step, EXISTING_ERR="SENTINEL_EXISTING", CANARY_ERR="SENTINEL_CANARY", **overrides)
+    assert result.returncode == code
+    assert "SENTINEL" not in result.stdout + result.stderr + summary
+    if code:
+        assert "probe_result=pass" not in summary
+    if step == "Probe generated absent canary":
+        assert log == "probe ghcr.io/taskforce-ai-dev/kavya:probe-123-456-1\n"
+
+
+@pytest.mark.parametrize(
+    ("pull_code", "inspect_code", "revision", "code", "expected_log"),
+    [
+        (0, 0, "37bfaf02f04ce7614b9674b1c867b78ab3c7d414\n", 0, ["docker pull ghcr.io/taskforce-ai-dev/kavya:37bfaf0", 'docker image inspect ghcr.io/taskforce-ai-dev/kavya:37bfaf0 --format {{ index .Config.Labels "org.opencontainers.image.revision" }}']),
+        (1, 0, "37bfaf02f04ce7614b9674b1c867b78ab3c7d414\n", 1, ["docker pull ghcr.io/taskforce-ai-dev/kavya:37bfaf0"]),
+        (0, 1, "37bfaf02f04ce7614b9674b1c867b78ab3c7d414\n", 1, ["docker pull ghcr.io/taskforce-ai-dev/kavya:37bfaf0", 'docker image inspect ghcr.io/taskforce-ai-dev/kavya:37bfaf0 --format {{ index .Config.Labels "org.opencontainers.image.revision" }}']),
+        (0, 0, "47bfaf02f04ce7614b9674b1c867b78ab3c7d414\n", 1, ["docker pull ghcr.io/taskforce-ai-dev/kavya:37bfaf0", 'docker image inspect ghcr.io/taskforce-ai-dev/kavya:37bfaf0 --format {{ index .Config.Labels "org.opencontainers.image.revision" }}']),
+        (0, 0, "37bfaf02f04ce7614b9674b1c867b78ab3c7d414\nextra\n", 1, ["docker pull ghcr.io/taskforce-ai-dev/kavya:37bfaf0", 'docker image inspect ghcr.io/taskforce-ai-dev/kavya:37bfaf0 --format {{ index .Config.Labels "org.opencontainers.image.revision" }}']),
+    ],
+)
+def test_kavya_image_probe_provenance_and_metadata_suppress_sentinels(tmp_path, pull_code, inspect_code, revision, code, expected_log):
+    result, summary, log = run_probe_workflow_step(
+        tmp_path, "Verify existing OCI revision", PULL_CODE=pull_code, INSPECT_CODE=inspect_code,
+        INSPECT_OUT=revision, PULL_OUT="SENTINEL_PULL_STDOUT", PULL_ERR="SENTINEL_PULL_STDERR", INSPECT_ERR="SENTINEL_INSPECT_STDERR",
+    )
+    combined = result.stdout + result.stderr + summary
+    assert result.returncode == code
+    assert log.splitlines() == expected_log
+    assert "SENTINEL" not in combined
+    assert "37bfaf02f04ce7614b9674b1c867b78ab3c7d414" not in combined
+    if code:
+        assert "probe_result=pass" not in summary
+
+
+@pytest.mark.parametrize("repository_id,run_id,attempt", [("", "456", "1"), ("abc", "456", "1"), ("123" * 50, "456", "1"), ("123", "", "1"), ("123", "456", "x")])
+def test_kavya_image_probe_canary_identifier_table_fails_before_fake_tools(tmp_path, repository_id, run_id, attempt):
+    result, summary, log = run_probe_workflow_step(tmp_path, "Probe generated absent canary", GITHUB_REPOSITORY_ID=repository_id, GITHUB_RUN_ID=run_id, GITHUB_RUN_ATTEMPT=attempt)
+    assert result.returncode != 0
+    assert log == ""
+    assert "probe_result=fail" in summary
+    assert "probe_result=pass" not in summary
+
+
+@pytest.mark.parametrize(
+    "workflow_sha,image_os,image_version,buildx_code,buildx_version,code",
+    [
+        ("a" * 40, "ubuntu24", "20240825.1", 0, "v0.16.2", 0),
+        ("", "ubuntu24", "20240825.1", 0, "v0.16.2", 1),
+        ("A" * 40, "ubuntu24", "20240825.1", 0, "v0.16.2", 1),
+        ("a" * 40, "", "20240825.1", 0, "v0.16.2", 1),
+        ("a" * 40, "ubuntu 24", "20240825.1", 0, "v0.16.2", 1),
+        ("a" * 40, "ubuntu24", "", 0, "v0.16.2", 1),
+        ("a" * 40, "ubuntu24", "bad value", 0, "v0.16.2", 1),
+        ("a" * 40, "ubuntu24", "20240825.1", 1, "v0.16.2", 1),
+        ("a" * 40, "ubuntu24", "20240825.1", 0, "bad value", 1),
+    ],
+)
+def test_kavya_image_probe_metadata_table_is_safe(tmp_path, workflow_sha, image_os, image_version, buildx_code, buildx_version, code):
+    result, summary, _log = run_probe_workflow_step(
+        tmp_path, "Record safe runtime metadata", GITHUB_WORKFLOW_SHA=workflow_sha,
+        ImageOS=image_os, ImageVersion=image_version, BUILDX_CODE=buildx_code, BUILDX_VERSION=buildx_version,
+    )
+    assert result.returncode == code
+    assert "PATH=" not in result.stdout + result.stderr + summary
+    assert "SENTINEL" not in result.stdout + result.stderr + summary
+    if code:
+        assert "probe_result=pass" not in summary
+
+
+def test_kavya_image_probe_run_scripts_parse_and_summary_is_allowlisted(tmp_path):
+    document, _job, _steps, _text = kavya_image_probe_job()
+    for script in workflow_run_strings(document):
+        parsed = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, check=False)
+        assert parsed.returncode == 0, parsed.stderr
+
+    allowed = (
+        "workflow_commit=", "checkout_action=", "buildx_action=", "login_action=", "runner_image=",
+        "runner_image_version=", "buildx_version=", "existing_tag_state=pass", "existing_revision=pass",
+        "canary_state=pass", "probe_version=1", "probe_result=pass",
+    )
+    for name in ("Record safe runtime metadata", "Probe known existing tag", "Verify existing OCI revision", "Probe generated absent canary", "Write safe probe summary"):
+        result, summary, _log = run_probe_workflow_step(tmp_path, name)
+        assert result.returncode == 0
+    assert all(line.startswith(allowed) for line in summary.splitlines())
+    assert "SENTINEL" not in summary
+
+
 def test_build_kavya_image_publisher_is_dispatch_only_and_least_privilege():
     document, job, steps, text = build_kavya_image_job()
 
