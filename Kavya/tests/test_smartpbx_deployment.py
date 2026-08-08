@@ -677,9 +677,12 @@ def probe_event_payload(
     client_payload=None,
     branch="main",
     repository=None,
+    bootstrap=None,
 ):
     if client_payload is None:
         client_payload = {"existing_tag": existing_tag, "expected_revision": expected_revision}
+        if bootstrap is not None:
+            client_payload["bootstrap"] = bootstrap
     return json.dumps(
         {
             "action": "kavya_image_read_only_probe",
@@ -747,6 +750,8 @@ def run_probe_workflow_step(tmp_path, name, output_files=None, **values):
         "PROBE_EVENT": probe_event_payload(),
         "PROBE_RUNNER_LABEL": "ubuntu-24.04", "PROBE_RUNNER_OS": "Linux", "PROBE_RUNNER_ARCH": "X64",
         "EXISTING_TAG": PROBE_EXISTING_TAG, "EXPECTED_REVISION": PROBE_EXPECTED_REVISION,
+        # steps.validate.outputs.bootstrap / steps.existing.outputs.existing_image
+        "PROBE_BOOTSTRAP": "false", "PROBE_EXISTING_IMAGE": "present",
         "GITHUB_REPOSITORY_ID": "123", "GITHUB_RUN_ID": "456", "GITHUB_RUN_ATTEMPT": "1",
         "BUILDX_VERSION": "v0.16.2", "BUILDX_CODE": "0",
         "EXISTING_OUT": "image_tag_state=existing\n", "EXISTING_ERR": "", "EXISTING_CODE": "10",
@@ -2295,3 +2300,167 @@ def test_kavya_image_tag_probe_allowlist_entries_are_full_capture_matches():
         assert forbidden not in allowlist_line, forbidden
     assert allowlist_line.count('"$registry_error" == "') == allowlist_line.count("$TAG")
     assert '"error: $TAG: not found"' in allowlist_line
+
+
+# --- Bootstrap mode -------------------------------------------------------
+# The probe requires a pre-existing tag and the publisher requires a green
+# probe, so the very first image can never be published: a bootstrap deadlock
+# the design did not cover. Bootstrap mode breaks it by letting the
+# existing-tag check pass on `absent`, and discloses that it did so.
+
+
+def test_kavya_image_probe_payload_accepts_an_optional_bootstrap_flag(tmp_path):
+    result, summary, log = run_probe_workflow_step(
+        tmp_path, PROBE_VALIDATION_STEP, PROBE_EVENT=probe_event_payload(bootstrap="true")
+    )
+
+    assert result.returncode == 0
+    assert log == ""
+    assert summary == ""
+    assert (tmp_path / "outputs").read_text(encoding="utf-8").splitlines() == [
+        f"existing_tag={PROBE_EXISTING_TAG}",
+        f"expected_revision={PROBE_EXPECTED_REVISION}",
+        "bootstrap=true",
+    ]
+
+
+def test_kavya_image_probe_defaults_to_strict_mode(tmp_path):
+    result, _summary, _log = run_probe_workflow_step(tmp_path, PROBE_VALIDATION_STEP)
+
+    assert result.returncode == 0
+    assert "bootstrap=false" in (tmp_path / "outputs").read_text(encoding="utf-8")
+
+
+PROBE_REJECTED_BOOTSTRAP_VALUES = ["false", "TRUE", "True", "1", "yes", "", " true", "true ", None]
+
+
+@pytest.mark.parametrize(
+    "value", PROBE_REJECTED_BOOTSTRAP_VALUES, ids=range(len(PROBE_REJECTED_BOOTSTRAP_VALUES))
+)
+def test_kavya_image_probe_rejects_any_bootstrap_value_but_exactly_true(tmp_path, value):
+    # Exactly one spelling asks for bootstrap and exactly one omission declines
+    # it. A typo must fail the dispatch loudly, never fall back to a mode the
+    # operator did not choose.
+    payload = {
+        "existing_tag": PROBE_EXISTING_TAG,
+        "expected_revision": PROBE_EXPECTED_REVISION,
+        "bootstrap": value,
+    }
+    result, summary, log = run_probe_workflow_step(
+        tmp_path, PROBE_VALIDATION_STEP, PROBE_EVENT=probe_event_payload(client_payload=payload)
+    )
+
+    assert result.returncode == 1, f"bootstrap={value!r} must be rejected"
+    assert log == ""
+    assert "probe_result=fail" in summary
+
+
+@pytest.mark.parametrize("value", [True, 1, 1.0, ["true"], {"v": "true"}])
+def test_kavya_image_probe_rejects_non_string_bootstrap(tmp_path, value):
+    payload = {
+        "existing_tag": PROBE_EXISTING_TAG,
+        "expected_revision": PROBE_EXPECTED_REVISION,
+        "bootstrap": value,
+    }
+    result, _summary, log = run_probe_workflow_step(
+        tmp_path, PROBE_VALIDATION_STEP, PROBE_EVENT=probe_event_payload(client_payload=payload)
+    )
+
+    assert result.returncode == 1
+    assert log == ""
+
+
+def test_kavya_image_probe_bootstrap_accepts_an_absent_existing_tag(tmp_path):
+    result, summary, log = run_probe_workflow_step(
+        tmp_path, "Probe known existing tag",
+        PROBE_BOOTSTRAP="true", EXISTING_CODE=0, EXISTING_OUT="image_tag_state=absent\n",
+    )
+
+    assert result.returncode == 0
+    assert "existing_tag_state=absent_bootstrap" in summary, (
+        "a bootstrap pass must be recorded as such, never as an ordinary pass"
+    )
+    assert "existing_tag_state=pass" not in summary
+    assert log == f"probe ghcr.io/taskforce-ai-dev/kavya:{PROBE_EXISTING_TAG}\n"
+    assert "existing_image=absent" in (tmp_path / "outputs").read_text(encoding="utf-8")
+
+
+def test_kavya_image_probe_bootstrap_still_verifies_a_tag_that_does_exist(tmp_path):
+    result, summary, _log = run_probe_workflow_step(
+        tmp_path, "Probe known existing tag", PROBE_BOOTSTRAP="true",
+    )
+
+    assert result.returncode == 0
+    assert "existing_tag_state=pass" in summary
+    assert "absent_bootstrap" not in summary
+    assert "existing_image=present" in (tmp_path / "outputs").read_text(encoding="utf-8")
+
+
+def test_kavya_image_probe_strict_mode_still_rejects_an_absent_existing_tag(tmp_path):
+    result, summary, _log = run_probe_workflow_step(
+        tmp_path, "Probe known existing tag",
+        EXISTING_CODE=0, EXISTING_OUT="image_tag_state=absent\n",
+    )
+
+    assert result.returncode == 1, "strict mode must be unchanged"
+    assert "probe_result=fail" in summary
+
+
+@pytest.mark.parametrize(
+    ("code", "output"),
+    [
+        (2, "image_tag_state=probe_unrecognized\n"),
+        (1, "image_tag_state=probe_failed\n"),
+        (0, "image_tag_state=existing\n"),
+        (0, "image_tag_state=absent"),
+        (0, "image_tag_state=absent\nextra\n"),
+        (10, "image_tag_state=absent\n"),
+        (99, "image_tag_state=absent\n"),
+    ],
+)
+def test_kavya_image_probe_bootstrap_still_requires_an_exact_state(tmp_path, code, output):
+    # Bootstrap relaxes only the "must already exist" premise. Every other
+    # uncertain result stays fail-closed.
+    result, summary, _log = run_probe_workflow_step(
+        tmp_path, "Probe known existing tag",
+        PROBE_BOOTSTRAP="true", EXISTING_CODE=code, EXISTING_OUT=output,
+    )
+
+    assert result.returncode == 1
+    assert "probe_result=fail" in summary
+
+
+def test_kavya_image_probe_revision_is_skipped_with_a_reason_when_there_is_no_image(tmp_path):
+    result, summary, log = run_probe_workflow_step(
+        tmp_path, "Verify existing OCI revision", PROBE_EXISTING_IMAGE="absent",
+    )
+
+    assert result.returncode == 0
+    assert "existing_revision=skipped_no_image" in summary, (
+        "the skip must be disclosed, not silently reported as a pass"
+    )
+    assert "existing_revision=pass" not in summary
+    assert log == "", "no registry call may be made when there is no image"
+
+
+def test_kavya_image_probe_revision_still_verifies_when_the_image_exists(tmp_path):
+    result, summary, log = run_probe_workflow_step(tmp_path, "Verify existing OCI revision")
+
+    assert result.returncode == 0
+    assert "existing_revision=pass" in summary
+    assert "skipped_no_image" not in summary
+    assert log != ""
+
+
+@pytest.mark.parametrize(
+    ("bootstrap", "expected_mode"), [("false", "strict"), ("true", "bootstrap")]
+)
+def test_kavya_image_probe_summary_discloses_the_mode(tmp_path, bootstrap, expected_mode):
+    # The publisher gate accepts any green probe at its head_sha, so a
+    # bootstrap-green run must say so in its own evidence.
+    result, summary, _log = run_probe_workflow_step(
+        tmp_path, "Write safe probe summary", PROBE_BOOTSTRAP=bootstrap,
+    )
+
+    assert result.returncode == 0
+    assert f"probe_mode={expected_mode}" in summary
