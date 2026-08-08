@@ -319,6 +319,92 @@ async def test_close_drains_paced_audio_promptly():
     assert transport._queue.empty()
 
 
+@pytest.mark.asyncio
+async def test_dropped_frames_are_counted_rather_than_silently_discarded():
+    from smartpbx_transport import SmartPBXMediaTransport
+
+    notified: list[int] = []
+    transport = SmartPBXMediaTransport(
+        RecordingSocket(), CONTEXT, max_queue_frames=2,
+        on_frame_dropped=lambda: notified.append(1),
+    )
+    transport.start()
+    for _ in range(20):
+        await transport.send_audio(FRAME)
+    await transport.close()
+
+    assert transport.frames_dropped_total >= 15, (
+        "drop-oldest backpressure discarded frames with no observability at all"
+    )
+    assert len(notified) == transport.frames_dropped_total
+
+
+def test_registry_status_surfaces_dropped_frames():
+    from smartpbx_gateway import SmartPBXSessionRegistry
+
+    registry = SmartPBXSessionRegistry(4)
+    assert registry.snapshot()["frames_dropped_total"] == 0
+    registry.record_frame_dropped()
+    registry.record_frame_dropped()
+    assert registry.snapshot()["frames_dropped_total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_gateway_reports_dropped_frames_through_status(monkeypatch):
+    import smartpbx_gateway as gateway_module
+
+    captured: dict[str, object] = {}
+    real = gateway_module.SmartPBXMediaTransport
+
+    def spy(websocket, context, *, max_queue_frames, on_frame_dropped=None):
+        captured["on_frame_dropped"] = on_frame_dropped
+        return real(
+            websocket, context, max_queue_frames=max_queue_frames,
+            on_frame_dropped=on_frame_dropped,
+        )
+
+    monkeypatch.setattr(gateway_module, "SmartPBXMediaTransport", spy)
+    registry = gateway_module.SmartPBXSessionRegistry(4)
+    settings = gateway_module.SmartPBXSettings.from_env({
+        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+    })
+    socket = FailingSocket(ok_sends=1000)
+    socket.messages.put_nowait(json.dumps({"event": "start", "start": {
+        "callId": "call-1", "otherLegCallId": "other-1",
+        "callerIdNumber": "caller", "calleeIdNumber": "callee",
+        "accountId": "account-1",
+        "mediaFormat": {"encoding": "g711_ulaw", "sampleRate": 8000},
+    }}))
+    socket.messages.put_nowait(json.dumps({"event": "stop"}))
+
+    class Session:
+        def __init__(self):
+            self.transfer_pending = False
+            self.terminal_future = asyncio.get_running_loop().create_future()
+
+        async def start(self):
+            pass
+
+        async def feed_audio(self, _audio):
+            pass
+
+        async def finish(self, schedule_post_call=False):
+            pass
+
+    async def factory(_context, _transport, _sink=None):
+        return Session()
+
+    gateway = gateway_module.SmartPBXGateway(settings, registry)
+    await asyncio.wait_for(gateway.handle(socket, factory), timeout=5)
+
+    assert callable(captured["on_frame_dropped"]), (
+        "the gateway must give the transport somewhere to report drops"
+    )
+    captured["on_frame_dropped"]()
+    assert gateway.snapshot()["frames_dropped_total"] == 1
+
+
 def _failing_stt_loop(monkeypatch, failures: int = 10_000):
     """Drive GoogleSTTStream._loop with a stream that always fails immediately."""
     import server
