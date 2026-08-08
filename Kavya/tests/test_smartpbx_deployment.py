@@ -480,6 +480,10 @@ def test_kavya_image_probe_requires_exact_states_provenance_and_internal_canary(
     assert '[[ "$probe_marker" == "$expected_marker" ]] || fail' in existing["run"]
     assert '[[ "$probe_code" -eq 0 ]]' in canary["run"]
     assert 'expected_marker="image_tag_state=absent"' in canary["run"]
+    assert 'probe_lines="$(wc -l < "$probe_stdout")" || fail' in canary["run"]
+    assert 'probe_marker="$(cat "$probe_stdout")" || fail' in canary["run"]
+    assert '[[ "$probe_lines" -eq 1 ]] || fail' in canary["run"]
+    assert '[[ "$probe_marker" == "$expected_marker" ]] || fail' in canary["run"]
     assert 'canary="probe-${GITHUB_REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in canary["run"]
     assert '[[ "$canary" =~ ^probe-[0-9]+-[0-9]+-[0-9]+$ ]]' in canary["run"]
     assert 'image="ghcr.io/taskforce-ai-dev/kavya"' in existing["run"]
@@ -563,9 +567,13 @@ def run_probe_workflow_step(tmp_path, name, **values):
     ],
 )
 def test_kavya_image_probe_validation_binds_identity_before_tools(tmp_path, tag, revision, code):
-    result, _summary, log = run_probe_workflow_step(tmp_path, "Validate probe inputs", EXISTING_TAG=tag, EXPECTED_REVISION=revision)
+    result, summary, log = run_probe_workflow_step(
+        tmp_path, "Validate probe inputs", EXISTING_TAG=tag, EXPECTED_REVISION=revision,
+    )
     assert result.returncode == code
     assert log == ""
+    if code:
+        assert "probe_result=pass" not in summary
 
 
 @pytest.mark.parametrize(
@@ -585,6 +593,8 @@ def test_kavya_image_probe_validation_binds_identity_before_tools(tmp_path, tag,
         ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "image_tag_state=existing\n"}, 1),
         ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "wrong\n"}, 1),
         ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": ""}, 1),
+        ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "image_tag_state=absent\nextra\n"}, 1),
+        ("Probe generated absent canary", {"CANARY_CODE": 0, "CANARY_OUT": "image_tag_state=absent"}, 1),
     ],
 )
 def test_kavya_image_probe_accepts_only_exact_probe_states(tmp_path, step, overrides, code):
@@ -605,6 +615,7 @@ def test_kavya_image_probe_accepts_only_exact_probe_states(tmp_path, step, overr
         (0, 1, "37bfaf02f04ce7614b9674b1c867b78ab3c7d414\n", 1, ["docker pull ghcr.io/taskforce-ai-dev/kavya:37bfaf0", 'docker image inspect ghcr.io/taskforce-ai-dev/kavya:37bfaf0 --format {{ index .Config.Labels "org.opencontainers.image.revision" }}']),
         (0, 0, "47bfaf02f04ce7614b9674b1c867b78ab3c7d414\n", 1, ["docker pull ghcr.io/taskforce-ai-dev/kavya:37bfaf0", 'docker image inspect ghcr.io/taskforce-ai-dev/kavya:37bfaf0 --format {{ index .Config.Labels "org.opencontainers.image.revision" }}']),
         (0, 0, "37bfaf02f04ce7614b9674b1c867b78ab3c7d414\nextra\n", 1, ["docker pull ghcr.io/taskforce-ai-dev/kavya:37bfaf0", 'docker image inspect ghcr.io/taskforce-ai-dev/kavya:37bfaf0 --format {{ index .Config.Labels "org.opencontainers.image.revision" }}']),
+        (0, 1, "SENTINEL_INSPECT_STDOUT\n", 1, ["docker pull ghcr.io/taskforce-ai-dev/kavya:37bfaf0", 'docker image inspect ghcr.io/taskforce-ai-dev/kavya:37bfaf0 --format {{ index .Config.Labels "org.opencontainers.image.revision" }}']),
     ],
 )
 def test_kavya_image_probe_provenance_and_metadata_suppress_sentinels(tmp_path, pull_code, inspect_code, revision, code, expected_log):
@@ -616,7 +627,7 @@ def test_kavya_image_probe_provenance_and_metadata_suppress_sentinels(tmp_path, 
     assert result.returncode == code
     assert log.splitlines() == expected_log
     assert "SENTINEL" not in combined
-    assert "37bfaf02f04ce7614b9674b1c867b78ab3c7d414" not in combined
+    assert all(value not in combined for value in revision.splitlines() if value)
     if code:
         assert "probe_result=pass" not in summary
 
