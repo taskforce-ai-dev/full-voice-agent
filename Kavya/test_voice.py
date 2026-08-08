@@ -74,7 +74,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-5-20250929"
 MAX_TOOL_ROUNDS = 5
 
 # Azure voice map -- same voices used in production ConversationRelay

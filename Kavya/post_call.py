@@ -244,7 +244,7 @@ async def extract_booking_details(
     try:
         if llm_provider == "claude" and anthropic_client:
             result = await _extract_with_claude(
-                anthropic_client, transcript_text, model or "claude-sonnet-4-20250514",
+                anthropic_client, transcript_text, model or "claude-sonnet-4-5-20250929",
             )
         elif llm_provider == "openai" and openai_client:
             result = await _extract_with_openai(
@@ -338,7 +338,7 @@ async def _retry_extraction(
             text = _clean_json_response(response.text)
         elif llm_provider == "claude" and anthropic_client:
             response = await anthropic_client.messages.create(
-                model=model or "claude-sonnet-4-20250514",
+                model=model or "claude-sonnet-4-5-20250929",
                 max_tokens=EXTRACTION_MAX_TOKENS,
                 messages=[{"role": "user", "content": prompt}],
             )

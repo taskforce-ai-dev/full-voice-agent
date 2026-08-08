@@ -92,7 +92,7 @@ Copy `.env.example` to `.env`. Key groups:
 
 **LLM provider** (pick one — Claude is default):
 - `LLM_PROVIDER` — `"claude"` (default), `"openai"`, or `"gemini"`
-- `ANTHROPIC_API_KEY`, `CLAUDE_MODEL` — Claude/Anthropic (default model: `claude-sonnet-4-20250514`)
+- `ANTHROPIC_API_KEY`, `CLAUDE_MODEL` — Claude/Anthropic (default model: `claude-sonnet-4-5-20250929`)
 - `OPENAI_API_KEY`, `OPENAI_MODEL` — OpenAI (default model: `gpt-4o`)
 - `GEMINI_API_KEY`, `GEMINI_MODEL` — Gemini via native google-genai SDK (default model: `gemini-2.5-flash`)
 
@@ -218,7 +218,7 @@ Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8
 ## Key Design Decisions
 
 - **Pluggable LLM**: `LLM_PROVIDER` env var switches between Claude (default), OpenAI, and Gemini. Each has its own client singleton, streaming functions, and tool format. History is stored in provider-native format; Gemini uses a converter `_history_to_gemini()` since it stores in OpenAI format internally.
-- **Claude as default**: Anthropic Claude (`claude-sonnet-4-20250514`) is the default and primary tested provider. Uses native `AsyncAnthropic` SDK with `messages.stream()`, content block events (`content_block_start`, `content_block_delta`, `content_block_stop`), and Anthropic tool format (`input_schema`).
+- **Claude as default**: Anthropic Claude (`claude-sonnet-4-5-20250929`) is the default and primary tested provider. Uses native `AsyncAnthropic` SDK with `messages.stream()`, content block events (`content_block_start`, `content_block_delta`, `content_block_stop`), and Anthropic tool format (`input_schema`).
 - **Two servers, one codebase**: `server.py` (unified production) and `media_stream_server.py` (standalone, Anthropic-only, kept as reference). Both share `booking_api.py`, `tools.py`, `knowledge_base.py`.
 - **DTMF language menu**: live menu (v0.16) is Press 1 → ConversationRelay (English + ElevenLabs); Press 2 → Media Streams (Arabic + ElevenLabs multilingual); Press 3 → Media Streams (Sinhala + OpenAI `gpt-4o-mini-tts`). `DIGIT_TO_LANG = {"1": "en", "2": "ar", "3": "si"}`; no input → English. Tamil (Media Streams + ElevenLabs) remains fully coded but is not mapped to any menu digit — add `"4": "ta"` plus a matching `<Say>` prompt to re-expose it.
 - **Interim-based STT endpointing**: Google Cloud STT rarely fires `is_final=True` for conversational speech. Each interim result overwrites `_pending_transcript` (not appends) and resets a 1.5s silence timer. When the timer fires, the latest interim is treated as the complete utterance.
@@ -419,7 +419,7 @@ This section documents the major changes made to the project since initial devel
 **Changes:**
 - Added `anthropic>=0.40.0` back to `requirements-prod.txt`
 - `LLM_PROVIDER` default changed to `"claude"`
-- Added `ANTHROPIC_API_KEY`, `CLAUDE_MODEL` env vars (default model: `claude-sonnet-4-20250514`)
+- Added `ANTHROPIC_API_KEY`, `CLAUDE_MODEL` env vars (default model: `claude-sonnet-4-5-20250929`)
 - Added `_get_anthropic_client()` — `AsyncAnthropic` singleton
 - Added `_run_llm_streaming_claude()` for ConversationRelay — uses `client.messages.stream()` context manager with `content_block_start` / `content_block_delta` / `content_block_stop` event handling
 - Added `_run_llm_claude()` for Media Streams — same event-based streaming with sentence-level TTS dispatch
