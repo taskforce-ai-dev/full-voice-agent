@@ -1,0 +1,91 @@
+name: diag registry verify (throwaway)
+
+# Diagnostic only. Never merged. The publisher pushed
+# ghcr.io/taskforce-ai-dev/kavya:db7d0d1 successfully but then failed comparing
+# the pushed digest to the action's reported digest, and the strict probe failed
+# comparing the OCI revision label. Both comparisons suppress their operands by
+# design, so the operands have to be observed deliberately.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/diag-registry-verify.yml
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Inspect the real published image
+        env:
+          TAG: ghcr.io/taskforce-ai-dev/kavya:db7d0d1
+          REPO: ghcr.io/taskforce-ai-dev/kavya
+          BUILT_DIGEST: sha256:3d7f73715d934dbb30e7ac09f240162830ee9d8038b04a73554e9539247d88a7
+          EXPECTED_REVISION: db7d0d1ff376bef2d7d9dad2caa166fd91c5df6f
+        run: |
+          set -uo pipefail
+          # The runner injects `bash -e`; several commands here are expected to
+          # fail and their failure is the data.
+          set +e
+
+          show() { printf '\n########## %s ##########\n' "$1"; }
+
+          show 'versions'
+          docker version --format '{{.Server.Version}}'
+          docker buildx version
+
+          show 'A. imagetools inspect (human)'
+          docker buildx imagetools inspect "$TAG"
+          printf 'exit=%s\n' "$?"
+
+          show 'B. imagetools inspect --raw (index vs manifest)'
+          docker buildx imagetools inspect "$TAG" --raw
+          printf 'exit=%s\n' "$?"
+
+          for tpl in '{{.Digest}}' '{{.Manifest.Digest}}' '{{.Manifest.MediaType}}'; do
+            show "C. --format $tpl"
+            out=$(docker buildx imagetools inspect "$TAG" --format "$tpl" 2>&1)
+            printf 'exit=%s\n' "$?"
+            printf 'value=[%s]\n' "$out"
+            printf '%s' "$out" | od -c | head -5
+          done
+
+          show 'D. digest comparison'
+          resolved=$(docker buildx imagetools inspect "$TAG" --format '{{.Digest}}' 2>/dev/null)
+          printf 'resolved   =%s\n' "$resolved"
+          printf 'built      =%s\n' "$BUILT_DIGEST"
+          if [[ "$resolved" == "$BUILT_DIGEST" ]]; then printf 'MATCH=yes\n'; else printf 'MATCH=no\n'; fi
+
+          show 'E. child manifests of the index'
+          docker buildx imagetools inspect "$TAG" --format '{{json .Manifest}}' 2>/dev/null
+
+          # Pull by each candidate reference and read the label byte-exactly.
+          for ref in "$TAG" "$REPO@$resolved" "$REPO@$BUILT_DIGEST"; do
+            show "F. pull + label for $ref"
+            docker pull "$ref" >/dev/null 2>&1
+            printf 'pull_exit=%s\n' "$?"
+            label=$(docker image inspect "$ref" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>&1)
+            printf 'inspect_exit=%s\n' "$?"
+            printf 'label=[%s]\n' "$label"
+            # Exactly what the probe compares: the raw stdout of the same command.
+            docker image inspect "$ref" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' >/tmp/label.out 2>/dev/null
+            printf 'raw stdout bytes:\n'
+            od -c /tmp/label.out | head -5
+            printf 'expected file bytes (printf %%s\\n):\n'
+            printf '%s\n' "$EXPECTED_REVISION" >/tmp/label.expected
+            od -c /tmp/label.expected | head -5
+            if cmp -s /tmp/label.out /tmp/label.expected; then printf 'CMP=match\n'; else printf 'CMP=differ\n'; fi
+            printf 'all labels:\n'
+            docker image inspect "$ref" --format '{{json .Config.Labels}}' 2>&1 | head -3
+          done
+          exit 0
