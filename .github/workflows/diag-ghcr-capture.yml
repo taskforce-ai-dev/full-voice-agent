@@ -1,0 +1,60 @@
+name: diag GHCR error wording (throwaway)
+
+# Diagnostic only. Never merged. Exists to capture the byte-exact wording GHCR
+# returns to an authenticated runner for a missing tag, which is the spec's
+# documented remedy for a probe canary/existing-tag "unrecognized message"
+# failure. It reads the registry only, prints no secret, and mutates nothing.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/diag-ghcr-capture.yml
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Capture registry wording
+        run: |
+          set -uo pipefail
+          # Replicate check-kavya-image-tag.sh exactly: combined stdout+stderr
+          # into one file, then the same load and case-fold the allowlist sees.
+          for ref in \
+            'ghcr.io/taskforce-ai-dev/kavya:37bfaf0' \
+            'ghcr.io/taskforce-ai-dev/kavya:probe-0-0-0'
+          do
+            capture="$(mktemp)"
+            docker buildx imagetools inspect "$ref" >"$capture" 2>&1
+            docker_exit=$?
+            printf '\n===== BEGIN %s =====\n' "$ref"
+            printf 'docker_exit=%s\n' "$docker_exit"
+            printf 'byte_length=%s\n' "$(wc -c <"$capture")"
+            if LC_ALL=C od -An -tx1 -v "$capture" | tr -s ' ' '\n' | grep -qx 00; then
+              printf 'contains_nul=yes\n'
+            else
+              printf 'contains_nul=no\n'
+            fi
+            printf -- '--- raw begin ---\n'
+            cat "$capture"
+            printf -- '--- raw end ---\n'
+            printf 'base64_raw=%s\n' "$(base64 -w0 <"$capture")"
+            # Exactly what the helper compares against its allowlist.
+            compare=$(<"$capture")
+            compare=${compare,,}
+            printf -- '--- helper compare form begin ---\n%s\n--- helper compare form end ---\n' "$compare"
+            printf 'base64_compare=%s\n' "$(printf '%s' "$compare" | base64 -w0)"
+            printf '===== END %s =====\n' "$ref"
+            rm -f "$capture"
+          done
+          exit 0
