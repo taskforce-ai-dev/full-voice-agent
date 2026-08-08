@@ -76,6 +76,80 @@ async def test_finish_stops_stt_off_the_event_loop_thread():
     )
 
 
+def _failing_stt_loop(monkeypatch, failures: int = 10_000):
+    """Drive GoogleSTTStream._loop with a stream that always fails immediately."""
+    import server
+
+    stream = server.GoogleSTTStream(on_final_result=lambda *_: None, lang="en")
+    stream._running = True
+    attempts = 0
+
+    def boom():
+        nonlocal attempts
+        attempts += 1
+        # Escape hatch so an unbounded loop still terminates the test run.
+        if attempts >= failures:
+            stream._running = False
+        raise RuntimeError("DefaultCredentialsError: credentials file rotated")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(stream, "_run_one_stream", boom)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: sleeps.append(seconds))
+    stream._loop()
+    return stream, (lambda: attempts), sleeps
+
+
+def test_stt_restart_loop_backs_off_instead_of_spinning(monkeypatch):
+    _stream, attempts, sleeps = _failing_stt_loop(monkeypatch)
+
+    assert attempts() <= 12, (
+        f"{attempts()} restart attempts with no delay: a synchronous "
+        "SpeechClient() failure spins the thread and floods the log ring"
+    )
+    assert sleeps, "a failed stream restart must back off before retrying"
+    assert sleeps == sorted(sleeps), "backoff must be non-decreasing"
+    assert max(sleeps) <= 5.0, "backoff must stay capped near 5s"
+
+
+def test_stt_restart_loop_gives_up_so_the_call_can_end(monkeypatch):
+    stream, attempts, _sleeps = _failing_stt_loop(monkeypatch, failures=10_000)
+
+    assert attempts() < 10_000, "the loop stopped only because the test forced it to"
+    assert stream._running is False, (
+        "after a capped run of consecutive failures the STT thread must stop "
+        "so the call ends cleanly rather than churning gRPC channels"
+    )
+
+
+def test_stt_restart_loop_resets_backoff_after_a_healthy_stream(monkeypatch):
+    import server
+
+    stream = server.GoogleSTTStream(on_final_result=lambda *_: None, lang="en")
+    stream._running = True
+    calls = 0
+
+    def flaky():
+        nonlocal calls
+        calls += 1
+        if calls in (1, 2, 4, 5):
+            raise RuntimeError("transient")
+        if calls == 3:
+            return  # a healthy stream ended normally
+        stream._running = False
+        raise RuntimeError("transient")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(stream, "_run_one_stream", flaky)
+    monkeypatch.setattr(server.time, "sleep", lambda seconds: sleeps.append(seconds))
+    stream._loop()
+
+    assert len(sleeps) >= 4
+    assert sleeps[2] <= sleeps[1], (
+        "a stream that ran successfully must reset the backoff, otherwise a "
+        "long healthy call inherits the delay from an unrelated early blip"
+    )
+
+
 @pytest.mark.asyncio
 async def test_finish_leaves_the_event_loop_responsive_for_other_calls():
     ticks = 0
