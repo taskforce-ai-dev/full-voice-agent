@@ -231,7 +231,7 @@ STT_DEBUG_DIR: str = os.getenv("STT_DEBUG_DIR", "stt_dumps")
 
 # LLM provider selection: "claude" (default), "openai", or "gemini"
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "claude")
-CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 

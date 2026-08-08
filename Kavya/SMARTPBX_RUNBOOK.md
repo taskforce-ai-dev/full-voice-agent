@@ -71,7 +71,7 @@ and do not add Twilio credentials or `HUMAN_AGENT_PHONE`.
 ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 LLM_PROVIDER=claude
-CLAUDE_MODEL=claude-sonnet-4-20250514
+CLAUDE_MODEL=claude-sonnet-4-5-20250929
 OPENAI_MODEL=gpt-4o
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash

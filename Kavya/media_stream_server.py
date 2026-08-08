@@ -71,7 +71,7 @@ AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "southeastasia")
 PORT: int = int(os.getenv("PORT", "8000"))
 
 # ── Claude ────────────────────────────────────────────────────────────────
-MODEL: str = "claude-sonnet-4-20250514"
+MODEL: str = "claude-sonnet-4-5-20250929"
 MAX_TOKENS: int = 300
 MAX_HISTORY: int = 20
 MAX_TOOL_ROUNDS: int = 5
