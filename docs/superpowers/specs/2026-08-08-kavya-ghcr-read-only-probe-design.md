@@ -2,55 +2,55 @@
 
 ## Purpose
 
-This design adds a narrow, trusted-operator confidence gate before the
-immutable Kavya image publisher may run for a reviewed revision. It proves,
-without changing the registry, that:
-
-1. An immutable, caller-selected existing tag has the expected OCI revision
-   label.
-2. A workflow-derived canary tag is absent.
+This design adds a narrow, trusted-operator confidence gate before the separate
+Kavya image publisher may run for a reviewed revision. It proves, without
+changing the registry, that an already-existing, caller-selected tag has the
+expected OCI revision label at the time of the probe, and that a
+workflow-derived canary tag is absent at that time.
 
 The first operational acceptance uses existing tag `37bfaf0` and expected
 revision `37bfaf02f04ce7614b9674b1c867b78ab3c7d414`.
 
+This is point-in-time evidence, not continuing tag immutability. The publisher
+is the only intended in-repository writer, but an out-of-band package writer
+can move a tag after a successful probe. Consumers must use the separately
+verified digest where that property matters.
+
 ## Scope and non-goals
 
-Implementation changes exactly these three in-scope surfaces:
+Implementation changes exactly these four surfaces:
 
 - `.github/workflows/probe-kavya-image.yml`;
-- `Kavya/tests/test_smartpbx_deployment.py`; and
-- `.github/scripts/check-kavya-image-tag.sh`.
+- `.github/scripts/check-kavya-image-tag.sh`;
+- `.github/workflows/build-kavya-image.yml`; and
+- `Kavya/tests/test_smartpbx_deployment.py`.
 
-The workflow is usable only after it is merged to the protected default branch.
-It has no source checkout or build context. It does not build, publish, push,
-create, overwrite, delete, or otherwise mutate an image or tag. It does not
-deploy, use environments, SSH, access a host or dashboard, read deploy secrets,
-change Nginx, or activate transfer or MCP functionality.
+The probe has no source checkout or build context. It does not build, publish,
+push, create, overwrite, delete, or otherwise mutate an image or tag. It does
+not deploy, use environments, SSH, access a host or dashboard, read deploy
+secrets, change Nginx, or activate transfer or MCP functionality.
 
-The immutable publisher remains a separate, fail-closed single writer. The
-shared probe helper becomes stricter by rejecting NUL-bearing registry captures;
-that may turn a previously ambiguous publisher probe into `probe_failed`, but
-does not relax any publisher decision or permit a write. Publisher workflow
-changes, registry writes, transfer, and deploy are out of scope.
+The only publisher changes in scope are the action pins, explicit runner label,
+and timeout described below. There is no publisher dispatch change. No other
+workflow is broadened into scope. The shared helper is stricter by rejecting
+NUL-bearing registry captures; that can make the publisher fail closed with
+`probe_failed`, but never permits a write.
 
 ## Architecture and dispatch trust boundary
 
 ```text
-trusted operator with repository dispatch authority
-  | POST /repos/{owner}/{repo}/dispatches
-  | type=kavya_image_read_only_probe
-  | payload={existing_tag, expected_revision}
+trusted operator
+  | POST repository_dispatch {existing_tag, expected_revision}
   v
-repository_dispatch resolved by GitHub from protected default branch
-  | default-branch workflow file, ref, and SHA
+default-branch workflow selected by GitHub
+  |-- terminal trust and payload validation before any action/tool
   v
-one GitHub-hosted read-only job
-  |-- validate event/ref/SHA and payload before tooling or registry access
-  |-- checkout tooling at github.workflow_sha only
-  |-- byte-exact existing marker and OCI revision checks
-  `-- byte-exact absent internally-derived-canary marker check
+GitHub-hosted read-only probe
+  |-- trusted helper at github.workflow_sha
+  |-- byte-exact existing-tag and revision checks
+  `-- byte-exact absent internally-derived canary check
   v
-fixed safe markers only; no registry or production writes
+validated existing_tag + expected_revision and fixed pass markers only
 ```
 
 The trigger is exactly:
@@ -61,231 +61,283 @@ on:
     types: [kavya_image_read_only_probe]
 ```
 
-For `repository_dispatch`, GitHub resolves `GITHUB_REF` to the default branch
-and `GITHUB_SHA` to its last commit, and runs only when the workflow file is on
-that branch. Thus neither the caller nor its payload selects a workflow file,
-ref, or SHA. The job additionally fails closed before checkout, setup, login,
-or registry access unless all of the following hold:
+GitHub documents that `repository_dispatch` runs only when the workflow file is
+on the default branch and sets its ref and SHA to that branch and its latest
+commit. The first shell step nevertheless fails before checkout, setup, login,
+registry access, or any other tool unless every one of these terminal checks
+passes:
 
-- `github.event_name` is `repository_dispatch` and `github.event.action` is
-  `kavya_image_read_only_probe`;
-- the event default-branch field is a safe branch name and `github.ref` is
-  exactly `refs/heads/<event default branch>`;
-- `github.sha` and `github.workflow_sha` are lowercase 40-hex SHAs and are
-  byte-for-byte equal; and
-- `github.workflow_ref` identifies this repository's
-  `.github/workflows/probe-kavya-image.yml` at that same default-branch ref.
+- `github.event_name == repository_dispatch` and
+  `github.event.action == kavya_image_read_only_probe`;
+- `github.repository == github.event.repository.full_name ==
+  taskforce-ai-dev/full-voice-agent`;
+- `github.event.repository.default_branch == main`;
+- `github.ref == refs/heads/main`, `github.ref_name == main`,
+  `github.ref_type == branch`, and `github.ref_protected == true`;
+- `github.sha` and `github.workflow_sha` are each lowercase 40-hex strings and
+  are byte-for-byte equal; and
+- `github.workflow_ref ==
+  taskforce-ai-dev/full-voice-agent/.github/workflows/probe-kavya-image.yml@refs/heads/main`.
 
-These checks are defense in depth against an unexpected Actions context; GitHub
-default-branch dispatch semantics and branch protection establish the actual
-workflow-selection boundary.
+The workflow must pass those values to the first step through named environment
+variables, including a serialized `github.event` for structural payload
+validation. It must not use `github.event.branch`: that is not a documented
+Actions context property and is not a security input. Every negative case exits
+through one generic fixed failure marker before any `uses:` step or command that
+can contact the registry.
 
-The job has one `ubuntu-latest` GitHub-hosted runner and exactly:
+The probe job is one GitHub-hosted job with this static shape:
 
 ```yaml
+runs-on: ubuntu-24.04
+timeout-minutes: 30
 permissions:
   contents: read
   packages: read
 ```
 
-Concurrency is static: group `kavya-image-read-only-probe` with
-`cancel-in-progress: false`. No caller value participates in the group.
+Concurrency remains static: group `kavya-image-read-only-probe` with
+`cancel-in-progress: false`; no caller value participates in the group.
 
-## Authorization is distinct from job permissions
+## Dispatcher and authorization
 
-Dispatch authorization belongs to the human/operator credential, not this
-workflow's `GITHUB_TOKEN`. A designated maintainer uses a fine-grained PAT with
-the repository's required **Contents: write** dispatch permission (or an
-equivalent repository-authorized credential) from a trusted operator machine.
-The credential must not be placed in workflow inputs, repository secrets, logs,
-or summaries. Repository access policy and protected-default-branch review are
-the authorization controls for who may issue the event.
+Dispatch authorization belongs to the trusted operator credential, not the
+job's `GITHUB_TOKEN`. A repository-authorized maintainer uses the documented
+repository-dispatch permission from a trusted machine. The credential never
+appears in workflow inputs, repository secrets, logs, or summaries.
 
-The job token is independently limited to `contents: read` and `packages: read`.
-It is used only by `docker/login-action` to read GHCR; it cannot authorize the
-operator dispatch and must never gain `packages: write`.
-
-The documented manual dispatcher is intentionally explicit and sends no ref or
+The dispatcher is terminal and fail-fast before `gh api`; it sends no ref or
 SHA selector:
 
 ```bash
+set -Eeuo pipefail
+fail() { printf '%s\n' 'dispatcher_validation=fail' >&2; exit 1; }
+
 repo='taskforce-ai-dev/full-voice-agent'
 existing_tag='37bfaf0'
 expected_revision='37bfaf02f04ce7614b9674b1c867b78ab3c7d414'
-[[ "$existing_tag" =~ ^[0-9a-f]{7}$ ]]
-[[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]]
-[[ "$existing_tag" == "${expected_revision:0:7}" ]]
+
+[[ "$repo" == 'taskforce-ai-dev/full-voice-agent' ]] || fail
+[[ "$existing_tag" =~ ^[0-9a-f]{7}$ ]] || fail
+[[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]] || fail
+[[ "$existing_tag" == "${expected_revision:0:7}" ]] || fail
+
 gh api --method POST "repos/$repo/dispatches" \
   -f event_type=kavya_image_read_only_probe \
   -f "client_payload[existing_tag]=$existing_tag" \
   -f "client_payload[expected_revision]=$expected_revision"
 ```
 
-The procedure is for a trusted, repository-authorized maintainer only; the
-workflow does not attempt to infer caller identity from payload fields.
+`workflow_dispatch` is not an alternate trigger because it permits selecting a
+ref. The workflow does not infer operator identity from payload fields.
 
-`workflow_dispatch` plus a branch/ref guard was rejected as the primary design:
-its guards are useful defense in depth but its manual UI/API model permits a
-selected ref, which weakens the simple default-branch execution story. An
-external GitHub App was also rejected for this first trusted-operator dispatch:
-it adds credential lifecycle, integration, and operational complexity without
-improving the protected-default-branch resolution needed here.
+`contents: read` is needed by checkout; `packages: read` is needed by the GHCR
+login/read path. Every action can access `github.token`; action pinning and
+least job permissions therefore apply to checkout, Buildx, login, and build/
+push equally. `persist-credentials: false` prevents checkout from persisting
+its credential in local Git configuration; it does not revoke `github.token` or
+prevent other actions from accessing the context token. The probe never grants
+`packages: write`; the publisher retains that distinct write permission.
 
-## Payload, validation, and trusted tooling
+## Payload, trusted tooling, and action pins
 
-`client_payload` has exactly these caller-controlled fields:
+`client_payload` contains exactly these two caller-controlled string fields:
 
 | Field | Required format | Operational value |
 | --- | --- | --- |
 | `existing_tag` | exactly seven lowercase hexadecimal characters | `37bfaf0` |
 | `expected_revision` | exactly forty lowercase hexadecimal characters | `37bfaf02f04ce7614b9674b1c867b78ab3c7d414` |
 
-The first trusted shell step receives a serialized `client_payload` and its two
-values only through `env`. Before any checkout, action setup, login, probe,
-pull, or inspection, it uses `jq -e` to require an object with exactly the two
-string keys above, then rejects empty values, uppercase, prefixes, whitespace,
-non-hex input, and any case where
-`existing_tag != expected_revision[0:7]`. The image repository is fixed in
-trusted workflow code. Callers cannot supply a repository, registry, digest,
-source ref, workflow ref, workflow SHA, or canary name.
+The first step uses `jq -e` against the environment-supplied serialized event
+to require exactly those two keys, both strings, then validates the shapes and
+requires `existing_tag == expected_revision[0:7]`. It validates all trust
+values above in the same terminal step. The image repository is fixed in
+trusted workflow code. Callers cannot provide a registry, digest, source ref,
+workflow ref, workflow SHA, or canary name.
 
-After validation, the only checkout is `actions/checkout@v7` at
+Pin every action used by either the probe or publisher to these full commits,
+preserving the version comments in both workflows:
+
+```yaml
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+- uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+- uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+- uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+```
+
+On 2026-08-08, the official GitHub REST `git/ref/tags/<tag>` endpoints reported
+each requested tag object as a `commit`, so no annotated-tag dereference was
+needed. The verification commands are:
+
+```bash
+curl --fail --silent --show-error \
+  https://api.github.com/repos/actions/checkout/git/ref/tags/v7
+curl --fail --silent --show-error \
+  https://api.github.com/repos/docker/setup-buildx-action/git/ref/tags/v4
+curl --fail --silent --show-error \
+  https://api.github.com/repos/docker/login-action/git/ref/tags/v4
+curl --fail --silent --show-error \
+  https://api.github.com/repos/docker/build-push-action/git/ref/tags/v7
+```
+
+For an annotated tag, resolve its returned tag object through the official
+`git/tags/<sha>` endpoint until the target is a commit, and pin that full commit
+instead. Do not substitute a tag object SHA.
+
+The probe's only checkout is the pinned checkout action at
 `github.workflow_sha`, into `.probe-tools`, with `persist-credentials: false`.
-The job executes only `.probe-tools/.github/scripts/check-kavya-image-tag.sh`.
-It reuses the publisher's declared `actions/checkout@v7`,
-`docker/setup-buildx-action@v4`, and `docker/login-action@v4` references. No
-application source ref is checked out or executed.
-
-The absent canary is derived only from validated GitHub repository ID, run ID,
-and run attempt, as `probe-<repository-id>-<run-id>-<attempt>`. It is not a
-payload field and its shape and maximum tag length are validated before use.
+It executes only `.probe-tools/.github/scripts/check-kavya-image-tag.sh`. The
+publisher pins both of its checkout invocations and all of its other actions to
+the same mappings. No application source ref is checked out or executed by the
+probe.
 
 ## Byte-exact read-only data flow
 
-Every capture resides in a newly created temporary directory, with traps that
-remove only that directory. Captured registry output is never printed. Contract
-bytes are never recovered through command substitution (`$(cat ...)`, `$(...)`)
-or line counting: expected bytes are written to temporary expected files and
-compared with `cmp -s`.
+Every capture is in a newly-created temporary directory that its trap removes.
+Captured registry output is never printed. Contract bytes are never recovered
+through command substitution or line counting; expected bytes are written with
+`printf` to temporary files and compared with `cmp -s`.
 
-1. Validate the event, default-branch ref/SHA/workflow binding, and both payload
-   values as above.
-2. Check out trusted tooling and initialize the publisher-parity Buildx and
-   read-only GHCR login actions.
-3. Run the trusted helper against the fixed-repository existing tag, capturing
-   stdout and stderr. Require exit `10`. Write exactly
-   `image_tag_state=existing\n` with `printf` to a temporary expected file and
-   require `cmp -s` against captured stdout. Any byte difference, including a
-   missing/final extra newline, whitespace, additional output, or NUL, fails.
-4. Pull that existing tag with stdout and stderr captured and suppressed. Inspect
-   only `org.opencontainers.image.revision`, also with both streams captured.
-   Write `expected_revision` plus exactly one newline to a temporary expected
-   file and require `cmp -s` against inspect stdout. Do not assign captured
-   inspection bytes to a shell variable.
-5. Derive and validate the canary, then run the same trusted helper with streams
-   captured. Require exit `0`; compare stdout with a temporary file containing
-   exactly `image_tag_state=absent\n` via `cmp -s`.
-6. Emit only fixed markers: `probe_version=1`, `existing_tag_state=pass`,
-   `existing_revision=pass`, `canary_state=pass`, and `probe_result=pass`.
+1. Perform the terminal context and payload validation above.
+2. Check out trusted tooling, run pinned Buildx setup, and perform pinned
+   read-only GHCR login.
+3. Run the trusted helper on the fixed-repository existing tag with both streams
+   captured. Require exit `10`, and compare stdout byte-for-byte to a temporary
+   file containing `image_tag_state=existing\n`. A missing or extra final
+   newline, whitespace, output, or NUL fails.
+4. Pull that existing tag with both streams captured and suppressed. Inspect
+   only `org.opencontainers.image.revision`, capture both streams, and compare
+   stdout byte-for-byte to `expected_revision` followed by one newline.
+5. Derive the canary only from validated repository ID, run ID, and attempt as
+   `probe-<repository-id>-<run-id>-<attempt>`. Validate its digits-only shape
+   and maximum tag length, run the helper, require exit `0`, and compare stdout
+   byte-for-byte to `image_tag_state=absent\n`; the same byte-exact failure
+   rules apply.
+6. Only after every check succeeds, emit the validated non-secret
+   `existing_tag` and `expected_revision` values and the fixed markers
+   `probe_version=1`, `existing_tag_state=pass`, `existing_revision=pass`,
+   `canary_state=pass`, and `probe_result=pass`.
 
-Any unexpected exit, mismatched byte sequence, helper failure, authentication or
-authorization issue, network/DNS/TLS/rate-limit/server error, malformed
-metadata, unexpected event context, or ambiguous registry result fails closed.
-An existing canary fails without overwrite, deletion, or cleanup. Failure output
-is generic and fixed; it contains no raw registry errors, token material, layer
-progress, image configuration, payload data, or captured bytes.
+The complete payload-derived output contract is therefore the two validated
+forms `existing_tag=[0-9a-f]{7}` and `expected_revision=[0-9a-f]{40}` plus the
+fixed markers above. Safe runtime-evidence lines are limited separately to the
+fixed requested runner label, the constrained documented runner OS/architecture,
+and the restricted Buildx-version format. It must not emit raw JSON, any other
+payload field, registry output, token material, layer progress, image
+configuration, or captured bytes. Any unexpected exit, differing byte,
+malformed metadata, authentication/authorization error, or network, DNS, TLS,
+rate-limit, server, or ambiguous registry result fails closed with only generic
+fixed failure output. An existing canary fails without overwrite, deletion, or
+cleanup.
 
 ## Shared helper hardening
 
-`check-kavya-image-tag.sh` remains the one shared classifier for both the probe
-and immutable publisher. Immediately after `docker buildx imagetools inspect`
-finishes and before either returning `existing` or loading/classifying the
-captured result into a shell variable, it must detect literal NUL bytes in the
-capture using a byte-safe operation (for example, `LC_ALL=C od -An -tx1 -v`
-followed by an exact `00`-byte-token check). A NUL causes only
-`image_tag_state=probe_failed` and exit `1`.
+`check-kavya-image-tag.sh` remains the shared classifier for probe and
+publisher. Immediately after `docker buildx imagetools inspect` finishes and
+before returning `existing` or loading/classifying the capture into a shell
+variable, it must detect literal NUL bytes with a byte-safe operation (for
+example `LC_ALL=C od -An -tx1 -v` and an exact `00` token check). A NUL returns
+only `image_tag_state=probe_failed` and exit `1`, including when Docker exits
+successfully.
 
-The helper must not load a NUL-bearing file into `registry_error`: Bash command
-substitution cannot preserve NUL bytes and would make classification ambiguous.
-After the NUL check, its existing exact absent-message allowlist and
-authorization/network/ambiguous-error rejection remain fail-closed. It still
-never echoes registry output. This applies even when Docker exits successfully,
-so an anomalous capture cannot be reported as `existing`.
+The helper must never load a NUL-bearing file into `registry_error`: Bash
+command substitution cannot preserve NUL bytes. After that check, its exact
+absent-message allowlist and authorization/network/ambiguous-error rejection
+remain fail-closed, and it never echoes registry output.
+
+## Runner and Buildx evidence
+
+Both workflows use `ubuntu-24.04` and `timeout-minutes: 30`. The probe records
+the fixed requested label and the documented `${{ runner.os }}` and
+`${{ runner.arch }}` values after constraining them to the expected
+`Linux`/`X64` forms. It does not read, require, or expose undocumented
+`ImageOS` or `ImageVersion` environment variables.
+
+The Buildx provenance is the pinned `docker/setup-buildx-action` commit above.
+The workflow records the successful `docker buildx version` result in a
+restricted safe format as diagnostic evidence of what that pinned setup action
+installed; no post-run metadata proves an uncompromised action or runner.
+Acceptance also retains GitHub's generated `Set up job` log block, including
+its image/version information, as run evidence only. The hosted runner image
+remains mutable residual trust and the design makes no immutability claim for
+it.
+
+The trust guarantees in this design are conditional on GitHub's execution
+environment and the pinned action commits being uncompromised. Pinning removes
+mutable tag resolution from both the read-only probe and write-capable
+publisher; it cannot make compromised code or a compromised hosted runner safe.
 
 ## Tests and implementation sequence
 
 Implementation starts RED and turns GREEN. `Kavya/tests/test_smartpbx_deployment.py`
-will statically parse the workflow with `yaml.BaseLoader` and dynamically execute
-named workflow shell steps with local fake tools; no test contacts a registry.
-It must cover:
+statically parses both workflows with `yaml.BaseLoader` and dynamically runs
+named shell steps with local fake tools; no test contacts a registry. It must
+cover:
 
-- exactly the `repository_dispatch` trigger and
-  `kavya_image_read_only_probe` type, no `workflow_dispatch`, and the
-  default-branch event/ref/SHA/workflow-ref defense-in-depth checks;
-- payload field schema, exact validation and tag/revision binding before every
-  checkout, setup, login, or registry operation;
-- one job, static concurrency, exactly the two read permissions, trusted
-  `github.workflow_sha` tooling checkout, and no source/input checkout;
-- byte-exact `cmp -s` expected-file checks for existing stdout, absent stdout,
-  and OCI revision stdout, with no command substitution of captured contract
-  bytes;
-- fixed-repository existing probe, internal canary derivation, and exact `10`
-  existing / `0` absent exit contracts;
-- literal-NUL regression cases for helper captures on both Docker-success
-  (`existing`) and Docker-failure (`absent`) paths; workflow existing and canary
-  marker captures; and the inspect-revision capture. The harness must write real
-  NUL bytes and use binary subprocess/file assertions rather than text-mode
-  environment variables or strings that cannot represent NUL;
-- suppression of captured errors, markers, revision bytes, pull output, inspect
-  output, secrets, and image configuration; and
-- no build, push, tag mutation, package write, deploy, SSH, host, dashboard,
+- the exact dispatch-only trigger/type and each terminal trust check, including
+  negative tests for either repository identity mismatch, non-main default
+  branch/ref/ref name/ref type, false protection, non-lowercase/non-40-hex or
+  unequal SHA values, and incorrect workflow ref; it rejects any use of
+  `github.event.branch` and proves every failure precedes checkout, setup,
+  login, or registry tooling;
+- the dispatcher has `set -Eeuo pipefail`, terminal validation before `gh api`,
+  no ref/SHA selector, and exactly the validated payload keys;
+- exact payload object/schema/binding checks, and a summary allowlist that
+  accepts only the two validated forms and fixed markers while rejecting
+  unvalidated or additional payload output;
+- one probe job, static concurrency, `ubuntu-24.04`, `timeout-minutes: 30`,
+  exactly the two read permissions, `github.workflow_sha` tooling checkout,
+  no source/input checkout, and no `ImageOS`/`ImageVersion` contract;
+- every probe and publisher action use is exactly the four documented full SHA
+  pins with retained version comments; both workflows have the fixed runner
+  label and timeout, and the publisher has no dispatch change;
+- byte-exact `cmp -s` expected-file checks for existing, absent, and OCI
+  revision stdout, without command substitution of captured contract bytes;
+- fixed-repository existing probe, internal canary derivation, exact exit `10`
+  existing / `0` absent contracts, and the scope ban on build/push/tag mutation
+  in the probe;
+- literal-NUL helper captures on Docker-success and Docker-failure paths plus
+  workflow existing/canary marker and inspect-revision captures. The harness
+  writes real NUL bytes and uses binary subprocess/file assertions; and
+- suppression of captured errors, markers, revision bytes, pull output,
+  secrets, and image configuration; no probe deploy, SSH, host, dashboard,
   environment, transfer, or MCP action.
 
-Existing publisher tests must continue to prove the publisher treats helper
-failure as fail-closed and does not write after a NUL-induced `probe_failed`.
-No dynamic registry test is introduced.
+Existing publisher tests continue to prove helper failures, including a
+NUL-induced `probe_failed`, block writing. No dynamic registry test is added.
 
-## Residual supply-chain risk and acceptance
+## Acceptance and rollback
 
-`actions/checkout@v7`, `docker/setup-buildx-action@v4`,
-`docker/login-action@v4`, and `ubuntu-latest` are mutable action/runner channel
-references, not immutable pins. This is an explicit residual risk. The workflow
-records only safe evidence: workflow commit SHA, declared action references,
-runner image/version metadata, actual Buildx version, and fixed pass markers.
-Human review compares those values and the setup-log resolved action SHAs;
-changed resolution or unexpected runner/Buildx metadata fails acceptance. This
-task does not repin publisher actions.
+After exact-head CI, secret scanning, and independent review approve the
+merged protected-main revision, the trusted operator sends the documented
+dispatch without a ref selector. Acceptance requires the validated
+`existing_tag=37bfaf0`,
+`expected_revision=37bfaf02f04ce7614b9674b1c867b78ab3c7d414`, every fixed pass
+marker, the pinned-action resolution, the requested runner label and documented
+runner context values, Buildx diagnostic, and the GitHub-generated `Set up job`
+image/version block. This evidence is point-in-time only and does not establish
+future tag immutability or action/runner compromise resistance.
 
-Acceptance is main-only: after exact-head CI, secret scanning, and independent
-review approve the merged protected-default-branch revision, the trusted
-operator dispatches the documented event without a ref selector. Acceptance
-requires all fixed pass markers and the stated existing tag/revision. Only then
-may a separate reviewed publisher run be considered for SHA `69ec0b3`.
-
-Rollback is to stop using the probe, correct it in a reviewed protected-branch
-change, and rerun the read-only gate. No registry or production state exists to
-undo.
+Only then may the separately reviewed publisher be considered for SHA
+`69ec0b3`. Rollback is to stop using the probe, correct it in a reviewed
+protected-main change, and rerun the read-only gate. There is no probe-created
+registry or production state to undo.
 
 ## Sources and decision notes
 
-- GitHub documents `repository_dispatch` type filtering, payload availability,
-  default-branch workflow-file requirement, and default-branch `GITHUB_REF` /
-  `GITHUB_SHA` resolution: https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#repository_dispatch
-- GitHub documents the dispatch REST endpoint, `event_type`, `client_payload`,
-  and fine-grained token requirement of Contents write:
-  https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event
-- GitHub documents that each Actions job receives a repository-limited,
-  short-lived `GITHUB_TOKEN`; job-token permissions are not caller
-  authorization: https://docs.github.com/en/actions/concepts/security/github_token
-- GitHub documents workflow-context values including workflow SHA/ref used by
-  the defense-in-depth binding:
-  https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#github-context
+- GitHub event semantics for `repository_dispatch`: https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#repository_dispatch
+- GitHub contexts, including ref, workflow identity, runner, and token
+  contexts: https://docs.github.com/en/actions/reference/workflows-and-actions/contexts
+- GitHub secure-use guidance for full-length action commit SHAs: https://docs.github.com/en/actions/how-tos/security-for-github-actions/security-guides/security-hardening-your-deployments
+- GitHub token permissions and access model: https://docs.github.com/en/actions/concepts/security/github_token
+- GitHub CLI `gh api` manual: https://cli.github.com/manual/gh_api
+- GitHub-hosted runner labels and lifecycle: https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+- Official tag sources, resolved on 2026-08-08: https://github.com/actions/checkout/tree/v7, https://github.com/docker/setup-buildx-action/tree/v4, https://github.com/docker/login-action/tree/v4, and https://github.com/docker/build-push-action/tree/v7
 
 ## Self-review
 
-There are no placeholders. The trigger, event type, protected-default-branch
-resolution, pre-tooling validation, caller/job authorization distinction,
-payload shapes, exact binding, byte-exact comparisons, NUL handling, test
-coverage, residual action/runner risk, safe summary, main-only acceptance, and
-read-only scope agree. `workflow_dispatch` is not an alternate trigger, and no
-step creates, writes, publishes, deploys, transfers, or contacts a host.
+There are no placeholders. Scope, trust validation, dispatcher fail-fast
+behavior, token claims, full action pins, explicit runner/timeout, byte-exact
+and NUL protections, safe acceptance output, point-in-time tag evidence,
+publisher constraints, tests, acceptance, rollback, and official sources agree.
+The probe has no registry write, deploy, host, transfer, or MCP scope.
