@@ -439,11 +439,11 @@ async def test_kb_retrieval_runs_off_the_event_loop(monkeypatch):
 def _fake_google_speech(on_stream):
     """Minimal stand-in for the google-cloud-speech surface _run_one_stream uses."""
 
-    class AudioEncoding:
+    class _AudioEncoding:
         MULAW = "MULAW"
 
     class RecognitionConfig:
-        AudioEncoding = AudioEncoding
+        AudioEncoding = _AudioEncoding
 
         def __init__(self, **_kwargs):
             pass

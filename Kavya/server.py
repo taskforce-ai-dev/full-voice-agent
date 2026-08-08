@@ -2425,7 +2425,21 @@ class GoogleSTTStream:
                 time.sleep(backoff)
 
     def _run_one_stream(self):
+        # Google caps a streaming_recognize call at ~5 minutes, so this runs many
+        # times per long call. Each client owns a gRPC channel, fds and
+        # completion-queue threads, so it must be released every time.
         client = google_speech.SpeechClient()
+        try:
+            self._stream_until_closed(client)
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.warning("STT client close failed", exc_info=True)
+
+    def _stream_until_closed(self, client):
         primary = STT_PRIMARY.get(self._lang, "si-LK")
         alternatives = STT_ALTERNATIVES.get(self._lang, ["en-US"])
         config = google_speech.StreamingRecognitionConfig(
@@ -3076,7 +3090,9 @@ class MediaStreamSession:
 
     async def _process_utterance_bound(self, text: str):
         try:
-            kb_context = retrieve_context(text)
+            # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
+            # this loop is shared by every concurrent call, so keep it off-loop.
+            kb_context = await asyncio.to_thread(retrieve_context, text)
         except Exception:
             logger.exception("KB retrieval failed")
             kb_context = ""
