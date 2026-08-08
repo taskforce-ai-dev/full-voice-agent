@@ -7,6 +7,7 @@ the shared MediaStreamSession/GoogleSTTStream out entirely.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 
@@ -74,6 +75,119 @@ async def test_finish_stops_stt_off_the_event_loop_thread():
         "STT stop() joins a worker thread for up to 5s; running it on the event "
         "loop freezes audio and timers for every other concurrent call"
     )
+
+
+class FailingSocket:
+    """A peer whose send_text starts raising after `ok_sends` frames."""
+
+    def __init__(self, ok_sends: int = 0) -> None:
+        self.ok_sends = ok_sends
+        self.sent = 0
+        self.headers = {"X-Kavya-SmartPBX-Token": "token"}
+        self.accepted = False
+        self.close_calls: list[tuple[int, str]] = []
+        self.messages: asyncio.Queue[str] = asyncio.Queue()
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def receive_text(self) -> str:
+        return await self.messages.get()
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.close_calls.append((code, reason))
+
+    async def send_text(self, _message: str) -> None:
+        if self.sent >= self.ok_sends:
+            raise RuntimeError("SENTINEL_WIRE_ERROR")
+        self.sent += 1
+
+
+def _transport(socket, frames: int = 8):
+    from smartpbx_transport import SmartPBXMediaTransport
+
+    return SmartPBXMediaTransport(socket, CONTEXT, max_queue_frames=frames)
+
+
+@pytest.mark.asyncio
+async def test_transport_records_a_dead_sender_instead_of_going_silent():
+    socket = FailingSocket()
+    transport = _transport(socket)
+    transport.start()
+
+    await transport.send_audio(b"\xff" * 160)
+    await asyncio.wait_for(transport.wait_send_failed(), timeout=1)
+
+    assert transport.send_failed is True, (
+        "a send_text exception kills the sender task; is_active then makes every "
+        "later send_audio a silent no-op with nothing signalled to the session"
+    )
+    assert transport.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_transport_close_survives_a_dead_sender_and_drains():
+    socket = FailingSocket()
+    transport = _transport(socket)
+    transport.start()
+    await transport.send_audio(b"\xff" * 160)
+    await asyncio.wait_for(transport.wait_send_failed(), timeout=1)
+    await transport.send_audio(b"\xff" * 160)
+
+    await transport.close()  # must not re-raise the sender's stored exception
+
+    assert transport._queue.empty(), "close() must still drain the queue"
+
+
+@pytest.mark.asyncio
+async def test_gateway_ends_the_call_when_the_outbound_sender_dies():
+    from dataclasses import replace
+
+    from smartpbx_gateway import (
+        SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings,
+    )
+
+    settings = replace(
+        SmartPBXSettings.from_env({
+            "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+            "SMARTPBX_ACCOUNT_ID": "account-1",
+        }),
+        idle_timeout_seconds=90,
+    )
+    socket = FailingSocket()
+    socket.messages.put_nowait(json.dumps({"event": "start", "start": {
+        "callId": "call-1", "otherLegCallId": "other-1",
+        "callerIdNumber": "caller", "calleeIdNumber": "callee",
+        "accountId": "account-1",
+        "mediaFormat": {"encoding": "g711_ulaw", "sampleRate": 8000},
+    }}))
+
+    class Session:
+        def __init__(self, transport) -> None:
+            self._transport = transport
+            self.transfer_pending = False
+            self.terminal_future = asyncio.get_running_loop().create_future()
+            self.finishes = 0
+
+        async def start(self) -> None:
+            await self._transport.send_audio(b"\xff" * 160)
+
+        async def feed_audio(self, _audio) -> None:
+            pass
+
+        async def finish(self, schedule_post_call: bool = False) -> None:
+            self.finishes += int(schedule_post_call)
+
+    async def factory(_context, transport, _sink=None):
+        return Session(transport)
+
+    gateway = SmartPBXGateway(settings, SmartPBXSessionRegistry(4))
+    # Well under the 90s idle timeout: the call must end on the failure signal,
+    # not by leaving the guest in dead air until the socket times out.
+    await asyncio.wait_for(gateway.handle(socket, factory), timeout=5)
+
+    assert socket.close_calls, "the gateway must close the dead call"
+    assert gateway.snapshot()["active_sessions"] == 0
 
 
 def _failing_stt_loop(monkeypatch, failures: int = 10_000):
