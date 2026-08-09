@@ -562,8 +562,35 @@ STT_ALTERNATIVES: dict[str, list[str]] = {
     "ar": ["en-US"],
 }
 
-# Silence (seconds) after last STT result before utterance is considered complete
-ENDPOINTING_SILENCE: float = 1.5
+def _parse_endpointing_seconds(
+    environ, name: str, default: float, minimum: float, maximum: float
+) -> float:
+    """Read a float endpointing duration from the environment, clamped.
+
+    A missing, blank, or unparseable value falls back to the default; a value
+    outside the range is clamped rather than rejected, so a mis-set knob can
+    never arm a zero-length or runaway timer.
+    """
+    raw = environ.get(name, "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+# Endpointing timers. A provider FINAL (Azure `recognized`) has already
+# segmented the utterance, so it flushes after a short grace that only guards
+# against a mid-thought continuation ("a room" ... "for next weekend"). The
+# longer silence timer is the fallback for the interim-only path, where the
+# provider (typically Google) never fires a final and we endpoint ourselves.
+# Both are env-tunable and clamped.
+ENDPOINTING_SILENCE: float = _parse_endpointing_seconds(
+    os.environ, "STT_ENDPOINTING_SILENCE_SECONDS", 1.0, 0.2, 5.0
+)
+STT_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "STT_FINAL_GRACE_SECONDS", 0.5, 0.05, 5.0
+)
 
 # Bounds on restarting a failed STT stream. Google caps a streaming_recognize
 # call at ~5 minutes, so healthy restarts are normal and must stay cheap; a
@@ -2707,6 +2734,11 @@ class MediaStreamSession:
         self._speak_generation: int = 0
 
         self._pending_transcript = ""
+        # Text from provider finals in the current utterance. Interims of a later
+        # segment are appended to this so a mid-utterance continuation keeps the
+        # already-committed words. Empty on the interim-only path (Google), where
+        # each cumulative interim simply overwrites the pending text.
+        self._committed_transcript = ""
         self._latest_interim = ""
         self._endpointing_handle: asyncio.TimerHandle | None = None
         self._stt: GoogleSTTStream | AzureSTTStream | None = None
@@ -2742,6 +2774,7 @@ class MediaStreamSession:
             self._endpointing_handle.cancel()
             self._endpointing_handle = None
         self._pending_transcript = ""
+        self._committed_transcript = ""
         self._latest_interim = ""
         self._is_speaking = False
         self._speak_generation += 1
@@ -2923,6 +2956,7 @@ class MediaStreamSession:
         self._cancel_reprompt()
         self._speak_generation += 1
         self._pending_transcript = ""
+        self._committed_transcript = ""
         self._latest_interim = ""
         if self._endpointing_handle:
             self._endpointing_handle.cancel()
@@ -3058,41 +3092,53 @@ class MediaStreamSession:
         # the re-prompt counter so future silences start fresh.
         self._cancel_reprompt()
         self._reprompt_count = 0
-        self._pending_transcript = (
-            self._pending_transcript + " " + text
-            if self._pending_transcript
+        # Provider finals commit across segments of one utterance.
+        self._committed_transcript = (
+            self._committed_transcript + " " + text
+            if self._committed_transcript
             else text
         )
-        if self._endpointing_handle:
-            self._endpointing_handle.cancel()
-        self._endpointing_handle = self._event_loop.call_later(
-            ENDPOINTING_SILENCE,
-            lambda: asyncio.ensure_future(self._flush_transcript()),
-        )
+        self._pending_transcript = self._committed_transcript
+        # The provider already segmented, so wait only a short grace for a
+        # mid-thought continuation rather than the full interim-fallback timer.
+        self._arm_endpointing(STT_FINAL_GRACE_SECONDS)
 
     async def _set_transcript_interim(self, text: str):
-        """Overwrite (not append) pending transcript with latest interim; reset timer."""
+        """Set pending to the latest interim (over the committed finals); reset timer."""
         if self.transfer_pending:
             return
         # Caller is speaking — cancel any pending silence nudge and reset
         # the re-prompt counter.
         self._cancel_reprompt()
         self._reprompt_count = 0
-        self._pending_transcript = text
+        # Preserve any committed finals from earlier segments; on the interim-only
+        # path there are none, so this is a plain overwrite of the cumulative
+        # interim as before.
+        self._pending_transcript = (
+            self._committed_transcript + " " + text
+            if self._committed_transcript
+            else text
+        )
+        # No final has segmented this, so use the longer self-endpointing timer.
+        self._arm_endpointing(ENDPOINTING_SILENCE)
+
+    def _arm_endpointing(self, delay: float) -> None:
         if self._endpointing_handle:
             self._endpointing_handle.cancel()
         self._endpointing_handle = self._event_loop.call_later(
-            ENDPOINTING_SILENCE,
+            delay,
             lambda: asyncio.ensure_future(self._flush_transcript()),
         )
 
     async def _flush_transcript(self):
         if self.transfer_pending:
             self._pending_transcript = ""
+            self._committed_transcript = ""
             self._latest_interim = ""
             return
         transcript = self._pending_transcript.strip()
         self._pending_transcript = ""
+        self._committed_transcript = ""
         self._latest_interim = ""
         self._endpointing_handle = None
         if not transcript:
