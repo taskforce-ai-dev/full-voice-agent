@@ -2600,3 +2600,28 @@ def test_publisher_resolve_digest_says_which_check_failed(tmp_path, overrides, m
     assert result.returncode == 1
     assert f"resolve_digest={marker}" in result.stderr, result.stderr
     assert outputs == ""
+
+
+def test_stt_endpointing_knobs_are_deliverable_through_the_documented_path():
+    # The smartpbx service uses an explicit environment allowlist, so an env var
+    # that is set but not listed here never reaches the container -- exactly the
+    # KAVYA_EN_ELEVENLABS_VOICE_ID class of bug. The kavya (Twilio) service uses
+    # env_file: .env, so .env.example is its passthrough.
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
+    kavya = compose["services"]["kavya"]
+    assert ".env" in kavya["env_file"], "the Twilio service forwards .env vars via env_file"
+
+    for name in ("STT_ENDPOINTING_SILENCE_SECONDS", "STT_FINAL_GRACE_SECONDS"):
+        assert smartpbx_env.get(name) == f"${{{name}}}", (
+            f"{name} must be in the smartpbx environment allowlist to reach the container"
+        )
+
+    example = read_text(".env.example")
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    for name, default in (
+        ("STT_ENDPOINTING_SILENCE_SECONDS", "1.0"),
+        ("STT_FINAL_GRACE_SECONDS", "0.5"),
+    ):
+        assert f"{name}={default}" in example, f"{name} missing from .env.example"
+        assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
