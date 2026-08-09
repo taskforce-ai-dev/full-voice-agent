@@ -326,9 +326,13 @@ class SmartPBXGateway:
                                 cancellation = error
                                 sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.CANCELLED, DiagnosticFailureClass.CANCELLED)
                     close_failed = not close_task.result()
-                    if close_failed:
+                    # A courtesy close that raises because the peer already closed
+                    # a completed call is not a degradation — it is the normal end
+                    # of a clean hangup. Only flag a close fault when the call did
+                    # not otherwise complete.
+                    if close_failed and not completed_normally:
                         sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DEGRADED, DiagnosticFailureClass.WEBSOCKET_CLOSE)
-                if completed_normally and cancellation is None and not cleanup_degraded and not close_failed:
+                if completed_normally and cancellation is None and not cleanup_degraded:
                     sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
             finally:
                 sink_enabled = False
