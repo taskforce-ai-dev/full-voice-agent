@@ -2592,6 +2592,12 @@ class AzureSTTStream:
             subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION,
         )
         speech_config.speech_recognition_language = primary
+        # FOLLOW-UP (not applied here): Azure's own segmentation silence
+        # (PropertyId.Speech_SegmentationSilenceTimeoutMs, ~500ms default) is the
+        # ~549ms measured interim→final gap before our grace even starts. Lowering
+        # it would cut more latency, but it changes recognition segmentation and
+        # cannot be verified without live Azure, so it is left for a measured,
+        # separately-tested change rather than forced blind.
         # 8 kHz / 16-bit / mono PCM — what mulaw decodes to.
         fmt = azure_speech.audio.AudioStreamFormat(
             samples_per_second=8000, bits_per_sample=16, channels=1,
