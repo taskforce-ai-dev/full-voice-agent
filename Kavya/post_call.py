@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import date
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,28 @@ Return ONLY the JSON object."""
 
 EXTRACTION_USER_TEMPLATE: str = "Transcript:\n\n{transcript}"
 
+# Prepended to the extraction prompts so the model resolves spoken dates against
+# the real current date instead of guessing the year. Mirrors the live in-call
+# prompt's "Today's date is <iso>." Without it, a bare month/day was resolved to
+# a past year (a 2026 call booking "27 September" as 2025).
+_DATE_ANCHOR_TEMPLATE: str = (
+    "Today's date is {today}. Resolve every relative or spoken date "
+    "(\"next Friday\", \"this weekend\", \"the 27th of September\") against this "
+    "date. A month and day with no spoken year refer to the next such date on or "
+    "after today, so the year is the current year or the next one — never a past "
+    "year.\n\n"
+)
+
+
+def build_extraction_system_prompt(today: str) -> str:
+    """Render the primary extraction system prompt anchored to ``today`` (ISO)."""
+    return _DATE_ANCHOR_TEMPLATE.format(today=today) + EXTRACTION_SYSTEM_PROMPT
+
+
+def build_retry_prompt(today: str) -> str:
+    """Render the simplified retry prompt anchored to ``today`` (ISO)."""
+    return _DATE_ANCHOR_TEMPLATE.format(today=today) + RETRY_PROMPT
+
 # ---------------------------------------------------------------------------
 # Property / room vocabulary
 #
@@ -160,12 +183,13 @@ async def _extract_with_claude(
     client: Any,
     transcript_text: str,
     model: str,
+    system_prompt: str,
 ) -> dict[str, Any]:
     """Extract booking details using Anthropic Claude."""
     response = await client.messages.create(
         model=model,
         max_tokens=EXTRACTION_MAX_TOKENS,
-        system=EXTRACTION_SYSTEM_PROMPT,
+        system=system_prompt,
         messages=[
             {"role": "user", "content": EXTRACTION_USER_TEMPLATE.format(transcript=transcript_text)},
         ],
@@ -178,13 +202,14 @@ async def _extract_with_openai(
     client: Any,
     transcript_text: str,
     model: str,
+    system_prompt: str,
 ) -> dict[str, Any]:
     """Extract booking details using OpenAI."""
     response = await client.chat.completions.create(
         model=model,
         max_tokens=EXTRACTION_MAX_TOKENS,
         messages=[
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": EXTRACTION_USER_TEMPLATE.format(transcript=transcript_text)},
         ],
     )
@@ -196,6 +221,7 @@ async def _extract_with_gemini(
     client: Any,
     transcript_text: str,
     model: str,
+    system_prompt: str,
 ) -> dict[str, Any]:
     """Extract booking details using Google Gemini native SDK."""
     from google.genai import types as genai_types
@@ -204,7 +230,7 @@ async def _extract_with_gemini(
         model=model,
         contents=EXTRACTION_USER_TEMPLATE.format(transcript=transcript_text),
         config=genai_types.GenerateContentConfig(
-            system_instruction=EXTRACTION_SYSTEM_PROMPT,
+            system_instruction=system_prompt,
             max_output_tokens=EXTRACTION_MAX_TOKENS,
             response_mime_type="application/json",
         ),
@@ -241,18 +267,23 @@ async def extract_booking_details(
         "summary": "Extraction failed — see transcript for details.",
     }
 
+    # Anchor at call time so the model never guesses the year (and so the anchor
+    # is not frozen into a module constant at import).
+    system_prompt = build_extraction_system_prompt(date.today().isoformat())
+
     try:
         if llm_provider == "claude" and anthropic_client:
             result = await _extract_with_claude(
                 anthropic_client, transcript_text, model or "claude-sonnet-4-5-20250929",
+                system_prompt,
             )
         elif llm_provider == "openai" and openai_client:
             result = await _extract_with_openai(
-                openai_client, transcript_text, model or "gpt-4o",
+                openai_client, transcript_text, model or "gpt-4o", system_prompt,
             )
         elif llm_provider == "gemini" and gemini_client:
             result = await _extract_with_gemini(
-                gemini_client, transcript_text, model or "gemini-2.5-flash",
+                gemini_client, transcript_text, model or "gemini-2.5-flash", system_prompt,
             )
         else:
             if privacy_safe:
@@ -323,7 +354,7 @@ async def _retry_extraction(
     privacy_safe: bool = False,
 ) -> dict[str, Any] | None:
     """Retry extraction with a shorter prompt if the first attempt failed."""
-    prompt = f"{RETRY_PROMPT}\n\nTranscript:\n{transcript_text}"
+    prompt = f"{build_retry_prompt(date.today().isoformat())}\n\nTranscript:\n{transcript_text}"
     try:
         if llm_provider == "gemini" and gemini_client:
             from google.genai import types as genai_types

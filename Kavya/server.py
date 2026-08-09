@@ -2747,6 +2747,13 @@ class MediaStreamSession:
         self._committed_transcript = ""
         self._latest_interim = ""
         self._endpointing_handle: asyncio.TimerHandle | None = None
+        # Held for the duration of one guest turn (dispatch → agent finishes
+        # responding). A stale endpointing timer or a late final/interim that
+        # fires while a turn is in flight must not start a second llm_round.
+        # The monotonic turn id lets an in-flight turn's own flush release the
+        # guard without clobbering a newer turn started by a barge-in.
+        self._utterance_dispatched = False
+        self._utterance_turn = 0
         self._stt: GoogleSTTStream | AzureSTTStream | None = None
 
         # Live-call audio capture (mulaw chunks) for offline STT benchmarking.
@@ -2782,6 +2789,8 @@ class MediaStreamSession:
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
+        self._utterance_dispatched = False
+        self._utterance_turn += 1
         self._is_speaking = False
         self._speak_generation += 1
         await self._clear_media_audio(force=True)
@@ -2964,6 +2973,11 @@ class MediaStreamSession:
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
+        # The guest interrupted: a new turn begins, so release the guard now even
+        # though the interrupted turn's _process_utterance has not unwound yet.
+        # Bumping the turn id stops that stale turn's finally from clobbering it.
+        self._utterance_dispatched = False
+        self._utterance_turn += 1
         if self._endpointing_handle:
             self._endpointing_handle.cancel()
             self._endpointing_handle = None
@@ -3142,6 +3156,11 @@ class MediaStreamSession:
             self._committed_transcript = ""
             self._latest_interim = ""
             return
+        # Exactly-once: a turn is already dispatched and the agent is responding.
+        # A stale timer or a late final/interim of the same utterance that fires
+        # now must not start a second llm_round.
+        if self._utterance_dispatched:
+            return
         transcript = self._pending_transcript.strip()
         self._pending_transcript = ""
         self._committed_transcript = ""
@@ -3149,12 +3168,23 @@ class MediaStreamSession:
         self._endpointing_handle = None
         if not transcript:
             return
+        # Claim the turn synchronously, before any await, so a concurrently-queued
+        # flush task sees the guard set and bails.
+        self._utterance_dispatched = True
+        self._utterance_turn += 1
+        turn = self._utterance_turn
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=guest_utterance")
         else:
             logger.info("Guest [%s]: %s", self.call_sid, transcript)
         self.full_transcript.append({"role": "user", "text": transcript})
-        await self._process_utterance(transcript)
+        try:
+            await self._process_utterance(transcript)
+        finally:
+            # Release only if a barge-in (or transfer) has not already started a
+            # newer turn; otherwise that newer turn owns the guard.
+            if self._utterance_turn == turn:
+                self._utterance_dispatched = False
 
     # â”€â”€ Utterance â†’ KB + Claude + TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 

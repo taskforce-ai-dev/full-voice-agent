@@ -489,7 +489,11 @@ class _CloseFaultWebSocket(FakeWebSocket):
 
 
 @pytest.mark.asyncio
-async def test_gateway_websocket_close_fault_is_once_and_requires_fixed_degraded_tuple(caplog):
+async def test_gateway_completed_call_is_not_degraded_when_the_peer_already_closed(caplog):
+    # A clean hangup: the caller (or carrier) closes the socket, so our courtesy
+    # close raises. The call still COMPLETED — it must not be labelled degraded,
+    # or every normal call (successful bookings included) reports a false fault
+    # and the diagnostic can no longer flag a real problem.
     registry = SmartPBXSessionRegistry(4)
     socket = _CloseFaultWebSocket([START, {"event": "stop"}])
     factory = Factory()
@@ -497,13 +501,28 @@ async def test_gateway_websocket_close_fault_is_once_and_requires_fixed_degraded
         await SmartPBXGateway(settings(), registry).handle(socket, factory)
     assert factory.sessions[0].finishes == [True]
     assert registry.snapshot()["released_total"] == 1
-    assert socket.close_attempts == 1
+    assert socket.close_attempts == 1, "teardown behaviour is unchanged: close is still attempted once"
     assert socket.close_calls == [(1000, "call ended")]
     assert_late_fault_sink_is_disabled(caplog, factory)
     assert [(r["stage"], r["outcome"], r["failure_class"]) for r in fixed_diagnostics(caplog)] == [
         ("session_start", "completed", "none"),
-        ("terminal_cleanup", "degraded", "websocket_close"),
+        ("terminal_cleanup", "completed", "none"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_close_fault_on_an_uncompleted_call_is_still_degraded(caplog):
+    # A close that fails on a call that did NOT complete cleanly is a genuine
+    # degradation and must still be flagged.
+    registry = SmartPBXSessionRegistry(4)
+    socket = _CloseFaultWebSocket([START, {"event": "future-event"}])
+    factory = Factory()
+    with caplog.at_level("INFO"):
+        await SmartPBXGateway(settings(), registry).handle(socket, factory)
+    assert socket.close_attempts == 1
+    tuples = [(r["stage"], r["outcome"], r["failure_class"]) for r in fixed_diagnostics(caplog)]
+    assert ("terminal_cleanup", "degraded", "websocket_close") in tuples
+    assert ("terminal_cleanup", "completed", "none") not in tuples
 
 
 @pytest.mark.asyncio
