@@ -2875,6 +2875,12 @@ class MediaStreamSession:
         self._speak_generation += 1
         await self._clear_media_audio(force=True)
 
+    def _cancel_dtmf_collection(self) -> None:
+        """Resolve any active keypad collection so its awaiter unwinds on teardown."""
+        collector = self._dtmf_collector
+        if collector is not None:
+            collector.cancel()
+
     async def feed_dtmf(self, digit: str) -> bool:
         """Feed a keypad digit to the active collector. True if it was consumed."""
         collector = self._dtmf_collector

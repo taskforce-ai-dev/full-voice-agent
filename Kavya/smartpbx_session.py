@@ -126,6 +126,11 @@ class KavyaSmartPBXSession:
             if pipeline is None:
                 return
             pipeline._cancel_reprompt()
+            # Resolve any in-flight keypad collection so its awaiting turn unwinds
+            # instead of hanging on the collector future.
+            cancel_dtmf = getattr(pipeline, "_cancel_dtmf_collection", None)
+            if cancel_dtmf is not None:
+                cancel_dtmf()
             endpointing_handle = getattr(pipeline, "_endpointing_handle", None)
             if endpointing_handle is not None:
                 endpointing_handle.cancel()
