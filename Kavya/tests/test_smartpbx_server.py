@@ -1766,6 +1766,148 @@ async def test_retained_non_english_multiround_transcript_preserves_legacy_conca
 
 
 @pytest.mark.asyncio
+async def test_interrupted_smartpbx_turn_appends_only_delivered_prefix_to_history_and_transcript():
+    import server
+
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport
+    )
+    pipeline._smartpbx_transfer_context = object()
+
+    pipeline._start_assistant_turn_delivery_tracking()
+    generation = pipeline._assistant_turn_generation
+    pipeline._record_generated_sentence("Welcome.")
+    await pipeline._send_tts_done(sentence="Welcome.", turn_generation=generation)
+    pipeline._record_generated_sentence("You have a special rate at this property.")
+    # No completion callback for this sentence simulates a mid-sentence
+    # interruption; it was generated but not actually spoken.
+    pipeline._append_assistant_history({
+        "role": "assistant",
+        "content": "Welcome. You have a special rate at this property.",
+    })
+    pipeline._append_assistant_turn_to_transcript(
+        "Welcome. You have a special rate at this property."
+    )
+
+    assert pipeline.history[-1] == {
+        "role": "assistant",
+        "content": "Welcome. [interrupted]",
+    }
+    assert pipeline.full_transcript[-1] == {
+        "role": "assistant",
+        "text": "Welcome. [interrupted]",
+    }
+    assert pipeline._delivered_sentences == ["Welcome."]
+
+
+@pytest.mark.asyncio
+async def test_uninterrupted_smartpbx_turn_appends_complete_text_to_history_and_transcript():
+    import server
+
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport
+    )
+    pipeline._smartpbx_transfer_context = object()
+
+    pipeline._start_assistant_turn_delivery_tracking()
+    generation = pipeline._assistant_turn_generation
+    pipeline._record_generated_sentence("Welcome.")
+    await pipeline._send_tts_done(sentence="Welcome.", turn_generation=generation)
+    pipeline._record_generated_sentence("You have a special rate at this property.")
+    await pipeline._send_tts_done(
+        sentence="You have a special rate at this property.",
+        turn_generation=generation,
+    )
+    pipeline._append_assistant_history({
+        "role": "assistant",
+        "content": "Welcome. You have a special rate at this property.",
+    })
+    pipeline._append_assistant_turn_to_transcript(
+        "Welcome. You have a special rate at this property."
+    )
+
+    assert pipeline.history[-1] == {
+        "role": "assistant",
+        "content": "Welcome. You have a special rate at this property.",
+    }
+    assert pipeline.full_transcript[-1] == {
+        "role": "assistant",
+        "text": "Welcome. You have a special rate at this property.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_delivered_sentence_state_resets_between_turns():
+    import server
+
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport
+    )
+    pipeline._smartpbx_transfer_context = object()
+
+    pipeline._start_assistant_turn_delivery_tracking()
+    pipeline._record_generated_sentence("One.")
+    await pipeline._send_tts_done(sentence="One.", turn_generation=pipeline._assistant_turn_generation)
+    assert pipeline._assistant_turn_generated_sentences == ["One."]
+    assert pipeline._delivered_sentences == ["One."]
+
+    pipeline._start_assistant_turn_delivery_tracking()
+    assert pipeline._assistant_turn_generated_sentences == []
+    assert pipeline._delivered_sentences == []
+
+    pipeline._record_generated_sentence("New turn sentence")
+    pipeline._append_assistant_history({
+        "role": "assistant",
+        "content": "New turn sentence",
+    })
+    pipeline._append_assistant_turn_to_transcript("New turn sentence")
+
+    assert pipeline.history[-1] == {
+        "role": "assistant",
+        "content": "[interrupted]",
+    }
+    assert pipeline.full_transcript[-1] == {
+        "role": "assistant",
+        "text": "[interrupted]",
+    }
+
+
+@pytest.mark.asyncio
+async def test_mid_sentence_interruption_does_not_record_in_delivered_list():
+    import server
+
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport
+    )
+    pipeline._smartpbx_transfer_context = object()
+
+    pipeline._start_assistant_turn_delivery_tracking()
+    first = pipeline._assistant_turn_generation
+    pipeline._record_generated_sentence("Welcome.")
+    await pipeline._send_tts_done(sentence="Welcome.", turn_generation=first)
+    pipeline._record_generated_sentence("This sentence is never spoken fully.")
+    pipeline._append_assistant_history({
+        "role": "assistant",
+        "content": "Welcome. This sentence is never spoken fully.",
+    })
+    pipeline._append_assistant_turn_to_transcript(
+        "Welcome. This sentence is never spoken fully.",
+    )
+
+    assert pipeline._assistant_turn_generated_sentences == [
+        "Welcome.",
+        "This sentence is never spoken fully.",
+    ]
+    assert pipeline._delivered_sentences == ["Welcome."]
+    assert "never spoken" not in pipeline._delivered_sentences
+    assert pipeline.history[-1]["content"] == "Welcome. [interrupted]"
+
+
+@pytest.mark.asyncio
 async def test_direct_tts_done_bargein_during_mark_does_not_rearm_reprompt():
     import server
 

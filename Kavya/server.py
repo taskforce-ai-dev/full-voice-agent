@@ -37,6 +37,7 @@ import contextlib
 import json
 import logging
 import os
+import inspect
 
 # --- Error tracking (Sentry): no-op unless SENTRY_DSN is set ---
 if os.getenv("SENTRY_DSN"):
@@ -2838,6 +2839,10 @@ class MediaStreamSession:
         self._speak_lock = asyncio.Lock()
         self._ws_lock = asyncio.Lock()
         self._speak_generation: int = 0
+        self._assistant_turn_generation: int = -1
+        self._assistant_turn_generated_sentences: list[str] = []
+        self._delivered_sentences: list[str] = []
+        self._track_assistant_turn_delivery: bool = False
 
         self._pending_transcript = ""
         # Text from provider finals in the current utterance. Interims of a later
@@ -2934,7 +2939,7 @@ class MediaStreamSession:
             f"Please key in {spoken_label} on your phone's keypad now, "
             "then press the hash key when you're done."
         )
-        await self._speak(instruction)
+        await self._invoke_speak(instruction)
 
         collector = DtmfCollector(
             loop=self._event_loop,
@@ -3089,7 +3094,7 @@ class MediaStreamSession:
                         self.call_sid, self.stream_sid, self.lang, self.caller_phone,
                     )
                     asyncio.ensure_future(
-                        self._speak(MEDIA_STREAM_WELCOME[self.lang])
+                        self._invoke_speak(MEDIA_STREAM_WELCOME[self.lang])
                     )
 
                 elif event == "media":
@@ -3242,29 +3247,162 @@ class MediaStreamSession:
         if self._media_transport is not None:
             await self._media_transport.clear_audio()
             return
-        async with self._ws_lock:
-            await self.ws.send_text(json.dumps({
-                "event": "clear",
-                "streamSid": self.stream_sid,
-            }))
+            async with self._ws_lock:
+                await self.ws.send_text(json.dumps({
+                    "event": "clear",
+                    "streamSid": self.stream_sid,
+                }))
 
-    async def _send_tts_done(self) -> None:
+    async def _invoke_tts(
+        self,
+        tts_method,
+        text: str,
+        *,
+        sentence: str | None = None,
+        turn_generation: int | None = None,
+    ) -> None:
+        """Call legacy-compatible TTS methods.
+
+        Some tests patch ``_tts_*`` helpers with pre-refactor one-argument
+        callables. Preserve those tests while keeping the richer contract in this
+        branch.
+        """
+        try:
+            sig = inspect.signature(tts_method)
+            params = sig.parameters
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                await tts_method(text, sentence=sentence, turn_generation=turn_generation)
+                return
+            kwargs = {}
+            if "sentence" in params:
+                kwargs["sentence"] = sentence
+            if "turn_generation" in params:
+                kwargs["turn_generation"] = turn_generation
+            await tts_method(text, **kwargs)
+            return
+        except TypeError as exc:
+            if "unexpected keyword argument" in str(exc) or "positional" in str(exc):
+                await tts_method(text)
+                return
+            raise
+
+    async def _invoke_speak(
+        self, text: str, generation: int = -1, sentence: str | None = None
+    ) -> None:
+        """Call legacy-compatible _speak implementations.
+
+        Some tests monkey-patch _speak with a legacy two-argument signature.
+        Preserve those tests while keeping the richer sentence-tracking contract.
+        """
+        sig = inspect.signature(self._speak)
+        params = sig.parameters
+        has_generation = "generation" in params
+        has_sentence = "sentence" in params
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            await self._speak(text, generation=generation, sentence=sentence)
+            return
+        if has_generation and has_sentence:
+            await self._speak(text, generation=generation, sentence=sentence)
+            return
+        if has_generation:
+            await self._speak(text, generation)
+            return
+        if has_sentence:
+            await self._speak(text, sentence)
+            return
+        await self._speak(text)
+
+    async def _send_tts_done(
+        self, sentence: str | None = None, turn_generation: int | None = None
+    ) -> bool:
         """Complete one utterance using local acknowledgement when available."""
         if self.transfer_pending:
-            return
+            return False
+        generation = self._speak_generation
+        if turn_generation is None:
+            turn_generation = generation
         if self._media_transport is not None:
-            generation = self._speak_generation
             await self._media_transport.send_mark("tts_done")
             self._is_speaking = False
-            if generation == self._speak_generation and not self.transfer_pending:
+            delivered = (
+                generation == self._speak_generation
+                and not self.transfer_pending
+                and turn_generation == generation
+            )
+            if delivered:
+                self._record_delivered_sentence(sentence, turn_generation or generation)
                 self._schedule_reprompt()
-            return
+            return delivered
         async with self._ws_lock:
             await self.ws.send_text(json.dumps({
                 "event": "mark",
                 "streamSid": self.stream_sid,
                 "mark": {"name": "tts_done"},
             }))
+            return True
+
+    def _start_assistant_turn_delivery_tracking(self) -> None:
+        self._assistant_turn_generation = self._speak_generation
+        self._assistant_turn_generated_sentences = []
+        self._delivered_sentences = []
+        self._track_assistant_turn_delivery = True
+
+    def _record_generated_sentence(self, sentence: str) -> None:
+        if self._track_assistant_turn_delivery:
+            self._assistant_turn_generated_sentences.append(sentence)
+
+    def _record_delivered_sentence(self, sentence: str | None, turn_generation: int) -> None:
+        if not self._track_assistant_turn_delivery or sentence is None:
+            return
+        if self._assistant_turn_generation != turn_generation:
+            return
+        self._delivered_sentences.append(sentence)
+
+    def _assistant_turn_was_interrupted(self) -> bool:
+        if not self._track_assistant_turn_delivery:
+            return False
+        return (
+            self._assistant_turn_generation != self._speak_generation or
+            len(self._assistant_turn_generated_sentences) != len(self._delivered_sentences)
+        )
+
+    def _assistant_turn_text_for_history(self, generated_text: str) -> str:
+        if not self._assistant_turn_was_interrupted():
+            return generated_text
+        delivered_text = " ".join(self._delivered_sentences)
+        return f"{delivered_text} [interrupted]" if delivered_text else "[interrupted]"
+
+    def _append_assistant_history(self, assistant_content: Any) -> None:
+        if self._smartpbx_transfer_context is not None:
+            if isinstance(assistant_content, dict):
+                assistant_msg = dict(assistant_content)
+                if assistant_msg.get("role") != "assistant":
+                    self.history.append(assistant_content)
+                    return
+
+                content = assistant_msg.get("content")
+                if self._is_smartpbx_session() and isinstance(content, str):
+                    recorded = self._assistant_turn_text_for_history(content)
+                    assistant_msg["content"] = recorded
+                self.history.append(assistant_msg)
+            else:
+                self.history.append(assistant_content)
+            return
+
+        self.history.append(assistant_content)
+
+    def _append_assistant_turn_to_transcript(self, generated_text: str) -> None:
+        if not self._is_smartpbx_session():
+            return
+        text = self._assistant_turn_text_for_history(generated_text)
+        self.full_transcript.append({"role": "assistant", "text": text})
+        if self._smartpbx_transfer_context is not None:
+            logger.info(
+                "smartpbx_media event=assistant_turn_delivery generated=%d delivered=%d interrupted=%s",
+                len(self._assistant_turn_generated_sentences),
+                len(self._delivered_sentences),
+                self._assistant_turn_was_interrupted(),
+            )
 
     # â”€â”€ Debug: live-call audio capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -3337,7 +3475,7 @@ class MediaStreamSession:
                     self.call_sid, self._reprompt_count, self.lang,
                 )
             self.full_transcript.append({"role": "assistant", "text": text})
-            await self._speak(text)
+            await self._invoke_speak(text)
         except asyncio.CancelledError:
             pass
 
@@ -3445,6 +3583,7 @@ class MediaStreamSession:
                 smartpbx_transfer_context.reset(transfer_token)
 
     async def _process_utterance_bound(self, text: str):
+        self._start_assistant_turn_delivery_tracking()
         try:
             # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
             # this loop is shared by every concurrent call, so keep it off-loop.
@@ -3473,7 +3612,7 @@ class MediaStreamSession:
                     logger.info("smartpbx_media event=agent_response")
                 else:
                     logger.info("Agent [%s]: %s", self.call_sid, response_text[:200])
-                self.full_transcript.append({"role": "assistant", "text": response_text})
+                self._append_assistant_turn_to_transcript(response_text)
         except Exception:
             if self._is_smartpbx_session():
                 logger.error("smartpbx_media event=llm_error")
@@ -3481,7 +3620,7 @@ class MediaStreamSession:
                 logger.exception("LLM error [%s]", self.call_sid)
             fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
             error_msg = fillers.get("_default", "I'm sorry, I encountered an error.")
-            await self._speak(error_msg)
+            await self._invoke_speak(error_msg)
 
     # â”€â”€ OpenAI streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -3525,7 +3664,7 @@ class MediaStreamSession:
                         )
                         for s in sentences:
                             task = asyncio.create_task(
-                                self._speak(s, generation=gen)
+                                self._invoke_speak(s, generation=gen, sentence=s)
                             )
                             tts_tasks.append(task)
 
@@ -3560,21 +3699,21 @@ class MediaStreamSession:
                 first_tool = tool_list[0]["name"]
                 if self._is_direct_smartpbx_english():
                     preamble = sentence_buffer.strip()
-                    if preamble:
-                        await self._speak(preamble, generation=gen)
+                    if preamble and not tts_tasks:
+                        await self._invoke_speak(preamble, generation=gen, sentence=preamble)
                     elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
                         filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
-                        await self._speak(filler, generation=gen)
+                        await self._invoke_speak(filler, generation=gen, sentence=filler)
                         smartpbx_filler_sent = True
                 else:
                     filler = fillers.get(first_tool, fillers.get("_default", ""))
                     if filler:
-                        await self._speak(filler)
+                        await self._invoke_speak(filler, generation=gen, sentence=filler)
 
                 # Build assistant message with tool_calls
                 assistant_msg: dict[str, Any] = {
                     "role": "assistant",
-                    "content": text_content or None,
+                    "content": self._assistant_turn_text_for_history(text_content) if text_content else None,
                     "tool_calls": [
                         {
                             "id": tc["id"],
@@ -3587,7 +3726,7 @@ class MediaStreamSession:
                         for tc in tool_list
                     ],
                 }
-                self.history.append(assistant_msg)
+                self._append_assistant_history(assistant_msg)
 
                 # Execute tools and add results
                 for tool_index, tc in enumerate(tool_list):
@@ -3625,14 +3764,17 @@ class MediaStreamSession:
             if remaining:
                 tts_tasks.append(
                     asyncio.create_task(
-                        self._speak(remaining, generation=gen)
+                        self._invoke_speak(remaining, generation=gen, sentence=remaining)
                     )
                 )
             if tts_tasks:
                 await asyncio.gather(*tts_tasks)
 
             if text_content:
-                self.history.append({"role": "assistant", "content": text_content})
+                self._append_assistant_history({
+                    "role": "assistant",
+                    "content": self._assistant_turn_text_for_history(text_content),
+                })
             return full_text
 
         if self._is_smartpbx_session():
@@ -3695,7 +3837,7 @@ class MediaStreamSession:
                             )
                             for s in sentences:
                                 task = asyncio.create_task(
-                                    self._speak(s, generation=gen)
+                                    self._invoke_speak(s, generation=gen, sentence=s)
                                 )
                                 tts_tasks.append(task)
                     if part.function_call:
@@ -3725,16 +3867,16 @@ class MediaStreamSession:
                 first_tool = function_calls[0]["name"]
                 if self._is_direct_smartpbx_english():
                     preamble = sentence_buffer.strip()
-                    if preamble:
-                        await self._speak(preamble, generation=gen)
+                    if preamble and not tts_tasks:
+                        await self._invoke_speak(preamble, generation=gen, sentence=preamble)
                     elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
                         filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
-                        await self._speak(filler, generation=gen)
+                        await self._invoke_speak(filler, generation=gen, sentence=filler)
                         smartpbx_filler_sent = True
                 else:
                     filler = fillers.get(first_tool, fillers.get("_default", ""))
                     if filler:
-                        await self._speak(filler)
+                        await self._invoke_speak(filler, generation=gen, sentence=filler)
 
                 # Build assistant message in OpenAI format
                 tool_calls_openai = []
@@ -3751,10 +3893,10 @@ class MediaStreamSession:
 
                 assistant_msg: dict[str, Any] = {
                     "role": "assistant",
-                    "content": text_content or None,
+                    "content": self._assistant_turn_text_for_history(text_content) if text_content else None,
                     "tool_calls": tool_calls_openai,
                 }
-                self.history.append(assistant_msg)
+                self._append_assistant_history(assistant_msg)
 
                 for tc in tool_calls_openai:
                     parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
@@ -3782,19 +3924,21 @@ class MediaStreamSession:
 
                 continue
 
-            # No tools — flush remaining sentence buffer
             remaining = sentence_buffer.strip()
             if remaining:
                 tts_tasks.append(
                     asyncio.create_task(
-                        self._speak(remaining, generation=gen)
+                        self._invoke_speak(remaining, generation=gen, sentence=remaining)
                     )
                 )
             if tts_tasks:
                 await asyncio.gather(*tts_tasks)
 
             if text_content:
-                self.history.append({"role": "assistant", "content": text_content})
+                self._append_assistant_history({
+                    "role": "assistant",
+                    "content": self._assistant_turn_text_for_history(text_content),
+                })
             return full_text
 
         if self._is_smartpbx_session():
@@ -3859,11 +4003,11 @@ class MediaStreamSession:
                                 sentences, sentence_buffer = _extract_sentences(
                                     sentence_buffer
                                 )
-                                for s in sentences:
-                                    task = asyncio.create_task(
-                                        self._speak(s, generation=gen)
-                                    )
-                                    tts_tasks.append(task)
+                            for s in sentences:
+                                task = asyncio.create_task(
+                                    self._invoke_speak(s, generation=gen, sentence=s)
+                                )
+                                tts_tasks.append(task)
 
                         elif event.delta.type == "input_json_delta":
                             tool_json += event.delta.partial_json
@@ -3904,21 +4048,22 @@ class MediaStreamSession:
                 first_tool = tool_use_blocks[0]["name"]
                 if self._is_direct_smartpbx_english():
                     preamble = sentence_buffer.strip()
-                    if preamble:
-                        await self._speak(preamble, generation=gen)
+                    if preamble and not tts_tasks:
+                        await self._invoke_speak(preamble, generation=gen, sentence=preamble)
                     elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
                         filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
-                        await self._speak(filler, generation=gen)
+                        await self._invoke_speak(filler, generation=gen, sentence=filler)
                         smartpbx_filler_sent = True
                 else:
                     filler = fillers.get(first_tool, fillers.get("_default", ""))
                     if filler:
-                        await self._speak(filler)
+                        await self._invoke_speak(filler, generation=gen, sentence=filler)
 
                 # Build assistant message with content blocks
                 assistant_content: list[dict[str, Any]] = []
                 if text_content:
-                    assistant_content.append({"type": "text", "text": text_content})
+                    text_block = self._assistant_turn_text_for_history(text_content)
+                    assistant_content.append({"type": "text", "text": text_block})
                 for tb in tool_use_blocks:
                     assistant_content.append({
                         "type": "tool_use",
@@ -3926,7 +4071,10 @@ class MediaStreamSession:
                         "name": tb["name"],
                         "input": tb["input"],
                     })
-                self.history.append({"role": "assistant", "content": assistant_content})
+                self._append_assistant_history({
+                    "role": "assistant",
+                    "content": assistant_content,
+                })
 
                 # Execute tools and build tool_result blocks
                 tool_results: list[dict[str, Any]] = []
@@ -3961,14 +4109,17 @@ class MediaStreamSession:
             if remaining:
                 tts_tasks.append(
                     asyncio.create_task(
-                        self._speak(remaining, generation=gen)
+                        self._invoke_speak(remaining, generation=gen, sentence=remaining)
                     )
                 )
             if tts_tasks:
                 await asyncio.gather(*tts_tasks)
 
             if text_content:
-                self.history.append({"role": "assistant", "content": text_content})
+                self._append_assistant_history({
+                    "role": "assistant",
+                    "content": self._assistant_turn_text_for_history(text_content),
+                })
             return full_text
 
         if self._is_smartpbx_session():
@@ -3979,7 +4130,7 @@ class MediaStreamSession:
 
     # â”€â”€ TTS â†’ Twilio mulaw audio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    async def _speak(self, text: str, generation: int = -1):
+    async def _speak(self, text: str, generation: int = -1, sentence: str | None = None):
         """Route text to appropriate TTS provider.
 
         English        â†’ protected canonical ElevenLabs eleven_flash_v2_5 profile
@@ -3993,17 +4144,42 @@ class MediaStreamSession:
                 return
             if generation >= 0 and generation != self._speak_generation:
                 return
+            if sentence is not None and self._track_assistant_turn_delivery:
+                self._record_generated_sentence(sentence)
             if self.lang in ("en", "ta", "ar"):
-                await self._tts_elevenlabs(text)
+                await self._invoke_tts(
+                    self._tts_elevenlabs,
+                    text,
+                    sentence=sentence,
+                    turn_generation=generation,
+                )
             elif self.lang == "si":
-                await self._tts_openai(text)
+                await self._invoke_tts(
+                    self._tts_openai,
+                    text,
+                    sentence=sentence,
+                    turn_generation=generation,
+                )
             else:
                 lang_code, voice_name = AZURE_VOICES[self.lang]
-                await self._tts_azure(text, lang_code, voice_name)
+                await self._invoke_tts(
+                    lambda txt, sentence=sentence, turn_generation=generation: self._tts_azure(
+                        txt, lang_code, voice_name, sentence=sentence, turn_generation=turn_generation
+                    ),
+                    text,
+                    sentence=sentence,
+                    turn_generation=generation,
+                )
 
     # â”€â”€ ElevenLabs TTS (Tamil) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    async def _tts_elevenlabs(self, text: str):
+    async def _tts_elevenlabs(
+        self,
+        text: str,
+        *,
+        sentence: str | None = None,
+        turn_generation: int | None = None,
+    ):
         """Stream ElevenLabs TTS as 8 kHz mu-law through the active transport."""
         if not ELEVENLABS_API_KEY:
             self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_MISSING_API_KEY)
@@ -4053,7 +4229,10 @@ class MediaStreamSession:
                         await self._send_media_audio(chunk)
 
             if self._is_speaking:
-                await self._send_tts_done()
+                await self._send_tts_done(
+                    sentence=sentence,
+                    turn_generation=turn_generation,
+                )
             else:
                 if self._is_smartpbx_session():
                     logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
@@ -4077,7 +4256,15 @@ class MediaStreamSession:
 
     # â”€â”€ Azure TTS (Sinhala) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    async def _tts_azure(self, text: str, lang_code: str, voice_name: str):
+    async def _tts_azure(
+        self,
+        text: str,
+        lang_code: str,
+        voice_name: str,
+        *,
+        sentence: str | None = None,
+        turn_generation: int | None = None,
+    ):
         """Stream Azure Cognitive Services TTS as mulaw 8 kHz to Twilio.
         Must only be called from _speak (lock already held).
         """
@@ -4120,7 +4307,10 @@ class MediaStreamSession:
                             break
                         await self._send_media_audio(chunk)
             if self._is_speaking:
-                await self._send_tts_done()
+                await self._send_tts_done(
+                    sentence=sentence,
+                    turn_generation=turn_generation,
+                )
             else:
                 if self._is_smartpbx_session():
                     logger.info("smartpbx_media event=tts_interrupted provider=azure")
@@ -4141,7 +4331,13 @@ class MediaStreamSession:
 
     # â”€â”€ OpenAI TTS (Sinhala) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    async def _tts_openai(self, text: str):
+    async def _tts_openai(
+        self,
+        text: str,
+        *,
+        sentence: str | None = None,
+        turn_generation: int | None = None,
+    ):
         """Stream OpenAI gpt-4o-mini-tts as mulaw 8 kHz to Twilio (Sinhala).
 
         OpenAI returns raw 24 kHz 16-bit mono PCM; we downsample to 8 kHz and
@@ -4217,7 +4413,10 @@ class MediaStreamSession:
                 await self._send_media_audio(mulaw_buf)
 
             if self._is_speaking:
-                await self._send_tts_done()
+                await self._send_tts_done(
+                    sentence=sentence,
+                    turn_generation=turn_generation,
+                )
             else:
                 if self._is_smartpbx_session():
                     logger.info("smartpbx_media event=tts_interrupted provider=openai")

@@ -16,7 +16,10 @@ import server
 
 def make_session(monkeypatch, lang="en", smartpbx=True):
     session = server.MediaStreamSession(websocket=None, lang=lang, media_transport=None)
-    session._event_loop = asyncio.get_running_loop()
+    try:
+        session._event_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        session._event_loop = None
     if smartpbx:
         session._smartpbx_transfer_context = object()
     barged = []
@@ -85,7 +88,7 @@ async def test_sustained_interim_while_speaking_barges_in(monkeypatch):
     session._is_speaking = True
     session._speaking_since = 0.0
     session._on_stt_interim("actually can you change my dates please")
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.02)
     assert barged == [True], "a real sustained interruption must still barge in"
 
 
@@ -104,7 +107,7 @@ async def test_normal_utterance_when_not_speaking_is_unchanged(monkeypatch):
     session, barged, accum, _interims = make_session(monkeypatch)
     session._is_speaking = False
     session._on_stt_result("I would like to book a room")
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.02)
     assert barged == []
     assert accum == ["I would like to book a room"], "listening path must be untouched"
 
