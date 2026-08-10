@@ -641,6 +641,19 @@ DTMF_MAX_DIGITS: int = _parse_clamped_int(
     os.environ, "DTMF_MAX_DIGITS", 15, 1, 40
 )
 
+# Barge-in threshold. While Kavya is speaking, only a SUBSTANTIVE interruption
+# clears her audio; a short blip ("mm-hmm"), room noise, or her own TTS echoing
+# back into STT must not. BARGEIN_MIN_CHARS is the minimum stripped transcript
+# length that counts; BARGEIN_DEBOUNCE_SECONDS ignores STT within that window of
+# a sentence starting (the echo burst). A genuine sustained interruption still
+# barges in. Both env-tunable and clamped.
+BARGEIN_MIN_CHARS: int = _parse_clamped_int(
+    os.environ, "BARGEIN_MIN_CHARS", 12, 0, 200
+)
+BARGEIN_DEBOUNCE_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "BARGEIN_DEBOUNCE_SECONDS", 0.6, 0.0, 5.0
+)
+
 # Bounds on restarting a failed STT stream. Google caps a streaming_recognize
 # call at ~5 minutes, so healthy restarts are normal and must stay cheap; a
 # persistent failure (rotated credentials, quota) must not become a tight spin.
@@ -2821,6 +2834,7 @@ class MediaStreamSession:
 
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._is_speaking = False
+        self._speaking_since = 0.0
         self._speak_lock = asyncio.Lock()
         self._ws_lock = asyncio.Lock()
         self._speak_generation: int = 0
@@ -3145,9 +3159,10 @@ class MediaStreamSession:
         if self._event_loop is None:
             return
         if self._is_speaking:
-            asyncio.run_coroutine_threadsafe(
-                self._handle_bargein(), self._event_loop,
-            )
+            if self._should_barge_in(transcript):
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_bargein(), self._event_loop,
+                )
             return
         asyncio.run_coroutine_threadsafe(
             self._accumulate_transcript(transcript), self._event_loop,
@@ -3166,13 +3181,24 @@ class MediaStreamSession:
         if self._event_loop is None:
             return
         if self._is_speaking:
-            asyncio.run_coroutine_threadsafe(
-                self._handle_bargein(), self._event_loop,
-            )
+            if self._should_barge_in(transcript):
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_bargein(), self._event_loop,
+                )
             return
         asyncio.run_coroutine_threadsafe(
             self._set_transcript_interim(transcript), self._event_loop,
         )
+
+    def _should_barge_in(self, transcript: str) -> bool:
+        """True only for a substantive interruption, filtering blips and echo."""
+        text = (transcript or "").strip()
+        if len(text) < BARGEIN_MIN_CHARS:
+            return False
+        if BARGEIN_DEBOUNCE_SECONDS > 0 and self._speaking_since:
+            if (time.monotonic() - self._speaking_since) < BARGEIN_DEBOUNCE_SECONDS:
+                return False
+        return True
 
     async def _handle_bargein(self):
         if self._is_smartpbx_session():
@@ -4001,6 +4027,7 @@ class MediaStreamSession:
             model_id = ELEVENLABS_MODEL_MULTILINGUAL
             voice_settings = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}
         self._is_speaking = True
+        self._speaking_since = time.monotonic()
         url = ELEVENLABS_TTS_URL.format(voice_id=voice_id) + "?output_format=ulaw_8000"
         headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
         payload: dict[str, Any] = {"text": text, "model_id": model_id, "voice_settings": voice_settings}
@@ -4059,6 +4086,7 @@ class MediaStreamSession:
             return
 
         self._is_speaking = True
+        self._speaking_since = time.monotonic()
         url = AZURE_TTS_URL.format(region=AZURE_SPEECH_REGION)
         headers = {
             "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
@@ -4129,6 +4157,7 @@ class MediaStreamSession:
             return
 
         self._is_speaking = True
+        self._speaking_since = time.monotonic()
         payload = {
             "model": OPENAI_TTS_MODEL,
             "voice": OPENAI_TTS_VOICE,
