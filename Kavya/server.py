@@ -78,6 +78,8 @@ from tools import (
     get_handover_tools,
     execute_tool,
     smartpbx_transfer_context,
+    ROOM_TYPES_BY_PROPERTY,
+    PROPERTY_HATTON,
 )
 from booking_api import close_session, is_configured
 # Imported for DEMO_RATES_ENABLED so the system prompt and the tool results
@@ -590,6 +592,28 @@ ENDPOINTING_SILENCE: float = _parse_endpointing_seconds(
 )
 STT_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "STT_FINAL_GRACE_SECONDS", 0.5, 0.05, 5.0
+)
+
+# Domain phrase list that biases the ENGLISH Azure recognizer toward booking
+# vocabulary — digit words (phone numbers), the property and room names (from the
+# single tools source of truth), and common booking terms. English only: phrase
+# lists are language-specific and the Sinhala/Tamil/Arabic Azure configs are left
+# as the owner keeps them. Applied via PhraseListGrammar in AzureSTTStream.start.
+_STT_DIGIT_WORDS: tuple[str, ...] = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "oh", "double", "triple",
+)
+_STT_BOOKING_TERMS: tuple[str, ...] = (
+    "Hatton Hills", "check-in", "check in", "check-out", "check out",
+    "honeymoon", "anniversary", "half board", "full board", "bed and breakfast",
+    "adults", "children", "child", "guests", "nights", "double room",
+    "plunge pool", "king bed", "twin beds", "sea view", "mountain view",
+    "breakfast", "dinner", "availability", "reservation", "booking",
+)
+EN_STT_PHRASE_LIST: tuple[str, ...] = (
+    tuple(ROOM_TYPES_BY_PROPERTY[PROPERTY_HATTON])
+    + _STT_BOOKING_TERMS
+    + _STT_DIGIT_WORDS
 )
 
 # Bounds on restarting a failed STT stream. Google caps a streaming_recognize
@@ -2610,6 +2634,20 @@ class AzureSTTStream:
         self._recognizer.recognizing.connect(self._on_recognizing)
         self._recognizer.recognized.connect(self._on_recognized)
         self._recognizer.canceled.connect(self._on_canceled)
+
+        # Bias English recognition toward the booking domain. English only —
+        # phrase lists are language-specific, so si/ta/ar keep the bare config.
+        # Defensive: a missing PhraseListGrammar (older SDK) or any failure here
+        # must never prevent recognition from starting.
+        phrase_list_grammar = getattr(azure_speech, "PhraseListGrammar", None)
+        if self._lang == "en" and EN_STT_PHRASE_LIST and phrase_list_grammar is not None:
+            try:
+                phrase_grammar = phrase_list_grammar.from_recognizer(self._recognizer)
+                for phrase in EN_STT_PHRASE_LIST:
+                    phrase_grammar.addPhrase(phrase)
+                logger.info("Azure STT English phrase list applied (%d phrases)", len(EN_STT_PHRASE_LIST))
+            except Exception:
+                logger.warning("Azure STT phrase list not applied", exc_info=True)
 
         self._running = True
         self._recognizer.start_continuous_recognition_async()
