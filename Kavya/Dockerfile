@@ -60,8 +60,14 @@ RUN pip install --no-cache-dir -r requirements-prod.lock.txt
 # (ModuleNotFoundError: No module named 'handover'), having been added in the
 # 2026-07-30 handover-failsafe work and only ever hot-swapped in.
 # If you add a module, add it here in the SAME commit.
-COPY server.py media_stream_server.py tools.py booking_api.py post_call.py knowledge_base.py yanolja_client.py yanolja_service.py dashboard_client.py handover.py smartpbx_gateway.py smartpbx_handover.py smartpbx_mcp.py smartpbx_protocol.py smartpbx_diagnostics.py smartpbx_session.py smartpbx_transport.py english_voice_profile.py ./
+COPY server.py media_stream_server.py tools.py booking_api.py post_call.py knowledge_base.py yanolja_client.py yanolja_service.py dashboard_client.py handover.py smartpbx_gateway.py smartpbx_handover.py smartpbx_mcp.py smartpbx_protocol.py smartpbx_diagnostics.py smartpbx_dtmf.py smartpbx_session.py smartpbx_transport.py english_voice_profile.py ./
 COPY knowledge_docs/ ./knowledge_docs/
+
+# --- Build-time import guard --------------------------------------------------
+# server.py imports the whole runtime tree (tools + every smartpbx_* module),
+# so a module added to the code but omitted from the COPY manifest above fails
+# THIS build instead of publishing an image that crashes on import at start.
+RUN python -c "import server"
 
 # --- Port --------------------------------------------------------------------
 EXPOSE 8000
