@@ -78,6 +78,8 @@ from tools import (
     get_handover_tools,
     execute_tool,
     smartpbx_transfer_context,
+    ROOM_TYPES_BY_PROPERTY,
+    PROPERTY_HATTON,
 )
 from booking_api import close_session, is_configured
 # Imported for DEMO_RATES_ENABLED so the system prompt and the tool results
@@ -590,6 +592,28 @@ ENDPOINTING_SILENCE: float = _parse_endpointing_seconds(
 )
 STT_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "STT_FINAL_GRACE_SECONDS", 0.5, 0.05, 5.0
+)
+
+# Domain phrase list that biases the ENGLISH Azure recognizer toward booking
+# vocabulary — digit words (phone numbers), the property and room names (from the
+# single tools source of truth), and common booking terms. English only: phrase
+# lists are language-specific and the Sinhala/Tamil/Arabic Azure configs are left
+# as the owner keeps them. Applied via PhraseListGrammar in AzureSTTStream.start.
+_STT_DIGIT_WORDS: tuple[str, ...] = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "oh", "double", "triple",
+)
+_STT_BOOKING_TERMS: tuple[str, ...] = (
+    "Hatton Hills", "check-in", "check in", "check-out", "check out",
+    "honeymoon", "anniversary", "half board", "full board", "bed and breakfast",
+    "adults", "children", "child", "guests", "nights", "double room",
+    "plunge pool", "king bed", "twin beds", "sea view", "mountain view",
+    "breakfast", "dinner", "availability", "reservation", "booking",
+)
+EN_STT_PHRASE_LIST: tuple[str, ...] = (
+    tuple(ROOM_TYPES_BY_PROPERTY[PROPERTY_HATTON])
+    + _STT_BOOKING_TERMS
+    + _STT_DIGIT_WORDS
 )
 
 # Bounds on restarting a failed STT stream. Google caps a streaming_recognize
@@ -2611,6 +2635,20 @@ class AzureSTTStream:
         self._recognizer.recognized.connect(self._on_recognized)
         self._recognizer.canceled.connect(self._on_canceled)
 
+        # Bias English recognition toward the booking domain. English only —
+        # phrase lists are language-specific, so si/ta/ar keep the bare config.
+        # Defensive: a missing PhraseListGrammar (older SDK) or any failure here
+        # must never prevent recognition from starting.
+        phrase_list_grammar = getattr(azure_speech, "PhraseListGrammar", None)
+        if self._lang == "en" and EN_STT_PHRASE_LIST and phrase_list_grammar is not None:
+            try:
+                phrase_grammar = phrase_list_grammar.from_recognizer(self._recognizer)
+                for phrase in EN_STT_PHRASE_LIST:
+                    phrase_grammar.addPhrase(phrase)
+                logger.info("Azure STT English phrase list applied (%d phrases)", len(EN_STT_PHRASE_LIST))
+            except Exception:
+                logger.warning("Azure STT phrase list not applied", exc_info=True)
+
         self._running = True
         self._recognizer.start_continuous_recognition_async()
         logger.info("Azure STT stream started (lang=%s, primary=%s)", self._lang, primary)
@@ -2729,6 +2767,10 @@ class MediaStreamSession:
         self.stream_sid: str | None = None
         self.call_sid: str = "unknown"
         self.caller_phone: str = "unknown"
+        # Booking slots captured from tool calls, re-injected into the system
+        # context every turn so they survive history trimming (a long
+        # number-retry loop would otherwise evict the early date/guest turns).
+        self._booking_slots: dict[str, str] = {}
         self.history: list[dict] = []
         self.full_transcript: list[dict[str, str]] = []
         self.call_start_time: str = ""
@@ -2796,10 +2838,77 @@ class MediaStreamSession:
         await self._clear_media_audio(force=True)
 
     def _log_tool_execution(self, tool_name: str, tool_input: Any) -> None:
+        self._capture_booking_slots(tool_name, tool_input)
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=tool_execute tool=%s", tool_name)
         else:
             logger.info("Executing tool '%s': %s", tool_name, tool_input)
+
+    # Slot keys the booking flow carries through its tool arguments. Captured
+    # from any tool call and re-injected every turn so a long call cannot make
+    # Kavya forget details the guest already gave (mid-call slot amnesia).
+    _BOOKING_SLOT_KEYS: tuple[str, ...] = (
+        "check_in", "check_out", "room_type", "room_name",
+        "guest_name", "salutation", "guest_phone",
+        "num_adults", "num_children",
+    )
+
+    def _capture_booking_slots(self, tool_name: str, tool_input: Any) -> None:
+        """Merge booking-slot values from a tool call into the persistent state."""
+        if tool_name not in {"check_availability", "create_booking"}:
+            return
+        if not isinstance(tool_input, dict):
+            return
+        for key in self._BOOKING_SLOT_KEYS:
+            if key not in tool_input:
+                continue
+            value = tool_input[key]
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                self._booking_slots[key] = text
+
+    def _booking_slots_note(self) -> str:
+        """Render the captured slots as a context block, or '' when empty."""
+        slots = self._booking_slots
+        if not slots:
+            return ""
+        lines: list[str] = []
+        if slots.get("guest_name"):
+            who = slots["guest_name"]
+            if slots.get("salutation"):
+                who = f"{slots['salutation']} {who}"
+            lines.append(f"- guest name: {who}")
+        if slots.get("check_in"):
+            lines.append(f"- check-in: {slots['check_in']}")
+        if slots.get("check_out"):
+            lines.append(f"- check-out: {slots['check_out']}")
+        if slots.get("num_adults") or slots.get("num_children"):
+            adults = slots.get("num_adults", "1")
+            children = slots.get("num_children", "0")
+            guests = f"- guests: {adults} adult(s)"
+            if children and children != "0":
+                guests += f", {children} child(ren)"
+            lines.append(guests)
+        if slots.get("room_type"):
+            room = slots["room_type"]
+            if slots.get("room_name") and slots["room_name"] != room:
+                room = f"{room} ({slots['room_name']})"
+            lines.append(f"- room: {room}")
+        if slots.get("guest_phone"):
+            lines.append(f"- phone: {slots['guest_phone']}")
+        if not lines:
+            return ""
+        return (
+            "\n\nBOOKING DETAILS COLLECTED SO FAR THIS CALL (the guest already "
+            "gave these — do NOT re-ask; only confirm if genuinely unsure):\n"
+            + "\n".join(lines)
+        )
+
+    def _active_system_prompt(self) -> str:
+        """The system prompt plus any booking slots captured so far."""
+        return self.system_prompt + self._booking_slots_note()
 
     def _log_tool_result(self, tool_name: str, result: str) -> None:
         if self._is_smartpbx_session():
@@ -3265,7 +3374,7 @@ class MediaStreamSession:
             has_tool_use = False
             gen = self._speak_generation
 
-            messages = [{"role": "system", "content": self.system_prompt}] + self.history
+            messages = [{"role": "system", "content": self._active_system_prompt()}] + self.history
             stream = await self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
@@ -3423,7 +3532,7 @@ class MediaStreamSession:
 
             gemini_contents = _history_to_gemini(self.history)
             config = {
-                "system_instruction": self.system_prompt,
+                "system_instruction": self._active_system_prompt(),
                 "max_output_tokens": MAX_TOKENS,
             }
             if self.tools:
@@ -3593,7 +3702,7 @@ class MediaStreamSession:
                 max_tokens=MAX_TOKENS,
                 system=[{
                     "type": "text",
-                    "text": self.system_prompt,
+                    "text": self._active_system_prompt(),
                     "cache_control": {"type": "ephemeral"},
                 }],
                 messages=self.history,
