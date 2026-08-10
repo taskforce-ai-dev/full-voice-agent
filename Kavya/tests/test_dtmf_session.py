@@ -90,3 +90,18 @@ async def test_overall_timeout_returns_a_failure_for_spoken_fallback(monkeypatch
     assert result["status"] == "no_input"
     assert result["reason"] == "overall_timeout"
     assert session._dtmf_collector is None
+
+
+def test_dtmf_knob_defaults_and_clamping():
+    # Floats via the endpointing parser, the digit count via the int parser.
+    assert server._parse_endpointing_seconds({}, "X", 6.0, 1.0, 30.0) == 6.0
+    assert server._parse_endpointing_seconds({"X": "999"}, "X", 6.0, 1.0, 30.0) == 30.0
+    assert server._parse_endpointing_seconds({"X": "0"}, "X", 30.0, 5.0, 120.0) == 5.0
+    assert server._parse_clamped_int({}, "X", 15, 1, 40) == 15
+    assert server._parse_clamped_int({"X": "999"}, "X", 15, 1, 40) == 40
+    assert server._parse_clamped_int({"X": "0"}, "X", 15, 1, 40) == 1
+    assert server._parse_clamped_int({"X": "bad"}, "X", 15, 1, 40) == 15
+    # The module constants are within their documented bounds.
+    assert 1.0 <= server.DTMF_INTERDIGIT_TIMEOUT_SECONDS <= 30.0
+    assert 5.0 <= server.DTMF_OVERALL_TIMEOUT_SECONDS <= 120.0
+    assert 1 <= server.DTMF_MAX_DIGITS <= 40
