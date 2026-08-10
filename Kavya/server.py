@@ -2729,6 +2729,10 @@ class MediaStreamSession:
         self.stream_sid: str | None = None
         self.call_sid: str = "unknown"
         self.caller_phone: str = "unknown"
+        # Booking slots captured from tool calls, re-injected into the system
+        # context every turn so they survive history trimming (a long
+        # number-retry loop would otherwise evict the early date/guest turns).
+        self._booking_slots: dict[str, str] = {}
         self.history: list[dict] = []
         self.full_transcript: list[dict[str, str]] = []
         self.call_start_time: str = ""
@@ -2796,10 +2800,77 @@ class MediaStreamSession:
         await self._clear_media_audio(force=True)
 
     def _log_tool_execution(self, tool_name: str, tool_input: Any) -> None:
+        self._capture_booking_slots(tool_name, tool_input)
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=tool_execute tool=%s", tool_name)
         else:
             logger.info("Executing tool '%s': %s", tool_name, tool_input)
+
+    # Slot keys the booking flow carries through its tool arguments. Captured
+    # from any tool call and re-injected every turn so a long call cannot make
+    # Kavya forget details the guest already gave (mid-call slot amnesia).
+    _BOOKING_SLOT_KEYS: tuple[str, ...] = (
+        "check_in", "check_out", "room_type", "room_name",
+        "guest_name", "salutation", "guest_phone",
+        "num_adults", "num_children",
+    )
+
+    def _capture_booking_slots(self, tool_name: str, tool_input: Any) -> None:
+        """Merge booking-slot values from a tool call into the persistent state."""
+        if tool_name not in {"check_availability", "create_booking"}:
+            return
+        if not isinstance(tool_input, dict):
+            return
+        for key in self._BOOKING_SLOT_KEYS:
+            if key not in tool_input:
+                continue
+            value = tool_input[key]
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                self._booking_slots[key] = text
+
+    def _booking_slots_note(self) -> str:
+        """Render the captured slots as a context block, or '' when empty."""
+        slots = self._booking_slots
+        if not slots:
+            return ""
+        lines: list[str] = []
+        if slots.get("guest_name"):
+            who = slots["guest_name"]
+            if slots.get("salutation"):
+                who = f"{slots['salutation']} {who}"
+            lines.append(f"- guest name: {who}")
+        if slots.get("check_in"):
+            lines.append(f"- check-in: {slots['check_in']}")
+        if slots.get("check_out"):
+            lines.append(f"- check-out: {slots['check_out']}")
+        if slots.get("num_adults") or slots.get("num_children"):
+            adults = slots.get("num_adults", "1")
+            children = slots.get("num_children", "0")
+            guests = f"- guests: {adults} adult(s)"
+            if children and children != "0":
+                guests += f", {children} child(ren)"
+            lines.append(guests)
+        if slots.get("room_type"):
+            room = slots["room_type"]
+            if slots.get("room_name") and slots["room_name"] != room:
+                room = f"{room} ({slots['room_name']})"
+            lines.append(f"- room: {room}")
+        if slots.get("guest_phone"):
+            lines.append(f"- phone: {slots['guest_phone']}")
+        if not lines:
+            return ""
+        return (
+            "\n\nBOOKING DETAILS COLLECTED SO FAR THIS CALL (the guest already "
+            "gave these — do NOT re-ask; only confirm if genuinely unsure):\n"
+            + "\n".join(lines)
+        )
+
+    def _active_system_prompt(self) -> str:
+        """The system prompt plus any booking slots captured so far."""
+        return self.system_prompt + self._booking_slots_note()
 
     def _log_tool_result(self, tool_name: str, result: str) -> None:
         if self._is_smartpbx_session():
@@ -3265,7 +3336,7 @@ class MediaStreamSession:
             has_tool_use = False
             gen = self._speak_generation
 
-            messages = [{"role": "system", "content": self.system_prompt}] + self.history
+            messages = [{"role": "system", "content": self._active_system_prompt()}] + self.history
             stream = await self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
@@ -3423,7 +3494,7 @@ class MediaStreamSession:
 
             gemini_contents = _history_to_gemini(self.history)
             config = {
-                "system_instruction": self.system_prompt,
+                "system_instruction": self._active_system_prompt(),
                 "max_output_tokens": MAX_TOKENS,
             }
             if self.tools:
@@ -3593,7 +3664,7 @@ class MediaStreamSession:
                 max_tokens=MAX_TOKENS,
                 system=[{
                     "type": "text",
-                    "text": self.system_prompt,
+                    "text": self._active_system_prompt(),
                     "cache_control": {"type": "ephemeral"},
                 }],
                 messages=self.history,
