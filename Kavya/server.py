@@ -90,6 +90,7 @@ from post_call import process_post_call_data
 from handover import handover_context, send_handover_notification
 from english_voice_profile import load_kavya_english_voice_profile
 from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+from smartpbx_dtmf import DtmfCollector
 
 try:
     import dashboard_client
@@ -614,6 +615,30 @@ EN_STT_PHRASE_LIST: tuple[str, ...] = (
     tuple(ROOM_TYPES_BY_PROPERTY[PROPERTY_HATTON])
     + _STT_BOOKING_TERMS
     + _STT_DIGIT_WORDS
+)
+
+
+def _parse_clamped_int(environ, name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read a clamped integer from the environment, falling back on the default."""
+    raw = environ.get(name, "")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+# DTMF keypad number capture. Keypad entry bypasses STT and is exact, so Kavya
+# collects phone/WhatsApp/callback numbers this way. Timeouts are env-tunable and
+# clamped so a mis-set knob cannot arm a zero or runaway wait.
+DTMF_INTERDIGIT_TIMEOUT_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "DTMF_INTERDIGIT_TIMEOUT_SECONDS", 6.0, 1.0, 30.0
+)
+DTMF_OVERALL_TIMEOUT_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "DTMF_OVERALL_TIMEOUT_SECONDS", 30.0, 5.0, 120.0
+)
+DTMF_MAX_DIGITS: int = _parse_clamped_int(
+    os.environ, "DTMF_MAX_DIGITS", 15, 1, 40
 )
 
 # Bounds on restarting a failed STT stream. Google caps a streaming_recognize
@@ -2782,6 +2807,8 @@ class MediaStreamSession:
         # context every turn so they survive history trimming (a long
         # number-retry loop would otherwise evict the early date/guest turns).
         self._booking_slots: dict[str, str] = {}
+        # Active DTMF keypad collector while collect_number_via_keypad is running.
+        self._dtmf_collector: DtmfCollector | None = None
         self.history: list[dict] = []
         self.full_transcript: list[dict[str, str]] = []
         self.call_start_time: str = ""
@@ -2847,6 +2874,59 @@ class MediaStreamSession:
         self._is_speaking = False
         self._speak_generation += 1
         await self._clear_media_audio(force=True)
+
+    async def feed_dtmf(self, digit: str) -> bool:
+        """Feed a keypad digit to the active collector. True if it was consumed."""
+        collector = self._dtmf_collector
+        if collector is None:
+            return False
+        collector.feed(digit)
+        return True
+
+    async def _collect_number_via_keypad(self, tool_input: Any) -> str:
+        """Speak the keypad instruction, then collect the guest's number via DTMF.
+
+        The instruction is spoken and awaited BEFORE collection begins, so the
+        caller always hears "key it in, then press hash" before the wait starts.
+        Returns the collected digits (with a spaced readback) or a failure so the
+        model can fall back to asking the guest to say the number.
+        """
+        # DTMF is wired for the SmartPBX path (Dialog sends clean dtmf events).
+        if not self._is_smartpbx_session():
+            return json.dumps({"status": "unavailable", "reason": "keypad_not_available"})
+        if self._event_loop is None:
+            return json.dumps({"status": "unavailable", "reason": "keypad_not_available"})
+
+        label = ""
+        if isinstance(tool_input, dict):
+            label = str(tool_input.get("label") or "").strip()
+        spoken_label = label or "your number"
+
+        # Speak the precise keypad instruction first and wait for it to be
+        # delivered; only then start collecting.
+        instruction = (
+            f"Please key in {spoken_label} on your phone's keypad now, "
+            "then press the hash key when you're done."
+        )
+        await self._speak(instruction)
+
+        collector = DtmfCollector(
+            loop=self._event_loop,
+            interdigit_timeout=DTMF_INTERDIGIT_TIMEOUT_SECONDS,
+            overall_timeout=DTMF_OVERALL_TIMEOUT_SECONDS,
+            max_digits=DTMF_MAX_DIGITS,
+        )
+        self._dtmf_collector = collector
+        collector.start()
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=dtmf_collect_start")
+        try:
+            result = await collector.future
+        finally:
+            self._dtmf_collector = None
+        if self._is_smartpbx_session():
+            logger.info("smartpbx_media event=dtmf_collect_done status=%s", result.get("status"))
+        return json.dumps(result)
 
     def _log_tool_execution(self, tool_name: str, tool_input: Any) -> None:
         self._capture_booking_slots(tool_name, tool_input)
@@ -3480,7 +3560,10 @@ class MediaStreamSession:
                         parsed_input = {}
                     self._log_tool_execution(tc["name"], parsed_input)
                     try:
-                        result_str = await execute_tool(tc["name"], parsed_input)
+                        if tc["name"] == "collect_number_via_keypad":
+                            result_str = await self._collect_number_via_keypad(parsed_input)
+                        else:
+                            result_str = await execute_tool(tc["name"], parsed_input)
                     except Exception as exc:
                         self._log_tool_failure(tc["name"])
                         if self._is_direct_smartpbx_english():
@@ -3639,7 +3722,10 @@ class MediaStreamSession:
                     parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
                     self._log_tool_execution(tc["function"]["name"], parsed_input)
                     try:
-                        result_str = await execute_tool(tc["function"]["name"], parsed_input)
+                        if tc["function"]["name"] == "collect_number_via_keypad":
+                            result_str = await self._collect_number_via_keypad(parsed_input)
+                        else:
+                            result_str = await execute_tool(tc["function"]["name"], parsed_input)
                     except Exception as exc:
                         self._log_tool_failure(tc["function"]["name"])
                         if self._is_direct_smartpbx_english():
@@ -3809,7 +3895,10 @@ class MediaStreamSession:
                 for tool_index, tb in enumerate(tool_use_blocks):
                     self._log_tool_execution(tb["name"], tb["input"])
                     try:
-                        result_str = await execute_tool(tb["name"], tb["input"])
+                        if tb["name"] == "collect_number_via_keypad":
+                            result_str = await self._collect_number_via_keypad(tb["input"])
+                        else:
+                            result_str = await execute_tool(tb["name"], tb["input"])
                     except Exception as exc:
                         self._log_tool_failure(tb["name"])
                         if self._is_direct_smartpbx_english():
