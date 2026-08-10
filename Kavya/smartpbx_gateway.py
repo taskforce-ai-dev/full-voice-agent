@@ -264,7 +264,12 @@ class SmartPBXGateway:
                         return
                 elif isinstance(event, DtmfEvent):
                     validate_event_context(event, context)
+                    # Every DTMF is still observed; when the session is collecting
+                    # a keypad number the digit is also fed to its collector.
                     sink(DiagnosticStage.CONTEXT_VALIDATION, DiagnosticOutcome.OBSERVED, DiagnosticFailureClass.NONE)
+                    feed_dtmf = getattr(session, "feed_dtmf", None)
+                    if feed_dtmf is not None:
+                        await feed_dtmf(event.digit)
                 elif isinstance(event, HangupEvent):
                     validate_event_context(event, context)
                     close_outcome = (1000, "call ended")

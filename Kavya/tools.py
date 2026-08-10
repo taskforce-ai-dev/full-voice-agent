@@ -374,6 +374,34 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["reason"],
         },
     },
+    {
+        "name": "collect_number_via_keypad",
+        "description": (
+            "Collect a phone, WhatsApp, or callback NUMBER from the guest via "
+            "their phone keypad (DTMF tones), which is 100% accurate — always "
+            "use this instead of relying on spoken digits whenever you need a "
+            "number. Say a brief lead-in first (e.g. 'Sure, let me take that on "
+            "the keypad'); the tool then plays the precise 'key it in, then press "
+            "hash' instruction and waits. It returns the collected digits and a "
+            "spaced readback form, or a failure so you can ask the guest to say "
+            "the number instead. Use ONLY for numbers — never for dates or guest "
+            "counts, which stay on the spoken path."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label": {
+                    "type": "string",
+                    "description": (
+                        "What the number is for, in natural words, e.g. "
+                        "'WhatsApp number for your confirmation' or 'best number "
+                        "to call you back on'."
+                    ),
+                },
+            },
+            "required": ["label"],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -668,6 +696,13 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
                 "recorded. Reassure the guest that the team will call them back."
             ),
         })
+
+    elif tool_name == "collect_number_via_keypad":
+        # Real collection is intercepted at the session level, where the live
+        # call and its DTMF stream are available. Reaching execute_tool means no
+        # collector is wired (e.g. the Twilio path), so degrade gracefully and
+        # let the model ask the guest to say the number.
+        return json.dumps({"status": "unavailable", "reason": "keypad_not_available"})
 
     else:
         logger.error("Unknown tool requested: %s", tool_name)
