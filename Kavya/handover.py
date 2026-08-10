@@ -165,6 +165,48 @@ def expand_spoken_repeats(raw: Any) -> str:
     return _REPEAT_RE.sub(_sub, str(raw))
 
 
+_TOKEN_SPLIT_RE = re.compile(r"[^0-9A-Za-z]+")
+
+
+def spoken_number_to_digits(raw: Any) -> str:
+    """Convert a dictated phone number to a bare digit string, deterministically.
+
+    Handles a number spoken entirely in words ("nought seven six"), entirely in
+    numerals ("076"), or a mix, plus the double/triple/treble repeat shorthand.
+    This is the code's job so the LLM never has to do digit arithmetic in its
+    head: it relays the caller's words verbatim and reads back what this returns.
+
+    PHONE-NUMBER FIELDS ONLY, exactly like :func:`expand_spoken_repeats`: "double"
+    is a room type at Hatton Hills, so this must never run over conversation text.
+
+    >>> spoken_number_to_digits("triple seven")
+    '777'
+    >>> spoken_number_to_digits("treble two")
+    '222'
+    >>> spoken_number_to_digits("nought seven six")
+    '076'
+    >>> spoken_number_to_digits("oh seven one one seven five four double six eight")
+    '0711754668'
+    >>> spoken_number_to_digits("double oh")
+    '00'
+    >>> spoken_number_to_digits("0771234567")
+    '0771234567'
+    """
+    if not raw:
+        return ""
+    expanded = expand_spoken_repeats(raw)
+    parts: list[str] = []
+    for token in _TOKEN_SPLIT_RE.split(expanded):
+        if not token:
+            continue
+        low = token.lower()
+        if low in _SPOKEN_DIGITS:
+            parts.append(_SPOKEN_DIGITS[low])
+        else:
+            parts.append(re.sub(r"\D", "", token))
+    return "".join(parts)
+
+
 def normalize_whatsapp(raw: Any) -> str:
     """Normalise a spoken/dialled phone number to digits with a country code.
 
@@ -205,7 +247,10 @@ def normalize_whatsapp(raw: Any) -> str:
     """
     if not raw:
         return ""
-    digits = re.sub(r"\D", "", expand_spoken_repeats(raw))
+    # Single chokepoint: the same deterministic word->digit conversion used by
+    # the live capture tool, so a wholly-spoken number ("nought seven six ...")
+    # and its dialled equivalent normalise identically and cannot diverge.
+    digits = spoken_number_to_digits(raw)
     if not digits:
         return ""
 
