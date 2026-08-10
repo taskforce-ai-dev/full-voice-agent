@@ -1,10 +1,10 @@
 """The collect_number_via_keypad tool and its prompt guidance.
 
-Keypad (DTMF) entry is 100% accurate, so Kavya must reach for it whenever she
-needs the guest's phone/WhatsApp/callback number instead of relying on spoken
-digits. The tool is declared in all three provider formats; its real execution
-is intercepted at the session level (it needs the live call), so execute_tool
-returns a graceful fallback for paths without a collector.
+Keypad (DTMF) entry is the fallback path when spoken capture fails or the
+caller asks to key in the number. The tool is declared in all three provider
+formats; its real execution is intercepted at the session level (it needs the
+live call), so execute_tool returns a graceful fallback for paths without a
+collector.
 """
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ def test_tool_is_declared_in_the_shared_definitions():
     assert "label" in props
     assert tool["input_schema"]["required"] == ["label"]
     desc = tool["description"].lower()
+    assert "fallback" in desc or "repeated" in desc
+    assert "always use" not in desc
     assert "keypad" in desc
     assert "number" in desc
 

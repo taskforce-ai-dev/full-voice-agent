@@ -29,8 +29,11 @@ def test_keypad_is_worded_as_a_fallback_not_the_default():
     assert "ALWAYS USE THE KEYPAD" not in prompt, "keypad must no longer be the primary path"
     low = prompt.lower()
     assert "collect_number_via_keypad" in prompt
+    capture_idx = low.index("capture_spoken_number")
     # The keypad appears only as a fallback offer.
     keypad_idx = low.index("collect_number_via_keypad")
+    assert capture_idx < keypad_idx
     window = low[max(0, keypad_idx - 400): keypad_idx + 400]
     assert "fallback" in window or "if the caller" in window or "only if" in window
     assert "keypad" in window
+    assert "fallback only" in window or "only if" in window or "repeated" in window

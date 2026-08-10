@@ -22,6 +22,8 @@ def test_tool_declared_with_a_verbatim_spoken_field():
     assert "spoken" in props
     assert tool["input_schema"]["required"] == ["spoken"]
     desc = tool["description"].lower()
+    assert "primary" in desc and "default" in desc
+    assert "first" in desc
     assert "exactly" in desc or "verbatim" in desc
     assert "double" in desc and "triple" in desc  # tells the model NOT to pre-convert
 

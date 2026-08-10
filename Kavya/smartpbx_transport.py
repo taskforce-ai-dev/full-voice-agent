@@ -15,6 +15,12 @@ from smartpbx_protocol import CallContext
 # g711_ulaw at 8 kHz carries one byte per sample, so a frame's wall-clock
 # duration is simply its length over this rate.
 _ULAW_BYTES_PER_SECOND = 8000
+# Grace window a full outbound queue waits for the realtime sender to drain
+# before it gives up and drops the newest frame. Bursty TTS outruns realtime
+# pacing, so a short wait turns most would-be overflow drops into backpressure
+# while the hard drop-newest remains the backstop for sustained overload.
+_SEND_BACKPRESSURE_SECONDS = 0.2
+_SEND_BACKPRESSURE_POLL = 0.005
 
 # Matches the gateway's saturating admission counters.
 _MAX_COUNTER = (1 << 63) - 1
@@ -46,6 +52,7 @@ class SmartPBXMediaTransport:
         self._queue: asyncio.Queue[_QueuedAudio] = asyncio.Queue(max_queue_frames)
         self._sender_task: asyncio.Task[None] | None = None
         self._generation = 0
+        self._truncating_generation: int | None = None
         self._closed = False
         self._send_failed = asyncio.Event()
 
@@ -74,19 +81,42 @@ class SmartPBXMediaTransport:
         self._sender_task = asyncio.create_task(self._send_queued_audio())
 
     async def send_audio(self, audio: bytes) -> None:
-        """Queue audio without allowing a slow network peer to block callers."""
+        """Queue audio, backpressuring briefly on a full queue before dropping."""
         if not self.is_active:
             return
-        if self._queue.full():
-            # Drop the newest frame, never the oldest. Evicting the head discards
-            # the frame that was next due, so playback jumps forward repeatedly
-            # and the reply garbles throughout; refusing the tail degrades to a
-            # clean early cut, which is far easier for a guest to recover from.
-            self._frames_dropped = min(self._frames_dropped + 1, _MAX_COUNTER)
-            if self._on_frame_dropped is not None:
-                self._on_frame_dropped()
+        generation = self._generation
+        if self._truncating_generation != generation:
+            # If generation changed while a prior truncation state was active,
+            # reset it so the next utterance can queue normally.
+            self._truncating_generation = None
+        elif self._truncating_generation == generation:
+            # Once truncating for this utterance, drop everything immediately
+            # to preserve a contiguous prefix and avoid frame decimation.
+            self._record_dropped_frame()
             return
-        self._queue.put_nowait(_QueuedAudio(self._generation, bytes(audio)))
+        if self._queue.full():
+            # Wait for the realtime sender to drain rather than dropping the tail
+            # at once. Bail — uncounted — if the transport closes or a barge-in
+            # supersedes this generation while we wait, so nothing hangs and a
+            # cleared frame is not miscounted as overflow.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _SEND_BACKPRESSURE_SECONDS
+            while self._queue.full():
+                if not self.is_active or self._generation != generation:
+                    return
+                if loop.time() >= deadline:
+                    break
+                await asyncio.sleep(_SEND_BACKPRESSURE_POLL)
+            if not self.is_active or self._generation != generation:
+                return
+            if self._queue.full():
+                self._truncating_generation = generation
+                # Sustained overflow: refuse the newest frame, never the oldest,
+                # so the delivered audio stays a contiguous prefix that ends early
+                # rather than a decimated sample that garbles throughout.
+                self._record_dropped_frame()
+                return
+        self._queue.put_nowait(_QueuedAudio(generation, bytes(audio)))
 
     async def send_mark(self, _name: str) -> None:
         """Report speech completion once queued audio has reached the wire.
@@ -100,11 +130,13 @@ class SmartPBXMediaTransport:
         if not self.is_active:
             return
         await self._queue.join()
+        self._truncating_generation = None
 
     async def clear_audio(self) -> None:
         """Discard queued audio from the current generation without a wire event."""
         if not self.is_active:
             return
+        self._truncating_generation = None
         self._generation += 1
         self._drain_queue()
 
@@ -113,6 +145,7 @@ class SmartPBXMediaTransport:
         if self._closed:
             return
         self._closed = True
+        self._truncating_generation = None
         sender_task = self._sender_task
         if sender_task is not None:
             sender_task.cancel()
@@ -163,13 +196,21 @@ class SmartPBXMediaTransport:
                 next_send_at += len(queued.audio) / _ULAW_BYTES_PER_SECOND
             finally:
                 self._queue.task_done()
+                if self._queue.empty():
+                    self._truncating_generation = None
 
     def _record_send_failure(self) -> None:
         """Signal a dead sender and release anything waiting on the queue."""
         self._send_failed.set()
+        self._truncating_generation = None
         self._drain_queue()
 
     def _drain_queue(self) -> None:
         while not self._queue.empty():
             self._queue.get_nowait()
             self._queue.task_done()
+
+    def _record_dropped_frame(self) -> None:
+        self._frames_dropped = min(self._frames_dropped + 1, _MAX_COUNTER)
+        if self._on_frame_dropped is not None:
+            self._on_frame_dropped()

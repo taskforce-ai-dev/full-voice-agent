@@ -110,3 +110,44 @@ async def test_close_is_idempotent_and_later_operations_are_noops():
 
     assert websocket.sent == []
     assert transport.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_clear_audio_drain_is_not_counted_as_a_drop():
+    # Only a genuine full-queue overflow counts; clearing must not inflate the
+    # frames_dropped_total metric (the 504-in-one-call evidence is real overflow).
+    websocket = FakeWebSocket()
+    websocket.allow_send.clear()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=4)
+    transport.start()
+    await transport.send_audio(b"in-flight")
+    await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
+    await transport.send_audio(b"a")
+    await transport.send_audio(b"b")
+    await transport.clear_audio()
+    assert transport.frames_dropped_total == 0
+    await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_send_audio_backpressures_and_bails_on_barge_in_without_hanging():
+    websocket = FakeWebSocket()
+    websocket.allow_send.clear()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=1)
+    transport.start()
+    await transport.send_audio(b"in-flight")  # taken by the (blocked) sender
+    await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
+    await transport.send_audio(b"queued")     # fills the 1-slot queue
+
+    # A further frame must backpressure (wait for space), not drop immediately.
+    pending = asyncio.create_task(transport.send_audio(b"waiting"))
+    await asyncio.sleep(0.01)
+    assert not pending.done(), "a full queue must backpressure, not drop the tail at once"
+    assert transport.frames_dropped_total == 0
+
+    # A barge-in supersedes the generation: the waiting frame is abandoned
+    # cleanly (uncounted) and does not hang.
+    await transport.clear_audio()
+    await asyncio.wait_for(pending, timeout=1)
+    assert transport.frames_dropped_total == 0
+    await transport.close()
