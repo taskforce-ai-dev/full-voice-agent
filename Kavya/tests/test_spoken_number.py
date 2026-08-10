@@ -63,3 +63,19 @@ def test_length_validation_rejects_wrong_counts():
 def test_handover_parser_doctests_still_pass():
     results = doctest.testmod(handover, verbose=False)
     assert results.failed == 0, f"{results.failed} handover doctest(s) failed"
+
+
+def test_stored_booking_phone_derives_from_the_same_parser():
+    # create_booking -> _resolve_stored_phone -> normalize_whatsapp, so the
+    # booking phone is the SAME deterministic conversion as the live readback.
+    from yanolja_service import _resolve_stored_phone
+
+    assert _resolve_stored_phone(
+        "oh seven one one seven five four double six eight"
+    ) == "94711754668"
+    # A wrong-length spoken number is not stored as a plausible wrong number;
+    # it falls back to the caller's own line.
+    assert _resolve_stored_phone(
+        "oh seven four two nine four four five one", "+94711754668"
+    ) == "94711754668"
+    assert _resolve_stored_phone("oh seven four two nine four four five one", "") == ""
