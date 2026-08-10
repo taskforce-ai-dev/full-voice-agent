@@ -602,7 +602,7 @@ STT_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
 # as the owner keeps them. Applied via PhraseListGrammar in AzureSTTStream.start.
 _STT_DIGIT_WORDS: tuple[str, ...] = (
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
-    "nine", "oh", "double", "triple",
+    "nine", "oh", "double", "triple", "treble", "nought", "naught",
 )
 _STT_BOOKING_TERMS: tuple[str, ...] = (
     "Hatton Hills", "check-in", "check in", "check-out", "check out",
