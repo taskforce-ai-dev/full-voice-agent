@@ -375,6 +375,37 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "capture_spoken_number",
+        "description": (
+            "Convert a phone, WhatsApp, or callback NUMBER the caller DICTATED "
+            "into exact digits. Pass the number EXACTLY as the caller said it, "
+            "words and all (e.g. 'nought seven six triple seven double five "
+            "one'), in the `spoken` field — do NOT convert double/triple/treble/"
+            "nought yourself, and never do the digit arithmetic in your head. "
+            "The tool returns the digits and a spaced `readback`; read that back "
+            "to the caller to confirm. If `valid` is false the number was the "
+            "wrong length — ask the caller to repeat it. Use this for every "
+            "spoken number."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "spoken": {
+                    "type": "string",
+                    "description": (
+                        "The number exactly as the caller said it, words and "
+                        "all, verbatim — no pre-conversion."
+                    ),
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Optional: what the number is for.",
+                },
+            },
+            "required": ["spoken"],
+        },
+    },
+    {
         "name": "collect_number_via_keypad",
         "description": (
             "Collect a phone, WhatsApp, or callback NUMBER from the guest via "
@@ -695,6 +726,25 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
                 "The message could not be sent right now, but the details are "
                 "recorded. Reassure the guest that the team will call them back."
             ),
+        })
+
+    elif tool_name == "capture_spoken_number":
+        # Deterministic word->digit conversion is the code's job (the single
+        # chokepoint in handover.py). The model relays the caller's words; it
+        # never does the arithmetic itself.
+        from handover import normalize_whatsapp, spoken_number_to_digits
+
+        spoken = tool_input.get("spoken") or ""
+        digits = spoken_number_to_digits(spoken)
+        normalized = normalize_whatsapp(spoken)
+        valid = bool(normalized)
+        return json.dumps({
+            "status": "captured" if valid else "invalid",
+            "digits": digits,
+            "readback": " ".join(digits),
+            "length": len(digits),
+            "valid": valid,
+            "normalized": normalized,
         })
 
     elif tool_name == "collect_number_via_keypad":

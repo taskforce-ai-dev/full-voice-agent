@@ -1,0 +1,78 @@
+"""The capture_spoken_number tool: relay-verbatim in, deterministic digits out."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+import tools
+
+
+def _configured(monkeypatch):
+    monkeypatch.setattr(tools, "is_configured", lambda: True)
+
+
+def test_tool_declared_with_a_verbatim_spoken_field():
+    tool = next(
+        (t for t in tools.TOOL_DEFINITIONS if t["name"] == "capture_spoken_number"), None
+    )
+    assert tool is not None, "capture_spoken_number must be a declared tool"
+    props = tool["input_schema"]["properties"]
+    assert "spoken" in props
+    assert tool["input_schema"]["required"] == ["spoken"]
+    desc = tool["description"].lower()
+    assert "exactly" in desc or "verbatim" in desc
+    assert "double" in desc and "triple" in desc  # tells the model NOT to pre-convert
+
+
+def test_tool_present_in_every_provider_format(monkeypatch):
+    _configured(monkeypatch)
+    assert any(t["name"] == "capture_spoken_number" for t in tools.get_tools())
+    assert any(
+        t["function"]["name"] == "capture_spoken_number" for t in tools.get_tools_openai()
+    )
+    gemini = tools.get_tools_gemini()[0]["function_declarations"]
+    assert any(t["name"] == "capture_spoken_number" for t in gemini)
+
+
+@pytest.mark.asyncio
+async def test_capture_returns_deterministic_digits_and_readback():
+    result = json.loads(await tools.execute_tool(
+        "capture_spoken_number",
+        {"spoken": "oh seven one one seven five four double six eight", "label": "WhatsApp"},
+    ))
+    assert result["status"] == "captured"
+    assert result["digits"] == "0711754668"
+    assert result["readback"] == "0 7 1 1 7 5 4 6 6 8"
+    assert result["length"] == 10
+    assert result["valid"] is True
+    assert result["normalized"] == "94711754668"
+
+
+@pytest.mark.asyncio
+async def test_capture_flags_a_wrong_length_number_as_invalid():
+    result = json.loads(await tools.execute_tool(
+        "capture_spoken_number",
+        {"spoken": "oh seven four two nine four four five one"},  # 8 local digits
+    ))
+    assert result["valid"] is False
+    assert result["status"] == "invalid"
+    # It still echoes what it heard so the model can ask about the right one.
+    assert result["digits"] == "074294451"
+
+
+@pytest.mark.asyncio
+async def test_capture_handles_triple_and_nought():
+    result = json.loads(await tools.execute_tool(
+        "capture_spoken_number", {"spoken": "nought seven six triple seven double five one"},
+    ))
+    assert result["digits"] == "076777551"
+    assert result["readback"] == "0 7 6 7 7 7 5 5 1"
+
+
+@pytest.mark.asyncio
+async def test_capture_with_no_input_is_invalid_not_a_crash():
+    result = json.loads(await tools.execute_tool("capture_spoken_number", {}))
+    assert result["valid"] is False
+    assert result["digits"] == ""

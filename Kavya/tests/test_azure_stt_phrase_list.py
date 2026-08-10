@@ -88,7 +88,7 @@ def test_phrase_list_constant_is_maintainable_and_domain_specific():
         assert room in phrases, f"room name {room} must be in the phrase list"
     for term in ("check-in", "check-out", "honeymoon", "half board", "adults", "nights"):
         assert term in phrases, f"booking term {term} must be in the phrase list"
-    for digit in ("zero", "one", "seven", "nine"):
+    for digit in ("zero", "one", "seven", "nine", "treble", "nought", "naught"):
         assert digit in phrases, f"digit word {digit} must be in the phrase list"
 
 
