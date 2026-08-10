@@ -377,15 +377,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "capture_spoken_number",
         "description": (
-            "Convert a phone, WhatsApp, or callback NUMBER the caller DICTATED "
-            "into exact digits. Pass the number EXACTLY as the caller said it, "
-            "words and all (e.g. 'nought seven six triple seven double five "
-            "one'), in the `spoken` field — do NOT convert double/triple/treble/"
-            "nought yourself, and never do the digit arithmetic in your head. "
-            "The tool returns the digits and a spaced `readback`; read that back "
-            "to the caller to confirm. If `valid` is false the number was the "
-            "wrong length — ask the caller to repeat it. Use this for every "
-            "spoken number."
+            "PRIMARY and DEFAULT: capture any phone, WhatsApp, or callback "
+            "NUMBER the caller DICTATES, and use this path FIRST every time "
+            "they speak a number. Convert the spoken words into exact digits, "
+            "preserving caller phrasing as input and returning validated digits. "
+            "Pass the number EXACTLY as the caller said it, words and all (e.g. "
+            "'nought seven six triple seven double five one'), in the `spoken` "
+            "field — do NOT convert double/triple/treble/nought yourself, and "
+            "never do the digit arithmetic in your head. The tool returns the "
+            "digits and a spaced `readback`; read that back to the caller to "
+            "confirm. If `valid` is false the number was the wrong length — "
+            "ask the caller to repeat it."
         ),
         "input_schema": {
             "type": "object",
@@ -409,10 +411,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "collect_number_via_keypad",
         "description": (
             "Collect a phone, WhatsApp, or callback NUMBER from the guest via "
-            "their phone keypad (DTMF tones), which is 100% accurate — always "
-            "use this instead of relying on spoken digits whenever you need a "
-            "number. Say a brief lead-in first (e.g. 'Sure, let me take that on "
-            "the keypad'); the tool then plays the precise 'key it in, then press "
+            "their phone keypad (DTMF tones) as a FALLBACK. Use this only after "
+            "repeated spoken attempts with `capture_spoken_number` have failed, "
+            "or if the guest is struggling or explicitly asks to key it in. "
+            "Say a brief lead-in first (e.g. 'Sure, let me take that on the "
+            "keypad'); the tool then plays the precise 'key it in, then press "
             "hash' instruction and waits. It returns the collected digits and a "
             "spaced readback form, or a failure so you can ask the guest to say "
             "the number instead. Use ONLY for numbers — never for dates or guest "
