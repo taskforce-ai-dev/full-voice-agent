@@ -2625,3 +2625,30 @@ def test_stt_endpointing_knobs_are_deliverable_through_the_documented_path():
     ):
         assert f"{name}={default}" in example, f"{name} missing from .env.example"
         assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
+
+
+def test_dtmf_knobs_are_deliverable_through_the_documented_path():
+    # The smartpbx service uses an explicit environment allowlist, so a knob set
+    # but not listed there never reaches the container. The kavya (Twilio) service
+    # forwards .env vars via env_file, so .env.example is its passthrough.
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
+
+    for name in (
+        "DTMF_INTERDIGIT_TIMEOUT_SECONDS",
+        "DTMF_OVERALL_TIMEOUT_SECONDS",
+        "DTMF_MAX_DIGITS",
+    ):
+        assert smartpbx_env.get(name) == f"${{{name}}}", (
+            f"{name} must be in the smartpbx environment allowlist to reach the container"
+        )
+
+    example = read_text(".env.example")
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    for name, default in (
+        ("DTMF_INTERDIGIT_TIMEOUT_SECONDS", "6"),
+        ("DTMF_OVERALL_TIMEOUT_SECONDS", "30"),
+        ("DTMF_MAX_DIGITS", "15"),
+    ):
+        assert f"{name}={default}" in example, f"{name} missing from .env.example"
+        assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
