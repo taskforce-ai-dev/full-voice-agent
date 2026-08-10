@@ -105,3 +105,63 @@ def test_dtmf_knob_defaults_and_clamping():
     assert 1.0 <= server.DTMF_INTERDIGIT_TIMEOUT_SECONDS <= 30.0
     assert 5.0 <= server.DTMF_OVERALL_TIMEOUT_SECONDS <= 120.0
     assert 1 <= server.DTMF_MAX_DIGITS <= 40
+
+
+@pytest.mark.asyncio
+async def test_hangup_during_collection_resolves_the_future_without_leaking(monkeypatch):
+    session, _spoken = make_smartpbx_session(monkeypatch)
+    task = asyncio.create_task(session._collect_number_via_keypad({"label": "phone"}))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert session._dtmf_collector is not None
+
+    # Teardown mid-collection (e.g. the guest hung up).
+    session._cancel_dtmf_collection()
+
+    result = json.loads(await asyncio.wait_for(task, timeout=1))
+    assert result["status"] == "cancelled"
+    assert session._dtmf_collector is None
+    assert task.done(), "the awaiting collection task must not leak"
+
+
+@pytest.mark.asyncio
+async def test_cancel_dtmf_collection_is_safe_when_not_collecting(monkeypatch):
+    session, _spoken = make_smartpbx_session(monkeypatch)
+    assert session._dtmf_collector is None
+    session._cancel_dtmf_collection()  # must not raise
+    assert session._dtmf_collector is None
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_finish_cancels_active_dtmf_collection():
+    from smartpbx_session import KavyaSmartPBXSession
+    from smartpbx_protocol import CallContext, MediaFormat
+
+    cancelled = []
+
+    class Pipeline:
+        transfer_pending = False
+        _endpointing_handle = None
+        _stt = None
+        full_transcript = []
+
+        def _cancel_reprompt(self):
+            pass
+
+        def _write_audio_dump(self):
+            pass
+
+        def _cancel_dtmf_collection(self):
+            cancelled.append(True)
+
+    context = CallContext("media", "safe", "0771234567", "0770000000", "account", MediaFormat("g711_ulaw", 8000))
+
+    async def post(**_):
+        return None
+
+    session = KavyaSmartPBXSession(
+        context, object(), pipeline=Pipeline(), post_call_processor=post,
+        welcome_text="", llm_provider="openai", model="m",
+    )
+    await session.finish(False)
+    assert cancelled == [True], "finish must cancel any active keypad collection"
