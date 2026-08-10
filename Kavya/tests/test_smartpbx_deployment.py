@@ -2652,3 +2652,17 @@ def test_dtmf_knobs_are_deliverable_through_the_documented_path():
     ):
         assert f"{name}={default}" in example, f"{name} missing from .env.example"
         assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
+
+
+def test_bargein_knobs_are_deliverable_through_the_documented_path():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
+    for name in ("BARGEIN_MIN_CHARS", "BARGEIN_DEBOUNCE_SECONDS"):
+        assert smartpbx_env.get(name) == f"${{{name}}}", (
+            f"{name} must be in the smartpbx environment allowlist to reach the container"
+        )
+    example = read_text(".env.example")
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    for name, default in (("BARGEIN_MIN_CHARS", "12"), ("BARGEIN_DEBOUNCE_SECONDS", "0.6")):
+        assert f"{name}={default}" in example, f"{name} missing from .env.example"
+        assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
