@@ -807,3 +807,50 @@ async def test_gateway_cancellation_during_blocking_close_reraises_and_disables_
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+class _DtmfSession(FakeSession):
+    def __init__(self, context, transport):
+        super().__init__(context, transport)
+        self.dtmf_digits: list[str] = []
+
+    async def feed_dtmf(self, digit):
+        self.dtmf_digits.append(digit)
+        return True
+
+
+class _DtmfFactory(Factory):
+    async def __call__(self, context, transport, sink=None):
+        self.sinks.append(sink)
+        session = _DtmfSession(context, transport)
+        self.sessions.append(session)
+        self.ready.set()
+        return session
+
+
+@pytest.mark.asyncio
+async def test_gateway_routes_dtmf_to_the_session_and_still_observes(caplog):
+    dtmf = {"event": "dtmf", "dtmf": {"callId": "call-1", "otherLegCallId": "other-1", "digit": "7"}}
+    registry = SmartPBXSessionRegistry(4)
+    socket = FakeWebSocket([START, dtmf, {"event": "stop"}], token="test-token", header="X-Kavya-SmartPBX-Token")
+    factory = _DtmfFactory()
+    with caplog.at_level("INFO"):
+        await SmartPBXGateway(settings(), registry).handle(socket, factory)
+
+    assert factory.sessions[0].dtmf_digits == ["7"], "the digit must reach the session collector hook"
+    tuples = [(r["stage"], r["outcome"], r["failure_class"]) for r in fixed_diagnostics(caplog)]
+    assert ("context_validation", "observed", "none") in tuples, "DTMF observability must be preserved"
+
+
+@pytest.mark.asyncio
+async def test_gateway_dtmf_without_a_collector_hook_still_observes(caplog):
+    # FakeSession has no feed_dtmf; the gateway must fall back to OBSERVED cleanly.
+    dtmf = {"event": "dtmf", "dtmf": {"callId": "call-1", "otherLegCallId": "other-1", "digit": "5"}}
+    registry = SmartPBXSessionRegistry(4)
+    socket = FakeWebSocket([START, dtmf, {"event": "stop"}], token="test-token", header="X-Kavya-SmartPBX-Token")
+    factory = Factory()
+    with caplog.at_level("INFO"):
+        await SmartPBXGateway(settings(), registry).handle(socket, factory)
+
+    tuples = [(r["stage"], r["outcome"], r["failure_class"]) for r in fixed_diagnostics(caplog)]
+    assert ("context_validation", "observed", "none") in tuples
