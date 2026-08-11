@@ -20,6 +20,7 @@ import server  # noqa: E402
 
 KB = (KAVYA / "knowledge_docs" / "hotel_info.txt").read_text(encoding="utf-8")
 PROMPT = server._build_system_prompt("en")
+SERVER_TEXT = (KAVYA / "server.py").read_text(encoding="utf-8")
 
 # Named in the pre-approval wording; management asked for both to be removed.
 FORMER_NAMES = ["Rakesh", "Mr. Chrys"]
@@ -72,7 +73,9 @@ def test_no_certification_is_claimed():
 # ---------------------------------------------------------------------------
 
 def test_prompt_states_rates_include_tax_and_service_charge():
-    assert "INCLUSIVE of all taxes and service charge" in PROMPT
+    assert "NET AND INCLUSIVE OF ALL TAXES" in PROMPT
+    assert "net and inclusive of all taxes and service charge" in PROMPT
+    assert "Every room-rate sentence must include the meal plan" in PROMPT
 
 
 def test_prompt_forbids_adding_a_service_charge_on_top():
@@ -83,9 +86,60 @@ def test_prompt_forbids_adding_a_service_charge_on_top():
 
 
 def test_kb_room_rates_are_inclusive():
-    assert "all taxes and service charge included" in KB
-    assert "include all taxes and service charge" in KB
-    assert "nothing further is added to it" in KB
+    assert "NET AND INCLUSIVE OF ALL TAXES" in KB.upper()
+    assert "service charge" in KB.lower()
+    assert "half board with breakfast and dinner included" in KB.lower()
+
+
+def test_prompt_includes_residency_question_once_before_rate_quote():
+    assert "RESIDENCY QUESTION — ASK ONLY WHEN QUOTING PRICES" in PROMPT
+    assert "Do NOT ask whether the guest is a Sri Lankan resident or a foreign guest" not in PROMPT
+    # The prompt still asks for one-time residency capture and re-use.
+    assert (
+        "once the guest has picked a room, ask whether they are a Sri Lankan "
+        "resident or a foreign guest" in PROMPT
+    )
+    assert "Ask it once and once only per booking" in PROMPT
+
+
+def test_kb_has_both_foreign_and_resident_rate_sheets():
+    assert "FOREIGN GUEST RATES" in KB
+    assert "SRI LANKAN RESIDENT RATES" in KB
+    assert "FOREIGN GUEST RATES — in US dollars" in KB
+    assert "Sri Lankan resident rates in rupees" in KB
+    assert "peak months of April and December" in KB
+    # Keep each sheet self-describing so single-sheet retrieval is unambiguous.
+    assert "guided nature walk" in KB  # existing complimentary listing retained
+
+
+def test_prompt_mentions_complimentary_experiences_during_booking():
+    assert "If the guest has told you this is a two-night or longer stay" in PROMPT
+    assert "guided nature walk" in PROMPT
+    assert "guided birding tour" in PROMPT
+    assert "stargazing" in PROMPT
+    assert PROMPT.count("proactively mention once") == 1
+
+
+def test_prompt_includes_warm_voice_rule_with_no_stage_directions():
+    low = PROMPT.lower()
+    assert (
+        "never emit bracketed stage directions or audio tags" in low
+    )
+    assert "asterisk actions" in low
+    assert "[warmly]" in PROMPT
+    assert "[laughs]" in PROMPT
+
+
+def test_hardcoded_branding_not_present_in_kavya_prompt_or_kb():
+    assert "Treehouse" not in PROMPT
+    assert "Mosvold" not in PROMPT
+    assert "Belihuloya" not in PROMPT
+    assert "Treehouse" not in KB
+    assert "Mosvold" not in KB
+    assert "Belihuloya" not in KB
+    assert "Treehouse" not in SERVER_TEXT
+    assert "Mosvold" not in SERVER_TEXT
+    assert "Belihuloya" not in SERVER_TEXT
 
 
 def test_paid_experiences_still_carry_their_service_charge():

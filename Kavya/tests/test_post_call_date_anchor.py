@@ -45,11 +45,16 @@ def test_extraction_system_prompt_builder_injects_the_given_date():
     lowered = prompt.lower()
     assert "year" in lowered
     assert "past" in lowered
+    assert "CRITICAL RULES FOR guest_name" in prompt
+    assert "create_booking" in prompt
+    assert "spelling" in prompt
 
 
 def test_retry_prompt_builder_injects_the_given_date():
     prompt = post_call.build_retry_prompt("2026-08-09")
     assert "Today's date is 2026-08-09." in prompt
+    assert "System marker" in prompt
+    assert "copy guest_name from the marker's guest_name field" in prompt
 
 
 @pytest.mark.asyncio

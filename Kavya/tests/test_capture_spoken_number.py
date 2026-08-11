@@ -36,6 +36,14 @@ def test_tool_present_in_every_provider_format(monkeypatch):
     )
     gemini = tools.get_tools_gemini()[0]["function_declarations"]
     assert any(t["name"] == "capture_spoken_number" for t in gemini)
+    assert any(t["name"] == "capture_spoken_name" for t in tools.get_tools())
+    assert any(
+        t["function"]["name"] == "capture_spoken_name" for t in tools.get_tools_openai()
+    )
+    assert any(
+        t["name"] == "capture_spoken_name"
+        for t in tools.get_tools_gemini()[0]["function_declarations"]
+    )
 
 
 @pytest.mark.asyncio

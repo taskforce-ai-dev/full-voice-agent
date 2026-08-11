@@ -524,8 +524,15 @@ async def derive_availability(
 
     if DEMO_RATES_ENABLED:
         rates_note = (
-            "Rates are per room per night in US dollars, half board "
-            f"(breakfast and dinner), including taxes. "
+            "These figures are the FOREIGN GUEST rates in US dollars, per room "
+            "per night, half board with breakfast and dinner included, net and "
+            "inclusive of all taxes and service charge. For Sri Lankan residents, "
+            "do not quote these figures — use the resident rupee sheet in the "
+            "hotel information, including peak-month guidance for April and "
+            "December. For peak booking months in April or December, quote from "
+            "the peak resident sheet.\n"
+            "Rates for Sri Lankan residents should therefore ignore the above "
+            "US-dollar figures and quote only from the resident rates in rupees."
             f"Reservations: {RESERVATIONS_PHONE}."
         )
     else:

@@ -134,7 +134,7 @@ def test_failsafe_session_collects_details_and_messages_the_manager(n8n):
     state = _seed_carry_over()
     seen = {}
 
-    async def fake_llm(*, client, system, conversation_history, tools, websocket, lang):
+    async def fake_llm(*, client, system, conversation_history, tools, websocket, lang, **_kwargs):
         seen["system"] = system
         seen["tools"] = [t["name"] for t in tools]
         # A model can only call a tool it was actually offered. The failsafe
@@ -228,7 +228,7 @@ def test_safety_net_does_not_double_send_after_a_successful_tool_call(n8n):
 def test_a_normal_session_is_not_in_failsafe_mode(n8n):
     seen = {}
 
-    async def fake_llm(*, client, system, conversation_history, tools, websocket, lang):
+    async def fake_llm(*, client, system, conversation_history, tools, websocket, lang, **_kwargs):
         seen["system"] = system
         seen["tools"] = [t["name"] for t in tools]
         return "Welcome! How can I help?"
@@ -250,7 +250,7 @@ def test_failsafe_turn_skips_the_knowledge_base(n8n):
     seen = {}
     kb_hits = []
 
-    async def fake_llm(*, client, system, conversation_history, tools, websocket, lang):
+    async def fake_llm(*, client, system, conversation_history, tools, websocket, lang, **_kwargs):
         seen["history"] = list(conversation_history)
         return "ok"
 
@@ -266,7 +266,7 @@ def test_failsafe_mode_is_ignored_on_non_english_paths(n8n):
     _seed_carry_over()
     seen = {}
 
-    async def fake_llm(*, client, system, conversation_history, tools, websocket, lang):
+    async def fake_llm(*, client, system, conversation_history, tools, websocket, lang, **_kwargs):
         seen["system"] = system
         return "ok"
 

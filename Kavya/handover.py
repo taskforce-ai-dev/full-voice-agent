@@ -97,8 +97,8 @@ def _is_e164_sane(digits: str) -> bool:
 # `notify_human_handover` tool handler can reach call metadata it never
 # receives as tool arguments. A ContextVar (not a plain global) because every
 # call is its own asyncio task and sessions overlap.
-handover_context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
-    "handover_context", default={}
+handover_context: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "handover_context", default=None
 )
 
 
@@ -122,6 +122,167 @@ _REPEAT_RE = re.compile(
     r"(\d|zero|oh|o|nought|naught|one|two|three|four|five|six|seven|eight|nine)\b",
     re.IGNORECASE,
 )
+
+_SPOKEN_TO_LETTER = {
+    "a": "A", "alpha": "A",
+    "b": "B", "bravo": "B",
+    "c": "C", "charlie": "C",
+    "d": "D", "delta": "D",
+    "e": "E", "echo": "E",
+    "f": "F", "foxtrot": "F",
+    "g": "G", "golf": "G",
+    "h": "H", "hotel": "H",
+    "i": "I", "india": "I",
+    "j": "J", "juliett": "J",
+    "k": "K", "kilo": "K",
+    "l": "L", "lima": "L",
+    "m": "M", "mike": "M",
+    "n": "N", "november": "N",
+    "are": "R",
+    "o": "O", "oscar": "O", "oh": "O", "zero": "O", "nought": "O", "naught": "O",
+    "p": "P", "papa": "P",
+    "q": "Q", "quebec": "Q",
+    "r": "R", "romeo": "R",
+    "s": "S", "sierra": "S",
+    "t": "T", "tango": "T",
+    "u": "U", "uniform": "U",
+    "v": "V", "victor": "V",
+    "w": "W", "whiskey": "W", "doubleyou": "W", "you": "W",
+    "x": "X", "xray": "X",
+    "y": "Y", "yankee": "Y", "why": "Y",
+    "z": "Z", "zulu": "Z",
+}
+
+_SPOKEN_NAME_REPEAT_WORDS = {
+    "double": 2,
+    "triple": 3,
+    "treble": 3,
+}
+
+_NAME_SEPARATOR_TOKENS = {
+    "for", "as", "in", "and", "is", "of", "the", "to", "with", "like", "and",
+}
+
+
+def _get_handover_context() -> dict[str, Any]:
+    ctx = handover_context.get()
+    if ctx is None:
+        ctx = {}
+        handover_context.set(ctx)
+    return ctx
+
+
+def _is_spoken_name_letter_token(raw: str) -> bool:
+    token = raw.strip().lower()
+    if not token:
+        return False
+    return bool(_map_spoken_name_token(token)) and token not in {"and", "or", "are"}
+
+
+def _map_spoken_name_token(raw: str) -> str:
+    token = raw.strip().lower()
+    if not token:
+        return ""
+    if len(token) == 1 and token.isalpha():
+        return token.upper()
+    return _SPOKEN_TO_LETTER.get(token, "")
+
+
+def _format_spelled_name_part(part: str) -> str:
+    lowered = part.lower()
+    if not lowered:
+        return ""
+    if len(set(lowered)) == 1:
+        return part.upper()
+    return lowered.title()
+
+
+def assemble_spoken_name(raw: Any) -> str:
+    """Assemble a spelled name from dictated letters into a title-cased string.
+
+    Handles plain letters (``d i l s h a n``), NATO words (``B for Bravo``),
+    repeat shorthand (``double e``, ``triple J``), mixed punctuation
+    (commas/periods) and common spoken-artifacts (``double you`` as W, ``are``
+    as R, ``why`` as Y, ``oh`` as O). The output is safe for booking fields:
+    it only contains letters and spaces.
+
+    This is a code-path helper; it is intentionally strict and will ignore
+    words that cannot map cleanly to a name letter.
+    """
+    if not raw:
+        return ""
+
+    raw_text = str(raw).replace("-", " ")
+    raw_text = raw_text.replace("|", " ")
+    cleaned_text = re.sub(r"[.,]", " ", raw_text)
+    tokens = re.findall(r"[A-Za-z]+", cleaned_text)
+    current: list[str] = []
+
+    i = 0
+    while i < len(tokens):
+        token = tokens[i].strip()
+        if not token:
+            i += 1
+            continue
+        low = token.lower()
+        if low in _NAME_SEPARATOR_TOKENS:
+            i += 1
+            continue
+
+        repeat_count = _SPOKEN_NAME_REPEAT_WORDS.get(low)
+        if repeat_count:
+            next_token = tokens[i + 1] if i + 1 < len(tokens) else ""
+            letter = _map_spoken_name_token(next_token)
+            if letter:
+                # "double you" is spoken as a single letter (W), not two W's.
+                current.append(letter if letter == "W" else (letter * repeat_count))
+                i += 2
+                continue
+
+        letter = _map_spoken_name_token(low)
+        if not letter:
+            i += 1
+            continue
+        if low in {"you", "oh"}:
+            prev_token = tokens[i - 1].lower() if i > 0 else ""
+            next_token = tokens[i + 1].lower() if i + 1 < len(tokens) else ""
+            if not (
+                _is_spoken_name_letter_token(prev_token)
+                or _is_spoken_name_letter_token(next_token)
+            ):
+                i += 1
+                continue
+
+        # Caller says "B for Bravo" or "D as in Delta". Use the first token
+        # and skip the immediate descriptive suffix to prevent accidental
+        # duplicate letters (B + Bravo).
+        next_token = tokens[i + 1].lower() if i + 1 < len(tokens) else ""
+        next_next = tokens[i + 2] if i + 2 < len(tokens) else ""
+        next_next_next = tokens[i + 3] if i + 3 < len(tokens) else ""
+        if (
+            next_token in {"for", "in"}
+            and _map_spoken_name_token(next_next) == letter
+        ):
+            i += 3
+        elif (
+            next_token == "as"
+            and next_next.lower() == "in"
+            and _map_spoken_name_token(next_next_next) == letter
+        ):
+            i += 4
+        elif (
+            next_token == "as"
+            and _map_spoken_name_token(next_next) == letter
+        ):
+            i += 3
+        else:
+            i += 1
+
+        current.append(letter)
+
+    if not current:
+        return ""
+    return _format_spelled_name_part("".join(current))
 
 
 def expand_spoken_repeats(raw: Any) -> str:

@@ -109,6 +109,7 @@ class SmartPBXSessionRegistry:
         self._max_sessions = max_sessions
         self._active_sessions = self._admitted_total = self._rejected_capacity_total = self._released_total = 0
         self._frames_dropped_total = 0
+        self._echo_rejections_total = 0
         self._lock = asyncio.Lock()
 
     async def try_acquire(self) -> SessionLease | None:
@@ -124,6 +125,10 @@ class SmartPBXSessionRegistry:
         """Count one outbound frame discarded by transport backpressure."""
         self._frames_dropped_total = _saturating_increment(self._frames_dropped_total)
 
+    def record_echo_rejection(self, _chars: int, _score: float) -> None:
+        """Count one transcript rejected as assistant speech echo."""
+        self._echo_rejections_total = _saturating_increment(self._echo_rejections_total)
+
     async def _release(self) -> None:
         async with self._lock:
             if self._active_sessions:
@@ -136,6 +141,7 @@ class SmartPBXSessionRegistry:
             "admitted_total": self._admitted_total, "rejected_capacity_total": self._rejected_capacity_total,
             "released_total": self._released_total,
             "frames_dropped_total": self._frames_dropped_total,
+            "echo_rejections_total": self._echo_rejections_total,
         }
 
 
@@ -233,6 +239,10 @@ class SmartPBXGateway:
                 sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.SESSION_FACTORY)
                 close_outcome = (1011, "internal error")
                 return
+            try:
+                session._record_echo_rejection = self._registry.record_echo_rejection
+            except Exception:
+                pass
             try:
                 await session.start()
             except Exception:

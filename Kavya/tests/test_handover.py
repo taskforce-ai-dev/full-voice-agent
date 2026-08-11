@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import handover  # noqa: E402
 from handover import (  # noqa: E402
     build_payload,
+    assemble_spoken_name,
     expand_spoken_repeats,
     is_valid_lk_nsn,
     normalize_whatsapp,
@@ -193,6 +194,43 @@ def test_normalize_whatsapp_never_double_prefixes():
 )
 def test_expand_spoken_repeats(raw, expected):
     assert expand_spoken_repeats(raw) == expected
+
+
+def test_assemble_spoken_name_supports_plain_letters_and_nato_words():
+    assert assemble_spoken_name("d i l s h a n") == "Dilshan"
+    assert assemble_spoken_name("B for Bravo") == "B"
+    assert assemble_spoken_name("bravo alpha") == "Ba"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("double you", "W"),
+        ("double e", "EE"),
+        ("triple e", "EEE"),  # if said as two words, still expands to EEE
+        ("I, B, C", "Ibc"),
+        ("D, I, L, S, H, A, N", "Dilshan"),
+        ("C, you, R", "Cwr"),
+        ("B as in Bravo", "B"),
+    ],
+)
+def test_assemble_spoken_name_handles_repeats_and_mixed_spoken_forms(raw, expected):
+    assert assemble_spoken_name(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("", ""),
+        (None, ""),
+        ("car was here", ""),
+        ("zero zero seven one", "OO"),
+        ("you know", ""),
+        ("oh well", ""),
+    ],
+)
+def test_assemble_spoken_name_ignores_garbage(raw, expected):
+    assert assemble_spoken_name(raw) == expected
 
 
 @pytest.mark.parametrize(

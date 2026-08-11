@@ -70,6 +70,15 @@ CRITICAL RULES FOR property AND room_preference:
 - Record room_preference using one of those exact five names, and nothing else. If the guest described a room loosely ("the one with the pool"), map it to the correct full name (that is the Mount Monarch Chalet).
 - If the guest never indicated a room, set room_preference to null.
 
+CRITICAL RULES FOR guest_name:
+- If a System marker line appears in this transcript in the form
+  "BOOKING CONFIRMED via create_booking: guest_name=<name>, ...",
+  copy guest_name from the marker text and nothing else.
+- If no create_booking exists but the transcript shows the guest spelling their name
+  letter-by-letter, assemble the name from those letters.
+- If neither condition applies, extract guest_name from conversational text as you
+  would normally.
+
 CRITICAL RULES FOR call_outcome — pick the BEST match:
 - "booking_confirmed" = guest confirmed a booking during the call
 - "booking_inquiry" = guest asked about booking/availability for specific dates (even if no tool was called)
@@ -153,7 +162,7 @@ def _normalize_property_and_room(result: dict[str, Any]) -> dict[str, Any]:
 
     Note what this deliberately no longer does: it used to NULL out
     ``room_preference`` whenever the property was unresolved, because a bare
-    "Deluxe Double Room" could belong to either Mosvold property. Keeping that
+    "Deluxe Double Room" could be ambiguous across properties. Keeping that
     behaviour here would now silently drop the room from every Google Sheet row
     where the model left ``property`` null — which is most of them, since nothing
     on the call asks the guest to name a property any more.
@@ -340,6 +349,8 @@ async def extract_booking_details(
 
 RETRY_PROMPT: str = """Extract these fields from the Hatton Hills call transcript as a short JSON object. Use null for missing fields.
 Fields: guest_name, property (always 'Hatton Hills'), num_guests, check_in (YYYY-MM-DD), check_out (YYYY-MM-DD), room_preference, availability_result, call_outcome (booking_inquiry/general_inquiry/booking_confirmed/callback_requested/dropped), follow_up_needed (Yes/No), summary (1 sentence English).
+If a System marker line appears, copy guest_name from the marker's guest_name field
+and do not infer it from surrounding guest-side chatter.
 Room types differ per property and similar names exist at both, so a room name alone is ambiguous: if the property is not established, set both property and room_preference to null. Never write a price figure into any field.
 Return ONLY valid JSON, no markdown."""
 
@@ -432,7 +443,11 @@ def _format_transcript(full_transcript: list[dict[str, str]]) -> str:
     """Convert transcript list to readable text."""
     lines: list[str] = []
     for entry in full_transcript:
-        role = "Guest" if entry["role"] == "user" else "Kavya"
+        role = (
+            "Guest" if entry["role"] == "user"
+            else "System" if entry["role"] == "system"
+            else "Kavya"
+        )
         lines.append(f"{role}: {entry['text']}")
     return "\n".join(lines)
 

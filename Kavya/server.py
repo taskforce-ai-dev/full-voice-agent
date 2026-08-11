@@ -3,7 +3,7 @@ server.py — Main FastAPI server for Hatton Hills Voice Agent (Kavya).
 
 Hatton Hills is a SINGLE property: a luxury boutique eco retreat in an
 eight-acre private forest in Sri Lanka's central hill country, with exactly five
-room types. The two-property (Mosvold) disambiguation machinery was collapsed to
+room types. The two-property disambiguation machinery was collapsed to
 single-property mode on 2026-07-30 — see yanolja_service.resolve_property.
 
 Handles:
@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import inspect
+import difflib
 
 # --- Error tracking (Sentry): no-op unless SENTRY_DSN is set ---
 if os.getenv("SENTRY_DSN"):
@@ -61,7 +62,7 @@ import xml.sax.saxutils
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from html import escape as html_escape
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote as url_quote
 
 import httpx
@@ -583,6 +584,87 @@ def _parse_endpointing_seconds(
     return min(max(value, minimum), maximum)
 
 
+def _parse_clamped_float(
+    environ, name: str, default: float, minimum: float, maximum: float
+) -> float:
+    """Read a float tuning knob from the environment, clamped."""
+    raw = environ.get(name, "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+_ECHO_NORMALIZE_PATTERN = re.compile(r"[^\w\s]+", re.UNICODE)
+_ECHO_AFFIRMATION_TOKENS: set[str] = {"yes", "yeah", "no", "correct", "right", "okay"}
+
+
+def _normalize_for_overlap(text: str) -> str:
+    """Lowercase and strip punctuation and duplicate spacing for scoring."""
+    normalized = _ECHO_NORMALIZE_PATTERN.sub(" ", (text or "").lower())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _starts_with_affirmation_token(text: str) -> bool:
+    """Return whether the normalized text starts with an affirmation token."""
+    tokens = _normalize_for_overlap(text).split()
+    return bool(tokens) and tokens[0] in _ECHO_AFFIRMATION_TOKENS
+
+
+def _token_overlap_ratio(reference: str, transcript: str) -> float:
+    """Order-aware fraction of transcript tokens matching the reference."""
+    reference_tokens = _normalize_for_overlap(reference).split()
+    transcript_tokens = _normalize_for_overlap(transcript).split()
+    if not reference_tokens or not transcript_tokens:
+        return 0.0
+    matcher = difflib.SequenceMatcher(None, reference_tokens, transcript_tokens)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return matched / len(transcript_tokens)
+
+
+def _append_booking_confirmation_marker(
+    transcript_sink: list[dict[str, str]],
+    tool_name: str,
+    tool_input: dict[str, Any],
+    tool_result: str,
+) -> None:
+    if tool_name != "create_booking":
+        return
+    if not isinstance(tool_result, str):
+        return
+    try:
+        parsed = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(parsed, dict):
+        return
+
+    success = parsed.get("success")
+    if not success and success is not True:
+        return
+
+    guest_name = (parsed.get("guest_name") or tool_input.get("guest_name") or "").strip()
+    if not guest_name:
+        return
+    marker_parts = [f"guest_name={guest_name}"]
+    if parsed.get("booking_reference"):
+        marker_parts.append(f"booking_reference={parsed.get('booking_reference')}")
+    if parsed.get("room_type"):
+        marker_parts.append(f"room_type={parsed.get('room_type')}")
+    if parsed.get("check_in"):
+        marker_parts.append(f"check_in={parsed.get('check_in')}")
+    if parsed.get("check_out"):
+        marker_parts.append(f"check_out={parsed.get('check_out')}")
+    transcript_sink.append({
+        "role": "system",
+        "text": (
+            "BOOKING CONFIRMED via create_booking: "
+            + ", ".join(marker_parts)
+        ),
+    })
+
+
 # Endpointing timers. A provider FINAL (Azure `recognized`) has already
 # segmented the utterance, so it flushes after a short grace that only guards
 # against a mid-thought continuation ("a room" ... "for next weekend"). The
@@ -647,13 +729,25 @@ DTMF_MAX_DIGITS: int = _parse_clamped_int(
 # back into STT must not. BARGEIN_MIN_CHARS is the minimum stripped transcript
 # length that counts; BARGEIN_DEBOUNCE_SECONDS ignores STT within that window of
 # a sentence starting (the echo burst). A genuine sustained interruption still
-# barges in. Both env-tunable and clamped.
+# barges in.
+#
+# SmartPBX dialog media is prone to TTS echo because the path has no echo
+# cancellation. To avoid false barge-ins on self-leakage, classify transcript
+# overlap against the assistant text recently spoken in the current turn.
+#
+# ECHO_MATCH_MIN_RATIO defines the minimum transcript-overlap ratio.
+# All tuning knobs are env-tunable and clamped.
+ECHO_SUPPRESSION_ENABLED: bool = os.getenv("ECHO_SUPPRESSION_ENABLED", "true").lower() == "true"
 BARGEIN_MIN_CHARS: int = _parse_clamped_int(
     os.environ, "BARGEIN_MIN_CHARS", 12, 0, 200
 )
 BARGEIN_DEBOUNCE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "BARGEIN_DEBOUNCE_SECONDS", 0.6, 0.0, 5.0
 )
+ECHO_MATCH_MIN_RATIO: float = _parse_clamped_float(
+    os.environ, "ECHO_MATCH_MIN_RATIO", 0.8, 0.5, 1.0
+)
+ECHO_SENTENCE_COVERAGE_MIN_RATIO: float = 0.6
 
 # Bounds on restarting a failed STT stream. Google caps a streaming_recognize
 # call at ~5 minutes, so healthy restarts are normal and must stay cheap; a
@@ -823,10 +917,10 @@ def _build_system_prompt(lang: str = "en") -> str:
     if yanolja_service.DEMO_RATES_ENABLED:
         rates_rules = (
             "RATES AND PRICING:\n"
-            "- Rates are per room, per night, in US dollars, half board "
-            "(breakfast and dinner included), and INCLUSIVE of all taxes and "
-            "service charge. Always say the currency and say 'per room per "
-            "night' so the guest is not confused.\n"
+            "- Every room-rate sentence must include the meal plan and value: "
+            "half board with breakfast and dinner included, NET AND INCLUSIVE OF "
+            "ALL TAXES and all service charge. For every rate you quote, include "
+            "the words 'per room per night' and the currency.\n"
             "- The room rate you quote is the FINAL room rate. Never add a "
             "service charge or a tax on top of it, never say 'plus service "
             "charge' or 'plus taxes', and never imply the guest will pay more "
@@ -834,21 +928,22 @@ def _build_system_prompt(lang: str = "en") -> str:
             "service charge are extra, say plainly that the rate already "
             "includes both.\n"
             "- You MAY quote the rates given in the hotel information in "
-            "context, and the rate returned by the check_availability tool. "
-            "Say figures as words, e.g. 'seven hundred US dollars' and 'one "
-            "thousand four hundred US dollars'.\n"
-            "- State rates plainly and confidently, e.g. 'the Forest Escape "
-            "Suite is seven hundred US dollars per room per night'. Do NOT "
-            "hedge, and do NOT call a rate indicative, approximate, "
-            "provisional or subject to change.\n"
+            "context, and the rate returned by the check_availability tool.\n"
+            "- For foreign guests, quote the foreign-guest USD examples as words: "
+            "'the Forest Escape Suite is seven hundred US dollars per room per "
+            "night' and 'the Mount Monarch Chalet is one thousand four hundred "
+            "US dollars per room per night'.\n"
+            "- For Sri Lankan residents, quote resident rates, such as "
+            "'the Forest Escape Suite is one hundred and fifty eight thousand "
+            "rupees per room per night on half board with breakfast and dinner "
+            "included, net and inclusive of all taxes and service charge'.\n"
+            "- State rates plainly and confidently. Do NOT hedge, and do NOT call a "
+            "rate indicative, approximate, provisional or subject to change.\n"
             "- NEVER invent a rate for anything not priced in your context. If "
             "asked the price of an upgrade, supplement, experience, transfer, "
             "meal or package that is not listed, say you do not have that "
             "figure to hand and offer the reservations number: plus nine four, "
             "seven seven, two two zero, four four zero zero.\n"
-            "- Do NOT ask whether the guest is a Sri Lankan resident or a "
-            "foreign guest, and do NOT quote a separate resident rate — there "
-            "is no separate resident rate at Hatton Hills.\n"
             "- For discounts, negotiated rates, long-stay or off-season deals, "
             "do NOT invent a number — treat it as a handoff opportunity.\n\n"
         )
@@ -870,12 +965,6 @@ def _build_system_prompt(lang: str = "en") -> str:
             "nine four, seven seven, two two zero, four four zero zero. "
             "Offer to take their dates so the team can come back with the "
             "rate.\n"
-            "- Do NOT ask whether the guest is a Sri Lankan resident or a "
-            "foreign guest. It is not needed to make a booking. If the guest "
-            "raises it themselves, you may confirm that Sri Lankan resident "
-            "guests present a valid National Identity Card or a Sri Lankan "
-            "passport at check-in, but you may NOT state any resident or "
-            "non-resident figure.\n"
             "- If the caller asks about current offers, promotions, seasonal "
             "deals or packages, do NOT describe any offer. Say you would rather "
             "have reservations confirm what is running for their dates, and "
@@ -892,7 +981,11 @@ def _build_system_prompt(lang: str = "en") -> str:
         )
         avail_price_clause = (
             "Whenever you do name a room, give its nightly rate with it, in "
-            "US dollars per room per night."
+            "the currency that matches the guest's residency: Sri Lankan "
+            "residents in LKR, foreign guests in US dollars. In every quoted "
+            "rate sentence include half board with breakfast and dinner, and "
+            "say 'net and inclusive of all taxes and service charge.' "
+            "State it as per room per night.\n"
         )
         rate_press_clause = (
             "- If the guest asks for a total, multiply the nightly rate by "
@@ -968,7 +1061,16 @@ def _build_system_prompt(lang: str = "en") -> str:
         "turn (for example a clarification AND an offer to transfer), because "
         "the guest's 'yes' then answers only one of them and you have to ask "
         "again. Ask the more important one, wait for the answer, then ask the "
-        "next.\n\n"
+        "next.\n"
+        "- Use warm, conversational phrasing with brief empathetic acknowledgments "
+        "such as 'I completely understand' and 'Of course, happy to help with "
+        "that.'\n"
+        "- Use natural transitions and punctuation for delivery pacing, including "
+        "em-dashes for a short beat.\n"
+        "- Use contractions naturally so the voice sounds human and unforced.\n"
+        "- Use exclamation marks only for genuine delight, not as filler.\n"
+        "- Never emit bracketed stage directions or audio tags (for example "
+        "'[warmly]' or '[laughs]') or asterisk actions.\n\n"
 
         "THE ROOM TYPES AT HATTON HILLS:\n"
         "- There is ONE property. Never ask which property, which hotel or "
@@ -1108,10 +1210,17 @@ def _build_system_prompt(lang: str = "en") -> str:
         "their room, treat it as settled: confirm it is available and "
         "proceed. Only ask which room they would like when they genuinely "
         f"have not said. {avail_price_clause}\n"
-        "- NEVER ask whether the guest is a Sri Lankan resident or a "
-        "foreign guest. It is not required to complete a booking, so do "
-        "not raise it and do not treat it as a step you are waiting on. "
-        "If the guest volunteers it, simply note it and carry on.\n"
+        "- RESIDENCY QUESTION — ASK ONLY WHEN QUOTING PRICES: once the guest "
+        "has picked a room, ask whether they are a Sri Lankan resident or a "
+        "foreign guest before quoting a rate. Ask it once and once only per "
+        "booking. Do not ask again, and do not change the answer in the same "
+        "call. Anchor every rate, every supplement, and every currency mention "
+        "to their residency: foreign guest = US dollars, Sri Lankan resident = "
+        "rupees.\n"
+        "- If the guest has told you this is a two-night or longer stay, "
+        "proactively mention once that guided nature walk, guided birding tour "
+        "and stargazing are complimentary. Mention this during room / rate "
+        "collection, not only after all booking details are already final.\n"
         + rate_press_clause +
         "- Once the guest has picked a room and confirmed they are happy "
         "to proceed, begin collecting their personal details, ONE "
@@ -1197,7 +1306,8 @@ def _build_system_prompt(lang: str = "en") -> str:
         "to spell it, e.g. 'Could you "
         "spell that for me, please?'. Build the name from the letters they "
         "give — accept plain letters and phonetic forms like 'B for Bravo' — "
-        "then read the full name back for a yes/no confirmation.\n"
+        "then call capture_spoken_name with the exact words they spoke and "
+        "read the tool's `readback` once for a yes/no confirmation.\n"
         "    * If you read a name back and the guest says it is NOT right, do "
         "not just guess again — ask them to spell the part that was wrong, "
         "e.g. 'Sorry about that — could you spell your last name for me?'. "
@@ -1210,7 +1320,7 @@ def _build_system_prompt(lang: str = "en") -> str:
         "send both parts together as 'First Last' (e.g. 'Chris Fernando'), "
         "never a single token.\n"
         "- SLOT OVERWRITE RULE: once a guest has given you a value for a slot "
-        "(name, mobile, dates, room, pax), do NOT silently "
+        "(name, residency, mobile, dates, room, pax), do NOT silently "
         "replace it if they say a different value later in the same call. "
         "Instead, explicitly confirm the change: 'I have your name as Chris "
         "Fernando — did you mean to change it to TJ Pereira?' Only update "
@@ -1360,10 +1470,12 @@ def _build_system_prompt(lang: str = "en") -> str:
         "and special requests. Say this in words only — never attach a "
         "figure or a percentage saving to it.\n"
         "- CELEBRATIONS: if the guest mentions a honeymoon, anniversary, "
-        "birthday or proposal, congratulate them warmly and offer to note "
-        "it on the booking so the team can look after them. Do NOT invent "
-        "or promise any package, perk, dinner, upgrade or inclusion — "
-        "offer to have reservations confirm what can be arranged.\n"
+        "birthday or proposal, congratulate them warmly and offer to note it on "
+        "the booking so the team can look after them. If the offer is available, "
+        "mention the honeymoon and special occasions package in that same turn and "
+        "ask whether they'd like candlelit dinner for the special occasion. "
+        "If the package is not available in the knowledge base, do not mention any "
+        "honeymoon-specific package and keep to the base note above.\n"
         "- Be empathetic and attentive. If a guest seems frustrated, acknowledge "
         "their feelings.\n"
         "- THREE-STRIKES EXIT: if you have asked the same clarifying question "
@@ -2843,6 +2955,7 @@ class MediaStreamSession:
         self._assistant_turn_generated_sentences: list[str] = []
         self._delivered_sentences: list[str] = []
         self._track_assistant_turn_delivery: bool = False
+        self._assistant_turn_speech_end_at: float = 0.0
 
         self._pending_transcript = ""
         # Text from provider finals in the current utterance. Interims of a later
@@ -2870,6 +2983,7 @@ class MediaStreamSession:
         # Set only by KavyaSmartPBXSession. None preserves legacy Twilio tools.
         self._smartpbx_transfer_context: Any | None = None
         self._smartpbx_caller_context: dict[str, str] | None = None
+        self._record_echo_rejection: Callable[[int, float], None] | None = None
         self.transfer_pending = False
 
     def _is_smartpbx_session(self) -> bool:
@@ -2881,6 +2995,51 @@ class MediaStreamSession:
             and self._media_transport is not None
             and self.lang == "en"
         )
+
+    def _assistant_text_for_echo_scoring(self) -> list[str]:
+        if self._is_speaking:
+            return list(self._assistant_turn_generated_sentences)
+        return []
+
+    def _emit_echo_rejection(self, transcript: str, score: float) -> None:
+        chars = len(transcript)
+        logger.info(
+            "smartpbx_media event=echo_rejected chars=%d score=%.3f",
+            chars,
+            score,
+        )
+        record = getattr(self, "_record_echo_rejection", None)
+        if callable(record):
+            record(chars, score)
+
+    def _is_echo(self, transcript: str) -> bool:
+        if not self._is_speaking:
+            return False
+        if not ECHO_SUPPRESSION_ENABLED:
+            return False
+        if not self._is_smartpbx_session():
+            return False
+        transcript_tokens = _normalize_for_overlap(transcript).split()
+        if len(transcript_tokens) < 5:
+            return False
+        if not transcript_tokens:
+            return False
+        transcript_starts_with_affirmation = transcript_tokens[0] in _ECHO_AFFIRMATION_TOKENS
+        assistant_sentences = self._assistant_text_for_echo_scoring()
+        if not assistant_sentences:
+            return False
+        for sentence in assistant_sentences:
+            if transcript_starts_with_affirmation and not _starts_with_affirmation_token(sentence):
+                continue
+            transcript_ratio = _token_overlap_ratio(sentence, transcript)
+            if transcript_ratio < ECHO_MATCH_MIN_RATIO:
+                continue
+            sentence_ratio = _token_overlap_ratio(transcript, sentence)
+            if sentence_ratio < ECHO_SENTENCE_COVERAGE_MIN_RATIO:
+                continue
+            self._emit_echo_rejection(transcript, transcript_ratio)
+            return True
+        return False
 
     async def enter_transfer_pending(self) -> None:
         """Silence AI activity after carrier acknowledgement without closing Dialog."""
@@ -2971,7 +3130,7 @@ class MediaStreamSession:
     # Kavya forget details the guest already gave (mid-call slot amnesia).
     _BOOKING_SLOT_KEYS: tuple[str, ...] = (
         "check_in", "check_out", "room_type", "room_name",
-        "guest_name", "salutation", "guest_phone",
+        "guest_name", "salutation", "guest_phone", "residency",
         "num_adults", "num_children",
     )
 
@@ -3002,6 +3161,8 @@ class MediaStreamSession:
             if slots.get("salutation"):
                 who = f"{slots['salutation']} {who}"
             lines.append(f"- guest name: {who}")
+        if slots.get("residency"):
+            lines.append(f"- residency: {slots['residency']}")
         if slots.get("check_in"):
             lines.append(f"- check-in: {slots['check_in']}")
         if slots.get("check_out"):
@@ -3066,6 +3227,7 @@ class MediaStreamSession:
 
     async def run(self):
         self._event_loop = asyncio.get_running_loop()
+        media_context_token: int | None = None
         await self.ws.accept()
         logger.info("Media stream WebSocket accepted (lang=%s)", self.lang)
 
@@ -3087,6 +3249,21 @@ class MediaStreamSession:
                     self.stream_sid = meta.get("streamSid")
                     self.call_sid = meta.get("callSid", "unknown")
                     self.caller_phone = _call_phone.pop(self.call_sid, "unknown")
+                    if (
+                        not self._is_smartpbx_session()
+                        and media_context_token is None
+                    ):
+                        # Media-stream sessions have no SmartPBX context branch, so
+                        # each session gets a dedicated per-call context dict for
+                        # handover/caller metadata. Tool handlers mutate this dict
+                        # in-place across the call lifecycle.
+                        media_context_token = handover_context.set({
+                            "caller_phone": self.caller_phone,
+                        })
+                    if not self._is_smartpbx_session() and media_context_token is not None:
+                        context = handover_context.get() or {}
+                        if isinstance(context, dict):
+                            context["caller_phone"] = self.caller_phone
                     self.call_start_time = datetime.now().isoformat()
                     _dashboard_call_started(self.call_sid, self.caller_phone, self.lang, self.call_start_time)
                     logger.info(
@@ -3122,6 +3299,8 @@ class MediaStreamSession:
         except Exception:
             logger.exception("Media stream error — Call: %s", self.call_sid)
         finally:
+            if media_context_token is not None:
+                handover_context.reset(media_context_token)
             self._cancel_reprompt()
             if self._stt:
                 self._stt.stop()
@@ -3164,6 +3343,8 @@ class MediaStreamSession:
         if self._event_loop is None:
             return
         if self._is_speaking:
+            if self._is_echo(transcript):
+                return
             if self._should_barge_in(transcript):
                 asyncio.run_coroutine_threadsafe(
                     self._handle_bargein(), self._event_loop,
@@ -3186,6 +3367,8 @@ class MediaStreamSession:
         if self._event_loop is None:
             return
         if self._is_speaking:
+            if self._is_echo(transcript):
+                return
             if self._should_barge_in(transcript):
                 asyncio.run_coroutine_threadsafe(
                     self._handle_bargein(), self._event_loop,
@@ -3211,6 +3394,7 @@ class MediaStreamSession:
         else:
             logger.info("Barge-in detected [%s]", self.call_sid)
         self._is_speaking = False
+        self._assistant_turn_speech_end_at = time.monotonic()
         self._cancel_reprompt()
         self._speak_generation += 1
         self._pending_transcript = ""
@@ -3332,6 +3516,7 @@ class MediaStreamSession:
             if delivered:
                 self._record_delivered_sentence(sentence, turn_generation or generation)
                 self._schedule_reprompt()
+            self._assistant_turn_speech_end_at = time.monotonic()
             return delivered
         async with self._ws_lock:
             await self.ws.send_text(json.dumps({
@@ -3356,7 +3541,13 @@ class MediaStreamSession:
             return
         if self._assistant_turn_generation != turn_generation:
             return
-        self._delivered_sentences.append(sentence)
+        if len(self._delivered_sentences) >= len(self._assistant_turn_generated_sentences):
+            return
+        start_index = len(self._delivered_sentences)
+        for idx in range(start_index, len(self._assistant_turn_generated_sentences)):
+            if self._assistant_turn_generated_sentences[idx] == sentence:
+                self._delivered_sentences.append(sentence)
+                return
 
     def _assistant_turn_was_interrupted(self) -> bool:
         if not self._track_assistant_turn_delivery:
@@ -3573,7 +3764,12 @@ class MediaStreamSession:
             transfer_token = smartpbx_transfer_context.set(
                 self._smartpbx_transfer_context
             )
-            caller_token = handover_context.set(self._smartpbx_caller_context or {})
+            if self._smartpbx_caller_context is None:
+                self._smartpbx_caller_context = {}
+            # Keep a live reference to the per-session caller-context dict.
+            # execute_tool paths intentionally mutate this dict in-place, and
+            # callers set/reset between turns would otherwise lose state.
+            caller_token = handover_context.set(self._smartpbx_caller_context)
         try:
             await self._process_utterance_bound(text)
         finally:
@@ -3753,6 +3949,12 @@ class MediaStreamSession:
                         "tool_call_id": tc["id"],
                         "content": result_str,
                     })
+                    _append_booking_confirmation_marker(
+                        self.full_transcript,
+                        tc["name"],
+                        parsed_input,
+                        result_str,
+                    )
                     self._log_tool_result(tc["name"], result_str)
                     if self.transfer_pending:
                         return full_text
@@ -3913,6 +4115,12 @@ class MediaStreamSession:
                             result_str = json.dumps({"error": "tool_execution_failed"})
                         else:
                             result_str = json.dumps({"error": str(exc)})
+                    _append_booking_confirmation_marker(
+                        self.full_transcript,
+                        tc["function"]["name"],
+                        parsed_input,
+                        result_str,
+                    )
                     self.history.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -4092,6 +4300,12 @@ class MediaStreamSession:
                             result_str = json.dumps({"error": "tool_execution_failed"})
                         else:
                             result_str = json.dumps({"error": str(exc)})
+                    _append_booking_confirmation_marker(
+                        self.full_transcript,
+                        tb["name"],
+                        tb["input"],
+                        result_str,
+                    )
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tb["id"],
@@ -4447,6 +4661,7 @@ async def _run_llm_streaming(
     conversation_history: list[dict],
     tools: list[dict],
     websocket: WebSocket,
+    transcript_sink: list[dict[str, str]] | None = None,
 ) -> str:
     """Stream an OpenAI response, handling tool use in a loop.
 
@@ -4559,6 +4774,12 @@ async def _run_llm_streaming(
                     "tool_call_id": tc["id"],
                     "content": result_str,
                 })
+                _append_booking_confirmation_marker(
+                    transcript_sink or [],
+                    tc["name"],
+                    parsed_input,
+                    result_str,
+                )
                 logger.info("Tool '%s' result: %s", tc["name"], result_str[:200])
 
             text_content = ""
@@ -4601,6 +4822,7 @@ async def _run_llm_streaming_gemini(
     conversation_history: list[dict],
     tools: list[dict],
     websocket: WebSocket,
+    transcript_sink: list[dict[str, str]] | None = None,
 ) -> str:
     """Stream a Gemini response via the native SDK, handling tool use.
 
@@ -4713,6 +4935,12 @@ async def _run_llm_streaming_gemini(
                     "tool_call_id": tc["id"],
                     "content": result_str,
                 })
+                _append_booking_confirmation_marker(
+                    transcript_sink or [],
+                    tc["function"]["name"],
+                    parsed_input,
+                    result_str,
+                )
                 logger.info("Tool '%s' result: %s", tc["function"]["name"], result_str[:200])
 
             text_content = ""
@@ -4775,6 +5003,7 @@ async def _run_llm_streaming_claude(
     tools: list[dict],
     websocket: WebSocket,
     lang: str = "en",
+    transcript_sink: list[dict[str, str]] | None = None,
 ) -> str:
     """Stream a Claude response via the Anthropic SDK, handling tool use.
 
@@ -4915,6 +5144,12 @@ async def _run_llm_streaming_claude(
                     "tool_use_id": tb["id"],
                     "content": result_str,
                 })
+                _append_booking_confirmation_marker(
+                    transcript_sink or [],
+                    tb["name"],
+                    tb["input"],
+                    result_str,
+                )
                 logger.info("Tool '%s' result: %s", tb["name"], result_str[:200])
 
             conversation_history.append({"role": "user", "content": tool_results})
@@ -4962,6 +5197,7 @@ async def _stream_llm_turn(
     anthropic_client: Any,
     gemini_client: Any,
     openai_client: Any,
+    transcript_sink: list[dict[str, str]] | None = None,
 ) -> str:
     """Stream one agent turn over the ConversationRelay socket.
 
@@ -4977,6 +5213,7 @@ async def _stream_llm_turn(
             tools=tools,
             websocket=websocket,
             lang=lang,
+            transcript_sink=transcript_sink,
         )
     if LLM_PROVIDER == "gemini":
         return await _run_llm_streaming_gemini(
@@ -4985,6 +5222,7 @@ async def _stream_llm_turn(
             conversation_history=conversation_history,
             tools=tools,
             websocket=websocket,
+            transcript_sink=transcript_sink,
         )
     return await _run_llm_streaming(
         client=openai_client,
@@ -4992,6 +5230,7 @@ async def _stream_llm_turn(
         conversation_history=conversation_history,
         tools=tools,
         websocket=websocket,
+        transcript_sink=transcript_sink,
     )
 
 
@@ -5173,7 +5412,11 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                 # branch below installs its own richer context; this covers the
                 # normal booking path, where handover_context is otherwise unset.
                 if not is_failsafe:
-                    handover_context.set({"caller_phone": caller_phone})
+                    from handover import _get_handover_context
+
+                    ctx = _get_handover_context()
+                    ctx["caller_phone"] = caller_phone
+                    handover_context.set(ctx)
 
                 if is_failsafe:
                     # Rebuild Kavya's context from the pre-transfer leg of this
@@ -5236,6 +5479,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                             anthropic_client=anthropic_client,
                             gemini_client=gemini_client,
                             openai_client=openai_client,
+                            transcript_sink=full_transcript,
                         )
                         logger.info("Agent [%s] (failsafe opening): %s",
                                     call_sid, opening[:200])
@@ -5306,6 +5550,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                         anthropic_client=anthropic_client,
                         gemini_client=gemini_client,
                         openai_client=openai_client,
+                        transcript_sink=full_transcript,
                     )
                     logger.info("Agent [%s]: %s", call_sid, response_text[:200])
                     if response_text:
@@ -5342,7 +5587,10 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                                 _parsed = json.loads(_raw) if isinstance(_raw, str) else _raw
                             except (json.JSONDecodeError, TypeError):
                                 _parsed = None
-                            if isinstance(_parsed, dict) and _parsed.get("status") == "transferring":
+                            if (
+                                isinstance(_parsed, dict)
+                                and _parsed.get("status") == "transferring"
+                            ):
                                 pending_transfer_reason = _parsed.get(
                                     "reason", "Caller requested human assistance."
                                 )
@@ -5457,11 +5705,11 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                             except Exception as exc:
                                 logger.error(
                                     "[handoff] REST update failed: %r", exc,
-                                )
+                            )
 
-                        # Exit the receive loop; Twilio will tear down the WS
-                        # as it processes the new TwiML.
-                        break
+                    # Exit the receive loop; Twilio will tear down the WS
+                    # as it processes the new TwiML.
+                    break
                 except WebSocketDisconnect:
                     # _run_llm_streaming_claude drains the stream and appends
                     # the assistant turn to conversation_history before raising,
