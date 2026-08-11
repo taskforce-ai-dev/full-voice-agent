@@ -62,7 +62,7 @@ import xml.sax.saxutils
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from html import escape as html_escape
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 from urllib.parse import quote as url_quote
 
 import httpx
@@ -389,6 +389,48 @@ TOOL_FILLERS: dict[str, str] = {
 }
 DEFAULT_FILLER: str = "Let me check that for you."
 
+# A small set of alternate one-liners for check/create/transfer tool calls.
+# Rotate these naturally to avoid repetitive canned wording across repeated retries.
+TOOL_FILLER_VARIANTS: dict[str, tuple[str, ...]] = {
+    "check_availability": (
+        "Just a moment while I check availability.",
+        "Let me check that for you.",
+        "One second while I check it.",
+    ),
+    "create_booking": (
+        "Let me prepare that booking now.",
+        "One moment while I create that for you.",
+        "I'm doing that now; give me a second.",
+    ),
+    "transfer_to_human": (
+        "One moment while I connect you to a human agent.",
+        "I’ll transfer you now.",
+        "Just a second while I connect that call.",
+    ),
+}
+
+_TOOL_FILLER_CYCLES: dict[str, int] = {
+    "check_availability": 0,
+    "create_booking": 0,
+    "transfer_to_human": 0,
+}
+
+
+def _next_tool_filler(tool_name: str) -> str:
+    variants = TOOL_FILLER_VARIANTS.get(tool_name)
+    if not variants:
+        return DEFAULT_FILLER
+    index = _TOOL_FILLER_CYCLES.get(tool_name, 0)
+    _TOOL_FILLER_CYCLES[tool_name] = (index + 1) % len(variants)
+    return variants[index]
+
+
+_CONVERSATION_CLAUDE_CAPTURE_TOOLS: set[str] = {
+    "capture_spoken_number",
+    "capture_spoken_name",
+    "collect_number_via_keypad",
+}
+
 
 def _join_turn(accumulated: str, new_text: str) -> str:
     """Append one tool-round's text to the running response, with a separator.
@@ -677,6 +719,12 @@ ENDPOINTING_SILENCE: float = _parse_endpointing_seconds(
 STT_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "STT_FINAL_GRACE_SECONDS", 0.5, 0.05, 5.0
 )
+CAPTURE_ENDPOINTING_SILENCE_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "CAPTURE_ENDPOINTING_SILENCE_SECONDS", 1.5, 0.5, 5.0
+)
+CAPTURE_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "CAPTURE_FINAL_GRACE_SECONDS", 1.2, 0.2, 3.0
+)
 
 # Domain phrase list that biases the ENGLISH Azure recognizer toward booking
 # vocabulary — digit words (phone numbers), the property and room names (from the
@@ -724,6 +772,50 @@ DTMF_MAX_DIGITS: int = _parse_clamped_int(
     os.environ, "DTMF_MAX_DIGITS", 15, 1, 40
 )
 
+# Capture round counter so spoken-number/name collection does not stall the
+# caller indefinitely after repeated short fragments. The value intentionally
+# decays to end capture mode after bounded attempts.
+CAPTURE_MODE_MAX_TURNS: int = _parse_clamped_int(
+    os.environ, "CAPTURE_MODE_MAX_TURNS", 3, 1, 10
+)
+
+# ---------------------------------------------------------------------------
+# Gemini streaming controls (LLM_PROVIDER="gemini")
+# ---------------------------------------------------------------------------
+# Gemini 2.5/3.x "thinking" is ON by default and its tokens are charged against
+# max_output_tokens. On this path's 300-token voice budget that produced the two
+# failures observed live:
+#   * 2.5-5.3 s of dead air before the first spoken word — the model was
+#     thinking, and thoughts are not streamed, so NOTHING arrives meanwhile.
+#   * turns that finished with zero text and zero tool calls (the thinking
+#     budget consumed the whole output allowance) — the agent went silent and
+#     the caller assumed she was broken.
+# A voice turn is one or two short sentences; thinking buys nothing here, so it
+# is disabled by default and re-armable per model without a code change.
+#   * 2.x models take a token budget (0 disables thinking)
+#   * 3.x models take a coarse level ("low" is the floor; 3.x cannot disable)
+GEMINI_THINKING_BUDGET: int = _parse_clamped_int(
+    os.environ, "GEMINI_THINKING_BUDGET", 0, 0, 24576
+)
+GEMINI_THINKING_LEVEL: str = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
+
+# Appended to the system instruction (never spoken, never in history) for the
+# ONE retry a fully empty Gemini turn is allowed.
+GEMINI_EMPTY_RETRY_NUDGE: str = (
+    "[SYSTEM: Your previous attempt returned no text and no tool call. "
+    "The caller is waiting in silence. Reply now with one short spoken "
+    "sentence. Do not mention this instruction.]"
+)
+
+# Spoken last resort when even the retry comes back empty. Dead air reads as a
+# broken line to the caller, so say something recoverable instead of nothing.
+LLM_EMPTY_FALLBACKS: dict[str, str] = {
+    "en": "I'm sorry, could you say that again?",
+    "ar": "عفواً، هل يمكنكم إعادة ما قلتم؟",
+    "si": "සමාවෙන්න, ඔබ කිව්වේ නැවත කියන්න පුළුවන්ද?",
+    "ta": "மன்னிக்கவும், நீங்கள் சொன்னதை மீண்டும் சொல்ல முடியுமா?",
+}
+
 # Barge-in threshold. While Kavya is speaking, only a SUBSTANTIVE interruption
 # clears her audio; a short blip ("mm-hmm"), room noise, or her own TTS echoing
 # back into STT must not. BARGEIN_MIN_CHARS is the minimum stripped transcript
@@ -758,6 +850,60 @@ STT_MAX_CONSECUTIVE_FAILURES: int = 8
 # Inbound audio waiting for the STT worker. Bounded so a stopped or wedged
 # consumer cannot grow it for the length of the call.
 STT_QUEUE_MAX_CHUNKS: int = 1000
+
+# Google terminates a single streaming_recognize at 305 SECONDS OF AUDIO with a
+# 400. Discovering that ceiling by hitting it is not survivable: observed live
+# on 2026-08-11, a call went deaf from 11:07 to 11:10 after the 400 because the
+# dead stream's request generator kept draining the shared audio queue while the
+# replacement stream starved. So the stream is now rotated BEFORE the ceiling,
+# preferring a gap in the caller's speech so the swap cannot cut a word in half,
+# with a hard deadline that rotates regardless if the caller never pauses.
+STT_STREAM_ROTATE_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "STT_STREAM_ROTATE_SECONDS", 240.0, 30.0, 300.0
+)
+STT_STREAM_ROTATE_DEADLINE_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "STT_STREAM_ROTATE_DEADLINE_SECONDS", 285.0, 60.0, 304.0
+)
+STT_ROTATE_QUIET_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "STT_ROTATE_QUIET_SECONDS", 0.3, 0.0, 3.0
+)
+# Audio that arrives while no stream is accepting is buffered and replayed into
+# the replacement, bounded to roughly ten seconds of Twilio's 20 ms mulaw frames.
+# Beyond that the OLDEST frames are dropped: replaying a deep backlog would push
+# the fresh stream toward its own 305 s audio ceiling and leave the recognizer
+# minutes behind the live caller.
+STT_SWAP_BUFFER_CHUNKS: int = _parse_clamped_int(
+    os.environ, "STT_SWAP_BUFFER_CHUNKS", 500, 50, STT_QUEUE_MAX_CHUNKS
+)
+
+# Google's `telephony` model is trained on 8 kHz narrowband phone audio, which
+# is exactly what Twilio and Dialog deliver. It is applied to ENGLISH ONLY:
+# coverage for si-LK / ta-IN / ar-SA is not something this repo can verify, and
+# a rejected model would take a whole language down. Any rejection degrades to
+# the default model once, permanently, rather than failing the call.
+STT_GOOGLE_MODEL_EN: str = os.getenv("STT_GOOGLE_MODEL_EN", "telephony")
+# Speech adaptation boost for the booking-domain phrase list (English only).
+STT_ADAPTATION_BOOST: float = _parse_clamped_float(
+    os.environ, "STT_ADAPTATION_BOOST", 15.0, 0.0, 20.0
+)
+STT_MAX_ADAPTATION_PHRASES: int = 500
+
+# ElevenLabs streaming latency optimisation. Higher values return the first audio
+# frame sooner at some cost to prosody; 3 is the useful ceiling for conversational
+# telephony (4 additionally disables text normalisation, which mangles spoken
+# numbers and prices — exactly what this agent reads out). 0 omits the parameter
+# entirely and takes ElevenLabs' own default.
+ELEVENLABS_OPTIMIZE_STREAMING_LATENCY: int = _parse_clamped_int(
+    os.environ, "ELEVENLABS_OPTIMIZE_STREAMING_LATENCY", 3, 0, 4
+)
+
+
+def _elevenlabs_stream_url(voice_id: str) -> str:
+    """Streaming TTS URL for a voice, including the latency knob when armed."""
+    url = ELEVENLABS_TTS_URL.format(voice_id=voice_id) + "?output_format=ulaw_8000"
+    if ELEVENLABS_OPTIMIZE_STREAMING_LATENCY:
+        url += f"&optimize_streaming_latency={ELEVENLABS_OPTIMIZE_STREAMING_LATENCY}"
+    return url
 
 # Silence (seconds) after greeting / agent turn before we re-prompt the caller.
 # If the caller never speaks, we re-greet them or ask if they're still online,
@@ -1145,13 +1291,15 @@ def _build_system_prompt(lang: str = "en") -> str:
         "it — words and all, e.g. 'nought seven six triple seven double five "
         "one'. Do NOT convert double, triple, treble or nought into digits "
         "yourself and never do the digit arithmetic in your head; that is the "
-        "tool's job. Then read back the tool's `readback` digits to confirm "
-        "(e.g. 'I've got 0 7 6 7 7 7 5 5 1 — is that right?'). If the tool says "
-        "the number is not valid (wrong length), ask the guest to say it again "
-        "and call the tool with the new attempt. Only if repeated spoken "
-        "attempts fail, or the guest is struggling or asks to use the keypad, "
-        "offer collect_number_via_keypad as a fallback. This is for NUMBERS "
-        "only — dates and guest counts stay on the normal spoken path.\n"
+        "tool's job. If the tool result status is `needs_more`, keep listening "
+        "patiently and read back only when the status changes to `captured`. "
+        "Read back the tool's `readback` digits to confirm (for example, "
+        "'I've got 0 7 6 7 7 7 5 5 1 — is that right?'). If the tool says "
+        "the number is not valid, ask the guest to say it again and call the "
+        "tool with the new attempt. Only after at least two full failed spoken "
+        "attempts, or if the guest is struggling or asks to use the keypad, "
+        "offer collect_number_via_keypad as a fallback. The fallback may be "
+        "offered only after `attempts >= 2`.\n"
         "- When a guest expresses booking intent, collect only what is needed to "
         "check availability: check-in and check-out dates, and number of guests "
         "(adults and children with ages). Ask ONE question at a time. Do NOT "
@@ -1786,12 +1934,21 @@ def _history_to_gemini(history: list[dict]) -> list[dict]:
                         args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
                     except json.JSONDecodeError:
                         args = {}
-                    parts.append({
+                    fc_part: dict[str, Any] = {
                         "function_call": {
                             "name": tc["function"]["name"],
                             "args": args,
                         }
-                    })
+                    }
+                    # Gemini 3.x hands back a thought signature alongside a
+                    # streamed function call and requires it echoed on the next
+                    # request; without it the follow-up round is rejected. It is
+                    # carried on the internal history entry only (never sent to
+                    # another provider, never serialised).
+                    signature = tc.get("gemini_thought_signature")
+                    if signature:
+                        fc_part["thought_signature"] = signature
+                    parts.append(fc_part)
             if parts:
                 contents.append({"role": "model", "parts": parts})
             i += 1
@@ -1820,6 +1977,138 @@ def _history_to_gemini(history: list[dict]) -> list[dict]:
             i += 1  # skip unknown roles
 
     return contents
+
+
+# ---------------------------------------------------------------------------
+# Gemini native streaming primitives (shared by both Gemini runners)
+# ---------------------------------------------------------------------------
+# Set once if the installed SDK / selected model rejects the thinking controls,
+# so the process stops paying for a doomed first attempt on every turn.
+_gemini_thinking_unsupported: bool = False
+
+_GEMINI_MAJOR_VERSION = re.compile(r"gemini-(\d+)")
+
+
+def _gemini_thinking_config(model: str) -> dict[str, Any] | None:
+    """Thinking controls for a short voice turn — see GEMINI_THINKING_BUDGET."""
+    if _gemini_thinking_unsupported:
+        return None
+    match = _GEMINI_MAJOR_VERSION.search((model or "").lower())
+    major = int(match.group(1)) if match else 2
+    if major >= 3:
+        # 3.x replaced the token budget with a coarse level and cannot turn
+        # thinking off entirely; the floor is the best this path can do.
+        return {"thinking_level": GEMINI_THINKING_LEVEL or "low"}
+    return {"thinking_budget": GEMINI_THINKING_BUDGET}
+
+
+def _build_gemini_config(
+    *,
+    system: str,
+    tools: list[dict] | None,
+    model: str,
+    nudge: str | None = None,
+) -> dict[str, Any]:
+    """Assemble the per-round google-genai config.
+
+    ``nudge`` is appended to the system instruction only — it is never added to
+    the conversation history, so the caller never hears it and it cannot leak
+    into the transcript or the post-call record.
+    """
+    system_instruction = f"{system}\n\n{nudge}" if nudge else system
+    config: dict[str, Any] = {
+        "system_instruction": system_instruction,
+        "max_output_tokens": MAX_TOKENS,
+    }
+    thinking = _gemini_thinking_config(model)
+    if thinking is not None:
+        config["thinking_config"] = thinking
+    if tools:
+        config["tools"] = tools
+    return config
+
+
+async def _open_gemini_stream(client, *, model: str, contents: list, config: dict):
+    """Open a native Gemini streaming response.
+
+    Degrades once, permanently, if the installed SDK or the selected model
+    rejects the thinking controls — an unknown model name must not take the
+    whole provider down.
+    """
+    global _gemini_thinking_unsupported
+    try:
+        return await client.aio.models.generate_content_stream(
+            model=model, contents=contents, config=config
+        )
+    except Exception as exc:
+        if "thinking_config" not in config or "thinking" not in str(exc).lower():
+            raise
+        _gemini_thinking_unsupported = True
+        logger.warning(
+            "gemini_diagnostic event=thinking_config_rejected model=%s detail=%s",
+            model, str(exc)[:200],
+        )
+        degraded = {k: v for k, v in config.items() if k != "thinking_config"}
+        return await client.aio.models.generate_content_stream(
+            model=model, contents=contents, config=degraded
+        )
+
+
+async def _iter_gemini_stream(stream) -> AsyncIterator[tuple[str, Any]]:
+    """Normalise a native Gemini stream into ``(kind, payload)`` deltas.
+
+    Kinds: ``"text"`` (str), ``"tool"`` (dict with name/args/thought_signature),
+    ``"finish"`` (finish reason or block reason).
+
+    Thought parts are DROPPED. On 3.x models the model's private reasoning
+    arrives as ordinary text parts flagged ``thought=True``; speaking that to a
+    caller is worse than saying nothing. Every attribute is read defensively —
+    the same normaliser has to survive both the real SDK objects and the
+    lightweight fakes the tests stream through it.
+    """
+    async for chunk in stream:
+        candidates = getattr(chunk, "candidates", None)
+        if not candidates:
+            feedback = getattr(chunk, "prompt_feedback", None)
+            block_reason = getattr(feedback, "block_reason", None) if feedback else None
+            if block_reason:
+                yield "finish", block_reason
+            continue
+        candidate = candidates[0]
+        content = getattr(candidate, "content", None)
+        for part in (getattr(content, "parts", None) or []):
+            if getattr(part, "thought", False):
+                continue
+            text = getattr(part, "text", None)
+            if text:
+                yield "text", text
+            function_call = getattr(part, "function_call", None)
+            if function_call:
+                raw_args = getattr(function_call, "args", None)
+                yield "tool", {
+                    "name": function_call.name,
+                    "args": dict(raw_args) if raw_args else {},
+                    "thought_signature": getattr(part, "thought_signature", None),
+                }
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason:
+            yield "finish", finish_reason
+
+
+def _log_gemini_empty(
+    *, path: str, attempt: int, finish_reason: Any, retrying: bool, call_sid: str = ""
+) -> None:
+    """Diagnostic for a Gemini turn that produced no text and no tool call.
+
+    One greppable line: this failure is invisible from the caller's side (they
+    just hear silence) and was previously indistinguishable in the logs from a
+    healthy short turn.
+    """
+    logger.warning(
+        "gemini_diagnostic event=empty_response path=%s attempt=%d finish=%s "
+        "retrying=%s call=%s",
+        path, attempt, finish_reason, str(retrying).lower(), call_sid or "-",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2566,7 +2855,13 @@ class GoogleSTTStream:
 
     Runs the synchronous gRPC streaming_recognize in a daemon thread.
     Fires on_final_result(transcript) from that thread.
-    Auto-restarts on the ~5-minute gRPC streaming limit.
+
+    Google caps ONE streaming_recognize at 305 seconds of audio, so a call
+    longer than five minutes spans several streams. Rotation is proactive (see
+    STT_STREAM_ROTATE_SECONDS) and each stream is fenced by an epoch, because
+    gRPC consumes the request generator on its own thread and a generator that
+    outlives its RPC keeps stealing frames from the shared queue — which is how
+    a "restarted" stream ended up deaf while the dead one ate the audio.
     """
 
     def __init__(
@@ -2585,6 +2880,19 @@ class GoogleSTTStream:
         self._thread: threading.Thread | None = None
         self._chunk_count = 0
         self._dropped_chunks = 0
+        # Monotonically increasing per stream. The request generator dies as soon
+        # as its own epoch is superseded, so exactly one generator is ever
+        # draining the audio queue.
+        self._stream_epoch = 0
+        # Monotonic timestamp of the last provider response (interim or final) —
+        # the rotation point prefers a moment when the caller is not mid-word.
+        self._last_voice_activity = 0.0
+        self._rotations = 0
+        # Injectable so rotation timing is tested without sleeping for minutes.
+        self._clock: Any = time.monotonic
+        # Set once if Google rejects the telephony model / adaptation for this
+        # deployment, so every later stream skips straight to the default model.
+        self._enhanced_config_rejected = False
         # Set by the owning session; called from this thread when the restart
         # cap trips so the call can end instead of sitting in silence.
         self.on_fatal: Any = None
@@ -2627,8 +2935,64 @@ class GoogleSTTStream:
         if self._chunk_count % 200 == 0:  # log every ~4s of audio
             logger.info("STT audio feed: %d chunks (lang=%s)", self._chunk_count, self._lang)
 
-    def _audio_generator(self):
+    def _rotation_due(self, started_at: float) -> bool:
+        """Whether the current stream should be swapped out now.
+
+        Past STT_STREAM_ROTATE_SECONDS the swap waits for a short gap in the
+        caller's speech so a word is not cut in half; past the deadline it
+        happens regardless, because hitting Google's 305 s ceiling costs far more
+        than a clipped syllable.
+        """
+        age = self._clock() - started_at
+        if age >= STT_STREAM_ROTATE_DEADLINE_SECONDS:
+            return True
+        if age < STT_STREAM_ROTATE_SECONDS:
+            return False
+        quiet_for = self._clock() - self._last_voice_activity
+        return quiet_for >= STT_ROTATE_QUIET_SECONDS
+
+    def _trim_stale_backlog(self) -> int:
+        """Drop all but the newest STT_SWAP_BUFFER_CHUNKS queued frames.
+
+        Called as each stream opens. Whatever the caller said during the swap is
+        replayed into the new stream; anything older than the buffer window is
+        dropped OLDEST-first, so the fresh stream is not immediately pushed back
+        toward its own audio ceiling by a stale backlog.
+        """
+        dropped = 0
+        while self._audio_q.qsize() > STT_SWAP_BUFFER_CHUNKS:
+            try:
+                chunk = self._audio_q.get_nowait()
+            except queue.Empty:
+                break
+            if chunk is None:
+                # Never swallow the stop sentinel: stop() is waiting on it.
+                with contextlib.suppress(queue.Full):
+                    self._audio_q.put_nowait(None)
+                break
+            dropped += 1
+        return dropped
+
+    def _audio_generator(self, epoch: int | None = None, started_at: float | None = None):
+        """Yield queued frames for ONE stream, then terminate.
+
+        Terminating matters as much as yielding: the generator runs on gRPC's
+        writer thread, so an old one left alive competes with its replacement
+        for frames off the single shared queue.
+        """
         while self._running:
+            if epoch is not None and epoch != self._stream_epoch:
+                return
+            if started_at is not None and self._rotation_due(started_at):
+                self._rotations += 1
+                logger.info(
+                    "STT rotating stream proactively at %.0fs of age "
+                    "(lang=%s, rotation=%d)",
+                    self._clock() - started_at, self._lang, self._rotations,
+                )
+                # Half-closing the request stream ends the RPC cleanly, so _loop
+                # reopens immediately with no backoff and no 400.
+                return
             try:
                 chunk = self._audio_q.get(timeout=0.1)
             except queue.Empty:
@@ -2646,6 +3010,9 @@ class GoogleSTTStream:
             try:
                 self._run_one_stream()
                 consecutive_failures = 0
+                # A clean end is either a proactive rotation or the caller
+                # hanging up: reopen immediately, no backoff.
+                continue
             except Exception as exc:
                 if not self._running:
                     break
@@ -2680,13 +3047,16 @@ class GoogleSTTStream:
             logger.warning("STT fatal signal failed", exc_info=True)
 
     def _run_one_stream(self):
-        # Google caps a streaming_recognize call at ~5 minutes, so this runs many
-        # times per long call. Each client owns a gRPC channel, fds and
+        # Google caps a streaming_recognize call at 305 s of audio, so this runs
+        # many times per long call. Each client owns a gRPC channel, fds and
         # completion-queue threads, so it must be released every time.
         client = google_speech.SpeechClient()
         try:
             self._stream_until_closed(client)
         finally:
+            # Fence the stream we are leaving BEFORE the next one opens, so its
+            # request generator cannot outlive it and steal the caller's audio.
+            self._stream_epoch += 1
             close = getattr(client, "close", None)
             if close is not None:
                 try:
@@ -2694,30 +3064,90 @@ class GoogleSTTStream:
                 except Exception:
                     logger.warning("STT client close failed", exc_info=True)
 
+    def _streaming_config(self, primary: str, alternatives: list[str], *, enhanced: bool):
+        """Build the per-stream recognition config.
+
+        ``enhanced`` adds the narrowband telephony model and the booking-domain
+        phrase list. English only — see STT_GOOGLE_MODEL_EN.
+        """
+        recognition: dict[str, Any] = {
+            "encoding": google_speech.RecognitionConfig.AudioEncoding.MULAW,
+            "sample_rate_hertz": 8000,
+            "language_code": primary,
+            # English resolves to an EMPTY list, deliberately: naming en-US as an
+            # alternative to itself is what this key must never do.
+            "alternative_language_codes": alternatives,
+            "enable_automatic_punctuation": True,
+        }
+        if enhanced:
+            if STT_GOOGLE_MODEL_EN:
+                recognition["model"] = STT_GOOGLE_MODEL_EN
+            speech_context = getattr(google_speech, "SpeechContext", None)
+            if speech_context is not None and EN_STT_PHRASE_LIST:
+                recognition["speech_contexts"] = [
+                    speech_context(
+                        phrases=list(EN_STT_PHRASE_LIST[:STT_MAX_ADAPTATION_PHRASES]),
+                        boost=STT_ADAPTATION_BOOST,
+                    )
+                ]
+        return google_speech.StreamingRecognitionConfig(
+            config=google_speech.RecognitionConfig(**recognition),
+            interim_results=True,
+        )
+
+    def _use_enhanced_config(self) -> bool:
+        return self._lang == "en" and not self._enhanced_config_rejected
+
+    def _open_stream(self, client, primary: str, alternatives: list[str], request_gen):
+        """Open the gRPC stream, degrading once if the enhanced config is refused."""
+        enhanced = self._use_enhanced_config()
+        try:
+            return client.streaming_recognize(
+                config=self._streaming_config(primary, alternatives, enhanced=enhanced),
+                requests=request_gen(),
+            )
+        except Exception as exc:
+            if not enhanced:
+                raise
+            self._enhanced_config_rejected = True
+            logger.warning(
+                "STT telephony model/adaptation rejected (%s) — retrying with the "
+                "default model for lang=%s", str(exc)[:200], self._lang,
+            )
+            return client.streaming_recognize(
+                config=self._streaming_config(primary, alternatives, enhanced=False),
+                requests=request_gen(),
+            )
+
     def _stream_until_closed(self, client):
         primary = STT_PRIMARY.get(self._lang, "si-LK")
         alternatives = STT_ALTERNATIVES.get(self._lang, ["en-US"])
-        config = google_speech.StreamingRecognitionConfig(
-            config=google_speech.RecognitionConfig(
-                encoding=google_speech.RecognitionConfig.AudioEncoding.MULAW,
-                sample_rate_hertz=8000,
-                language_code=primary,
-                alternative_language_codes=alternatives,
-                enable_automatic_punctuation=True,
-            ),
-            interim_results=True,
+        epoch = self._stream_epoch
+        started_at = self._clock()
+        self._last_voice_activity = started_at
+
+        dropped = self._trim_stale_backlog()
+        if dropped:
+            logger.warning(
+                "STT dropped %d stale frames buffered across the stream swap "
+                "(lang=%s)", dropped, self._lang,
+            )
+
+        logger.info(
+            "STT gRPC stream opening (primary=%s, alts=%s, enhanced=%s)",
+            primary, alternatives, self._use_enhanced_config(),
         )
-        logger.info("STT gRPC stream opening (primary=%s, alts=%s)", primary, alternatives)
 
         def request_gen():
-            for chunk in self._audio_generator():
+            for chunk in self._audio_generator(epoch=epoch, started_at=started_at):
                 yield google_speech.StreamingRecognizeRequest(audio_content=chunk)
 
-        responses = client.streaming_recognize(config=config, requests=request_gen())
+        responses = self._open_stream(client, primary, alternatives, request_gen)
         logger.info("STT gRPC stream connected — waiting for speech...")
         for response in responses:
             if not self._running:
                 break
+            self._last_voice_activity = self._clock()
             for result in response.results:
                 if result.alternatives:
                     transcript = result.alternatives[0].transcript.strip()
@@ -3013,6 +3443,10 @@ class MediaStreamSession:
         # guard without clobbering a newer turn started by a barge-in.
         self._utterance_dispatched = False
         self._utterance_turn = 0
+        # Capture-mode keeps endpointing looser while the caller is dictating
+        # a number or name across fragments.
+        self._capture_mode_active: bool = False
+        self._capture_mode_turns_left: int = 0
         self._stt: GoogleSTTStream | AzureSTTStream | None = None
 
         # Live-call audio capture (mulaw chunks) for offline STT benchmarking.
@@ -3098,6 +3532,8 @@ class MediaStreamSession:
         self._utterance_turn += 1
         self._is_speaking = False
         self._speak_generation += 1
+        self._capture_mode_active = False
+        self._capture_mode_turns_left = 0
         await self._clear_media_audio(force=True)
 
     def _cancel_dtmf_collection(self) -> None:
@@ -3438,6 +3874,8 @@ class MediaStreamSession:
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
+        self._capture_mode_active = False
+        self._capture_mode_turns_left = 0
         # The guest interrupted: a new turn begins, so release the guard now even
         # though the interrupted turn's _process_utterance has not unwound yet.
         # Bumping the turn id stops that stale turn's finally from clobbering it.
@@ -3633,6 +4071,53 @@ class MediaStreamSession:
                 self._assistant_turn_was_interrupted(),
             )
 
+    @staticmethod
+    def _capture_complete_tools() -> tuple[str, ...]:
+        return (
+            "capture_spoken_number",
+            "capture_spoken_name",
+            "collect_number_via_keypad",
+        )
+
+    @staticmethod
+    def _capture_followup_required(result: dict[str, Any]) -> bool:
+        status = str(result.get("status", "")).lower()
+        return status in {"needs_more", "invalid", "unavailable"}
+
+    def _enter_capture_mode(self, turns: int = CAPTURE_MODE_MAX_TURNS) -> None:
+        self._capture_mode_active = True
+        self._capture_mode_turns_left = turns
+
+    def _exit_capture_mode(self) -> None:
+        self._capture_mode_active = False
+        self._capture_mode_turns_left = 0
+
+    def _consume_capture_mode_turn(self) -> None:
+        if not self._capture_mode_active:
+            return
+        if self._capture_mode_turns_left <= 0:
+            self._exit_capture_mode()
+            return
+        self._capture_mode_turns_left -= 1
+        if self._capture_mode_turns_left <= 0:
+            self._exit_capture_mode()
+
+    def _is_capture_mode_active(self) -> bool:
+        return self._capture_mode_active
+
+    def _capture_turn_timeout(self, *, final: bool) -> float:
+        if self._is_capture_mode_active():
+            return CAPTURE_FINAL_GRACE_SECONDS if final else CAPTURE_ENDPOINTING_SILENCE_SECONDS
+        return STT_FINAL_GRACE_SECONDS if final else ENDPOINTING_SILENCE
+
+    def _record_capture_tool_completion(self, tool_name: str, result: dict[str, Any]) -> None:
+        if tool_name not in self._capture_complete_tools():
+            return
+        if self._capture_followup_required(result):
+            self._enter_capture_mode()
+            return
+        self._exit_capture_mode()
+
     # â”€â”€ Debug: live-call audio capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _write_audio_dump(self) -> None:
@@ -3726,7 +4211,7 @@ class MediaStreamSession:
         self._pending_transcript = self._committed_transcript
         # The provider already segmented, so wait only a short grace for a
         # mid-thought continuation rather than the full interim-fallback timer.
-        self._arm_endpointing(STT_FINAL_GRACE_SECONDS)
+        self._arm_endpointing(self._capture_turn_timeout(final=True))
 
     async def _set_transcript_interim(self, text: str):
         """Set pending to the latest interim (over the committed finals); reset timer."""
@@ -3745,7 +4230,7 @@ class MediaStreamSession:
             else text
         )
         # No final has segmented this, so use the longer self-endpointing timer.
-        self._arm_endpointing(ENDPOINTING_SILENCE)
+        self._arm_endpointing(self._capture_turn_timeout(final=False))
 
     def _arm_endpointing(self, delay: float) -> None:
         if self._endpointing_handle:
@@ -3776,6 +4261,7 @@ class MediaStreamSession:
         # Claim the turn synchronously, before any await, so a concurrently-queued
         # flush task sees the guard set and bails.
         self._utterance_dispatched = True
+        self._consume_capture_mode_turn()
         self._utterance_turn += 1
         turn = self._utterance_turn
         if self._is_smartpbx_session():
@@ -3987,6 +4473,12 @@ class MediaStreamSession:
                         "tool_call_id": tc["id"],
                         "content": result_str,
                     })
+                    try:
+                        parsed_result = json.loads(result_str)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_result = None
+                    if isinstance(parsed_result, dict):
+                        self._record_capture_tool_completion(tc["name"], parsed_result)
                     _append_booking_confirmation_marker(
                         self.full_transcript,
                         tc["name"],
@@ -4026,10 +4518,19 @@ class MediaStreamSession:
     # â”€â”€ Gemini native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
 
     async def _run_llm_gemini(self) -> str:
-        """Gemini-native streaming version of _run_llm for Media Streams."""
+        """Gemini-native streaming version of _run_llm for Media Streams.
+
+        Sentence-level: every completed sentence is handed to TTS as it arrives,
+        through the same ``_extract_sentences`` → ``_invoke_speak`` pipeline (and
+        therefore the same generation fence and delivered-sentence tracking) the
+        Claude path uses. Lang-agnostic — the Sinhala/Tamil/Arabic Media Streams
+        calls and the direct SmartPBX English calls all run through here.
+        """
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
         smartpbx_filler_sent = False
+        # One empty-response retry per guest turn, not per tool round.
+        empty_retry_used = False
 
         for round_idx in range(MAX_TOOL_ROUNDS):
             if self._is_smartpbx_session():
@@ -4042,49 +4543,87 @@ class MediaStreamSession:
             sentence_buffer = ""
             tts_tasks: list[asyncio.Task] = []
             has_tool_use = False
-            gen = self._speak_generation
-
-            gemini_contents = _history_to_gemini(self.history)
-            config = {
-                "system_instruction": self._active_system_prompt(),
-                "max_output_tokens": MAX_TOKENS,
-            }
-            if self.tools:
-                config["tools"] = self.tools
-
-            response = await self.gemini_client.aio.models.generate_content_stream(
-                model=self.model,
-                contents=gemini_contents,
-                config=config,
-            )
-
             finish_reason = None
-            async for chunk in response:
-                if not chunk.candidates:
-                    continue
-                candidate = chunk.candidates[0]
-                if candidate.finish_reason:
-                    finish_reason = candidate.finish_reason
-                if not candidate.content or not candidate.content.parts:
-                    continue
-                for part in candidate.content.parts:
-                    if part.text:
-                        text_content += part.text
-                        if not has_tool_use:
-                            sentence_buffer += part.text
-                            sentences, sentence_buffer = _extract_sentences(
-                                sentence_buffer
-                            )
-                            for s in sentences:
-                                task = asyncio.create_task(
-                                    self._invoke_speak(s, generation=gen, sentence=s)
-                                )
-                                tts_tasks.append(task)
-                    if part.function_call:
+            gen = self._speak_generation
+            nudge: str | None = None
+
+            # Attempt 0 is the real turn. Attempt 1 only happens when attempt 0
+            # streamed absolutely nothing (no text, no tool call, or a blocked
+            # response) and this turn has not already spent its one retry.
+            for attempt in range(2):
+                text_content = ""
+                function_calls = []
+                sentence_buffer = ""
+                has_tool_use = False
+                finish_reason = None
+
+                response = await _open_gemini_stream(
+                    self.gemini_client,
+                    model=self.model,
+                    contents=_history_to_gemini(self.history),
+                    config=_build_gemini_config(
+                        system=self._active_system_prompt(),
+                        tools=self.tools,
+                        model=self.model,
+                        nudge=nudge,
+                    ),
+                )
+
+                async for kind, payload in _iter_gemini_stream(response):
+                    if kind == "finish":
+                        finish_reason = payload
+                        continue
+                    if kind == "tool":
                         has_tool_use = True
-                        fc = part.function_call
-                        args = dict(fc.args) if fc.args else {}
-                        function_calls.append({"name": fc.name, "args": args})
+                        function_calls.append(payload)
+                        continue
+
+                    text_content += payload
+                    # Once a function call has appeared the remaining text is a
+                    # pre-tool aside, and a barge-in means the caller is talking
+                    # over her right now — in both cases stop scheduling speech,
+                    # but keep draining so history records the full turn.
+                    if has_tool_use or self._speak_generation != gen:
+                        continue
+                    sentence_buffer += payload
+                    sentences, sentence_buffer = _extract_sentences(sentence_buffer)
+                    if not sentences:
+                        continue
+                    for s in sentences:
+                        tts_tasks.append(
+                            asyncio.create_task(
+                                self._invoke_speak(s, generation=gen, sentence=s)
+                            )
+                        )
+                    # Hand control to those tasks NOW. Without this the first TTS
+                    # request only started once the stream had been fully drained
+                    # (create_task alone schedules nothing until this coroutine
+                    # suspends), which is why this path used to emit a single TTS
+                    # call after llm_round_complete instead of speaking sentence
+                    # by sentence.
+                    await asyncio.sleep(0)
+
+                if text_content.strip() or function_calls:
+                    break
+
+                retrying = attempt == 0 and not empty_retry_used
+                _log_gemini_empty(
+                    path="media_stream",
+                    attempt=attempt + 1,
+                    finish_reason=finish_reason,
+                    retrying=retrying,
+                    call_sid=self.call_sid,
+                )
+                if self._is_smartpbx_session():
+                    logger.warning(
+                        "smartpbx_media event=llm_empty_response provider=gemini "
+                        "attempt=%d retrying=%s",
+                        attempt + 1, str(retrying).lower(),
+                    )
+                if not retrying:
+                    break
+                empty_retry_used = True
+                nudge = GEMINI_EMPTY_RETRY_NUDGE
 
             if self._is_smartpbx_session():
                 logger.info("smartpbx_media event=llm_round_complete provider=gemini tools=%d", len(function_calls))
@@ -4095,6 +4634,24 @@ class MediaStreamSession:
                 full_text = _join_turn(full_text, text_content)
             else:
                 full_text += text_content
+
+            # Still nothing after the retry: say something recoverable rather
+            # than leaving the caller listening to silence.
+            if not text_content.strip() and not function_calls:
+                fallback = LLM_EMPTY_FALLBACKS.get(
+                    self.lang, LLM_EMPTY_FALLBACKS["en"]
+                )
+                logger.warning(
+                    "gemini_diagnostic event=empty_response_fallback path=media_stream "
+                    "call=%s lang=%s", self.call_sid or "-", self.lang,
+                )
+                await self._invoke_speak(fallback, generation=gen, sentence=fallback)
+                self._append_assistant_history(
+                    {"role": "assistant", "content": fallback}
+                )
+                if self._is_direct_smartpbx_english():
+                    return _join_turn(full_text, fallback)
+                return full_text + fallback
 
             if function_calls:
                 if self._is_smartpbx_session():
@@ -4122,14 +4679,17 @@ class MediaStreamSession:
                 tool_calls_openai = []
                 for i, fc in enumerate(function_calls):
                     tc_id = f"gemini_tc_{round_idx}_{i}"
-                    tool_calls_openai.append({
+                    entry: dict[str, Any] = {
                         "id": tc_id,
                         "type": "function",
                         "function": {
                             "name": fc["name"],
                             "arguments": json.dumps(fc["args"]),
                         },
-                    })
+                    }
+                    if fc.get("thought_signature"):
+                        entry["gemini_thought_signature"] = fc["thought_signature"]
+                    tool_calls_openai.append(entry)
 
                 assistant_msg: dict[str, Any] = {
                     "role": "assistant",
@@ -4153,6 +4713,14 @@ class MediaStreamSession:
                             result_str = json.dumps({"error": "tool_execution_failed"})
                         else:
                             result_str = json.dumps({"error": str(exc)})
+                    try:
+                        parsed_result = json.loads(result_str)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_result = None
+                    if isinstance(parsed_result, dict):
+                        self._record_capture_tool_completion(
+                            tc["function"]["name"], parsed_result
+                        )
                     _append_booking_confirmation_marker(
                         self.full_transcript,
                         tc["function"]["name"],
@@ -4336,6 +4904,12 @@ class MediaStreamSession:
                             result_str = json.dumps({"error": "tool_execution_failed"})
                         else:
                             result_str = json.dumps({"error": str(exc)})
+                    try:
+                        parsed_result = json.loads(result_str)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_result = None
+                    if isinstance(parsed_result, dict):
+                        self._record_capture_tool_completion(tb["name"], parsed_result)
                     _append_booking_confirmation_marker(
                         self.full_transcript,
                         tb["name"],
@@ -4454,7 +5028,7 @@ class MediaStreamSession:
             voice_settings = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}
         self._is_speaking = True
         self._speaking_since = time.monotonic()
-        url = ELEVENLABS_TTS_URL.format(voice_id=voice_id) + "?output_format=ulaw_8000"
+        url = _elevenlabs_stream_url(voice_id)
         headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
         payload: dict[str, Any] = {"text": text, "model_id": model_id, "voice_settings": voice_settings}
 
@@ -4858,6 +5432,8 @@ async def _run_llm_streaming_gemini(
     conversation_history: list[dict],
     tools: list[dict],
     websocket: WebSocket,
+    lang: str = "en",
+    generation_ref: list[int] | None = None,
     transcript_sink: list[dict[str, str]] | None = None,
 ) -> str:
     """Stream a Gemini response via the native SDK, handling tool use.
@@ -4865,50 +5441,103 @@ async def _run_llm_streaming_gemini(
     Uses the same history format (OpenAI) internally, converting to Gemini
     format for each API call.  Tool results are appended in OpenAI format
     so _trim_history works unchanged.
+
+    Parity with the Claude runner: tokens go out as they arrive behind the same
+    barge-in generation fence and closed-socket guard, the slow-response filler
+    covers a stalled first token, and a turn that streams nothing at all is
+    retried once before falling back to a spoken apology rather than silence.
     """
     full_response_text = ""
     filler_sent = False
+    ws_closed = False
+    empty_retry_used = False
+    generation = generation_ref[0] if generation_ref else None
+
+    def _is_stale_generation() -> bool:
+        return (
+            generation_ref is not None
+            and generation is not None
+            and generation != generation_ref[0]
+        )
+
+    async def _safe_send(payload: dict) -> None:
+        nonlocal ws_closed
+        if _is_stale_generation():
+            return
+        if ws_closed:
+            return
+        try:
+            await websocket.send_text(json.dumps(payload))
+        except (WebSocketDisconnect, RuntimeError) as exc:
+            ws_closed = True
+            logger.warning(
+                "WebSocket closed mid-stream (%s) — draining Gemini silently",
+                type(exc).__name__,
+            )
 
     for round_idx in range(MAX_TOOL_ROUNDS):
         logger.info("Gemini streaming round %d", round_idx + 1)
 
         text_content = ""
-        function_calls: list[dict] = []  # [{name, args}, ...]
-
-        gemini_contents = _history_to_gemini(conversation_history)
-        config = {
-            "system_instruction": system,
-            "max_output_tokens": MAX_TOKENS,
-        }
-        if tools:
-            config["tools"] = tools
-
-        response = await gemini_client.aio.models.generate_content_stream(
-            model=MODEL,
-            contents=gemini_contents,
-            config=config,
-        )
-
+        function_calls: list[dict] = []  # [{name, args, thought_signature}, ...]
         finish_reason = None
-        async for chunk in response:
-            if not chunk.candidates:
-                continue
-            candidate = chunk.candidates[0]
-            if candidate.finish_reason:
-                finish_reason = candidate.finish_reason
-            if not candidate.content or not candidate.content.parts:
-                continue
-            for part in candidate.content.parts:
-                if part.text:
-                    text_content += part.text
-                    await websocket.send_text(
-                        json.dumps({"type": "text", "token": part.text})
-                    )
-                if part.function_call:
-                    fc = part.function_call
-                    # Convert args to dict — may be a proto MapComposite
-                    args = dict(fc.args) if fc.args else {}
-                    function_calls.append({"name": fc.name, "args": args})
+        nudge: str | None = None
+
+        # Attempt 0 is the real turn; attempt 1 only runs when attempt 0 streamed
+        # nothing at all and this turn has not already spent its one retry.
+        for attempt in range(2):
+            text_content = ""
+            function_calls = []
+            finish_reason = None
+
+            # Cover a stalled first token (thinking, a 429 retry inside the SDK,
+            # a slow tool-heavy prompt) the same way the Claude path does.
+            slow_task: asyncio.Task | None = None
+            if not ws_closed:
+                slow_task = asyncio.create_task(_slow_response_filler(websocket, lang))
+
+            def _cancel_slow(task: asyncio.Task | None = slow_task) -> None:
+                if task and not task.done():
+                    task.cancel()
+
+            try:
+                response = await _open_gemini_stream(
+                    gemini_client,
+                    model=MODEL,
+                    contents=_history_to_gemini(conversation_history),
+                    config=_build_gemini_config(
+                        system=system, tools=tools, model=MODEL, nudge=nudge
+                    ),
+                )
+
+                async for kind, payload in _iter_gemini_stream(response):
+                    if kind == "finish":
+                        finish_reason = payload
+                        continue
+                    if kind == "tool":
+                        _cancel_slow()
+                        function_calls.append(payload)
+                        continue
+                    _cancel_slow()
+                    text_content += payload
+                    await _safe_send({"type": "text", "token": payload})
+            finally:
+                _cancel_slow()
+
+            if text_content.strip() or function_calls:
+                break
+
+            retrying = attempt == 0 and not empty_retry_used
+            _log_gemini_empty(
+                path="conversation_relay",
+                attempt=attempt + 1,
+                finish_reason=finish_reason,
+                retrying=retrying,
+            )
+            if not retrying:
+                break
+            empty_retry_used = True
+            nudge = GEMINI_EMPTY_RETRY_NUDGE
 
         logger.info(
             "Gemini round %d done — text=%d chars, tools=%d, finish=%s",
@@ -4917,6 +5546,22 @@ async def _run_llm_streaming_gemini(
 
         full_response_text = _join_turn(full_response_text, text_content)
 
+        # Nothing survived the retry — speak a recoverable line. Twilio only
+        # renders what it is sent, so without this the caller gets dead air and
+        # concludes the line is broken.
+        if not text_content.strip() and not function_calls:
+            fallback = LLM_EMPTY_FALLBACKS.get(lang, LLM_EMPTY_FALLBACKS["en"])
+            logger.warning(
+                "gemini_diagnostic event=empty_response_fallback "
+                "path=conversation_relay lang=%s", lang,
+            )
+            await _safe_send({"type": "text", "token": fallback, "last": True})
+            conversation_history.append({"role": "assistant", "content": fallback})
+            full_response_text = _join_turn(full_response_text, fallback)
+            if ws_closed:
+                raise WebSocketDisconnect()
+            return full_response_text
+
         if function_calls:
             logger.info(
                 "Gemini requested %d tool(s): %s",
@@ -4924,30 +5569,38 @@ async def _run_llm_streaming_gemini(
                 [fc["name"] for fc in function_calls],
             )
 
-            # Skip the canned filler when the model already streamed its own
-            # pre-tool text (avoids duplicate "let me check..." announcements);
-            # still send it when the model jumped straight to the tool.
+            # Only play the canned filler when Gemini produced NO pre-tool text
+            # of its own — a second canned line would duplicate its own
+            # announcement back to back. Capture tools are instant and local, so
+            # they get no filler at all; the tools still run either way.
             if not filler_sent and not text_content.strip():
                 first_tool_name = function_calls[0]["name"]
-                filler = TOOL_FILLERS.get(first_tool_name, DEFAULT_FILLER)
-                await websocket.send_text(
-                    json.dumps({"type": "text", "token": filler, "last": True})
-                )
-                logger.info("Sent filler: '%s'", filler)
-                filler_sent = True
+                if first_tool_name in _CONVERSATION_CLAUDE_CAPTURE_TOOLS:
+                    filler = ""
+                elif first_tool_name in TOOL_FILLER_VARIANTS:
+                    filler = _next_tool_filler(first_tool_name)
+                else:
+                    filler = TOOL_FILLERS.get(first_tool_name, DEFAULT_FILLER)
+                if filler:
+                    await _safe_send({"type": "text", "token": filler, "last": True})
+                    logger.info("Sent filler: '%s'", filler)
+                    filler_sent = True
 
             # Build assistant message in OpenAI format (for history storage)
             tool_calls_openai = []
             for i, fc in enumerate(function_calls):
                 tc_id = f"gemini_tc_{round_idx}_{i}"
-                tool_calls_openai.append({
+                entry: dict[str, Any] = {
                     "id": tc_id,
                     "type": "function",
                     "function": {
                         "name": fc["name"],
                         "arguments": json.dumps(fc["args"]),
                     },
-                })
+                }
+                if fc.get("thought_signature"):
+                    entry["gemini_thought_signature"] = fc["thought_signature"]
+                tool_calls_openai.append(entry)
 
             assistant_msg: dict[str, Any] = {
                 "role": "assistant",
@@ -4958,7 +5611,14 @@ async def _run_llm_streaming_gemini(
 
             # Execute tools and add results (OpenAI format)
             for tc in tool_calls_openai:
-                parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+                try:
+                    parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+                except json.JSONDecodeError:
+                    logger.error(
+                        "Bad tool JSON for %s: %s",
+                        tc["function"]["name"], tc["function"]["arguments"][:200],
+                    )
+                    parsed_input = {}
                 logger.info("Executing tool '%s' with input: %s", tc["function"]["name"], parsed_input)
                 try:
                     result_str = await execute_tool(tc["function"]["name"], parsed_input)
@@ -4983,9 +5643,7 @@ async def _run_llm_streaming_gemini(
             continue
 
         # No tool calls — done
-        await websocket.send_text(
-            json.dumps({"type": "text", "token": "", "last": True})
-        )
+        await _safe_send({"type": "text", "token": "", "last": True})
 
         if text_content:
             conversation_history.append({
@@ -4993,19 +5651,25 @@ async def _run_llm_streaming_gemini(
                 "content": text_content,
             })
 
-        logger.info("Gemini response complete (%d chars)", len(full_response_text))
+        logger.info(
+            "Gemini response complete (%d chars)%s",
+            len(full_response_text),
+            " [WS closed]" if ws_closed else "",
+        )
+        if ws_closed:
+            raise WebSocketDisconnect()
         return full_response_text
 
     # Exhausted all tool rounds
     logger.warning("Exhausted %d tool rounds (Gemini)", MAX_TOOL_ROUNDS)
-    await websocket.send_text(
-        json.dumps({"type": "text", "token": "", "last": True})
-    )
+    await _safe_send({"type": "text", "token": "", "last": True})
     if full_response_text:
         conversation_history.append({
             "role": "assistant",
             "content": full_response_text,
         })
+    if ws_closed:
+        raise WebSocketDisconnect()
     return full_response_text
 
 
@@ -5039,6 +5703,7 @@ async def _run_llm_streaming_claude(
     tools: list[dict],
     websocket: WebSocket,
     lang: str = "en",
+    generation_ref: list[int] | None = None,
     transcript_sink: list[dict[str, str]] | None = None,
 ) -> str:
     """Stream a Claude response via the Anthropic SDK, handling tool use.
@@ -5053,9 +5718,19 @@ async def _run_llm_streaming_claude(
     full_response_text = ""
     filler_sent = False
     ws_closed = False
+    generation = generation_ref[0] if generation_ref else None
+
+    def _is_stale_generation() -> bool:
+        return (
+            generation_ref is not None
+            and generation is not None
+            and generation != generation_ref[0]
+        )
 
     async def _safe_send(payload: dict) -> None:
         nonlocal ws_closed
+        if _is_stale_generation():
+            return
         if ws_closed:
             return
         try:
@@ -5144,10 +5819,18 @@ async def _run_llm_streaming_claude(
             # fires to cover tool-execution latency.
             if not filler_sent and not text_content.strip():
                 first_tool_name = tool_use_blocks[0]["name"]
-                filler = TOOL_FILLERS.get(first_tool_name, DEFAULT_FILLER)
-                await _safe_send({"type": "text", "token": filler, "last": True})
-                logger.info("Sent filler: '%s'", filler)
-                filler_sent = True
+                # Capture tools answer instantly — no filler, but the tool
+                # must still execute below (never skip the round body).
+                filler = None
+                if first_tool_name not in _CONVERSATION_CLAUDE_CAPTURE_TOOLS:
+                    if first_tool_name in {"check_availability", "create_booking", "transfer_to_human"}:
+                        filler = _next_tool_filler(first_tool_name)
+                    else:
+                        filler = TOOL_FILLERS.get(first_tool_name, DEFAULT_FILLER)
+                if filler:
+                    await _safe_send({"type": "text", "token": filler, "last": True})
+                    logger.info("Sent filler: '%s'", filler)
+                    filler_sent = True
 
             # Build assistant message with content blocks
             assistant_content: list[dict[str, Any]] = []
@@ -5171,6 +5854,9 @@ async def _run_llm_streaming_claude(
                 except Exception as exc:
                     logger.exception("Tool execution failed for '%s'", tb["name"])
                     result_str = json.dumps({"error": f"Tool execution failed: {exc}"})
+                # Capture-mode endpointing is a MediaStreamSession concern;
+                # ConversationRelay (this path) does its own endpointing on
+                # Twilio's edge, so there is no session state to update here.
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tb["id"],
@@ -5226,6 +5912,7 @@ async def _stream_llm_turn(
     tools: list[dict[str, Any]],
     websocket: WebSocket,
     lang: str,
+    generation_ref: list[int] | None = None,
     anthropic_client: Any,
     gemini_client: Any,
     openai_client: Any,
@@ -5245,6 +5932,7 @@ async def _stream_llm_turn(
             tools=tools,
             websocket=websocket,
             lang=lang,
+            generation_ref=generation_ref,
             transcript_sink=transcript_sink,
         )
     if LLM_PROVIDER == "gemini":
@@ -5254,6 +5942,8 @@ async def _stream_llm_turn(
             conversation_history=conversation_history,
             tools=tools,
             websocket=websocket,
+            lang=lang,
+            generation_ref=generation_ref,
             transcript_sink=transcript_sink,
         )
     return await _run_llm_streaming(
@@ -5349,6 +6039,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
     anthropic_client = None
     openai_client = None
     gemini_client = None
+    generation_ref: list[int] = [0]
     try:
         if LLM_PROVIDER == "claude":
             anthropic_client = _get_anthropic_client()
@@ -5495,6 +6186,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                         {"role": "user", "content": _FAILSAFE_KICKOFF}
                     )
                     try:
+                        generation_ref[0] += 1
                         opening = await _stream_llm_turn(
                             system=system_prompt,
                             conversation_history=conversation_history,
@@ -5508,6 +6200,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                             tools=[],
                             websocket=websocket,
                             lang=lang,
+                            generation_ref=generation_ref,
                             anthropic_client=anthropic_client,
                             gemini_client=gemini_client,
                             openai_client=openai_client,
@@ -5579,6 +6272,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                         tools=tools_for_session,
                         websocket=websocket,
                         lang=lang,
+                        generation_ref=generation_ref,
                         anthropic_client=anthropic_client,
                         gemini_client=gemini_client,
                         openai_client=openai_client,
@@ -5801,6 +6495,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                     call_sid,
                     message.get("utteranceUntilInterrupt", ""),
                 )
+                generation_ref[0] += 1
 
             # ---------------------------------------------------------------
             # OTHER

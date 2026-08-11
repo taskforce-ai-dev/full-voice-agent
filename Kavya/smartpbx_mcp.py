@@ -36,6 +36,23 @@ _MAX_CALL_ID_CHARS = 256
 
 _SDK_LOGGERS = ("mcp.client.streamable_http", "mcp.client.session")
 
+# The Dialog UCP MCP `transfer_call` tool declares exactly one required argument,
+# `number`, and wants the bare dialable number the caller asked for -- verified
+# live against https://dialog.cybergate.lk:9443/ucp/v2/mcp on 2026-08-11 via
+# tools/list. Our operator config keeps the safer `tel:`/`sip:` URI allowlist
+# form, so the scheme is stripped here, at the wire boundary, and nowhere else.
+_TRANSFER_ARGUMENT = "number"
+_TEL_SCHEME = "tel:"
+
+# Any digit run this long or longer is a phone number; never log one.
+_LOGGABLE_DIGITS = re.compile(r"[0-9]{5,}")
+_LOGGABLE_DETAIL = re.compile(r"[^A-Za-z0-9 ._:=<>/'\"-]+")
+_MAX_LOG_DETAIL_CHARS = 160
+# Exceptions raised by the MCP SDK / its response validation are protocol
+# faults, not network faults. Matched by module so this stays importable and
+# testable without the SDK present.
+_PROTOCOL_ERROR_ROOTS = frozenset({"mcp", "pydantic", "pydantic_core", "jsonschema"})
+
 
 class TransferDisabled(RuntimeError):
     """The explicitly configured handover boundary is unavailable."""
@@ -200,7 +217,9 @@ class DialogMCPCallControl:
         destination = self._settings.transfer_destinations.get(destination_key)
         if destination is None:
             raise TransferDisabled("destination_not_allowed")
-        return await self._invoke("transfer_call", {"destination_number": destination})
+        return await self._invoke(
+            "transfer_call", {_TRANSFER_ARGUMENT: _wire_destination(destination)}
+        )
 
     async def _invoke(self, tool_name: str, arguments: dict[str, str]) -> TransferResult:
         for attempt in range(1, self._settings.retries + 2):
@@ -229,11 +248,11 @@ class DialogMCPCallControl:
                     _log_result("retryable_failure", attempt)
                     continue
                 failure = _failure_class(cause)
-                _log_result(failure, attempt)
+                _log_result(failure, attempt, _log_detail(cause))
                 return TransferResult(False, failure)
 
             outcome = _result_outcome(result)
-            _log_result(outcome, attempt)
+            _log_result(outcome, attempt, _result_detail(outcome, result))
             return TransferResult(outcome == "success", None if outcome == "success" else outcome)
         return TransferResult(False, "request_failed")
 
@@ -338,9 +357,26 @@ async def _open_session(
                 yield session
 
 
+def _wire_destination(destination: str) -> str:
+    """Render an allowlisted destination as the bare value Dialog's tool wants.
+
+    The live tool schema takes one `number` string. A `tel:` URI is dialable only
+    once the scheme is dropped (`tel:+94711754668` -> `+94711754668`); a `sip:`
+    URI is already the routable form and is passed through whole.
+    """
+    if destination.startswith(_TEL_SCHEME):
+        return destination[len(_TEL_SCHEME):]
+    return destination
+
+
 def _result_outcome(result: object) -> str:
     is_error = getattr(result, "isError", None)
     content = getattr(result, "content", None)
+    # Dialog omits `isError` entirely on a non-error result (verified live), so an
+    # absent flag is an acknowledgement, not a malformed reply. Anything other
+    # than absent-or-bool is still refused.
+    if is_error is None:
+        is_error = False
     if not isinstance(is_error, bool) or not isinstance(content, list) or not content:
         return "malformed_result"
     return "tool_error" if is_error else "success"
@@ -395,10 +431,68 @@ def _failure_class(error: BaseException) -> str:
         return "server" if error.response.status_code >= 500 else "client"
     if isinstance(error, httpx.TransportError):
         return "transport"
+    if _is_protocol_error(error):
+        # A JSON-RPC error object or an unparseable result arrives over a
+        # perfectly healthy HTTP 200. Calling that `transport` sent a whole
+        # incident chasing the network while the real fault was our request.
+        return "protocol"
     return "transport"
 
 
-def _log_result(outcome: str, attempt: int) -> None:
+def _is_protocol_error(error: BaseException) -> bool:
+    """True for a JSON-RPC error reply or an SDK response-validation failure."""
+    if isinstance(error, (httpx.HTTPError, OSError)):
+        return False
+    if isinstance(_jsonrpc_error_code(error), int):
+        return True
+    return type(error).__module__.split(".", 1)[0] in _PROTOCOL_ERROR_ROOTS
+
+
+def _jsonrpc_error_code(error: BaseException) -> object:
+    """Read `McpError.error.code` without importing the SDK."""
+    return getattr(getattr(error, "error", None), "code", None)
+
+
+def _result_detail(outcome: str, result: object) -> str:
+    """Surface why the provider refused, bounded and digit-masked.
+
+    Only for a refusal: a success needs no explanation, and the reply text is
+    provider-authored, so it is masked exactly like a protocol error message.
+    """
+    if outcome != "tool_error":
+        return ""
+    texts: list[str] = []
+    for block in getattr(result, "content", None) or ():
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text:
+            texts.append(text)
+    message = _bounded_log_text(" ".join(texts))
+    return f"reason={message}" if message else ""
+
+
+def _bounded_log_text(value: object) -> str:
+    masked = _LOGGABLE_DETAIL.sub(" ", _LOGGABLE_DIGITS.sub("#####", str(value)))
+    return " ".join(masked.split())[:_MAX_LOG_DETAIL_CHARS]
+
+
+def _log_detail(error: BaseException) -> str:
+    """Bounded, digit-masked cause for the one log line an operator will read."""
+    if not _is_protocol_error(error):
+        return ""
+    code = _jsonrpc_error_code(error)
+    message = _bounded_log_text(
+        getattr(getattr(error, "error", None), "message", None) or str(error)
+    )
+    prefix = f"code={code} " if isinstance(code, int) else ""
+    return f"{prefix}reason={message}" if message else prefix.strip()
+
+
+def _log_result(outcome: str, attempt: int, detail: str = "") -> None:
+    if detail:
+        logger.info(
+            "smartpbx_mcp_result outcome=%s attempt=%d %s", outcome, attempt, detail
+        )
+        return
     logger.info("smartpbx_mcp_result outcome=%s attempt=%d", outcome, attempt)
 
 

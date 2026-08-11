@@ -162,7 +162,7 @@ async def test_transfer_uses_other_leg_call_id_and_exactly_one_configured_accoun
     session = fake_mcp.sessions[0]
     assert session.events == [
         ("initialize",),
-        ("call_tool", "transfer_call", {"destination_number": "tel:+94110000000"}),
+        ("call_tool", "transfer_call", {"number": "+94110000000"}),
     ]
 
 
@@ -314,6 +314,199 @@ async def test_iserror_tool_result_is_a_non_retryable_tool_failure():
 
     assert result == smartpbx_mcp.TransferResult(False, "tool_error")
     assert len(fake_mcp.calls) == 1
+
+
+# --------------------------------------------------------------------------
+# Live-observed Dialog UCP contract (dialog.cybergate.lk:9443/ucp/v2/mcp,
+# captured 2026-08-11 with the production key). Every literal below is a
+# recorded response body, not an assumption:
+#
+#   tools/list      transfer_call inputSchema -> {"number": <string>} required
+#   tools/call OK   {"content":[{"type":"text","text":"..."}]}      (no isError)
+#   tools/call err  {"content":[...],"isError":true}
+#   JSON-RPC error  {"error":{"code":-32603,"message":"required argument
+#                    \"destination number\" not found"}}  over HTTP 200
+#
+# The 11:10 UTC outage was the last of these: we sent `destination_number`,
+# Dialog rejected it as a JSON-RPC error, and the SDK's McpError was filed as
+# `transport`. These tests exist so neither half can silently regress.
+# --------------------------------------------------------------------------
+
+
+class FakeErrorData:
+    """Shape-compatible stand-in for mcp.types.ErrorData."""
+
+    def __init__(self, code, message):
+        self.code = code
+        self.message = message
+
+
+class FakeMcpError(Exception):
+    """Shape-compatible stand-in for mcp.shared.exceptions.McpError.
+
+    The SDK is not installed in the test environment, and production classifies
+    this by duck-typing (`.error.code`) precisely so it need not be.
+    """
+
+    __module__ = "mcp.shared.exceptions"
+
+    def __init__(self, code, message):
+        self.error = FakeErrorData(code, message)
+        super().__init__(message)
+
+
+class FakeTextBlock:
+    def __init__(self, text):
+        self.type = "text"
+        self.text = text
+
+
+class AcknowledgedResult:
+    """Dialog's real non-error reply: content present, `isError` absent."""
+
+    def __init__(self, text="Transfer initiated"):
+        self.content = [FakeTextBlock(text)]
+
+
+@pytest.mark.asyncio
+async def test_transfer_sends_the_bare_number_argument_dialog_actually_requires():
+    """Regression for the 2026-08-11 outage: the argument name and value shape.
+
+    `tel:` is an allowlist notation of ours; Dialog wants `number` holding the
+    dialable value. Sending `destination_number` transferred nobody.
+    """
+    fake_mcp = FakeSessionFactory(AcknowledgedResult())
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result.transferred is True
+    name, arguments = fake_mcp.sessions[0].events[1][1], fake_mcp.sessions[0].events[1][2]
+    assert name == "transfer_call"
+    assert arguments == {"number": "+94110000000"}
+    assert "destination_number" not in arguments
+    assert not arguments["number"].startswith("tel:")
+
+
+@pytest.mark.asyncio
+async def test_sip_destination_reaches_the_provider_as_the_whole_uri():
+    fake_mcp = FakeSessionFactory(AcknowledgedResult())
+    configured = settings(
+        SMARTPBX_TRANSFER_DESTINATIONS_JSON='{"human_support":"sip:support@pbx.example"}'
+    )
+
+    result = await DialogMCPCallControl(configured, context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result.transferred is True
+    assert fake_mcp.sessions[0].events[1][2] == {"number": "sip:support@pbx.example"}
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_result_without_iserror_is_a_success_not_a_failure():
+    """Dialog omits `isError` when it accepts the call. That is an acknowledgement.
+
+    Treating the absent flag as malformed would fail closed on a transfer that
+    really happened -- guest handed to a human AND the manager WhatsApped.
+    """
+    fake_mcp = FakeSessionFactory(AcknowledgedResult())
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(True, None)
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_error_reply_is_a_protocol_failure_never_transport():
+    """The exact 11:10 UTC failure must no longer masquerade as a network fault."""
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(FakeMcpError(-32603, 'required argument "destination number" not found'))
+    )
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(False, "protocol")
+    assert result.failure != "transport"
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_protocol_failure_is_logged_with_the_cause_and_no_dialable_digits(caplog):
+    """An operator must be able to read *why* off one line, without leaking a number."""
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(FakeMcpError(-32602, "tool 'transfer_call' rejected +94711754668"))
+    )
+
+    with caplog.at_level(logging.INFO, logger="smartpbx_mcp"):
+        await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+            "human_support"
+        )
+
+    line = "\n".join(record.getMessage() for record in caplog.records)
+    assert "outcome=protocol" in line
+    assert "code=-32602" in line
+    assert "rejected" in line
+    assert "94711754668" not in line
+
+
+@pytest.mark.asyncio
+async def test_provider_refusal_reports_its_reason_as_a_bounded_tool_error(caplog):
+    """`routing key not found` is the real reply when the call leg is unknown."""
+    fake_mcp = FakeSessionFactory(
+        SimpleNamespace(isError=True, content=[FakeTextBlock("routing key not found")])
+    )
+
+    with caplog.at_level(logging.INFO, logger="smartpbx_mcp"):
+        result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+            "human_support"
+        )
+
+    assert result == smartpbx_mcp.TransferResult(False, "tool_error")
+    assert "outcome=tool_error" in caplog.text
+    assert "routing key not found" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_protocol_failure_does_not_retry_and_stays_fail_closed():
+    """A rejected request is not worth repeating, and must still reach the fallback."""
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(FakeMcpError(-32603, "bad argument")),
+        AcknowledgedResult(),
+    )
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result.transferred is False
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_genuine_network_failure_is_still_classified_as_transport():
+    """The protocol class must not swallow the case it was carved out of."""
+    fake_mcp = FakeSessionFactory(AfterDispatch(httpx.ReadError("connection reset")))
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(False, "transport")
+
+
+def test_configured_production_destination_passes_the_operator_allowlist():
+    """The number swapped in on 2026-08-11 is valid config -- it was never the cause."""
+    for number in ('{"human_support":"tel:+94711754668"}', '{"human_support":"tel:+94765603946"}'):
+        configured = settings(SMARTPBX_TRANSFER_DESTINATIONS_JSON=number)
+        assert configured.failure is None
+        assert configured.enabled is True
 
 
 class ChunkedResponse(httpx.AsyncByteStream):

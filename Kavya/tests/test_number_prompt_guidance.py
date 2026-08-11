@@ -34,6 +34,8 @@ def test_keypad_is_worded_as_a_fallback_not_the_default():
     keypad_idx = low.index("collect_number_via_keypad")
     assert capture_idx < keypad_idx
     window = low[max(0, keypad_idx - 400): keypad_idx + 400]
-    assert "fallback" in window or "if the caller" in window or "only if" in window
+    assert "fallback" in window
     assert "keypad" in window
-    assert "fallback only" in window or "only if" in window or "repeated" in window
+    # Keypad must be conditional on failed spoken attempts, not the default.
+    assert "only after" in window or "only if" in window or "repeated" in window
+    assert "failed spoken attempt" in window or "attempts >= 2" in window
