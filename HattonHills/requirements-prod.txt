@@ -13,7 +13,7 @@ twilio>=9.10.9,<10.0
 
 # Knowledge base / RAG
 chromadb>=0.4.0
-sentence-transformers>=2.2.0
+sentence-transformers>=5.7.0
 
 # STT (Media Streams) — Google (default) + Azure (STT_PROVIDER=azure)
 google-cloud-speech>=2.40.0
