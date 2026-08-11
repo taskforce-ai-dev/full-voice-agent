@@ -221,15 +221,15 @@ Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8
 - **Claude as default**: Anthropic Claude (`claude-sonnet-4-5-20250929`) is the default and primary tested provider. Uses native `AsyncAnthropic` SDK with `messages.stream()`, content block events (`content_block_start`, `content_block_delta`, `content_block_stop`), and Anthropic tool format (`input_schema`).
 - **Two servers, one codebase**: `server.py` (unified production) and `media_stream_server.py` (standalone, Anthropic-only, kept as reference). Both share `booking_api.py`, `tools.py`, `knowledge_base.py`.
 - **DTMF language menu**: live menu (v0.16) is Press 1 → ConversationRelay (English + ElevenLabs); Press 2 → Media Streams (Arabic + ElevenLabs multilingual); Press 3 → Media Streams (Sinhala + OpenAI `gpt-4o-mini-tts`). `DIGIT_TO_LANG = {"1": "en", "2": "ar", "3": "si"}`; no input → English. Tamil (Media Streams + ElevenLabs) remains fully coded but is not mapped to any menu digit — add `"4": "ta"` plus a matching `<Say>` prompt to re-expose it.
-- **Interim-based STT endpointing**: Google Cloud STT rarely fires `is_final=True` for conversational speech. Each interim result overwrites `_pending_transcript` (not appends) and resets a 1.5s silence timer. When the timer fires, the latest interim is treated as the complete utterance.
+- **Interim-based STT endpointing**: Google Cloud STT rarely fires `is_final=True` for conversational speech. Each interim result overwrites `_pending_transcript` (not appends) and resets a `STT_ENDPOINTING_SILENCE_SECONDS` timer. `STT_ENDPOINTING_SILENCE_SECONDS` defaults to `1.0` and clamps to `[0.2, 5.0]`. `STT_FINAL_GRACE_SECONDS` defaults to `0.5` and clamps to `[0.05, 5.0]`.
 - **Tool gating via system prompt**: General info (rooms, rates, policies, activities) answered from KB context — no tool call. Tools only for date-specific booking operations.
 - **Filler speech**: Spoken before tool execution to avoid silence during API calls (language-specific fillers for Sinhala/Tamil).
 - **max_tokens=300**: Forces concise voice-appropriate responses.
-- **History trimming**: Max 20 messages. `_trim_history()` is format-aware — detects and skips orphaned tool result messages at the start of trimmed history for both Anthropic format (user messages containing `tool_result` content blocks) and OpenAI format (`role: "tool"` messages). Also skips orphaned assistant `tool_use`/`tool_calls` messages.
+- **History trimming**: Max `MAX_HISTORY_MESSAGES` messages (`60`). `_trim_history()` is format-aware — detects and skips orphaned tool result messages at the start of trimmed history for both Anthropic format (user messages containing `tool_result` content blocks) and OpenAI format (`role: "tool"` messages). Also skips orphaned assistant `tool_use`/`tool_calls` messages.
 - **Native script**: LLM responds in native Sinhala/Tamil Unicode script. TTS handles native script directly.
 - **Kavya persona**: Collects booking info in order: name → location (local vs foreign rates) → pax → dates → room. Mentions complimentary activities (2+ nights), April/December advance payment, honeymoon packages.
 - **Hybrid TTS**: English → ElevenLabs turbo (cloned voice via ConversationRelay), Sinhala → OpenAI `gpt-4o-mini-tts` (voice `nova`, 24 kHz PCM → 8 kHz μ-law via `audioop`), Tamil → ElevenLabs `eleven_multilingual_v2` (cloned voice, `ulaw_8000` output). Legacy Azure `si-LK-SameeraNeural` Sinhala path (`_tts_azure`) is wired but no longer the live route.
-- **Barge-in**: Media Streams only. When STT detects speech during TTS, sends `clear` event to Twilio, sets `_is_speaking = False`, increments `_speak_generation` to cancel queued TTS tasks.
+- **Barge-in**: Media Streams only. When STT detects speech during TTS, sends `clear` event to Twilio, sets `_is_speaking = False`, increments `_speak_generation` to cancel queued TTS tasks. Thresholds are driven by `BARGEIN_MIN_CHARS` (default `12`, clamp `[0, 200]`) and `BARGEIN_DEBOUNCE_SECONDS` (default `0.6`, clamp `[0.0, 5.0]`).
 
 ## Server Endpoints
 
@@ -253,9 +253,15 @@ Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8
 ## Server Constants
 
 - `MAX_TOKENS = 300`
-- `MAX_HISTORY_MESSAGES = 20`
+- `MAX_HISTORY_MESSAGES = 60`
 - `MAX_TOOL_ROUNDS = 5`
-- `ENDPOINTING_SILENCE = 1.5` (Media Streams only — seconds of silence before utterance is complete)
+- `STT_ENDPOINTING_SILENCE_SECONDS = 1.0` (clamp `[0.2, 5.0]`)
+- `STT_FINAL_GRACE_SECONDS = 0.5` (clamp `[0.05, 5.0]`)
+- `DTMF_INTERDIGIT_TIMEOUT_SECONDS = 6.0` (clamp `[1.0, 30.0]`)
+- `DTMF_OVERALL_TIMEOUT_SECONDS = 30.0` (clamp `[5.0, 120.0]`)
+- `DTMF_MAX_DIGITS = 15` (clamp `[1, 40]`)
+- `BARGEIN_MIN_CHARS = 12` (clamp `[0, 200]`)
+- `BARGEIN_DEBOUNCE_SECONDS = 0.6` (clamp `[0.0, 5.0]`)
 
 ## System Prompt Structure
 
@@ -281,6 +287,13 @@ Built dynamically by `_build_system_prompt(lang)` with today's date injected and
 - **Media Streams TTS routing**: `_speak()` routes by language: Tamil/Arabic → `_tts_elevenlabs()` (ElevenLabs `eleven_multilingual_v2`, `ulaw_8000`), Sinhala → `_tts_openai()` (OpenAI `gpt-4o-mini-tts`, `response_format=pcm` 24 kHz → 8 kHz μ-law via `audioop.ratecv`/`lin2ulaw`, flushed in 640-byte frames). The legacy `_tts_azure()` (Azure REST, `raw-8khz-8bit-mono-mulaw`, SSML) is wired but unused. `_speak_lock` serializes TTS calls. `_ws_lock` serializes WebSocket writes.
 - **Error handling**: LLM streaming failure sends language-appropriate fallback message. Missing LLM client closes WebSocket with code 1011.
 - **Legacy**: `ezee_api.py` kept but not imported. `media_stream_server.py` uses Anthropic Claude directly — kept as reference.
+- **Twilio/SmartPBX env loading asymmetry:** `kavya` uses `env_file: .env`; `kavya-smartpbx` uses an explicit allowlist under `environment:` and should not use `env_file` in compose. This is a deliberate trap-prevention design: any var only present in `.env.smartpbx` is ignored unless copied into the `kavya-smartpbx` allowlist.
+- **How to verify the allowlist trap:** from repo root: `cd Kavya && docker compose config | rg -n "kavya-smartpbx:|env_file|STT_ENDPOINTING_SILENCE_SECONDS|DTMF_INTERDIGIT_TIMEOUT_SECONDS|BARGEIN_MIN_CHARS"` . `kavya-smartpbx` must show values from `environment`, and no `env_file` stanza.
+- **Compose/dockerfile safety:** `Dockerfile` uses explicit module `COPY` manifest and a build-time `RUN python -c "import server"` guard. `Kavya/tests/test_dockerfile_manifest.py` enforces closure coverage and the presence of the import guard so missing modules fail fast at build-time or pre-build CI.
+- **Deploy gate sequence:** `Kavya/SMARTPBX_RUNBOOK.md` requires read-only probe + immutable image identity checks and a reviewed helper script for deployment. The repo-level gates are:
+  - `probe-kavya-image.yml` (`repository_dispatch`, event type `kavya_image_read_only_probe`, requires `github.ref_protected`, and validates payload keys `existing_tag`, `expected_revision`, optional `bootstrap: "true"`).
+  - `build-kavya-image.yml` (`workflow_dispatch` with `ref` + `expected_sha`, requires a fresh successful read-only probe on same `head_sha`, and verifies image label revision before publishing).
+- **GHCR auth note:** on VPS, `docker login` frequently expires; authenticate with `--password-stdin` (or equivalent token stdin flow) before the deploy/review helper run.
 
 ---
 
@@ -859,6 +872,37 @@ service modes are architecturally incapable of running in one process.
 
 **How to test:** `pytest Kavya/tests/test_smartpbx_*.py`. Live cutover: follow
 `SMARTPBX_RUNBOOK.md` in full — do not shortcut its gates.
+
+### v0.23 — SmartPBX migration hardening: env knobs, deploy gates, and number-capture contract
+**Reason:** Consolidate operational facts for the Dialog SmartPBX path and prevent repeatable incidents from docs drift during on-call.
+
+**Changes:**
+- Documented verified `server.py` defaults and clamp windows for new migration knobs:
+  - `STT_ENDPOINTING_SILENCE_SECONDS` (`1.0`, clamp `[0.2, 5.0]`)
+  - `STT_FINAL_GRACE_SECONDS` (`0.5`, clamp `[0.05, 5.0]`)
+  - `DTMF_INTERDIGIT_TIMEOUT_SECONDS` (`6.0`, clamp `[1.0, 30.0]`)
+  - `DTMF_OVERALL_TIMEOUT_SECONDS` (`30.0`, clamp `[5.0, 120.0]`)
+  - `DTMF_MAX_DIGITS` (`15`, clamp `[1, 40]`)
+  - `BARGEIN_MIN_CHARS` (`12`, clamp `[0, 200]`)
+  - `BARGEIN_DEBOUNCE_SECONDS` (`0.6`, clamp `[0.0, 5.0]`)
+- Added explicit compose allowlist guidance: `kavya-smartpbx` has no `env_file` and is an explicit environment allowlist; values in `.env.smartpbx` are ignored unless copied into its block.
+- Added doc hooks for Dockerfile hardening rails: explicit module `COPY` manifest and build-time `RUN python -c "import server"` guard, plus `test_dockerfile_manifest.py` assertions.
+- Added deploy-gate contract: read-only probe + publish workflow chain, immutable image + revision checks before deployment, and GHCR token-in/stdin workflow for private GHCR pull.
+- Added explicit spoken-number capture contract: `capture_spoken_number` primary/default, `collect_number_via_keypad` fallback-only, deterministic normalization path through `expand_spoken_repeats`, `spoken_number_to_digits`, and `normalize_whatsapp`.
+
+**Not changed:** regular Twilio call behavior, existing `server.py` primary routes, and normal handoff success path remain unchanged by this doc-only update.
+
+**How to test:** `pytest Kavya/tests/test_dockerfile_manifest.py` and `pytest Kavya/tests/test_smartpbx_*.py`, then dry-run `SMARTPBX_RUNBOOK.md` gate command blocks against reviewed tooling only.
+
+### Spoken-number capture contract
+- Primary path for phone/WhatsApp/callback numbers remains spoken capture: use `capture_spoken_number` first and pass caller phrases exactly as spoken.
+- `collect_number_via_keypad` is fallback-only and should be offered only after repeated spoken capture failures or when the caller explicitly requests keypad entry.
+- Deterministic parser path lives in `Kavya/handover.py`: `expand_spoken_repeats` and `spoken_number_to_digits` expand double/triple/treble and zero variants, then `normalize_whatsapp` validates and normalizes length. This path is the single normalization source for live readback, booking phone, and WhatsApp payload so model arithmetic cannot drift from it.
+
+### SmartPBX migration operational hardening
+- `SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS` is validated in `smartpbx_gateway.py` as an integer setting: default `300`, clamp `[30, 1800]`. If absent, it falls back to this default through settings parsing.
+- `smartpbx_transport.py` has no env-driven knobs; transport behavior is bounded by internal backpressure constants (`_SEND_BACKPRESSURE_SECONDS=0.2`, `_SEND_BACKPRESSURE_POLL=0.005`).
+- Missing `KAVYA_EN_ELEVENLABS_VOICE_ID` is a hard failure path in `english_voice_profile.load_kavya_english_voice_profile()` for English TTS: it raises `ValueError`, logged as a skip path for `_tts_elevenlabs()` rather than fabricated/fallback speech.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 
