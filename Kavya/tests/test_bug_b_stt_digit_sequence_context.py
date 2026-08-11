@@ -1,0 +1,37 @@
+from tests.test_stt_stream_rotation import _fake_google_speech, _stream
+import server
+
+
+def test_english_speech_context_includes_digit_sequence_oov_class(monkeypatch):
+    fake, _recorded = _fake_google_speech()
+    monkeypatch.setattr(server, "google_speech", fake)
+
+    stt = _stream(lang="en")
+    config = stt._streaming_config("en-US", server.STT_ALTERNATIVES.get("en", []), enhanced=True)
+
+    contexts = config.kwargs["config"].kwargs["speech_contexts"]
+    assert len(contexts) == 2
+    assert contexts[0].kwargs["phrases"] == list(server.EN_STT_PHRASE_LIST[:server.STT_MAX_ADAPTATION_PHRASES])
+    assert contexts[0].kwargs["boost"] == server.STT_ADAPTATION_BOOST
+    assert contexts[1].kwargs["phrases"] == ["$OOV_CLASS_DIGIT_SEQUENCE"]
+    assert contexts[1].kwargs["boost"] == 4.0
+
+
+def test_other_languages_do_not_apply_english_speech_contexts(monkeypatch):
+    # `enhanced` is what carries the telephony model + adaptation, and it is
+    # gated to English by _use_enhanced_config(); non-en streams can never
+    # request it, so exercise the real production gate rather than forcing
+    # enhanced=True onto a language the code forbids it for.
+    fake, _recorded = _fake_google_speech()
+    monkeypatch.setattr(server, "google_speech", fake)
+
+    for lang, primary in (("si", "si-LK"), ("ta", "ta-IN")):
+        stream = _stream(lang=lang)
+        assert stream._use_enhanced_config() is False
+        config = stream._streaming_config(
+            primary,
+            server.STT_ALTERNATIVES.get(lang, []),
+            enhanced=stream._use_enhanced_config(),
+        )
+        assert "speech_contexts" not in config.kwargs["config"].kwargs
+        assert "model" not in config.kwargs["config"].kwargs

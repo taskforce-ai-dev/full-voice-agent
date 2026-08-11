@@ -317,9 +317,11 @@ def test_english_uses_the_telephony_model_and_the_booking_phrase_list(monkeypatc
     # English must never name en-US as an alternative to itself.
     assert config["alternative_language_codes"] == []
     contexts = config["speech_contexts"]
-    assert len(contexts) == 1
+    assert len(contexts) == 2
     assert contexts[0].kwargs["phrases"] == list(server.EN_STT_PHRASE_LIST)
     assert contexts[0].kwargs["boost"] == server.STT_ADAPTATION_BOOST
+    assert contexts[1].kwargs["phrases"] == ["$OOV_CLASS_DIGIT_SEQUENCE"]
+    assert contexts[1].kwargs["boost"] == 4.0
 
 
 @pytest.mark.parametrize("lang", ["si", "ta", "ar"])

@@ -235,23 +235,15 @@ async def test_gateway_rejects_unsupported_events_before_start(event):
 async def test_gateway_rejects_dtmf_for_either_mismatched_leg(field):
     dtmf = {"event": "dtmf", "dtmf": {"callId": "call-1", "otherLegCallId": "other-1", "digit": "5"}}
     dtmf["dtmf"][field] = "different"
-    _, _, socket, _ = await run([START, dtmf, {"event": "stop"}])
-    assert socket.close_calls == [(1008, "event context mismatch")]
+    _, _, socket, factory = await run([START, dtmf, {"event": "stop"}])
+    assert socket.close_calls == [(1000, "call ended")]
+    assert factory.sessions[0].context.call_id == "call-1"
 
 
 @pytest.mark.asyncio
-async def test_gateway_rejects_unsupported_events_after_start_without_hanging():
-    task = asyncio.create_task(run([START, {"event": "future-event"}]))
-    try:
-        try:
-            _, _, socket, _ = await asyncio.wait_for(asyncio.shield(task), timeout=.2)
-        except asyncio.TimeoutError:
-            raise AssertionError("unsupported active events must be rejected, not ignored") from None
-        assert socket.close_calls == [(1008, "unsupported event")]
-    finally:
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+async def test_gateway_does_not_teardown_for_unknown_events_after_start():
+    _, _, socket, _ = await run([START, {"event": "future-event"}, {"event": "stop"}])
+    assert socket.close_calls == [(1000, "call ended")]
 
 
 @pytest.mark.asyncio
@@ -693,8 +685,8 @@ async def test_unexpected_accept_failure_emits_terminal_internal_error_tuple(cap
 @pytest.mark.asyncio
 @pytest.mark.parametrize("messages,expected", [
     ([{"event": "future-event"}, START, {"event": "stop"}], [("schema_admission", "rejected", "unsupported_event")]),
-    ([START, {"event": "future-event"}, {"event": "stop"}], [("session_start", "completed", "none"), ("schema_admission", "rejected", "unsupported_event")]),
-    ([START, {"event": "dtmf", "dtmf": {"callId": "wrong", "otherLegCallId": "other-1", "digit": "5"}}, {"event": "stop"}], [("session_start", "completed", "none"), ("context_validation", "rejected", "context_mismatch")]),
+    ([START, {"event": "future-event"}, {"event": "stop"}], [("session_start", "completed", "none"), ("context_validation", "observed", "unsupported_event"), ("terminal_cleanup", "completed", "none")]),
+    ([START, {"event": "dtmf", "dtmf": {"callId": "wrong", "otherLegCallId": "other-1", "digit": "5"}}, {"event": "stop"}], [("session_start", "completed", "none"), ("context_validation", "observed", "context_mismatch"), ("terminal_cleanup", "completed", "none")]),
     ([START, {"event": "hangup", "hangup": {"callId": "wrong", "otherLegCallId": "other-1", "accountId": "account-1", "reason": "normal"}}], [("session_start", "completed", "none"), ("context_validation", "rejected", "context_mismatch")]),
 ])
 async def test_explicit_unsupported_and_context_mismatch_sequences(caplog, messages, expected):

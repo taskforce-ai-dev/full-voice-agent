@@ -3088,6 +3088,10 @@ class GoogleSTTStream:
                     speech_context(
                         phrases=list(EN_STT_PHRASE_LIST[:STT_MAX_ADAPTATION_PHRASES]),
                         boost=STT_ADAPTATION_BOOST,
+                    ),
+                    speech_context(
+                        phrases=["$OOV_CLASS_DIGIT_SEQUENCE"],
+                        boost=4.0,
                     )
                 ]
         return google_speech.StreamingRecognitionConfig(

@@ -273,13 +273,33 @@ class SmartPBXGateway:
                         close_outcome = (1011, "internal error")
                         return
                 elif isinstance(event, DtmfEvent):
-                    validate_event_context(event, context)
-                    # Every DTMF is still observed; when the session is collecting
-                    # a keypad number the digit is also fed to its collector.
-                    sink(DiagnosticStage.CONTEXT_VALIDATION, DiagnosticOutcome.OBSERVED, DiagnosticFailureClass.NONE)
-                    feed_dtmf = getattr(session, "feed_dtmf", None)
-                    if feed_dtmf is not None:
-                        await feed_dtmf(event.digit)
+                    try:
+                        validate_event_context(event, context)
+                    except ProtocolViolation as error:
+                        # Some Dialog clients send DTMF frames that do not carry
+                        # stable call-leg identifiers even when the session is
+                        # otherwise valid. Treat this as non-fatal telemetry:
+                        # route what we can and keep the call alive.
+                        if error.failure_class == "context_mismatch":
+                            sink(
+                                DiagnosticStage.CONTEXT_VALIDATION,
+                                DiagnosticOutcome.OBSERVED,
+                                DiagnosticFailureClass.CONTEXT_MISMATCH,
+                            )
+                        else:
+                            raise
+                    else:
+                        # Every validated DTMF is still observed; when the session
+                        # is collecting a keypad number the digit is also fed to
+                        # its collector.
+                        sink(
+                            DiagnosticStage.CONTEXT_VALIDATION,
+                            DiagnosticOutcome.OBSERVED,
+                            DiagnosticFailureClass.NONE,
+                        )
+                        feed_dtmf = getattr(session, "feed_dtmf", None)
+                        if feed_dtmf is not None:
+                            await feed_dtmf(event.digit)
                 elif isinstance(event, HangupEvent):
                     validate_event_context(event, context)
                     close_outcome = (1000, "call ended")
@@ -290,7 +310,10 @@ class SmartPBXGateway:
                     completed_normally = True
                     break
                 elif isinstance(event, UnsupportedEvent):
-                    raise ProtocolViolation(POLICY_VIOLATION, "unsupported event", "unsupported_event")
+                    # Keep the session alive for this in-band protocol drift.
+                    # DTMF, media, and hangup are the operationally required
+                    # control path; unknown event kinds are observability-only.
+                    sink(DiagnosticStage.CONTEXT_VALIDATION, DiagnosticOutcome.OBSERVED, DiagnosticFailureClass.UNSUPPORTED_EVENT)
                 elif isinstance(event, ConnectedEvent):
                     raise ProtocolViolation(POLICY_VIOLATION, "connected after start", "connected_after_start")
         except asyncio.TimeoutError:

@@ -204,6 +204,12 @@ async def transfer_call(self, destination_key: str, call_id: str) -> TransferRes
     })
 ```
 
+> **CORRECTED 2026-08-11:** `destination_number` is not the real argument name and this sketch
+> never transferred a call. Dialog's live `transfer_call` schema is `{"number": <string>}`
+> (required), taking the bare dialable number with the `tel:` scheme stripped. See
+> `Kavya/smartpbx_mcp.py::_wire_destination` and the live-observed contract block in
+> `Kavya/tests/test_smartpbx_mcp.py`.
+
 Use one explicit configured account header, MCP HTTPS timeouts, one retry only for retryable transport/server failures, response bounds, and no secret/PII logging. Add `mcp>=1.28,<2` and regenerate the lock using the repository's Python 3.11 resolver.
 
 - [ ] **Step 4: Wire the logical Kavya handover tool only in SmartPBX sessions**
