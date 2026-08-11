@@ -799,6 +799,14 @@ GEMINI_THINKING_BUDGET: int = _parse_clamped_int(
 )
 GEMINI_THINKING_LEVEL: str = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
 
+# Runtime failover from Gemini to Claude when a Gemini call fails.
+GEMINI_FAILOVER_TO_CLAUDE: bool = os.getenv(
+    "GEMINI_FAILOVER_TO_CLAUDE", "true"
+).lower() == "true"
+GEMINI_FAILOVER_STICKY_AFTER: int = _parse_clamped_int(
+    os.environ, "GEMINI_FAILOVER_STICKY_AFTER", 2, 1, 10
+)
+
 # Appended to the system instruction (never spoken, never in history) for the
 # ONE retry a fully empty Gemini turn is allowed.
 GEMINI_EMPTY_RETRY_NUDGE: str = (
@@ -2109,6 +2117,114 @@ def _log_gemini_empty(
         "retrying=%s call=%s",
         path, attempt, finish_reason, str(retrying).lower(), call_sid or "-",
     )
+
+
+def _extract_gemini_exception_code(exc: Any) -> Any:
+    """Read a status-like error code from a Gemini exception using duck-typing."""
+
+    candidates: list[Any] = [
+        getattr(exc, "status", None),
+        getattr(exc, "status_code", None),
+        getattr(exc, "code", None),
+    ]
+
+    nested_error = getattr(exc, "error", None)
+    if nested_error is not None:
+        if isinstance(nested_error, dict):
+            candidates.extend([
+                nested_error.get("status"),
+                nested_error.get("status_code"),
+                nested_error.get("code"),
+            ])
+        else:
+            candidates.extend([
+                getattr(nested_error, "status", None),
+                getattr(nested_error, "status_code", None),
+                getattr(nested_error, "code", None),
+            ])
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+
+        if isinstance(candidate, int):
+            return candidate
+
+        if isinstance(candidate, str):
+            stripped = candidate.strip()
+            if stripped:
+                return stripped
+
+        if isinstance(candidate, bool):
+            continue
+
+        candidate_value = getattr(candidate, "value", None)
+        if isinstance(candidate_value, int):
+            return candidate_value
+        if isinstance(candidate_value, str) and candidate_value.strip():
+            return candidate_value.strip()
+
+        candidate_name = getattr(candidate, "name", None)
+        if isinstance(candidate_name, str) and candidate_name.strip():
+            return candidate_name.strip()
+
+    return None
+
+
+def _classify_gemini_exception(exc: Exception) -> str:
+    """Map a Gemini exception to one of ``quota``, ``server``, ``client_error``."""
+
+    raw_code = _extract_gemini_exception_code(exc)
+    if raw_code is None:
+        message = str(exc).upper()
+        if "RESOURCE_EXHAUSTED" in message or "429" in message:
+            return "quota"
+        return "client_error"
+
+    if isinstance(raw_code, int):
+        if raw_code == 429:
+            return "quota"
+        if 500 <= raw_code <= 599:
+            return "server"
+        return "client_error"
+
+    code = str(raw_code).strip().upper()
+    if code in {"429", "RESOURCE_EXHAUSTED"}:
+        return "quota"
+    if code.startswith("5") and len(code) == 3 and code.isdigit():
+        return "server"
+    return "client_error"
+
+
+def _init_gemini_failover_state() -> dict[str, Any]:
+    return {
+        "consecutive_failovers": 0,
+        "degraded": False,
+        "degraded_logged": False,
+    }
+
+
+def _note_gemini_failover(state: dict[str, Any]) -> str:
+    """Record one failover and return updated state."""
+
+    state["consecutive_failovers"] = state.get("consecutive_failovers", 0) + 1
+    consecutive = state["consecutive_failovers"]
+
+    if state.get("degraded", False):
+        return "degraded"
+
+    if consecutive >= GEMINI_FAILOVER_STICKY_AFTER:
+        state["degraded"] = True
+        if not state.get("degraded_logged", False):
+            logger.info("smartpbx_media event=llm_provider_degraded")
+            state["degraded_logged"] = True
+        return "degraded"
+
+    return "tracking"
+
+
+def _note_gemini_success(state: dict[str, Any]) -> None:
+    state["consecutive_failovers"] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -3431,6 +3547,8 @@ class MediaStreamSession:
         self._delivered_sentences: list[str] = []
         self._track_assistant_turn_delivery: bool = False
         self._assistant_turn_speech_end_at: float = 0.0
+        # Gemini failover state is per MediaStreamSession.
+        self._gemini_failover_state: dict[str, Any] = _init_gemini_failover_state()
 
         self._pending_transcript = ""
         # Text from provider finals in the current utterance. Interims of a later
@@ -4525,245 +4643,299 @@ class MediaStreamSession:
         """Gemini-native streaming version of _run_llm for Media Streams.
 
         Sentence-level: every completed sentence is handed to TTS as it arrives,
-        through the same ``_extract_sentences`` → ``_invoke_speak`` pipeline (and
+        through the same ``_extract_sentences``  ``_invoke_speak`` pipeline (and
         therefore the same generation fence and delivered-sentence tracking) the
-        Claude path uses. Lang-agnostic — the Sinhala/Tamil/Arabic Media Streams
+        Claude path uses. Lang-agnostic the Sinhala/Tamil/Arabic Media Streams
         calls and the direct SmartPBX English calls all run through here.
         """
-        full_text = ""
-        fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
-        smartpbx_filler_sent = False
-        # One empty-response retry per guest turn, not per tool round.
-        empty_retry_used = False
+        if self._gemini_failover_state.get("degraded") and ANTHROPIC_API_KEY:
+            logger.info(
+                "smartpbx_media event=llm_provider_failover from=gemini to=claude reason=sticky"
+            )
+            return await self._run_llm_claude()
 
-        for round_idx in range(MAX_TOOL_ROUNDS):
-            if self._is_smartpbx_session():
-                logger.info("smartpbx_media event=llm_round provider=gemini round=%d", round_idx + 1)
-            else:
-                logger.info("Gemini round %d [%s]", round_idx + 1, self.call_sid)
+        async def _run_gemini_turn() -> str:
+            full_text = ""
+            fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
+            smartpbx_filler_sent = False
+            # One empty-response retry per guest turn, not per tool round.
+            empty_retry_used = False
 
-            text_content = ""
-            function_calls: list[dict] = []
-            sentence_buffer = ""
-            tts_tasks: list[asyncio.Task] = []
-            has_tool_use = False
-            finish_reason = None
-            gen = self._speak_generation
-            nudge: str | None = None
+            for round_idx in range(MAX_TOOL_ROUNDS):
+                if self._is_smartpbx_session():
+                    logger.info("smartpbx_media event=llm_round provider=gemini round=%d", round_idx + 1)
+                else:
+                    logger.info("Gemini round %d [%s]", round_idx + 1, self.call_sid)
 
-            # Attempt 0 is the real turn. Attempt 1 only happens when attempt 0
-            # streamed absolutely nothing (no text, no tool call, or a blocked
-            # response) and this turn has not already spent its one retry.
-            for attempt in range(2):
                 text_content = ""
-                function_calls = []
+                function_calls: list[dict] = []
                 sentence_buffer = ""
+                tts_tasks: list[asyncio.Task] = []
                 has_tool_use = False
                 finish_reason = None
+                gen = self._speak_generation
+                nudge: str | None = None
 
-                response = await _open_gemini_stream(
-                    self.gemini_client,
-                    model=self.model,
-                    contents=_history_to_gemini(self.history),
-                    config=_build_gemini_config(
-                        system=self._active_system_prompt(),
-                        tools=self.tools,
+                # Attempt 0 is the real turn. Attempt 1 only happens when attempt 0
+                # streamed absolutely nothing (no text, no tool call, or a blocked
+                # response) and this turn has not already spent its one retry.
+                for attempt in range(2):
+                    text_content = ""
+                    function_calls = []
+                    sentence_buffer = ""
+                    has_tool_use = False
+                    finish_reason = None
+
+                    response = await _open_gemini_stream(
+                        self.gemini_client,
                         model=self.model,
-                        nudge=nudge,
-                    ),
-                )
-
-                async for kind, payload in _iter_gemini_stream(response):
-                    if kind == "finish":
-                        finish_reason = payload
-                        continue
-                    if kind == "tool":
-                        has_tool_use = True
-                        function_calls.append(payload)
-                        continue
-
-                    text_content += payload
-                    # Once a function call has appeared the remaining text is a
-                    # pre-tool aside, and a barge-in means the caller is talking
-                    # over her right now — in both cases stop scheduling speech,
-                    # but keep draining so history records the full turn.
-                    if has_tool_use or self._speak_generation != gen:
-                        continue
-                    sentence_buffer += payload
-                    sentences, sentence_buffer = _extract_sentences(sentence_buffer)
-                    if not sentences:
-                        continue
-                    for s in sentences:
-                        tts_tasks.append(
-                            asyncio.create_task(
-                                self._invoke_speak(s, generation=gen, sentence=s)
-                            )
-                        )
-                    # Hand control to those tasks NOW. Without this the first TTS
-                    # request only started once the stream had been fully drained
-                    # (create_task alone schedules nothing until this coroutine
-                    # suspends), which is why this path used to emit a single TTS
-                    # call after llm_round_complete instead of speaking sentence
-                    # by sentence.
-                    await asyncio.sleep(0)
-
-                if text_content.strip() or function_calls:
-                    break
-
-                retrying = attempt == 0 and not empty_retry_used
-                _log_gemini_empty(
-                    path="media_stream",
-                    attempt=attempt + 1,
-                    finish_reason=finish_reason,
-                    retrying=retrying,
-                    call_sid=self.call_sid,
-                )
-                if self._is_smartpbx_session():
-                    logger.warning(
-                        "smartpbx_media event=llm_empty_response provider=gemini "
-                        "attempt=%d retrying=%s",
-                        attempt + 1, str(retrying).lower(),
+                        contents=_history_to_gemini(self.history),
+                        config=_build_gemini_config(
+                            system=self._active_system_prompt(),
+                            tools=self.tools,
+                            model=self.model,
+                            nudge=nudge,
+                        ),
                     )
-                if not retrying:
-                    break
-                empty_retry_used = True
-                nudge = GEMINI_EMPTY_RETRY_NUDGE
 
-            if self._is_smartpbx_session():
-                logger.info("smartpbx_media event=llm_round_complete provider=gemini tools=%d", len(function_calls))
-            else:
-                logger.info("Gemini round %d [%s] — text=%d chars, tools=%d, finish=%s", round_idx + 1, self.call_sid, len(text_content), len(function_calls), finish_reason)
+                    async for kind, payload in _iter_gemini_stream(response):
+                        if kind == "finish":
+                            finish_reason = payload
+                            continue
+                        if kind == "tool":
+                            has_tool_use = True
+                            function_calls.append(payload)
+                            continue
 
-            if self._is_direct_smartpbx_english():
-                full_text = _join_turn(full_text, text_content)
-            else:
-                full_text += text_content
+                        text_content += payload
+                        # Once a function call has appeared the remaining text is a
+                        # pre-tool aside, and a barge-in means the caller is talking
+                        # over her right now in both cases stop scheduling speech,
+                        # but keep draining so history records the full turn.
+                        if has_tool_use or self._speak_generation != gen:
+                            continue
+                        sentence_buffer += payload
+                        sentences, sentence_buffer = _extract_sentences(sentence_buffer)
+                        if not sentences:
+                            continue
+                        for s in sentences:
+                            tts_tasks.append(
+                                asyncio.create_task(
+                                    self._invoke_speak(s, generation=gen, sentence=s)
+                                )
+                            )
+                        # Hand control to those tasks NOW. Without this the first TTS
+                        # request only started once the stream had been fully drained
+                        # (create_task alone schedules nothing until this coroutine
+                        # suspends), which is why this path used to emit a single TTS
+                        # call after llm_round_complete instead of speaking sentence
+                        # by sentence.
+                        await asyncio.sleep(0)
 
-            # Still nothing after the retry: say something recoverable rather
-            # than leaving the caller listening to silence.
-            if not text_content.strip() and not function_calls:
-                fallback = LLM_EMPTY_FALLBACKS.get(
-                    self.lang, LLM_EMPTY_FALLBACKS["en"]
-                )
-                logger.warning(
-                    "gemini_diagnostic event=empty_response_fallback path=media_stream "
-                    "call=%s lang=%s", self.call_sid or "-", self.lang,
-                )
-                await self._invoke_speak(fallback, generation=gen, sentence=fallback)
-                self._append_assistant_history(
-                    {"role": "assistant", "content": fallback}
-                )
-                if self._is_direct_smartpbx_english():
-                    return _join_turn(full_text, fallback)
-                return full_text + fallback
+                    if text_content.strip() or function_calls:
+                        break
 
-            if function_calls:
+                    retrying = attempt == 0 and not empty_retry_used
+                    _log_gemini_empty(
+                        path="media_stream",
+                        attempt=attempt + 1,
+                        finish_reason=finish_reason,
+                        retrying=retrying,
+                        call_sid=self.call_sid,
+                    )
+                    if self._is_smartpbx_session():
+                        logger.warning(
+                            "smartpbx_media event=llm_empty_response provider=gemini "
+                            "attempt=%d retrying=%s",
+                            attempt + 1, str(retrying).lower(),
+                        )
+                    if not retrying:
+                        break
+                    empty_retry_used = True
+                    nudge = GEMINI_EMPTY_RETRY_NUDGE
+
                 if self._is_smartpbx_session():
-                    logger.info("smartpbx_media event=tool_batch count=%d", len(function_calls))
+                    logger.info("smartpbx_media event=llm_round_complete provider=gemini tools=%d", len(function_calls))
                 else:
-                    logger.info("Tools [%s]: %s", self.call_sid, [fc["name"] for fc in function_calls])
+                    logger.info("Gemini round %d [%s] text=%d chars, tools=%d, finish=%s", round_idx + 1, self.call_sid, len(text_content), len(function_calls), finish_reason)
+
+                if self._is_direct_smartpbx_english():
+                    full_text = _join_turn(full_text, text_content)
+                else:
+                    full_text += text_content
+
+                # Still nothing after the retry: say something recoverable rather
+                # than leaving the caller listening to silence.
+                if not text_content.strip() and not function_calls:
+                    fallback = LLM_EMPTY_FALLBACKS.get(
+                        self.lang, LLM_EMPTY_FALLBACKS["en"]
+                    )
+                    logger.warning(
+                        "gemini_diagnostic event=empty_response_fallback path=media_stream "
+                        "call=%s lang=%s", self.call_sid or "-", self.lang,
+                    )
+                    await self._invoke_speak(fallback, generation=gen, sentence=fallback)
+                    self._append_assistant_history({
+                        "role": "assistant",
+                        "content": fallback
+                    })
+                    if self._is_direct_smartpbx_english():
+                        return _join_turn(full_text, fallback)
+                    return full_text + fallback
+
+                if function_calls:
+                    if self._is_smartpbx_session():
+                        logger.info("smartpbx_media event=tool_batch count=%d", len(function_calls))
+                    else:
+                        logger.info("Tools [%s]: %s", self.call_sid, [fc["name"] for fc in function_calls])
+                    if tts_tasks:
+                        await asyncio.gather(*tts_tasks)
+
+                    first_tool = function_calls[0]["name"]
+                    if self._is_direct_smartpbx_english():
+                        preamble = sentence_buffer.strip()
+                        if preamble and not tts_tasks:
+                            await self._invoke_speak(preamble, generation=gen, sentence=preamble)
+                        elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
+                            filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
+                            await self._invoke_speak(filler, generation=gen, sentence=filler)
+                            smartpbx_filler_sent = True
+                    else:
+                        filler = fillers.get(first_tool, fillers.get("_default", ""))
+                        if filler:
+                            await self._invoke_speak(filler, generation=gen, sentence=filler)
+
+                    # Build assistant message in OpenAI format
+                    tool_calls_openai = []
+                    for i, fc in enumerate(function_calls):
+                        tc_id = f"gemini_tc_{round_idx}_{i}"
+                        entry: dict[str, Any] = {
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {
+                                "name": fc["name"],
+                                "arguments": json.dumps(fc["args"]),
+                            },
+                        }
+                        if fc.get("thought_signature"):
+                            entry["gemini_thought_signature"] = fc["thought_signature"]
+                        tool_calls_openai.append(entry)
+
+                    assistant_msg: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": self._assistant_turn_text_for_history(text_content) if text_content else None,
+                        "tool_calls": tool_calls_openai,
+                    }
+                    self._append_assistant_history(assistant_msg)
+
+                    for tc in tool_calls_openai:
+                        parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+                        self._log_tool_execution(tc["function"]["name"], parsed_input)
+                        try:
+                            if tc["function"]["name"] == "collect_number_via_keypad":
+                                result_str = await self._collect_number_via_keypad(parsed_input)
+                            else:
+                                result_str = await execute_tool(tc["function"]["name"], parsed_input)
+                        except Exception as exc:
+                            self._log_tool_failure(tc["function"]["name"])
+                            if self._is_direct_smartpbx_english():
+                                tc["function"]["arguments"] = "{}"
+                                result_str = json.dumps({"error": "tool_execution_failed"})
+                            else:
+                                result_str = json.dumps({"error": str(exc)})
+                        try:
+                            parsed_result = json.loads(result_str)
+                        except (json.JSONDecodeError, TypeError):
+                            parsed_result = None
+                        if isinstance(parsed_result, dict):
+                            self._record_capture_tool_completion(
+                                tc["function"]["name"], parsed_result
+                            )
+                        _append_booking_confirmation_marker(
+                            self.full_transcript,
+                            tc["function"]["name"],
+                            parsed_input,
+                            result_str,
+                        )
+                        self.history.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result_str,
+                        })
+                        self._log_tool_result(tc["function"]["name"], result_str)
+                        if self.transfer_pending:
+                            return full_text
+
+                    continue
+
+                remaining = sentence_buffer.strip()
+                if remaining:
+                    tts_tasks.append(
+                        asyncio.create_task(
+                            self._invoke_speak(remaining, generation=gen, sentence=remaining)
+                        )
+                    )
                 if tts_tasks:
                     await asyncio.gather(*tts_tasks)
 
-                first_tool = function_calls[0]["name"]
-                if self._is_direct_smartpbx_english():
-                    preamble = sentence_buffer.strip()
-                    if preamble and not tts_tasks:
-                        await self._invoke_speak(preamble, generation=gen, sentence=preamble)
-                    elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
-                        filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
-                        await self._invoke_speak(filler, generation=gen, sentence=filler)
-                        smartpbx_filler_sent = True
-                else:
-                    filler = fillers.get(first_tool, fillers.get("_default", ""))
-                    if filler:
-                        await self._invoke_speak(filler, generation=gen, sentence=filler)
-
-                # Build assistant message in OpenAI format
-                tool_calls_openai = []
-                for i, fc in enumerate(function_calls):
-                    tc_id = f"gemini_tc_{round_idx}_{i}"
-                    entry: dict[str, Any] = {
-                        "id": tc_id,
-                        "type": "function",
-                        "function": {
-                            "name": fc["name"],
-                            "arguments": json.dumps(fc["args"]),
-                        },
-                    }
-                    if fc.get("thought_signature"):
-                        entry["gemini_thought_signature"] = fc["thought_signature"]
-                    tool_calls_openai.append(entry)
-
-                assistant_msg: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": self._assistant_turn_text_for_history(text_content) if text_content else None,
-                    "tool_calls": tool_calls_openai,
-                }
-                self._append_assistant_history(assistant_msg)
-
-                for tc in tool_calls_openai:
-                    parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
-                    self._log_tool_execution(tc["function"]["name"], parsed_input)
-                    try:
-                        if tc["function"]["name"] == "collect_number_via_keypad":
-                            result_str = await self._collect_number_via_keypad(parsed_input)
-                        else:
-                            result_str = await execute_tool(tc["function"]["name"], parsed_input)
-                    except Exception as exc:
-                        self._log_tool_failure(tc["function"]["name"])
-                        if self._is_direct_smartpbx_english():
-                            tc["function"]["arguments"] = "{}"
-                            result_str = json.dumps({"error": "tool_execution_failed"})
-                        else:
-                            result_str = json.dumps({"error": str(exc)})
-                    try:
-                        parsed_result = json.loads(result_str)
-                    except (json.JSONDecodeError, TypeError):
-                        parsed_result = None
-                    if isinstance(parsed_result, dict):
-                        self._record_capture_tool_completion(
-                            tc["function"]["name"], parsed_result
-                        )
-                    _append_booking_confirmation_marker(
-                        self.full_transcript,
-                        tc["function"]["name"],
-                        parsed_input,
-                        result_str,
-                    )
-                    self.history.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": result_str,
+                if text_content:
+                    self._append_assistant_history({
+                        "role": "assistant",
+                        "content": self._assistant_turn_text_for_history(text_content),
                     })
-                    self._log_tool_result(tc["function"]["name"], result_str)
-                    if self.transfer_pending:
-                        return full_text
+                return full_text
 
-                continue
-
-            remaining = sentence_buffer.strip()
-            if remaining:
-                tts_tasks.append(
-                    asyncio.create_task(
-                        self._invoke_speak(remaining, generation=gen, sentence=remaining)
-                    )
-                )
-            if tts_tasks:
-                await asyncio.gather(*tts_tasks)
-
-            if text_content:
-                self._append_assistant_history({
-                    "role": "assistant",
-                    "content": self._assistant_turn_text_for_history(text_content),
-                })
+            if self._is_smartpbx_session():
+                logger.warning("smartpbx_media event=tool_round_limit provider=gemini")
+            else:
+                logger.warning("Exhausted %d tool rounds (Gemini) [%s]", MAX_TOOL_ROUNDS, self.call_sid)
             return full_text
 
-        if self._is_smartpbx_session():
-            logger.warning("smartpbx_media event=tool_round_limit provider=gemini")
-        else:
-            logger.warning("Exhausted %d tool rounds (Gemini) [%s]", MAX_TOOL_ROUNDS, self.call_sid)
-        return full_text
+        gemini_history_len = len(self.history)
+        try:
+            response_text = await _run_gemini_turn()
+            _note_gemini_success(self._gemini_failover_state)
+            return response_text
+        except Exception as exc:
+            if len(self.history) > gemini_history_len:
+                self.history = self.history[:gemini_history_len]
+
+            if not GEMINI_FAILOVER_TO_CLAUDE:
+                raise
+
+            # A configured client is sufficient; the key only gates building one.
+            if self.anthropic_client is None:
+                if not ANTHROPIC_API_KEY:
+                    raise
+                try:
+                    self.anthropic_client = _get_anthropic_client()
+                except RuntimeError:
+                    raise
+
+            if self.anthropic_client is None:
+                raise
+
+            reason = _classify_gemini_exception(exc)
+            logger.warning(
+                "smartpbx_media event=llm_provider_failover from=gemini to=claude reason=%s",
+                reason,
+            )
+
+            previous_model = self.model
+            previous_tools = self.tools
+            previous_provider = self.llm_provider
+            self.model = CLAUDE_MODEL
+            self.tools = get_tools() if previous_provider == "gemini" else self.tools
+            self.llm_provider = "claude"
+
+            try:
+                _note_gemini_failover(self._gemini_failover_state)
+                return await self._run_llm_claude()
+            finally:
+                self.model = previous_model
+                self.tools = previous_tools
+                self.llm_provider = previous_provider
+
 
     # â”€â”€ Claude native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
 
@@ -5439,6 +5611,7 @@ async def _run_llm_streaming_gemini(
     lang: str = "en",
     generation_ref: list[int] | None = None,
     transcript_sink: list[dict[str, str]] | None = None,
+    failover_state: dict[str, Any] | None = None,
 ) -> str:
     """Stream a Gemini response via the native SDK, handling tool use.
 
@@ -5451,230 +5624,288 @@ async def _run_llm_streaming_gemini(
     covers a stalled first token, and a turn that streams nothing at all is
     retried once before falling back to a spoken apology rather than silence.
     """
-    full_response_text = ""
-    filler_sent = False
-    ws_closed = False
-    empty_retry_used = False
-    generation = generation_ref[0] if generation_ref else None
+    if failover_state is None:
+        failover_state = _init_gemini_failover_state()
 
-    def _is_stale_generation() -> bool:
-        return (
-            generation_ref is not None
-            and generation is not None
-            and generation != generation_ref[0]
+    if failover_state.get("degraded") and ANTHROPIC_API_KEY:
+        logger.info("smartpbx_media event=llm_provider_failover from=gemini to=claude reason=sticky")
+        return await _run_llm_streaming_claude(
+            client=_get_anthropic_client(),
+            system=system,
+            conversation_history=conversation_history,
+            tools=tools,
+            websocket=websocket,
+            lang=lang,
+            generation_ref=generation_ref,
+            transcript_sink=transcript_sink,
+            model=CLAUDE_MODEL,
         )
 
-    async def _safe_send(payload: dict) -> None:
-        nonlocal ws_closed
-        if _is_stale_generation():
-            return
-        if ws_closed:
-            return
-        try:
-            await websocket.send_text(json.dumps(payload))
-        except (WebSocketDisconnect, RuntimeError) as exc:
-            ws_closed = True
-            logger.warning(
-                "WebSocket closed mid-stream (%s) — draining Gemini silently",
-                type(exc).__name__,
+    conversation_history_len = len(conversation_history)
+
+    async def _run_gemini_stream() -> str:
+        full_response_text = ""
+        filler_sent = False
+        ws_closed = False
+        empty_retry_used = False
+        generation = generation_ref[0] if generation_ref else None
+
+        def _is_stale_generation() -> bool:
+            return (
+                generation_ref is not None
+                and generation is not None
+                and generation != generation_ref[0]
             )
 
-    for round_idx in range(MAX_TOOL_ROUNDS):
-        logger.info("Gemini streaming round %d", round_idx + 1)
-
-        text_content = ""
-        function_calls: list[dict] = []  # [{name, args, thought_signature}, ...]
-        finish_reason = None
-        nudge: str | None = None
-
-        # Attempt 0 is the real turn; attempt 1 only runs when attempt 0 streamed
-        # nothing at all and this turn has not already spent its one retry.
-        for attempt in range(2):
-            text_content = ""
-            function_calls = []
-            finish_reason = None
-
-            # Cover a stalled first token (thinking, a 429 retry inside the SDK,
-            # a slow tool-heavy prompt) the same way the Claude path does.
-            slow_task: asyncio.Task | None = None
-            if not ws_closed:
-                slow_task = asyncio.create_task(_slow_response_filler(websocket, lang))
-
-            def _cancel_slow(task: asyncio.Task | None = slow_task) -> None:
-                if task and not task.done():
-                    task.cancel()
-
+        async def _safe_send(payload: dict) -> None:
+            nonlocal ws_closed
+            if _is_stale_generation():
+                return
+            if ws_closed:
+                return
             try:
-                response = await _open_gemini_stream(
-                    gemini_client,
-                    model=MODEL,
-                    contents=_history_to_gemini(conversation_history),
-                    config=_build_gemini_config(
-                        system=system, tools=tools, model=MODEL, nudge=nudge
-                    ),
+                await websocket.send_text(json.dumps(payload))
+            except (WebSocketDisconnect, RuntimeError) as exc:
+                ws_closed = True
+                logger.warning(
+                    "WebSocket closed mid-stream (%s) — draining Gemini silently",
+                    type(exc).__name__,
                 )
 
-                async for kind, payload in _iter_gemini_stream(response):
-                    if kind == "finish":
-                        finish_reason = payload
-                        continue
-                    if kind == "tool":
+        for round_idx in range(MAX_TOOL_ROUNDS):
+            logger.info("Gemini streaming round %d", round_idx + 1)
+
+            text_content = ""
+            function_calls: list[dict] = []  # [{name, args, thought_signature}, ...]
+            finish_reason = None
+            nudge: str | None = None
+
+            # Attempt 0 is the real turn; attempt 1 only runs when attempt 0 streamed
+            # nothing at all and this turn has not already spent its one retry.
+            for attempt in range(2):
+                text_content = ""
+                function_calls = []
+                finish_reason = None
+
+                # Cover a stalled first token (thinking, a 429 retry inside the SDK,
+                # a slow tool-heavy prompt) the same way the Claude path does.
+                slow_task: asyncio.Task | None = None
+                if not ws_closed:
+                    slow_task = asyncio.create_task(_slow_response_filler(websocket, lang))
+
+                def _cancel_slow(task: asyncio.Task | None = slow_task) -> None:
+                    if task and not task.done():
+                        task.cancel()
+
+                try:
+                    response = await _open_gemini_stream(
+                        gemini_client,
+                        model=MODEL,
+                        contents=_history_to_gemini(conversation_history),
+                        config=_build_gemini_config(
+                            system=system, tools=tools, model=MODEL, nudge=nudge
+                        ),
+                    )
+
+                    async for kind, payload in _iter_gemini_stream(response):
+                        if kind == "finish":
+                            finish_reason = payload
+                            continue
+                        if kind == "tool":
+                            _cancel_slow()
+                            function_calls.append(payload)
+                            continue
                         _cancel_slow()
-                        function_calls.append(payload)
-                        continue
+                        text_content += payload
+                        await _safe_send({"type": "text", "token": payload})
+                finally:
                     _cancel_slow()
-                    text_content += payload
-                    await _safe_send({"type": "text", "token": payload})
-            finally:
-                _cancel_slow()
 
-            if text_content.strip() or function_calls:
-                break
+                if text_content.strip() or function_calls:
+                    break
 
-            retrying = attempt == 0 and not empty_retry_used
-            _log_gemini_empty(
-                path="conversation_relay",
-                attempt=attempt + 1,
-                finish_reason=finish_reason,
-                retrying=retrying,
+                retrying = attempt == 0 and not empty_retry_used
+                _log_gemini_empty(
+                    path="conversation_relay",
+                    attempt=attempt + 1,
+                    finish_reason=finish_reason,
+                    retrying=retrying,
+                )
+                if not retrying:
+                    break
+                empty_retry_used = True
+                nudge = GEMINI_EMPTY_RETRY_NUDGE
+
+            logger.info(
+                "Gemini round %d done — text=%d chars, tools=%d, finish=%s",
+                round_idx + 1, len(text_content), len(function_calls), finish_reason,
             )
-            if not retrying:
-                break
-            empty_retry_used = True
-            nudge = GEMINI_EMPTY_RETRY_NUDGE
 
-        logger.info(
-            "Gemini round %d done — text=%d chars, tools=%d, finish=%s",
-            round_idx + 1, len(text_content), len(function_calls), finish_reason,
-        )
+            full_response_text = _join_turn(full_response_text, text_content)
 
-        full_response_text = _join_turn(full_response_text, text_content)
+            # Nothing survived the retry — speak a recoverable line. Twilio only
+            # renders what it is sent, so without this the caller gets dead air and
+            # concludes the line is broken.
+            if not text_content.strip() and not function_calls:
+                fallback = LLM_EMPTY_FALLBACKS.get(lang, LLM_EMPTY_FALLBACKS["en"])
+                logger.warning(
+                    "gemini_diagnostic event=empty_response_fallback "
+                    "path=conversation_relay lang=%s", lang,
+                )
+                await _safe_send({"type": "text", "token": fallback, "last": True})
+                conversation_history.append({"role": "assistant", "content": fallback})
+                full_response_text = _join_turn(full_response_text, fallback)
+                if ws_closed:
+                    raise WebSocketDisconnect()
+                return full_response_text
 
-        # Nothing survived the retry — speak a recoverable line. Twilio only
-        # renders what it is sent, so without this the caller gets dead air and
-        # concludes the line is broken.
-        if not text_content.strip() and not function_calls:
-            fallback = LLM_EMPTY_FALLBACKS.get(lang, LLM_EMPTY_FALLBACKS["en"])
-            logger.warning(
-                "gemini_diagnostic event=empty_response_fallback "
-                "path=conversation_relay lang=%s", lang,
+            if function_calls:
+                logger.info(
+                    "Gemini requested %d tool(s): %s",
+                    len(function_calls),
+                    [fc["name"] for fc in function_calls],
+                )
+
+                # Only play the canned filler when Gemini produced NO pre-tool text
+                # of its own — a second canned line would duplicate its own
+                # announcement back to back. Capture tools are instant and local, so
+                # they get no filler at all; the tools still run either way.
+                if not filler_sent and not text_content.strip():
+                    first_tool_name = function_calls[0]["name"]
+                    if first_tool_name in _CONVERSATION_CLAUDE_CAPTURE_TOOLS:
+                        filler = ""
+                    elif first_tool_name in TOOL_FILLER_VARIANTS:
+                        filler = _next_tool_filler(first_tool_name)
+                    else:
+                        filler = TOOL_FILLERS.get(first_tool_name, DEFAULT_FILLER)
+                    if filler:
+                        await _safe_send({"type": "text", "token": filler, "last": True})
+                        logger.info("Sent filler: '%s'", filler)
+                        filler_sent = True
+
+                # Build assistant message in OpenAI format (for history storage)
+                tool_calls_openai = []
+                for i, fc in enumerate(function_calls):
+                    tc_id = f"gemini_tc_{round_idx}_{i}"
+                    entry: dict[str, Any] = {
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": fc["name"],
+                            "arguments": json.dumps(fc["args"]),
+                        },
+                    }
+                    if fc.get("thought_signature"):
+                        entry["gemini_thought_signature"] = fc["thought_signature"]
+                    tool_calls_openai.append(entry)
+
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": text_content or None,
+                    "tool_calls": tool_calls_openai,
+                }
+                conversation_history.append(assistant_msg)
+
+                # Execute tools and add results (OpenAI format)
+                for tc in tool_calls_openai:
+                    try:
+                        parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+                    except json.JSONDecodeError:
+                        logger.error(
+                            "Bad tool JSON for %s: %s",
+                            tc["function"]["name"], tc["function"]["arguments"][:200],
+                        )
+                        parsed_input = {}
+                    logger.info("Executing tool '%s' with input: %s", tc["function"]["name"], parsed_input)
+                    try:
+                        result_str = await execute_tool(tc["function"]["name"], parsed_input)
+                    except Exception as exc:
+                        logger.exception("Tool execution failed for '%s'", tc["function"]["name"])
+                        result_str = json.dumps({"error": f"Tool execution failed: {exc}"})
+
+                    conversation_history.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result_str,
+                    })
+                    _append_booking_confirmation_marker(
+                        transcript_sink or [],
+                        tc["function"]["name"],
+                        parsed_input,
+                        result_str,
+                    )
+                    logger.info("Tool '%s' result: %s", tc["function"]["name"], result_str[:200])
+
+                text_content = ""
+                continue
+
+            # No tool calls — done
+            await _safe_send({"type": "text", "token": "", "last": True})
+
+            if text_content:
+                conversation_history.append({
+                    "role": "assistant",
+                    "content": text_content,
+                })
+
+            logger.info(
+                "Gemini response complete (%d chars)%s",
+                len(full_response_text),
+                " [WS closed]" if ws_closed else "",
             )
-            await _safe_send({"type": "text", "token": fallback, "last": True})
-            conversation_history.append({"role": "assistant", "content": fallback})
-            full_response_text = _join_turn(full_response_text, fallback)
             if ws_closed:
                 raise WebSocketDisconnect()
             return full_response_text
 
-        if function_calls:
-            logger.info(
-                "Gemini requested %d tool(s): %s",
-                len(function_calls),
-                [fc["name"] for fc in function_calls],
-            )
-
-            # Only play the canned filler when Gemini produced NO pre-tool text
-            # of its own — a second canned line would duplicate its own
-            # announcement back to back. Capture tools are instant and local, so
-            # they get no filler at all; the tools still run either way.
-            if not filler_sent and not text_content.strip():
-                first_tool_name = function_calls[0]["name"]
-                if first_tool_name in _CONVERSATION_CLAUDE_CAPTURE_TOOLS:
-                    filler = ""
-                elif first_tool_name in TOOL_FILLER_VARIANTS:
-                    filler = _next_tool_filler(first_tool_name)
-                else:
-                    filler = TOOL_FILLERS.get(first_tool_name, DEFAULT_FILLER)
-                if filler:
-                    await _safe_send({"type": "text", "token": filler, "last": True})
-                    logger.info("Sent filler: '%s'", filler)
-                    filler_sent = True
-
-            # Build assistant message in OpenAI format (for history storage)
-            tool_calls_openai = []
-            for i, fc in enumerate(function_calls):
-                tc_id = f"gemini_tc_{round_idx}_{i}"
-                entry: dict[str, Any] = {
-                    "id": tc_id,
-                    "type": "function",
-                    "function": {
-                        "name": fc["name"],
-                        "arguments": json.dumps(fc["args"]),
-                    },
-                }
-                if fc.get("thought_signature"):
-                    entry["gemini_thought_signature"] = fc["thought_signature"]
-                tool_calls_openai.append(entry)
-
-            assistant_msg: dict[str, Any] = {
-                "role": "assistant",
-                "content": text_content or None,
-                "tool_calls": tool_calls_openai,
-            }
-            conversation_history.append(assistant_msg)
-
-            # Execute tools and add results (OpenAI format)
-            for tc in tool_calls_openai:
-                try:
-                    parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
-                except json.JSONDecodeError:
-                    logger.error(
-                        "Bad tool JSON for %s: %s",
-                        tc["function"]["name"], tc["function"]["arguments"][:200],
-                    )
-                    parsed_input = {}
-                logger.info("Executing tool '%s' with input: %s", tc["function"]["name"], parsed_input)
-                try:
-                    result_str = await execute_tool(tc["function"]["name"], parsed_input)
-                except Exception as exc:
-                    logger.exception("Tool execution failed for '%s'", tc["function"]["name"])
-                    result_str = json.dumps({"error": f"Tool execution failed: {exc}"})
-
-                conversation_history.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result_str,
-                })
-                _append_booking_confirmation_marker(
-                    transcript_sink or [],
-                    tc["function"]["name"],
-                    parsed_input,
-                    result_str,
-                )
-                logger.info("Tool '%s' result: %s", tc["function"]["name"], result_str[:200])
-
-            text_content = ""
-            continue
-
-        # No tool calls — done
+        # Exhausted all tool rounds
+        logger.warning("Exhausted %d tool rounds (Gemini)", MAX_TOOL_ROUNDS)
         await _safe_send({"type": "text", "token": "", "last": True})
-
-        if text_content:
+        if full_response_text:
             conversation_history.append({
                 "role": "assistant",
-                "content": text_content,
+                "content": full_response_text,
             })
-
-        logger.info(
-            "Gemini response complete (%d chars)%s",
-            len(full_response_text),
-            " [WS closed]" if ws_closed else "",
-        )
         if ws_closed:
             raise WebSocketDisconnect()
         return full_response_text
 
-    # Exhausted all tool rounds
-    logger.warning("Exhausted %d tool rounds (Gemini)", MAX_TOOL_ROUNDS)
-    await _safe_send({"type": "text", "token": "", "last": True})
-    if full_response_text:
-        conversation_history.append({
-            "role": "assistant",
-            "content": full_response_text,
-        })
-    if ws_closed:
-        raise WebSocketDisconnect()
-    return full_response_text
+    try:
+        response_text = await _run_gemini_stream()
+        _note_gemini_success(failover_state)
+        return response_text
+    except Exception as exc:
+        if len(conversation_history) > conversation_history_len:
+            conversation_history[:] = conversation_history[:conversation_history_len]
+
+        if not GEMINI_FAILOVER_TO_CLAUDE:
+            raise
+
+        if not ANTHROPIC_API_KEY:
+            raise exc
+
+        reason = _classify_gemini_exception(exc)
+        logger.warning(
+            "smartpbx_media event=llm_provider_failover from=gemini to=claude reason=%s",
+            reason,
+        )
+
+        try:
+            claude_client = _get_anthropic_client()
+        except RuntimeError:
+            raise
+
+        _note_gemini_failover(failover_state)
+        return await _run_llm_streaming_claude(
+            client=claude_client,
+            system=system,
+            conversation_history=conversation_history,
+            tools=tools,
+            websocket=websocket,
+            lang=lang,
+            generation_ref=generation_ref,
+            transcript_sink=transcript_sink,
+            model=CLAUDE_MODEL,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5709,6 +5940,7 @@ async def _run_llm_streaming_claude(
     lang: str = "en",
     generation_ref: list[int] | None = None,
     transcript_sink: list[dict[str, str]] | None = None,
+    model: str = MODEL,
 ) -> str:
     """Stream a Claude response via the Anthropic SDK, handling tool use.
 
@@ -5766,7 +5998,7 @@ async def _run_llm_streaming_claude(
                 slow_task.cancel()
 
         async with client.messages.stream(
-            model=MODEL,
+            model=model,
             max_tokens=MAX_TOKENS,
             system=_split_claude_system_blocks(system),
             messages=conversation_history,
@@ -5921,6 +6153,7 @@ async def _stream_llm_turn(
     gemini_client: Any,
     openai_client: Any,
     transcript_sink: list[dict[str, str]] | None = None,
+    gemini_failover_state: dict[str, Any] | None = None,
 ) -> str:
     """Stream one agent turn over the ConversationRelay socket.
 
@@ -5949,6 +6182,7 @@ async def _stream_llm_turn(
             lang=lang,
             generation_ref=generation_ref,
             transcript_sink=transcript_sink,
+            failover_state=gemini_failover_state,
         )
     return await _run_llm_streaming(
         client=openai_client,
@@ -6044,6 +6278,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
     openai_client = None
     gemini_client = None
     generation_ref: list[int] = [0]
+    gemini_failover_state = _init_gemini_failover_state()
     try:
         if LLM_PROVIDER == "claude":
             anthropic_client = _get_anthropic_client()
@@ -6209,6 +6444,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                             gemini_client=gemini_client,
                             openai_client=openai_client,
                             transcript_sink=full_transcript,
+                            gemini_failover_state=gemini_failover_state,
                         )
                         logger.info("Agent [%s] (failsafe opening): %s",
                                     call_sid, opening[:200])
@@ -6281,6 +6517,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                         gemini_client=gemini_client,
                         openai_client=openai_client,
                         transcript_sink=full_transcript,
+                        gemini_failover_state=gemini_failover_state,
                     )
                     logger.info("Agent [%s]: %s", call_sid, response_text[:200])
                     if response_text:
