@@ -95,8 +95,15 @@ def test_all_provider_paths_inject_the_slot_aware_prompt():
     # Guard against a single provider path regressing to the bare system prompt.
     import inspect
 
-    for method in ("_run_llm", "_run_llm_gemini", "_run_llm_claude"):
+    for method in ("_run_llm", "_run_llm_gemini"):
         src = inspect.getsource(getattr(server.MediaStreamSession, method))
         assert "_active_system_prompt()" in src, (
             f"{method} must assemble the slot-aware system prompt, not self.system_prompt"
         )
+    # The Claude path splits the slots note into a separate uncached system
+    # block (prompt-cache layout) — still slot-aware, different assembly.
+    claude_src = inspect.getsource(server.MediaStreamSession._run_llm_claude)
+    assert "_build_claude_system_blocks(" in claude_src
+    assert "_booking_slots_note()" in claude_src, (
+        "_run_llm_claude must pass the slots note into the system blocks"
+    )
