@@ -93,6 +93,43 @@ class FakeGemini:
         self.aio = SimpleNamespace(models=FakeGeminiModels(self))
 
 
+class FakeFlakyGemini:
+    """Gemini mock where a turn can raise an exception or return chunks."""
+
+    def __init__(self, turns):
+        self._turns = list(turns)
+        self.requests = 0
+        self.configs: list[dict] = []
+        self.contents: list[list] = []
+        self.timeline: list[tuple] = []
+        self.aio = SimpleNamespace(models=self)
+
+    async def generate_content_stream(self, **kwargs):
+        self.requests += 1
+        self.configs.append(kwargs.get("config"))
+        self.contents.append(kwargs.get("contents"))
+
+        behavior = self._turns.pop(0)
+        if isinstance(behavior, BaseException):
+            raise behavior
+
+        turn = SimpleNamespace(chunks=behavior)
+        turn_index = self.requests - 1
+
+        async def stream():
+            for index, chunk in enumerate(turn.chunks):
+                self.timeline.append(("chunk", turn_index, index))
+                yield chunk
+
+        return stream()
+
+
+class _QuotaError(Exception):
+    def __init__(self, message: str = "quota exceeded", status: int = 429):
+        super().__init__(message)
+        self.status = status
+
+
 class FakeTransport:
     """Stand-in for SmartPBXMediaTransport (present only on the direct path)."""
 
@@ -590,3 +627,212 @@ def test_conversation_relay_capture_tool_gets_no_filler_but_still_runs(monkeypat
     assert executed == ["capture_spoken_number"], "the tool must still execute"
     assert socket.tokens() == ["Got it."]
     assert server.DEFAULT_FILLER not in socket.tokens()
+
+
+# --- Gemini failover -> Claude (per-session + per-call sticky) ---------------
+
+def test_session_media_stream_gemini_quota_error_failsover_to_claude(monkeypatch, caplog):
+    session, spoken = _session([[_empty_chunk()]])
+    session.anthropic_client = object()
+    session.history.append({"role": "user", "content": "hello"})
+    base_model = session.model
+
+    calls: list[dict] = []
+
+    async def _run_claude() -> str:
+        calls.append(
+            {
+                "model": session.model,
+                "provider": session.llm_provider,
+                "tools_len": len(session.tools),
+            }
+        )
+        return "claude fallback"
+
+    monkeypatch.setattr(session, "_run_llm_claude", _run_claude)
+    session.gemini_client = FakeFlakyGemini([_QuotaError()])
+
+    with caplog.at_level("WARNING", logger="server"):
+        result = asyncio.run(session._run_llm_gemini())
+
+    assert result == "claude fallback"
+    assert calls == [
+        {"model": server.CLAUDE_MODEL, "provider": "claude", "tools_len": len(server.get_tools())}
+    ]
+    assert session.model == base_model
+    assert any(
+        "event=llm_provider_failover" in r.getMessage() and "reason=quota" in r.getMessage()
+        for r in caplog.records
+    )
+    assert session._gemini_failover_state["consecutive_failovers"] == 1
+
+
+def test_gemini_failover_can_be_disabled_for_conversation_relay(monkeypatch):
+    socket = FakeRelaySocket()
+    client = FakeFlakyGemini([_QuotaError()])
+    monkeypatch.setattr(server, "GEMINI_FAILOVER_TO_CLAUDE", False)
+
+    with pytest.raises(_QuotaError):
+        asyncio.run(
+            server._run_llm_streaming_gemini(
+                gemini_client=client,
+                system="sys",
+                conversation_history=[{"role": "user", "content": "hi"}],
+                tools=[],
+                websocket=socket,
+            )
+        )
+
+
+def test_conversation_relay_gemini_sticky_failover_threshold_blocks_gemini(monkeypatch, caplog):
+    socket = FakeRelaySocket()
+    state = server._init_gemini_failover_state()
+    client = FakeFlakyGemini([_QuotaError(), _QuotaError(), _empty_chunk(), _empty_chunk()])
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: "anthropic")
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "present")
+    claude_calls = 0
+
+    async def _run_claude(
+        client: object,
+        system: str,
+        conversation_history: list[dict],
+        tools: list[dict],
+        websocket: FakeRelaySocket,
+        lang: str = "en",
+        generation_ref=None,
+        transcript_sink=None,
+        model=server.MODEL,
+    ) -> str:
+        nonlocal claude_calls
+        claude_calls += 1
+        return "claude"
+
+    monkeypatch.setattr(server, "_run_llm_streaming_claude", _run_claude)
+
+    with caplog.at_level("INFO", logger="server"):
+        for _ in range(3):
+            result = asyncio.run(
+                server._run_llm_streaming_gemini(
+                    gemini_client=client,
+                    system="sys",
+                    conversation_history=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    websocket=socket,
+                    failover_state=state,
+                )
+            )
+            assert result == "claude"
+
+    degraded_logs = [
+        r.getMessage()
+        for r in caplog.records
+        if "smartpbx_media event=llm_provider_degraded" in r.getMessage()
+    ]
+
+    assert len(degraded_logs) == 1
+    assert client.requests == 2
+    assert claude_calls == 3
+    assert state["degraded"] is True
+
+
+def test_conversation_relay_gemini_recovery_resets_failover_counter(monkeypatch):
+    socket = FakeRelaySocket()
+    state = server._init_gemini_failover_state()
+    client = FakeFlakyGemini([
+        _QuotaError(),
+        [_text_chunk("ok from gemini")],
+        _QuotaError(),
+        _empty_chunk(),
+    ])
+
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: "anthropic")
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "present")
+    claude_calls = 0
+
+    async def _run_claude(
+        client: object,
+        system: str,
+        conversation_history: list[dict],
+        tools: list[dict],
+        websocket: FakeRelaySocket,
+        lang: str = "en",
+        generation_ref=None,
+        transcript_sink=None,
+        model=server.MODEL,
+    ) -> str:
+        nonlocal claude_calls
+        claude_calls += 1
+        return "claude"
+
+    monkeypatch.setattr(server, "_run_llm_streaming_claude", _run_claude)
+
+    first = asyncio.run(
+        server._run_llm_streaming_gemini(
+            gemini_client=client,
+            system="sys",
+            conversation_history=[{"role": "user", "content": "hi"}],
+            tools=[],
+            websocket=socket,
+            failover_state=state,
+        )
+    )
+    assert first == "claude"
+
+    second = asyncio.run(
+        server._run_llm_streaming_gemini(
+            gemini_client=client,
+            system="sys",
+            conversation_history=[{"role": "user", "content": "again"}],
+            tools=[],
+            websocket=socket,
+            failover_state=state,
+        )
+    )
+    assert second == "ok from gemini"
+
+    third = asyncio.run(
+        server._run_llm_streaming_gemini(
+            gemini_client=client,
+            system="sys",
+            conversation_history=[{"role": "user", "content": "again"}],
+            tools=[],
+            websocket=socket,
+            failover_state=state,
+        )
+    )
+    assert third == "claude"
+
+    assert state["degraded"] is False
+    assert state["consecutive_failovers"] == 1
+    assert claude_calls == 2
+    # Three Gemini attempts is the desired shape: the mid-sequence success
+    # reset the counter, so the third turn tries Gemini again before failing
+    # over — recovery must re-earn trust, not stay degraded.
+    assert client.requests == 3
+
+
+def test_conversation_relay_gemini_fails_over_only_when_anthropic_configured(monkeypatch):
+    socket = FakeRelaySocket()
+    client = FakeFlakyGemini([_QuotaError()])
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "")
+    claude_calls = 0
+
+    async def _run_claude(*_args, **_kwargs):
+        nonlocal claude_calls
+        claude_calls += 1
+        return "claude"
+
+    monkeypatch.setattr(server, "_run_llm_streaming_claude", _run_claude)
+
+    with pytest.raises(_QuotaError):
+        asyncio.run(
+            server._run_llm_streaming_gemini(
+                gemini_client=client,
+                system="sys",
+                conversation_history=[{"role": "user", "content": "hi"}],
+                tools=[],
+                websocket=socket,
+            )
+        )
+
+    assert claude_calls == 0
