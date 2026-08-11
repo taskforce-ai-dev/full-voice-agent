@@ -3224,7 +3224,8 @@ class MediaStreamSession:
             lines.append(f"- phone: {slots['guest_phone']}")
         if not lines:
             return ""
-        return f"{_BOOKING_SLOTS_NOTE_PREFIX}{'\n'.join(lines)}"
+        joined = "\n".join(lines)
+        return _BOOKING_SLOTS_NOTE_PREFIX + joined
 
     def _active_system_prompt(self) -> str:
         """The system prompt plus any booking slots captured so far."""
