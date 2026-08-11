@@ -190,7 +190,10 @@ async def test_smartpbx_english_tts_uses_profile_without_general_voice(monkeypat
     pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=FakeTransport())
     await pipeline._tts_elevenlabs("Hello from Kavya.")
     request = client.requests[0]
-    assert request["url"] == "https://api.elevenlabs.io/v1/text-to-speech/unit-test-canonical-voice/stream?output_format=ulaw_8000"
+    assert request["url"] == (
+        "https://api.elevenlabs.io/v1/text-to-speech/unit-test-canonical-voice/stream"
+        "?output_format=ulaw_8000&optimize_streaming_latency=3"
+    )
     assert request["json"] == {"text": "Hello from Kavya.", "model_id": "eleven_flash_v2_5", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}}
     assert "output_format" not in request["json"]
     assert "mp3" not in request["url"]
@@ -1527,13 +1530,13 @@ class DirectToolClaude:
         self.messages = DirectToolClaudeMessages(self)
 
 
-def direct_tool_round(provider, arguments, preamble=None):
+def direct_tool_round(provider, arguments, preamble=None, tool_name="create_booking"):
     if provider == "openai":
         return [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
             content=preamble,
             tool_calls=[SimpleNamespace(
                 index=0, id="tool-1",
-                function=SimpleNamespace(name="create_booking", arguments=json.dumps(arguments)),
+                function=SimpleNamespace(name=tool_name, arguments=json.dumps(arguments)),
             )],
         ))])]
     if provider == "gemini":
@@ -1542,7 +1545,7 @@ def direct_tool_round(provider, arguments, preamble=None):
             parts.append(SimpleNamespace(text=preamble, function_call=None))
         parts.append(SimpleNamespace(
             text=None,
-            function_call=SimpleNamespace(name="create_booking", args=arguments),
+            function_call=SimpleNamespace(name=tool_name, args=arguments),
         ))
         return [SimpleNamespace(candidates=[SimpleNamespace(
             finish_reason=None, content=SimpleNamespace(parts=parts),
@@ -1556,7 +1559,7 @@ def direct_tool_round(provider, arguments, preamble=None):
     events.extend([
         SimpleNamespace(
             type="content_block_start",
-            content_block=SimpleNamespace(type="tool_use", id="tool-1", name="create_booking"),
+            content_block=SimpleNamespace(type="tool_use", id="tool-1", name=tool_name),
         ),
         SimpleNamespace(
             type="content_block_delta",
@@ -1602,6 +1605,14 @@ def direct_tool_pipeline(server, provider, client, lang="en"):
     pipeline._smartpbx_transfer_context = object()
     pipeline.tools = [{"provider": provider}]
     return pipeline
+
+
+class CapturingTextWebSocket:
+    def __init__(self):
+        self.messages = []
+
+    async def send_text(self, message):
+        self.messages.append(message)
 
 
 @pytest.mark.asyncio
@@ -1763,6 +1774,184 @@ async def test_retained_non_english_multiround_transcript_preserves_legacy_conca
     await pipeline._process_utterance_bound("safe guest turn")
 
     assert pipeline.full_transcript[-1] == {"role": "assistant", "text": "Preamble.Recovery."}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["check_availability", "create_booking", "transfer_to_human"])
+async def test_claude_streaming_tool_round_sends_core_fillers(monkeypatch, tool_name):
+    import server
+
+    client = direct_tool_client("claude", [
+        direct_tool_round("claude", {"safe": "value"}, tool_name=tool_name),
+        direct_text_round("claude", "Recovery."),
+    ])
+    websocket = CapturingTextWebSocket()
+
+    async def successful_tool(_name, _arguments):
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    server._TOOL_FILLER_CYCLES[tool_name] = 0
+
+    await server._run_llm_streaming_claude(
+        client=client,
+        system="You are a booking assistant.",
+        conversation_history=[],
+        tools=server.get_tools(),
+        websocket=websocket,
+        lang="en",
+        generation_ref=[0],
+        transcript_sink=[],
+    )
+
+    tokens = [json.loads(message)["token"] for message in websocket.messages]
+    assert tokens and tokens[0] == server.TOOL_FILLER_VARIANTS[tool_name][0]
+
+
+@pytest.mark.asyncio
+async def test_claude_streaming_tool_round_filler_suppressed_after_preamble(monkeypatch):
+    import server
+
+    preamble = "I will take care of that."
+    client = direct_tool_client("claude", [
+        direct_tool_round(
+            "claude",
+            {"safe": "value"},
+            preamble=preamble,
+            tool_name="create_booking",
+        ),
+        direct_text_round("claude", "Recovery."),
+    ])
+    websocket = CapturingTextWebSocket()
+
+    async def successful_tool(_name, _arguments):
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    await server._run_llm_streaming_claude(
+        client=client,
+        system="You are a booking assistant.",
+        conversation_history=[],
+        tools=server.get_tools(),
+        websocket=websocket,
+        lang="en",
+        generation_ref=[0],
+        transcript_sink=[],
+    )
+
+    tokens = [json.loads(message)["token"] for message in websocket.messages]
+    assert tokens and tokens[0] == preamble
+    assert preamble in tokens
+    assert not any(
+        token in set().union(*server.TOOL_FILLER_VARIANTS.values()) for token in tokens
+    )
+
+
+@pytest.mark.asyncio
+async def test_claude_streaming_capture_tool_round_does_not_emit_filler(monkeypatch):
+    import server
+
+    client = direct_tool_client("claude", [
+        direct_tool_round("claude", {"spoken": "zero one"}, tool_name="capture_spoken_number"),
+        direct_text_round("claude", "Recovery."),
+    ])
+    websocket = CapturingTextWebSocket()
+
+    async def successful_tool(_name, _arguments):
+        return json.dumps({"status": "needs_more", "digits": "01"})
+
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    await server._run_llm_streaming_claude(
+        client=client,
+        system="You are a booking assistant.",
+        conversation_history=[],
+        tools=server.get_tools(),
+        websocket=websocket,
+        lang="en",
+        generation_ref=[0],
+        transcript_sink=[],
+    )
+
+    tokens = [json.loads(message)["token"] for message in websocket.messages]
+    assert tokens[0] == "Recovery."
+    assert "Recovery." in tokens
+    filler_set = {line for lines in server.TOOL_FILLER_VARIANTS.values() for line in lines}
+    assert not any(token in filler_set for token in tokens)
+
+
+@pytest.mark.asyncio
+async def test_claude_streaming_tool_fillers_respect_stale_generation(monkeypatch):
+    import server
+
+    generation_ref = [0]
+    first_round = direct_tool_round(
+        "claude",
+        {"safe": "value"},
+        tool_name="check_availability",
+    )
+    second_round = []
+    unblock = asyncio.Event()
+
+    class _Stream:
+        def __init__(self, events):
+            self.events = events
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await unblock.wait()
+            if not self.events:
+                raise StopAsyncIteration
+            return self.events.pop(0)
+
+    class _ClaudeMessages:
+        def __init__(self, rounds):
+            self.rounds = rounds
+
+        def stream(self, **_kwargs):
+            return _Stream(self.rounds.pop(0))
+
+    class _ClaudeClient:
+        def __init__(self, rounds):
+            self.rounds = rounds
+
+        @property
+        def messages(self):
+            return _ClaudeMessages(self.rounds)
+
+    client = _ClaudeClient([first_round, second_round])
+    websocket = CapturingTextWebSocket()
+
+    async def successful_tool(_name, _arguments):
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    run = asyncio.create_task(
+        server._run_llm_streaming_claude(
+            client=client,
+            system="You are a booking assistant.",
+            conversation_history=[],
+            tools=server.get_tools(),
+            websocket=websocket,
+            lang="en",
+            generation_ref=generation_ref,
+            transcript_sink=[],
+        )
+    )
+
+    await asyncio.sleep(0)
+    generation_ref[0] = 1
+    unblock.set()
+    await run
+
+    assert websocket.messages == []
 
 
 @pytest.mark.asyncio

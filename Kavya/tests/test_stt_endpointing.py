@@ -60,6 +60,11 @@ def make_session(monkeypatch, lang="en"):
     return session, loop, processed
 
 
+class _NoopMonkeyPatch:
+    def setattr(self, *_args, **_kwargs) -> None:
+        return None
+
+
 # --- (a) provider final flushes after the short grace ---------------------
 
 @pytest.mark.parametrize("lang", ["en", *TWILIO_MEDIA_STREAM_LANGS])
@@ -102,6 +107,34 @@ def test_twilio_interim_only_utterance_still_flushes_via_the_fallback(monkeypatc
     assert processed == ["mata kamarayak"]
 
 
+def test_capture_mode_timers_switch_and_revert():
+    session, loop, _processed = make_session(_NoopMonkeyPatch())
+    session._enter_capture_mode(2)
+
+    asyncio.run(session._accumulate_transcript("071175"))
+    assert loop.last.delay == server.CAPTURE_FINAL_GRACE_SECONDS
+
+    asyncio.run(session._set_transcript_interim("071175"))
+    assert loop.last.delay == server.CAPTURE_ENDPOINTING_SILENCE_SECONDS
+
+    session._exit_capture_mode()
+    asyncio.run(session._accumulate_transcript("071175"))
+    assert loop.last.delay == server.STT_FINAL_GRACE_SECONDS
+
+    asyncio.run(session._set_transcript_interim("071175"))
+    assert loop.last.delay == server.ENDPOINTING_SILENCE
+
+
+def test_capture_mode_consumes_turns_and_auto_expires():
+    session, _loop, _processed = make_session(_NoopMonkeyPatch())
+    session._enter_capture_mode(2)
+
+    session._consume_capture_mode_turn()
+    assert session._is_capture_mode_active()
+    session._consume_capture_mode_turn()
+    assert not session._is_capture_mode_active()
+
+
 # --- (c) the durations are env-driven and clamped -------------------------
 
 def test_endpointing_seconds_parser_reads_clamps_and_defaults():
@@ -112,6 +145,20 @@ def test_endpointing_seconds_parser_reads_clamps_and_defaults():
     assert parse({"X": ""}, "X", 1.0, 0.05, 5.0) == 1.0
     assert parse({"X": "99"}, "X", 1.0, 0.05, 5.0) == 5.0  # clamp high
     assert parse({"X": "0"}, "X", 1.0, 0.05, 5.0) == 0.05  # clamp low
+    assert parse(
+        {"CAPTURE_FINAL_GRACE_SECONDS": "10"},
+        "CAPTURE_FINAL_GRACE_SECONDS",
+        1.2,
+        0.2,
+        3.0,
+    ) == 3.0
+    assert parse(
+        {"CAPTURE_ENDPOINTING_SILENCE_SECONDS": "0"},
+        "CAPTURE_ENDPOINTING_SILENCE_SECONDS",
+        1.5,
+        0.5,
+        5.0,
+    ) == 0.5
 
 
 def test_module_defaults_are_shorter_than_the_old_hardcoded_wait():

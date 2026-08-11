@@ -94,6 +94,109 @@ async def test_immediate_failure_keeps_pipeline_active_and_notifies_once_then_re
     assert notifications[0]["privacy_safe"] is True
 
 
+def _real_control(session_factory):
+    """Wire the genuine MCP client in, so the wire contract is under test too."""
+    from smartpbx_mcp import DialogMCPCallControl, DialogMCPSettings
+    from smartpbx_protocol import CallContext, MediaFormat
+
+    settings = DialogMCPSettings.from_env({
+        "SMARTPBX_MCP_URL": "https://dialog.example:9443/ucp/v2/mcp",
+        "SMARTPBX_API_KEY": "api-key-marker",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+        "SMARTPBX_MCP_ACCOUNT_HEADER": "account_id",
+        "SMARTPBX_TRANSFER_DESTINATIONS_JSON": '{"human_support":"tel:+94711754668"}',
+    })
+    context = CallContext(
+        call_id="media-leg", other_leg_call_id="dialog-leg", caller_id_number="+94771234567",
+        callee_id_number="+94110000000", account_id="account-1",
+        media_format=MediaFormat("g711_ulaw", 8000),
+    )
+    return DialogMCPCallControl(settings, context, session_factory)
+
+
+def _session_factory(outcome):
+    from contextlib import asynccontextmanager
+
+    calls = []
+
+    class _Session:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    @asynccontextmanager
+    async def factory(**_kwargs):
+        yield _Session()
+
+    return factory, calls
+
+
+@pytest.mark.asyncio
+async def test_dialog_acknowledgement_transfers_and_never_whatsapps_the_manager():
+    """End to end: the argument Dialog wants, and no failsafe on a real transfer.
+
+    This is the 2026-08-11 outage in one assertion -- the guest was not
+    transferred AND the manager was WhatsApped, which is the combination that
+    tells an operator the transfer path is broken.
+    """
+    acknowledged = type("Result", (), {"content": [type("T", (), {"text": "ok"})()]})()
+    factory, calls = _session_factory(acknowledged)
+    notifications = []
+
+    async def notify(**kwargs):
+        notifications.append(kwargs)
+        return {"ok": True}
+
+    coordinator = SmartPBXHandoverCoordinator(
+        call_control=_real_control(factory), pipeline=_Pipeline(), call_sid="dialog-leg",
+        caller_phone="+94771234567", transcript=lambda: [], dashboard_sender=None,
+        notification_sender=notify, human_agent_whatsapp="94711754668",
+    )
+
+    result = json.loads(await coordinator.attempt("guest asked for a human"))
+
+    assert calls == [("transfer_call", {"number": "+94711754668"})]
+    assert result == {"status": "transferred", "confirmation": "provider_acknowledged"}
+    assert coordinator.transfer_pending is True
+    assert notifications == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_request_still_falls_back_to_the_manager_whatsapp():
+    """A protocol-level rejection is a genuine failure: fail closed, notify."""
+
+    class _McpError(Exception):
+        __module__ = "mcp.shared.exceptions"
+
+        def __init__(self):
+            self.error = type("E", (), {"code": -32603, "message": "bad argument"})()
+            super().__init__("bad argument")
+
+    factory, _calls = _session_factory(_McpError())
+    notifications = []
+
+    async def notify(**kwargs):
+        notifications.append(kwargs)
+        return {"ok": True}
+
+    coordinator = SmartPBXHandoverCoordinator(
+        call_control=_real_control(factory), pipeline=_Pipeline(), call_sid="dialog-leg",
+        caller_phone="+94771234567", transcript=lambda: [], dashboard_sender=None,
+        notification_sender=notify, human_agent_whatsapp="94711754668",
+    )
+
+    result = json.loads(await coordinator.attempt("guest asked for a human"))
+
+    assert result == {"status": "unavailable", "notification": "sent"}
+    assert coordinator.transfer_pending is False
+    assert len(notifications) == 1
+
+
 @pytest.mark.asyncio
 async def test_concurrent_attempts_dispatch_and_notify_only_once_per_attempt():
     control = _Control(result=type("Result", (), {"transferred": False})())

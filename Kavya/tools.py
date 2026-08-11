@@ -165,6 +165,57 @@ def _matches_room_type(property_name: str, room_type: str) -> bool:
     )
 
 
+def _is_capture_done_utterance(raw: Any) -> bool:
+    """Return True when the caller explicitly ends number dictation."""
+    text = str(raw or "").strip().lower()
+    if not text:
+        return False
+    return any(
+        phrase in text
+        for phrase in (
+            " done", " that's it", " that's enough", " that's all", " complete",
+            " done.", " done,", " finished", " all done", "all done",
+            " that's all.", " that's all,", " that's enough.",
+        )
+    )
+
+
+def _build_capture_result_payload(
+    spoken: str,
+    digits: str,
+    normalized: str,
+    *,
+    attempts: int,
+    status: str = "invalid",
+) -> dict[str, Any]:
+    """Build a capture tool payload with shared accumulation metadata."""
+    if status == "needs_more":
+        return {
+            "status": status,
+            "digits": digits,
+            "readback": "",
+            "length": len(digits),
+            "valid": False,
+            "normalized": normalized,
+            "attempts": attempts,
+            "fallback_allowed": attempts >= 2,
+            "spoken": spoken,
+        }
+
+    valid = bool(normalized)
+    return {
+        "status": "captured" if valid else status,
+        "digits": digits,
+        "readback": " ".join(digits),
+        "length": len(digits),
+        "valid": valid,
+        "normalized": normalized,
+        "attempts": attempts,
+        "fallback_allowed": attempts >= 2,
+        "spoken": spoken,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tool definitions (Claude function-calling schema)
 # ---------------------------------------------------------------------------
@@ -774,20 +825,77 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         # Deterministic word->digit conversion is the code's job (the single
         # chokepoint in handover.py). The model relays the caller's words; it
         # never does the arithmetic itself.
-        from handover import normalize_whatsapp, spoken_number_to_digits
+        from handover import _get_handover_context, normalize_whatsapp, spoken_number_to_digits
 
         spoken = tool_input.get("spoken") or ""
         digits = spoken_number_to_digits(spoken)
-        normalized = normalize_whatsapp(spoken)
-        valid = bool(normalized)
-        return json.dumps({
-            "status": "captured" if valid else "invalid",
-            "digits": digits,
-            "readback": " ".join(digits),
-            "length": len(digits),
-            "valid": valid,
-            "normalized": normalized,
-        })
+        explicit_done = _is_capture_done_utterance(spoken)
+
+        ctx = _get_handover_context()
+        state = ctx.setdefault("_capture_spoken_number", {})
+        prior_digits = str(state.get("digits", ""))
+        prior_attempts = int(state.get("attempts", 0))
+        combined_digits = prior_digits + digits
+
+        if explicit_done:
+            state_attempts = prior_attempts + 1
+            normalized = normalize_whatsapp(combined_digits)
+            if normalized:
+                ctx.pop("_capture_spoken_number", None)
+                return json.dumps(_build_capture_result_payload(
+                    spoken=spoken,
+                    digits=combined_digits,
+                    normalized=normalized,
+                    attempts=state_attempts,
+                    status="captured",
+                ))
+            if len(combined_digits) >= 9:
+                state.update({"digits": combined_digits, "attempts": state_attempts})
+                return json.dumps(_build_capture_result_payload(
+                    spoken=spoken,
+                    digits=combined_digits,
+                    normalized="",
+                    attempts=state_attempts,
+                    status="invalid",
+                ))
+            state.update({"digits": combined_digits, "attempts": state_attempts})
+            return json.dumps(_build_capture_result_payload(
+                spoken=spoken,
+                digits=combined_digits,
+                normalized="",
+                attempts=state_attempts,
+                status="needs_more",
+            ))
+
+        if len(combined_digits) < 9:
+            attempts = prior_attempts + 1
+            state.update({"digits": combined_digits, "attempts": attempts})
+            return json.dumps(_build_capture_result_payload(
+                spoken=spoken,
+                digits=combined_digits,
+                normalized="",
+                attempts=attempts,
+                status="needs_more",
+            ))
+
+        normalized = normalize_whatsapp(combined_digits)
+        if normalized:
+            ctx.pop("_capture_spoken_number", None)
+            return json.dumps(_build_capture_result_payload(
+                spoken=spoken,
+                digits=combined_digits,
+                normalized=normalized,
+                attempts=prior_attempts,
+                status="captured",
+            ))
+        state.update({"digits": combined_digits, "attempts": prior_attempts + 1})
+        return json.dumps(_build_capture_result_payload(
+            spoken=spoken,
+            digits=combined_digits,
+            normalized="",
+            attempts=prior_attempts + 1,
+            status="needs_more",
+        ))
 
     elif tool_name == "collect_number_via_keypad":
         # Real collection is intercepted at the session level, where the live
