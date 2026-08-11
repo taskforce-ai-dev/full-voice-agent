@@ -490,6 +490,55 @@ async def test_gateway_reports_dropped_frames_through_status(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_gateway_tracks_echo_rejections_through_status():
+    import smartpbx_gateway as gateway_module
+
+    settings = gateway_module.SmartPBXSettings.from_env({
+        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+        "SMARTPBX_ACCOUNT_ID": "account-1",
+    })
+    socket = FailingSocket(ok_sends=1000)
+    socket.messages.put_nowait(json.dumps({
+        "event": "start", "start": {
+            "callId": "call-1", "otherLegCallId": "other-1",
+            "callerIdNumber": "caller", "calleeIdNumber": "callee",
+            "accountId": "account-1",
+            "mediaFormat": {"encoding": "g711_ulaw", "sampleRate": 8000},
+        }
+    }))
+    socket.messages.put_nowait(json.dumps({"event": "stop"}))
+
+    seen = {}
+
+    class Session:
+        def __init__(self):
+            self.transfer_pending = False
+            self.terminal_future = asyncio.get_running_loop().create_future()
+
+        async def start(self):
+            pass
+
+        async def feed_audio(self, _audio):
+            pass
+
+        async def finish(self, schedule_post_call=False):
+            pass
+
+    async def factory(_context, _transport, _sink=None):
+        session = Session()
+        seen["session"] = session
+        return session
+
+    gateway = gateway_module.SmartPBXGateway(settings, gateway_module.SmartPBXSessionRegistry(4))
+    await asyncio.wait_for(gateway.handle(socket, factory), timeout=5)
+
+    session = seen["session"]
+    assert callable(getattr(session, "_record_echo_rejection", None))
+    session._record_echo_rejection(7, 0.91)
+    assert gateway.snapshot()["echo_rejections_total"] == 1
+
+
+@pytest.mark.asyncio
 async def test_kb_retrieval_runs_off_the_event_loop(monkeypatch):
     import server
 

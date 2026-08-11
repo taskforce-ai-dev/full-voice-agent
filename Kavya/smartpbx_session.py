@@ -37,6 +37,7 @@ class KavyaSmartPBXSession:
         llm_provider: str | None = None,
         model: str | None = None,
         diagnostic_sink: SmartPBXDiagnosticSink | None = None,
+        echo_rejection_callback: Callable[[int, float], None] | None = None,
     ) -> None:
         self._context = context
         self._transport = transport
@@ -47,6 +48,7 @@ class KavyaSmartPBXSession:
         self._llm_provider = llm_provider
         self._model = model
         self._diagnostic_sink = diagnostic_sink if diagnostic_sink is not None else _noop_diagnostic
+        self._record_echo_rejection = echo_rejection_callback
 
         loop = asyncio.get_running_loop()
         self._terminal_future: asyncio.Future[None] = loop.create_future()
@@ -99,6 +101,7 @@ class KavyaSmartPBXSession:
         self._load_runtime_defaults()
         pipeline = self._require_pipeline()
         self._bind_smartpbx_tool_context(pipeline)
+        pipeline._record_echo_rejection = self._record_echo_rejection
         pipeline.lang = "en"
         pipeline.call_sid = self._context.other_leg_call_id
         pipeline.caller_phone = self._context.caller_number

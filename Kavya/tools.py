@@ -182,7 +182,7 @@ _PROPERTY_SCHEMA: dict[str, Any] = {
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "check_availability",
-        "description": (
+                "description": (
             "Check room availability at Hatton Hills for a given date range. "
             "Hatton Hills is the only property, so do NOT ask the guest which "
             "property or location they mean; 'property' is optional. "
@@ -191,9 +191,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "room_type and do NOT call this multiple times in a row. The "
             "guest's room preference is irrelevant at availability check "
             "time; surface all available types from the single response. "
-            "The result includes the nightly rate in US dollars for each "
-            "available room type — you MAY quote those figures to the guest."
-        ),
+                "The result includes the nightly rate in foreign-guest US "
+                "dollars for each "
+                "available room type — you MAY quote those figures to the guest."
+                "These are foreign-guest rates. For Sri Lankan residents, use "
+                "resident rates from the hotel information."
+            ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -402,6 +405,31 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "label": {
                     "type": "string",
                     "description": "Optional: what the number is for.",
+                },
+            },
+            "required": ["spoken"],
+        },
+    },
+    {
+        "name": "capture_spoken_name",
+        "description": (
+            "PRIMARY and DEFAULT: capture a guest name the caller SPELLS. The "
+            "caller will pronounce letters (e.g. 'B for Bravo', 'double you', "
+            "or 'D I L S H A N'). Convert the spoken letters to a single "
+            "assembled name and return it in one word with title case. Use this "
+            "whenever a name is unclear and the guest agrees to spell it. This "
+            "is how the spelling fallback works; do NOT try to guess the letters "
+            "from transcript fragments yourself."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "spoken": {
+                    "type": "string",
+                    "description": (
+                        "The caller's dictated spelling exactly as spoken, "
+                        "including letter words and punctuation."
+                    ),
                 },
             },
             "required": ["spoken"],
@@ -627,6 +655,17 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         requested_room = (tool_input.get("room_type") or "").strip()
         if not _matches_room_type(property_name, requested_room):
             return _room_type_error(property_name, requested_room)
+
+        if not str(tool_input.get("guest_name") or "").strip():
+            # If spelling already ran and returned a parsed name, use it so
+            # create_booking gets exactly what the guest confirmed.
+            from handover import _get_handover_context
+
+            ctx = _get_handover_context()
+            guest_name = (ctx.get("spelled_name") or "").strip()
+            if guest_name:
+                tool_input["guest_name"] = guest_name
+
         logger.info(
             "create_booking for property: %s, room type: %s", property_name, requested_room
         )
@@ -636,9 +675,9 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         # number is unusable (wrong length -> normalize_whatsapp returns ""),
         # yanolja_service.book falls back to this so the booking still carries a
         # reachable WhatsApp number instead of storing garbage or nothing.
-        from handover import handover_context
+        from handover import _get_handover_context
 
-        caller_phone = (handover_context.get() or {}).get("caller_phone", "")
+        caller_phone = _get_handover_context().get("caller_phone", "")
 
         result = await create_booking(
             check_in=tool_input["check_in"],
@@ -695,9 +734,9 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         return json.dumps({"status": "transferring", "reason": reason})
 
     elif tool_name == "notify_human_handover":
-        from handover import handover_context, send_handover_notification
+        from handover import _get_handover_context, send_handover_notification
 
-        ctx = handover_context.get() or {}
+        ctx = _get_handover_context()
         outcome = await send_handover_notification(
             call_sid=ctx.get("call_sid", ""),
             customer_name=tool_input.get("customer_name", ""),
@@ -756,6 +795,27 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         # collector is wired (e.g. the Twilio path), so degrade gracefully and
         # let the model ask the guest to say the number.
         return json.dumps({"status": "unavailable", "reason": "keypad_not_available"})
+
+    elif tool_name == "capture_spoken_name":
+        # Deterministic spelling assembly and readback for guest names.
+        from handover import assemble_spoken_name, _get_handover_context
+
+        spoken = tool_input.get("spoken") or ""
+        name = assemble_spoken_name(spoken)
+        ctx = _get_handover_context()
+        ctx["spelled_name"] = name
+        # Keep explicit set in case this is the first handover access and we
+        # need to replace None defaults with a per-call session dict.
+        from handover import handover_context
+
+        handover_context.set(ctx)
+        return json.dumps({
+            "status": "captured" if name else "invalid",
+            "name": name,
+            "readback": name,
+            "length": len(name),
+            "spelling": spoken,
+        })
 
     else:
         logger.error("Unknown tool requested: %s", tool_name)

@@ -937,7 +937,7 @@ async def test_dialog_utterance_context_is_isolated_across_two_sessions_and_rese
         ("second", second._smartpbx_transfer_context, {"caller_phone": "second-caller"}),
     ]
     assert smartpbx_transfer_context.get() is None
-    assert handover_context.get() == {}
+    assert handover_context.get() is None
 
 
 @pytest.mark.asyncio
@@ -957,7 +957,7 @@ async def test_dialog_utterance_context_resets_after_failure_and_cancellation():
     with pytest.raises(RuntimeError, match="expected"):
         await pipeline._process_utterance("failure")
     assert smartpbx_transfer_context.get() is None
-    assert handover_context.get() == {}
+    assert handover_context.get() is None
 
     entered = asyncio.Event()
 
@@ -972,7 +972,7 @@ async def test_dialog_utterance_context_resets_after_failure_and_cancellation():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert smartpbx_transfer_context.get() is None
-    assert handover_context.get() == {}
+    assert handover_context.get() is None
 
 
 
@@ -1907,6 +1907,27 @@ async def test_mid_sentence_interruption_does_not_record_in_delivered_list():
     assert pipeline.history[-1]["content"] == "Welcome. [interrupted]"
 
 
+def test_record_delivered_sentence_skips_gap_and_keeps_tail_match_order():
+    import server
+
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=FakeTransport()
+    )
+    pipeline._start_assistant_turn_delivery_tracking()
+    generation = pipeline._assistant_turn_generation
+    first = "Welcome."
+    second = "You can also add a transfer."
+    third = "Please confirm your details."
+
+    pipeline._record_generated_sentence(first)
+    pipeline._record_generated_sentence(second)
+    pipeline._record_generated_sentence(third)
+    pipeline._record_delivered_sentence(first, generation)
+    pipeline._record_delivered_sentence(third, generation)
+
+    assert pipeline._delivered_sentences == [first, third]
+
+
 @pytest.mark.asyncio
 async def test_direct_tts_done_bargein_during_mark_does_not_rearm_reprompt():
     import server
@@ -2109,6 +2130,7 @@ def test_smartpbx_status_requires_the_shared_token():
     allowed = status(_fake_request({"X-Kavya-SmartPBX-Token": "status-token"}))
     assert allowed["active_sessions"] == 0
     assert allowed["max_sessions"] == 4
+    assert allowed["echo_rejections_total"] == 0
 
     # active_sessions vs the cap of 4 is a live occupancy oracle, and
     # admitted_total is a call-volume counter. Neither may be internet-readable.
