@@ -4,7 +4,7 @@ uvicorn[standard]>=0.52.0
 websockets>=17.0.1
 
 # AI / LLM
-anthropic>=0.120.2
+anthropic>=0.121.0
 openai>=1.0.0
 
 # Telephony
