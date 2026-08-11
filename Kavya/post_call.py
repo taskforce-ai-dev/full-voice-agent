@@ -184,6 +184,19 @@ def _clean_json_response(text: str) -> str:
     return text.strip()
 
 
+def _extract_text_from_anthropic_response(response: Any) -> str:
+    for block in response.content or []:
+        if getattr(block, "type", None) == "text":
+            return _clean_json_response(block.text)
+    raise ValueError("no text block in extraction response")
+
+
+def _ensure_dict_response(result: Any, text: str) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise json.JSONDecodeError("extraction returned non-object JSON", text, 0)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # LLM extraction -- supports Claude, OpenAI, Gemini
 # ---------------------------------------------------------------------------
@@ -203,8 +216,8 @@ async def _extract_with_claude(
             {"role": "user", "content": EXTRACTION_USER_TEMPLATE.format(transcript=transcript_text)},
         ],
     )
-    text = _clean_json_response(response.content[0].text)
-    return json.loads(text)
+    text = _extract_text_from_anthropic_response(response)
+    return _ensure_dict_response(json.loads(text), text)
 
 
 async def _extract_with_openai(
@@ -223,7 +236,7 @@ async def _extract_with_openai(
         ],
     )
     text = _clean_json_response(response.choices[0].message.content)
-    return json.loads(text)
+    return _ensure_dict_response(json.loads(text), text)
 
 
 async def _extract_with_gemini(
@@ -245,7 +258,7 @@ async def _extract_with_gemini(
         ),
     )
     text = _clean_json_response(response.text)
-    return json.loads(text)
+    return _ensure_dict_response(json.loads(text), text)
 
 
 async def extract_booking_details(
@@ -310,7 +323,10 @@ async def extract_booking_details(
 
     except json.JSONDecodeError as exc:
         if privacy_safe:
-            logger.warning("smartpbx_post_call event=extraction_parse_failed attempt=1")
+            logger.warning(
+                "smartpbx_post_call event=extraction_parse_failed attempt=1 exc_type=%s",
+                type(exc).__name__,
+            )
         else:
             logger.warning("Failed to parse LLM extraction JSON (attempt 1): %s", exc)
         # Retry once with a simpler prompt
@@ -331,7 +347,10 @@ async def extract_booking_details(
                 return _normalize_property_and_room(retry_result)
         except Exception as retry_exc:
             if privacy_safe:
-                logger.error("smartpbx_post_call event=extraction_retry_failed")
+                logger.error(
+                    "smartpbx_post_call event=extraction_retry_failed exc_type=%s",
+                    type(retry_exc).__name__,
+                )
             else:
                 logger.error("Retry extraction also failed: %s", retry_exc)
         empty["_extraction_error"] = (
@@ -340,7 +359,10 @@ async def extract_booking_details(
         return empty
     except Exception as exc:
         if privacy_safe:
-            logger.error("smartpbx_post_call event=extraction_failed")
+            logger.error(
+                "smartpbx_post_call event=extraction_failed exc_type=%s",
+                type(exc).__name__,
+            )
         else:
             logger.exception("LLM extraction failed: %s", exc)
         empty["_extraction_error"] = "extraction_failed" if privacy_safe else str(exc)
@@ -384,7 +406,7 @@ async def _retry_extraction(
                 max_tokens=EXTRACTION_MAX_TOKENS,
                 messages=[{"role": "user", "content": prompt}],
             )
-            text = _clean_json_response(response.content[0].text)
+            text = _extract_text_from_anthropic_response(response)
         elif llm_provider == "openai" and openai_client:
             response = await openai_client.chat.completions.create(
                 model=model or "gpt-4o",
@@ -394,10 +416,13 @@ async def _retry_extraction(
             text = _clean_json_response(response.choices[0].message.content)
         else:
             return None
-        return json.loads(text)
+        return _ensure_dict_response(json.loads(text), text)
     except Exception as exc:
         if privacy_safe:
-            logger.error("smartpbx_post_call event=extraction_retry_failed")
+            logger.error(
+                "smartpbx_post_call event=extraction_retry_failed exc_type=%s",
+                type(exc).__name__,
+            )
         else:
             logger.error("Retry extraction failed: %s", exc)
         return None

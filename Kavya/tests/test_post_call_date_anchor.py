@@ -9,6 +9,7 @@ frozen. Shared by the Twilio and SmartPBX post-call flows.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date
 from types import SimpleNamespace
@@ -16,6 +17,19 @@ from types import SimpleNamespace
 import pytest
 
 import post_call
+
+
+def _extract_with_text_blocks(blocks: list[SimpleNamespace]) -> SimpleNamespace:
+    return SimpleNamespace(content=blocks)
+
+
+class _FakeAnthropicClient:
+    def __init__(self, content_blocks: list[SimpleNamespace]):
+        self._response = _extract_with_text_blocks(content_blocks)
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, **_kwargs):
+        return self._response
 
 
 class RecordingClaude:
@@ -31,11 +45,21 @@ class RecordingClaude:
         if system is not None:
             self.system_prompts.append(system)
         self.user_prompts.append(messages[-1]["content"])
-        return SimpleNamespace(content=[SimpleNamespace(text=self._responder(system, messages))])
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=self._responder(system, messages))]
+        )
 
 
 def _static_json(_system, _messages):
     return '{"guest_name": "Test", "summary": "ok"}'
+
+
+def _text_block(content: str) -> SimpleNamespace:
+    return SimpleNamespace(type="text", text=content)
+
+
+def _non_text_block() -> SimpleNamespace:
+    return SimpleNamespace(type="tool_use", id="tool-1")
 
 
 def test_extraction_system_prompt_builder_injects_the_given_date():
@@ -114,6 +138,49 @@ async def test_spoken_date_resolves_to_the_next_occurrence_year(monkeypatch):
         lang="en", llm_provider="claude", anthropic_client=client, model="m",
     )
     assert result["check_in"] == "2026-09-27", "must not pick a past year"
+
+
+@pytest.mark.asyncio
+async def test_non_dict_extraction_payload_triggers_retry_path(monkeypatch, caplog):
+    client = _FakeAnthropicClient([_text_block("[{\"ok\": false}]")])
+    calls = {"retry_count": 0}
+
+    async def _retry(*_args, **_kwargs):
+        calls["retry_count"] += 1
+        return {"guest_name": "Retry Name", "summary": "Recovered."}
+
+    monkeypatch.setattr(post_call, "_retry_extraction", _retry)
+    with caplog.at_level(logging.WARNING):
+        result = await post_call.extract_booking_details(
+            "Transcript text", lang="en", llm_provider="claude",
+            anthropic_client=client, model="m", privacy_safe=True,
+        )
+    assert calls["retry_count"] == 1
+    assert result["guest_name"] == "Retry Name"
+    assert "smartpbx_post_call event=extraction_failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_later_text_block_is_used_for_claude_extraction():
+    client = _FakeAnthropicClient([_non_text_block(), _text_block(
+        '{"guest_name": "Later Block", "summary": "ok"}',
+    )])
+    result = await post_call._extract_with_claude(
+        client=client, transcript_text="txt", model="m", system_prompt="sys",
+    )
+    assert result["guest_name"] == "Later Block"
+
+
+@pytest.mark.asyncio
+async def test_privacy_safe_extraction_failure_logs_exception_type(caplog):
+    client = _FakeAnthropicClient([_non_text_block()])
+    with caplog.at_level(logging.ERROR):
+        result = await post_call.extract_booking_details(
+            "Transcript text", lang="en", llm_provider="claude",
+            anthropic_client=client, model="m", privacy_safe=True,
+        )
+    assert "smartpbx_post_call event=extraction_failed exc_type=ValueError" in caplog.text
+    assert result["_extraction_error"] == "extraction_failed"
 
 
 class _FrozenDate:

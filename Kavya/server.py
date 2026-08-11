@@ -2892,6 +2892,47 @@ def _make_stt(
 
 
 # ---------------------------------------------------------------------------
+# Prompt-cache layout: the stable system prompt is the cache_control-marked
+# block; the volatile booking-slots note rides behind it uncached so slot
+# updates never invalidate the ~8k-token cached prefix (tools + system).
+# ---------------------------------------------------------------------------
+
+_BOOKING_SLOTS_NOTE_PREFIX = (
+    "\n\nBOOKING DETAILS COLLECTED SO FAR THIS CALL (the guest already "
+    "gave these — do NOT re-ask; only confirm if genuinely unsure):\n"
+)
+
+
+def _build_claude_system_blocks(
+    stable_system_prompt: str,
+    booking_slots_note: str = "",
+) -> list[dict[str, Any]]:
+    system_blocks: list[dict[str, Any]] = [{
+        "type": "text",
+        "text": stable_system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+    if booking_slots_note:
+        system_blocks.append({
+            "type": "text",
+            "text": booking_slots_note,
+        })
+    return system_blocks
+
+
+def _split_claude_system_blocks(system_prompt: str) -> list[dict[str, Any]]:
+    if _BOOKING_SLOTS_NOTE_PREFIX in system_prompt:
+        stable, note_tail = system_prompt.split(_BOOKING_SLOTS_NOTE_PREFIX, 1)
+        return _build_claude_system_blocks(
+            stable,
+            f"{_BOOKING_SLOTS_NOTE_PREFIX}{note_tail}"
+            if note_tail
+            else "",
+        )
+    return _build_claude_system_blocks(system_prompt)
+
+
+# ---------------------------------------------------------------------------
 # Media Stream Session (Sinhala / Tamil calls)
 # ---------------------------------------------------------------------------
 
@@ -3183,11 +3224,7 @@ class MediaStreamSession:
             lines.append(f"- phone: {slots['guest_phone']}")
         if not lines:
             return ""
-        return (
-            "\n\nBOOKING DETAILS COLLECTED SO FAR THIS CALL (the guest already "
-            "gave these — do NOT re-ask; only confirm if genuinely unsure):\n"
-            + "\n".join(lines)
-        )
+        return f"{_BOOKING_SLOTS_NOTE_PREFIX}{'\n'.join(lines)}"
 
     def _active_system_prompt(self) -> str:
         """The system prompt plus any booking slots captured so far."""
@@ -4187,11 +4224,9 @@ class MediaStreamSession:
             async with self.anthropic_client.messages.stream(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
-                system=[{
-                    "type": "text",
-                    "text": self._active_system_prompt(),
-                    "cache_control": {"type": "ephemeral"},
-                }],
+                system=_build_claude_system_blocks(
+                    self.system_prompt, self._booking_slots_note()
+                ),
                 messages=self.history,
                 tools=self.tools if self.tools else NOT_GIVEN,
             ) as stream:
@@ -5053,11 +5088,7 @@ async def _run_llm_streaming_claude(
         async with client.messages.stream(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=[{
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral"},
-            }],
+            system=_split_claude_system_blocks(system),
             messages=conversation_history,
             tools=tools if tools else NOT_GIVEN,
         ) as stream:
