@@ -167,6 +167,15 @@ No beta/global tool is implemented.
 
 `transfer_call` accepts a logical destination key, not an arbitrary URI from an LLM. Configuration maps that key to an exact URI from `SMARTPBX_TRANSFER_DESTINATIONS_JSON`. The caller/LLM cannot provide or modify the final URI. This prevents premium-number and arbitrary-SIP transfer abuse.
 
+> **CORRECTED 2026-08-11 — `destination_number` IS WRONG AND NEVER WORKED.** Verified against the live
+> endpoint with the production key: `tools/list` declares `transfer_call` with `inputSchema`
+> `{"number": <string>}`, `required: ["number"]`. Sending `destination_number` returns a JSON-RPC
+> error over HTTP 200 (`-32603 required argument "destination number" not found`) and transfers
+> nobody. The value must also be the bare dialable number — `tel:+94711754668` is our allowlist
+> notation, and the scheme must be stripped at the wire boundary. Kavya was fixed in
+> `Kavya/smartpbx_mcp.py`; **`Flico Agent/smartpbx_mcp.py:266` still sends the wrong argument and its
+> SmartPBX handover is broken in production.**
+
 The MCP tool argument is exactly `destination_number`. The initial fallback destination is configured by the operator after Dialog confirms the live queue or extension URI. An unavailable or unconfigured destination or account-header mode leaves transfer disabled rather than guessing from the PDF conflicts.
 
 ## Failure Policy
