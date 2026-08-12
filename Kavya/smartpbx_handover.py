@@ -102,10 +102,11 @@ class SmartPBXHandoverCoordinator:
                     raise
                 except Exception:
                     pass
+                await self._deliver_notification(outcome="transfer_succeeded")
                 await self._send_dashboard()
                 return self._result
             self._phase = HandoverPhase.IMMEDIATE_FAILED
-            notification = await self._deliver_notification()
+            notification = await self._deliver_notification(outcome="transfer_failed")
             self._result = json.dumps({"status": "unavailable", "notification": notification})
             return self._result
 
@@ -121,7 +122,7 @@ class SmartPBXHandoverCoordinator:
             async with asyncio.timeout(_FINALIZE_RETRY_TIMEOUT):
                 async with self._lock:
                     if self._phase is HandoverPhase.IMMEDIATE_FAILED and self._notification_state == "failed":
-                        await self._deliver_notification()
+                        await self._deliver_notification(outcome="transfer_failed")
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -165,7 +166,7 @@ class SmartPBXHandoverCoordinator:
         except Exception:
             return
 
-    async def _deliver_notification(self) -> str:
+    async def _deliver_notification(self, outcome: str) -> str:
         if self._notification_state == "sent":
             return "sent"
         if self._notification_attempts >= 2:
@@ -185,22 +186,30 @@ class SmartPBXHandoverCoordinator:
         self._notification_attempts += 1
         self._notification_state = "failed"
         summary = "Live transfer could not be started; please call the guest back. " + self._reason
+        if outcome == "transfer_succeeded":
+            summary = "Live transfer was started; please call the guest back if needed. " + self._reason
         tail = bound_transcript_tail(self._transcript())
         if tail:
             summary += "\n\nLast exchanges:\n" + tail
         try:
             async with asyncio.timeout(5):
-                outcome = await self._notification_sender(call_sid=self._call_sid, customer_name="Unknown",
-                    customer_whatsapp=self._caller_phone, call_summary=summary[:3628],
-                    human_agent_whatsapp=self._human_agent_whatsapp, privacy_safe=True)
+                notification_outcome = await self._notification_sender(
+                    call_sid=self._call_sid,
+                    customer_name="Unknown",
+                    customer_whatsapp=self._caller_phone,
+                    call_summary=summary[:3628],
+                    human_agent_whatsapp=self._human_agent_whatsapp,
+                    privacy_safe=True,
+                    outcome=outcome,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
             self._notification_state = "failed"
             return self._notification_state
-        if outcome.get("ok"):
+        if notification_outcome.get("ok"):
             self._notification_state = "sent"
-        elif outcome.get("error") == "missing_customer_whatsapp":
+        elif notification_outcome.get("error") == "missing_customer_whatsapp":
             self._notification_state = "not_actionable"
         else:
             self._notification_state = "failed"

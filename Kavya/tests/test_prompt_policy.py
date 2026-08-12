@@ -468,3 +468,20 @@ def test_prompt_cannot_confirm_the_booking_if_the_guest_refuses_caller_id_too():
 def test_prompt_exempts_foreign_numbers_from_the_nine_digit_rule():
     assert "FOREIGN NUMBERS" in PROMPT
     assert "nine-digit rule does NOT apply" in PROMPT
+
+
+def test_prompt_requires_immediate_proactive_transfer_on_explicit_request():
+    """Transfer requests should not be followed by silence or a confirm prompt.
+
+    When the guest explicitly asks for a human, the path should be announced
+    and executed in the same turn unless the request is genuinely ambiguous.
+    """
+    assert "If the guest explicitly asks for a human, agent, manager, or real person" in PROMPT
+    assert "immediately acknowledge and transfer in the same turn" in PROMPT
+    assert "Do not ask for separate confirmation if the request is explicit" in PROMPT
+
+
+def test_prompt_promotes_obvious_next_step_proactively():
+    """When the next action is obvious, Kavya should take it rather than wait."""
+    assert "When the obvious next step after a repeated failure is available" in PROMPT
+    assert "do the obvious next step instead of waiting to be asked again." in PROMPT.lower()

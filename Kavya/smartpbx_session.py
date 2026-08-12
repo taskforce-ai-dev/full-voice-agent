@@ -282,7 +282,11 @@ class KavyaSmartPBXSession:
             dashboard_sender=dashboard_sender, notification_sender=handover.send_handover_notification,
             human_agent_whatsapp=os.getenv("SMARTPBX_HUMAN_AGENT_WHATSAPP", ""),
         )
-        self._smartpbx_transfer_context = SmartPBXTransferContext(control, coordinator=coordinator)
+        self._smartpbx_transfer_context = SmartPBXTransferContext(
+            control,
+            coordinator=coordinator,
+            pipeline=pipeline,
+        )
         pipeline._smartpbx_transfer_context = self._smartpbx_transfer_context
         pipeline._smartpbx_caller_context = {
             "caller_phone": self._context.caller_number,
