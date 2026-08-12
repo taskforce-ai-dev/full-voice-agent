@@ -14,7 +14,51 @@ def test_english_speech_context_includes_digit_sequence_oov_class(monkeypatch):
     assert contexts[0].kwargs["phrases"] == list(server.EN_STT_PHRASE_LIST[:server.STT_MAX_ADAPTATION_PHRASES])
     assert contexts[0].kwargs["boost"] == server.STT_ADAPTATION_BOOST
     assert contexts[1].kwargs["phrases"] == ["$OOV_CLASS_DIGIT_SEQUENCE"]
-    assert contexts[1].kwargs["boost"] == 4.0
+    assert contexts[1].kwargs["boost"] == server.STT_DIGIT_CLASS_BOOST
+
+
+def test_english_speech_context_omits_digit_sequence_oov_class_when_disabled(monkeypatch):
+    fake, _recorded = _fake_google_speech()
+    monkeypatch.setattr(server, "google_speech", fake)
+    monkeypatch.setattr(server, "STT_DIGIT_CLASS_BOOST", 0.0)
+
+    stt = _stream(lang="en")
+    config = stt._streaming_config("en-US", server.STT_ALTERNATIVES.get("en", []), enhanced=True)
+
+    contexts = config.kwargs["config"].kwargs["speech_contexts"]
+    assert len(contexts) == 1
+    assert contexts[0].kwargs["phrases"] == list(server.EN_STT_PHRASE_LIST[:server.STT_MAX_ADAPTATION_PHRASES])
+
+
+def test_english_speech_context_uses_clamped_digit_class_boost():
+    assert server._parse_clamped_float(
+        {"STT_DIGIT_CLASS_BOOST": "25"},
+        "STT_DIGIT_CLASS_BOOST",
+        4.0,
+        0.0,
+        20.0,
+    ) == 20.0
+    assert server._parse_clamped_float(
+        {"STT_DIGIT_CLASS_BOOST": "-7"},
+        "STT_DIGIT_CLASS_BOOST",
+        4.0,
+        0.0,
+        20.0,
+    ) == 0.0
+
+
+def test_stt_digit_class_context_obeys_custom_boost(monkeypatch):
+    fake, _recorded = _fake_google_speech()
+    monkeypatch.setattr(server, "google_speech", fake)
+    monkeypatch.setattr(server, "STT_DIGIT_CLASS_BOOST", 6.5)
+
+    stt = _stream(lang="en")
+    config = stt._streaming_config("en-US", server.STT_ALTERNATIVES.get("en", []), enhanced=True)
+
+    contexts = config.kwargs["config"].kwargs["speech_contexts"]
+    assert len(contexts) == 2
+    assert contexts[1].kwargs["phrases"] == ["$OOV_CLASS_DIGIT_SEQUENCE"]
+    assert contexts[1].kwargs["boost"] == 6.5
 
 
 def test_other_languages_do_not_apply_english_speech_contexts(monkeypatch):

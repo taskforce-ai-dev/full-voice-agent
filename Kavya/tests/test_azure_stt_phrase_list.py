@@ -100,6 +100,11 @@ def test_room_names_are_derived_from_the_shared_vocabulary_not_relisted():
         assert room in server.EN_STT_PHRASE_LIST
 
 
+def test_english_digit_repeat_terms_are_present_in_stt_phrase_list():
+    for term in ("double", "triple", "treble", "nought"):
+        assert term in server.EN_STT_PHRASE_LIST, f"digit term {term} is required in EN_STT_PHRASE_LIST"
+
+
 def test_english_recognizer_gets_the_phrase_list_populated(monkeypatch):
     factory = _run_start(monkeypatch, lang="en")
 
