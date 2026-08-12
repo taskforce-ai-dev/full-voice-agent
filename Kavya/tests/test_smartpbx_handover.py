@@ -91,6 +91,8 @@ async def test_immediate_failure_keeps_pipeline_active_and_notifies_once_then_re
     assert coordinator.phase is HandoverPhase.IMMEDIATE_FAILED
     assert pipeline.entered == 0
     assert len(notifications) == 2
+    assert notifications[0]["outcome"] == "transfer_failed"
+    assert notifications[1]["outcome"] == "transfer_failed"
     assert notifications[0]["privacy_safe"] is True
 
 
@@ -138,12 +140,7 @@ def _session_factory(outcome):
 
 @pytest.mark.asyncio
 async def test_dialog_acknowledgement_transfers_and_never_whatsapps_the_manager():
-    """End to end: the argument Dialog wants, and no failsafe on a real transfer.
-
-    This is the 2026-08-11 outage in one assertion -- the guest was not
-    transferred AND the manager was WhatsApped, which is the combination that
-    tells an operator the transfer path is broken.
-    """
+    """A provider-approved transfer still sends one WhatsApp heads-up."""
     acknowledged = type("Result", (), {"content": [type("T", (), {"text": "ok"})()]})()
     factory, calls = _session_factory(acknowledged)
     notifications = []
@@ -163,7 +160,8 @@ async def test_dialog_acknowledgement_transfers_and_never_whatsapps_the_manager(
     assert calls == [("transfer_call", {"number": "+94711754668"})]
     assert result == {"status": "transferred", "confirmation": "provider_acknowledged"}
     assert coordinator.transfer_pending is True
-    assert notifications == []
+    assert len(notifications) == 1
+    assert notifications[0]["outcome"] == "transfer_succeeded"
 
 
 @pytest.mark.asyncio
@@ -195,6 +193,7 @@ async def test_rejected_request_still_falls_back_to_the_manager_whatsapp():
     assert result == {"status": "unavailable", "notification": "sent"}
     assert coordinator.transfer_pending is False
     assert len(notifications) == 1
+    assert notifications[0]["outcome"] == "transfer_failed"
 
 
 @pytest.mark.asyncio
@@ -216,4 +215,30 @@ async def test_concurrent_attempts_dispatch_and_notify_only_once_per_attempt():
 
     assert len(control.calls) == 1
     assert len(notifications) == 1
+    assert notifications[0]["outcome"] == "transfer_failed"
     assert all(json.loads(value)["status"] == "unavailable" for value in results)
+
+
+@pytest.mark.asyncio
+async def test_transfer_succeeded_and_failed_outcomes_are_in_payload():
+    notifications = []
+
+    async def notify(**kwargs):
+        notifications.append((kwargs["call_sid"], kwargs.get("outcome")))
+        return {"ok": True}
+
+    success = SmartPBXHandoverCoordinator(
+        call_control=_Control(result=type("Result", (), {"transferred": True})()),
+        pipeline=_Pipeline(), call_sid="success-call", caller_phone="0771234567", transcript=lambda: [],
+        dashboard_sender=None, notification_sender=notify, human_agent_whatsapp="0770000000",
+    )
+    failure = SmartPBXHandoverCoordinator(
+        call_control=_Control(result=type("Result", (), {"transferred": False})()),
+        pipeline=_Pipeline(), call_sid="failed-call", caller_phone="0771234567", transcript=lambda: [],
+        dashboard_sender=None, notification_sender=notify, human_agent_whatsapp="0770000000",
+    )
+
+    await success.attempt("first")
+    await failure.attempt("second")
+
+    assert notifications == [("success-call", "transfer_succeeded"), ("failed-call", "transfer_failed")]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -27,6 +28,38 @@ BASE_ENV = {
     "SMARTPBX_MCP_ACCOUNT_HEADER": "account_id",
     "SMARTPBX_TRANSFER_DESTINATIONS_JSON": '{"human_support":"tel:+94110000000"}',
 }
+
+
+class _TransferPipelineStub:
+    def __init__(self, events: list[tuple[str, str]], *, generated: list[str] | None = None,
+                 auto_deliver: bool = True):
+        self.events = events
+        self._assistant_turn_generation = 7
+        self._assistant_turn_generated_sentences = list(generated or [])
+        self._delivered_sentences = []
+        self._track_assistant_turn_delivery = True
+        self._speak_generation = 0
+        self._auto_deliver = auto_deliver
+
+    async def _invoke_speak(self, text: str, generation: int = -1, sentence: str | None = None) -> None:
+        self.events.append(("speak", sentence or text))
+        if sentence:
+            self._assistant_turn_generated_sentences.append(sentence)
+            if self._auto_deliver:
+                self._delivered_sentences.append(sentence)
+
+    def mark_delivered(self, sentence: str) -> None:
+        self._delivered_sentences.append(sentence)
+        self.events.append(("delivered", sentence))
+
+
+class _TransferCoordinatorStub:
+    def __init__(self, events: list[tuple[str, str]]):
+        self.events = events
+
+    async def attempt(self, reason: str) -> str:
+        self.events.append(("attempt", (reason or "").strip()))
+        return json.dumps({"status": "unavailable"})
 
 
 def settings(**overrides):
@@ -699,3 +732,90 @@ async def test_legacy_transfer_tool_result_is_byte_for_byte_equivalent():
     )
 
     assert result == '{"status": "transferring", "reason": "Caller asked for the manager."}'
+
+
+@pytest.mark.asyncio
+async def test_transfer_announcement_is_spoken_and_waited_for_before_mcp_call():
+    events: list[tuple[str, str]] = []
+    pipeline = _TransferPipelineStub(events)
+    coordinator = _TransferCoordinatorStub(events)
+
+    from tools import (
+        TRANSFER_ANNOUNCEMENT_TEXT,
+        SmartPBXTransferContext,
+        execute_tool,
+        smartpbx_transfer_context,
+    )
+
+    token = smartpbx_transfer_context.set(
+        SmartPBXTransferContext(call_control=None, coordinator=coordinator, pipeline=pipeline)
+    )
+    try:
+        result = await execute_tool("transfer_to_human", {"reason": "Manager please"})
+    finally:
+        smartpbx_transfer_context.reset(token)
+
+    assert result == '{"status": "unavailable"}'
+    assert events[0] == ("speak", TRANSFER_ANNOUNCEMENT_TEXT)
+    assert events[1][0] == "attempt"
+
+
+@pytest.mark.asyncio
+async def test_stuck_transfer_announcement_delivery_is_bounded_by_tts_timeout(monkeypatch):
+    events: list[tuple[str, str]] = []
+    pipeline = _TransferPipelineStub(events, auto_deliver=False)
+    coordinator = _TransferCoordinatorStub(events)
+
+    import tools
+
+    monkeypatch.setattr(tools, "TRANSFER_ANNOUNCEMENT_TIMEOUT_SECONDS", 0.05)
+    start = asyncio.get_running_loop().time()
+    token = tools.smartpbx_transfer_context.set(
+        tools.SmartPBXTransferContext(
+            call_control=None,
+            coordinator=coordinator,
+            pipeline=pipeline,
+        )
+    )
+    try:
+        result = await tools.execute_tool("transfer_to_human", {"reason": "urgent"})
+    finally:
+        tools.smartpbx_transfer_context.reset(token)
+    elapsed = asyncio.get_running_loop().time() - start
+
+    assert result == '{"status": "unavailable"}'
+    assert elapsed < 0.20
+    assert events[0] == ("speak", tools.TRANSFER_ANNOUNCEMENT_TEXT)
+    assert events[1][0] == "attempt"
+
+
+@pytest.mark.asyncio
+async def test_model_spoken_turn_is_used_when_available_and_canned_announcement_is_skipped():
+    events: list[tuple[str, str]] = []
+    pipeline = _TransferPipelineStub(
+        events,
+        generated=["I can transfer you now"],
+        auto_deliver=False,
+    )
+    coordinator = _TransferCoordinatorStub(events)
+
+    from tools import SmartPBXTransferContext, execute_tool, smartpbx_transfer_context
+
+    async def deliver_model_sentence() -> None:
+        await asyncio.sleep(0.02)
+        pipeline.mark_delivered("I can transfer you now")
+
+    token = smartpbx_transfer_context.set(
+        SmartPBXTransferContext(call_control=None, coordinator=coordinator, pipeline=pipeline)
+    )
+    try:
+        delivery = asyncio.create_task(deliver_model_sentence())
+        result = await execute_tool("transfer_to_human", {"reason": "urgent"})
+        await delivery
+    finally:
+        smartpbx_transfer_context.reset(token)
+
+    assert result == '{"status": "unavailable"}'
+    assert ("speak", "I can transfer you now") not in events
+    assert events[0] == ("delivered", "I can transfer you now")
+    assert events[1][0] == "attempt"

@@ -469,9 +469,10 @@ def build_payload(
     customer_whatsapp: str,
     call_summary: str,
     human_agent_whatsapp: str,
+    outcome: str | None = None,
 ) -> dict[str, str]:
     """Assemble the n8n handover payload with both numbers normalised."""
-    return {
+    payload = {
         "call_sid": (call_sid or "").strip() or "unknown",
         "customer_name": (customer_name or "").strip() or "Unknown",
         "customer_whatsapp": normalize_whatsapp(customer_whatsapp),
@@ -479,6 +480,10 @@ def build_payload(
         "human_agent_whatsapp": normalize_whatsapp(human_agent_whatsapp),
         "timestamp": utc_timestamp(),
     }
+    value = (outcome or "").strip()
+    if value:
+        payload["outcome"] = value
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +497,7 @@ async def send_handover_notification(
     customer_whatsapp: str,
     call_summary: str,
     human_agent_whatsapp: str,
+    outcome: str | None = None,
     privacy_safe: bool = False,
 ) -> dict[str, Any]:
     """POST the handover payload to n8n.
@@ -505,6 +511,7 @@ async def send_handover_notification(
         customer_whatsapp=customer_whatsapp,
         call_summary=call_summary,
         human_agent_whatsapp=human_agent_whatsapp,
+        outcome=outcome,
     )
 
     if not payload["customer_whatsapp"]:

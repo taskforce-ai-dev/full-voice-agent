@@ -35,6 +35,7 @@ required again, and letting `normalise_property` return None. Do not delete it.
 import asyncio
 import json
 import logging
+import os
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,12 +51,29 @@ from booking_api import (
 logger = logging.getLogger(__name__)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+TRANSFER_ANNOUNCEMENT_TEXT: str = os.getenv(
+    "TRANSFER_ANNOUNCEMENT_TEXT",
+    "Of course — I'm transferring you to a colleague now. Please hold the line."
+)
+TRANSFER_ANNOUNCEMENT_TIMEOUT_SECONDS: float = _env_float(
+    "TRANSFER_ANNOUNCEMENT_TIMEOUT_SECONDS", 6.0
+)
+
+
 @dataclass
 class SmartPBXTransferContext:
     """Per-utterance Dialog handover state; None deliberately means legacy Twilio."""
 
     call_control: Any | None
     coordinator: Any | None = None
+    pipeline: Any | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     transfer_attempted: bool = False
 
@@ -762,6 +780,7 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     elif tool_name == "transfer_to_human":
         if transfer_context is not None:
             if transfer_context.coordinator is not None:
+                await _ensure_transfer_speech_and_delivery(transfer_context)
                 return await transfer_context.coordinator.attempt(tool_input.get("reason"))
             async with transfer_context.lock:
                 if transfer_context.transfer_attempted:
@@ -941,3 +960,70 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     else:
         logger.info("smartpbx_tool event=result tool=%s", tool_name)
     return json.dumps(result)
+
+
+async def _ensure_transfer_speech_and_delivery(context: SmartPBXTransferContext) -> None:
+    """Deliver pre-transfer speech before any MCP call.
+
+    If the model already spoke in this assistant turn, do not inject the
+    canned fallback line; wait for the existing turn audio to report delivery.
+    """
+    pipeline = context.pipeline
+    if pipeline is None:
+        return
+
+    announce_text = TRANSFER_ANNOUNCEMENT_TEXT
+    timeout = max(0.0, TRANSFER_ANNOUNCEMENT_TIMEOUT_SECONDS)
+
+    generated = list(getattr(pipeline, "_assistant_turn_generated_sentences", []))
+    generation = int(getattr(pipeline, "_assistant_turn_generation", -1))
+    if not generated:
+        invoker = getattr(pipeline, "_invoke_speak", None)
+        if invoker is not None:
+            try:
+                await invoker(
+                    announce_text,
+                    generation=int(getattr(pipeline, "_speak_generation", 0)),
+                    sentence=announce_text,
+                )
+            except Exception:
+                logger.exception("smartpbx_tool event=transfer_announcement_tts_failure")
+                return
+            generation = int(getattr(pipeline, "_assistant_turn_generation", generation))
+            generated = list(getattr(pipeline, "_assistant_turn_generated_sentences", []))
+
+    await _await_turn_delivery(
+        pipeline,
+        generation=generation,
+        expected=len(generated),
+        timeout=timeout,
+    )
+
+
+async def _await_turn_delivery(
+    pipeline: Any,
+    *,
+    generation: int,
+    expected: int,
+    timeout: float,
+) -> None:
+    """Wait for the current assistant turn's sentence-delivery accounting.
+
+    The accounting is driven by _send_tts_done, which already uses the shared
+    Dialog barrier (send_mark -> queue.join). Keep this wait bounded so blocked
+    TTS cannot keep transfer hanging indefinitely.
+    """
+    if expected <= 0 or timeout <= 0:
+        return
+
+    try:
+        async with asyncio.timeout(timeout):
+            while (
+                int(getattr(pipeline, "_assistant_turn_generation", -1)) == generation
+                and len(getattr(pipeline, "_delivered_sentences", [])) < expected
+            ):
+                await asyncio.sleep(0)
+    except TimeoutError:
+        logger.warning(
+            "smartpbx_tool event=transfer_delivery_timeout timeout=%.2f", timeout,
+        )
