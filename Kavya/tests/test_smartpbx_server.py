@@ -1616,6 +1616,73 @@ class CapturingTextWebSocket:
 
 
 @pytest.mark.asyncio
+async def test_direct_english_capture_tool_uses_last_raw_utterance_for_number_and_name(monkeypatch):
+    import server
+
+    client = direct_tool_client("openai", [
+        direct_tool_round("openai", {"spoken": "zero one"}, tool_name="capture_spoken_number"),
+        direct_text_round("openai", "Thanks, got the number."),
+        direct_tool_round("openai", {"spoken": "bad-model-name"}, tool_name="capture_spoken_name"),
+        direct_text_round("openai", "Thanks, got the name."),
+    ])
+    pipeline = direct_tool_pipeline(server, "openai", client)
+    captured: list[tuple[str, str]] = []
+
+    async def successful_tool(name, arguments):
+        captured.append((name, arguments.get("spoken")))
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    await pipeline._process_utterance_bound("double seven")
+    await pipeline._process_utterance_bound("Jane Doe")
+
+    assert captured == [
+        ("capture_spoken_number", "double seven"),
+        ("capture_spoken_name", "Jane Doe"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openai_streaming_capture_tool_falls_back_to_model_spoken_without_user_utterance(monkeypatch):
+    import server
+
+    socket = CapturingTextWebSocket()
+    client = direct_tool_client("openai", [
+        direct_tool_round("openai", {"spoken": "zero one two"}, tool_name="capture_spoken_number"),
+        direct_text_round("openai", "Got it."),
+    ])
+    captured: list[dict[str, object]] = []
+
+    async def successful_tool(name, arguments):
+        captured.append(arguments)
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    await server._run_llm_streaming(
+        client=client,
+        system="You are a booking assistant.",
+        conversation_history=[{"role": "assistant", "content": "No user turn in this turn."}],
+        tools=server.get_tools(),
+        websocket=socket,
+    )
+
+    assert captured == [{"spoken": "zero one two"}]
+
+
+def test_extract_last_user_utterance_strips_reference_context_prefix():
+    import server
+
+    history = [
+        {"role": "user", "content": "stale turn"},
+        {"role": "assistant", "content": "assistant follows"},
+        {"role": "user", "content": "[Reference context: context payload.]\n\nGuest: double seven"},
+    ]
+
+    assert server._extract_last_user_utterance(history) == "double seven"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
 async def test_direct_english_tool_failure_uses_one_filler_and_opaque_recovery(monkeypatch, caplog, provider):
     import server

@@ -640,6 +640,10 @@ def _parse_clamped_float(
 
 _ECHO_NORMALIZE_PATTERN = re.compile(r"[^\w\s]+", re.UNICODE)
 _ECHO_AFFIRMATION_TOKENS: set[str] = {"yes", "yeah", "no", "correct", "right", "okay"}
+_REFERENCE_CONTEXT_PREFIX_PATTERN = re.compile(
+    r"^\[Reference context:\s*.*?\]\s*(?:\r?\n\s*)*Guest:\s*",
+    re.DOTALL,
+)
 
 
 def _normalize_for_overlap(text: str) -> str:
@@ -663,6 +667,75 @@ def _token_overlap_ratio(reference: str, transcript: str) -> float:
     matcher = difflib.SequenceMatcher(None, reference_tokens, transcript_tokens)
     matched = sum(block.size for block in matcher.get_matching_blocks())
     return matched / len(transcript_tokens)
+
+
+def _strip_reference_context(utterance: str) -> str:
+    """Drop a ConversationRelay reference-context wrapper from user turns."""
+    if not utterance:
+        return utterance
+    stripped = utterance.lstrip()
+    if not stripped.startswith("[Reference context:"):
+        return utterance.strip()
+    if _REFERENCE_CONTEXT_PREFIX_PATTERN.match(stripped) is None:
+        return utterance.strip()
+    return _REFERENCE_CONTEXT_PREFIX_PATTERN.sub("", stripped).strip()
+
+
+def _extract_last_user_utterance(conversation_history: list[dict[str, Any]]) -> str:
+    """Find the latest user text in history, preferring the raw utterance."""
+    for message in reversed(conversation_history):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return _strip_reference_context(content)
+    return ""
+
+
+_CONVERSATION_CAPTURE_TOOLS: set[str] = {
+    "capture_spoken_number",
+    "capture_spoken_name",
+}
+
+
+def _override_capture_spoken_argument(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    override_spoken: str,
+    *,
+    source: str,
+) -> tuple[dict[str, Any], bool]:
+    """Return tool args with spoken text replaced from the raw utterance."""
+    if tool_name not in _CONVERSATION_CAPTURE_TOOLS:
+        return tool_input, False
+
+    if not isinstance(tool_input, dict):
+        return tool_input, False
+
+    model_spoken = tool_input.get("spoken")
+    if model_spoken is None:
+        model_spoken = ""
+    elif not isinstance(model_spoken, str):
+        model_spoken = str(model_spoken)
+
+    if not override_spoken:
+        return tool_input, False
+
+    if override_spoken == model_spoken:
+        return tool_input, False
+
+    logger.info(
+        "%s event=tool_arg_override tool=%s model_len=%d raw_len=%d",
+        source,
+        tool_name,
+        len(model_spoken),
+        len(override_spoken),
+    )
+    overridden = dict(tool_input)
+    overridden["spoken"] = override_spoken
+    return overridden, True
 
 
 def _append_booking_confirmation_marker(
@@ -893,6 +966,11 @@ STT_GOOGLE_MODEL_EN: str = os.getenv("STT_GOOGLE_MODEL_EN", "telephony")
 # Speech adaptation boost for the booking-domain phrase list (English only).
 STT_ADAPTATION_BOOST: float = _parse_clamped_float(
     os.environ, "STT_ADAPTATION_BOOST", 15.0, 0.0, 20.0
+)
+# Boost for the digit-class speech context appended to English streams. Set to
+# ``0`` to disable the context entirely.
+STT_DIGIT_CLASS_BOOST: float = _parse_clamped_float(
+    os.environ, "STT_DIGIT_CLASS_BOOST", 4.0, 0.0, 20.0
 )
 STT_MAX_ADAPTATION_PHRASES: int = 500
 
@@ -1383,6 +1461,10 @@ def _build_system_prompt(lang: str = "en") -> str:
         "question at a time, in this order: full name (no salutation), "
         "then mobile number. Do NOT ask for an email address at any "
         "point — we do not collect email.\n"
+        "- The order is a default, never a gate: if the guest offers their "
+        "phone number (or any detail) before you asked for it, capture it "
+        "IMMEDIATELY with the proper tool — never deflect or ask them to "
+        "wait — then return to whatever was still missing.\n"
         "- For full name: you MUST capture a first name and a last name "
         "(surname / family name) before proceeding. The guest may give more "
         "than two tokens — a first, middle and last name is a normal, "
@@ -3204,12 +3286,15 @@ class GoogleSTTStream:
                     speech_context(
                         phrases=list(EN_STT_PHRASE_LIST[:STT_MAX_ADAPTATION_PHRASES]),
                         boost=STT_ADAPTATION_BOOST,
-                    ),
-                    speech_context(
-                        phrases=["$OOV_CLASS_DIGIT_SEQUENCE"],
-                        boost=4.0,
                     )
                 ]
+                if STT_DIGIT_CLASS_BOOST > 0:
+                    recognition["speech_contexts"].append(
+                        speech_context(
+                            phrases=["$OOV_CLASS_DIGIT_SEQUENCE"],
+                            boost=STT_DIGIT_CLASS_BOOST,
+                        )
+                    )
         return google_speech.StreamingRecognitionConfig(
             config=google_speech.RecognitionConfig(**recognition),
             interim_results=True,
@@ -3565,6 +3650,7 @@ class MediaStreamSession:
         # guard without clobbering a newer turn started by a barge-in.
         self._utterance_dispatched = False
         self._utterance_turn = 0
+        self._last_guest_utterance_raw: str = ""
         # Capture-mode keeps endpointing looser while the caller is dictating
         # a number or name across fragments.
         self._capture_mode_active: bool = False
@@ -4425,6 +4511,7 @@ class MediaStreamSession:
                 smartpbx_transfer_context.reset(transfer_token)
 
     async def _process_utterance_bound(self, text: str):
+        self._last_guest_utterance_raw = text
         self._start_assistant_turn_delivery_tracking()
         try:
             # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
@@ -4577,6 +4664,12 @@ class MediaStreamSession:
                     except json.JSONDecodeError:
                         logger.error("Bad tool JSON for %s", tc["name"])
                         parsed_input = {}
+                    parsed_input, _ = _override_capture_spoken_argument(
+                        tool_name=tc["name"],
+                        tool_input=parsed_input,
+                        override_spoken=self._last_guest_utterance_raw,
+                        source="smartpbx_media",
+                    )
                     self._log_tool_execution(tc["name"], parsed_input)
                     try:
                         if tc["name"] == "collect_number_via_keypad":
@@ -4830,6 +4923,12 @@ class MediaStreamSession:
 
                     for tc in tool_calls_openai:
                         parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+                        parsed_input, _ = _override_capture_spoken_argument(
+                            tool_name=tc["function"]["name"],
+                            tool_input=parsed_input,
+                            override_spoken=self._last_guest_utterance_raw,
+                            source="smartpbx_media",
+                        )
                         self._log_tool_execution(tc["function"]["name"], parsed_input)
                         try:
                             if tc["function"]["name"] == "collect_number_via_keypad":
@@ -5548,6 +5647,12 @@ async def _run_llm_streaming(
                 except json.JSONDecodeError:
                     logger.error("Bad tool JSON for %s: %s", tc["name"], tc["arguments"][:200])
                     parsed_input = {}
+                parsed_input, _ = _override_capture_spoken_argument(
+                    tool_name=tc["name"],
+                    tool_input=parsed_input,
+                    override_spoken=_extract_last_user_utterance(conversation_history),
+                    source="conversation_relay",
+                )
                 logger.info("Executing tool '%s' with input: %s", tc["name"], parsed_input)
                 try:
                     result_str = await execute_tool(tc["name"], parsed_input)
@@ -5816,6 +5921,12 @@ async def _run_llm_streaming_gemini(
                             tc["function"]["name"], tc["function"]["arguments"][:200],
                         )
                         parsed_input = {}
+                    parsed_input, _ = _override_capture_spoken_argument(
+                        tool_name=tc["function"]["name"],
+                        tool_input=parsed_input,
+                        override_spoken=_extract_last_user_utterance(conversation_history),
+                        source="conversation_relay",
+                    )
                     logger.info("Executing tool '%s' with input: %s", tc["function"]["name"], parsed_input)
                     try:
                         result_str = await execute_tool(tc["function"]["name"], parsed_input)
@@ -6084,6 +6195,12 @@ async def _run_llm_streaming_claude(
             # Execute tools and build tool_result blocks
             tool_results: list[dict[str, Any]] = []
             for tb in tool_use_blocks:
+                tb["input"], _ = _override_capture_spoken_argument(
+                    tool_name=tb["name"],
+                    tool_input=tb["input"],
+                    override_spoken=_extract_last_user_utterance(conversation_history),
+                    source="conversation_relay",
+                )
                 logger.info("Executing tool '%s' with input: %s", tb["name"], tb["input"])
                 try:
                     result_str = await execute_tool(tb["name"], tb["input"])

@@ -629,6 +629,39 @@ def test_conversation_relay_capture_tool_gets_no_filler_but_still_runs(monkeypat
     assert server.DEFAULT_FILLER not in socket.tokens()
 
 
+def test_conversation_relay_capture_tool_uses_reference_context_prefix_raw_utterance(monkeypatch):
+    socket = FakeRelaySocket()
+    client = FakeGemini([
+        [_tool_chunk("capture_spoken_number", {"spoken": "bad-model-spoken"})],
+        [_text_chunk("Thanks, I have the number.")],
+    ])
+    captured: dict[str, str] = {}
+
+    async def execute(name, arguments):
+        captured["name"] = name
+        captured["spoken"] = arguments.get("spoken", "")
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    asyncio.run(
+        server._run_llm_streaming_gemini(
+            gemini_client=client,
+            system="sys",
+            conversation_history=[
+                {"role": "user", "content": "[Reference context: KB snippets]\n\nGuest: triple seven"},
+            ],
+            tools=server.get_tools(),
+            websocket=socket,
+        )
+    )
+
+    assert captured == {
+        "name": "capture_spoken_number",
+        "spoken": "triple seven",
+    }
+
+
 # --- Gemini failover -> Claude (per-session + per-call sticky) ---------------
 
 def test_session_media_stream_gemini_quota_error_failsover_to_claude(monkeypatch, caplog):
