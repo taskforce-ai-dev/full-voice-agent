@@ -82,6 +82,8 @@ jobs:
 
           : > rows.md
           any=false
+          deploy_any=false
+          kavya=false
           build_any=false
           image_any=false
           unknown_any=false
@@ -96,6 +98,17 @@ jobs:
             [ -z "$match" ] && continue
 
             any=true
+            if [ "$id" = "kavya" ]; then
+              kavya=true
+              count=$(printf '%s\n' "$match" | grep -c . || true)
+              printf '| `%s` | `%s` | **excluded** | reviewed SmartPBX probe -> publisher -> runbook route; no generic deployment | %s |\n' \
+                "$id" "$dir" "$count" >> rows.md
+              echo "-> $id (excluded; reviewed SmartPBX probe -> publisher -> runbook route)"
+              continue
+            fi
+
+            deploy_any=true
+
             mode=fast
             effect='hot-swap changed `.py` + `docker restart` — seconds'
             if printf '%s\n' "$match" | grep -qE 'requirements.*\.txt|Dockerfile|docker-compose\.ya?ml'; then
@@ -140,6 +153,8 @@ jobs:
           done
 
           echo "any=$any" >> "$GITHUB_OUTPUT"
+          echo "deploy_any=$deploy_any" >> "$GITHUB_OUTPUT"
+          echo "kavya=$kavya" >> "$GITHUB_OUTPUT"
           echo "build_any=$build_any" >> "$GITHUB_OUTPUT"
           echo "image_any=$image_any" >> "$GITHUB_OUTPUT"
           echo "unknown_any=$unknown_any" >> "$GITHUB_OUTPUT"
@@ -153,6 +168,8 @@ jobs:
       - id: body
         env:
           ANY: ${{ steps.detect.outputs.any }}
+          DEPLOY_ANY: ${{ steps.detect.outputs.deploy_any }}
+          KAVYA: ${{ steps.detect.outputs.kavya }}
           BUILD_ANY: ${{ steps.detect.outputs.build_any }}
           IMAGE_ANY: ${{ steps.detect.outputs.image_any }}
           UNKNOWN_ANY: ${{ steps.detect.outputs.unknown_any }}
@@ -163,9 +180,9 @@ jobs:
             echo '<!-- deploy-impact -->'
             echo '## Deploy impact'
             echo
-            if [ "$ANY" = "true" ]; then
+            if [ "$DEPLOY_ANY" = "true" ]; then
               echo '> **Merging this PR deploys to production** (`67.207.90.109`).'
-              echo '> The agents below restart, briefly interrupting any in-flight calls.'
+              echo '> Listed non-Kavya agents restart, briefly interrupting any in-flight calls.'
               echo '> Merge during a quiet window.'
               echo
               echo '| Agent | Folder | Mode | Effect on merge | Files |'
@@ -191,6 +208,20 @@ jobs:
                 echo 'file included) means a new build. Nothing compiles on the VPS.'
                 echo
               fi
+              if [ "$KAVYA" = "true" ]; then
+                echo '> Merging this PR does not deploy Kavya. It remains excluded from'
+                echo '> generic deployment and requires the reviewed SmartPBX probe -> publisher -> runbook route.'
+                echo
+              fi
+            elif [ "$KAVYA" = "true" ]; then
+              echo '> Merging this PR does not deploy Kavya.'
+              echo '> Kavya is excluded from generic deployment; use the reviewed SmartPBX'
+              echo '> probe -> publisher -> runbook route only.'
+              echo
+              echo '| Agent | Folder | Mode | Effect on merge | Files |'
+              echo '|---|---|---|---|---|'
+              cat rows.md
+              echo
             else
               echo 'No agent folders changed — **merging this PR deploys nothing.**'
               echo 'Tooling, CI and docs changes do not reach the VPS.'
@@ -205,14 +236,26 @@ jobs:
 
             echo '<details><summary>Rollback</summary>'
             echo
-            echo '```bash'
-            echo '# registry agents (all seven active ones) — pulls the exact image that ran'
-            echo 'gh workflow run deploy.yml -f agent=<id> -f ref=<last-good-sha> -f mode=image'
-            echo
-            echo '# legacy fast/build path — Sofia Agent only'
-            echo 'gh workflow run deploy.yml -f agent=sofia -f ref=<last-good-sha> -f mode=fast'
-            echo '```'
-            echo
+            if [ "$DEPLOY_ANY" = "true" ]; then
+              echo '```bash'
+              echo '# registry image agents (excluding Kavya) — pull the exact image that ran'
+              echo 'gh workflow run deploy.yml -f agent=<non-kavya-image-id> -f ref=<last-good-sha> -f mode=image'
+              echo
+              echo '# legacy fast/build path — Sofia Agent only'
+              echo 'gh workflow run deploy.yml -f agent=sofia -f ref=<last-good-sha> -f mode=fast'
+              echo '```'
+              echo
+            fi
+            if [ "$KAVYA" = "true" ]; then
+              echo '**Kavya SmartPBX rollback:** first follow the withdraw/drain steps in'
+              echo '`Kavya/SMARTPBX_RUNBOOK.md`. For a reviewed last-good immutable image,'
+              echo 'use its guarded `/opt/kavya/scripts/deploy_smartpbx_image.sh` command with'
+              echo 'the exact tag, full revision, and digest from its reviewed record.'
+              echo 'Do not call generic deploy.yml with agent=kavya mode=image.'
+              echo 'For clarity, do not call generic `deploy.yml` with `agent=kavya` and `mode=image`; that route rejects Kavya.'
+              echo
+            fi
+
             echo '</details>'
             echo
             echo '_Mirrors the detection in `deploy-on-push.yml`. See [CONTRIBUTING.md §6](../blob/main/CONTRIBUTING.md). Reporting only — this workflow never deploys._'

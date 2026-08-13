@@ -325,8 +325,52 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
 
     assert "fingerprint" not in normalized_diagnostics
     assert "event=smartpbx_protocol_diagnostic" in diagnostics
-    assert diagnostics.count("event=") == 1
-    assert "exactly seven fields" in normalized_diagnostics
+    assert "finite approved event allowlist" in normalized_diagnostics
+    # This is the complete direct-SmartPBX runtime taxonomy, not the obsolete
+    # seven-event subset. Keeping the list here makes a new emitted event a
+    # conscious privacy/runbook decision rather than undocumented log drift.
+    for event_name in (
+        "smartpbx_protocol_diagnostic",
+        "stt_digit_class_state",
+        "stt_interim_shape",
+        "turn_stage",
+        "turn_summary",
+        "session_summary",
+        "echo_rejected",
+        "agent_response",
+        "assistant_turn_delivery",
+        "audio_dump_written",
+        "bad_tool_json",
+        "llm_round",
+        "llm_round_complete",
+        "llm_empty_response",
+        "llm_error",
+        "llm_provider_degraded",
+        "llm_provider_failover",
+        "tool_execute",
+        "tool_result",
+        "tool_error",
+        "tool_batch",
+        "tool_round_limit",
+        "tts_failure",
+        "tts_interrupted",
+        "barge_in",
+        "guest_utterance",
+        "kb_error",
+        "silence_reprompt",
+        "stt_final",
+        "stt_provider_final",
+        "stt_provider_interim",
+        "capture_buffer_bounded",
+        "capture_final_buffered",
+        "capture_forced_dispatch",
+        "capture_mode_enter",
+        "capture_mode_exit",
+        "dtmf_collect_start",
+        "dtmf_collect_done",
+    ):
+        assert f"`{event_name}`" in diagnostics
+    assert "unlisted event names are not permitted" in normalized_diagnostics
     for field in (
         "correlation_id",
         "stage",
@@ -334,25 +378,21 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "failure_class",
         "active_sessions",
         "duration_ms",
+        "turn_id",
+        "session_trace_id",
+        "provider",
     ):
         assert f"`{field}`" in diagnostics
     assert "opaque, local, randomly generated" in normalized_diagnostics
     assert "never derived from dialog" in normalized_diagnostics
-    for forbidden in (
-        "payload",
-        "audio",
-        "transcript",
-        "credential",
-        "exception",
-        "stack",
-        "session_id",
-        "call_fingerprint",
-        "counter",
-        "raw call",
-        "call id",
-        "dialog id",
-    ):
-        assert forbidden not in normalized_diagnostics
+    assert "only seven" not in normalized_diagnostics
+    assert "bounded provider enum" in normalized_diagnostics
+    for provider in ("openai", "gemini", "claude", "elevenlabs", "azure"):
+        assert f"`{provider}`" in diagnostics
+    assert (
+        "must not contain transcript text, audio, call ids, exception bodies, or secrets"
+        in normalized_diagnostics
+    )
 
     assert "transfer-disabled" in runbook
     assert "Test endpoint-down fallback before shifting traffic." in cutover
@@ -366,6 +406,78 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
     stop = rollback.find("stop kavya-smartpbx")
     assert withdraw >= 0
     assert withdraw < drain < stop
+
+
+def test_new_smartpbx_caller_rhythm_knobs_are_blank_safe_passthroughs():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
+
+    assert smartpbx_env.get("SMARTPBX_MAX_TOKENS") == "${SMARTPBX_MAX_TOKENS:-}"
+    assert (
+        smartpbx_env.get("SMARTPBX_INITIAL_FILLER_DELAY_SECONDS")
+        == "${SMARTPBX_INITIAL_FILLER_DELAY_SECONDS:-}"
+    )
+
+    example = read_text(".env.example")
+    assert re.search(r"^SMARTPBX_MAX_TOKENS=$", example, re.MULTILINE)
+    assert re.search(
+        r"^SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=$", example, re.MULTILINE
+    )
+    assert re.search(r"^SMARTPBX_MAX_TOKENS=\d", example, re.MULTILINE) is None
+    assert re.search(
+        r"^SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=\d", example, re.MULTILINE
+    ) is None
+
+
+def test_runbook_smartpbx_template_keeps_caller_rhythm_knobs_blank_and_private():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    template = runbook.split("```dotenv", 1)[1].split("```", 1)[0]
+
+    assert re.search(r"^SMARTPBX_MAX_TOKENS=$", template, re.MULTILINE)
+    assert re.search(
+        r"^SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=$", template, re.MULTILINE
+    )
+    assert re.search(r"^SMARTPBX_MAX_TOKENS=\d", template, re.MULTILINE) is None
+    assert re.search(
+        r"^SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=\d", template, re.MULTILINE
+    ) is None
+    assert "$(" not in template
+    assert "`" not in template
+
+
+def test_runbook_allows_only_privacy_safe_telemetry_and_bounded_local_retention():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    normalized = re.sub(r"\s+", " ", runbook).lower()
+
+    assert "finite approved event allowlist" in normalized
+    assert "json-file" in normalized
+    assert 'max-size: "10m"' in runbook
+    assert 'max-file: "3"' in runbook
+    assert "30 mb maximum" in normalized
+    assert "aggregate-only" in normalized
+    assert "do not export raw logs" in normalized
+    assert "wire-delivery proxies" in normalized
+    assert "session_trace_id" in normalized
+    assert "bounded provider enum" in normalized
+    assert "must not contain transcript text, audio, call ids, exception bodies, or secrets" in normalized
+
+
+def test_pr_impact_keeps_kavya_out_of_generic_deploy_and_gives_its_real_rollback_path():
+    workflow = (
+        PROJECT_ROOT.parent / ".github" / "workflows" / "pr-deploy-impact.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "kavya=$kavya" in workflow
+    assert 'KAVYA: ${{ steps.detect.outputs.kavya }}' in workflow
+    assert "Merging this PR does not deploy Kavya." in workflow
+    assert "Kavya SmartPBX rollback" in workflow
+    assert "SMARTPBX_RUNBOOK.md" in workflow
+    assert "deploy_smartpbx_image.sh" in workflow
+    assert (
+        "do not call generic `deploy.yml` with `agent=kavya` and `mode=image`"
+        in workflow
+    )
+    assert "# registry agents (all seven active ones)" not in workflow
 
 
 BUILD_KAVYA_IMAGE_WORKFLOW = PROJECT_ROOT.parent / ".github/workflows/build-kavya-image.yml"
@@ -2627,6 +2739,22 @@ def test_stt_endpointing_knobs_are_deliverable_through_the_documented_path():
         assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
 
 
+def test_digit_class_boost_is_allowlisted_without_a_committed_runtime_value():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
+
+    assert smartpbx_env.get("STT_DIGIT_CLASS_BOOST") == "${STT_DIGIT_CLASS_BOOST:-}"
+
+    example = read_text(".env.example")
+    assert "STT_DIGIT_CLASS_BOOST=" in example
+
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    assert "STT_DIGIT_CLASS_BOOST=" in runbook
+    assert "docker compose --env-file .env.smartpbx config" in runbook
+    assert "do not print" in runbook.lower()
+    assert "digit_class_enabled" in runbook
+
+
 def test_dtmf_knobs_are_deliverable_through_the_documented_path():
     # The smartpbx service uses an explicit environment allowlist, so a knob set
     # but not listed there never reaches the container. The kavya (Twilio) service
@@ -2666,3 +2794,54 @@ def test_bargein_knobs_are_deliverable_through_the_documented_path():
     for name, default in (("BARGEIN_MIN_CHARS", "12"), ("BARGEIN_DEBOUNCE_SECONDS", "0.6")):
         assert f"{name}={default}" in example, f"{name} missing from .env.example"
         assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
+
+
+def test_generic_deploy_and_pr_impact_exclude_kavya_from_image_routing():
+    """Kavya images have a separately reviewed probe -> publisher -> runbook path."""
+    workflows = PROJECT_ROOT.parent / ".github" / "workflows"
+    deploy_on_push = (workflows / "deploy-on-push.yml").read_text(encoding="utf-8")
+    pr_impact = (workflows / "pr-deploy-impact.yml").read_text(encoding="utf-8")
+
+    for workflow in (deploy_on_push, pr_impact):
+        assert '"Kavya:kavya"' in workflow
+        assert 'if [ "$id" = "kavya" ]' in workflow
+        assert "excluded" in workflow.lower()
+        assert "probe" in workflow.lower()
+        assert "publisher" in workflow.lower()
+        assert "runbook" in workflow.lower()
+
+    # The generic matrix must never carry a Kavya image row into deploy.yml.
+    assert 'items="${items}{\\"agent\\":\\"${id}\\",\\"mode\\":\\"${mode}\\"},"' in deploy_on_push
+    kavya_guard = deploy_on_push.split('if [ "$id" = "kavya" ]', 1)[1]
+    assert kavya_guard.find('continue') < kavya_guard.find('items="${items}')
+
+
+def test_kavya_exclusion_keeps_other_registry_agents_on_generic_image_routing():
+    workflows = PROJECT_ROOT.parent / ".github" / "workflows"
+    deploy_on_push = (workflows / "deploy-on-push.yml").read_text(encoding="utf-8")
+    pr_impact = (workflows / "pr-deploy-impact.yml").read_text(encoding="utf-8")
+
+    # The exclusion is narrow: compose-backed registry detection remains the
+    # generic path for other agents and continues to report image impact.
+    for workflow in (deploy_on_push, pr_impact):
+        assert '"Flico Agent:flico"' in workflow
+        assert "ghcr\\.io/" in workflow
+        assert "mode=image" in workflow
+
+
+def test_kavya_generic_rejection_and_reviewed_image_gates_remain_intact():
+    workflows = PROJECT_ROOT.parent / ".github" / "workflows"
+    generic_deploy = (workflows / "deploy.yml").read_text(encoding="utf-8")
+    probe = (workflows / "probe-kavya-image.yml").read_text(encoding="utf-8")
+    publisher = (workflows / "build-kavya-image.yml").read_text(encoding="utf-8")
+
+    assert '"$AGENT" == "kavya" && "$MODE" == "image"' in generic_deploy
+    assert "Kavya image mode is disabled" in generic_deploy
+
+    assert "repository_dispatch:" in probe
+    assert "kavya_image_read_only_probe" in probe
+    assert "contents: read" in probe
+    assert "workflow_dispatch:" in publisher
+    assert "expected_sha" in publisher
+    assert "fresh successful read-only probe" in publisher
+    assert "org.opencontainers.image.revision" in publisher

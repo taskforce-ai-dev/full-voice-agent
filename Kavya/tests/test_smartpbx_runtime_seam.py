@@ -568,6 +568,454 @@ async def test_kb_retrieval_runs_off_the_event_loop(monkeypatch):
     )
 
 
+def test_turn_telemetry_emits_one_opaque_bounded_privacy_safe_summary():
+    """A turn must be correlatable without retaining caller or utterance data."""
+    import server
+
+    emitted: list[dict[str, object]] = []
+    clock = iter((
+        1_000_000_000, 1_100_000_000, 1_200_000_000,
+        1_350_000_000, 1_500_000_000, 2_000_000_000,
+    ))
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        monotonic_ns=lambda: next(clock),
+        new_id=lambda: "opaque-random-turn-id",
+    )
+
+    turn_id = telemetry.start_turn("final")
+    telemetry.mark(turn_id, "endpoint")
+    telemetry.mark(turn_id, "kb_start")
+    telemetry.mark(turn_id, "kb_complete")
+    telemetry.mark_once(turn_id, "llm_first_token")
+    telemetry.mark_once(turn_id, "llm_first_token")
+    telemetry.finish(turn_id, "completed", generated_chars=23, delivered_sentences=2)
+    telemetry.finish(turn_id, "completed")
+
+    summary = [record for record in emitted if record["event"] == "turn_summary"]
+    assert turn_id == "opaque-random-turn-id"
+    assert len(summary) == 1
+    assert summary[0]["turn_id"] == turn_id
+    assert summary[0]["outcome"] == "completed"
+    assert summary[0]["endpoint_source"] == "final"
+    assert summary[0]["endpoint_ms"] == 100
+    assert summary[0]["kb_ms"] == 150
+    assert summary[0]["llm_first_token_ms"] == 500
+    assert summary[0]["generated_chars"] == 23
+    assert summary[0]["delivered_sentences"] == 2
+    assert "turn_seq" not in summary[0]
+    assert all(
+        isinstance(value, int) and 0 <= value <= 600_000
+        for key, value in summary[0].items()
+        if key.endswith("_ms")
+    )
+    forbidden = {
+        "transcript", "text", "call_id", "callSid", "caller", "phone", "payload",
+        "authorization", "token", "secret", "headers", "tool_input", "exception",
+    }
+    assert not (forbidden & set(summary[0]))
+
+
+def test_turn_telemetry_emits_only_fixed_privacy_safe_cadence_aggregates():
+    """Cadence timing is a wire proxy, never a payload or playback assertion."""
+    import server
+
+    emitted: list[dict[str, object]] = []
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        monotonic_ns=lambda: 1_000_000_000,
+        new_id=lambda: "opaque-cadence-turn",
+    )
+
+    turn_id = telemetry.start_turn("final")
+    telemetry.finish(
+        turn_id,
+        "completed",
+        frames_160b=4,
+        frames_partial=1,
+        frames_other=0,
+        inter_send_gap_p95_ms=20,
+        inter_send_gap_max_ms=24,
+        queue_underruns=1,
+    )
+
+    summary = next(record for record in emitted if record["event"] == "turn_summary")
+    assert {
+        field: summary[field]
+        for field in (
+            "frames_160b",
+            "frames_partial",
+            "frames_other",
+            "inter_send_gap_p95_ms",
+            "inter_send_gap_max_ms",
+            "queue_underruns",
+        )
+    } == {
+        "frames_160b": 4,
+        "frames_partial": 1,
+        "frames_other": 0,
+        "inter_send_gap_p95_ms": 20,
+        "inter_send_gap_max_ms": 24,
+        "queue_underruns": 1,
+    }
+    assert summary["inter_send_gap_p95_ms"] <= summary["inter_send_gap_max_ms"]
+    assert not ({
+        "call_id", "callId", "caller", "phone", "payload", "playback",
+        "transcript", "text", "token", "secret", "headers",
+    } & set(summary))
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["completed", "tool_failed", "tts_failed", "interrupted", "transfer_pending"],
+)
+def test_turn_telemetry_summarizes_every_terminal_outcome_once(outcome):
+    import server
+
+    emitted: list[dict[str, object]] = []
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        new_id=lambda: "opaque-turn",
+    )
+    turn_id = telemetry.start_turn("unknown")
+    telemetry.finish(turn_id, outcome)
+
+    summaries = [record for record in emitted if record["event"] == "turn_summary"]
+    assert len(summaries) == 1
+    assert summaries[0]["outcome"] == outcome
+    assert summaries[0]["turn_id"] == "opaque-turn"
+
+
+def test_turn_telemetry_retires_finished_turn_state_but_preserves_session_aggregates():
+    """Long-lived calls must not retain one private map entry per completed turn."""
+    import server
+
+    emitted: list[dict[str, object]] = []
+    identifiers = iter(f"opaque-turn-{index}" for index in range(128))
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        new_id=lambda: next(identifiers),
+    )
+
+    for _ in range(128):
+        turn_id = telemetry.start_turn("interim")
+        telemetry.finish(turn_id, "completed")
+
+    assert telemetry._turns == {}
+    assert telemetry.turns_started == 128
+    assert telemetry.turns_summarized == 128
+    summaries = [record for record in emitted if record["event"] == "turn_summary"]
+    assert len(summaries) == 128
+
+
+@pytest.mark.asyncio
+async def test_filler_clear_syncs_generation_before_next_turn_bind():
+    """A filler win must fence old TTS before the next normal reply starts."""
+    import server
+
+    class GenerationFencedTransport:
+        def __init__(self):
+            self._generation = 0
+            self.bindings: list[tuple[int, str]] = []
+            self.rejected_bindings: list[tuple[int, str]] = []
+            self.audio: list[bytes] = []
+
+        async def clear_audio(self):
+            self._generation += 1
+
+        def bind_turn(self, generation, turn_id):
+            if generation == self._generation:
+                self.bindings.append((generation, turn_id))
+            else:
+                self.rejected_bindings.append((generation, turn_id))
+
+        async def send_audio(self, audio):
+            self.audio.append(audio)
+
+    transport = GenerationFencedTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport,
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._active_smartpbx_turn_id = "next-turn"
+    controller = server.SmartPBXInitialFillerController(
+        speak=lambda *_args, **_kwargs: None,
+        generation=pipeline._speak_generation,
+        delay_seconds=2.5,
+        clear_audio=pipeline._clear_media_audio,
+    )
+    controller.spoke = True
+
+    await controller.on_content_delta()
+    await pipeline._send_media_audio(b"\xff" * 160)
+
+    assert pipeline._speak_generation == transport._generation == 1
+    assert transport.bindings == [(1, "next-turn")]
+    assert transport.rejected_bindings == []
+    assert transport.audio == [b"\xff" * 160]
+
+
+@pytest.mark.asyncio
+async def test_barged_in_old_runner_cannot_mark_or_cancel_the_new_runner_turn(
+    monkeypatch,
+):
+    """An old LLM finally must stay bound to its captured turn and filler."""
+    import server
+
+    class FreshRunnerFiller:
+        def __init__(self):
+            self.finish_calls = 0
+
+        async def on_session_finish(self):
+            self.finish_calls += 1
+
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=Transport(),
+    )
+    pipeline._smartpbx_transfer_context = object()
+    emitted: list[dict[str, object]] = []
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        new_id=lambda: "unused",
+    )
+    pipeline._turn_telemetry = telemetry
+    old_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = old_turn
+    old_entered = asyncio.Event()
+    old_release = asyncio.Event()
+    new_entered = asyncio.Event()
+    new_release = asyncio.Event()
+
+    async def delayed_llm():
+        if pipeline._last_guest_utterance_raw == "old guest turn":
+            old_entered.set()
+            await old_release.wait()
+            return "old reply"
+        new_entered.set()
+        await new_release.wait()
+        return "new reply"
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_run_llm_claude", delayed_llm)
+
+    old_task = asyncio.create_task(pipeline._process_utterance_bound("old guest turn"))
+    await asyncio.wait_for(old_entered.wait(), timeout=1)
+
+    await pipeline._handle_bargein()
+    new_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = new_turn
+    fresh_filler = FreshRunnerFiller()
+    pipeline._smartpbx_initial_filler = fresh_filler
+    new_task = asyncio.create_task(pipeline._process_utterance_bound("new guest turn"))
+    await asyncio.wait_for(new_entered.wait(), timeout=1)
+
+    old_release.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    old_runner_new_turn_stages = [
+        record for record in emitted
+        if record.get("event") == "turn_stage"
+        and record.get("turn_id") == new_turn
+        and record.get("stage") == "llm_complete"
+    ]
+    old_runner_filler_finishes = fresh_filler.finish_calls
+    old_runner_filler = pipeline._smartpbx_initial_filler
+    old_runner_active_turn = pipeline._active_smartpbx_turn_id
+
+    new_release.set()
+    await asyncio.wait_for(new_task, timeout=1)
+
+    assert old_runner_new_turn_stages == []
+    assert old_runner_filler_finishes == 0
+    assert old_runner_filler is fresh_filler
+    assert old_runner_active_turn == new_turn
+    assert fresh_filler.finish_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_turn_dropped_frame_counts_are_deltas_not_the_session_total(monkeypatch):
+    """Each turn summary reports only overflow observed since that turn started."""
+    import server
+
+    class DropCountingTransport(Transport):
+        def __init__(self):
+            self.frames_dropped_total = 0
+
+    transport = DropCountingTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport,
+    )
+    pipeline._smartpbx_transfer_context = object()
+    emitted: list[dict[str, object]] = []
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        new_id=lambda: "unused",
+    )
+    pipeline._turn_telemetry = telemetry
+
+    async def empty_llm():
+        return ""
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_run_llm_claude", empty_llm)
+
+    first_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = first_turn
+    transport.frames_dropped_total = 5
+    await pipeline._process_utterance_bound("first guest turn")
+
+    second_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = second_turn
+    transport.frames_dropped_total = 7
+    await pipeline._process_utterance_bound("second guest turn")
+
+    summaries = {
+        record["turn_id"]: record
+        for record in emitted
+        if record.get("event") == "turn_summary"
+    }
+    assert summaries[first_turn]["dropped_frames"] == 5
+    assert summaries[second_turn]["dropped_frames"] == 2
+
+
+@pytest.mark.asyncio
+async def test_overlapping_runner_drop_summaries_stay_bound_to_their_generation(
+    monkeypatch,
+):
+    """An old runner must not summarize overflow from a newer generation."""
+    import server
+
+    class GenerationDropTransport(Transport):
+        def __init__(self):
+            self.frames_dropped_total = 0
+            self.generation = 0
+
+        async def clear_audio(self):
+            self.generation += 1
+
+    transport = GenerationDropTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport,
+    )
+    pipeline._smartpbx_transfer_context = object()
+    emitted: list[dict[str, object]] = []
+    turn_ids = iter(("turn-old", "turn-new"))
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        new_id=lambda: next(turn_ids),
+    )
+    pipeline._turn_telemetry = telemetry
+    old_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = old_turn
+    pipeline._smartpbx_dropped_frame_baselines[old_turn] = 0
+    old_entered = asyncio.Event()
+    old_release = asyncio.Event()
+    new_entered = asyncio.Event()
+    new_release = asyncio.Event()
+
+    async def delayed_llm():
+        runner = server._smartpbx_runner_context.get()
+        if runner is not None and runner.turn_id == old_turn:
+            old_entered.set()
+            await old_release.wait()
+        else:
+            new_entered.set()
+            await new_release.wait()
+        return ""
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_run_llm_claude", delayed_llm)
+
+    old_task = asyncio.create_task(pipeline._process_utterance_bound("old turn"))
+    await asyncio.wait_for(old_entered.wait(), timeout=1)
+    for total in (1, 2):
+        transport.frames_dropped_total = total
+        pipeline._on_smartpbx_transport_event(
+            old_turn, 0, "frame_dropped", 0, total,
+        )
+
+    await pipeline._handle_bargein()
+    new_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = new_turn
+    pipeline._smartpbx_dropped_frame_baselines[new_turn] = 2
+    new_task = asyncio.create_task(pipeline._process_utterance_bound("new turn"))
+    await asyncio.wait_for(new_entered.wait(), timeout=1)
+    for total in (3, 4, 5):
+        transport.frames_dropped_total = total
+        pipeline._on_smartpbx_transport_event(
+            new_turn, 1, "frame_dropped", 0, total,
+        )
+
+    new_release.set()
+    await asyncio.wait_for(new_task, timeout=1)
+    old_release.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    summaries = {
+        record["turn_id"]: record
+        for record in emitted
+        if record.get("event") == "turn_summary"
+    }
+    assert summaries[old_turn]["dropped_frames"] == 2
+    assert summaries[new_turn]["dropped_frames"] == 3
+
+
+@pytest.mark.asyncio
+async def test_session_finish_emits_one_opaque_aggregate_summary_after_cleanup(monkeypatch):
+    import smartpbx_session
+
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        smartpbx_session,
+        "_emit_smartpbx_session_summary",
+        lambda **fields: records.append(fields),
+    )
+    pipeline = Pipeline()
+    pipeline._turn_telemetry = types.SimpleNamespace(turns_started=3, turns_summarized=3)
+    pipeline._smartpbx_barge_ins = 2
+    session = _session(pipeline)
+    await session.finish(False)
+    await session.finish(False)
+
+    assert records == [
+        {
+            "event": "session_summary",
+            "session_trace_id": records[0]["session_trace_id"],
+            "outcome": "finished",
+            "turns_started": 3,
+            "turns_summarized": 3,
+            "duration_ms": records[0]["duration_ms"],
+            "frames_dropped_total": 0,
+            "barge_ins": 2,
+        }
+    ]
+    assert isinstance(records[0]["session_trace_id"], str)
+    assert 0 <= records[0]["duration_ms"] <= 600_000
+    assert not ({"call_id", "caller", "phone", "transcript", "text"} & set(records[0]))
+
+
+@pytest.mark.asyncio
+async def test_transport_binds_turns_per_generation_without_false_drain_after_clear():
+    from smartpbx_transport import SmartPBXMediaTransport
+
+    websocket = FailingSocket(ok_sends=1000)
+    events: list[tuple[str, int, str]] = []
+    transport = SmartPBXMediaTransport(
+        websocket, CONTEXT, on_transport_event=lambda turn_id, generation, stage, *_: events.append((turn_id, generation, stage)),
+    )
+    transport.start()
+    transport.bind_turn(0, "turn-old")
+    await transport.clear_audio()
+    transport.bind_turn(1, "turn-new")
+    await transport.send_audio(b"\xff" * 160)
+    await asyncio.wait_for(transport.send_mark("tts_done"), timeout=1)
+    await transport.close()
+
+    assert events.count(("turn-new", 1, "first_media_sent")) == 1
+    assert events.count(("turn-new", 1, "queue_drained")) == 1
+    assert not [event for event in events if event[0] == "turn-old" and event[2] == "queue_drained"]
+
+
 def _fake_google_speech(on_stream):
     """Minimal stand-in for the google-cloud-speech surface _run_one_stream uses."""
 

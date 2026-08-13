@@ -421,7 +421,7 @@ async def test_gateway_cleanup_faults_continue_once_and_require_fixed_degraded_t
     factory = _FaultFactory()
     with caplog.at_level("INFO"):
         await SmartPBXGateway(settings(), registry).handle(socket, factory)
-    assert _FAULT_STATE["order"] == ["session", "transport", "lease"]
+    assert _FAULT_STATE["order"] == ["transport", "session", "lease"]
     assert factory.sessions[0].finishes == [True]
     assert registry.snapshot()["released_total"] == 1
     assert socket.close_calls == [(1000, "call ended")]
@@ -455,7 +455,7 @@ async def test_gateway_cancellation_shields_cleanup_then_reraises_and_disables_l
         _FAULT_STATE["release_finish"].set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert _FAULT_STATE["order"] == ["session", "transport", "lease"]
+        assert _FAULT_STATE["order"] == ["transport", "session", "lease"]
         assert registry.snapshot()["released_total"] == 1
         assert socket.close_calls == [(1000, "call ended")]
         assert_late_fault_sink_is_disabled(caplog, factory)

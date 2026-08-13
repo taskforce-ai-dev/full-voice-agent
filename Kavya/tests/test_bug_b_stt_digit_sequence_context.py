@@ -61,6 +61,24 @@ def test_stt_digit_class_context_obeys_custom_boost(monkeypatch):
     assert contexts[1].kwargs["boost"] == 6.5
 
 
+def test_privacy_safe_english_configuration_logs_digit_class_state(monkeypatch, caplog):
+    fake, _recorded = _fake_google_speech()
+    monkeypatch.setattr(server, "google_speech", fake)
+    monkeypatch.setattr(server, "STT_DIGIT_CLASS_BOOST", 6.5)
+    stt = server.GoogleSTTStream(
+        on_final_result=lambda *_: None,
+        lang="en",
+        privacy_safe=True,
+    )
+
+    with caplog.at_level("INFO"):
+        stt._streaming_config("en-US", [], enhanced=True)
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "smartpbx_media event=stt_digit_class_state digit_class_enabled=true digit_class_boost=6.5"
+    ]
+
+
 def test_other_languages_do_not_apply_english_speech_contexts(monkeypatch):
     # `enhanced` is what carries the telephony model + adaptation, and it is
     # gated to English by _use_enhanced_config(); non-en streams can never

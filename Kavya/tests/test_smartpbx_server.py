@@ -1594,6 +1594,70 @@ def direct_tool_client(provider, rounds):
     return DirectToolClaude(rounds)
 
 
+class ControlledDirectToolOpenAI:
+    """One shared client whose old stream can pause behind a newer turn."""
+
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.chat = SimpleNamespace(completions=self)
+
+    async def create(self, **kwargs):
+        self.requests.append(kwargs)
+        return self.rounds.pop(0)
+
+
+class ControlledDirectToolGeminiModels:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def generate_content_stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        return self.owner.rounds.pop(0)
+
+
+class ControlledDirectToolGemini:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.aio = SimpleNamespace(models=ControlledDirectToolGeminiModels(self))
+
+
+class ControlledDirectToolClaudeStream:
+    def __init__(self, events):
+        self.events = events
+
+    async def __aenter__(self):
+        return self.events
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class ControlledDirectToolClaudeMessages:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        return ControlledDirectToolClaudeStream(self.owner.rounds.pop(0))
+
+
+class ControlledDirectToolClaude:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.messages = ControlledDirectToolClaudeMessages(self)
+
+
+def controlled_direct_tool_client(provider, rounds):
+    if provider == "openai":
+        return ControlledDirectToolOpenAI(rounds)
+    if provider == "gemini":
+        return ControlledDirectToolGemini(rounds)
+    return ControlledDirectToolClaude(rounds)
+
+
 def direct_tool_pipeline(server, provider, client, lang="en"):
     pipeline = server.MediaStreamSession(
         websocket=None, lang=lang, media_transport=FakeTransport(),
@@ -1605,6 +1669,103 @@ def direct_tool_pipeline(server, provider, client, lang="en"):
     pipeline._smartpbx_transfer_context = object()
     pipeline.tools = [{"provider": provider}]
     return pipeline
+
+
+def direct_tool_history_records(provider, history):
+    """Return provider-normalized request/result identifiers from shared history."""
+    if provider == "claude":
+        requests = [
+            block
+            for message in history
+            if message.get("role") == "assistant"
+            and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        results = [
+            block
+            for message in history
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        ]
+        return (
+            [request["id"] for request in requests],
+            [request["name"] for request in requests],
+            [result["tool_use_id"] for result in results],
+        )
+
+    requests = [
+        call
+        for message in history
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+    results = [
+        message
+        for message in history
+        if message.get("role") == "tool"
+    ]
+    return (
+        [request["id"] for request in requests],
+        [request["function"]["name"] for request in requests],
+        [result["tool_call_id"] for result in results],
+    )
+
+
+def direct_single_tool_pairs(provider, history):
+    """Return each adjacent provider request/result pair with its input."""
+    pairs = []
+    for index, message in enumerate(history[:-1]):
+        following = history[index + 1]
+        if provider == "claude":
+            requests = [
+                block
+                for block in message.get("content", [])
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            ]
+            results = [
+                block
+                for block in following.get("content", [])
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            ]
+            for request in requests:
+                matching = [
+                    result for result in results
+                    if result.get("tool_use_id") == request["id"]
+                ]
+                if matching:
+                    pairs.append((request["input"], request["id"], matching[0]["tool_use_id"]))
+            continue
+
+        for request in message.get("tool_calls") or []:
+            if following.get("role") == "tool" and following.get("tool_call_id") == request["id"]:
+                pairs.append((
+                    json.loads(request["function"]["arguments"]),
+                    request["id"],
+                    following["tool_call_id"],
+                ))
+    return pairs
+
+
+def direct_tool_request_inputs(provider, history):
+    """Return every provider request input, including unmatched requests."""
+    if provider == "claude":
+        return [
+            block["input"]
+            for message in history
+            if message.get("role") == "assistant"
+            and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+    return [
+        json.loads(call["function"]["arguments"])
+        for message in history
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
 
 
 class CapturingTextWebSocket:
@@ -1641,6 +1802,356 @@ async def test_direct_english_capture_tool_uses_last_raw_utterance_for_number_an
         ("capture_spoken_number", "double seven"),
         ("capture_spoken_name", "Jane Doe"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+@pytest.mark.parametrize("entrypoint", ["provider", "bound"])
+async def test_direct_smartpbx_runner_without_turn_contract_keeps_legacy_tool_behavior(
+    monkeypatch, provider, entrypoint,
+):
+    """Injected callers may have no ContextVar or no telemetry-owned turn ID."""
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"request": "legacy"}),
+        direct_text_round(provider, "Legacy turn complete."),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    pipeline.history = [{"role": "user", "content": "legacy caller request"}]
+    executed: list[tuple[str, dict[str, object]]] = []
+    tool_contexts: list[tuple[bool, str | None]] = []
+
+    async def record_tool(name, arguments):
+        runner = server._smartpbx_runner_context.get()
+        tool_contexts.append((runner is not None, None if runner is None else runner.turn_id))
+        executed.append((name, dict(arguments)))
+        return json.dumps({"status": "ok"})
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "execute_tool", record_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+
+    if entrypoint == "bound":
+        await pipeline._process_utterance_bound("legacy caller request")
+    else:
+        assert server._smartpbx_runner_context.get() is None
+        if provider == "openai":
+            await pipeline._run_llm()
+        elif provider == "gemini":
+            await pipeline._run_llm_gemini()
+        else:
+            await pipeline._run_llm_claude()
+
+    assert executed == [("create_booking", {"request": "legacy"})]
+    assert tool_contexts == [
+        (entrypoint == "bound", None)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+@pytest.mark.parametrize(
+    "tool_name",
+    ["create_booking", "transfer_to_human", "capture_spoken_number"],
+)
+async def test_barged_in_stale_runner_cannot_execute_tools_or_consume_new_raw_utterance(
+    monkeypatch, provider, tool_name,
+):
+    """Only the current SmartPBX runner may cross the tool side-effect boundary."""
+    import server
+
+    old_stream_blocked = asyncio.Event()
+    release_old_stream = asyncio.Event()
+    old_turns = iter(("old-turn", "new-turn"))
+
+    old_arguments = (
+        {"spoken": "model-old-spoken"}
+        if tool_name == "capture_spoken_number"
+        else {"request": "old"}
+    )
+    new_arguments = (
+        {"spoken": "model-new-spoken"}
+        if tool_name == "capture_spoken_number"
+        else {"request": "new"}
+    )
+
+    async def delayed_old_tool_round():
+        for event in direct_tool_round(provider, old_arguments, tool_name=tool_name):
+            yield event
+        old_stream_blocked.set()
+        await release_old_stream.wait()
+
+    async def immediate_round(events):
+        for event in events:
+            yield event
+
+    client = controlled_direct_tool_client(provider, [
+        delayed_old_tool_round(),
+        immediate_round(direct_tool_round(provider, new_arguments, tool_name=tool_name)),
+        immediate_round(direct_text_round(provider, "New turn complete.")),
+        immediate_round(direct_text_round(provider, "Old turn complete.")),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    telemetry = server.SmartPBXTurnTelemetry(new_id=lambda: next(old_turns))
+    pipeline._turn_telemetry = telemetry
+    old_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = old_turn
+    executed: list[tuple[str, dict[str, object]]] = []
+
+    async def record_tool(name, arguments):
+        executed.append((name, dict(arguments)))
+        return json.dumps({"status": "ok"})
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", record_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+
+    old_task = asyncio.create_task(
+        pipeline._process_utterance_bound("old guest raw utterance")
+    )
+    await asyncio.wait_for(old_stream_blocked.wait(), timeout=1)
+
+    await pipeline._handle_bargein()
+    new_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = new_turn
+    new_task = asyncio.create_task(
+        pipeline._process_utterance_bound("new guest raw utterance")
+    )
+    await asyncio.wait_for(new_task, timeout=1)
+
+    expected_arguments = (
+        {"spoken": "new guest raw utterance"}
+        if tool_name == "capture_spoken_number"
+        else new_arguments
+    )
+    assert executed == [(tool_name, expected_arguments)]
+    request_ids, request_names, result_ids = direct_tool_history_records(
+        provider, pipeline.history,
+    )
+    assert request_names == [tool_name]
+    assert result_ids == request_ids
+    history_after_current = list(pipeline.history)
+    transcript_after_current = list(pipeline.full_transcript)
+    delivery_after_current = (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+    )
+
+    release_old_stream.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    # The stale runner still holds its old provider stream, but must neither run
+    # a side effect nor write an unmatched tool request to the newer turn.
+    assert executed == [(tool_name, expected_arguments)]
+    assert pipeline.history == history_after_current
+    assert pipeline.full_transcript == transcript_after_current
+    assert (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+    ) == delivery_after_current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+async def test_barged_in_slow_tool_cannot_leave_orphaned_provider_history(
+    monkeypatch, provider,
+):
+    """A completed old effect is not replayed or written after a newer turn wins."""
+    import server
+
+    old_tool_entered = asyncio.Event()
+    release_old_tool = asyncio.Event()
+    turn_ids = iter(("old-slow-tool", "new-slow-tool"))
+    old_arguments = {"request": "old", "guest_name": "Old Guest"}
+    new_arguments = {"request": "new", "guest_name": "Current Guest"}
+
+    async def immediate_round(events):
+        for event in events:
+            yield event
+
+    client = controlled_direct_tool_client(provider, [
+        immediate_round(direct_tool_round(provider, old_arguments)),
+        immediate_round(direct_tool_round(provider, new_arguments)),
+        immediate_round(direct_text_round(provider, "Current tool complete.")),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    telemetry = server.SmartPBXTurnTelemetry(new_id=lambda: next(turn_ids))
+    pipeline._turn_telemetry = telemetry
+    old_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = old_turn
+    executed: list[dict[str, object]] = []
+
+    async def slow_old_tool(name, arguments):
+        executed.append({"name": name, "arguments": dict(arguments)})
+        if arguments["request"] == "old":
+            old_tool_entered.set()
+            await release_old_tool.wait()
+        return json.dumps({"status": "ok"})
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", slow_old_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+
+    old_task = asyncio.create_task(
+        pipeline._process_utterance_bound("old slow tool utterance")
+    )
+    await asyncio.wait_for(old_tool_entered.wait(), timeout=1)
+
+    await pipeline._handle_bargein()
+    new_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = new_turn
+    await asyncio.wait_for(
+        pipeline._process_utterance_bound("new tool utterance"), timeout=1,
+    )
+
+    assert executed == [
+        {"name": "create_booking", "arguments": old_arguments},
+        {"name": "create_booking", "arguments": new_arguments},
+    ]
+    assert direct_tool_request_inputs(provider, pipeline.history) == [new_arguments]
+    request_ids, request_names, result_ids = direct_tool_history_records(
+        provider, pipeline.history,
+    )
+    assert request_names == ["create_booking"]
+    assert result_ids == request_ids
+    assert direct_single_tool_pairs(provider, pipeline.history) == [
+        (new_arguments, "tool-1" if provider != "gemini" else "gemini_tc_0_0",
+         "tool-1" if provider != "gemini" else "gemini_tc_0_0"),
+    ]
+    history_after_current = list(pipeline.history)
+    transcript_after_current = list(pipeline.full_transcript)
+    delivery_after_current = (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+        dict(pipeline._booking_slots),
+    )
+
+    release_old_tool.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    assert direct_single_tool_pairs(provider, pipeline.history) == [
+        (new_arguments, "tool-1" if provider != "gemini" else "gemini_tc_0_0",
+         "tool-1" if provider != "gemini" else "gemini_tc_0_0"),
+    ]
+    assert direct_tool_request_inputs(provider, pipeline.history) == [new_arguments]
+    request_ids, request_names, result_ids = direct_tool_history_records(
+        provider, pipeline.history,
+    )
+    assert request_names == ["create_booking"]
+    assert result_ids == request_ids
+    assert pipeline.history == history_after_current
+    assert pipeline.full_transcript == transcript_after_current
+    assert (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+        dict(pipeline._booking_slots),
+    ) == delivery_after_current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+async def test_barged_in_stale_text_runner_cannot_write_current_turn_state(
+    monkeypatch, provider,
+):
+    """A stale no-tool completion cannot append history or transcript text."""
+    import server
+
+    old_stream_blocked = asyncio.Event()
+    release_old_stream = asyncio.Event()
+    turn_ids = iter(("old-text-turn", "new-text-turn"))
+
+    async def delayed_old_text_round():
+        for event in direct_text_round(provider, "Old stale response."):
+            yield event
+        old_stream_blocked.set()
+        await release_old_stream.wait()
+
+    async def immediate_round(events):
+        for event in events:
+            yield event
+
+    client = controlled_direct_tool_client(provider, [
+        delayed_old_text_round(),
+        immediate_round(direct_text_round(provider, "New current response.")),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    telemetry = server.SmartPBXTurnTelemetry(new_id=lambda: next(turn_ids))
+    pipeline._turn_telemetry = telemetry
+    old_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = old_turn
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+
+    old_task = asyncio.create_task(
+        pipeline._process_utterance_bound("old text utterance")
+    )
+    await asyncio.wait_for(old_stream_blocked.wait(), timeout=1)
+
+    await pipeline._handle_bargein()
+    new_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = new_turn
+    await asyncio.wait_for(
+        pipeline._process_utterance_bound("new text utterance"), timeout=1,
+    )
+
+    assert [
+        message["content"]
+        for message in pipeline.history
+        if message.get("role") == "assistant" and isinstance(message.get("content"), str)
+    ] == ["New current response."]
+    assert [
+        message["text"]
+        for message in pipeline.full_transcript
+        if message.get("role") == "assistant"
+    ] == ["New current response."]
+    history_after_current = list(pipeline.history)
+    transcript_after_current = list(pipeline.full_transcript)
+    delivery_after_current = (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+    )
+
+    release_old_stream.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    assert pipeline.history == history_after_current
+    assert pipeline.full_transcript == transcript_after_current
+    assert (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+    ) == delivery_after_current
 
 
 @pytest.mark.asyncio
@@ -2431,3 +2942,228 @@ def test_smartpbx_health_stays_open_for_liveness_probes():
     health = {route.path: route for route in app.routes}["/health"].endpoint
 
     assert health() == {"status": "ok", "service_mode": "smartpbx"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_direct_smartpbx_provider_requests_use_the_concise_output_budget(
+    monkeypatch, provider
+):
+    """Only direct Dialog sessions get the 120-token caller-rhythm budget."""
+    import server
+
+    client = direct_tool_client(provider, [direct_text_round(provider, "Concise reply.")])
+    pipeline = direct_tool_pipeline(server, provider, client)
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("guest turn")
+
+    request = client.requests[0]
+    if provider == "gemini":
+        assert request["config"]["max_output_tokens"] == 120
+    else:
+        assert request["max_tokens"] == 120
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_non_smartpbx_provider_requests_keep_the_existing_output_budget(
+    monkeypatch, provider
+):
+    """ConversationRelay and ordinary Media Streams must remain at 300 tokens."""
+    import server
+
+    client = direct_tool_client(provider, [direct_text_round(provider, "Legacy reply.")])
+    pipeline = server.MediaStreamSession(
+        websocket=None,
+        lang="en",
+        media_transport=FakeTransport(),
+        anthropic_client=client if provider == "claude" else None,
+        gemini_client=client if provider == "gemini" else None,
+        openai_client=client if provider == "openai" else None,
+        llm_provider=provider,
+        model=f"{provider}-legacy-model",
+    )
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("guest turn")
+
+    request = client.requests[0]
+    if provider == "gemini":
+        assert request["config"]["max_output_tokens"] == 300
+    else:
+        assert request["max_tokens"] == 300
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 120),
+        ("", 120),
+        ("39", 40),
+        ("40", 40),
+        ("120", 120),
+        ("200", 200),
+        ("201", 200),
+        ("not-an-int", 120),
+    ],
+)
+def test_smartpbx_output_token_resolver_defaults_and_clamps(raw, expected):
+    import server
+
+    assert server._resolve_smartpbx_max_tokens(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf"])
+def test_smartpbx_initial_filler_delay_rejects_nonfinite_environment_values(raw):
+    import math
+    import server
+
+    resolved = server._resolve_smartpbx_initial_filler_delay(raw)
+
+    assert math.isfinite(resolved)
+    assert resolved == 2.5
+
+
+class _ControlledInitialFillerSleep:
+    def __init__(self):
+        self.delays = []
+        self.release = asyncio.Event()
+
+    async def __call__(self, seconds):
+        self.delays.append(seconds)
+        await self.release.wait()
+
+
+def _initial_filler_controller(server, sleep, speak, *, clear_audio=None):
+    return server.SmartPBXInitialFillerController(
+        speak=speak,
+        generation=7,
+        delay_seconds=2.5,
+        sleep=sleep,
+        clear_audio=clear_audio,
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_smartpbx_filler_waits_exactly_2_5_seconds_then_speaks_once():
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    spoken = []
+
+    async def speak(text, *, generation):
+        spoken.append((text, generation))
+
+    controller = _initial_filler_controller(server, sleep, speak)
+    controller.start()
+    await asyncio.sleep(0)
+    assert sleep.delays == [2.5]
+    assert spoken == []
+
+    sleep.release.set()
+    await controller.wait()
+
+    assert spoken == [(server.SMARTPBX_INITIAL_FILLER_TEXT, 7)]
+    assert controller.spoke is True
+    assert controller.suppress_specialized_tool_filler is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel",
+    [
+        lambda controller: controller.on_content_delta(),
+        lambda controller: controller.on_tool_delta(),
+        lambda controller: controller.on_barge_in(),
+        lambda controller: controller.on_generation_change(8),
+        lambda controller: controller.on_session_finish(),
+    ],
+    ids=["content", "tool", "barge-in", "generation-change", "finish"],
+)
+async def test_initial_smartpbx_filler_cancels_before_the_delay_for_every_terminal_race(
+    cancel,
+):
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    spoken = []
+
+    async def speak(text, *, generation):
+        spoken.append((text, generation))
+
+    controller = _initial_filler_controller(server, sleep, speak)
+    controller.start()
+    await asyncio.sleep(0)
+    await cancel(controller)
+    sleep.release.set()
+    await controller.wait()
+
+    assert spoken == []
+    assert controller.spoke is False
+    assert controller.suppress_specialized_tool_filler is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["create_booking", "transfer_to_human"])
+async def test_spoken_initial_filler_is_cleared_before_a_side_effecting_tool_runs(tool_name):
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    filler_started = asyncio.Event()
+    filler_cancelled = asyncio.Event()
+    events = []
+
+    async def speak(_text, *, generation):
+        events.append(("filler", generation))
+        filler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            filler_cancelled.set()
+            raise
+
+    async def clear_audio():
+        events.append(("clear", None))
+
+    controller = _initial_filler_controller(server, sleep, speak, clear_audio=clear_audio)
+    controller.start()
+    await asyncio.sleep(0)
+    sleep.release.set()
+    await asyncio.wait_for(filler_started.wait(), timeout=1)
+
+    await controller.on_tool_delta()
+    await asyncio.wait_for(filler_cancelled.wait(), timeout=1)
+    events.append((tool_name, None))
+
+    assert events == [("filler", 7), ("clear", None), (tool_name, None)]
+    assert controller.suppress_specialized_tool_filler is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", ["capture_spoken_number", "capture_spoken_name", "collect_number_via_keypad"])
+async def test_capture_and_keypad_rounds_never_arm_an_initial_smartpbx_filler(capture):
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    spoken = []
+
+    async def speak(text, *, generation):
+        spoken.append((text, generation))
+
+    controller = _initial_filler_controller(server, sleep, speak)
+    controller.start(capture_tool=capture)
+    await asyncio.sleep(0)
+    sleep.release.set()
+    await controller.wait()
+
+    assert sleep.delays == []
+    assert spoken == []

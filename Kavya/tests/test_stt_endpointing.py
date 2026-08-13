@@ -111,8 +111,15 @@ def test_capture_mode_timers_switch_and_revert():
     session, loop, _processed = make_session(_NoopMonkeyPatch())
     session._enter_capture_mode(2)
 
+    # In capture mode a provider final no longer dispatches — it refreshes the
+    # combining window — so it must never wait less than the capture-silence
+    # timer. (It used to arm the short capture grace and dispatch, which is what
+    # made every 2-4 digit fragment cost its own LLM turn.)
     asyncio.run(session._accumulate_transcript("071175"))
-    assert loop.last.delay == server.CAPTURE_FINAL_GRACE_SECONDS
+    assert loop.last.delay >= server.CAPTURE_ENDPOINTING_SILENCE_SECONDS
+    assert loop.last.delay == max(
+        server.CAPTURE_FINAL_GRACE_SECONDS, server.CAPTURE_ENDPOINTING_SILENCE_SECONDS
+    )
 
     asyncio.run(session._set_transcript_interim("071175"))
     assert loop.last.delay == server.CAPTURE_ENDPOINTING_SILENCE_SECONDS
@@ -204,6 +211,37 @@ def test_continuation_after_a_final_within_grace_is_not_cut_off(monkeypatch):
     assert processed == [], "nothing may be processed while the caller is still speaking"
 
 
+@pytest.mark.parametrize(
+    ("interim", "expected_shape"),
+    [
+        ("second segment", "segment"),
+        ("first final second segment", "exact_cumulative"),
+        ("First final second segment", "unknown"),
+    ],
+)
+def test_smartpbx_interim_shape_telemetry_is_exact_and_text_free(
+    monkeypatch, caplog, interim, expected_shape
+):
+    session, _loop, _processed = make_session(monkeypatch)
+    session._smartpbx_transfer_context = object()
+    session._media_transport = object()
+
+    with caplog.at_level("INFO"):
+        asyncio.run(session._accumulate_transcript("first final"))
+        asyncio.run(session._set_transcript_interim(interim))
+
+    event = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("smartpbx_media event=stt_interim_shape")
+    )
+    assert f"shape={expected_shape}" in event
+    assert "committed_chars=11" in event
+    assert f"interim_chars={len(interim)}" in event
+    assert "first final" not in event
+    assert interim not in event
+
+
 def test_multi_segment_finals_accumulate_into_one_utterance(monkeypatch):
     session, loop, processed = make_session(monkeypatch)
 
@@ -234,3 +272,16 @@ def test_flush_clears_committed_and_pending_state(monkeypatch):
     assert processed == ["first utterance"]
     assert pending == "second"
     assert session._committed_transcript == ""
+
+
+def test_smartpbx_flush_starts_a_turn_with_the_endpoint_source(monkeypatch):
+    session, _loop, _processed = make_session(monkeypatch)
+    session._smartpbx_transfer_context = object()
+    session._media_transport = object()
+    session._pending_transcript = "endpointed final"
+    session._committed_transcript = "endpointed final"
+
+    asyncio.run(session._flush_transcript())
+
+    assert session._active_smartpbx_turn_id is not None
+    assert session._turn_telemetry._turns[session._active_smartpbx_turn_id].endpoint_source == "final"

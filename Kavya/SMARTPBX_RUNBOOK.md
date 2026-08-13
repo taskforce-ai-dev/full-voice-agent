@@ -85,6 +85,7 @@ ELEVENLABS_VOICE_ID_AR=
 STT_PROVIDER=azure
 STT_ENDPOINTING_SILENCE_SECONDS=1.0
 STT_FINAL_GRACE_SECONDS=0.5
+STT_DIGIT_CLASS_BOOST=
 DTMF_INTERDIGIT_TIMEOUT_SECONDS=6
 DTMF_OVERALL_TIMEOUT_SECONDS=30
 DTMF_MAX_DIGITS=15
@@ -110,6 +111,8 @@ SMARTPBX_ACCOUNT_ID=
 SMARTPBX_MAX_MESSAGE_CHARS=65536
 SMARTPBX_MAX_AUDIO_BYTES=32768
 SMARTPBX_MAX_OUTBOUND_FRAMES=512
+SMARTPBX_MAX_TOKENS=
+SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=
 SMARTPBX_START_TIMEOUT_SECONDS=10
 SMARTPBX_IDLE_TIMEOUT_SECONDS=90
 SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS=300
@@ -123,6 +126,36 @@ SMARTPBX_MCP_READ_TIMEOUT_SECONDS=15
 SMARTPBX_MCP_MAX_RESPONSE_BYTES=1048576
 SMARTPBX_MCP_RETRIES=1
 ```
+
+## Later reviewed English digit-class rollout
+
+This runbook does not select a production boost. After review of the relevant
+test and privacy-safe telemetry evidence, choose a nonzero
+`STT_DIGIT_CLASS_BOOST` only in the protected `.env.smartpbx` file. Do not print
+that file, the selected value, or any secret.
+
+Before a separately approved recreate, render configuration with
+`docker compose --env-file .env.smartpbx config` (and the SmartPBX profile) and
+verify only that the explicit allowlist contains the key:
+
+```sh
+set -euo pipefail
+cd /opt/kavya
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config --format json \
+  | jq -e '.services["kavya-smartpbx"].environment | has("STT_DIGIT_CLASS_BOOST")' >/dev/null
+```
+
+After the separately approved pinned recreate using the established guarded
+deployment command in the TLS bootstrap or deployment path below, verify without
+printing configuration or secrets that the one safe state event was emitted:
+
+```sh
+docker compose --env-file .env.smartpbx --profile smartpbx logs --since 10m kavya-smartpbx \
+  | rg -q 'smartpbx_media event=stt_digit_class_state digit_class_enabled=(true|false) digit_class_boost='
+```
+
+The event reports only the clamped boost and enabled state; it contains no
+environment dump, transcript, caller identifier, provider payload, or secret.
 
 ## Canonical English voice provisioning
 
@@ -214,7 +247,31 @@ it requires both loopback endpoints before the final TLS vhost is installed.
 
 ## Cutover gates
 
-Before enabling the Dialog route, emit only the fixed protocol diagnostic with exactly seven fields: `event=smartpbx_protocol_diagnostic`, `correlation_id`, `stage`, `outcome`, `failure_class`, `active_sessions`, and `duration_ms`. The `correlation_id` is opaque, local, randomly generated, and never derived from Dialog. No additional event names, fields, values, or measurements are permitted.
+Before enabling the Dialog route, the cutover evidence export is a **finite approved
+event allowlist**. It may contain only the following runtime event names:
+`smartpbx_protocol_diagnostic`, `stt_digit_class_state`, `stt_interim_shape`,
+`turn_stage`, `turn_summary`, `session_summary`, `echo_rejected`,
+`agent_response`, `assistant_turn_delivery`, `audio_dump_written`,
+`bad_tool_json`, `llm_round`, `llm_round_complete`, `llm_empty_response`,
+`llm_error`, `llm_provider_degraded`, `llm_provider_failover`, `tool_execute`,
+`tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`,
+`tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
+`silence_reprompt`, `stt_final`, `stt_provider_final`, `stt_provider_interim`,
+`capture_buffer_bounded`, `capture_final_buffered`, `capture_forced_dispatch`,
+`capture_mode_enter`, `capture_mode_exit`, `dtmf_collect_start`, and
+`dtmf_collect_done`; unlisted event names are not permitted.
+The protocol diagnostic record is emitted as
+`event=smartpbx_protocol_diagnostic`.
+
+The fixed, aggregate-only fields are `correlation_id`, `stage`, `outcome`,
+`failure_class`, `active_sessions`, `duration_ms`, `turn_id`,
+`session_trace_id`, and `provider` where the named event emits that field.
+`correlation_id`, `turn_id`, and `session_trace_id` are opaque, local, randomly
+generated identifiers and are never derived from dialog. The `provider` field is
+a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, or `azure`.
+Wire-delivery proxies describe paced transport behavior only; they are not
+playback acknowledgements. Every approved event must not contain transcript text,
+audio, call ids, exception bodies, or secrets.
 
 1. Bad or missing WSS auth is rejected.
 2. A bidirectional call proves caller audio reaches STT, an LLM turn completes,
@@ -349,6 +406,18 @@ rising counter as "Kavya is answering at unusual length" and look at the prompt
 and the KB content first. Raise `SMARTPBX_MAX_OUTBOUND_FRAMES` (ceiling 512) only
 if it is already below the default. Investigate CPU or the Dialog socket only
 once reply length has been ruled out.
+
+## SmartPBX telemetry privacy and retention
+
+Keep the cutover evidence aggregate-only and limited to the finite approved
+event allowlist above. Do not export raw logs, transcript text, audio, payloads,
+caller identifiers, or environment values. The cadence values are wire-delivery
+proxies, not playback proof.
+
+The SmartPBX Compose service uses Docker's `json-file` logging with
+`max-size: "10m"` and `max-file: "3"`: local retention is therefore a 30 MB
+maximum. Preserve that cap during operations; do not add a remote raw-log sink
+or widen the approved event set without a separately reviewed privacy change.
 
 ## Withdraw and rollback without dropping calls
 

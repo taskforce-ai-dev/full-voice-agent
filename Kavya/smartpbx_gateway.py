@@ -297,9 +297,13 @@ class SmartPBXGateway:
                             DiagnosticOutcome.OBSERVED,
                             DiagnosticFailureClass.NONE,
                         )
-                        feed_dtmf = getattr(session, "feed_dtmf", None)
-                        if feed_dtmf is not None:
-                            await feed_dtmf(event.digit)
+                    # DtmfEvent is fully parsed before context validation. A
+                    # per-leg mismatch is observed above but deliberately does
+                    # not discard a valid keypad digit; malformed events and all
+                    # other protocol violations still raise before this point.
+                    feed_dtmf = getattr(session, "feed_dtmf", None)
+                    if feed_dtmf is not None:
+                        await feed_dtmf(event.digit)
                 elif isinstance(event, HangupEvent):
                     validate_event_context(event, context)
                     close_outcome = (1000, "call ended")
@@ -473,8 +477,12 @@ class SmartPBXGateway:
             "lease": DiagnosticFailureClass.LEASE_CLEANUP,
         }
         for name, operation in (
-            ("session", None if session is None else session.finish(schedule_post_call=True)),
             ("transport", None if transport is None else transport.close()),
+            # finish() emits the session aggregate and schedules post-call work.
+            # Close first so that aggregate observes terminal transport cleanup,
+            # while the fault-isolated/shielded loop below still releases the
+            # lease if either operation fails or is cancelled.
+            ("session", None if session is None else session.finish(schedule_post_call=True)),
             ("lease", None if lease is None else lease.release()),
         ):
             if operation is None:
