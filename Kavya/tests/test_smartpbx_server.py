@@ -1671,6 +1671,49 @@ def direct_tool_pipeline(server, provider, client, lang="en"):
     return pipeline
 
 
+def direct_tool_history_records(provider, history):
+    """Return provider-normalized request/result identifiers from shared history."""
+    if provider == "claude":
+        requests = [
+            block
+            for message in history
+            if message.get("role") == "assistant"
+            and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        results = [
+            block
+            for message in history
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        ]
+        return (
+            [request["id"] for request in requests],
+            [request["name"] for request in requests],
+            [result["tool_use_id"] for result in results],
+        )
+
+    requests = [
+        call
+        for message in history
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+    results = [
+        message
+        for message in history
+        if message.get("role") == "tool"
+    ]
+    return (
+        [request["id"] for request in requests],
+        [request["function"]["name"] for request in requests],
+        [result["tool_call_id"] for result in results],
+    )
+
+
 class CapturingTextWebSocket:
     def __init__(self):
         self.messages = []
@@ -1835,13 +1878,120 @@ async def test_barged_in_stale_runner_cannot_execute_tools_or_consume_new_raw_ut
         else new_arguments
     )
     assert executed == [(tool_name, expected_arguments)]
+    request_ids, request_names, result_ids = direct_tool_history_records(
+        provider, pipeline.history,
+    )
+    assert request_names == [tool_name]
+    assert result_ids == request_ids
+    history_after_current = list(pipeline.history)
+    transcript_after_current = list(pipeline.full_transcript)
+    delivery_after_current = (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+    )
 
     release_old_stream.set()
     await asyncio.wait_for(old_task, timeout=1)
 
     # The stale runner still holds its old provider stream, but must neither run
-    # a side effect nor read the session-global raw text for the newer turn.
+    # a side effect nor write an unmatched tool request to the newer turn.
     assert executed == [(tool_name, expected_arguments)]
+    assert pipeline.history == history_after_current
+    assert pipeline.full_transcript == transcript_after_current
+    assert (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+    ) == delivery_after_current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+async def test_barged_in_stale_text_runner_cannot_write_current_turn_state(
+    monkeypatch, provider,
+):
+    """A stale no-tool completion cannot append history or transcript text."""
+    import server
+
+    old_stream_blocked = asyncio.Event()
+    release_old_stream = asyncio.Event()
+    turn_ids = iter(("old-text-turn", "new-text-turn"))
+
+    async def delayed_old_text_round():
+        for event in direct_text_round(provider, "Old stale response."):
+            yield event
+        old_stream_blocked.set()
+        await release_old_stream.wait()
+
+    async def immediate_round(events):
+        for event in events:
+            yield event
+
+    client = controlled_direct_tool_client(provider, [
+        delayed_old_text_round(),
+        immediate_round(direct_text_round(provider, "New current response.")),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    telemetry = server.SmartPBXTurnTelemetry(new_id=lambda: next(turn_ids))
+    pipeline._turn_telemetry = telemetry
+    old_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = old_turn
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+
+    old_task = asyncio.create_task(
+        pipeline._process_utterance_bound("old text utterance")
+    )
+    await asyncio.wait_for(old_stream_blocked.wait(), timeout=1)
+
+    await pipeline._handle_bargein()
+    new_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = new_turn
+    await asyncio.wait_for(
+        pipeline._process_utterance_bound("new text utterance"), timeout=1,
+    )
+
+    assert [
+        message["content"]
+        for message in pipeline.history
+        if message.get("role") == "assistant" and isinstance(message.get("content"), str)
+    ] == ["New current response."]
+    assert [
+        message["text"]
+        for message in pipeline.full_transcript
+        if message.get("role") == "assistant"
+    ] == ["New current response."]
+    history_after_current = list(pipeline.history)
+    transcript_after_current = list(pipeline.full_transcript)
+    delivery_after_current = (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+    )
+
+    release_old_stream.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    assert pipeline.history == history_after_current
+    assert pipeline.full_transcript == transcript_after_current
+    assert (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+    ) == delivery_after_current
 
 
 @pytest.mark.asyncio
