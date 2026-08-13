@@ -85,6 +85,7 @@ ELEVENLABS_VOICE_ID_AR=
 STT_PROVIDER=azure
 STT_ENDPOINTING_SILENCE_SECONDS=1.0
 STT_FINAL_GRACE_SECONDS=0.5
+STT_DIGIT_CLASS_BOOST=
 DTMF_INTERDIGIT_TIMEOUT_SECONDS=6
 DTMF_OVERALL_TIMEOUT_SECONDS=30
 DTMF_MAX_DIGITS=15
@@ -123,6 +124,37 @@ SMARTPBX_MCP_READ_TIMEOUT_SECONDS=15
 SMARTPBX_MCP_MAX_RESPONSE_BYTES=1048576
 SMARTPBX_MCP_RETRIES=1
 ```
+
+## Later reviewed English digit-class rollout
+
+This runbook does not select a production boost. After review of the relevant
+test and privacy-safe telemetry evidence, choose a nonzero
+`STT_DIGIT_CLASS_BOOST` only in the protected `.env.smartpbx` file. Do not print
+that file, the selected value, or any secret.
+
+Before a separately approved recreate, render configuration with
+`docker compose --env-file .env.smartpbx config` (and the SmartPBX profile) and
+verify only that the explicit allowlist contains the key:
+
+```sh
+set -euo pipefail
+cd /opt/kavya
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config --format json \
+  | jq -e '.services["kavya-smartpbx"].environment | has("STT_DIGIT_CLASS_BOOST")' >/dev/null
+```
+
+Recreate only the pinned SmartPBX service through the reviewed deployment path,
+then verify without printing configuration or secrets that the one safe state
+event was emitted:
+
+```sh
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
+docker compose --env-file .env.smartpbx --profile smartpbx logs --since 10m kavya-smartpbx \
+  | rg -q 'smartpbx_media event=stt_digit_class_state digit_class_enabled=(true|false) digit_class_boost='
+```
+
+The event reports only the clamped boost and enabled state; it contains no
+environment dump, transcript, caller identifier, provider payload, or secret.
 
 ## Canonical English voice provisioning
 

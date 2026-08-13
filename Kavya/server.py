@@ -3389,6 +3389,9 @@ class GoogleSTTStream:
         # Set once if Google rejects the telephony model / adaptation for this
         # deployment, so every later stream skips straight to the default model.
         self._enhanced_config_rejected = False
+        # A privacy-safe SmartPBX configuration event is emitted once per STT
+        # stream object, including when enhanced configuration later falls back.
+        self._digit_class_state_logged = False
         # Set by the owning session; called from this thread when the restart
         # cap trips so the call can end instead of sitting in silence.
         self.on_fatal: Any = None
@@ -3575,6 +3578,14 @@ class GoogleSTTStream:
             "alternative_language_codes": alternatives,
             "enable_automatic_punctuation": True,
         }
+        if self._privacy_safe and self._lang == "en" and not self._digit_class_state_logged:
+            self._digit_class_state_logged = True
+            logger.info(
+                "smartpbx_media event=stt_digit_class_state "
+                "digit_class_enabled=%s digit_class_boost=%s",
+                str(STT_DIGIT_CLASS_BOOST > 0).lower(),
+                STT_DIGIT_CLASS_BOOST,
+            )
         if enhanced:
             if STT_GOOGLE_MODEL_EN:
                 recognition["model"] = STT_GOOGLE_MODEL_EN
@@ -4923,6 +4934,32 @@ class MediaStreamSession:
         # Preserve any committed finals from earlier segments; on the interim-only
         # path there are none, so this is a plain overwrite of the cumulative
         # interim as before.
+        if self._is_smartpbx_session():
+            committed = self._committed_transcript
+            exact_prefix = f"{committed} "
+            has_one_exact_separator = (
+                text.startswith(exact_prefix)
+                and len(text) > len(exact_prefix)
+                and not text[len(exact_prefix)].isspace()
+            )
+            if committed and has_one_exact_separator:
+                shape = "exact_cumulative"
+            elif committed and text.casefold().startswith(committed.casefold()):
+                # This identifies a possible cumulative shape for counting only.
+                # It never changes pending text or authorizes de-duplication.
+                shape = "unknown"
+            else:
+                # A case, spacing, or punctuation variation is deliberately not
+                # treated as cumulative. Google v1 documents consecutive results,
+                # not a cumulative-after-final contract, so keep this text intact.
+                shape = "unknown"
+            logger.info(
+                "smartpbx_media event=stt_interim_shape shape=%s "
+                "committed_chars=%d interim_chars=%d",
+                shape,
+                len(committed),
+                len(text),
+            )
         pending = (
             self._committed_transcript + " " + text
             if self._committed_transcript
