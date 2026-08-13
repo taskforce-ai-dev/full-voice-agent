@@ -95,6 +95,11 @@ class SmartPBXMediaTransport:
         return self._frames_dropped
 
     @property
+    def generation(self) -> int:
+        """Current local fencing generation after the latest clear."""
+        return self._generation
+
+    @property
     def send_failed(self) -> bool:
         """True once the outbound sender has died on a wire error."""
         return self._send_failed.is_set()
@@ -116,6 +121,9 @@ class SmartPBXMediaTransport:
                 # Generations survive until a barge-in, whereas telemetry turns
                 # do not.  A new opaque turn therefore starts fresh aggregate
                 # cadence accounting without touching queued audio/fencing.
+                self._first_sent_generations.discard(generation)
+                self._drained_generations.discard(generation)
+                self._cancel_underrun_check(generation)
                 self._cadence_by_generation[generation] = _CadenceState()
             self._generation_turn_ids[generation] = turn_id
 
@@ -247,9 +255,7 @@ class SmartPBXMediaTransport:
         self._residual_by_generation.pop(old_generation, None)
         self._close_generation_for_cadence(old_generation)
         self._emit_transport_event(old_generation, "barge_clear")
-        self._generation_turn_ids.pop(old_generation, None)
-        self._first_sent_generations.discard(old_generation)
-        self._drained_generations.discard(old_generation)
+        self._retire_generation(old_generation)
         self._generation += 1
         self._drain_queue()
 
@@ -269,6 +275,7 @@ class SmartPBXMediaTransport:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await sender_task
         self._drain_queue()
+        self._retire_all_generations()
 
     async def _enqueue_frame(self, audio: bytes, generation: int) -> bool:
         """Apply the original bounded newest-frame policy to one wire frame."""
@@ -358,6 +365,7 @@ class SmartPBXMediaTransport:
         self._residual_by_generation.clear()
         self._close_all_generations_for_cadence()
         self._drain_queue()
+        self._retire_all_generations()
 
     def _drain_queue(self) -> None:
         while not self._queue.empty():
@@ -436,6 +444,25 @@ class SmartPBXMediaTransport:
     def _close_all_generations_for_cadence(self) -> None:
         for generation in list(self._cadence_by_generation):
             self._close_generation_for_cadence(generation)
+
+    def _retire_generation(self, generation: int) -> None:
+        """Drop post-callback telemetry state for a retired generation."""
+        self._generation_turn_ids.pop(generation, None)
+        self._first_sent_generations.discard(generation)
+        self._drained_generations.discard(generation)
+        self._residual_by_generation.pop(generation, None)
+        self._cadence_by_generation.pop(generation, None)
+        self._queued_frames_by_generation.pop(generation, None)
+        self._cancel_underrun_check(generation)
+
+    def _retire_all_generations(self) -> None:
+        for generation in set(self._generation_turn_ids) | set(self._cadence_by_generation):
+            self._retire_generation(generation)
+        self._first_sent_generations.clear()
+        self._drained_generations.clear()
+        self._residual_by_generation.clear()
+        self._cadence_by_generation.clear()
+        self._queued_frames_by_generation.clear()
 
     def _cancel_underrun_check(self, generation: int) -> None:
         task = self._underrun_tasks.pop(generation, None)

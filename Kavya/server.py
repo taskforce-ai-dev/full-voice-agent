@@ -36,10 +36,12 @@ import base64
 import contextlib
 import json
 import logging
+import math
 import os
 import inspect
 import difflib
 import secrets
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 # --- Error tracking (Sentry): no-op unless SENTRY_DSN is set ---
@@ -150,6 +152,21 @@ class _SmartPBXTurnState:
     finished: bool = False
 
 
+@dataclass
+class _SmartPBXRunnerContext:
+    """Task-local ownership for one SmartPBX utterance runner."""
+
+    turn_id: str | None
+    dropped_frame_baseline: int
+    speak_generation: int
+    initial_filler: Any | None = None
+
+
+_smartpbx_runner_context: ContextVar[_SmartPBXRunnerContext | None] = ContextVar(
+    "smartpbx_runner_context", default=None
+)
+
+
 class SmartPBXTurnTelemetry:
     """Call-local, opaque SmartPBX turn timing recorder.
 
@@ -201,6 +218,11 @@ class SmartPBXTurnTelemetry:
             return
         self.mark(turn_id, stage, at_ns=at_ns)
 
+    def has_active_turn(self, turn_id: str) -> bool:
+        """Whether this opaque turn still needs transport-stage snapshots."""
+        state = self._turns.get(turn_id)
+        return state is not None and not state.finished
+
     def finish(self, turn_id: str, outcome: str, **counts: int) -> None:
         state = self._turns.get(turn_id)
         if state is None or state.finished:
@@ -242,7 +264,12 @@ class SmartPBXTurnTelemetry:
             if name in counts:
                 fields[name] = min(max(int(counts[name]), 0), maximum)
         self.turns_summarized += 1
-        self._emit("turn_summary", **fields)
+        try:
+            self._emit("turn_summary", **fields)
+        finally:
+            # Terminal summaries contain all state needed by the session
+            # aggregate. Never retain a completed turn for the call lifetime.
+            self._turns.pop(turn_id, None)
 
 # ---------------------------------------------------------------------------
 # Environment variables
@@ -435,6 +462,8 @@ def _resolve_smartpbx_initial_filler_delay(raw: object) -> float:
         value = float(raw) if raw not in (None, "") else 2.5
     except (TypeError, ValueError):
         value = 2.5
+    if not math.isfinite(value):
+        value = 2.5
     return min(max(value, 0.5), 5.0)
 
 
@@ -596,6 +625,7 @@ class SmartPBXInitialFillerController:
         self._clear_audio = clear_audio
         self._task: asyncio.Task | None = None
         self.spoke = False
+        self._cleared_after_spoke = False
 
     @property
     def suppress_specialized_tool_filler(self) -> bool:
@@ -621,7 +651,13 @@ class SmartPBXInitialFillerController:
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        if clear_if_spoke and self.spoke and self._clear_audio is not None:
+        if (
+            clear_if_spoke
+            and self.spoke
+            and not self._cleared_after_spoke
+            and self._clear_audio is not None
+        ):
+            self._cleared_after_spoke = True
             await self._clear_audio()
 
     async def on_content_delta(self) -> None:
@@ -4109,6 +4145,8 @@ class MediaStreamSession:
         self._tts_failed_smartpbx_turn_ids: set[str] = set()
         self._smartpbx_barge_ins = 0
         self._smartpbx_cadence_by_turn: dict[str, dict[str, int]] = {}
+        self._smartpbx_dropped_frame_baselines: dict[str, int] = {}
+        self._smartpbx_last_finished_dropped_frames = 0
         self._smartpbx_initial_filler: SmartPBXInitialFillerController | None = None
 
     def _is_smartpbx_session(self) -> bool:
@@ -4140,14 +4178,29 @@ class MediaStreamSession:
         async def speak(text: str, *, generation: int) -> None:
             await self._invoke_speak(text, generation=generation)
 
+        async def clear_audio() -> None:
+            # A late delta from an interrupted runner must not clear the newer
+            # turn's transport generation.
+            if generation == self._speak_generation:
+                await self._clear_media_audio()
+                runner = _smartpbx_runner_context.get()
+                if runner is not None and runner.speak_generation == generation:
+                    runner.speak_generation = self._speak_generation
+
         controller = SmartPBXInitialFillerController(
             speak=speak,
             generation=generation,
             delay_seconds=SMARTPBX_INITIAL_FILLER_DELAY_SECONDS,
-            clear_audio=self._clear_media_audio,
+            clear_audio=clear_audio,
         )
         controller.start()
-        self._smartpbx_initial_filler = controller
+        runner = _smartpbx_runner_context.get()
+        if runner is not None:
+            runner.initial_filler = controller
+        # A stale runner can still unwind after a barge-in. It may retain its
+        # own controller, but it must never replace the newer runner's one.
+        if runner is None or runner.turn_id == self._active_smartpbx_turn_id:
+            self._smartpbx_initial_filler = controller
         return controller
 
     async def _finish_initial_smartpbx_filler(
@@ -4166,21 +4219,55 @@ class MediaStreamSession:
             self._turn_telemetry = SmartPBXTurnTelemetry()
         return self._turn_telemetry
 
+    def _current_smartpbx_turn_id(self) -> str | None:
+        """Use the task's captured turn while a runner is active."""
+        runner = _smartpbx_runner_context.get()
+        return runner.turn_id if runner is not None else self._active_smartpbx_turn_id
+
+    def _runner_speak_generation(self, fallback: int) -> int:
+        """Use the runner's current fence after a filler-only clear."""
+        runner = _smartpbx_runner_context.get()
+        return fallback if runner is None else runner.speak_generation
+
+    def _current_smartpbx_dropped_frames(self) -> int:
+        return max(int(getattr(self._media_transport, "frames_dropped_total", 0)), 0)
+
+    def _smartpbx_dropped_frames_for_turn(self, turn_id: str) -> int:
+        """Return only overflow accumulated since this opaque turn began."""
+        runner = _smartpbx_runner_context.get()
+        if runner is not None and runner.turn_id == turn_id:
+            baseline = runner.dropped_frame_baseline
+        else:
+            baseline = self._smartpbx_dropped_frame_baselines.get(
+                turn_id, self._smartpbx_last_finished_dropped_frames,
+            )
+        current = self._current_smartpbx_dropped_frames()
+        return max(current - baseline, 0)
+
+    def _retire_smartpbx_turn(self, turn_id: str) -> None:
+        self._smartpbx_cadence_by_turn.pop(turn_id, None)
+        self._smartpbx_dropped_frame_baselines.pop(turn_id, None)
+        self._smartpbx_last_finished_dropped_frames = (
+            self._current_smartpbx_dropped_frames()
+        )
+
     def _mark_smartpbx_turn(self, stage: str, *, at_ns: int | None = None) -> None:
         telemetry = self._ensure_smartpbx_turn_telemetry()
-        if telemetry is not None and self._active_smartpbx_turn_id is not None:
-            telemetry.mark(self._active_smartpbx_turn_id, stage, at_ns=at_ns)
+        turn_id = self._current_smartpbx_turn_id()
+        if telemetry is not None and turn_id is not None:
+            telemetry.mark(turn_id, stage, at_ns=at_ns)
 
     def _mark_smartpbx_turn_once(self, stage: str, *, at_ns: int | None = None) -> None:
         telemetry = self._ensure_smartpbx_turn_telemetry()
-        if telemetry is not None and self._active_smartpbx_turn_id is not None:
-            telemetry.mark_once(self._active_smartpbx_turn_id, stage, at_ns=at_ns)
+        turn_id = self._current_smartpbx_turn_id()
+        if telemetry is not None and turn_id is not None:
+            telemetry.mark_once(turn_id, stage, at_ns=at_ns)
 
     def _on_smartpbx_transport_event(
         self, turn_id: str, generation: int, stage: str, monotonic_ns: int, dropped_frames: int
     ) -> None:
         telemetry = self._turn_telemetry
-        if telemetry is None:
+        if telemetry is None or not telemetry.has_active_turn(turn_id):
             return
         snapshot = getattr(self._media_transport, "cadence_summary_for_generation", None)
         if callable(snapshot):
@@ -4413,16 +4500,18 @@ class MediaStreamSession:
             logger.info("Tool '%s' â†’ %s", tool_name, result[:200])
 
     def _log_tool_failure(self, tool_name: str) -> None:
-        if self._active_smartpbx_turn_id is not None:
-            self._tool_failed_smartpbx_turn_ids.add(self._active_smartpbx_turn_id)
+        turn_id = self._current_smartpbx_turn_id()
+        if turn_id is not None:
+            self._tool_failed_smartpbx_turn_ids.add(turn_id)
         if self._is_smartpbx_session():
             logger.error("smartpbx_media event=tool_error tool=%s", tool_name)
         else:
             logger.exception("Tool '%s' failed", tool_name)
 
     def _log_tts_failure(self, provider: str, outcome: str, status: int | None = None) -> None:
-        if self._active_smartpbx_turn_id is not None:
-            self._tts_failed_smartpbx_turn_ids.add(self._active_smartpbx_turn_id)
+        turn_id = self._current_smartpbx_turn_id()
+        if turn_id is not None:
+            self._tts_failed_smartpbx_turn_ids.add(turn_id)
         if self._is_smartpbx_session():
             if status is None:
                 logger.error("smartpbx_media event=tts_failure provider=%s outcome=%s", provider, outcome)
@@ -4622,7 +4711,11 @@ class MediaStreamSession:
             self._smartpbx_barge_ins += 1
             if self._active_smartpbx_turn_id is not None:
                 self._interrupted_smartpbx_turn_ids.add(self._active_smartpbx_turn_id)
-                self._mark_smartpbx_turn_once("barge_clear")
+                telemetry = self._ensure_smartpbx_turn_telemetry()
+                if telemetry is not None:
+                    telemetry.mark_once(
+                        self._active_smartpbx_turn_id, "barge_clear"
+                    )
         self._assistant_turn_speech_end_at = time.monotonic()
         self._cancel_reprompt()
         self._speak_generation += 1
@@ -4650,11 +4743,15 @@ class MediaStreamSession:
         """Send raw mulaw through the active provider-specific media transport."""
         if self.transfer_pending:
             return
+        runner = _smartpbx_runner_context.get()
+        if runner is not None and runner.speak_generation != self._speak_generation:
+            return
         if self._media_transport is not None:
-            if self._active_smartpbx_turn_id is not None:
+            turn_id = self._current_smartpbx_turn_id()
+            if turn_id is not None:
                 bind_turn = getattr(self._media_transport, "bind_turn", None)
                 if callable(bind_turn):
-                    bind_turn(self._speak_generation, self._active_smartpbx_turn_id)
+                    bind_turn(self._speak_generation, turn_id)
             await self._media_transport.send_audio(audio)
             return
         async with self._ws_lock:
@@ -4669,7 +4766,16 @@ class MediaStreamSession:
         if self.transfer_pending and not force:
             return
         if self._media_transport is not None:
-            await self._media_transport.clear_audio()
+            cleared_generation = await self._media_transport.clear_audio()
+            transport_generation = getattr(
+                self._media_transport,
+                "generation",
+                getattr(self._media_transport, "_generation", cleared_generation),
+            )
+            if isinstance(transport_generation, int) and not isinstance(
+                transport_generation, bool,
+            ):
+                self._speak_generation = max(transport_generation, 0)
             return
             async with self._ws_lock:
                 await self.ws.send_text(json.dumps({
@@ -5198,6 +5304,9 @@ class MediaStreamSession:
         telemetry = self._ensure_smartpbx_turn_telemetry()
         if telemetry is not None:
             self._active_smartpbx_turn_id = telemetry.start_turn(endpoint_source)
+            self._smartpbx_dropped_frame_baselines[
+                self._active_smartpbx_turn_id
+            ] = self._current_smartpbx_dropped_frames()
             telemetry.mark(self._active_smartpbx_turn_id, "endpoint")
         self._utterance_turn += 1
         turn = self._utterance_turn
@@ -5244,11 +5353,31 @@ class MediaStreamSession:
                 smartpbx_transfer_context.reset(transfer_token)
 
     async def _process_utterance_bound(self, text: str):
+        turn_id = self._active_smartpbx_turn_id
+        telemetry = self._ensure_smartpbx_turn_telemetry()
+        dropped_frame_baseline = self._smartpbx_dropped_frame_baselines.get(
+            turn_id, self._smartpbx_last_finished_dropped_frames,
+        )
+        runner = _SmartPBXRunnerContext(
+            turn_id=turn_id,
+            dropped_frame_baseline=dropped_frame_baseline,
+            speak_generation=self._speak_generation,
+        )
+        runner_token = _smartpbx_runner_context.set(runner)
+        try:
+            await self._process_utterance_bound_runner(text, turn_id, telemetry)
+        finally:
+            _smartpbx_runner_context.reset(runner_token)
+
+    async def _process_utterance_bound_runner(
+        self,
+        text: str,
+        turn_id: str | None,
+        telemetry: SmartPBXTurnTelemetry | None,
+    ) -> None:
         self._last_guest_utterance_raw = text
         self._capture_success_this_turn = False
         self._start_assistant_turn_delivery_tracking()
-        turn_id = self._active_smartpbx_turn_id
-        telemetry = self._ensure_smartpbx_turn_telemetry()
         outcome = "completed"
         response_text = ""
         try:
@@ -5262,10 +5391,10 @@ class MediaStreamSession:
                     turn_id,
                     "transfer_pending" if self.transfer_pending else "cancelled",
                     delivered_sentences=len(self._delivered_sentences),
-                    dropped_frames=getattr(self._media_transport, "frames_dropped_total", 0),
+                    dropped_frames=self._smartpbx_dropped_frames_for_turn(turn_id),
                     **self._smartpbx_cadence_counts(turn_id),
                 )
-                self._smartpbx_cadence_by_turn.pop(turn_id, None)
+                self._retire_smartpbx_turn(turn_id)
             raise
         except Exception:
             if self._is_smartpbx_session():
@@ -5312,10 +5441,14 @@ class MediaStreamSession:
             error_msg = fillers.get("_default", "I'm sorry, I encountered an error.")
             await self._invoke_speak(error_msg)
         finally:
-            if self._smartpbx_initial_filler is not None:
-                await self._finish_initial_smartpbx_filler(
-                    self._smartpbx_initial_filler
-                )
+            runner = _smartpbx_runner_context.get()
+            controller = None if runner is None else runner.initial_filler
+            if (
+                controller is None
+                and turn_id == self._active_smartpbx_turn_id
+            ):
+                controller = self._smartpbx_initial_filler
+            await self._finish_initial_smartpbx_filler(controller)
             if self.transfer_pending:
                 outcome = "transfer_pending"
             elif turn_id in self._interrupted_smartpbx_turn_ids:
@@ -5329,10 +5462,10 @@ class MediaStreamSession:
                     turn_id, outcome,
                     generated_chars=len(response_text),
                     delivered_sentences=len(self._delivered_sentences),
-                    dropped_frames=getattr(self._media_transport, "frames_dropped_total", 0),
+                    dropped_frames=self._smartpbx_dropped_frames_for_turn(turn_id),
                     **self._smartpbx_cadence_counts(turn_id),
                 )
-                self._smartpbx_cadence_by_turn.pop(turn_id, None)
+                self._retire_smartpbx_turn(turn_id)
                 self._interrupted_smartpbx_turn_ids.discard(turn_id)
                 self._tool_failed_smartpbx_turn_ids.discard(turn_id)
                 self._tts_failed_smartpbx_turn_ids.discard(turn_id)
@@ -5380,6 +5513,8 @@ class MediaStreamSession:
                 if delta.content:
                     if initial_filler is not None:
                         await initial_filler.on_content_delta()
+                        if initial_filler._cleared_after_spoke:
+                            gen = self._speak_generation
                     self._mark_smartpbx_turn_once("llm_first_token")
                     text_content += delta.content
                     if not has_tool_use:
@@ -5396,6 +5531,8 @@ class MediaStreamSession:
                 if delta.tool_calls:
                     if initial_filler is not None:
                         await initial_filler.on_tool_delta()
+                        if initial_filler._cleared_after_spoke:
+                            gen = self._speak_generation
                     self._mark_smartpbx_turn_once("llm_first_token")
                     has_tool_use = True
                     for tc_delta in delta.tool_calls:
@@ -5649,6 +5786,8 @@ class MediaStreamSession:
                         if kind == "tool":
                             if initial_filler is not None:
                                 await initial_filler.on_tool_delta()
+                                if initial_filler._cleared_after_spoke:
+                                    gen = self._speak_generation
                             self._mark_smartpbx_turn_once("llm_first_token")
                             has_tool_use = True
                             function_calls.append(payload)
@@ -5656,6 +5795,8 @@ class MediaStreamSession:
 
                         if initial_filler is not None:
                             await initial_filler.on_content_delta()
+                            if initial_filler._cleared_after_spoke:
+                                gen = self._speak_generation
                         self._mark_smartpbx_turn_once("llm_first_token")
                         text_content += payload
                         # Once a function call has appeared the remaining text is a
@@ -5967,6 +6108,8 @@ class MediaStreamSession:
                         if event.content_block.type == "tool_use":
                             if initial_filler is not None:
                                 await initial_filler.on_tool_delta()
+                                if initial_filler._cleared_after_spoke:
+                                    gen = self._speak_generation
                             self._mark_smartpbx_turn_once("llm_first_token")
                             has_tool_use = True
                             cur_tool_id = event.content_block.id
@@ -5977,6 +6120,8 @@ class MediaStreamSession:
                         if event.delta.type == "text_delta":
                             if initial_filler is not None:
                                 await initial_filler.on_content_delta()
+                                if initial_filler._cleared_after_spoke:
+                                    gen = self._speak_generation
                             self._mark_smartpbx_turn_once("llm_first_token")
                             text_content += event.delta.text
                             # A text delta after a tool_use block starts must

@@ -245,7 +245,19 @@ it requires both loopback endpoints before the final TLS vhost is installed.
 
 ## Cutover gates
 
-Before enabling the Dialog route, emit only the fixed protocol diagnostic with exactly seven fields: `event=smartpbx_protocol_diagnostic`, `correlation_id`, `stage`, `outcome`, `failure_class`, `active_sessions`, and `duration_ms`. The `correlation_id` is opaque, local, randomly generated, and never derived from Dialog. No additional event names, fields, values, or measurements are permitted.
+Before enabling the Dialog route, the cutover evidence export is a **finite approved
+event allowlist**. It may contain only `smartpbx_protocol_diagnostic`,
+`stt_digit_class_state`, `stt_interim_shape`, `turn_stage`, `turn_summary`,
+`session_summary`, and `echo_rejected`; unlisted event names are not permitted.
+`smartpbx_protocol_diagnostic` has exactly seven fields:
+`event=smartpbx_protocol_diagnostic`, `correlation_id`, `stage`, `outcome`,
+`failure_class`, `active_sessions`, and `duration_ms`. The `correlation_id` is
+opaque, local, randomly generated, and never derived from Dialog. The other
+approved telemetry is aggregate-only: opaque turn/session identifiers, bounded
+durations and counters, endpoint source, STT shape, or echo character count and
+score. It must not contain a transcript, caller identifier, audio, provider
+payload, credential, or other raw value. Wire-delivery proxies describe paced
+transport behavior only; they are not playback acknowledgements.
 
 1. Bad or missing WSS auth is rejected.
 2. A bidirectional call proves caller audio reaches STT, an LLM turn completes,
@@ -380,6 +392,18 @@ rising counter as "Kavya is answering at unusual length" and look at the prompt
 and the KB content first. Raise `SMARTPBX_MAX_OUTBOUND_FRAMES` (ceiling 512) only
 if it is already below the default. Investigate CPU or the Dialog socket only
 once reply length has been ruled out.
+
+## SmartPBX telemetry privacy and retention
+
+Keep the cutover evidence aggregate-only and limited to the finite approved
+event allowlist above. Do not export raw logs, transcript text, audio, payloads,
+caller identifiers, or environment values. The cadence values are wire-delivery
+proxies, not playback proof.
+
+The SmartPBX Compose service uses Docker's `json-file` logging with
+`max-size: "10m"` and `max-file: "3"`: local retention is therefore a 30 MB
+maximum. Preserve that cap during operations; do not add a remote raw-log sink
+or widen the approved event set without a separately reviewed privacy change.
 
 ## Withdraw and rollback without dropping calls
 
