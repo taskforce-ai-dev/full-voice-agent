@@ -4454,8 +4454,11 @@ class MediaStreamSession:
             logger.info("smartpbx_media event=dtmf_collect_done status=%s", result.get("status"))
         return json.dumps(result)
 
-    def _log_tool_execution(self, tool_name: str, tool_input: Any) -> None:
-        self._capture_booking_slots(tool_name, tool_input)
+    def _log_tool_execution(
+        self, tool_name: str, tool_input: Any, *, capture_slots: bool = True,
+    ) -> None:
+        if capture_slots:
+            self._capture_booking_slots(tool_name, tool_input)
         self._mark_smartpbx_turn_once("tool_start")
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=tool_execute tool=%s", tool_name)
@@ -4543,12 +4546,16 @@ class MediaStreamSession:
         else:
             logger.info("Tool '%s' â†’ %s", tool_name, result[:200])
 
-    def _log_tool_failure(self, tool_name: str) -> None:
+    def _log_tool_failure(
+        self, tool_name: str, error: BaseException | None = None,
+    ) -> None:
         turn_id = self._current_smartpbx_turn_id()
         if turn_id is not None:
             self._tool_failed_smartpbx_turn_ids.add(turn_id)
         if self._is_smartpbx_session():
             logger.error("smartpbx_media event=tool_error tool=%s", tool_name)
+        elif error is not None:
+            logger.error("Tool '%s' failed", tool_name, exc_info=error)
         else:
             logger.exception("Tool '%s' failed", tool_name)
 
@@ -5666,16 +5673,15 @@ class MediaStreamSession:
                         for tc in tool_list
                     ],
                 }
-                if not self._current_smartpbx_runner_owns_shared_state():
-                    return ""
-                self._append_assistant_history(assistant_msg)
-
-                # Execute tools and add results
+                # Execute every tool first, then publish the provider's request
+                # and result block together. A barge-in may not strand a request
+                # in shared history while its awaited effect is still running.
+                staged_results: list[
+                    tuple[int, dict[str, str], Any, str, BaseException | None]
+                ] = []
                 for tool_index, tc in enumerate(tool_list):
-                    # This is the side-effect boundary. A runner made stale by
-                    # barge-in must not execute a tool or read newer raw speech.
                     if not self._current_smartpbx_runner_can_execute_tools():
-                        return full_text
+                        return ""
                     try:
                         parsed_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
                     except json.JSONDecodeError:
@@ -5687,14 +5693,17 @@ class MediaStreamSession:
                         override_spoken=self._smartpbx_runner_raw_utterance(),
                         source="smartpbx_media",
                     )
-                    self._log_tool_execution(tc["name"], parsed_input)
+                    self._log_tool_execution(
+                        tc["name"], parsed_input, capture_slots=False,
+                    )
+                    tool_error: BaseException | None = None
                     try:
                         if tc["name"] == "collect_number_via_keypad":
                             result_str = await self._collect_number_via_keypad(parsed_input)
                         else:
                             result_str = await execute_tool(tc["name"], parsed_input)
                     except Exception as exc:
-                        self._log_tool_failure(tc["name"])
+                        tool_error = exc
                         if self._is_direct_smartpbx_english():
                             assistant_msg["tool_calls"][tool_index]["function"]["arguments"] = "{}"
                             result_str = json.dumps({"error": "tool_execution_failed"})
@@ -5702,11 +5711,25 @@ class MediaStreamSession:
                             result_str = json.dumps({"error": str(exc)})
                     if not self._current_smartpbx_runner_owns_shared_state():
                         return ""
+                    staged_results.append(
+                        (tool_index, tc, parsed_input, result_str, tool_error)
+                    )
+                    if self.transfer_pending:
+                        break
+
+                if not self._current_smartpbx_runner_owns_shared_state():
+                    return ""
+                if len(staged_results) != len(tool_list):
+                    assistant_msg["tool_calls"] = assistant_msg["tool_calls"][:len(staged_results)]
+                self._append_assistant_history(assistant_msg)
+                for _tool_index, tc, _parsed_input, result_str, _tool_error in staged_results:
                     self.history.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "content": result_str,
                     })
+                for _tool_index, tc, parsed_input, result_str, tool_error in staged_results:
+                    self._capture_booking_slots(tc["name"], parsed_input)
                     try:
                         parsed_result = json.loads(result_str)
                     except (json.JSONDecodeError, TypeError):
@@ -5719,9 +5742,11 @@ class MediaStreamSession:
                         parsed_input,
                         result_str,
                     )
+                    if tool_error is not None:
+                        self._log_tool_failure(tc["name"], tool_error)
                     self._log_tool_result(tc["name"], result_str)
-                    if self.transfer_pending:
-                        return full_text
+                if self.transfer_pending:
+                    return full_text
 
                 continue
 
@@ -6033,14 +6058,12 @@ class MediaStreamSession:
                         "content": self._assistant_turn_text_for_history(text_content) if text_content else None,
                         "tool_calls": tool_calls_openai,
                     }
-                    if not self._current_smartpbx_runner_owns_shared_state():
-                        return ""
-                    self._append_assistant_history(assistant_msg)
-
+                    staged_results: list[
+                        tuple[dict[str, Any], Any, str, BaseException | None]
+                    ] = []
                     for tc in tool_calls_openai:
-                        # Fence immediately before each provider tool boundary.
                         if not self._current_smartpbx_runner_can_execute_tools():
-                            return full_text
+                            return ""
                         parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
                         parsed_input, _ = _override_capture_spoken_argument(
                             tool_name=tc["function"]["name"],
@@ -6048,18 +6071,21 @@ class MediaStreamSession:
                             override_spoken=self._smartpbx_runner_raw_utterance(),
                             source="smartpbx_media",
                         )
-                        self._log_tool_execution(tc["function"]["name"], parsed_input)
+                        self._log_tool_execution(
+                            tc["function"]["name"], parsed_input, capture_slots=False,
+                        )
                         # Set BEFORE the await: a tool that raises half-way may
                         # already have had its effect, so the turn is no longer
                         # safe to replay on Claude.
                         tool_executed = True
+                        tool_error: BaseException | None = None
                         try:
                             if tc["function"]["name"] == "collect_number_via_keypad":
                                 result_str = await self._collect_number_via_keypad(parsed_input)
                             else:
                                 result_str = await execute_tool(tc["function"]["name"], parsed_input)
                         except Exception as exc:
-                            self._log_tool_failure(tc["function"]["name"])
+                            tool_error = exc
                             if self._is_direct_smartpbx_english():
                                 tc["function"]["arguments"] = "{}"
                                 result_str = json.dumps({"error": "tool_execution_failed"})
@@ -6067,6 +6093,24 @@ class MediaStreamSession:
                                 result_str = json.dumps({"error": str(exc)})
                         if not self._current_smartpbx_runner_owns_shared_state():
                             return ""
+                        staged_results.append(
+                            (tc, parsed_input, result_str, tool_error)
+                        )
+                        if self.transfer_pending:
+                            break
+
+                    if not self._current_smartpbx_runner_owns_shared_state():
+                        return ""
+                    if len(staged_results) != len(tool_calls_openai):
+                        assistant_msg["tool_calls"] = assistant_msg["tool_calls"][:len(staged_results)]
+                    self._append_assistant_history(assistant_msg)
+                    for tc, _parsed_input, result_str, _tool_error in staged_results:
+                        self.history.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result_str,
+                        })
+                    for tc, parsed_input, result_str, tool_error in staged_results:
                         try:
                             parsed_result = json.loads(result_str)
                         except (json.JSONDecodeError, TypeError):
@@ -6081,14 +6125,12 @@ class MediaStreamSession:
                             parsed_input,
                             result_str,
                         )
-                        self.history.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": result_str,
-                        })
+                        self._capture_booking_slots(tc["function"]["name"], parsed_input)
+                        if tool_error is not None:
+                            self._log_tool_failure(tc["function"]["name"], tool_error)
                         self._log_tool_result(tc["function"]["name"], result_str)
-                        if self.transfer_pending:
-                            return full_text
+                    if self.transfer_pending:
+                        return full_text
 
                     continue
 
@@ -6310,19 +6352,14 @@ class MediaStreamSession:
                         "name": tb["name"],
                         "input": tb["input"],
                     })
-                if not self._current_smartpbx_runner_owns_shared_state():
-                    return ""
-                self._append_assistant_history({
-                    "role": "assistant",
-                    "content": assistant_content,
-                })
-
-                # Execute tools and build tool_result blocks
-                tool_results: list[dict[str, Any]] = []
+                # Keep the Anthropic request and all tool results local until
+                # every awaited effect has completed under the same ownership.
+                staged_results: list[
+                    tuple[int, dict[str, Any], Any, str, BaseException | None]
+                ] = []
                 for tool_index, tb in enumerate(tool_use_blocks):
-                    # Fence immediately before each provider tool boundary.
                     if not self._current_smartpbx_runner_can_execute_tools():
-                        return full_text
+                        return ""
                     # The capture tools must parse what the caller actually SAID,
                     # not the model's paraphrase of it — and on this path the raw
                     # utterance is the whole combined dictation. This is the
@@ -6336,14 +6373,17 @@ class MediaStreamSession:
                         override_spoken=self._smartpbx_runner_raw_utterance(),
                         source="smartpbx_media",
                     )
-                    self._log_tool_execution(tb["name"], tb["input"])
+                    self._log_tool_execution(
+                        tb["name"], tb["input"], capture_slots=False,
+                    )
+                    tool_error: BaseException | None = None
                     try:
                         if tb["name"] == "collect_number_via_keypad":
                             result_str = await self._collect_number_via_keypad(tb["input"])
                         else:
                             result_str = await execute_tool(tb["name"], tb["input"])
                     except Exception as exc:
-                        self._log_tool_failure(tb["name"])
+                        tool_error = exc
                         if self._is_direct_smartpbx_english():
                             assistant_content[tool_index + (1 if text_content else 0)]["input"] = {}
                             result_str = json.dumps({"error": "tool_execution_failed"})
@@ -6351,6 +6391,29 @@ class MediaStreamSession:
                             result_str = json.dumps({"error": str(exc)})
                     if not self._current_smartpbx_runner_owns_shared_state():
                         return ""
+                    staged_results.append(
+                        (tool_index, tb, tb["input"], result_str, tool_error)
+                    )
+                    if self.transfer_pending:
+                        break
+
+                if not self._current_smartpbx_runner_owns_shared_state():
+                    return ""
+                if len(staged_results) != len(tool_use_blocks):
+                    assistant_content = assistant_content[:len(staged_results) + (1 if text_content else 0)]
+                tool_results: list[dict[str, Any]] = []
+                for _tool_index, tb, _tool_input, result_str, _tool_error in staged_results:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tb["id"],
+                        "content": result_str,
+                    })
+                self._append_assistant_history({
+                    "role": "assistant",
+                    "content": assistant_content,
+                })
+                self.history.append({"role": "user", "content": tool_results})
+                for _tool_index, tb, tool_input, result_str, tool_error in staged_results:
                     try:
                         parsed_result = json.loads(result_str)
                     except (json.JSONDecodeError, TypeError):
@@ -6360,19 +6423,15 @@ class MediaStreamSession:
                     _append_booking_confirmation_marker(
                         self.full_transcript,
                         tb["name"],
-                        tb["input"],
+                        tool_input,
                         result_str,
                     )
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tb["id"],
-                        "content": result_str,
-                    })
+                    self._capture_booking_slots(tb["name"], tool_input)
+                    if tool_error is not None:
+                        self._log_tool_failure(tb["name"], tool_error)
                     self._log_tool_result(tb["name"], result_str)
-                    if self.transfer_pending:
-                        return full_text
-
-                self.history.append({"role": "user", "content": tool_results})
+                if self.transfer_pending:
+                    return full_text
                 continue
 
             # No tools — flush remaining sentence buffer
