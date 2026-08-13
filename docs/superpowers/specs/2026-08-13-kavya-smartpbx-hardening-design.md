@@ -31,6 +31,8 @@ tuning timing-sensitive behavior.
    route; retain the probe, publisher, and guarded runbook deployment path.
 7. Retain only privacy-safe operational logs for a bounded repository-owned
    period and document how to verify that contract.
+8. Test and, if CI evidence supports it, reframe SmartPBX μ-law outbound audio
+   from current 640-byte/80 ms TTS chunks to steady 160-byte/20 ms media frames.
 
 ## Non-goals and invariants
 
@@ -43,6 +45,12 @@ tuning timing-sensitive behavior.
 - Do not change keypad or transfer timeout values, reorder side-effecting tools,
   or assert that Dialog has an acoustic playback acknowledgement.  Transport
   timestamps remain a wire-delivery proxy.
+- Keep `nginx-smartpbx.conf` `proxy_read_timeout`/`proxy_send_timeout` at 120 s.
+  Treat a proxy close as a separate watch item and change it only with evidence
+  that it caused an observed call close.
+- Do not add a canary deployment implementation, dashboard change, production
+  route/configuration change, or provider dashboard mutation in this cycle. The
+  immutable baseline tag and a future controlled test DID are sufficient.
 - Do not silently deduplicate interims based on fuzzy matching, normalization,
   token overlap, or a provider assumption.
 - Do not change production `STT_DIGIT_CLASS_BOOST` in this cycle and do not put
@@ -86,6 +94,9 @@ tool_ms=<0..600000> tts_first_chunk_ms=<0..600000>
 first_media_sent_ms=<0..600000> queue_drained_ms=<0..600000>
 barge_clear_ms=<0..600000> generated_chars=<0..20000>
 delivered_sentences=<0..100> dropped_frames=<0..100000>
+frames_160b=<0..100000> frames_partial=<0..100000> frames_other=<0..100000>
+inter_send_gap_p95_ms=<0..600000> inter_send_gap_max_ms=<0..600000>
+queue_underruns=<0..100000>
 ```
 
 Each field is optional when its boundary did not occur.  The implementation
@@ -117,7 +128,43 @@ entry and its pending timing exactly as it invalidates stale audio.  The session
 creates `session_trace_id` in `_start_once()` and emits its aggregate
 `session_summary` from `_finish_once()` after pipeline/STT/transport cleanup.
 
-### 2. DTMF mismatch is diagnostic, not digit loss
+### 2. Media cadence evidence and 20 ms reframing
+
+The pinned Client Connect reference
+`ChanakaDev/ai-provider-example-websocket@d778fd5d9de46c2fe470f4e8e71167dd1aaa414f`
+splits `g711_ulaw@8000` output into 160-byte (20 ms) media frames.  Kavya's
+ElevenLabs/Azure readers currently request 640-byte chunks and
+`SmartPBXMediaTransport` sends each queued bytes object as one media frame; at
+8 kHz μ-law this is 80 ms.  The wire JSON shape is already compatible and
+Kavya's realtime pacing means this is not proof of loss or playback failure.
+It is, however, the strongest evidence-backed application/provider cadence
+difference and merits a controlled A/B.
+
+Implement the cadence change inside `SmartPBXMediaTransport`, before its
+existing queue/backpressure policy: `send_audio()` accepts arbitrary μ-law
+chunks, appends only current-generation bytes to a per-generation residual, and
+enqueues each complete 160-byte slice in original byte order.  The residual is
+strictly bounded below 160 bytes.  `send_mark()` flushes the live generation's
+remaining 1--159 bytes as one final partial frame before its existing
+`queue.join()` delivery barrier; no zero-length frame and no padding is sent.
+`clear_audio()`, close, and generation mismatch discard that generation's
+residual exactly as they discard stale queued audio.  This preserves generation
+fencing, contiguous-prefix behavior, existing 200 ms backpressure, and
+drop-newest accounting: an overflow may still remove only the newest queued
+full/partial frame, never reorder or replace earlier bytes.
+
+Add safe transport cadence accounting keyed by `turn_id`.  Frame sizes use only
+the fixed buckets `160B`, `partial_1_159B`, and `other`; no payload or exact
+unbounded size value is logged.  Keep a bounded per-turn inter-send-gap sample
+(at most 256 monotonic gaps) and report p95 and maximum only in the terminal
+summary, clamped as all other durations.  Increment `queue_underruns` only when
+the sender reaches its next scheduled send instant while the same generation's
+utterance remains open but has no queued frame; do not count normal utterance
+completion, stale generation clearing, or close as an under-run.  These values
+describe application-to-WebSocket cadence, not Client Connect acceptance or
+acoustic playback.
+
+### 3. DTMF mismatch is diagnostic, not digit loss
 
 `SmartPBXGateway` already parses `DtmfEvent` before context validation.  Move
 the existing `feed_dtmf(event.digit)` block out of the validation `else` so it
@@ -127,7 +174,7 @@ existing `CONTEXT_MISMATCH/OBSERVED` diagnostic on the mismatch.  Other
 `ProtocolViolation` values still raise, and the protocol parser continues to
 reject malformed event shapes and invalid digits before this branch.
 
-### 3. Interim semantics evidence gate
+### 4. Interim semantics evidence gate
 
 First obtain a source-backed Google streaming-result shape and add a fixture for
 both segment-only and cumulative-after-final cases.  The telemetry records only
@@ -142,7 +189,7 @@ token matching to create a match.  If that provider semantics is not supported,
 the implementation ships the fixture and telemetry only, leaving concatenation
 unchanged.
 
-### 4. Digit-class state and deployment gate
+### 5. Digit-class state and deployment gate
 
 Retain the existing clamped `STT_DIGIT_CLASS_BOOST` parsing and English-only
 `$OOV_CLASS_DIGIT_SEQUENCE` insertion.  At SmartPBX STT initialization log one
@@ -162,7 +209,7 @@ confirm the allowlist, recreate the pinned SmartPBX container, and verify the
 safe enabled-state event.  It must not print the environment file or its
 secrets.  This plan deliberately does not select the value.
 
-### 5. Caller rhythm
+### 6. Caller rhythm
 
 Use a SmartPBX-specific output profile: `SMARTPBX_MAX_TOKENS` defaults to `120`
 and is clamped to `[40, 200]`; non-SmartPBX paths retain the existing
@@ -188,7 +235,7 @@ never schedule this initial filler.  Tools retain their existing ordering; in
 particular `create_booking`, transfer, and every other side-effecting operation
 never begins concurrently with filler delivery.
 
-### 6. CI, retention, and operations
+### 7. CI, retention, and operations
 
 Change `.github/workflows/deploy-on-push.yml` and the matching
 `.github/workflows/pr-deploy-impact.yml` reporting route so a changed `Kavya/**`
@@ -205,6 +252,22 @@ configuration plus the safe event schema.  Do not add raw-log collection,
 longer retention, a dashboard payload, or a Dialog/caller-derived call
 correlation identifier; the locally random `turn_id`/`session_trace_id` contract
 above is the sole permitted correlation mechanism.
+
+The runbook adds a controlled synthetic-tone A/B only: compare the immutable
+baseline's prior 640-byte cadence with the reviewed 160-byte framing against a
+new non-production test DID and Client Connect echo provider.  It uses a
+synthetic tone, no caller recording, no dashboard/production route change, and
+no canary deployment implementation.  The result package must contain provider
+`callId`/CDR or case reference, UTC (`Z`) handshake/start/first-media/playback/
+close timestamps, negotiated codec/rate, accepted/queued/played evidence,
+frame-size bucket counts, p95/max gaps, and close reason.  It must not contain
+caller/callee numbers, payloads, transcripts, credentials, or raw exception
+bodies.  Provider `callId` is a controlled external-support artifact, never a
+Kavya log field or a derivative for `turn_id`/`session_trace_id`.
+
+Keep Nginx's 120 s proxy timeouts unchanged.  During the controlled test collect
+proxy and provider close times; investigate that watch item separately only if
+they prove a proxy timeout closed the connection.
 
 ## Verification and rollout
 

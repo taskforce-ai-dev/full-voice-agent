@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` or `executing-plans` task by task.  Steps use checkbox syntax for tracking.
 
-**Goal:** Make SmartPBX turn latency diagnosable without PII, repair valid mismatched DTMF, gate any interim de-duplication on provider evidence, expose safe STT state, improve only measured caller rhythm, and stop generic CI from selecting the intentionally rejected Kavya image deploy route.
+**Goal:** Make SmartPBX turn latency diagnosable without PII, repair valid mismatched DTMF, gate any interim de-duplication on provider evidence, expose safe STT state, improve measured caller rhythm, prove 20 ms μ-law media cadence safely, and stop generic CI from selecting the intentionally rejected Kavya image deploy route.
 
 **Architecture:** `MediaStreamSession` owns a SmartPBX-only recorder with a fresh opaque random `turn_id` per dispatched turn; STT, KB/LLM/tool/TTS, and the paced Dialog transport contribute fixed numeric boundaries using that key. `KavyaSmartPBXSession` owns a separate opaque `session_trace_id` and terminal aggregate. Protocol and deployment changes remain narrow: parsed DTMF forwarding is separated from diagnostic context matching, and the generic deploy dispatcher excludes Kavya while the existing immutable-image probe/publisher/runbook flow remains authoritative.
 
@@ -15,6 +15,8 @@
 - Never log transcript text, identifiers for caller/call/stream, phone numbers, provider payloads, tool arguments/results, headers, secrets, environment dumps, or exception messages.
 - All elapsed values use monotonic time, integer milliseconds, and clamp to `0..600000`; transport values are wire proxies, never playback acknowledgement.
 - Preserve capture buffering, transfer announcement/delivery behavior, queue pacing/backpressure, echo rejection, four-call admission, and Twilio paths.
+- Reframe SmartPBX `g711_ulaw@8000` output to 160 bytes/20 ms inside the existing transport; preserve byte order, generation fencing, bounded residuals, contiguous-prefix truncation, and drop accounting.
+- Keep Nginx SmartPBX proxy timeouts at 120 s unless controlled evidence proves a proxy-caused close. Do not implement a canary deployment, dashboard change, or production route/configuration change.
 - Do not change keypad or transfer timeouts, reorder side-effecting tools, mutate production configuration, or hardcode a production digit-class boost.
 - Local pytest may hang. Write focused tests first, then push test-only and implementation commits only to the existing `Rakesh` branch for targeted GitHub CI red/green evidence. This authorizes neither other branches, merge, deployment, production mutation, nor a push outside that CI purpose. Call local `python3 -m py_compile` syntax-only.
 - Do one consolidated final review after all tasks.  Do not perform a review gate after each task.
@@ -22,12 +24,13 @@
 ## File Map
 
 - Modify: `Kavya/server.py` — SmartPBX turn recorder, endpoint/provider-shape telemetry, output profile, initial filler, and digit-class state event.
-- Modify: `Kavya/smartpbx_transport.py` — generation-scoped first-send/drain/clear/drop timing callbacks with no payload logging.
+- Modify: `Kavya/smartpbx_transport.py` — generation-scoped first-send/drain/clear/drop timing callbacks, bounded 160-byte μ-law reframing/residual flush, and cadence accounting with no payload logging.
 - Modify: `Kavya/smartpbx_session.py` — locally random `session_trace_id`, generation-to-turn binding handoff, and one post-cleanup aggregate `session_summary`.
 - Modify: `Kavya/smartpbx_gateway.py` — forward valid parsed DTMF after an observed mismatch.
 - Modify: `Kavya/docker-compose.yml`, `Kavya/.env.example`, and `Kavya/SMARTPBX_RUNBOOK.md` — explicit non-secret knobs, rendered-config checks, and bounded retention procedure.
+- Read only: `Kavya/nginx-smartpbx.conf` — retain 120 s proxy timeouts and document the separate close-evidence watch item.
 - Modify: `.github/workflows/deploy-on-push.yml` and `.github/workflows/pr-deploy-impact.yml` — exclude Kavya from generic image deployment and report that truthfully.
-- Modify/add focused tests in `Kavya/tests/test_smartpbx_gateway.py`, `Kavya/tests/test_bug_a_smartpbx_gateway_fail_open.py`, `Kavya/tests/test_stt_endpointing.py`, `Kavya/tests/test_bug_b_stt_digit_sequence_context.py`, `Kavya/tests/test_smartpbx_runtime_seam.py`, `Kavya/tests/test_smartpbx_server.py`, and `Kavya/tests/test_smartpbx_deployment.py`.
+- Modify/add focused tests in `Kavya/tests/test_smartpbx_gateway.py`, `Kavya/tests/test_bug_a_smartpbx_gateway_fail_open.py`, `Kavya/tests/test_stt_endpointing.py`, `Kavya/tests/test_bug_b_stt_digit_sequence_context.py`, `Kavya/tests/test_smartpbx_transport.py`, `Kavya/tests/test_smartpbx_runtime_seam.py`, `Kavya/tests/test_smartpbx_server.py`, and `Kavya/tests/test_smartpbx_deployment.py`.
 
 ## Phase 0: Documentation and baseline
 
@@ -170,9 +173,49 @@ class SmartPBXMediaTransport:
 - [ ] Add a regression that verifies `create_booking` and transfer retain their existing sequential ordering after any active neutral filler is cancelled/cleared. Do not add concurrent filler/tool execution optimization in this cycle.
 - [ ] Run the focused GitHub CI test and syntax-only compile.
 
-## Phase 5: CI routing and bounded operations
+## Phase 5: Media cadence and controlled evidence
 
-### Task 10: Exclude Kavya from generic image deployment
+### Task 10: Test and implement 160-byte μ-law reframing
+
+**Files:**
+- Modify: `Kavya/smartpbx_transport.py`
+- Modify: `Kavya/tests/test_smartpbx_transport.py`
+- Modify: `Kavya/tests/test_smartpbx_runtime_seam.py`
+- Modify: `Kavya/tests/test_smartpbx_server.py`
+
+**Interfaces:**
+
+```python
+class SmartPBXMediaTransport:
+    async def send_audio(self, audio: bytes, generation: int) -> None: ...
+    async def send_mark(self, name: str) -> None: ...  # flush live residual, then join
+```
+
+- [ ] Write failing transport tests with deterministic μ-law byte sequences: `640` input bytes send as four ordered `160`-byte frames; fragmented input (`40 + 120 + 480`) yields the same four frames; `641` bytes send four `160`-byte frames plus one final `1`-byte frame only when `send_mark()` flushes.
+- [ ] Add stale-generation, `clear_audio()`, and `close()` controls: each discards its residual without a partial send; no test may inspect/log base64 payload content outside the fake WebSocket assertion.
+- [ ] Add sustained-overload tests showing the resulting sent bytes remain a contiguous prefix, newest full/partial frame loss increments the existing drop accounting, and prior frames are never reordered.
+- [ ] Add cadence-accounting tests: fixed frame buckets `160B`, `partial_1_159B`, `other`; bounded p95/max inter-send gaps; and `queue_underruns` only for an open same-generation utterance empty at its scheduled send instant. Normal marker completion, stale clear, and close are not under-runs.
+- [ ] Commit only the failing cadence tests as `test(kavya): define SmartPBX 20ms media cadence`, push only to existing `Rakesh` for authorized CI evidence, and capture the expected red result.
+- [ ] Implement generation-scoped residual buffering in `SmartPBXMediaTransport`: append input, enqueue exact ordered 160-byte slices, retain fewer than 160 bytes, flush one nonempty residual before `send_mark()` joins, and discard residual on clear/close/generation mismatch. Do not pad, split/reorder old queued frames, alter queue capacity/backpressure waits, or log audio bytes.
+- [ ] Emit only fixed cadence aggregates in `turn_summary`: `frames_160b`, `frames_partial`, `frames_other`, `inter_send_gap_p95_ms`, `inter_send_gap_max_ms`, and `queue_underruns`. Mark `first_media_sent_ms` and `queue_drained_ms` as wire proxies, never playback acknowledgement.
+- [ ] Run local `python3 -m py_compile Kavya/smartpbx_transport.py` syntax-only and rerun the targeted GitHub CI evidence to green.
+
+### Task 11: Add the controlled Client Connect cadence runbook
+
+**Files:**
+- Modify: `Kavya/SMARTPBX_RUNBOOK.md`
+- Modify: `Kavya/tests/test_smartpbx_deployment.py`
+- Read only: `Kavya/nginx-smartpbx.conf`
+
+- [ ] Record the comparison baseline: pinned Client Connect sample commit `d778fd5d9de46c2fe470f4e8e71167dd1aaa414f`, current immutable Kavya baseline tag, and its prior 640-byte cadence.
+- [ ] Add a synthetic-tone A/B procedure using a new non-production test DID and Client Connect echo provider: run the same μ-law tone through baseline 640-byte and reviewed 160-byte versions; never use a caller recording, production route, dashboard change, production credential, or canary deployment implementation.
+- [ ] Require a provider evidence package for each controlled call: provider `callId`, CDR/case reference, UTC `Z` handshake/start/first inbound/first outbound/playback start/playback end/close timestamps, negotiated codec/rate, accepted/queued/played state, close reason, frame bucket counts, p95/max gaps, and queue/drop outcomes. Explicitly forbid caller/callee numbers, payloads, transcripts, tokens, and raw exception bodies.
+- [ ] Keep `proxy_read_timeout` and `proxy_send_timeout` at `120s`. Add a separate watch item requiring matching Nginx/provider close timestamps before any timeout proposal; no timeout edit is part of this plan.
+- [ ] Add static tests for the fixed cadence terms, evidence-package privacy exclusions, immutable baseline wording, and unchanged 120 s Nginx requirement. Run the targeted GitHub CI evidence.
+
+## Phase 6: CI routing and bounded operations
+
+### Task 12: Exclude Kavya from generic image deployment
 
 **Files:**
 - Modify: `.github/workflows/deploy-on-push.yml`
@@ -185,7 +228,7 @@ class SmartPBXMediaTransport:
 - [ ] Add static YAML tests proving a `Kavya/**` change cannot call generic deploy with image mode, PR impact reporting also calls it excluded, a non-Kavya image-backed agent preserves prior routing, and the publisher/probe workflow files still exist with their guarded trigger/permissions contract.
 - [ ] Run the targeted GitHub CI test.  Expected result: generic push no longer produces the intentional Kavya red deployment.
 
-### Task 11: Document retention and operational verification
+### Task 13: Document retention and operational verification
 
 **Files:**
 - Modify: `Kavya/SMARTPBX_RUNBOOK.md`
@@ -197,13 +240,13 @@ class SmartPBXMediaTransport:
 - [ ] Add static documentation/config assertions for the retention values and forbidden raw/secret terms in the event contract.
 - [ ] Run the focused GitHub CI test.
 
-## Phase 6: Consolidated verification and promotion handoff
+## Phase 7: Consolidated verification and promotion handoff
 
-### Task 12: One final review and CI evidence package
+### Task 14: One final review and CI evidence package
 
 **Files:** all modified files above; no new feature scope.
 
-- [ ] Compare the final diff with `kavya-smartpbx-pre-stt-latency-20260813`; confirm capture buffering, transfer announcements, `send_mark()` delivery barrier, paced contiguous-prefix transport, echo suppression, four-call cap, and Twilio route code are unchanged except for telemetry seams explicitly required above.
+- [ ] Compare the final diff with `kavya-smartpbx-pre-stt-latency-20260813`; confirm capture buffering, transfer announcements, `send_mark()` delivery barrier, paced contiguous-prefix transport, echo suppression, four-call cap, Twilio route code, and Nginx 120 s timeout values are unchanged except for the explicit 160-byte transport reframing and telemetry seams above.
 - [ ] Run `git diff --check`, static workflow/config tests, and `python3 -m py_compile` for every changed Python module.  Report each as static/syntax evidence only.
 - [ ] Run the selected GitHub CI workflow(s) for the focused tests and retain links/results for red→green proof.  Do not claim local pytest passed.
 - [ ] Inspect every new structured event literal and confirm it has only the fixed allowed keys; inspect logging paths for exception messages/payload leakage.
