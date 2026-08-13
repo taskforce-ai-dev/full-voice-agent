@@ -4238,8 +4238,8 @@ class MediaStreamSession:
         runner = _smartpbx_runner_context.get()
         return fallback if runner is None else runner.speak_generation
 
-    def _current_smartpbx_runner_can_execute_tools(self) -> bool:
-        """Keep a barged-out task from mutating the caller's newer turn."""
+    def _current_smartpbx_runner_owns_shared_state(self) -> bool:
+        """Whether this runner may mutate call state after an awaited boundary."""
         if not self._is_direct_smartpbx_english():
             return True
         runner = _smartpbx_runner_context.get()
@@ -4252,6 +4252,10 @@ class MediaStreamSession:
             runner.turn_id == self._active_smartpbx_turn_id
             and runner.speak_generation == self._speak_generation
         )
+
+    def _current_smartpbx_runner_can_execute_tools(self) -> bool:
+        """Keep a barged-out task from crossing the tool side-effect boundary."""
+        return self._current_smartpbx_runner_owns_shared_state()
 
     def _smartpbx_runner_raw_utterance(self) -> str:
         """Return raw capture input owned by this task, never a newer turn's."""
@@ -4864,6 +4868,8 @@ class MediaStreamSession:
         Some tests monkey-patch _speak with a legacy two-argument signature.
         Preserve those tests while keeping the richer sentence-tracking contract.
         """
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return
         sig = inspect.signature(self._speak)
         params = sig.parameters
         has_generation = "generation" in params
@@ -4950,6 +4956,8 @@ class MediaStreamSession:
         return f"{delivered_text} [interrupted]" if delivered_text else "[interrupted]"
 
     def _append_assistant_history(self, assistant_content: Any) -> None:
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return
         if self._smartpbx_transfer_context is not None:
             if isinstance(assistant_content, dict):
                 assistant_msg = dict(assistant_content)
@@ -4969,6 +4977,8 @@ class MediaStreamSession:
         self.history.append(assistant_content)
 
     def _append_assistant_turn_to_transcript(self, generated_text: str) -> None:
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return
         if not self._is_smartpbx_session():
             return
         text = self._assistant_turn_text_for_history(generated_text)
@@ -5465,6 +5475,9 @@ class MediaStreamSession:
                 response_text = await self._run_llm_gemini()
             else:
                 response_text = await self._run_llm()
+            if not self._current_smartpbx_runner_owns_shared_state():
+                outcome = "interrupted"
+                return
             self._mark_smartpbx_turn("llm_complete")
             if response_text:
                 if self._is_smartpbx_session():
@@ -5476,6 +5489,9 @@ class MediaStreamSession:
             outcome = "cancelled"
             raise
         except Exception:
+            if not self._current_smartpbx_runner_owns_shared_state():
+                outcome = "interrupted"
+                return
             outcome = "llm_failed"
             if self._is_smartpbx_session():
                 logger.error("smartpbx_media event=llm_error")
@@ -5502,10 +5518,11 @@ class MediaStreamSession:
             elif turn_id in self._tool_failed_smartpbx_turn_ids:
                 outcome = "tool_failed"
             if telemetry is not None and turn_id is not None:
+                stale_runner = not self._current_smartpbx_runner_owns_shared_state()
                 telemetry.finish(
                     turn_id, outcome,
                     generated_chars=len(response_text),
-                    delivered_sentences=len(self._delivered_sentences),
+                    delivered_sentences=0 if stale_runner else len(self._delivered_sentences),
                     dropped_frames=self._smartpbx_dropped_frames_for_turn(turn_id),
                     **self._smartpbx_cadence_counts(turn_id),
                 )
@@ -5516,11 +5533,14 @@ class MediaStreamSession:
         # Pre-arm the patient timers for the NEXT guest turn(s) when this turn
         # actually asked the caller to dictate. Runs after the turn so it sees the
         # delivered sentences and cannot be undone by the capture tool's own exit.
-        self._maybe_enter_capture_mode_from_ask()
+        if self._current_smartpbx_runner_owns_shared_state():
+            self._maybe_enter_capture_mode_from_ask()
 
     # â”€â”€ OpenAI streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _run_llm(self) -> str:
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return ""
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
         smartpbx_filler_sent = False
@@ -5591,6 +5611,8 @@ class MediaStreamSession:
                             if tc_delta.function.arguments:
                                 tool_calls_data[idx]["arguments"] += tc_delta.function.arguments
 
+            if not self._current_smartpbx_runner_owns_shared_state():
+                return ""
             if self._is_direct_smartpbx_english():
                 full_text = _join_turn(full_text, text_content)
             else:
@@ -5644,6 +5666,8 @@ class MediaStreamSession:
                         for tc in tool_list
                     ],
                 }
+                if not self._current_smartpbx_runner_owns_shared_state():
+                    return ""
                 self._append_assistant_history(assistant_msg)
 
                 # Execute tools and add results
@@ -5676,6 +5700,8 @@ class MediaStreamSession:
                             result_str = json.dumps({"error": "tool_execution_failed"})
                         else:
                             result_str = json.dumps({"error": str(exc)})
+                    if not self._current_smartpbx_runner_owns_shared_state():
+                        return ""
                     self.history.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -5710,6 +5736,8 @@ class MediaStreamSession:
             if tts_tasks:
                 await asyncio.gather(*tts_tasks)
 
+            if not self._current_smartpbx_runner_owns_shared_state():
+                return ""
             if text_content:
                 self._append_assistant_history({
                     "role": "assistant",
@@ -5747,6 +5775,8 @@ class MediaStreamSession:
         a second failure: Anthropic 400s on Gemini's ``function_declarations``
         payload, so the caller would hear the error line instead of an answer.
         """
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return ""
         previous_model = self.model
         previous_tools = self.tools
         previous_provider = self.llm_provider
@@ -5770,6 +5800,8 @@ class MediaStreamSession:
         Claude path uses. Lang-agnostic the Sinhala/Tamil/Arabic Media Streams
         calls and the direct SmartPBX English calls all run through here.
         """
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return ""
         if self._gemini_failover_state.get("degraded") and ANTHROPIC_API_KEY:
             logger.info(
                 "smartpbx_media event=llm_provider_failover from=gemini to=claude reason=sticky"
@@ -5898,6 +5930,8 @@ class MediaStreamSession:
                 else:
                     logger.info("Gemini round %d [%s] text=%d chars, tools=%d, finish=%s", round_idx + 1, self.call_sid, len(text_content), len(function_calls), finish_reason)
 
+                if not self._current_smartpbx_runner_owns_shared_state():
+                    return ""
                 if self._is_direct_smartpbx_english():
                     full_text = _join_turn(full_text, text_content)
                 else:
@@ -5937,6 +5971,8 @@ class MediaStreamSession:
                         "call=%s lang=%s", self.call_sid or "-", self.lang,
                     )
                     await self._invoke_speak(fallback, generation=gen, sentence=fallback)
+                    if not self._current_smartpbx_runner_owns_shared_state():
+                        return ""
                     self._append_assistant_history({
                         "role": "assistant",
                         "content": fallback
@@ -5997,6 +6033,8 @@ class MediaStreamSession:
                         "content": self._assistant_turn_text_for_history(text_content) if text_content else None,
                         "tool_calls": tool_calls_openai,
                     }
+                    if not self._current_smartpbx_runner_owns_shared_state():
+                        return ""
                     self._append_assistant_history(assistant_msg)
 
                     for tc in tool_calls_openai:
@@ -6027,6 +6065,8 @@ class MediaStreamSession:
                                 result_str = json.dumps({"error": "tool_execution_failed"})
                             else:
                                 result_str = json.dumps({"error": str(exc)})
+                        if not self._current_smartpbx_runner_owns_shared_state():
+                            return ""
                         try:
                             parsed_result = json.loads(result_str)
                         except (json.JSONDecodeError, TypeError):
@@ -6062,6 +6102,8 @@ class MediaStreamSession:
                 if tts_tasks:
                     await asyncio.gather(*tts_tasks)
 
+                if not self._current_smartpbx_runner_owns_shared_state():
+                    return ""
                 if text_content:
                     self._append_assistant_history({
                         "role": "assistant",
@@ -6078,9 +6120,13 @@ class MediaStreamSession:
         gemini_history_len = len(self.history)
         try:
             response_text = await _run_gemini_turn()
+            if not self._current_smartpbx_runner_owns_shared_state():
+                return ""
             _note_gemini_success(self._gemini_failover_state)
             return response_text
         except Exception as exc:
+            if not self._current_smartpbx_runner_owns_shared_state():
+                return ""
             if len(self.history) > gemini_history_len:
                 self.history = self.history[:gemini_history_len]
 
@@ -6116,6 +6162,8 @@ class MediaStreamSession:
 
     async def _run_llm_claude(self) -> str:
         """Anthropic Claude streaming for Media Streams with sentence-level TTS."""
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return ""
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
         smartpbx_filler_sent = False
@@ -6212,6 +6260,8 @@ class MediaStreamSession:
                             cur_tool_id = None
                             tool_json = ""
 
+            if not self._current_smartpbx_runner_owns_shared_state():
+                return ""
             if self._is_direct_smartpbx_english():
                 full_text = _join_turn(full_text, text_content)
             else:
@@ -6260,6 +6310,8 @@ class MediaStreamSession:
                         "name": tb["name"],
                         "input": tb["input"],
                     })
+                if not self._current_smartpbx_runner_owns_shared_state():
+                    return ""
                 self._append_assistant_history({
                     "role": "assistant",
                     "content": assistant_content,
@@ -6297,6 +6349,8 @@ class MediaStreamSession:
                             result_str = json.dumps({"error": "tool_execution_failed"})
                         else:
                             result_str = json.dumps({"error": str(exc)})
+                    if not self._current_smartpbx_runner_owns_shared_state():
+                        return ""
                     try:
                         parsed_result = json.loads(result_str)
                     except (json.JSONDecodeError, TypeError):
@@ -6332,6 +6386,8 @@ class MediaStreamSession:
             if tts_tasks:
                 await asyncio.gather(*tts_tasks)
 
+            if not self._current_smartpbx_runner_owns_shared_state():
+                return ""
             if text_content:
                 self._append_assistant_history({
                     "role": "assistant",
