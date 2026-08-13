@@ -241,3 +241,16 @@ def test_flush_clears_committed_and_pending_state(monkeypatch):
     assert processed == ["first utterance"]
     assert pending == "second"
     assert session._committed_transcript == ""
+
+
+def test_smartpbx_flush_starts_a_turn_with_the_endpoint_source(monkeypatch):
+    session, _loop, _processed = make_session(monkeypatch)
+    session._smartpbx_transfer_context = object()
+    session._media_transport = object()
+    session._pending_transcript = "endpointed final"
+    session._committed_transcript = "endpointed final"
+
+    asyncio.run(session._flush_transcript())
+
+    assert session._active_smartpbx_turn_id is not None
+    assert session._turn_telemetry._turns[session._active_smartpbx_turn_id].endpoint_source == "final"
