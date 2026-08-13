@@ -111,8 +111,15 @@ def test_capture_mode_timers_switch_and_revert():
     session, loop, _processed = make_session(_NoopMonkeyPatch())
     session._enter_capture_mode(2)
 
+    # In capture mode a provider final no longer dispatches — it refreshes the
+    # combining window — so it must never wait less than the capture-silence
+    # timer. (It used to arm the short capture grace and dispatch, which is what
+    # made every 2-4 digit fragment cost its own LLM turn.)
     asyncio.run(session._accumulate_transcript("071175"))
-    assert loop.last.delay == server.CAPTURE_FINAL_GRACE_SECONDS
+    assert loop.last.delay >= server.CAPTURE_ENDPOINTING_SILENCE_SECONDS
+    assert loop.last.delay == max(
+        server.CAPTURE_FINAL_GRACE_SECONDS, server.CAPTURE_ENDPOINTING_SILENCE_SECONDS
+    )
 
     asyncio.run(session._set_transcript_interim("071175"))
     assert loop.last.delay == server.CAPTURE_ENDPOINTING_SILENCE_SECONDS

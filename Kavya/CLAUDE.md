@@ -898,6 +898,59 @@ service modes are architecturally incapable of running in one process.
 - Primary path for phone/WhatsApp/callback numbers remains spoken capture: use `capture_spoken_number` first and pass caller phrases exactly as spoken.
 - `collect_number_via_keypad` is fallback-only and should be offered only after repeated spoken capture failures or when the caller explicitly requests keypad entry.
 - Deterministic parser path lives in `Kavya/handover.py`: `expand_spoken_repeats` and `spoken_number_to_digits` expand double/triple/treble and zero variants, then `normalize_whatsapp` validates and normalizes length. This path is the single normalization source for live readback, booking phone, and WhatsApp payload so model arithmetic cannot drift from it.
+- **Fragment combining (capture mode).** Callers dictate numbers in 2-4 digit
+  groups and the recognizer commits a final at every pause. `MediaStreamSession`
+  therefore treats a dictation as ONE utterance:
+  - Capture mode is armed by the **delivered ask** (`_maybe_enter_capture_mode_from_ask`,
+    module patterns `_CAPTURE_ASK_PATTERNS` / `_CAPTURE_ASK_SUPPRESS_PATTERNS`),
+    so the first fragment is already patient — it no longer waits for the first
+    capture tool call. A read-back is not an ask; the successful-capture turn
+    also suppresses re-entry.
+  - While armed, every provider FINAL refreshes the capture-silence window
+    instead of dispatching (`_capture_turn_timeout` returns the more patient of
+    `CAPTURE_FINAL_GRACE_SECONDS`/`CAPTURE_ENDPOINTING_SILENCE_SECONDS`), the
+    combined text is capped at `CAPTURE_BUFFER_MAX_CHARS` (600, head kept), and
+    only the combined utterance is dispatched. Finals still pass the `_is_echo`
+    gate before they can enter the buffer.
+  - The silence re-prompt cannot fire while a capture buffer or capture timer is
+    pending (`_capture_dispatch_pending`) — a nudge mid-number talks over the
+    caller.
+  - The episode is bounded: a `status=captured` result, a combined utterance
+    below `CAPTURE_DICTATION_MIN_RATIO` (0.3) digit/letter-like tokens, or
+    `CAPTURE_MODE_MAX_TURNS` all end it. The allowance is spent AFTER the turn
+    and `_enter_capture_mode` never refills a live episode, so `needs_more`
+    cannot reset an exhausted one.
+  - Teardown forces the buffer into `full_transcript`
+    (`_force_pending_capture_dispatch`, called from `MediaStreamSession.run()`
+    teardown, `enter_transfer_pending`, and `KavyaSmartPBXSession._finish_once`) —
+    a half-dictated number must reach the call log and post-call extraction.
+  - Capture mode deliberately survives a barge-in (the buffer does not): a
+    caller talking over the tail of the ask is a dictation starting.
+  - Both knobs are env-tunable and clamped: `CAPTURE_BUFFER_MAX_CHARS`
+    (600, clamp `[60, 4000]`) and `CAPTURE_DICTATION_MIN_RATIO`
+    (0.3, clamp `[0.0, 1.0]`).
+  - **The capture parsers only ever see the caller's own words** because every
+    runner overrides the model's `spoken` argument with the raw utterance
+    (`_override_capture_spoken_argument`) — media Claude/OpenAI/Gemini and all
+    three ConversationRelay runners. The combined dictation reaches the parser
+    through that override and nowhere else, so a runner that skips it silently
+    discards the fragment combining.
+
+### Gemini double-empty is a failover, not an outcome (Aug 2026)
+A Gemini turn that streams no text and no tool call twice in a row now raises
+`_GeminiEmptyTurnError` into the existing Gemini→Claude failover path
+(`reason=empty_response`, sticky counter advances) instead of always speaking the
+canned `LLM_EMPTY_FALLBACKS` line — dead air to the caller is the same symptom as
+a quota error. The canned line remains for the cases where failover cannot run
+(`GEMINI_FAILOVER_TO_CLAUDE=false`, or no Anthropic client/key), and for any
+empty round that is **not replayable**: failover re-runs the whole turn from the
+truncated history, so it is gated on `round_idx == 0` with nothing spoken and no
+tool executed. A later empty round takes the canned line rather than risk running
+`create_booking` twice. Every failover (sticky and per-exception, both runners)
+converts the tool list to Anthropic shape via `_claude_tools_from_gemini` —
+Anthropic 400s on Gemini's `function_declarations` payload, and substituting
+`get_tools()` would hand the restricted handover-failsafe session the full
+booking tool set.
 
 ### SmartPBX migration operational hardening
 - `SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS` is validated in `smartpbx_gateway.py` as an integer setting: default `300`, clamp `[30, 1800]`. If absent, it falls back to this default through settings parsing.
