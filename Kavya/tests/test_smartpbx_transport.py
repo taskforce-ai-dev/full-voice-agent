@@ -347,3 +347,61 @@ async def test_marker_clear_and_close_are_not_cadence_underruns():
     assert "queue_underrun" not in await stages_after_terminal(
         lambda transport: transport.close()
     )
+
+
+@pytest.mark.asyncio
+async def test_normal_turn_reuse_emits_fresh_first_send_and_drain():
+    """A normal next turn must not need a barge-in to reset transport telemetry."""
+    websocket = FakeWebSocket()
+    events: list[tuple[str, int, str]] = []
+    transport = SmartPBXMediaTransport(
+        websocket,
+        CONTEXT,
+        max_queue_frames=8,
+        on_transport_event=lambda turn_id, generation, stage, *_: events.append(
+            (turn_id, generation, stage)
+        ),
+    )
+    transport.start()
+    try:
+        transport.bind_turn(0, "turn-one")
+        await transport.send_audio(b"\x10" * 160)
+        await transport.send_mark("turn-one-done")
+
+        # The reply completed normally, so Dialog has not cleared audio and the
+        # live transport generation is intentionally still zero.
+        transport.bind_turn(0, "turn-two")
+        await transport.send_audio(b"\x20" * 160)
+        await transport.send_mark("turn-two-done")
+
+        assert events.count(("turn-one", 0, "first_media_sent")) == 1
+        assert events.count(("turn-one", 0, "queue_drained")) == 1
+        assert events.count(("turn-two", 0, "first_media_sent")) == 1
+        assert events.count(("turn-two", 0, "queue_drained")) == 1
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_clear_and_close_retire_generation_cadence_state():
+    """Transport keeps only live/needed cadence state, never an unbounded history."""
+    websocket = FakeWebSocket()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    try:
+        transport.bind_turn(0, "turn-one")
+        await transport.send_audio(b"\x30" * 160)
+        await transport.send_mark("turn-one-done")
+        await transport.clear_audio()
+
+        assert transport._generation_turn_ids == {}
+        assert transport._cadence_by_generation == {}
+        assert transport._residual_by_generation == {}
+        assert transport._queued_frames_by_generation == {}
+    finally:
+        await transport.close()
+
+    assert transport._generation_turn_ids == {}
+    assert transport._cadence_by_generation == {}
+    assert transport._residual_by_generation == {}
+    assert transport._queued_frames_by_generation == {}

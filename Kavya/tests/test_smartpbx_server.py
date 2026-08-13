@@ -2511,6 +2511,17 @@ def test_smartpbx_output_token_resolver_defaults_and_clamps(raw, expected):
     assert server._resolve_smartpbx_max_tokens(raw) == expected
 
 
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf"])
+def test_smartpbx_initial_filler_delay_rejects_nonfinite_environment_values(raw):
+    import math
+    import server
+
+    resolved = server._resolve_smartpbx_initial_filler_delay(raw)
+
+    assert math.isfinite(resolved)
+    assert resolved == 2.5
+
+
 class _ControlledInitialFillerSleep:
     def __init__(self):
         self.delays = []

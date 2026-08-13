@@ -325,8 +325,18 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
 
     assert "fingerprint" not in normalized_diagnostics
     assert "event=smartpbx_protocol_diagnostic" in diagnostics
-    assert diagnostics.count("event=") == 1
-    assert "exactly seven fields" in normalized_diagnostics
+    assert "finite approved event allowlist" in normalized_diagnostics
+    for event_name in (
+        "smartpbx_protocol_diagnostic",
+        "stt_digit_class_state",
+        "stt_interim_shape",
+        "turn_stage",
+        "turn_summary",
+        "session_summary",
+        "echo_rejected",
+    ):
+        assert f"`{event_name}`" in diagnostics
+    assert "unlisted event names are not permitted" in normalized_diagnostics
     for field in (
         "correlation_id",
         "stage",
@@ -366,6 +376,59 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
     stop = rollback.find("stop kavya-smartpbx")
     assert withdraw >= 0
     assert withdraw < drain < stop
+
+
+def test_new_smartpbx_caller_rhythm_knobs_are_blank_safe_passthroughs():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
+
+    assert smartpbx_env.get("SMARTPBX_MAX_TOKENS") == "${SMARTPBX_MAX_TOKENS:-}"
+    assert (
+        smartpbx_env.get("SMARTPBX_INITIAL_FILLER_DELAY_SECONDS")
+        == "${SMARTPBX_INITIAL_FILLER_DELAY_SECONDS:-}"
+    )
+
+    example = read_text(".env.example")
+    assert re.search(r"^SMARTPBX_MAX_TOKENS=$", example, re.MULTILINE)
+    assert re.search(
+        r"^SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=$", example, re.MULTILINE
+    )
+    assert re.search(r"^SMARTPBX_MAX_TOKENS=\d", example, re.MULTILINE) is None
+    assert re.search(
+        r"^SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=\d", example, re.MULTILINE
+    ) is None
+
+
+def test_runbook_allows_only_privacy_safe_telemetry_and_bounded_local_retention():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    normalized = re.sub(r"\s+", " ", runbook).lower()
+
+    assert "finite approved event allowlist" in normalized
+    assert "json-file" in normalized
+    assert 'max-size: "10m"' in runbook
+    assert 'max-file: "3"' in runbook
+    assert "30 mb maximum" in normalized
+    assert "aggregate-only" in normalized
+    assert "do not export raw logs" in normalized
+    assert "wire-delivery proxies" in normalized
+
+
+def test_pr_impact_keeps_kavya_out_of_generic_deploy_and_gives_its_real_rollback_path():
+    workflow = (
+        PROJECT_ROOT.parent / ".github" / "workflows" / "pr-deploy-impact.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "kavya=$kavya" in workflow
+    assert 'KAVYA: ${{ steps.detect.outputs.kavya }}' in workflow
+    assert "Merging this PR does not deploy Kavya." in workflow
+    assert "Kavya SmartPBX rollback" in workflow
+    assert "SMARTPBX_RUNBOOK.md" in workflow
+    assert "deploy_smartpbx_image.sh" in workflow
+    assert (
+        "do not call generic `deploy.yml` with `agent=kavya` and `mode=image`"
+        in workflow
+    )
+    assert "# registry agents (all seven active ones)" not in workflow
 
 
 BUILD_KAVYA_IMAGE_WORKFLOW = PROJECT_ROOT.parent / ".github/workflows/build-kavya-image.yml"
