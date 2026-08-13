@@ -616,6 +616,55 @@ def test_turn_telemetry_emits_one_opaque_bounded_privacy_safe_summary():
     assert not (forbidden & set(summary[0]))
 
 
+def test_turn_telemetry_emits_only_fixed_privacy_safe_cadence_aggregates():
+    """Cadence timing is a wire proxy, never a payload or playback assertion."""
+    import server
+
+    emitted: list[dict[str, object]] = []
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        monotonic_ns=lambda: 1_000_000_000,
+        new_id=lambda: "opaque-cadence-turn",
+    )
+
+    turn_id = telemetry.start_turn("final")
+    telemetry.finish(
+        turn_id,
+        "completed",
+        frames_160b=4,
+        frames_partial=1,
+        frames_other=0,
+        inter_send_gap_p95_ms=20,
+        inter_send_gap_max_ms=24,
+        queue_underruns=1,
+    )
+
+    summary = next(record for record in emitted if record["event"] == "turn_summary")
+    assert {
+        field: summary[field]
+        for field in (
+            "frames_160b",
+            "frames_partial",
+            "frames_other",
+            "inter_send_gap_p95_ms",
+            "inter_send_gap_max_ms",
+            "queue_underruns",
+        )
+    } == {
+        "frames_160b": 4,
+        "frames_partial": 1,
+        "frames_other": 0,
+        "inter_send_gap_p95_ms": 20,
+        "inter_send_gap_max_ms": 24,
+        "queue_underruns": 1,
+    }
+    assert summary["inter_send_gap_p95_ms"] <= summary["inter_send_gap_max_ms"]
+    assert not ({
+        "call_id", "callId", "caller", "phone", "payload", "playback",
+        "transcript", "text", "token", "secret", "headers",
+    } & set(summary))
+
+
 @pytest.mark.parametrize(
     "outcome",
     ["completed", "tool_failed", "tts_failed", "interrupted", "transfer_pending"],

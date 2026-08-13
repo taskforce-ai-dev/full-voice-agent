@@ -35,6 +35,105 @@ async def wait_for_sent(websocket, count):
         await asyncio.sleep(0)
 
 
+def decoded_media_frames(websocket):
+    """Decode fake-WebSocket payloads only for outbound byte-order assertions."""
+    return [
+        base64.b64decode(json.loads(message)["media"]["payload"])
+        for message in websocket.sent
+    ]
+
+
+ULAW_640 = bytes(range(256)) * 2 + bytes(range(128))
+
+
+@pytest.mark.asyncio
+async def test_reframes_a_640_byte_mulaw_chunk_into_four_ordered_20ms_frames():
+    websocket = FakeWebSocket()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    try:
+        await transport.send_audio(ULAW_640)
+        await asyncio.wait_for(wait_for_sent(websocket, 4), timeout=1)
+        await transport.send_mark("tts_done")
+
+        assert decoded_media_frames(websocket) == [
+            ULAW_640[offset:offset + 160] for offset in range(0, 640, 160)
+        ]
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_reframes_fragmented_mulaw_input_without_reordering_bytes():
+    websocket = FakeWebSocket()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    try:
+        await transport.send_audio(ULAW_640[:40])
+        await transport.send_audio(ULAW_640[40:160])
+        await transport.send_audio(ULAW_640[160:])
+        await asyncio.wait_for(wait_for_sent(websocket, 4), timeout=1)
+        await transport.send_mark("tts_done")
+
+        assert decoded_media_frames(websocket) == [
+            ULAW_640[offset:offset + 160] for offset in range(0, 640, 160)
+        ]
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_send_mark_flushes_only_the_final_mulaw_residual_frame():
+    websocket = FakeWebSocket()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    audio = ULAW_640 + b"\xfe"
+    try:
+        await transport.send_audio(audio)
+        await asyncio.wait_for(wait_for_sent(websocket, 4), timeout=1)
+
+        assert decoded_media_frames(websocket) == [
+            audio[offset:offset + 160] for offset in range(0, 640, 160)
+        ]
+
+        await transport.send_mark("tts_done")
+        assert decoded_media_frames(websocket) == [
+            audio[offset:offset + 160] for offset in range(0, 640, 160)
+        ] + [b"\xfe"]
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_clear_audio_discards_a_live_generation_residual_before_it_can_send():
+    websocket = FakeWebSocket()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    try:
+        await transport.send_audio(b"\xa1" * 159)
+        await asyncio.sleep(0.01)
+        await transport.clear_audio()
+        await transport.send_audio(b"\xb2" * 160)
+        await asyncio.wait_for(wait_for_sent(websocket, 1), timeout=1)
+        await transport.send_mark("tts_done")
+
+        assert decoded_media_frames(websocket) == [b"\xb2" * 160]
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_close_discards_a_live_generation_residual_without_a_partial_wire_frame():
+    websocket = FakeWebSocket()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    await transport.send_audio(b"\xc3" * 159)
+    await asyncio.sleep(0.01)
+    await transport.close()
+
+    assert decoded_media_frames(websocket) == []
+
+
 @pytest.mark.asyncio
 async def test_sends_only_the_documented_media_envelope():
     websocket = FakeWebSocket()
@@ -151,3 +250,93 @@ async def test_send_audio_backpressures_and_bails_on_barge_in_without_hanging():
     await asyncio.wait_for(pending, timeout=1)
     assert transport.frames_dropped_total == 0
     await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_reframed_overflow_keeps_a_contiguous_prefix_and_counts_partial_tail_loss():
+    """A saturated queue may cut the reply short, but may not reorder its bytes."""
+
+    class SlowPayloadSocket(FakeWebSocket):
+        async def send_text(self, message):
+            # Exceeds the bounded 200 ms admission wait, forcing drop-newest.
+            await asyncio.sleep(0.4)
+            await super().send_text(message)
+
+    websocket = SlowPayloadSocket()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=2)
+    source = b"".join(bytes([index]) * 160 for index in range(20)) + b"tail"
+    transport.start()
+    try:
+        await transport.send_audio(source)
+        await transport.send_mark("tts_done")
+        delivered = b"".join(decoded_media_frames(websocket))
+
+        assert delivered == source[:len(delivered)]
+        assert transport.frames_dropped_total > 0
+        assert delivered != source, "the sustained overload must drop the newest tail"
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_cadence_accounting_uses_fixed_buckets_and_detects_one_open_utterance_underrun():
+    websocket = FakeWebSocket()
+    events: list[str] = []
+    transport = SmartPBXMediaTransport(
+        websocket,
+        CONTEXT,
+        max_queue_frames=8,
+        on_transport_event=lambda _turn_id, _generation, stage, *_: events.append(stage),
+    )
+    transport.bind_turn(0, "opaque-turn")
+    transport.start()
+    try:
+        await transport.send_audio(b"\x7f" * 160)
+        await asyncio.wait_for(wait_for_sent(websocket, 1), timeout=1)
+        # The generation remains open without a marker, so its next scheduled
+        # 20 ms send instant is a real sender underrun rather than a terminal gap.
+        await asyncio.sleep(0.035)
+
+        assert transport.cadence_summary_for_generation(0) == {
+            "frames_160b": 1,
+            "frames_partial": 0,
+            "frames_other": 0,
+            "inter_send_gap_p95_ms": 0,
+            "inter_send_gap_max_ms": 0,
+            "queue_underruns": 1,
+        }
+        assert events.count("queue_underrun") == 1
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_marker_clear_and_close_are_not_cadence_underruns():
+    async def stages_after_terminal(action):
+        websocket = FakeWebSocket()
+        stages: list[str] = []
+        transport = SmartPBXMediaTransport(
+            websocket,
+            CONTEXT,
+            max_queue_frames=8,
+            on_transport_event=lambda _turn_id, _generation, stage, *_: stages.append(stage),
+        )
+        transport.bind_turn(0, "opaque-turn")
+        transport.start()
+        await transport.send_audio(b"\x4d" * 160)
+        await asyncio.wait_for(wait_for_sent(websocket, 1), timeout=1)
+        await action(transport)
+        await asyncio.sleep(0.035)
+        if transport.is_active:
+            await transport.close()
+        return stages
+
+    assert "queue_underrun" not in await stages_after_terminal(
+        lambda transport: transport.send_mark("tts_done")
+    )
+    assert "queue_underrun" not in await stages_after_terminal(
+        lambda transport: transport.clear_audio()
+    )
+    assert "queue_underrun" not in await stages_after_terminal(
+        lambda transport: transport.close()
+    )
