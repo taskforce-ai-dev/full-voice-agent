@@ -254,10 +254,10 @@ event allowlist**. It may contain only `smartpbx_protocol_diagnostic`,
 `failure_class`, `active_sessions`, and `duration_ms`. The `correlation_id` is
 opaque, local, randomly generated, and never derived from Dialog. The other
 approved telemetry is aggregate-only: opaque turn/session identifiers, bounded
-durations and counters, endpoint source, STT shape, or echo character count and
-score. It must not contain a transcript, caller identifier, audio, provider
-payload, credential, or other raw value. Wire-delivery proxies describe paced
-transport behavior only; they are not playback acknowledgements.
+durations, endpoint source, STT shape, or echo character count and score. It
+excludes caller content, provider details, secrets, errors, and trace
+identifiers. Wire-delivery proxies describe paced transport behavior only; they
+are not playback acknowledgements.
 
 1. Bad or missing WSS auth is rejected.
 2. A bidirectional call proves caller audio reaches STT, an LLM turn completes,

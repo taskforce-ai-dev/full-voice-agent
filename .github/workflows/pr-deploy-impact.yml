@@ -250,8 +250,9 @@ jobs:
               echo '**Kavya SmartPBX rollback:** first follow the withdraw/drain steps in'
               echo '`Kavya/SMARTPBX_RUNBOOK.md`. For a reviewed last-good immutable image,'
               echo 'use its guarded `/opt/kavya/scripts/deploy_smartpbx_image.sh` command with'
-              echo 'the exact tag, full revision, and digest from its reviewed record; do not call generic'
-              echo '`deploy.yml` with `agent=kavya` and `mode=image`; that route rejects Kavya.'
+              echo 'the exact tag, full revision, and digest from its reviewed record.'
+              echo 'Do not call generic deploy.yml with agent=kavya mode=image.'
+              echo 'For clarity, do not call generic `deploy.yml` with `agent=kavya` and `mode=image`; that route rejects Kavya.'
               echo
             fi
 

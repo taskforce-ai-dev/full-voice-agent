@@ -186,6 +186,7 @@ class SmartPBXTurnTelemetry:
         self._monotonic_ns = monotonic_ns
         self._new_id = new_id
         self._turns: dict[str, _SmartPBXTurnState] = {}
+        self._last_turn_id: str | None = None
         self.turns_started = 0
         self.turns_summarized = 0
 
@@ -196,7 +197,13 @@ class SmartPBXTurnTelemetry:
     def start_turn(self, endpoint_source: str) -> str:
         endpoint_source = endpoint_source if endpoint_source in _SMARTPBX_ENDPOINT_SOURCES else "unknown"
         turn_id = self._new_id()
+        # Default IDs are random, but retain a bounded collision guard so an
+        # adversarial/custom ID source cannot merge an old runner into a new
+        # one. Do not retain an unbounded completed-ID history.
+        while turn_id in self._turns or turn_id == self._last_turn_id:
+            turn_id = secrets.token_urlsafe(16)
         self._turns[turn_id] = _SmartPBXTurnState(self._monotonic_ns(), endpoint_source)
+        self._last_turn_id = turn_id
         self.turns_started += 1
         self._emit("turn_stage", event="turn_stage", turn_id=turn_id, stage="started", endpoint_source=endpoint_source)
         return turn_id
