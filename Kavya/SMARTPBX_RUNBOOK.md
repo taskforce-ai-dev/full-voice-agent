@@ -111,6 +111,8 @@ SMARTPBX_ACCOUNT_ID=
 SMARTPBX_MAX_MESSAGE_CHARS=65536
 SMARTPBX_MAX_AUDIO_BYTES=32768
 SMARTPBX_MAX_OUTBOUND_FRAMES=512
+SMARTPBX_MAX_TOKENS=
+SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=
 SMARTPBX_START_TIMEOUT_SECONDS=10
 SMARTPBX_IDLE_TIMEOUT_SECONDS=90
 SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS=300
@@ -246,18 +248,30 @@ it requires both loopback endpoints before the final TLS vhost is installed.
 ## Cutover gates
 
 Before enabling the Dialog route, the cutover evidence export is a **finite approved
-event allowlist**. It may contain only `smartpbx_protocol_diagnostic`,
-`stt_digit_class_state`, `stt_interim_shape`, `turn_stage`, `turn_summary`,
-`session_summary`, and `echo_rejected`; unlisted event names are not permitted.
-`smartpbx_protocol_diagnostic` has exactly seven fields:
-`event=smartpbx_protocol_diagnostic`, `correlation_id`, `stage`, `outcome`,
-`failure_class`, `active_sessions`, and `duration_ms`. The `correlation_id` is
-opaque, local, randomly generated, and never derived from Dialog. The other
-approved telemetry is aggregate-only: opaque turn/session identifiers, bounded
-durations, endpoint source, STT shape, or echo character count and score. It
-excludes caller content, provider details, secrets, errors, and trace
-identifiers. Wire-delivery proxies describe paced transport behavior only; they
-are not playback acknowledgements.
+event allowlist**. It may contain only the following runtime event names:
+`smartpbx_protocol_diagnostic`, `stt_digit_class_state`, `stt_interim_shape`,
+`turn_stage`, `turn_summary`, `session_summary`, `echo_rejected`,
+`agent_response`, `assistant_turn_delivery`, `audio_dump_written`,
+`bad_tool_json`, `llm_round`, `llm_round_complete`, `llm_empty_response`,
+`llm_error`, `llm_provider_degraded`, `llm_provider_failover`, `tool_execute`,
+`tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`,
+`tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
+`silence_reprompt`, `stt_final`, `stt_provider_final`, `stt_provider_interim`,
+`capture_buffer_bounded`, `capture_final_buffered`, `capture_forced_dispatch`,
+`capture_mode_enter`, `capture_mode_exit`, `dtmf_collect_start`, and
+`dtmf_collect_done`; unlisted event names are not permitted.
+The protocol diagnostic record is emitted as
+`event=smartpbx_protocol_diagnostic`.
+
+The fixed, aggregate-only fields are `correlation_id`, `stage`, `outcome`,
+`failure_class`, `active_sessions`, `duration_ms`, `turn_id`,
+`session_trace_id`, and `provider` where the named event emits that field.
+`correlation_id`, `turn_id`, and `session_trace_id` are opaque, local, randomly
+generated identifiers and are never derived from dialog. The `provider` field is
+a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, or `azure`.
+Wire-delivery proxies describe paced transport behavior only; they are not
+playback acknowledgements. Every approved event must not contain transcript text,
+audio, call ids, exception bodies, or secrets.
 
 1. Bad or missing WSS auth is rejected.
 2. A bidirectional call proves caller audio reaches STT, an LLM turn completes,

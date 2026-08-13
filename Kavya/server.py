@@ -159,6 +159,7 @@ class _SmartPBXRunnerContext:
     turn_id: str | None
     dropped_frame_baseline: int
     speak_generation: int
+    raw_utterance: str
     initial_filler: Any | None = None
 
 
@@ -4153,6 +4154,7 @@ class MediaStreamSession:
         self._smartpbx_barge_ins = 0
         self._smartpbx_cadence_by_turn: dict[str, dict[str, int]] = {}
         self._smartpbx_dropped_frame_baselines: dict[str, int] = {}
+        self._smartpbx_dropped_frames_by_turn: dict[str, int] = {}
         self._smartpbx_last_finished_dropped_frames = 0
         self._smartpbx_initial_filler: SmartPBXInitialFillerController | None = None
 
@@ -4236,11 +4238,35 @@ class MediaStreamSession:
         runner = _smartpbx_runner_context.get()
         return fallback if runner is None else runner.speak_generation
 
+    def _current_smartpbx_runner_can_execute_tools(self) -> bool:
+        """Keep a barged-out task from mutating the caller's newer turn."""
+        if not self._is_direct_smartpbx_english():
+            return True
+        runner = _smartpbx_runner_context.get()
+        return (
+            runner is not None
+            and runner.turn_id is not None
+            and runner.turn_id == self._active_smartpbx_turn_id
+            and runner.speak_generation == self._speak_generation
+        )
+
+    def _smartpbx_runner_raw_utterance(self) -> str:
+        """Return raw capture input owned by this task, never a newer turn's."""
+        runner = _smartpbx_runner_context.get()
+        if self._is_direct_smartpbx_english() and runner is not None:
+            return runner.raw_utterance
+        return self._last_guest_utterance_raw
+
     def _current_smartpbx_dropped_frames(self) -> int:
         return max(int(getattr(self._media_transport, "frames_dropped_total", 0)), 0)
 
     def _smartpbx_dropped_frames_for_turn(self, turn_id: str) -> int:
-        """Return only overflow accumulated since this opaque turn began."""
+        """Return overflow reported through this turn's bound generation."""
+        recorded = self._smartpbx_dropped_frames_by_turn.get(turn_id)
+        if recorded is not None:
+            return recorded
+        # Legacy test doubles do not emit transport events. Production turns
+        # initialize the bound counter before audio can be sent.
         runner = _smartpbx_runner_context.get()
         if runner is not None and runner.turn_id == turn_id:
             baseline = runner.dropped_frame_baseline
@@ -4254,6 +4280,7 @@ class MediaStreamSession:
     def _retire_smartpbx_turn(self, turn_id: str) -> None:
         self._smartpbx_cadence_by_turn.pop(turn_id, None)
         self._smartpbx_dropped_frame_baselines.pop(turn_id, None)
+        self._smartpbx_dropped_frames_by_turn.pop(turn_id, None)
         self._smartpbx_last_finished_dropped_frames = (
             self._current_smartpbx_dropped_frames()
         )
@@ -4280,6 +4307,9 @@ class MediaStreamSession:
         if callable(snapshot):
             self._smartpbx_cadence_by_turn[turn_id] = snapshot(generation)
         if stage == "frame_dropped":
+            self._smartpbx_dropped_frames_by_turn[turn_id] = (
+                self._smartpbx_dropped_frames_by_turn.get(turn_id, 0) + 1
+            )
             return
         telemetry.mark_once(turn_id, stage, at_ns=monotonic_ns)
 
@@ -5314,6 +5344,9 @@ class MediaStreamSession:
             self._smartpbx_dropped_frame_baselines[
                 self._active_smartpbx_turn_id
             ] = self._current_smartpbx_dropped_frames()
+            self._smartpbx_dropped_frames_by_turn[
+                self._active_smartpbx_turn_id
+            ] = 0
             telemetry.mark(self._active_smartpbx_turn_id, "endpoint")
         self._utterance_turn += 1
         turn = self._utterance_turn
@@ -5369,6 +5402,7 @@ class MediaStreamSession:
             turn_id=turn_id,
             dropped_frame_baseline=dropped_frame_baseline,
             speak_generation=self._speak_generation,
+            raw_utterance=text,
         )
         runner_token = _smartpbx_runner_context.set(runner)
         try:
@@ -5611,6 +5645,10 @@ class MediaStreamSession:
 
                 # Execute tools and add results
                 for tool_index, tc in enumerate(tool_list):
+                    # This is the side-effect boundary. A runner made stale by
+                    # barge-in must not execute a tool or read newer raw speech.
+                    if not self._current_smartpbx_runner_can_execute_tools():
+                        return full_text
                     try:
                         parsed_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
                     except json.JSONDecodeError:
@@ -5619,7 +5657,7 @@ class MediaStreamSession:
                     parsed_input, _ = _override_capture_spoken_argument(
                         tool_name=tc["name"],
                         tool_input=parsed_input,
-                        override_spoken=self._last_guest_utterance_raw,
+                        override_spoken=self._smartpbx_runner_raw_utterance(),
                         source="smartpbx_media",
                     )
                     self._log_tool_execution(tc["name"], parsed_input)
@@ -5959,11 +5997,14 @@ class MediaStreamSession:
                     self._append_assistant_history(assistant_msg)
 
                     for tc in tool_calls_openai:
+                        # Fence immediately before each provider tool boundary.
+                        if not self._current_smartpbx_runner_can_execute_tools():
+                            return full_text
                         parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
                         parsed_input, _ = _override_capture_spoken_argument(
                             tool_name=tc["function"]["name"],
                             tool_input=parsed_input,
-                            override_spoken=self._last_guest_utterance_raw,
+                            override_spoken=self._smartpbx_runner_raw_utterance(),
                             source="smartpbx_media",
                         )
                         self._log_tool_execution(tc["function"]["name"], parsed_input)
@@ -6224,6 +6265,9 @@ class MediaStreamSession:
                 # Execute tools and build tool_result blocks
                 tool_results: list[dict[str, Any]] = []
                 for tool_index, tb in enumerate(tool_use_blocks):
+                    # Fence immediately before each provider tool boundary.
+                    if not self._current_smartpbx_runner_can_execute_tools():
+                        return full_text
                     # The capture tools must parse what the caller actually SAID,
                     # not the model's paraphrase of it — and on this path the raw
                     # utterance is the whole combined dictation. This is the
@@ -6234,7 +6278,7 @@ class MediaStreamSession:
                     tb["input"], _ = _override_capture_spoken_argument(
                         tool_name=tb["name"],
                         tool_input=tb["input"],
-                        override_spoken=self._last_guest_utterance_raw,
+                        override_spoken=self._smartpbx_runner_raw_utterance(),
                         source="smartpbx_media",
                     )
                     self._log_tool_execution(tb["name"], tb["input"])
