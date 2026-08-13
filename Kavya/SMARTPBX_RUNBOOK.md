@@ -143,12 +143,11 @@ SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smart
   | jq -e '.services["kavya-smartpbx"].environment | has("STT_DIGIT_CLASS_BOOST")' >/dev/null
 ```
 
-Recreate only the pinned SmartPBX service through the reviewed deployment path,
-then verify without printing configuration or secrets that the one safe state
-event was emitted:
+After the separately approved pinned recreate using the established guarded
+deployment command in the TLS bootstrap or deployment path below, verify without
+printing configuration or secrets that the one safe state event was emitted:
 
 ```sh
-SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
 docker compose --env-file .env.smartpbx --profile smartpbx logs --since 10m kavya-smartpbx \
   | rg -q 'smartpbx_media event=stt_digit_class_state digit_class_enabled=(true|false) digit_class_boost='
 ```
