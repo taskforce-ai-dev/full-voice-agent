@@ -852,6 +852,124 @@ CAPTURE_MODE_MAX_TURNS: int = _parse_clamped_int(
     os.environ, "CAPTURE_MODE_MAX_TURNS", 3, 1, 10
 )
 
+# Hard cap on the combined dictation held across provider finals. A phone number
+# and a spelled name are both far under this; the cap only exists so a stuck
+# capture episode (open mic, TV in the room) cannot grow an unbounded utterance
+# and hand the model a wall of text. Env-tunable and clamped like its neighbours,
+# so a mis-set knob can neither truncate a normal number nor lift the cap.
+CAPTURE_BUFFER_MAX_CHARS: int = _parse_clamped_int(
+    os.environ, "CAPTURE_BUFFER_MAX_CHARS", 600, 60, 4000
+)
+
+# Below this share of digit/letter-like tokens the combined utterance is not a
+# dictation any more — the caller changed the subject — and capture mode ends.
+# 0.0 makes capture mode never exit on content (only on success/turn cap); 1.0
+# would demand a pure dictation, so both extremes stay reachable but clamped.
+CAPTURE_DICTATION_MIN_RATIO: float = _parse_clamped_float(
+    os.environ, "CAPTURE_DICTATION_MIN_RATIO", 0.3, 0.0, 1.0
+)
+
+# ---------------------------------------------------------------------------
+# Capture-ask detection (arms capture mode BEFORE the caller answers)
+# ---------------------------------------------------------------------------
+# Callers dictate phone numbers and name spellings in two-to-four digit
+# fragments: the recognizer commits a final at every natural pause, and each
+# final used to cost a whole LLM turn (capture tool -> needs_more -> re-ask).
+# Capture mode fixes the endpointing, but it only engaged AFTER the first
+# capture tool call, so the opening fragments still paid full price.
+#
+# These patterns arm capture mode from Kavya's own ask, matched ONLY against
+# sentences she actually delivered (see `_delivered_sentences`) — an ask cut off
+# by a barge-in was never heard and must not pre-arm anything. The list is
+# deliberately conservative: a false positive makes the following turns wait the
+# patient capture timers, which reads as sluggish on ordinary conversation.
+_CAPTURE_ASK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "your phone number", "a WhatsApp number", "the callback number"
+    re.compile(
+        r"\b(?:phone|mobile|cell|contact|whats\s?app|call\s?back|callback)\s+"
+        r"(?:phone\s+)?number\b"
+    ),
+    # "may I have the number", "could you repeat the number"
+    re.compile(
+        r"\b(?:may|could|can|would|will)\s+(?:i|you|we)\b[^.?!]{0,60}\bnumber\b"
+    ),
+    # "what's your number", "what is the number"
+    re.compile(r"\bwhat(?:'s|s| is)\s+(?:your|the)\b[^.?!]{0,40}\bnumber\b"),
+    # spelling asks
+    re.compile(r"\bhow\s+do\s+you\s+spell\b"),
+    re.compile(r"\bspell\b[^.?!]{0,40}\b(?:it|that|your|the|out|for\s+me)\b"),
+    # digit-wise asks and continuations
+    re.compile(
+        r"\b(?:digit\s+by\s+digit|one\s+digit\s+at\s+a\s+time|"
+        r"remaining\s+digits|rest\s+of\s+the\s+(?:number|digits)|"
+        r"(?:last|next|first)\s+(?:few\s+)?digits)\b"
+    ),
+    re.compile(r"\bgo\s+ahead\b[^.?!]{0,40}\b(?:number|digits)\b"),
+)
+
+# A read-back is not an ask. "So I have your phone number as oh seven seven..."
+# matches the first pattern above, and re-arming capture mode on Kavya's own
+# confirmation would keep a finished episode alive for another three turns.
+_CAPTURE_ASK_SUPPRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Possession, not a request: "I have your phone number", "so I have...",
+    # "thank you, I have it". Anchored so the modal-fronted REQUEST form
+    # ("may I have your mobile number?") is not swallowed with it.
+    re.compile(
+        r"(?:^|[,;]\s*|\b(?:and|so|then|okay|right|now)\s+)"
+        r"i\s+(?:have|'ve\s+got|have\s+got|heard|noted)\b"
+    ),
+    re.compile(r"\bthat(?:'s|s| is)\s+(?:correct|right|noted|saved|confirmed)\b"),
+    re.compile(r"\b(?:so|then)\s+your\b"),
+    re.compile(r"\b(?:let\s+me|i'll|i\s+will)\s+(?:confirm|read)\b"),
+    re.compile(r"\bnumber\s+(?:is|as|was)\b"),
+    # "the number of guests/nights" is a count question, not a dictation.
+    re.compile(
+        r"\bnumber\s+of\s+(?:guests|people|adults|children|kids|nights|rooms)\b"
+    ),
+)
+
+# Tokens that read as dictated digits or a spelled letter. Used only to decide
+# whether an already-buffered capture utterance is still a dictation.
+_CAPTURE_DICTATION_WORDS: frozenset[str] = frozenset({
+    "zero", "oh", "o", "nought", "naught", "nil",
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "double", "triple", "treble", "plus", "hundred", "dash", "hyphen", "dot",
+})
+
+
+def _is_capture_ask_sentence(sentence: str) -> bool:
+    """True when one delivered sentence asks the caller to dictate."""
+    text = " ".join((sentence or "").lower().split())
+    if not text:
+        return False
+    if any(pattern.search(text) for pattern in _CAPTURE_ASK_SUPPRESS_PATTERNS):
+        return False
+    return any(pattern.search(text) for pattern in _CAPTURE_ASK_PATTERNS)
+
+
+def _detect_capture_ask(sentences: Any) -> bool:
+    """True when any delivered sentence of the turn asked for a dictation."""
+    if not sentences:
+        return False
+    return any(_is_capture_ask_sentence(sentence) for sentence in sentences)
+
+
+def _capture_dictation_ratio(text: str) -> float:
+    """Share of tokens in ``text`` that look like dictated digits or letters."""
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    if not tokens:
+        return 0.0
+    hits = 0
+    for token in tokens:
+        if token.isdigit():
+            hits += 1
+        elif len(token) == 1 and token.isalpha():
+            hits += 1
+        elif token in _CAPTURE_DICTATION_WORDS:
+            hits += 1
+    return hits / len(tokens)
+
+
 # ---------------------------------------------------------------------------
 # Gemini streaming controls (LLM_PROVIDER="gemini")
 # ---------------------------------------------------------------------------
@@ -2280,6 +2398,69 @@ def _classify_gemini_exception(exc: Exception) -> str:
     return "client_error"
 
 
+class _GeminiEmptyTurnError(Exception):
+    """A Gemini turn produced no text and no tool call, twice in a row.
+
+    Modelled as a provider failure rather than a turn outcome: the caller hears
+    dead air, which is exactly what a quota error sounds like, so it takes the
+    same failover route. Raised ONLY when Claude can actually answer the turn —
+    when failover is unavailable the runners speak the canned line instead, and
+    this exception never appears.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("gemini returned an empty turn twice")
+
+
+def _claude_tools_from_gemini(tools: Any) -> list[dict[str, Any]]:
+    """Re-shape Gemini function declarations as Anthropic tool definitions.
+
+    A Gemini→Claude failover swaps the runner but carries the SAME tool list, and
+    the two wire shapes are incompatible: Anthropic 400s on Gemini's
+    ``[{"function_declarations": [...]}]``. Converting — rather than substituting
+    ``get_tools()`` — preserves WHICH tools the caller allowed: the
+    handover-failsafe session is deliberately restricted to
+    ``notify_human_handover``, and handing it the full booking set would let Kavya
+    try to book a room instead of notifying the manager.
+
+    Anything already Anthropic-shaped passes through, so this is safe to apply on
+    a path whose provider was never Gemini.
+    """
+    if not tools:
+        return []
+    converted: list[dict[str, Any]] = []
+    for entry in tools:
+        if not isinstance(entry, dict):
+            continue
+        declarations = entry.get("function_declarations")
+        if declarations is None:
+            if entry.get("name"):
+                converted.append(entry)
+            continue
+        for declaration in declarations:
+            if not isinstance(declaration, dict) or not declaration.get("name"):
+                continue
+            converted.append({
+                "name": declaration["name"],
+                "description": declaration.get("description", ""),
+                "input_schema": declaration.get("parameters")
+                or {"type": "object", "properties": {}},
+            })
+    return converted
+
+
+def _gemini_relay_failover_ready() -> bool:
+    """True when the ConversationRelay Gemini turn can be re-run on Claude."""
+    if not GEMINI_FAILOVER_TO_CLAUDE:
+        return False
+    if not ANTHROPIC_API_KEY:
+        return False
+    try:
+        return _get_anthropic_client() is not None
+    except RuntimeError:
+        return False
+
+
 def _init_gemini_failover_state() -> dict[str, Any]:
     return {
         "consecutive_failovers": 0,
@@ -3654,9 +3835,16 @@ class MediaStreamSession:
         self._utterance_turn = 0
         self._last_guest_utterance_raw: str = ""
         # Capture-mode keeps endpointing looser while the caller is dictating
-        # a number or name across fragments.
+        # a number or name across fragments, and combines the fragments into one
+        # utterance instead of spending an LLM turn on each.
         self._capture_mode_active: bool = False
         self._capture_mode_turns_left: int = 0
+        # Set while the turn that completed a capture is running, so its
+        # read-back ("your number is oh seven seven...") cannot re-arm capture
+        # mode through the ask detector.
+        self._capture_success_this_turn: bool = False
+        # One capture-buffer-bounded log line per episode, not per overflowing final.
+        self._capture_bound_logged: bool = False
         self._stt: GoogleSTTStream | AzureSTTStream | None = None
 
         # Live-call audio capture (mulaw chunks) for offline STT benchmarking.
@@ -3730,6 +3918,10 @@ class MediaStreamSession:
         """Silence AI activity after carrier acknowledgement without closing Dialog."""
         if self.transfer_pending:
             return
+        # Before anything is torn down: a half-dictated number in the capture
+        # buffer is about to be discarded, and after the transfer nothing else
+        # will ever record it.
+        await self._force_pending_capture_dispatch("transfer")
         self.transfer_pending = True
         self._cancel_reprompt()
         if self._endpointing_handle:
@@ -3991,6 +4183,9 @@ class MediaStreamSession:
             self._write_audio_dump()
             if self._endpointing_handle:
                 self._endpointing_handle.cancel()
+            # Stop/hangup: anything still buffered mid-dictation only survives if
+            # it reaches the transcript before post-call extraction reads it.
+            await self._force_pending_capture_dispatch("session_end")
             call_end_time = datetime.now().isoformat()
             logger.info(
                 "Media stream session ended — Call: %s, history: %d, transcript: %d msgs",
@@ -4084,8 +4279,11 @@ class MediaStreamSession:
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
-        self._capture_mode_active = False
-        self._capture_mode_turns_left = 0
+        # Capture mode deliberately SURVIVES a barge-in. A caller talking over the
+        # tail of "...could I take your number?" is a dictation starting, and
+        # dropping back to the short timers there re-creates the fragment-per-turn
+        # problem this exists to fix. The buffer is still cleared — the new turn
+        # starts from the caller's fresh speech, not from a half-heard utterance.
         # The guest interrupted: a new turn begins, so release the guard now even
         # though the interrupted turn's _process_utterance has not unwound yet.
         # Bumping the turn id stops that stale turn's finally from clobbering it.
@@ -4294,39 +4492,147 @@ class MediaStreamSession:
         status = str(result.get("status", "")).lower()
         return status in {"needs_more", "invalid", "unavailable"}
 
-    def _enter_capture_mode(self, turns: int = CAPTURE_MODE_MAX_TURNS) -> None:
+    def _enter_capture_mode(
+        self, turns: int = CAPTURE_MODE_MAX_TURNS, *, reason: str = "tool"
+    ) -> None:
+        if self._capture_mode_active:
+            # An episode already in flight keeps its REMAINING allowance. A
+            # needs_more re-ask must never hand an exhausted episode a fresh
+            # budget, or a caller whose number never parses is asked forever.
+            return
         self._capture_mode_active = True
         self._capture_mode_turns_left = turns
+        self._capture_bound_logged = False
+        if self._is_smartpbx_session():
+            logger.info(
+                "smartpbx_media event=capture_mode_enter reason=%s turns=%d",
+                reason, turns,
+            )
 
-    def _exit_capture_mode(self) -> None:
+    def _exit_capture_mode(self, reason: str = "reset") -> None:
+        was_active = self._capture_mode_active
         self._capture_mode_active = False
         self._capture_mode_turns_left = 0
+        if was_active and self._is_smartpbx_session():
+            logger.info("smartpbx_media event=capture_mode_exit reason=%s", reason)
 
     def _consume_capture_mode_turn(self) -> None:
         if not self._capture_mode_active:
             return
         if self._capture_mode_turns_left <= 0:
-            self._exit_capture_mode()
+            self._exit_capture_mode("max_turns")
             return
         self._capture_mode_turns_left -= 1
         if self._capture_mode_turns_left <= 0:
-            self._exit_capture_mode()
+            self._exit_capture_mode("max_turns")
 
     def _is_capture_mode_active(self) -> bool:
         return self._capture_mode_active
 
     def _capture_turn_timeout(self, *, final: bool) -> float:
         if self._is_capture_mode_active():
-            return CAPTURE_FINAL_GRACE_SECONDS if final else CAPTURE_ENDPOINTING_SILENCE_SECONDS
+            if final:
+                # In capture mode a final no longer dispatches — it refreshes the
+                # combining window — so it must never wait LESS than the silence
+                # timer. Take the more patient of the two knobs so neither can
+                # undercut the other when an operator tunes only one.
+                return max(
+                    CAPTURE_FINAL_GRACE_SECONDS, CAPTURE_ENDPOINTING_SILENCE_SECONDS
+                )
+            return CAPTURE_ENDPOINTING_SILENCE_SECONDS
         return STT_FINAL_GRACE_SECONDS if final else ENDPOINTING_SILENCE
 
     def _record_capture_tool_completion(self, tool_name: str, result: dict[str, Any]) -> None:
         if tool_name not in self._capture_complete_tools():
             return
         if self._capture_followup_required(result):
-            self._enter_capture_mode()
+            self._enter_capture_mode(reason="tool_needs_more")
             return
-        self._exit_capture_mode()
+        captured = str(result.get("status", "")).lower() == "captured"
+        if captured:
+            # The read-back of a successful capture reads exactly like an ask, so
+            # stand the ask detector down for the remainder of this turn.
+            self._capture_success_this_turn = True
+        self._exit_capture_mode("captured" if captured else "tool_complete")
+
+    def _maybe_enter_capture_mode_from_ask(self) -> None:
+        """Arm capture mode from a delivered ask, before the caller answers.
+
+        Only sentences the caller actually heard count — `_delivered_sentences` is
+        the post-TTS record, so an ask cut off by a barge-in cannot pre-arm
+        anything. This is what makes the FIRST fragment of a dictated number
+        patient: capture mode used to engage only after the first capture tool
+        call, by which point two or three fragments had each cost a full turn.
+        """
+        if self._capture_success_this_turn:
+            return
+        if self._is_capture_mode_active():
+            return
+        if not _detect_capture_ask(self._delivered_sentences):
+            return
+        self._enter_capture_mode(reason="ask")
+
+    def _bound_capture_text(self, text: str) -> str:
+        """Cap the combined dictation so a stuck episode cannot run away."""
+        if len(text) <= CAPTURE_BUFFER_MAX_CHARS:
+            return text
+        if self._capture_bound_logged:
+            # Once at the cap EVERY further final overflows; one line per episode
+            # is the signal, the rest is noise.
+            return text[:CAPTURE_BUFFER_MAX_CHARS].rstrip()
+        self._capture_bound_logged = True
+        if self._is_smartpbx_session():
+            logger.info(
+                "smartpbx_media event=capture_buffer_bounded limit=%d",
+                CAPTURE_BUFFER_MAX_CHARS,
+            )
+        else:
+            logger.info(
+                "Capture buffer bounded at %d chars [%s]",
+                CAPTURE_BUFFER_MAX_CHARS, self.call_sid,
+            )
+        # Keep the HEAD: the digits said first are the start of the number.
+        return text[:CAPTURE_BUFFER_MAX_CHARS].rstrip()
+
+    def _capture_dispatch_pending(self) -> bool:
+        """True while a capture episode still owns buffered text or a live timer."""
+        if not self._is_capture_mode_active():
+            return False
+        if self._pending_transcript.strip() or self._committed_transcript.strip():
+            return True
+        return self._endpointing_handle is not None
+
+    async def _force_pending_capture_dispatch(self, reason: str) -> None:
+        """Preserve buffered capture speech before the call can end.
+
+        Teardown (stop/hangup, transfer) must not silently drop a half-dictated
+        number: once the buffer is cleared, the call log and the post-call
+        extraction are the only places it could still have existed. This records
+        the combined utterance rather than starting an LLM turn — on both call
+        sites the audio path is already gone, so there is nobody to speak to and
+        a turn would only delay teardown.
+        """
+        if not self._is_capture_mode_active():
+            return
+        buffered = (self._pending_transcript or self._committed_transcript).strip()
+        if self._endpointing_handle is not None:
+            self._endpointing_handle.cancel()
+            self._endpointing_handle = None
+        self._pending_transcript = ""
+        self._committed_transcript = ""
+        self._latest_interim = ""
+        if not buffered:
+            return
+        self.full_transcript.append({"role": "user", "text": buffered})
+        if self._is_smartpbx_session():
+            logger.info(
+                "smartpbx_media event=capture_forced_dispatch reason=%s chars=%d",
+                reason, len(buffered),
+            )
+        else:
+            logger.info(
+                "Forced pending capture dispatch (%s) [%s]", reason, self.call_sid
+            )
 
     # â”€â”€ Debug: live-call audio capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -4385,6 +4691,13 @@ class MediaStreamSession:
                 # Agent is talking — re-arm after it finishes.
                 self._schedule_reprompt()
                 return
+            if self._capture_dispatch_pending():
+                # A nudge mid-number is exactly the UX this buffering exists to
+                # kill: the caller is pausing between digit groups, not silent.
+                # Buffered speech or a live capture timer both mean "still
+                # dictating" — wait, do not talk over them.
+                self._schedule_reprompt()
+                return
             messages = REPROMPT_MESSAGES.get(self.lang, REPROMPT_MESSAGES["en"])
             text = messages[min(self._reprompt_count, len(messages) - 1)]
             self._reprompt_count += 1
@@ -4413,14 +4726,27 @@ class MediaStreamSession:
         self._cancel_reprompt()
         self._reprompt_count = 0
         # Provider finals commit across segments of one utterance.
-        self._committed_transcript = (
+        combined = (
             self._committed_transcript + " " + text
             if self._committed_transcript
             else text
         )
+        capture = self._is_capture_mode_active()
+        if capture:
+            combined = self._bound_capture_text(combined)
+        self._committed_transcript = combined
         self._pending_transcript = self._committed_transcript
-        # The provider already segmented, so wait only a short grace for a
-        # mid-thought continuation rather than the full interim-fallback timer.
+        if capture and self._is_smartpbx_session():
+            # No transcript text in the log line — this path carries the caller's
+            # phone number.
+            logger.info(
+                "smartpbx_media event=capture_final_buffered chars=%d",
+                len(self._committed_transcript),
+            )
+        # Outside capture mode the provider already segmented, so wait only a
+        # short grace for a mid-thought continuation. Inside capture mode a final
+        # does NOT dispatch: it refreshes the full capture-silence window so the
+        # 2-4 digit fragments of one number combine into a single utterance.
         self._arm_endpointing(self._capture_turn_timeout(final=True))
 
     async def _set_transcript_interim(self, text: str):
@@ -4434,11 +4760,14 @@ class MediaStreamSession:
         # Preserve any committed finals from earlier segments; on the interim-only
         # path there are none, so this is a plain overwrite of the cumulative
         # interim as before.
-        self._pending_transcript = (
+        pending = (
             self._committed_transcript + " " + text
             if self._committed_transcript
             else text
         )
+        if self._is_capture_mode_active():
+            pending = self._bound_capture_text(pending)
+        self._pending_transcript = pending
         # No final has segmented this, so use the longer self-endpointing timer.
         self._arm_endpointing(self._capture_turn_timeout(final=False))
 
@@ -4471,7 +4800,18 @@ class MediaStreamSession:
         # Claim the turn synchronously, before any await, so a concurrently-queued
         # flush task sees the guard set and bails.
         self._utterance_dispatched = True
-        self._consume_capture_mode_turn()
+        # A turn only spends the capture allowance if capture mode was already
+        # armed when the caller's speech was dispatched — the turn that ARMED it
+        # (the ask, or the first needs_more) is not itself a capture turn.
+        capture_turn = self._is_capture_mode_active()
+        if capture_turn and (
+            _capture_dictation_ratio(transcript) < CAPTURE_DICTATION_MIN_RATIO
+        ):
+            # The caller moved on ("actually, can I ask about breakfast?").
+            # Staying in capture mode would make every following turn wait the
+            # patient timers for a conversation that is no longer a dictation.
+            self._exit_capture_mode("low_dictation_ratio")
+            capture_turn = False
         self._utterance_turn += 1
         turn = self._utterance_turn
         if self._is_smartpbx_session():
@@ -4485,6 +4825,10 @@ class MediaStreamSession:
             # Release only if a barge-in (or transfer) has not already started a
             # newer turn; otherwise that newer turn owns the guard.
             if self._utterance_turn == turn:
+                # Spend the allowance AFTER the turn, so a needs_more re-ask
+                # inside it cannot resurrect an episode that just ran out.
+                if capture_turn:
+                    self._consume_capture_mode_turn()
                 self._utterance_dispatched = False
 
     # â”€â”€ Utterance â†’ KB + Claude + TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -4514,6 +4858,7 @@ class MediaStreamSession:
 
     async def _process_utterance_bound(self, text: str):
         self._last_guest_utterance_raw = text
+        self._capture_success_this_turn = False
         self._start_assistant_turn_delivery_tracking()
         try:
             # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
@@ -4552,6 +4897,10 @@ class MediaStreamSession:
             fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
             error_msg = fillers.get("_default", "I'm sorry, I encountered an error.")
             await self._invoke_speak(error_msg)
+        # Pre-arm the patient timers for the NEXT guest turn(s) when this turn
+        # actually asked the caller to dictate. Runs after the turn so it sees the
+        # delivered sentences and cannot be undone by the capture tool's own exit.
+        self._maybe_enter_capture_mode_from_ask()
 
     # â”€â”€ OpenAI streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -4734,6 +5083,42 @@ class MediaStreamSession:
 
     # â”€â”€ Gemini native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
 
+    def _gemini_failover_ready(self) -> bool:
+        """True when this session can re-run a Gemini turn through Claude."""
+        if not GEMINI_FAILOVER_TO_CLAUDE:
+            return False
+        if self.anthropic_client is not None:
+            return True
+        if not ANTHROPIC_API_KEY:
+            return False
+        try:
+            self.anthropic_client = _get_anthropic_client()
+        except RuntimeError:
+            return False
+        return self.anthropic_client is not None
+
+    async def _run_claude_failover_turn(self) -> str:
+        """Run this turn on Claude with Claude-shaped model AND tools, then restore.
+
+        Every Gemini→Claude failover lands here — sticky and per-exception alike.
+        Swapping the runner without swapping the tool shape is not a failover but
+        a second failure: Anthropic 400s on Gemini's ``function_declarations``
+        payload, so the caller would hear the error line instead of an answer.
+        """
+        previous_model = self.model
+        previous_tools = self.tools
+        previous_provider = self.llm_provider
+        self.model = CLAUDE_MODEL
+        if previous_provider == "gemini":
+            self.tools = _claude_tools_from_gemini(previous_tools)
+        self.llm_provider = "claude"
+        try:
+            return await self._run_llm_claude()
+        finally:
+            self.model = previous_model
+            self.tools = previous_tools
+            self.llm_provider = previous_provider
+
     async def _run_llm_gemini(self) -> str:
         """Gemini-native streaming version of _run_llm for Media Streams.
 
@@ -4747,7 +5132,7 @@ class MediaStreamSession:
             logger.info(
                 "smartpbx_media event=llm_provider_failover from=gemini to=claude reason=sticky"
             )
-            return await self._run_llm_claude()
+            return await self._run_claude_failover_turn()
 
         async def _run_gemini_turn() -> str:
             full_text = ""
@@ -4755,6 +5140,9 @@ class MediaStreamSession:
             smartpbx_filler_sent = False
             # One empty-response retry per guest turn, not per tool round.
             empty_retry_used = False
+            # Any tool that has STARTED executing makes this turn unreplayable —
+            # a Claude re-run would repeat its side effects (create_booking).
+            tool_executed = False
 
             for round_idx in range(MAX_TOOL_ROUNDS):
                 if self._is_smartpbx_session():
@@ -4859,9 +5247,32 @@ class MediaStreamSession:
                 else:
                     full_text += text_content
 
-                # Still nothing after the retry: say something recoverable rather
-                # than leaving the caller listening to silence.
+                # Still nothing after the retry. Two empty turns in a row is a
+                # provider failure, not a short answer, so raise it into the same
+                # failover path a quota error takes: Claude can answer the turn
+                # properly. The canned line is what happens only when failover is
+                # unavailable — see the handler below.
                 if not text_content.strip() and not function_calls:
+                    # Failover REPLAYS the whole turn from the same history, so it
+                    # is only safe while this turn has no side effects yet: nothing
+                    # spoken, no tool executed. An empty LATER round must take the
+                    # canned line instead, or Claude re-runs the round that already
+                    # ran create_booking and the guest is booked twice.
+                    replayable = (
+                        round_idx == 0
+                        and not full_text.strip()
+                        and not tool_executed
+                        and not smartpbx_filler_sent
+                    )
+                    if replayable and self._gemini_failover_ready():
+                        raise _GeminiEmptyTurnError()
+                    if not replayable:
+                        logger.warning(
+                            "gemini_diagnostic event=empty_response_not_replayable "
+                            "path=media_stream round=%d tools_executed=%s call=%s",
+                            round_idx + 1, str(tool_executed).lower(),
+                            self.call_sid or "-",
+                        )
                     fallback = LLM_EMPTY_FALLBACKS.get(
                         self.lang, LLM_EMPTY_FALLBACKS["en"]
                     )
@@ -4932,6 +5343,10 @@ class MediaStreamSession:
                             source="smartpbx_media",
                         )
                         self._log_tool_execution(tc["function"]["name"], parsed_input)
+                        # Set BEFORE the await: a tool that raises half-way may
+                        # already have had its effect, so the turn is no longer
+                        # safe to replay on Claude.
+                        tool_executed = True
                         try:
                             if tc["function"]["name"] == "collect_number_via_keypad":
                                 result_str = await self._collect_number_via_keypad(parsed_input)
@@ -5016,26 +5431,17 @@ class MediaStreamSession:
             if self.anthropic_client is None:
                 raise
 
-            reason = _classify_gemini_exception(exc)
+            reason = (
+                "empty_response" if isinstance(exc, _GeminiEmptyTurnError)
+                else _classify_gemini_exception(exc)
+            )
             logger.warning(
                 "smartpbx_media event=llm_provider_failover from=gemini to=claude reason=%s",
                 reason,
             )
 
-            previous_model = self.model
-            previous_tools = self.tools
-            previous_provider = self.llm_provider
-            self.model = CLAUDE_MODEL
-            self.tools = get_tools() if previous_provider == "gemini" else self.tools
-            self.llm_provider = "claude"
-
-            try:
-                _note_gemini_failover(self._gemini_failover_state)
-                return await self._run_llm_claude()
-            finally:
-                self.model = previous_model
-                self.tools = previous_tools
-                self.llm_provider = previous_provider
+            _note_gemini_failover(self._gemini_failover_state)
+            return await self._run_claude_failover_turn()
 
 
     # â”€â”€ Claude native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
@@ -5087,16 +5493,19 @@ class MediaStreamSession:
                     elif event.type == "content_block_delta":
                         if event.delta.type == "text_delta":
                             text_content += event.delta.text
+                            # A text delta after a tool_use block starts must
+                            # not speak (the tool round replies next turn) —
+                            # and `sentences` only binds inside this branch.
                             if not has_tool_use:
                                 sentence_buffer += event.delta.text
                                 sentences, sentence_buffer = _extract_sentences(
                                     sentence_buffer
                                 )
-                            for s in sentences:
-                                task = asyncio.create_task(
-                                    self._invoke_speak(s, generation=gen, sentence=s)
-                                )
-                                tts_tasks.append(task)
+                                for s in sentences:
+                                    task = asyncio.create_task(
+                                        self._invoke_speak(s, generation=gen, sentence=s)
+                                    )
+                                    tts_tasks.append(task)
 
                         elif event.delta.type == "input_json_delta":
                             tool_json += event.delta.partial_json
@@ -5168,6 +5577,19 @@ class MediaStreamSession:
                 # Execute tools and build tool_result blocks
                 tool_results: list[dict[str, Any]] = []
                 for tool_index, tb in enumerate(tool_use_blocks):
+                    # The capture tools must parse what the caller actually SAID,
+                    # not the model's paraphrase of it — and on this path the raw
+                    # utterance is the whole combined dictation. This is the
+                    # production runner (LLM_PROVIDER defaults to claude); without
+                    # this override the fragment combining upstream would be
+                    # thrown away here. Same call as the OpenAI/Gemini media and
+                    # ConversationRelay paths.
+                    tb["input"], _ = _override_capture_spoken_argument(
+                        tool_name=tb["name"],
+                        tool_input=tb["input"],
+                        override_spoken=self._last_guest_utterance_raw,
+                        source="smartpbx_media",
+                    )
                     self._log_tool_execution(tb["name"], tb["input"])
                     try:
                         if tb["name"] == "collect_number_via_keypad":
@@ -5740,7 +6162,10 @@ async def _run_llm_streaming_gemini(
             client=_get_anthropic_client(),
             system=system,
             conversation_history=conversation_history,
-            tools=tools,
+            # Same tools, Anthropic shape — Gemini's function_declarations payload
+            # would 400. Converting keeps the caller's restriction intact (the
+            # failsafe session must still offer ONLY notify_human_handover).
+            tools=_claude_tools_from_gemini(tools),
             websocket=websocket,
             lang=lang,
             generation_ref=generation_ref,
@@ -5755,6 +6180,9 @@ async def _run_llm_streaming_gemini(
         filler_sent = False
         ws_closed = False
         empty_retry_used = False
+        # Any tool that has STARTED executing makes this turn unreplayable — a
+        # Claude re-run would repeat its side effects (create_booking).
+        tool_executed = False
         generation = generation_ref[0] if generation_ref else None
 
         def _is_stale_generation() -> bool:
@@ -5850,10 +6278,30 @@ async def _run_llm_streaming_gemini(
 
             full_response_text = _join_turn(full_response_text, text_content)
 
-            # Nothing survived the retry — speak a recoverable line. Twilio only
-            # renders what it is sent, so without this the caller gets dead air and
-            # concludes the line is broken.
+            # Nothing survived the retry. Two empty turns in a row is a provider
+            # failure, not a short answer, so hand the turn to Claude the same way
+            # a quota error is handed over. Only when that is unavailable do we
+            # speak a recoverable line: Twilio renders only what it is sent, so
+            # without one the caller gets dead air and concludes the line is broken.
             if not text_content.strip() and not function_calls:
+                # Failover REPLAYS the turn from the same history, so it is only
+                # safe while nothing has been sent to the caller and no tool has
+                # run. An empty LATER round takes the canned line instead — a
+                # replay would re-execute create_booking.
+                replayable = (
+                    round_idx == 0
+                    and not full_response_text.strip()
+                    and not tool_executed
+                    and not filler_sent
+                )
+                if replayable and _gemini_relay_failover_ready():
+                    raise _GeminiEmptyTurnError()
+                if not replayable:
+                    logger.warning(
+                        "gemini_diagnostic event=empty_response_not_replayable "
+                        "path=conversation_relay round=%d tools_executed=%s",
+                        round_idx + 1, str(tool_executed).lower(),
+                    )
                 fallback = LLM_EMPTY_FALLBACKS.get(lang, LLM_EMPTY_FALLBACKS["en"])
                 logger.warning(
                     "gemini_diagnostic event=empty_response_fallback "
@@ -5930,6 +6378,9 @@ async def _run_llm_streaming_gemini(
                         source="conversation_relay",
                     )
                     logger.info("Executing tool '%s' with input: %s", tc["function"]["name"], parsed_input)
+                    # Set BEFORE the await: a tool that raises half-way may already
+                    # have had its effect, so this turn can no longer be replayed.
+                    tool_executed = True
                     try:
                         result_str = await execute_tool(tc["function"]["name"], parsed_input)
                     except Exception as exc:
@@ -5996,7 +6447,10 @@ async def _run_llm_streaming_gemini(
         if not ANTHROPIC_API_KEY:
             raise exc
 
-        reason = _classify_gemini_exception(exc)
+        reason = (
+            "empty_response" if isinstance(exc, _GeminiEmptyTurnError)
+            else _classify_gemini_exception(exc)
+        )
         logger.warning(
             "smartpbx_media event=llm_provider_failover from=gemini to=claude reason=%s",
             reason,
@@ -6012,7 +6466,8 @@ async def _run_llm_streaming_gemini(
             client=claude_client,
             system=system,
             conversation_history=conversation_history,
-            tools=tools,
+            # Anthropic shape, same membership — see _claude_tools_from_gemini.
+            tools=_claude_tools_from_gemini(tools),
             websocket=websocket,
             lang=lang,
             generation_ref=generation_ref,

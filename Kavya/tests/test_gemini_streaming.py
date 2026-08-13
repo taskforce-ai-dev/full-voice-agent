@@ -869,3 +869,466 @@ def test_conversation_relay_gemini_fails_over_only_when_anthropic_configured(mon
         )
 
     assert claude_calls == 0
+
+
+# --- a double-empty turn is a provider failure, not an outcome --------------
+# Two empty turns in a row sound exactly like a quota error to the caller: dead
+# air. So it takes the same route — Claude re-runs the turn and the sticky
+# counter advances. The canned apology survives ONLY as the last resort when
+# failover is unavailable, which is the one case where silence is the alternative.
+
+def test_media_stream_double_empty_gemini_turn_failsover_to_claude(monkeypatch, caplog):
+    session, spoken = _session([[_empty_chunk()], [_empty_chunk()]])
+    session.anthropic_client = object()
+
+    async def _run_claude() -> str:
+        return "claude answered the turn"
+
+    monkeypatch.setattr(session, "_run_llm_claude", _run_claude)
+
+    with caplog.at_level("WARNING", logger="server"):
+        result = asyncio.run(session._run_llm_gemini())
+
+    assert session.gemini_client.requests == 2, "the one empty-turn retry still runs first"
+    assert result == "claude answered the turn"
+    assert spoken == [], "the canned apology must not be spoken when Claude can answer"
+    assert session._gemini_failover_state["consecutive_failovers"] == 1
+    assert any(
+        "event=llm_provider_failover" in r.getMessage()
+        and "reason=empty_response" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_media_stream_repeated_double_empty_turns_go_sticky(monkeypatch, caplog):
+    session, spoken = _session(
+        [[_empty_chunk()], [_empty_chunk()], [_empty_chunk()], [_empty_chunk()]]
+    )
+    session.anthropic_client = object()
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "present")
+    claude_calls = 0
+
+    async def _run_claude() -> str:
+        nonlocal claude_calls
+        claude_calls += 1
+        return "claude"
+
+    monkeypatch.setattr(session, "_run_llm_claude", _run_claude)
+
+    with caplog.at_level("INFO", logger="server"):
+        for _ in range(3):
+            assert asyncio.run(session._run_llm_gemini()) == "claude"
+
+    assert claude_calls == 3
+    assert session._gemini_failover_state["degraded"] is True
+    # The third turn never touched Gemini: 2 turns x (attempt + retry).
+    assert session.gemini_client.requests == 4
+    assert spoken == []
+    assert sum(
+        "event=llm_provider_degraded" in r.getMessage() for r in caplog.records
+    ) == 1
+
+
+def test_media_stream_double_empty_speaks_the_canned_line_when_failover_is_off(monkeypatch):
+    session, spoken = _session([[_empty_chunk()], [_empty_chunk()]])
+    session.anthropic_client = object()
+    monkeypatch.setattr(server, "GEMINI_FAILOVER_TO_CLAUDE", False)
+
+    async def _run_claude() -> str:
+        raise AssertionError("failover is disabled — Claude must not be called")
+
+    monkeypatch.setattr(session, "_run_llm_claude", _run_claude)
+
+    result = asyncio.run(session._run_llm_gemini())
+
+    fallback = server.LLM_EMPTY_FALLBACKS["en"]
+    assert spoken == [fallback], "silence is still not an acceptable outcome"
+    assert result == fallback
+    assert session.history[-1] == {"role": "assistant", "content": fallback}
+    assert session._gemini_failover_state["consecutive_failovers"] == 0
+
+
+def test_media_stream_double_empty_speaks_the_canned_line_without_anthropic(monkeypatch):
+    session, spoken = _session([[_empty_chunk()], [_empty_chunk()]])
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "")
+    assert session.anthropic_client is None
+
+    result = asyncio.run(session._run_llm_gemini())
+
+    assert spoken == [server.LLM_EMPTY_FALLBACKS["en"]]
+    assert result == server.LLM_EMPTY_FALLBACKS["en"]
+
+
+def test_conversation_relay_double_empty_gemini_turn_failsover_to_claude(monkeypatch, caplog):
+    socket = FakeRelaySocket()
+    client = FakeGemini([[_empty_chunk()], [_empty_chunk()]])
+    state = server._init_gemini_failover_state()
+    history: list[dict] = [{"role": "user", "content": "hi"}]
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: "anthropic")
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "present")
+
+    async def _run_claude(
+        client: object,
+        system: str,
+        conversation_history: list[dict],
+        tools: list[dict],
+        websocket: FakeRelaySocket,
+        lang: str = "en",
+        generation_ref=None,
+        transcript_sink=None,
+        model=server.MODEL,
+    ) -> str:
+        return "claude answered the turn"
+
+    monkeypatch.setattr(server, "_run_llm_streaming_claude", _run_claude)
+
+    with caplog.at_level("WARNING", logger="server"):
+        result = asyncio.run(
+            server._run_llm_streaming_gemini(
+                gemini_client=client,
+                system="sys",
+                conversation_history=history,
+                tools=[],
+                websocket=socket,
+                failover_state=state,
+            )
+        )
+
+    assert client.requests == 2
+    assert result == "claude answered the turn"
+    assert socket.tokens() == [], "no canned apology when Claude can answer"
+    assert state["consecutive_failovers"] == 1
+    assert history == [{"role": "user", "content": "hi"}], (
+        "the abandoned Gemini turn must not leave history behind"
+    )
+    assert any(
+        "event=llm_provider_failover" in r.getMessage()
+        and "reason=empty_response" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+# --- failover must hand Claude CLAUDE-shaped tools ---------------------------
+# A Gemini→Claude failover swaps the runner but carries the same tool list.
+# Anthropic 400s on Gemini's [{"function_declarations": [...]}] shape, so a
+# failover that forgets to convert produces a second failure — the caller hears
+# the error line instead of the recovered answer. These tests deliberately do
+# NOT monkeypatch the Claude runner: they assert what the Anthropic client (and
+# the relay runner) is actually handed.
+
+class _FakeStreamContext:
+    def __init__(self, events):
+        self._events = events
+
+    async def __aenter__(self):
+        async def _stream():
+            for event in self._events:
+                yield event
+
+        return _stream()
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _FakeAnthropicMessages:
+    def __init__(self, events):
+        self.calls: list[dict] = []
+        self._events = events
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeStreamContext(self._events)
+
+
+class FakeAnthropicClient:
+    def __init__(self, events=None):
+        self.messages = _FakeAnthropicMessages(events or [])
+
+
+def _anthropic_text_delta(text: str):
+    return SimpleNamespace(
+        type="content_block_delta",
+        delta=SimpleNamespace(type="text_delta", text=text),
+    )
+
+
+GEMINI_SHAPED_TOOLS = [
+    {
+        "function_declarations": [
+            {
+                "name": "check_availability",
+                "description": "check rooms",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "capture_spoken_number",
+                "description": "parse digits",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+    }
+]
+
+
+def test_gemini_tool_shape_converts_to_anthropic_definitions():
+    converted = server._claude_tools_from_gemini(GEMINI_SHAPED_TOOLS)
+
+    assert [tool["name"] for tool in converted] == [
+        "check_availability", "capture_spoken_number",
+    ]
+    assert all("input_schema" in tool for tool in converted)
+    assert all("function_declarations" not in tool for tool in converted)
+
+
+def test_gemini_tool_shape_conversion_preserves_a_restricted_tool_set():
+    """The handover failsafe offers ONLY the notify tool — that must survive."""
+    converted = server._claude_tools_from_gemini(server.get_handover_tools("gemini"))
+
+    assert [tool["name"] for tool in converted] == ["notify_human_handover"]
+    assert converted == server.get_handover_tools("claude")
+
+
+def test_gemini_tool_shape_conversion_round_trips_the_real_tool_definitions():
+    """Converting the production Gemini tools must reproduce get_tools() exactly."""
+    import tools as tools_module
+
+    gemini_shaped = [
+        {
+            "function_declarations": [
+                {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["input_schema"],
+                }
+                for tool in tools_module.TOOL_DEFINITIONS
+            ]
+        }
+    ]
+    assert server._claude_tools_from_gemini(gemini_shaped) == tools_module.TOOL_DEFINITIONS
+
+
+def test_gemini_tool_shape_conversion_passes_anthropic_tools_through():
+    claude_tools = [
+        {"name": "check_availability", "description": "d", "input_schema": {}}
+    ]
+    assert server._claude_tools_from_gemini(claude_tools) == claude_tools
+    assert server._claude_tools_from_gemini([]) == []
+    assert server._claude_tools_from_gemini(None) == []
+
+
+@pytest.mark.asyncio
+async def test_media_stream_sticky_failover_sends_claude_shaped_tools(monkeypatch):
+    session, spoken = _session([])
+    session.tools = server.get_tools_gemini() or GEMINI_SHAPED_TOOLS
+    session.anthropic_client = FakeAnthropicClient([_anthropic_text_delta("recovered.")])
+    session.history = [{"role": "user", "content": "hello"}]
+    session._gemini_failover_state["degraded"] = True
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "present")
+
+    async def _noop_speak(*_args, **_kwargs):
+        return None
+
+    session._invoke_speak = _noop_speak
+    gemini_tools = list(session.tools)
+
+    result = await session._run_llm_gemini()
+
+    assert result == "recovered."
+    call = session.anthropic_client.messages.calls[0]
+    assert call["model"] == server.CLAUDE_MODEL
+    sent_tools = call["tools"]
+    assert sent_tools is not server.NOT_GIVEN
+    assert all("function_declarations" not in tool for tool in sent_tools), (
+        "Anthropic 400s on Gemini's function_declarations payload"
+    )
+    assert [tool["name"] for tool in sent_tools] == [
+        declaration["name"]
+        for entry in gemini_tools
+        for declaration in entry["function_declarations"]
+    ]
+    # The session must be left on its own provider for the next turn.
+    assert session.llm_provider == "gemini"
+    assert session.tools == gemini_tools
+    assert session.model == "gemini-2.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_media_stream_exception_failover_sends_claude_shaped_tools(monkeypatch):
+    session, _spoken = _session([])
+    session.tools = GEMINI_SHAPED_TOOLS
+    session.gemini_client = FakeFlakyGemini([_QuotaError()])
+    session.anthropic_client = FakeAnthropicClient([_anthropic_text_delta("recovered.")])
+    session.history = [{"role": "user", "content": "hello"}]
+
+    async def _noop_speak(*_args, **_kwargs):
+        return None
+
+    session._invoke_speak = _noop_speak
+
+    result = await session._run_llm_gemini()
+
+    assert result == "recovered."
+    call = session.anthropic_client.messages.calls[0]
+    assert call["model"] == server.CLAUDE_MODEL
+    assert [tool["name"] for tool in call["tools"]] == [
+        "check_availability", "capture_spoken_number",
+    ]
+    assert session.tools == GEMINI_SHAPED_TOOLS
+    assert session.llm_provider == "gemini"
+
+
+def test_conversation_relay_sticky_failover_sends_claude_shaped_tools(monkeypatch):
+    socket = FakeRelaySocket()
+    state = server._init_gemini_failover_state()
+    state["degraded"] = True
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "present")
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: "anthropic")
+    seen: list[list[dict]] = []
+
+    async def _run_claude(*, tools, **_kwargs) -> str:
+        seen.append(tools)
+        return "claude"
+
+    monkeypatch.setattr(server, "_run_llm_streaming_claude", _run_claude)
+
+    result = asyncio.run(
+        server._run_llm_streaming_gemini(
+            gemini_client=FakeGemini([]),
+            system="sys",
+            conversation_history=[{"role": "user", "content": "hi"}],
+            tools=GEMINI_SHAPED_TOOLS,
+            websocket=socket,
+            failover_state=state,
+        )
+    )
+
+    assert result == "claude"
+    assert [tool["name"] for tool in seen[0]] == [
+        "check_availability", "capture_spoken_number",
+    ]
+    assert all("function_declarations" not in tool for tool in seen[0])
+
+
+def test_conversation_relay_exception_failover_sends_claude_shaped_tools(monkeypatch):
+    socket = FakeRelaySocket()
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "present")
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: "anthropic")
+    seen: list[list[dict]] = []
+
+    async def _run_claude(*, tools, **_kwargs) -> str:
+        seen.append(tools)
+        return "claude"
+
+    monkeypatch.setattr(server, "_run_llm_streaming_claude", _run_claude)
+
+    result = asyncio.run(
+        server._run_llm_streaming_gemini(
+            gemini_client=FakeFlakyGemini([_QuotaError()]),
+            system="sys",
+            conversation_history=[{"role": "user", "content": "hi"}],
+            tools=server.get_handover_tools("gemini"),
+            websocket=socket,
+        )
+    )
+
+    assert result == "claude"
+    assert [tool["name"] for tool in seen[0]] == ["notify_human_handover"], (
+        "the failsafe session must not be handed the full booking tool set"
+    )
+
+
+# --- an empty LATER round must never be replayed on Claude ------------------
+# Failover re-runs the whole turn from the truncated history. That is safe only
+# while the turn has no side effects yet. If round 1 already executed a tool
+# (create_booking!) or spoke, a replay would repeat it — so a later empty round
+# takes the canned line instead.
+
+def test_media_stream_empty_round_after_a_tool_ran_does_not_replay_on_claude(monkeypatch):
+    session, spoken = _session(
+        [
+            [_tool_chunk("create_booking", {"guest_name": "Raya"})],
+            [_empty_chunk()],
+            [_empty_chunk()],
+        ]
+    )
+    session.anthropic_client = FakeAnthropicClient([_anthropic_text_delta("nope")])
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "present")
+    executed: list[str] = []
+
+    async def execute(name, _arguments):
+        executed.append(name)
+        return json.dumps({"success": True, "booking_reference": "HH-1"})
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    result = asyncio.run(session._run_llm_gemini())
+
+    fallback = server.LLM_EMPTY_FALLBACKS["en"]
+    assert executed == ["create_booking"], "the booking must not be made twice"
+    assert session.anthropic_client.messages.calls == [], (
+        "a turn with side effects must not be replayed on Claude"
+    )
+    assert spoken[-1] == fallback
+    assert result.endswith(fallback)
+    assert session._gemini_failover_state["consecutive_failovers"] == 0
+
+
+def test_conversation_relay_empty_round_after_a_tool_ran_does_not_replay(monkeypatch):
+    socket = FakeRelaySocket()
+    client = FakeGemini(
+        [
+            [_tool_chunk("create_booking", {"guest_name": "Raya"})],
+            [_empty_chunk()],
+            [_empty_chunk()],
+        ]
+    )
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "present")
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: "anthropic")
+    claude_calls = 0
+
+    async def _run_claude(**_kwargs) -> str:
+        nonlocal claude_calls
+        claude_calls += 1
+        return "claude"
+
+    monkeypatch.setattr(server, "_run_llm_streaming_claude", _run_claude)
+    executed: list[str] = []
+
+    async def execute(name, _arguments):
+        executed.append(name)
+        return json.dumps({"success": True, "booking_reference": "HH-1"})
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    result = asyncio.run(
+        server._run_llm_streaming_gemini(
+            gemini_client=client,
+            system="sys",
+            conversation_history=[{"role": "user", "content": "book it"}],
+            tools=[],
+            websocket=socket,
+        )
+    )
+
+    assert executed == ["create_booking"], "the booking must not be made twice"
+    assert claude_calls == 0
+    assert result.endswith(server.LLM_EMPTY_FALLBACKS["en"])
+    assert socket.tokens()[-1] == server.LLM_EMPTY_FALLBACKS["en"]
+
+
+def test_media_stream_first_round_empty_still_fails_over(monkeypatch):
+    """The safe case must keep working: nothing spoken, no tool, round 1."""
+    session, spoken = _session([[_empty_chunk()], [_empty_chunk()]])
+    session.anthropic_client = FakeAnthropicClient([_anthropic_text_delta("recovered.")])
+
+    async def _noop_speak(*_args, **_kwargs):
+        return None
+
+    session._invoke_speak = _noop_speak
+
+    result = asyncio.run(session._run_llm_gemini())
+
+    assert result == "recovered."
+    assert spoken == []
+    assert session._gemini_failover_state["consecutive_failovers"] == 1
