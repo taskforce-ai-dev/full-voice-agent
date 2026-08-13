@@ -36,6 +36,43 @@ async def test_dtmf_mid_session_routes_to_collector_and_does_not_teardown_sessio
 
 
 @pytest.mark.asyncio
+async def test_valid_mismatched_leg_dtmf_still_reaches_the_collector(caplog):
+    dtmf = {
+        "event": "dtmf",
+        "dtmf": {"callId": "wrong-leg", "otherLegCallId": "other-1", "digit": "5"},
+    }
+    factory = _DtmfFactory()
+
+    with caplog.at_level(logging.INFO):
+        _, _, socket, _ = await run([START, dtmf, {"event": "stop"}], factory=factory)
+
+    assert socket.close_calls == [(1000, "call ended")]
+    assert factory.sessions[0].dtmf_digits == ["5"]
+    assert (
+        "context_validation",
+        "observed",
+        "context_mismatch",
+    ) in [(row["stage"], row["outcome"], row["failure_class"]) for row in fixed_diagnostics(caplog)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dtmf",
+    [
+        {"event": "dtmf", "dtmf": {"callId": "call-1", "otherLegCallId": "other-1"}},
+        {"event": "dtmf", "dtmf": {"callId": "call-1", "otherLegCallId": "other-1", "digit": "99"}},
+    ],
+)
+async def test_malformed_or_invalid_dtmf_never_reaches_the_collector(dtmf):
+    factory = _DtmfFactory()
+
+    _, _, socket, _ = await run([START, dtmf], factory=factory)
+
+    assert socket.close_calls[0][0] == 1008
+    assert factory.sessions[0].dtmf_digits == []
+
+
+@pytest.mark.asyncio
 async def test_unknown_mid_session_message_logs_diagnostic_and_continues(caplog):
     with caplog.at_level(logging.INFO):
         _, _, socket, _ = await run([START, {"event": "future-event"}, {"event": "stop"}])
