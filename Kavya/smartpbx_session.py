@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
+import secrets
+import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
@@ -14,6 +17,13 @@ from smartpbx_transport import SmartPBXMediaTransport
 
 
 PostCallProcessor = Callable[..., Awaitable[None]]
+logger = logging.getLogger(__name__)
+_SESSION_MAX_MS = 600_000
+
+
+def _emit_smartpbx_session_summary(**fields: object) -> None:
+    """Emit only the fixed aggregate SmartPBX session contract."""
+    logger.info("smartpbx_media %s", " ".join(f"{key}={value}" for key, value in fields.items()))
 
 
 def _resolve_llm_provider(provider: str | None, default_provider: str) -> str:
@@ -61,6 +71,9 @@ class KavyaSmartPBXSession:
         self._post_call_task: asyncio.Task[None] | None = None
         self._call_start_time = ""
         self._smartpbx_transfer_context: Any | None = None
+        self._session_trace_id: str | None = None
+        self._session_started_ns = time.monotonic_ns()
+        self._session_summary_emitted = False
 
     @property
     def terminal_future(self) -> asyncio.Future[None]:
@@ -99,9 +112,16 @@ class KavyaSmartPBXSession:
         await asyncio.shield(task)
 
     async def _start_once(self) -> None:
+        self._ensure_session_trace_id()
         self._load_runtime_defaults()
         pipeline = self._require_pipeline()
         self._bind_smartpbx_tool_context(pipeline)
+        ensure_telemetry = getattr(pipeline, "_ensure_smartpbx_turn_telemetry", None)
+        if callable(ensure_telemetry):
+            ensure_telemetry()
+        set_transport_callback = getattr(self._transport, "set_transport_event_callback", None)
+        if callable(set_transport_callback):
+            set_transport_callback(getattr(pipeline, "_on_smartpbx_transport_event", None))
         pipeline._record_echo_rejection = self._record_echo_rejection
         pipeline.lang = "en"
         pipeline.call_sid = self._context.other_leg_call_id
@@ -184,8 +204,32 @@ class KavyaSmartPBXSession:
                     )
                 )
         finally:
+            self._emit_session_summary()
             if not self._terminal_future.done():
                 self._terminal_future.set_result(None)
+
+    def _ensure_session_trace_id(self) -> str:
+        if self._session_trace_id is None:
+            self._session_trace_id = secrets.token_urlsafe(16)
+        return self._session_trace_id
+
+    def _emit_session_summary(self) -> None:
+        if self._session_summary_emitted:
+            return
+        self._session_summary_emitted = True
+        pipeline = self._pipeline
+        telemetry = getattr(pipeline, "_turn_telemetry", None)
+        duration_ms = min(max((time.monotonic_ns() - self._session_started_ns) // 1_000_000, 0), _SESSION_MAX_MS)
+        _emit_smartpbx_session_summary(
+            event="session_summary",
+            session_trace_id=self._ensure_session_trace_id(),
+            outcome="finished",
+            turns_started=min(max(int(getattr(telemetry, "turns_started", 0)), 0), 100_000),
+            turns_summarized=min(max(int(getattr(telemetry, "turns_summarized", 0)), 0), 100_000),
+            duration_ms=duration_ms,
+            frames_dropped_total=min(max(int(getattr(self._transport, "frames_dropped_total", 0)), 0), 100_000),
+            barge_ins=min(max(int(getattr(pipeline, "_smartpbx_barge_ins", 0)), 0), 100_000),
+        )
 
     def _wire_stt_fatal_signal(self, stt: Any) -> None:
         """Let a terminally failed STT stream end the call in seconds.

@@ -39,6 +39,8 @@ import logging
 import os
 import inspect
 import difflib
+import secrets
+from dataclasses import dataclass, field
 
 # --- Error tracking (Sentry): no-op unless SENTRY_DSN is set ---
 if os.getenv("SENTRY_DSN"):
@@ -118,6 +120,119 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+_SMARTPBX_TELEMETRY_MAX_MS = 600_000
+_SMARTPBX_ENDPOINT_SOURCES = frozenset({"final", "interim", "capture", "unknown"})
+_SMARTPBX_TURN_OUTCOMES = frozenset({
+    "completed", "llm_failed", "tool_failed", "tts_failed", "interrupted",
+    "transfer_pending", "cancelled",
+})
+_SMARTPBX_TURN_STAGES = frozenset({
+    "started", "endpoint", "kb_start", "kb_complete", "llm_request",
+    "llm_first_token", "llm_complete", "tool_start", "tool_complete",
+    "tts_request", "tts_first_chunk", "first_media_sent", "queue_drained",
+    "barge_clear",
+})
+
+
+def _emit_smartpbx_turn_telemetry(_event: str, **fields: object) -> None:
+    """Emit fixed-shape telemetry without serializing call or provider data."""
+    ordered = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.info("smartpbx_media %s", ordered)
+
+
+@dataclass
+class _SmartPBXTurnState:
+    start_ns: int
+    endpoint_source: str
+    stages: dict[str, int] = field(default_factory=dict)
+    finished: bool = False
+
+
+class SmartPBXTurnTelemetry:
+    """Call-local, opaque SmartPBX turn timing recorder.
+
+    This object deliberately knows neither Dialog context nor utterance content.
+    All timestamps are monotonic and become bounded integer milliseconds only
+    when a fixed-shape event is emitted.
+    """
+
+    def __init__(
+        self,
+        *,
+        emit: Callable[..., None] = _emit_smartpbx_turn_telemetry,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        new_id: Callable[[], str] = lambda: secrets.token_urlsafe(16),
+    ) -> None:
+        self._emit = emit
+        self._monotonic_ns = monotonic_ns
+        self._new_id = new_id
+        self._turns: dict[str, _SmartPBXTurnState] = {}
+        self.turns_started = 0
+        self.turns_summarized = 0
+
+    @staticmethod
+    def _bounded_ms(start_ns: int, end_ns: int) -> int:
+        return min(max((end_ns - start_ns) // 1_000_000, 0), _SMARTPBX_TELEMETRY_MAX_MS)
+
+    def start_turn(self, endpoint_source: str) -> str:
+        endpoint_source = endpoint_source if endpoint_source in _SMARTPBX_ENDPOINT_SOURCES else "unknown"
+        turn_id = self._new_id()
+        self._turns[turn_id] = _SmartPBXTurnState(self._monotonic_ns(), endpoint_source)
+        self.turns_started += 1
+        self._emit("turn_stage", event="turn_stage", turn_id=turn_id, stage="started", endpoint_source=endpoint_source)
+        return turn_id
+
+    def mark(self, turn_id: str, stage: str, *, at_ns: int | None = None) -> None:
+        state = self._turns.get(turn_id)
+        if state is None or state.finished or stage not in _SMARTPBX_TURN_STAGES:
+            return
+        timestamp = self._monotonic_ns() if at_ns is None else at_ns
+        state.stages[stage] = timestamp
+        self._emit(
+            "turn_stage", event="turn_stage", turn_id=turn_id, stage=stage,
+            elapsed_ms=self._bounded_ms(state.start_ns, timestamp),
+        )
+
+    def mark_once(self, turn_id: str, stage: str, *, at_ns: int | None = None) -> None:
+        state = self._turns.get(turn_id)
+        if state is None or stage in state.stages:
+            return
+        self.mark(turn_id, stage, at_ns=at_ns)
+
+    def finish(self, turn_id: str, outcome: str, **counts: int) -> None:
+        state = self._turns.get(turn_id)
+        if state is None or state.finished:
+            return
+        state.finished = True
+        outcome = outcome if outcome in _SMARTPBX_TURN_OUTCOMES else "cancelled"
+        end_ns = self._monotonic_ns()
+        fields: dict[str, object] = {
+            "event": "turn_summary", "turn_id": turn_id, "outcome": outcome,
+            "endpoint_source": state.endpoint_source,
+        }
+        stage_fields = {
+            "endpoint": "endpoint_ms",
+            "llm_first_token": "llm_first_token_ms",
+            "llm_complete": "llm_complete_ms",
+            "tts_first_chunk": "tts_first_chunk_ms",
+            "first_media_sent": "first_media_sent_ms",
+            "queue_drained": "queue_drained_ms",
+            "barge_clear": "barge_clear_ms",
+        }
+        for stage, field_name in stage_fields.items():
+            if stage in state.stages:
+                fields[field_name] = self._bounded_ms(state.start_ns, state.stages[stage])
+        if "kb_start" in state.stages and "kb_complete" in state.stages:
+            fields["kb_ms"] = self._bounded_ms(state.stages["kb_start"], state.stages["kb_complete"])
+        if "tool_start" in state.stages and "tool_complete" in state.stages:
+            fields["tool_ms"] = self._bounded_ms(state.stages["tool_start"], state.stages["tool_complete"])
+        for name, maximum in (("generated_chars", 20_000), ("delivered_sentences", 100), ("dropped_frames", 100_000)):
+            if name in counts:
+                fields[name] = min(max(int(counts[name]), 0), maximum)
+        self.turns_summarized += 1
+        self._emit("turn_summary", **fields)
 
 # ---------------------------------------------------------------------------
 # Environment variables
@@ -3858,6 +3973,12 @@ class MediaStreamSession:
         self._smartpbx_caller_context: dict[str, str] | None = None
         self._record_echo_rejection: Callable[[int, float], None] | None = None
         self.transfer_pending = False
+        self._turn_telemetry: SmartPBXTurnTelemetry | None = None
+        self._active_smartpbx_turn_id: str | None = None
+        self._interrupted_smartpbx_turn_ids: set[str] = set()
+        self._tool_failed_smartpbx_turn_ids: set[str] = set()
+        self._tts_failed_smartpbx_turn_ids: set[str] = set()
+        self._smartpbx_barge_ins = 0
 
     def _is_smartpbx_session(self) -> bool:
         return self._smartpbx_transfer_context is not None
@@ -3868,6 +3989,33 @@ class MediaStreamSession:
             and self._media_transport is not None
             and self.lang == "en"
         )
+
+    def _ensure_smartpbx_turn_telemetry(self) -> SmartPBXTurnTelemetry | None:
+        if not self._is_direct_smartpbx_english():
+            return None
+        if self._turn_telemetry is None:
+            self._turn_telemetry = SmartPBXTurnTelemetry()
+        return self._turn_telemetry
+
+    def _mark_smartpbx_turn(self, stage: str, *, at_ns: int | None = None) -> None:
+        telemetry = self._ensure_smartpbx_turn_telemetry()
+        if telemetry is not None and self._active_smartpbx_turn_id is not None:
+            telemetry.mark(self._active_smartpbx_turn_id, stage, at_ns=at_ns)
+
+    def _mark_smartpbx_turn_once(self, stage: str, *, at_ns: int | None = None) -> None:
+        telemetry = self._ensure_smartpbx_turn_telemetry()
+        if telemetry is not None and self._active_smartpbx_turn_id is not None:
+            telemetry.mark_once(self._active_smartpbx_turn_id, stage, at_ns=at_ns)
+
+    def _on_smartpbx_transport_event(
+        self, turn_id: str, _generation: int, stage: str, monotonic_ns: int, dropped_frames: int
+    ) -> None:
+        telemetry = self._turn_telemetry
+        if telemetry is None:
+            return
+        if stage == "frame_dropped":
+            return
+        telemetry.mark_once(turn_id, stage, at_ns=monotonic_ns)
 
     def _assistant_text_for_echo_scoring(self) -> list[str]:
         if self._is_speaking:
@@ -3999,6 +4147,7 @@ class MediaStreamSession:
 
     def _log_tool_execution(self, tool_name: str, tool_input: Any) -> None:
         self._capture_booking_slots(tool_name, tool_input)
+        self._mark_smartpbx_turn_once("tool_start")
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=tool_execute tool=%s", tool_name)
         else:
@@ -4070,18 +4219,23 @@ class MediaStreamSession:
         return self.system_prompt + self._booking_slots_note()
 
     def _log_tool_result(self, tool_name: str, result: str) -> None:
+        self._mark_smartpbx_turn("tool_complete")
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=tool_result tool=%s", tool_name)
         else:
             logger.info("Tool '%s' â†’ %s", tool_name, result[:200])
 
     def _log_tool_failure(self, tool_name: str) -> None:
+        if self._active_smartpbx_turn_id is not None:
+            self._tool_failed_smartpbx_turn_ids.add(self._active_smartpbx_turn_id)
         if self._is_smartpbx_session():
             logger.error("smartpbx_media event=tool_error tool=%s", tool_name)
         else:
             logger.exception("Tool '%s' failed", tool_name)
 
     def _log_tts_failure(self, provider: str, outcome: str, status: int | None = None) -> None:
+        if self._active_smartpbx_turn_id is not None:
+            self._tts_failed_smartpbx_turn_ids.add(self._active_smartpbx_turn_id)
         if self._is_smartpbx_session():
             if status is None:
                 logger.error("smartpbx_media event=tts_failure provider=%s outcome=%s", provider, outcome)
@@ -4273,6 +4427,11 @@ class MediaStreamSession:
         else:
             logger.info("Barge-in detected [%s]", self.call_sid)
         self._is_speaking = False
+        if self._is_direct_smartpbx_english():
+            self._smartpbx_barge_ins += 1
+            if self._active_smartpbx_turn_id is not None:
+                self._interrupted_smartpbx_turn_ids.add(self._active_smartpbx_turn_id)
+                self._mark_smartpbx_turn_once("barge_clear")
         self._assistant_turn_speech_end_at = time.monotonic()
         self._cancel_reprompt()
         self._speak_generation += 1
@@ -4299,6 +4458,10 @@ class MediaStreamSession:
         if self.transfer_pending:
             return
         if self._media_transport is not None:
+            if self._active_smartpbx_turn_id is not None:
+                bind_turn = getattr(self._media_transport, "bind_turn", None)
+                if callable(bind_turn):
+                    bind_turn(self._speak_generation, self._active_smartpbx_turn_id)
             await self._media_transport.send_audio(audio)
             return
         async with self._ws_lock:
@@ -4791,6 +4954,7 @@ class MediaStreamSession:
         if self._utterance_dispatched:
             return
         transcript = self._pending_transcript.strip()
+        had_committed_final = bool(self._committed_transcript)
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
@@ -4812,6 +4976,13 @@ class MediaStreamSession:
             # patient timers for a conversation that is no longer a dictation.
             self._exit_capture_mode("low_dictation_ratio")
             capture_turn = False
+        endpoint_source = (
+            "capture" if capture_turn else "final" if had_committed_final else "interim"
+        )
+        telemetry = self._ensure_smartpbx_turn_telemetry()
+        if telemetry is not None:
+            self._active_smartpbx_turn_id = telemetry.start_turn(endpoint_source)
+            telemetry.mark(self._active_smartpbx_turn_id, "endpoint")
         self._utterance_turn += 1
         turn = self._utterance_turn
         if self._is_smartpbx_session():
@@ -4860,13 +5031,32 @@ class MediaStreamSession:
         self._last_guest_utterance_raw = text
         self._capture_success_this_turn = False
         self._start_assistant_turn_delivery_tracking()
+        turn_id = self._active_smartpbx_turn_id
+        telemetry = self._ensure_smartpbx_turn_telemetry()
+        outcome = "completed"
+        response_text = ""
         try:
+            self._mark_smartpbx_turn_once("kb_start")
             # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
             # this loop is shared by every concurrent call, so keep it off-loop.
             kb_context = await asyncio.to_thread(retrieve_context, text)
+        except asyncio.CancelledError:
+            if telemetry is not None and turn_id is not None:
+                telemetry.finish(
+                    turn_id,
+                    "transfer_pending" if self.transfer_pending else "cancelled",
+                    delivered_sentences=len(self._delivered_sentences),
+                    dropped_frames=getattr(self._media_transport, "frames_dropped_total", 0),
+                )
+            raise
         except Exception:
-            logger.exception("KB retrieval failed")
+            if self._is_smartpbx_session():
+                logger.error("smartpbx_media event=kb_error")
+            else:
+                logger.exception("KB retrieval failed")
             kb_context = ""
+        finally:
+            self._mark_smartpbx_turn("kb_complete")
 
         if kb_context and "No knowledge base loaded" not in kb_context:
             user_msg = f"[Reference context: {kb_context}]\n\nGuest: {text}"
@@ -4877,19 +5067,25 @@ class MediaStreamSession:
         self.history = _trim_history(self.history)
 
         try:
+            self._mark_smartpbx_turn_once("llm_request")
             if self.llm_provider == "claude":
                 response_text = await self._run_llm_claude()
             elif self.llm_provider == "gemini":
                 response_text = await self._run_llm_gemini()
             else:
                 response_text = await self._run_llm()
+            self._mark_smartpbx_turn("llm_complete")
             if response_text:
                 if self._is_smartpbx_session():
                     logger.info("smartpbx_media event=agent_response")
                 else:
                     logger.info("Agent [%s]: %s", self.call_sid, response_text[:200])
                 self._append_assistant_turn_to_transcript(response_text)
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         except Exception:
+            outcome = "llm_failed"
             if self._is_smartpbx_session():
                 logger.error("smartpbx_media event=llm_error")
             else:
@@ -4897,6 +5093,25 @@ class MediaStreamSession:
             fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
             error_msg = fillers.get("_default", "I'm sorry, I encountered an error.")
             await self._invoke_speak(error_msg)
+        finally:
+            if self.transfer_pending:
+                outcome = "transfer_pending"
+            elif turn_id in self._interrupted_smartpbx_turn_ids:
+                outcome = "interrupted"
+            elif turn_id in self._tts_failed_smartpbx_turn_ids:
+                outcome = "tts_failed"
+            elif turn_id in self._tool_failed_smartpbx_turn_ids:
+                outcome = "tool_failed"
+            if telemetry is not None and turn_id is not None:
+                telemetry.finish(
+                    turn_id, outcome,
+                    generated_chars=len(response_text),
+                    delivered_sentences=len(self._delivered_sentences),
+                    dropped_frames=getattr(self._media_transport, "frames_dropped_total", 0),
+                )
+                self._interrupted_smartpbx_turn_ids.discard(turn_id)
+                self._tool_failed_smartpbx_turn_ids.discard(turn_id)
+                self._tts_failed_smartpbx_turn_ids.discard(turn_id)
         # Pre-arm the patient timers for the NEXT guest turn(s) when this turn
         # actually asked the caller to dictate. Runs after the turn so it sees the
         # delivered sentences and cannot be undone by the capture tool's own exit.
@@ -4936,6 +5151,7 @@ class MediaStreamSession:
                 delta = choice.delta
 
                 if delta.content:
+                    self._mark_smartpbx_turn_once("llm_first_token")
                     text_content += delta.content
                     if not has_tool_use:
                         sentence_buffer += delta.content
@@ -4949,6 +5165,7 @@ class MediaStreamSession:
                             tts_tasks.append(task)
 
                 if delta.tool_calls:
+                    self._mark_smartpbx_turn_once("llm_first_token")
                     has_tool_use = True
                     for tc_delta in delta.tool_calls:
                         idx = tc_delta.index
@@ -5186,10 +5403,12 @@ class MediaStreamSession:
                             finish_reason = payload
                             continue
                         if kind == "tool":
+                            self._mark_smartpbx_turn_once("llm_first_token")
                             has_tool_use = True
                             function_calls.append(payload)
                             continue
 
+                        self._mark_smartpbx_turn_once("llm_first_token")
                         text_content += payload
                         # Once a function call has appeared the remaining text is a
                         # pre-tool aside, and a barge-in means the caller is talking
@@ -5485,6 +5704,7 @@ class MediaStreamSession:
                 async for event in stream:
                     if event.type == "content_block_start":
                         if event.content_block.type == "tool_use":
+                            self._mark_smartpbx_turn_once("llm_first_token")
                             has_tool_use = True
                             cur_tool_id = event.content_block.id
                             cur_tool_name = event.content_block.name
@@ -5492,6 +5712,7 @@ class MediaStreamSession:
 
                     elif event.type == "content_block_delta":
                         if event.delta.type == "text_delta":
+                            self._mark_smartpbx_turn_once("llm_first_token")
                             text_content += event.delta.text
                             # A text delta after a tool_use block starts must
                             # not speak (the tool round replies next turn) —
@@ -5726,6 +5947,7 @@ class MediaStreamSession:
             model_id = ELEVENLABS_MODEL_MULTILINGUAL
             voice_settings = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}
         self._is_speaking = True
+        self._mark_smartpbx_turn_once("tts_request")
         self._speaking_since = time.monotonic()
         url = _elevenlabs_stream_url(voice_id)
         headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
@@ -5749,6 +5971,8 @@ class MediaStreamSession:
                     async for chunk in resp.aiter_bytes(chunk_size=640):
                         if not self._is_speaking:
                             break
+                        if chunk:
+                            self._mark_smartpbx_turn_once("tts_first_chunk")
                         await self._send_media_audio(chunk)
 
             if self._is_speaking:

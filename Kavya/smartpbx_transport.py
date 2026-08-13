@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -40,18 +41,23 @@ class SmartPBXMediaTransport:
         websocket: Any,
         context: CallContext,
         *,
-        max_queue_frames: int,
+        max_queue_frames: int = 8,
         on_frame_dropped: Callable[[], None] | None = None,
+        on_transport_event: Callable[[str, int, str, int, int], None] | None = None,
     ) -> None:
         if isinstance(max_queue_frames, bool) or max_queue_frames < 1:
             raise ValueError("max_queue_frames must be positive")
         self._on_frame_dropped = on_frame_dropped
+        self._on_transport_event = on_transport_event
         self._frames_dropped = 0
         self._websocket = websocket
         self._context = context
         self._queue: asyncio.Queue[_QueuedAudio] = asyncio.Queue(max_queue_frames)
         self._sender_task: asyncio.Task[None] | None = None
         self._generation = 0
+        self._generation_turn_ids: dict[int, str] = {}
+        self._first_sent_generations: set[int] = set()
+        self._drained_generations: set[int] = set()
         self._truncating_generation: int | None = None
         self._closed = False
         self._send_failed = asyncio.Event()
@@ -79,6 +85,27 @@ class SmartPBXMediaTransport:
         if self._closed or self._sender_task is not None:
             return
         self._sender_task = asyncio.create_task(self._send_queued_audio())
+
+    def bind_turn(self, generation: int, turn_id: str) -> None:
+        """Associate a live media generation with an opaque pipeline turn id."""
+        if generation == self._generation:
+            self._generation_turn_ids[generation] = turn_id
+
+    def set_transport_event_callback(
+        self, callback: Callable[[str, int, str, int, int], None] | None
+    ) -> None:
+        self._on_transport_event = callback
+
+    def _emit_transport_event(self, generation: int, stage: str) -> None:
+        turn_id = self._generation_turn_ids.get(generation)
+        callback = self._on_transport_event
+        if turn_id is None or callback is None:
+            return
+        try:
+            callback(turn_id, generation, stage, time.monotonic_ns(), self._frames_dropped)
+        except Exception:
+            # Telemetry must never interrupt the media delivery path.
+            return
 
     async def send_audio(self, audio: bytes) -> None:
         """Queue audio, backpressuring briefly on a full queue before dropping."""
@@ -129,14 +156,23 @@ class SmartPBXMediaTransport:
         """
         if not self.is_active:
             return
+        generation = self._generation
         await self._queue.join()
+        if self.is_active and generation == self._generation and generation not in self._drained_generations:
+            self._drained_generations.add(generation)
+            self._emit_transport_event(generation, "queue_drained")
         self._truncating_generation = None
 
     async def clear_audio(self) -> None:
         """Discard queued audio from the current generation without a wire event."""
         if not self.is_active:
             return
+        old_generation = self._generation
         self._truncating_generation = None
+        self._emit_transport_event(old_generation, "barge_clear")
+        self._generation_turn_ids.pop(old_generation, None)
+        self._first_sent_generations.discard(old_generation)
+        self._drained_generations.discard(old_generation)
         self._generation += 1
         self._drain_queue()
 
@@ -193,6 +229,9 @@ class SmartPBXMediaTransport:
                     # Never echo the wire error: it can carry payload bytes.
                     self._record_send_failure()
                     return
+                if queued.generation == self._generation and queued.generation not in self._first_sent_generations:
+                    self._first_sent_generations.add(queued.generation)
+                    self._emit_transport_event(queued.generation, "first_media_sent")
                 next_send_at += len(queued.audio) / _ULAW_BYTES_PER_SECOND
             finally:
                 self._queue.task_done()
@@ -212,5 +251,6 @@ class SmartPBXMediaTransport:
 
     def _record_dropped_frame(self) -> None:
         self._frames_dropped = min(self._frames_dropped + 1, _MAX_COUNTER)
+        self._emit_transport_event(self._generation, "frame_dropped")
         if self._on_frame_dropped is not None:
             self._on_frame_dropped()
