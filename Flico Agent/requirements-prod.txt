@@ -13,7 +13,7 @@ twilio>=9.0.0
 # Knowledge base / RAG
 chromadb>=0.4.0
 sentence-transformers>=2.2.0
-numpy>=1.24
+numpy>=2.5.1
 # kb/ models the query filters and listings with pydantic and uses the v2 API
 # (model_dump). It arrived transitively via fastapi/chromadb; pin the major so a
 # rebuild can't silently resolve a version the KB can't run on.
