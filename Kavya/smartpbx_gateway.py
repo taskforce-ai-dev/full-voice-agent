@@ -297,9 +297,13 @@ class SmartPBXGateway:
                             DiagnosticOutcome.OBSERVED,
                             DiagnosticFailureClass.NONE,
                         )
-                        feed_dtmf = getattr(session, "feed_dtmf", None)
-                        if feed_dtmf is not None:
-                            await feed_dtmf(event.digit)
+                    # DtmfEvent is fully parsed before context validation. A
+                    # per-leg mismatch is observed above but deliberately does
+                    # not discard a valid keypad digit; malformed events and all
+                    # other protocol violations still raise before this point.
+                    feed_dtmf = getattr(session, "feed_dtmf", None)
+                    if feed_dtmf is not None:
+                        await feed_dtmf(event.digit)
                 elif isinstance(event, HangupEvent):
                     validate_event_context(event, context)
                     close_outcome = (1000, "call ended")
