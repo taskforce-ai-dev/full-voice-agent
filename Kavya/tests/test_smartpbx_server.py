@@ -1709,10 +1709,11 @@ async def test_direct_english_capture_tool_uses_last_raw_utterance_for_number_an
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
-async def test_direct_smartpbx_runner_without_context_keeps_legacy_tool_behavior(
-    monkeypatch, provider,
+@pytest.mark.parametrize("entrypoint", ["provider", "bound"])
+async def test_direct_smartpbx_runner_without_turn_contract_keeps_legacy_tool_behavior(
+    monkeypatch, provider, entrypoint,
 ):
-    """Injected direct-runner callers predate the task-local turn contract."""
+    """Injected callers may have no ContextVar or no telemetry-owned turn ID."""
     import server
 
     client = direct_tool_client(provider, [
@@ -1722,8 +1723,11 @@ async def test_direct_smartpbx_runner_without_context_keeps_legacy_tool_behavior
     pipeline = direct_tool_pipeline(server, provider, client)
     pipeline.history = [{"role": "user", "content": "legacy caller request"}]
     executed: list[tuple[str, dict[str, object]]] = []
+    tool_contexts: list[tuple[bool, str | None]] = []
 
     async def record_tool(name, arguments):
+        runner = server._smartpbx_runner_context.get()
+        tool_contexts.append((runner is not None, None if runner is None else runner.turn_id))
         executed.append((name, dict(arguments)))
         return json.dumps({"status": "ok"})
 
@@ -1732,16 +1736,23 @@ async def test_direct_smartpbx_runner_without_context_keeps_legacy_tool_behavior
 
     monkeypatch.setattr(server, "execute_tool", record_tool)
     monkeypatch.setattr(pipeline, "_speak", no_speak)
-    assert server._smartpbx_runner_context.get() is None
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
 
-    if provider == "openai":
-        await pipeline._run_llm()
-    elif provider == "gemini":
-        await pipeline._run_llm_gemini()
+    if entrypoint == "bound":
+        await pipeline._process_utterance_bound("legacy caller request")
     else:
-        await pipeline._run_llm_claude()
+        assert server._smartpbx_runner_context.get() is None
+        if provider == "openai":
+            await pipeline._run_llm()
+        elif provider == "gemini":
+            await pipeline._run_llm_gemini()
+        else:
+            await pipeline._run_llm_claude()
 
     assert executed == [("create_booking", {"request": "legacy"})]
+    assert tool_contexts == [
+        (entrypoint == "bound", None)
+    ]
 
 
 @pytest.mark.asyncio
