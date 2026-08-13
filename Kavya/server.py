@@ -4949,10 +4949,7 @@ class MediaStreamSession:
                 # It never changes pending text or authorizes de-duplication.
                 shape = "unknown"
             else:
-                # A case, spacing, or punctuation variation is deliberately not
-                # treated as cumulative. Google v1 documents consecutive results,
-                # not a cumulative-after-final contract, so keep this text intact.
-                shape = "unknown"
+                shape = "segment"
             logger.info(
                 "smartpbx_media event=stt_interim_shape shape=%s "
                 "committed_chars=%d interim_chars=%d",
