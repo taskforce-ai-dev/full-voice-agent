@@ -1714,6 +1714,60 @@ def direct_tool_history_records(provider, history):
     )
 
 
+def direct_single_tool_pairs(provider, history):
+    """Return each adjacent provider request/result pair with its input."""
+    pairs = []
+    for index, message in enumerate(history[:-1]):
+        following = history[index + 1]
+        if provider == "claude":
+            requests = [
+                block
+                for block in message.get("content", [])
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            ]
+            results = [
+                block
+                for block in following.get("content", [])
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            ]
+            for request in requests:
+                matching = [
+                    result for result in results
+                    if result.get("tool_use_id") == request["id"]
+                ]
+                if matching:
+                    pairs.append((request["input"], request["id"], matching[0]["tool_use_id"]))
+            continue
+
+        for request in message.get("tool_calls") or []:
+            if following.get("role") == "tool" and following.get("tool_call_id") == request["id"]:
+                pairs.append((
+                    json.loads(request["function"]["arguments"]),
+                    request["id"],
+                    following["tool_call_id"],
+                ))
+    return pairs
+
+
+def direct_tool_request_inputs(provider, history):
+    """Return every provider request input, including unmatched requests."""
+    if provider == "claude":
+        return [
+            block["input"]
+            for message in history
+            if message.get("role") == "assistant"
+            and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+    return [
+        json.loads(call["function"]["arguments"])
+        for message in history
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+
+
 class CapturingTextWebSocket:
     def __init__(self):
         self.messages = []
@@ -1907,6 +1961,112 @@ async def test_barged_in_stale_runner_cannot_execute_tools_or_consume_new_raw_ut
         list(pipeline._delivered_sentences),
         pipeline._track_assistant_turn_delivery,
         pipeline._last_guest_utterance_raw,
+    ) == delivery_after_current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+async def test_barged_in_slow_tool_cannot_leave_orphaned_provider_history(
+    monkeypatch, provider,
+):
+    """A completed old effect is not replayed or written after a newer turn wins."""
+    import server
+
+    old_tool_entered = asyncio.Event()
+    release_old_tool = asyncio.Event()
+    turn_ids = iter(("old-slow-tool", "new-slow-tool"))
+    old_arguments = {"request": "old", "guest_name": "Old Guest"}
+    new_arguments = {"request": "new", "guest_name": "Current Guest"}
+
+    async def immediate_round(events):
+        for event in events:
+            yield event
+
+    client = controlled_direct_tool_client(provider, [
+        immediate_round(direct_tool_round(provider, old_arguments)),
+        immediate_round(direct_tool_round(provider, new_arguments)),
+        immediate_round(direct_text_round(provider, "Current tool complete.")),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    telemetry = server.SmartPBXTurnTelemetry(new_id=lambda: next(turn_ids))
+    pipeline._turn_telemetry = telemetry
+    old_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = old_turn
+    executed: list[dict[str, object]] = []
+
+    async def slow_old_tool(name, arguments):
+        executed.append({"name": name, "arguments": dict(arguments)})
+        if arguments["request"] == "old":
+            old_tool_entered.set()
+            await release_old_tool.wait()
+        return json.dumps({"status": "ok"})
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", slow_old_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+
+    old_task = asyncio.create_task(
+        pipeline._process_utterance_bound("old slow tool utterance")
+    )
+    await asyncio.wait_for(old_tool_entered.wait(), timeout=1)
+
+    await pipeline._handle_bargein()
+    new_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = new_turn
+    await asyncio.wait_for(
+        pipeline._process_utterance_bound("new tool utterance"), timeout=1,
+    )
+
+    assert executed == [
+        {"name": "create_booking", "arguments": old_arguments},
+        {"name": "create_booking", "arguments": new_arguments},
+    ]
+    assert direct_tool_request_inputs(provider, pipeline.history) == [new_arguments]
+    request_ids, request_names, result_ids = direct_tool_history_records(
+        provider, pipeline.history,
+    )
+    assert request_names == ["create_booking"]
+    assert result_ids == request_ids
+    assert direct_single_tool_pairs(provider, pipeline.history) == [
+        (new_arguments, "tool-1" if provider != "gemini" else "gemini_tc_0_0",
+         "tool-1" if provider != "gemini" else "gemini_tc_0_0"),
+    ]
+    history_after_current = list(pipeline.history)
+    transcript_after_current = list(pipeline.full_transcript)
+    delivery_after_current = (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+        dict(pipeline._booking_slots),
+    )
+
+    release_old_tool.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    assert direct_single_tool_pairs(provider, pipeline.history) == [
+        (new_arguments, "tool-1" if provider != "gemini" else "gemini_tc_0_0",
+         "tool-1" if provider != "gemini" else "gemini_tc_0_0"),
+    ]
+    assert direct_tool_request_inputs(provider, pipeline.history) == [new_arguments]
+    request_ids, request_names, result_ids = direct_tool_history_records(
+        provider, pipeline.history,
+    )
+    assert request_names == ["create_booking"]
+    assert result_ids == request_ids
+    assert pipeline.history == history_after_current
+    assert pipeline.full_transcript == transcript_after_current
+    assert (
+        pipeline._assistant_turn_generation,
+        list(pipeline._assistant_turn_generated_sentences),
+        list(pipeline._delivered_sentences),
+        pipeline._track_assistant_turn_delivery,
+        pipeline._last_guest_utterance_raw,
+        dict(pipeline._booking_slots),
     ) == delivery_after_current
 
 
