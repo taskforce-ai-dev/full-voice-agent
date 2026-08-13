@@ -140,6 +140,7 @@ async def test_sends_only_the_documented_media_envelope():
     transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=2)
     transport.start()
     await transport.send_audio(b"audio")
+    await transport.send_mark("tts_done")
     await asyncio.wait_for(wait_for_sent(websocket, 1), timeout=1)
 
     assert json.loads(websocket.sent[0]) == {
@@ -161,16 +162,20 @@ async def test_serialized_sender_drops_newest_when_bounded_queue_overflows():
     websocket.allow_send.clear()
     transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=2)
     transport.start()
-    await transport.send_audio(b"in-flight")
+    in_flight = b"i" * 160
+    oldest = b"o" * 160
+    newest = b"n" * 160
+    latest = b"l" * 160
+    await transport.send_audio(in_flight)
     await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
-    await transport.send_audio(b"oldest")
-    await transport.send_audio(b"newest")
-    await transport.send_audio(b"latest")
+    await transport.send_audio(oldest)
+    await transport.send_audio(newest)
+    await transport.send_audio(latest)
     websocket.allow_send.set()
     await asyncio.wait_for(wait_for_sent(websocket, 3), timeout=1)
 
     assert [json.loads(item)["media"]["payload"] for item in websocket.sent] == [
-        base64.b64encode(audio).decode("ascii") for audio in (b"in-flight", b"oldest", b"newest")
+        base64.b64encode(audio).decode("ascii") for audio in (in_flight, oldest, newest)
     ]
     assert transport.frames_dropped_total == 1
     await transport.close()
@@ -182,16 +187,18 @@ async def test_clear_audio_discards_stale_generation_without_a_wire_control_even
     websocket.allow_send.clear()
     transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=2)
     transport.start()
-    await transport.send_audio(b"in-flight")
+    in_flight = b"i" * 160
+    current = b"c" * 160
+    await transport.send_audio(in_flight)
     await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
-    await transport.send_audio(b"stale")
+    await transport.send_audio(b"s" * 160)
     await transport.clear_audio()
-    await transport.send_audio(b"current")
+    await transport.send_audio(current)
     websocket.allow_send.set()
     await asyncio.wait_for(wait_for_sent(websocket, 2), timeout=1)
 
     assert [json.loads(item)["media"]["payload"] for item in websocket.sent] == [
-        base64.b64encode(audio).decode("ascii") for audio in (b"in-flight", b"current")
+        base64.b64encode(audio).decode("ascii") for audio in (in_flight, current)
     ]
     await transport.close()
 
@@ -219,10 +226,10 @@ async def test_clear_audio_drain_is_not_counted_as_a_drop():
     websocket.allow_send.clear()
     transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=4)
     transport.start()
-    await transport.send_audio(b"in-flight")
+    await transport.send_audio(b"i" * 160)
     await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
-    await transport.send_audio(b"a")
-    await transport.send_audio(b"b")
+    await transport.send_audio(b"a" * 160)
+    await transport.send_audio(b"b" * 160)
     await transport.clear_audio()
     assert transport.frames_dropped_total == 0
     await transport.close()
@@ -234,12 +241,12 @@ async def test_send_audio_backpressures_and_bails_on_barge_in_without_hanging():
     websocket.allow_send.clear()
     transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=1)
     transport.start()
-    await transport.send_audio(b"in-flight")  # taken by the (blocked) sender
+    await transport.send_audio(b"i" * 160)  # taken by the (blocked) sender
     await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
-    await transport.send_audio(b"queued")     # fills the 1-slot queue
+    await transport.send_audio(b"q" * 160)     # fills the 1-slot queue
 
     # A further frame must backpressure (wait for space), not drop immediately.
-    pending = asyncio.create_task(transport.send_audio(b"waiting"))
+    pending = asyncio.create_task(transport.send_audio(b"w" * 160))
     await asyncio.sleep(0.01)
     assert not pending.done(), "a full queue must backpressure, not drop the tail at once"
     assert transport.frames_dropped_total == 0

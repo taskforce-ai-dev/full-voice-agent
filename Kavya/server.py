@@ -228,7 +228,17 @@ class SmartPBXTurnTelemetry:
             fields["kb_ms"] = self._bounded_ms(state.stages["kb_start"], state.stages["kb_complete"])
         if "tool_start" in state.stages and "tool_complete" in state.stages:
             fields["tool_ms"] = self._bounded_ms(state.stages["tool_start"], state.stages["tool_complete"])
-        for name, maximum in (("generated_chars", 20_000), ("delivered_sentences", 100), ("dropped_frames", 100_000)):
+        for name, maximum in (
+            ("generated_chars", 20_000),
+            ("delivered_sentences", 100),
+            ("dropped_frames", 100_000),
+            ("frames_160b", 100_000),
+            ("frames_partial", 100_000),
+            ("frames_other", 100_000),
+            ("inter_send_gap_p95_ms", _SMARTPBX_TELEMETRY_MAX_MS),
+            ("inter_send_gap_max_ms", _SMARTPBX_TELEMETRY_MAX_MS),
+            ("queue_underruns", 100_000),
+        ):
             if name in counts:
                 fields[name] = min(max(int(counts[name]), 0), maximum)
         self.turns_summarized += 1
@@ -3990,6 +4000,7 @@ class MediaStreamSession:
         self._tool_failed_smartpbx_turn_ids: set[str] = set()
         self._tts_failed_smartpbx_turn_ids: set[str] = set()
         self._smartpbx_barge_ins = 0
+        self._smartpbx_cadence_by_turn: dict[str, dict[str, int]] = {}
 
     def _is_smartpbx_session(self) -> bool:
         return self._smartpbx_transfer_context is not None
@@ -4019,14 +4030,21 @@ class MediaStreamSession:
             telemetry.mark_once(self._active_smartpbx_turn_id, stage, at_ns=at_ns)
 
     def _on_smartpbx_transport_event(
-        self, turn_id: str, _generation: int, stage: str, monotonic_ns: int, dropped_frames: int
+        self, turn_id: str, generation: int, stage: str, monotonic_ns: int, dropped_frames: int
     ) -> None:
         telemetry = self._turn_telemetry
         if telemetry is None:
             return
+        snapshot = getattr(self._media_transport, "cadence_summary_for_generation", None)
+        if callable(snapshot):
+            self._smartpbx_cadence_by_turn[turn_id] = snapshot(generation)
         if stage == "frame_dropped":
             return
         telemetry.mark_once(turn_id, stage, at_ns=monotonic_ns)
+
+    def _smartpbx_cadence_counts(self, turn_id: str) -> dict[str, int]:
+        """Return fixed numeric transport aggregates for this opaque turn only."""
+        return dict(self._smartpbx_cadence_by_turn.get(turn_id, {}))
 
     def _assistant_text_for_echo_scoring(self) -> list[str]:
         if self._is_speaking:
@@ -5081,7 +5099,9 @@ class MediaStreamSession:
                     "transfer_pending" if self.transfer_pending else "cancelled",
                     delivered_sentences=len(self._delivered_sentences),
                     dropped_frames=getattr(self._media_transport, "frames_dropped_total", 0),
+                    **self._smartpbx_cadence_counts(turn_id),
                 )
+                self._smartpbx_cadence_by_turn.pop(turn_id, None)
             raise
         except Exception:
             if self._is_smartpbx_session():
@@ -5142,7 +5162,9 @@ class MediaStreamSession:
                     generated_chars=len(response_text),
                     delivered_sentences=len(self._delivered_sentences),
                     dropped_frames=getattr(self._media_transport, "frames_dropped_total", 0),
+                    **self._smartpbx_cadence_counts(turn_id),
                 )
+                self._smartpbx_cadence_by_turn.pop(turn_id, None)
                 self._interrupted_smartpbx_turn_ids.discard(turn_id)
                 self._tool_failed_smartpbx_turn_ids.discard(turn_id)
                 self._tts_failed_smartpbx_turn_ids.discard(turn_id)
