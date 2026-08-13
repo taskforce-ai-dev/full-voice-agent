@@ -56,6 +56,19 @@ jobs:
             dir="${entry%%:*}"; id="${entry##*:}"
             match=$(printf '%s\n' "$CHANGED" | grep -F "$dir/" || true)
             [ -z "$match" ] && continue
+            # Kavya SmartPBX has a protected immutable-image route. Generic
+            # deploy.yml rejects its image mode, so do not manufacture an
+            # intentional failure here: use the reviewed probe -> publisher ->
+            # runbook flow instead.
+            if [ "$id" = "kavya" ]; then
+              echo "-> Kavya excluded from generic deployment; use reviewed SmartPBX probe -> publisher -> runbook route"
+              {
+                echo "## Kavya SmartPBX deployment"
+                echo "- Kavya changes are excluded from generic deploy-on-push."
+                echo "- Use the reviewed SmartPBX probe -> publisher -> runbook route."
+              } >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
             # Safety: syntax-check any changed Python before shipping it.
             while IFS= read -r f; do
               [ -z "$f" ] && continue

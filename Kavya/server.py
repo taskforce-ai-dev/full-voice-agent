@@ -419,6 +419,31 @@ elif LLM_PROVIDER == "gemini":
 else:
     MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o")
 MAX_TOKENS: int = 300
+
+
+def _resolve_smartpbx_max_tokens(raw: object) -> int:
+    """Resolve the bounded direct-SmartPBX output budget without touching Twilio."""
+    try:
+        value = int(raw) if raw not in (None, "") else 120
+    except (TypeError, ValueError):
+        value = 120
+    return min(max(value, 40), 200)
+
+
+def _resolve_smartpbx_initial_filler_delay(raw: object) -> float:
+    try:
+        value = float(raw) if raw not in (None, "") else 2.5
+    except (TypeError, ValueError):
+        value = 2.5
+    return min(max(value, 0.5), 5.0)
+
+
+SMARTPBX_MAX_TOKENS: int = _resolve_smartpbx_max_tokens(
+    os.getenv("SMARTPBX_MAX_TOKENS")
+)
+SMARTPBX_INITIAL_FILLER_DELAY_SECONDS: float = _resolve_smartpbx_initial_filler_delay(
+    os.getenv("SMARTPBX_INITIAL_FILLER_DELAY_SECONDS")
+)
 MAX_HISTORY_MESSAGES: int = 60
 MAX_TOOL_ROUNDS: int = 5
 
@@ -539,6 +564,88 @@ _TOOL_FILLER_CYCLES: dict[str, int] = {
     "create_booking": 0,
     "transfer_to_human": 0,
 }
+
+
+SMARTPBX_INITIAL_FILLER_TEXT = "Just a moment while I check that for you."
+_SMARTPBX_CAPTURE_TOOLS = frozenset({
+    "capture_spoken_number", "capture_spoken_name", "collect_number_via_keypad",
+})
+
+
+class SmartPBXInitialFillerController:
+    """One cancellable neutral filler for a direct SmartPBX first provider round.
+
+    The timer is deliberately independent of the provider stream.  A delta wins
+    by cancelling it; if the timer has already entered speech, cancellation also
+    clears that generation before any side-effecting tool can continue.
+    """
+
+    def __init__(
+        self,
+        *,
+        speak,
+        generation: int,
+        delay_seconds: float,
+        sleep=asyncio.sleep,
+        clear_audio=None,
+    ) -> None:
+        self._speak = speak
+        self.generation = generation
+        self.delay_seconds = delay_seconds
+        self._sleep = sleep
+        self._clear_audio = clear_audio
+        self._task: asyncio.Task | None = None
+        self.spoke = False
+
+    @property
+    def suppress_specialized_tool_filler(self) -> bool:
+        return self.spoke
+
+    def start(self, *, capture_tool: str | None = None) -> None:
+        if self._task is not None or capture_tool in _SMARTPBX_CAPTURE_TOOLS:
+            return
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        try:
+            await self._sleep(self.delay_seconds)
+            # Mark before awaiting TTS: a tool delta racing an in-flight TTS
+            # request must suppress its specialized filler and clear first.
+            self.spoke = True
+            await self._speak(SMARTPBX_INITIAL_FILLER_TEXT, generation=self.generation)
+        except asyncio.CancelledError:
+            return
+
+    async def _cancel(self, *, clear_if_spoke: bool) -> None:
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if clear_if_spoke and self.spoke and self._clear_audio is not None:
+            await self._clear_audio()
+
+    async def on_content_delta(self) -> None:
+        await self._cancel(clear_if_spoke=True)
+
+    async def on_tool_delta(self) -> None:
+        await self._cancel(clear_if_spoke=True)
+
+    async def on_barge_in(self) -> None:
+        # The caller owns the established generation-clear sequence; doing it
+        # here too would emit two clears for one barge-in.
+        await self._cancel(clear_if_spoke=False)
+
+    async def on_generation_change(self, generation: int) -> None:
+        if generation != self.generation:
+            await self._cancel(clear_if_spoke=True)
+
+    async def on_session_finish(self) -> None:
+        # Session/transfer teardown performs the authoritative media clear.
+        await self._cancel(clear_if_spoke=False)
+
+    async def wait(self) -> None:
+        if self._task is not None:
+            await asyncio.gather(self._task, return_exceptions=True)
 
 
 def _next_tool_filler(tool_name: str) -> str:
@@ -2343,6 +2450,7 @@ def _build_gemini_config(
     tools: list[dict] | None,
     model: str,
     nudge: str | None = None,
+    max_output_tokens: int = MAX_TOKENS,
 ) -> dict[str, Any]:
     """Assemble the per-round google-genai config.
 
@@ -2353,7 +2461,7 @@ def _build_gemini_config(
     system_instruction = f"{system}\n\n{nudge}" if nudge else system
     config: dict[str, Any] = {
         "system_instruction": system_instruction,
-        "max_output_tokens": MAX_TOKENS,
+        "max_output_tokens": max_output_tokens,
     }
     thinking = _gemini_thinking_config(model)
     if thinking is not None:
@@ -4001,6 +4109,7 @@ class MediaStreamSession:
         self._tts_failed_smartpbx_turn_ids: set[str] = set()
         self._smartpbx_barge_ins = 0
         self._smartpbx_cadence_by_turn: dict[str, dict[str, int]] = {}
+        self._smartpbx_initial_filler: SmartPBXInitialFillerController | None = None
 
     def _is_smartpbx_session(self) -> bool:
         return self._smartpbx_transfer_context is not None
@@ -4011,6 +4120,44 @@ class MediaStreamSession:
             and self._media_transport is not None
             and self.lang == "en"
         )
+
+    def _provider_max_tokens(self) -> int:
+        return SMARTPBX_MAX_TOKENS if self._is_direct_smartpbx_english() else MAX_TOKENS
+
+    def _start_initial_smartpbx_filler(
+        self, *, round_idx: int, generation: int
+    ) -> SmartPBXInitialFillerController | None:
+        if (
+            round_idx != 0
+            or not self._is_direct_smartpbx_english()
+            or self.transfer_pending
+            or self._is_speaking
+            or self._is_capture_mode_active()
+            or generation != self._speak_generation
+        ):
+            return None
+
+        async def speak(text: str, *, generation: int) -> None:
+            await self._invoke_speak(text, generation=generation)
+
+        controller = SmartPBXInitialFillerController(
+            speak=speak,
+            generation=generation,
+            delay_seconds=SMARTPBX_INITIAL_FILLER_DELAY_SECONDS,
+            clear_audio=self._clear_media_audio,
+        )
+        controller.start()
+        self._smartpbx_initial_filler = controller
+        return controller
+
+    async def _finish_initial_smartpbx_filler(
+        self, controller: SmartPBXInitialFillerController | None
+    ) -> None:
+        if controller is None:
+            return
+        await controller.on_session_finish()
+        if self._smartpbx_initial_filler is controller:
+            self._smartpbx_initial_filler = None
 
     def _ensure_smartpbx_turn_telemetry(self) -> SmartPBXTurnTelemetry | None:
         if not self._is_direct_smartpbx_english():
@@ -4095,6 +4242,8 @@ class MediaStreamSession:
         """Silence AI activity after carrier acknowledgement without closing Dialog."""
         if self.transfer_pending:
             return
+        if self._smartpbx_initial_filler is not None:
+            await self._smartpbx_initial_filler.on_session_finish()
         # Before anything is torn down: a half-dictated number in the capture
         # buffer is about to be discarded, and after the transfer nothing else
         # will ever record it.
@@ -4243,9 +4392,18 @@ class MediaStreamSession:
         joined = "\n".join(lines)
         return _BOOKING_SLOTS_NOTE_PREFIX + joined
 
+    def _smartpbx_rhythm_rule(self) -> str:
+        return (
+            "\n\nSMARTPBX CALLER RHYTHM:\n"
+            "- Answer first in one or two concise sentences.\n"
+            "- Ask no more than one necessary next question.\n"
+            if self._is_direct_smartpbx_english()
+            else ""
+        )
+
     def _active_system_prompt(self) -> str:
-        """The system prompt plus any booking slots captured so far."""
-        return self.system_prompt + self._booking_slots_note()
+        """The system prompt plus direct-SmartPBX rhythm and booking slots."""
+        return self.system_prompt + self._smartpbx_rhythm_rule() + self._booking_slots_note()
 
     def _log_tool_result(self, tool_name: str, result: str) -> None:
         self._mark_smartpbx_turn("tool_complete")
@@ -4361,6 +4519,8 @@ class MediaStreamSession:
             if media_context_token is not None:
                 handover_context.reset(media_context_token)
             self._cancel_reprompt()
+            if self._smartpbx_initial_filler is not None:
+                await self._smartpbx_initial_filler.on_session_finish()
             if self._stt:
                 self._stt.stop()
             self._write_audio_dump()
@@ -4456,6 +4616,8 @@ class MediaStreamSession:
         else:
             logger.info("Barge-in detected [%s]", self.call_sid)
         self._is_speaking = False
+        if self._smartpbx_initial_filler is not None:
+            await self._smartpbx_initial_filler.on_barge_in()
         if self._is_direct_smartpbx_english():
             self._smartpbx_barge_ins += 1
             if self._active_smartpbx_turn_id is not None:
@@ -4464,6 +4626,8 @@ class MediaStreamSession:
         self._assistant_turn_speech_end_at = time.monotonic()
         self._cancel_reprompt()
         self._speak_generation += 1
+        if self._smartpbx_initial_filler is not None:
+            await self._smartpbx_initial_filler.on_generation_change(self._speak_generation)
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
@@ -5148,6 +5312,10 @@ class MediaStreamSession:
             error_msg = fillers.get("_default", "I'm sorry, I encountered an error.")
             await self._invoke_speak(error_msg)
         finally:
+            if self._smartpbx_initial_filler is not None:
+                await self._finish_initial_smartpbx_filler(
+                    self._smartpbx_initial_filler
+                )
             if self.transfer_pending:
                 outcome = "transfer_pending"
             elif turn_id in self._interrupted_smartpbx_turn_ids:
@@ -5192,11 +5360,14 @@ class MediaStreamSession:
             tts_tasks: list[asyncio.Task] = []
             has_tool_use = False
             gen = self._speak_generation
+            initial_filler = self._start_initial_smartpbx_filler(
+                round_idx=round_idx, generation=gen
+            )
 
             messages = [{"role": "system", "content": self._active_system_prompt()}] + self.history
             stream = await self.client.chat.completions.create(
                 model=self.model,
-                max_tokens=MAX_TOKENS,
+                max_tokens=self._provider_max_tokens(),
                 messages=messages,
                 tools=self.tools or None,
                 stream=True,
@@ -5207,6 +5378,8 @@ class MediaStreamSession:
                 delta = choice.delta
 
                 if delta.content:
+                    if initial_filler is not None:
+                        await initial_filler.on_content_delta()
                     self._mark_smartpbx_turn_once("llm_first_token")
                     text_content += delta.content
                     if not has_tool_use:
@@ -5221,6 +5394,8 @@ class MediaStreamSession:
                             tts_tasks.append(task)
 
                 if delta.tool_calls:
+                    if initial_filler is not None:
+                        await initial_filler.on_tool_delta()
                     self._mark_smartpbx_turn_once("llm_first_token")
                     has_tool_use = True
                     for tc_delta in delta.tool_calls:
@@ -5254,7 +5429,16 @@ class MediaStreamSession:
                     preamble = sentence_buffer.strip()
                     if preamble and not tts_tasks:
                         await self._invoke_speak(preamble, generation=gen, sentence=preamble)
-                    elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
+                    elif (
+                        first_tool != "transfer_to_human"
+                        and first_tool not in _SMARTPBX_CAPTURE_TOOLS
+                        and not smartpbx_filler_sent
+                        and not text_content.strip()
+                        and not (
+                            initial_filler is not None
+                            and initial_filler.suppress_specialized_tool_filler
+                        )
+                    ):
                         filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
                         await self._invoke_speak(filler, generation=gen, sentence=filler)
                         smartpbx_filler_sent = True
@@ -5431,6 +5615,9 @@ class MediaStreamSession:
                 finish_reason = None
                 gen = self._speak_generation
                 nudge: str | None = None
+                initial_filler = self._start_initial_smartpbx_filler(
+                    round_idx=round_idx, generation=gen
+                )
 
                 # Attempt 0 is the real turn. Attempt 1 only happens when attempt 0
                 # streamed absolutely nothing (no text, no tool call, or a blocked
@@ -5451,6 +5638,7 @@ class MediaStreamSession:
                             tools=self.tools,
                             model=self.model,
                             nudge=nudge,
+                            max_output_tokens=self._provider_max_tokens(),
                         ),
                     )
 
@@ -5459,11 +5647,15 @@ class MediaStreamSession:
                             finish_reason = payload
                             continue
                         if kind == "tool":
+                            if initial_filler is not None:
+                                await initial_filler.on_tool_delta()
                             self._mark_smartpbx_turn_once("llm_first_token")
                             has_tool_use = True
                             function_calls.append(payload)
                             continue
 
+                        if initial_filler is not None:
+                            await initial_filler.on_content_delta()
                         self._mark_smartpbx_turn_once("llm_first_token")
                         text_content += payload
                         # Once a function call has appeared the remaining text is a
@@ -5577,7 +5769,16 @@ class MediaStreamSession:
                         preamble = sentence_buffer.strip()
                         if preamble and not tts_tasks:
                             await self._invoke_speak(preamble, generation=gen, sentence=preamble)
-                        elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
+                        elif (
+                            first_tool != "transfer_to_human"
+                            and first_tool not in _SMARTPBX_CAPTURE_TOOLS
+                            and not smartpbx_filler_sent
+                            and not text_content.strip()
+                            and not (
+                                initial_filler is not None
+                                and initial_filler.suppress_specialized_tool_filler
+                            )
+                        ):
                             filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
                             await self._invoke_speak(filler, generation=gen, sentence=filler)
                             smartpbx_filler_sent = True
@@ -5743,6 +5944,9 @@ class MediaStreamSession:
             tts_tasks: list[asyncio.Task] = []
             has_tool_use = False
             gen = self._speak_generation
+            initial_filler = self._start_initial_smartpbx_filler(
+                round_idx=round_idx, generation=gen
+            )
 
             # Prompt caching: marking the system prompt with cache_control
             # caches the entire request prefix (tools + system) for ~5 min.
@@ -5750,9 +5954,10 @@ class MediaStreamSession:
             # turn of every call.
             async with self.anthropic_client.messages.stream(
                 model=self.model,
-                max_tokens=MAX_TOKENS,
+                max_tokens=self._provider_max_tokens(),
                 system=_build_claude_system_blocks(
-                    self.system_prompt, self._booking_slots_note()
+                    self.system_prompt + self._smartpbx_rhythm_rule(),
+                    self._booking_slots_note(),
                 ),
                 messages=self.history,
                 tools=self.tools if self.tools else NOT_GIVEN,
@@ -5760,6 +5965,8 @@ class MediaStreamSession:
                 async for event in stream:
                     if event.type == "content_block_start":
                         if event.content_block.type == "tool_use":
+                            if initial_filler is not None:
+                                await initial_filler.on_tool_delta()
                             self._mark_smartpbx_turn_once("llm_first_token")
                             has_tool_use = True
                             cur_tool_id = event.content_block.id
@@ -5768,6 +5975,8 @@ class MediaStreamSession:
 
                     elif event.type == "content_block_delta":
                         if event.delta.type == "text_delta":
+                            if initial_filler is not None:
+                                await initial_filler.on_content_delta()
                             self._mark_smartpbx_turn_once("llm_first_token")
                             text_content += event.delta.text
                             # A text delta after a tool_use block starts must
@@ -5825,7 +6034,16 @@ class MediaStreamSession:
                     preamble = sentence_buffer.strip()
                     if preamble and not tts_tasks:
                         await self._invoke_speak(preamble, generation=gen, sentence=preamble)
-                    elif first_tool != "transfer_to_human" and not smartpbx_filler_sent and not text_content.strip():
+                    elif (
+                        first_tool != "transfer_to_human"
+                        and first_tool not in _SMARTPBX_CAPTURE_TOOLS
+                        and not smartpbx_filler_sent
+                        and not text_content.strip()
+                        and not (
+                            initial_filler is not None
+                            and initial_filler.suppress_specialized_tool_filler
+                        )
+                    ):
                         filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
                         await self._invoke_speak(filler, generation=gen, sentence=filler)
                         smartpbx_filler_sent = True

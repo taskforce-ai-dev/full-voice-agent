@@ -96,6 +96,14 @@ jobs:
             [ -z "$match" ] && continue
 
             any=true
+            if [ "$id" = "kavya" ]; then
+              count=$(printf '%s\n' "$match" | grep -c . || true)
+              printf '| `%s` | `%s` | **excluded** | reviewed SmartPBX probe -> publisher -> runbook route; no generic deployment | %s |\n' \
+                "$id" "$dir" "$count" >> rows.md
+              echo "-> $id (excluded; reviewed SmartPBX probe -> publisher -> runbook route)"
+              continue
+            fi
+
             mode=fast
             effect='hot-swap changed `.py` + `docker restart` — seconds'
             if printf '%s\n' "$match" | grep -qE 'requirements.*\.txt|Dockerfile|docker-compose\.ya?ml'; then
