@@ -2682,3 +2682,54 @@ def test_bargein_knobs_are_deliverable_through_the_documented_path():
     for name, default in (("BARGEIN_MIN_CHARS", "12"), ("BARGEIN_DEBOUNCE_SECONDS", "0.6")):
         assert f"{name}={default}" in example, f"{name} missing from .env.example"
         assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
+
+
+def test_generic_deploy_and_pr_impact_exclude_kavya_from_image_routing():
+    """Kavya images have a separately reviewed probe -> publisher -> runbook path."""
+    workflows = PROJECT_ROOT.parent / ".github" / "workflows"
+    deploy_on_push = (workflows / "deploy-on-push.yml").read_text(encoding="utf-8")
+    pr_impact = (workflows / "pr-deploy-impact.yml").read_text(encoding="utf-8")
+
+    for workflow in (deploy_on_push, pr_impact):
+        assert '"Kavya:kavya"' in workflow
+        assert 'if [ "$id" = "kavya" ]' in workflow
+        assert "excluded" in workflow.lower()
+        assert "probe" in workflow.lower()
+        assert "publisher" in workflow.lower()
+        assert "runbook" in workflow.lower()
+
+    # The generic matrix must never carry a Kavya image row into deploy.yml.
+    assert 'items="${items}{\\"agent\\":\\"${id}\\",\\"mode\\":\\"${mode}\\"},"' in deploy_on_push
+    kavya_guard = deploy_on_push.split('if [ "$id" = "kavya" ]', 1)[1]
+    assert kavya_guard.find('continue') < kavya_guard.find('items="${items}')
+
+
+def test_kavya_exclusion_keeps_other_registry_agents_on_generic_image_routing():
+    workflows = PROJECT_ROOT.parent / ".github" / "workflows"
+    deploy_on_push = (workflows / "deploy-on-push.yml").read_text(encoding="utf-8")
+    pr_impact = (workflows / "pr-deploy-impact.yml").read_text(encoding="utf-8")
+
+    # The exclusion is narrow: compose-backed registry detection remains the
+    # generic path for other agents and continues to report image impact.
+    for workflow in (deploy_on_push, pr_impact):
+        assert '"Flico Agent:flico"' in workflow
+        assert "ghcr\\.io/" in workflow
+        assert "mode=image" in workflow
+
+
+def test_kavya_generic_rejection_and_reviewed_image_gates_remain_intact():
+    workflows = PROJECT_ROOT.parent / ".github" / "workflows"
+    generic_deploy = (workflows / "deploy.yml").read_text(encoding="utf-8")
+    probe = (workflows / "probe-kavya-image.yml").read_text(encoding="utf-8")
+    publisher = (workflows / "build-kavya-image.yml").read_text(encoding="utf-8")
+
+    assert '"$AGENT" == "kavya" && "$MODE" == "image"' in generic_deploy
+    assert "Kavya image mode is disabled" in generic_deploy
+
+    assert "repository_dispatch:" in probe
+    assert "kavya_image_read_only_probe" in probe
+    assert "contents: read" in probe
+    assert "workflow_dispatch:" in publisher
+    assert "expected_sha" in publisher
+    assert "fresh successful read-only probe" in publisher
+    assert "org.opencontainers.image.revision" in publisher

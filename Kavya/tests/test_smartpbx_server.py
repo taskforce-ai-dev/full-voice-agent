@@ -2431,3 +2431,217 @@ def test_smartpbx_health_stays_open_for_liveness_probes():
     health = {route.path: route for route in app.routes}["/health"].endpoint
 
     assert health() == {"status": "ok", "service_mode": "smartpbx"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_direct_smartpbx_provider_requests_use_the_concise_output_budget(
+    monkeypatch, provider
+):
+    """Only direct Dialog sessions get the 120-token caller-rhythm budget."""
+    import server
+
+    client = direct_tool_client(provider, [direct_text_round(provider, "Concise reply.")])
+    pipeline = direct_tool_pipeline(server, provider, client)
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("guest turn")
+
+    request = client.requests[0]
+    if provider == "gemini":
+        assert request["config"]["max_output_tokens"] == 120
+    else:
+        assert request["max_tokens"] == 120
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_non_smartpbx_provider_requests_keep_the_existing_output_budget(
+    monkeypatch, provider
+):
+    """ConversationRelay and ordinary Media Streams must remain at 300 tokens."""
+    import server
+
+    client = direct_tool_client(provider, [direct_text_round(provider, "Legacy reply.")])
+    pipeline = server.MediaStreamSession(
+        websocket=None,
+        lang="en",
+        media_transport=FakeTransport(),
+        anthropic_client=client if provider == "claude" else None,
+        gemini_client=client if provider == "gemini" else None,
+        openai_client=client if provider == "openai" else None,
+        llm_provider=provider,
+        model=f"{provider}-legacy-model",
+    )
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    await pipeline._process_utterance_bound("guest turn")
+
+    request = client.requests[0]
+    if provider == "gemini":
+        assert request["config"]["max_output_tokens"] == 300
+    else:
+        assert request["max_tokens"] == 300
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 120),
+        ("", 120),
+        ("39", 40),
+        ("40", 40),
+        ("120", 120),
+        ("200", 200),
+        ("201", 200),
+        ("not-an-int", 120),
+    ],
+)
+def test_smartpbx_output_token_resolver_defaults_and_clamps(raw, expected):
+    import server
+
+    assert server._resolve_smartpbx_max_tokens(raw) == expected
+
+
+class _ControlledInitialFillerSleep:
+    def __init__(self):
+        self.delays = []
+        self.release = asyncio.Event()
+
+    async def __call__(self, seconds):
+        self.delays.append(seconds)
+        await self.release.wait()
+
+
+def _initial_filler_controller(server, sleep, speak, *, clear_audio=None):
+    return server.SmartPBXInitialFillerController(
+        speak=speak,
+        generation=7,
+        delay_seconds=2.5,
+        sleep=sleep,
+        clear_audio=clear_audio,
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_smartpbx_filler_waits_exactly_2_5_seconds_then_speaks_once():
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    spoken = []
+
+    async def speak(text, *, generation):
+        spoken.append((text, generation))
+
+    controller = _initial_filler_controller(server, sleep, speak)
+    controller.start()
+    await asyncio.sleep(0)
+    assert sleep.delays == [2.5]
+    assert spoken == []
+
+    sleep.release.set()
+    await controller.wait()
+
+    assert spoken == [(server.SMARTPBX_INITIAL_FILLER_TEXT, 7)]
+    assert controller.spoke is True
+    assert controller.suppress_specialized_tool_filler is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel",
+    [
+        lambda controller: controller.on_content_delta(),
+        lambda controller: controller.on_tool_delta(),
+        lambda controller: controller.on_barge_in(),
+        lambda controller: controller.on_generation_change(8),
+        lambda controller: controller.on_session_finish(),
+    ],
+    ids=["content", "tool", "barge-in", "generation-change", "finish"],
+)
+async def test_initial_smartpbx_filler_cancels_before_the_delay_for_every_terminal_race(
+    cancel,
+):
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    spoken = []
+
+    async def speak(text, *, generation):
+        spoken.append((text, generation))
+
+    controller = _initial_filler_controller(server, sleep, speak)
+    controller.start()
+    await asyncio.sleep(0)
+    await cancel(controller)
+    sleep.release.set()
+    await controller.wait()
+
+    assert spoken == []
+    assert controller.spoke is False
+    assert controller.suppress_specialized_tool_filler is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["create_booking", "transfer_to_human"])
+async def test_spoken_initial_filler_is_cleared_before_a_side_effecting_tool_runs(tool_name):
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    filler_started = asyncio.Event()
+    filler_cancelled = asyncio.Event()
+    events = []
+
+    async def speak(_text, *, generation):
+        events.append(("filler", generation))
+        filler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            filler_cancelled.set()
+            raise
+
+    async def clear_audio():
+        events.append(("clear", None))
+
+    controller = _initial_filler_controller(server, sleep, speak, clear_audio=clear_audio)
+    controller.start()
+    await asyncio.sleep(0)
+    sleep.release.set()
+    await asyncio.wait_for(filler_started.wait(), timeout=1)
+
+    await controller.on_tool_delta()
+    await asyncio.wait_for(filler_cancelled.wait(), timeout=1)
+    events.append((tool_name, None))
+
+    assert events == [("filler", 7), ("clear", None), (tool_name, None)]
+    assert controller.suppress_specialized_tool_filler is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", ["capture_spoken_number", "capture_spoken_name", "collect_number_via_keypad"])
+async def test_capture_and_keypad_rounds_never_arm_an_initial_smartpbx_filler(capture):
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    spoken = []
+
+    async def speak(text, *, generation):
+        spoken.append((text, generation))
+
+    controller = _initial_filler_controller(server, sleep, speak)
+    controller.start(capture_tool=capture)
+    await asyncio.sleep(0)
+    sleep.release.set()
+    await controller.wait()
+
+    assert sleep.delays == []
+    assert spoken == []
