@@ -326,6 +326,9 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
     assert "fingerprint" not in normalized_diagnostics
     assert "event=smartpbx_protocol_diagnostic" in diagnostics
     assert "finite approved event allowlist" in normalized_diagnostics
+    # This is the complete direct-SmartPBX runtime taxonomy, not the obsolete
+    # seven-event subset. Keeping the list here makes a new emitted event a
+    # conscious privacy/runbook decision rather than undocumented log drift.
     for event_name in (
         "smartpbx_protocol_diagnostic",
         "stt_digit_class_state",
@@ -334,6 +337,37 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "turn_summary",
         "session_summary",
         "echo_rejected",
+        "agent_response",
+        "assistant_turn_delivery",
+        "audio_dump_written",
+        "bad_tool_json",
+        "llm_round",
+        "llm_round_complete",
+        "llm_empty_response",
+        "llm_error",
+        "llm_provider_degraded",
+        "llm_provider_failover",
+        "tool_execute",
+        "tool_result",
+        "tool_error",
+        "tool_batch",
+        "tool_round_limit",
+        "tts_failure",
+        "tts_interrupted",
+        "barge_in",
+        "guest_utterance",
+        "kb_error",
+        "silence_reprompt",
+        "stt_final",
+        "stt_provider_final",
+        "stt_provider_interim",
+        "capture_buffer_bounded",
+        "capture_final_buffered",
+        "capture_forced_dispatch",
+        "capture_mode_enter",
+        "capture_mode_exit",
+        "dtmf_collect_start",
+        "dtmf_collect_done",
     ):
         assert f"`{event_name}`" in diagnostics
     assert "unlisted event names are not permitted" in normalized_diagnostics
@@ -344,25 +378,21 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "failure_class",
         "active_sessions",
         "duration_ms",
+        "turn_id",
+        "session_trace_id",
+        "provider",
     ):
         assert f"`{field}`" in diagnostics
     assert "opaque, local, randomly generated" in normalized_diagnostics
     assert "never derived from dialog" in normalized_diagnostics
-    for forbidden in (
-        "payload",
-        "audio",
-        "transcript",
-        "credential",
-        "exception",
-        "stack",
-        "session_id",
-        "call_fingerprint",
-        "counter",
-        "raw call",
-        "call id",
-        "dialog id",
-    ):
-        assert forbidden not in normalized_diagnostics
+    assert "only seven" not in normalized_diagnostics
+    assert "bounded provider enum" in normalized_diagnostics
+    for provider in ("openai", "gemini", "claude", "elevenlabs", "azure"):
+        assert f"`{provider}`" in diagnostics
+    assert (
+        "must not contain transcript text, audio, call ids, exception bodies, or secrets"
+        in normalized_diagnostics
+    )
 
     assert "transfer-disabled" in runbook
     assert "Test endpoint-down fallback before shifting traffic." in cutover
@@ -399,6 +429,22 @@ def test_new_smartpbx_caller_rhythm_knobs_are_blank_safe_passthroughs():
     ) is None
 
 
+def test_runbook_smartpbx_template_keeps_caller_rhythm_knobs_blank_and_private():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    template = runbook.split("```dotenv", 1)[1].split("```", 1)[0]
+
+    assert re.search(r"^SMARTPBX_MAX_TOKENS=$", template, re.MULTILINE)
+    assert re.search(
+        r"^SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=$", template, re.MULTILINE
+    )
+    assert re.search(r"^SMARTPBX_MAX_TOKENS=\d", template, re.MULTILINE) is None
+    assert re.search(
+        r"^SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=\d", template, re.MULTILINE
+    ) is None
+    assert "$(" not in template
+    assert "`" not in template
+
+
 def test_runbook_allows_only_privacy_safe_telemetry_and_bounded_local_retention():
     runbook = read_text("SMARTPBX_RUNBOOK.md")
     normalized = re.sub(r"\s+", " ", runbook).lower()
@@ -411,6 +457,9 @@ def test_runbook_allows_only_privacy_safe_telemetry_and_bounded_local_retention(
     assert "aggregate-only" in normalized
     assert "do not export raw logs" in normalized
     assert "wire-delivery proxies" in normalized
+    assert "session_trace_id" in normalized
+    assert "bounded provider enum" in normalized
+    assert "must not contain transcript text, audio, call ids, exception bodies, or secrets" in normalized
 
 
 def test_pr_impact_keeps_kavya_out_of_generic_deploy_and_gives_its_real_rollback_path():

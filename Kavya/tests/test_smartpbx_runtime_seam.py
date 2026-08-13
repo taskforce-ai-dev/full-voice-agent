@@ -879,6 +879,88 @@ async def test_turn_dropped_frame_counts_are_deltas_not_the_session_total(monkey
 
 
 @pytest.mark.asyncio
+async def test_overlapping_runner_drop_summaries_stay_bound_to_their_generation(
+    monkeypatch,
+):
+    """An old runner must not summarize overflow from a newer generation."""
+    import server
+
+    class GenerationDropTransport(Transport):
+        def __init__(self):
+            self.frames_dropped_total = 0
+            self.generation = 0
+
+        async def clear_audio(self):
+            self.generation += 1
+
+    transport = GenerationDropTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport,
+    )
+    pipeline._smartpbx_transfer_context = object()
+    emitted: list[dict[str, object]] = []
+    turn_ids = iter(("turn-old", "turn-new"))
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        new_id=lambda: next(turn_ids),
+    )
+    pipeline._turn_telemetry = telemetry
+    old_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = old_turn
+    pipeline._smartpbx_dropped_frame_baselines[old_turn] = 0
+    old_entered = asyncio.Event()
+    old_release = asyncio.Event()
+    new_entered = asyncio.Event()
+    new_release = asyncio.Event()
+
+    async def delayed_llm():
+        runner = server._smartpbx_runner_context.get()
+        if runner is not None and runner.turn_id == old_turn:
+            old_entered.set()
+            await old_release.wait()
+        else:
+            new_entered.set()
+            await new_release.wait()
+        return ""
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_run_llm_claude", delayed_llm)
+
+    old_task = asyncio.create_task(pipeline._process_utterance_bound("old turn"))
+    await asyncio.wait_for(old_entered.wait(), timeout=1)
+    for total in (1, 2):
+        transport.frames_dropped_total = total
+        pipeline._on_smartpbx_transport_event(
+            old_turn, 0, "frame_dropped", 0, total,
+        )
+
+    await pipeline._handle_bargein()
+    new_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = new_turn
+    pipeline._smartpbx_dropped_frame_baselines[new_turn] = 2
+    new_task = asyncio.create_task(pipeline._process_utterance_bound("new turn"))
+    await asyncio.wait_for(new_entered.wait(), timeout=1)
+    for total in (3, 4, 5):
+        transport.frames_dropped_total = total
+        pipeline._on_smartpbx_transport_event(
+            new_turn, 1, "frame_dropped", 0, total,
+        )
+
+    new_release.set()
+    await asyncio.wait_for(new_task, timeout=1)
+    old_release.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    summaries = {
+        record["turn_id"]: record
+        for record in emitted
+        if record.get("event") == "turn_summary"
+    }
+    assert summaries[old_turn]["dropped_frames"] == 2
+    assert summaries[new_turn]["dropped_frames"] == 3
+
+
+@pytest.mark.asyncio
 async def test_session_finish_emits_one_opaque_aggregate_summary_after_cleanup(monkeypatch):
     import smartpbx_session
 

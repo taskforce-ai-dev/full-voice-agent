@@ -1594,6 +1594,70 @@ def direct_tool_client(provider, rounds):
     return DirectToolClaude(rounds)
 
 
+class ControlledDirectToolOpenAI:
+    """One shared client whose old stream can pause behind a newer turn."""
+
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.chat = SimpleNamespace(completions=self)
+
+    async def create(self, **kwargs):
+        self.requests.append(kwargs)
+        return self.rounds.pop(0)
+
+
+class ControlledDirectToolGeminiModels:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def generate_content_stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        return self.owner.rounds.pop(0)
+
+
+class ControlledDirectToolGemini:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.aio = SimpleNamespace(models=ControlledDirectToolGeminiModels(self))
+
+
+class ControlledDirectToolClaudeStream:
+    def __init__(self, events):
+        self.events = events
+
+    async def __aenter__(self):
+        return self.events
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class ControlledDirectToolClaudeMessages:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def stream(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        return ControlledDirectToolClaudeStream(self.owner.rounds.pop(0))
+
+
+class ControlledDirectToolClaude:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.requests = []
+        self.messages = ControlledDirectToolClaudeMessages(self)
+
+
+def controlled_direct_tool_client(provider, rounds):
+    if provider == "openai":
+        return ControlledDirectToolOpenAI(rounds)
+    if provider == "gemini":
+        return ControlledDirectToolGemini(rounds)
+    return ControlledDirectToolClaude(rounds)
+
+
 def direct_tool_pipeline(server, provider, client, lang="en"):
     pipeline = server.MediaStreamSession(
         websocket=None, lang=lang, media_transport=FakeTransport(),
@@ -1641,6 +1705,95 @@ async def test_direct_english_capture_tool_uses_last_raw_utterance_for_number_an
         ("capture_spoken_number", "double seven"),
         ("capture_spoken_name", "Jane Doe"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+@pytest.mark.parametrize(
+    "tool_name",
+    ["create_booking", "transfer_to_human", "capture_spoken_number"],
+)
+async def test_barged_in_stale_runner_cannot_execute_tools_or_consume_new_raw_utterance(
+    monkeypatch, provider, tool_name,
+):
+    """Only the current SmartPBX runner may cross the tool side-effect boundary."""
+    import server
+
+    old_stream_blocked = asyncio.Event()
+    release_old_stream = asyncio.Event()
+    old_turns = iter(("old-turn", "new-turn"))
+
+    old_arguments = (
+        {"spoken": "model-old-spoken"}
+        if tool_name == "capture_spoken_number"
+        else {"request": "old"}
+    )
+    new_arguments = (
+        {"spoken": "model-new-spoken"}
+        if tool_name == "capture_spoken_number"
+        else {"request": "new"}
+    )
+
+    async def delayed_old_tool_round():
+        for event in direct_tool_round(provider, old_arguments, tool_name=tool_name):
+            yield event
+        old_stream_blocked.set()
+        await release_old_stream.wait()
+
+    async def immediate_round(events):
+        for event in events:
+            yield event
+
+    client = controlled_direct_tool_client(provider, [
+        delayed_old_tool_round(),
+        immediate_round(direct_tool_round(provider, new_arguments, tool_name=tool_name)),
+        immediate_round(direct_text_round(provider, "New turn complete.")),
+        immediate_round(direct_text_round(provider, "Old turn complete.")),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    telemetry = server.SmartPBXTurnTelemetry(new_id=lambda: next(old_turns))
+    pipeline._turn_telemetry = telemetry
+    old_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = old_turn
+    executed: list[tuple[str, dict[str, object]]] = []
+
+    async def record_tool(name, arguments):
+        executed.append((name, dict(arguments)))
+        return json.dumps({"status": "ok"})
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", record_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+
+    old_task = asyncio.create_task(
+        pipeline._process_utterance_bound("old guest raw utterance")
+    )
+    await asyncio.wait_for(old_stream_blocked.wait(), timeout=1)
+
+    await pipeline._handle_bargein()
+    new_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = new_turn
+    new_task = asyncio.create_task(
+        pipeline._process_utterance_bound("new guest raw utterance")
+    )
+    await asyncio.wait_for(new_task, timeout=1)
+
+    expected_arguments = (
+        {"spoken": "new guest raw utterance"}
+        if tool_name == "capture_spoken_number"
+        else new_arguments
+    )
+    assert executed == [(tool_name, expected_arguments)]
+
+    release_old_stream.set()
+    await asyncio.wait_for(old_task, timeout=1)
+
+    # The stale runner still holds its old provider stream, but must neither run
+    # a side effect nor read the session-global raw text for the newer turn.
+    assert executed == [(tool_name, expected_arguments)]
 
 
 @pytest.mark.asyncio
