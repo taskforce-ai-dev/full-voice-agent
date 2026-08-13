@@ -4243,9 +4243,13 @@ class MediaStreamSession:
         if not self._is_direct_smartpbx_english():
             return True
         runner = _smartpbx_runner_context.get()
+        # Older injected/direct callers invoke a provider runner without the
+        # task-local turn wrapper. They have no runner ownership to validate;
+        # only an explicitly captured runner can be stale after a barge-in.
+        if runner is None:
+            return True
         return (
-            runner is not None
-            and runner.turn_id is not None
+            runner.turn_id is not None
             and runner.turn_id == self._active_smartpbx_turn_id
             and runner.speak_generation == self._speak_generation
         )

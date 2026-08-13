@@ -1709,6 +1709,43 @@ async def test_direct_english_capture_tool_uses_last_raw_utterance_for_number_an
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+async def test_direct_smartpbx_runner_without_context_keeps_legacy_tool_behavior(
+    monkeypatch, provider,
+):
+    """Injected direct-runner callers predate the task-local turn contract."""
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"request": "legacy"}),
+        direct_text_round(provider, "Legacy turn complete."),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    pipeline.history = [{"role": "user", "content": "legacy caller request"}]
+    executed: list[tuple[str, dict[str, object]]] = []
+
+    async def record_tool(name, arguments):
+        executed.append((name, dict(arguments)))
+        return json.dumps({"status": "ok"})
+
+    async def no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "execute_tool", record_tool)
+    monkeypatch.setattr(pipeline, "_speak", no_speak)
+    assert server._smartpbx_runner_context.get() is None
+
+    if provider == "openai":
+        await pipeline._run_llm()
+    elif provider == "gemini":
+        await pipeline._run_llm_gemini()
+    else:
+        await pipeline._run_llm_claude()
+
+    assert executed == [("create_booking", {"request": "legacy"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
 @pytest.mark.parametrize(
     "tool_name",
     ["create_booking", "transfer_to_human", "capture_spoken_number"],
