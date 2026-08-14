@@ -343,14 +343,24 @@ def test_fix1_conversation_relay_gemini_exception_with_no_tool_still_fails_over(
 def test_fix2_capture_mode_empty_response_keeps_pre_phase_b_silence():
     """Capture mode must not get the new retry-with-nudge attempt, and an
     exhausted empty response must not speak the new shared recovery line —
-    matching whatever a non-"direct" empty response already did."""
-    rounds = [[_openai_chunk()] for _ in range(server.MAX_TOOL_ROUNDS)]
-    session, spoken = _openai_session(rounds, capture_mode=True)
+    matching whatever a non-"direct" empty response already did.
+
+    Pre-Phase-B (and still true for any non-direct-SmartPBX call today), one
+    empty round with no text and no tool call ends the turn immediately —
+    the round loop only continues via the tool-call ``continue`` path, so a
+    single empty response never advances to a second round. Only the
+    SmartPBX-direct retry-nudge policy adds a second attempt (still within
+    round 0, via ``max_attempts``); capture mode must not get that either.
+    So the whole turn costs exactly one request, not one per
+    ``MAX_TOOL_ROUNDS``.
+    """
+    session, spoken = _openai_session([[_openai_chunk()]], capture_mode=True)
 
     result = asyncio.run(session._run_llm())
 
-    assert session.client.requests == server.MAX_TOOL_ROUNDS, (
-        "capture mode must not get the extra empty-retry attempt per round"
+    assert session.client.requests == 1, (
+        "capture mode must not get the extra empty-retry attempt, "
+        "and a single empty round must not loop for extra rounds"
     )
     assert spoken == [], "capture mode must not speak the new shared recovery line"
     assert result == ""
@@ -492,7 +502,13 @@ def test_fix4_late_tool_completion_after_ownership_loss_emits_bounded_telemetry(
     events: list[dict] = []
     monkeypatch.setattr(
         server, "_emit_smartpbx_turn_telemetry",
-        lambda event, **fields: events.append({"event": event, **fields}),
+        # Matches the codebase's established emit convention (see
+        # SmartPBXTurnTelemetry.start_turn/mark/finish): callers always pass
+        # ``event=`` as a keyword alongside the positional label, so the
+        # fake must accept the positional under a different name -- taking
+        # it as ``event`` collides with the keyword and raises "multiple
+        # values for argument 'event'".
+        lambda _event, **fields: events.append(dict(fields)),
     )
 
     runner = server._SmartPBXRunnerContext(
@@ -557,7 +573,11 @@ def test_fix4_tool_completes_after_teardown_races_ahead_is_discarded_but_visible
     events: list[dict] = []
     monkeypatch.setattr(
         server, "_emit_smartpbx_turn_telemetry",
-        lambda event, **fields: events.append({"event": event, **fields}),
+        # See the matching comment in the fix4_late_tool_completion test above:
+        # the codebase's established emit convention always passes ``event=``
+        # as a keyword alongside the positional label, so the fake must not
+        # name its positional parameter ``event`` or the call collides.
+        lambda _event, **fields: events.append(dict(fields)),
     )
 
     async def execute(_name, _arguments):
@@ -580,7 +600,15 @@ def test_fix4_tool_completes_after_teardown_races_ahead_is_discarded_but_visible
 
     assert result == "", "a runner that lost ownership must not commit to history or speak"
     assert not any(m.get("role") == "tool" for m in session.history), "the booking result must not be committed"
-    assert spoken == [], "no recovery text either — this is a discard, not a spoken outcome"
+    # The pre-tool filler ("I'm creating your reservation now.") is spoken
+    # while this runner still legitimately owns the turn -- ownership is only
+    # lost inside the awaited execute_tool() call, after the filler already
+    # went out (see test_direct_english_tool_failure_uses_one_filler_and_
+    # opaque_recovery for the same filler-before-tool-await shape). What must
+    # NOT happen is any *outcome* text once the result comes back discarded.
+    assert spoken == [server.TOOL_FILLERS["create_booking"]], (
+        "no recovery/outcome text after the discard -- only the pre-tool filler"
+    )
     late_events = [e for e in events if e.get("stage") == "late_tool_completion"]
     assert len(late_events) == 1, "the discarded success must be observable, not silent"
     assert late_events[0]["turn_id"] == turn_id

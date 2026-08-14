@@ -3487,12 +3487,26 @@ async def test_smartpbx_barge_in_during_empty_retry_prevents_stale_recovery_spee
 @pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
 async def test_twilio_media_streams_empty_response_behaviour_is_unchanged(monkeypatch, provider):
     """Non-SmartPBX Twilio Media Streams (Arabic/Sinhala/Tamil) must not gain
-    a retry or a spoken recovery line -- Phase B's shared empty-response
-    policy and stream timeouts apply only to the direct SmartPBX English
-    path."""
+    the NEW SmartPBX-only retry-nudge/recovery-line policy -- Phase B's
+    shared empty-response policy and stream timeouts apply only to the
+    direct SmartPBX English path.
+
+    Gemini is a deliberate exception to "no retry at all": its own
+    per-turn empty-response retry (``GEMINI_EMPTY_RETRY_NUDGE`` + the
+    canned ``LLM_EMPTY_FALLBACKS`` line) predates Phase B entirely
+    (commit 716ec9e) and is unconditional -- it fires for every session,
+    not just direct SmartPBX -- so it needs a second empty round to
+    attempt against and is "unchanged" at 2 requests with the old canned
+    fallback spoken, not silence. OpenAI/Claude have no such per-provider
+    retry outside the SmartPBX-gated Phase B policy and stay silent at
+    one request, as before.
+    """
     import server
 
-    client = direct_tool_client(provider, [direct_empty_round(provider)])
+    rounds = [direct_empty_round(provider)]
+    if provider == "gemini":
+        rounds.append(direct_empty_round(provider))
+    client = direct_tool_client(provider, rounds)
     pipeline = _twilio_media_streams_pipeline(server, provider, client, lang="ar")
     spoken = []
 
@@ -3502,10 +3516,17 @@ async def test_twilio_media_streams_empty_response_behaviour_is_unchanged(monkey
     monkeypatch.setattr(pipeline, "_speak", speak)
     result = await _run_direct_provider(pipeline, provider)
 
-    assert _provider_request_count(pipeline, provider) == 1
     assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
     assert server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT not in spoken
-    assert result == ""
+    if provider == "gemini":
+        fallback = server.LLM_EMPTY_FALLBACKS["ar"]
+        assert _provider_request_count(pipeline, provider) == 2
+        assert spoken == [fallback]
+        assert result == fallback
+    else:
+        assert _provider_request_count(pipeline, provider) == 1
+        assert spoken == []
+        assert result == ""
 
 
 def test_smartpbx_initial_filler_delay_default_is_1_5_seconds():
