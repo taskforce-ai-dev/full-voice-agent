@@ -209,6 +209,27 @@ class KavyaSmartPBXSession:
         finally:
             # Unfinished turns must reach exactly one terminal summary before
             # the session aggregate that counts them.
+            #
+            # Fix-4 (pre-merge review, in-flight tool vs. teardown race):
+            # the in-flight utterance-runner task (the `asyncio.ensure_future`
+            # spawned by `_arm_endpointing`'s endpointing timer -> `_flush_transcript`
+            # -> `_process_utterance*` -> the LLM runner -> `execute_tool`) is
+            # deliberately NOT cancelled here. A cancel could land mid-`await
+            # execute_tool(...)`, and asyncio cancellation gives no guarantee the
+            # outbound HTTP request (e.g. create_booking) had not already been
+            # sent when CancelledError is raised -- a half-committed side effect
+            # on the wire is worse than letting the call finish. Ownership is
+            # instead revalidated on the pipeline side after every awaited
+            # provider/tool boundary (`_current_smartpbx_runner_owns_shared_state`),
+            # which already discards a result when a newer turn/generation has
+            # taken over (ordinary barge-in); `_finalize_smartpbx_turns()` below
+            # clears `_active_smartpbx_turn_id`, so a runner that resumes after
+            # this point loses ownership the same way and its result is
+            # discarded rather than committed to history. The one gap that fix
+            # closes: when a tool already executed this turn, losing ownership
+            # now emits one bounded `turn_stage stage="late_tool_completion"`
+            # event first, so a late-completing tool becomes an observable
+            # event instead of a silent success with no trace.
             finalize_turns = getattr(self._pipeline, "_finalize_smartpbx_turns", None)
             if callable(finalize_turns):
                 finalize_turns()
