@@ -319,7 +319,12 @@ class SmartPBXGateway:
                     # control path; unknown event kinds are observability-only.
                     sink(DiagnosticStage.CONTEXT_VALIDATION, DiagnosticOutcome.OBSERVED, DiagnosticFailureClass.UNSUPPORTED_EVENT)
                 elif isinstance(event, ConnectedEvent):
-                    raise ProtocolViolation(POLICY_VIOLATION, "connected after start", "connected_after_start")
+                    # The vendor reference (ChanakaDev/ai-provider-example-websocket)
+                    # and its FAQ document that `connected` is purely informational
+                    # and may arrive at any point in the session, including after
+                    # `start` — log and keep the call alive rather than tearing it
+                    # down. Mirrors the UnsupportedEvent in-band-drift handling above.
+                    sink(DiagnosticStage.CONTEXT_VALIDATION, DiagnosticOutcome.OBSERVED, DiagnosticFailureClass.CONNECTED_AFTER_START)
         except asyncio.TimeoutError:
             if session is None:
                 sink(DiagnosticStage.SCHEMA_ADMISSION, DiagnosticOutcome.REJECTED, DiagnosticFailureClass.START_TIMEOUT)

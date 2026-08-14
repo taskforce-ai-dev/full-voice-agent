@@ -565,13 +565,43 @@ async def test_gateway_cleanup_logs_never_include_exception_details(caplog):
 
 
 @pytest.mark.asyncio
-async def test_connected_after_start_is_rejected():
+async def test_connected_after_start_is_logged_and_ignored(caplog):
+    # Vendor reference (ChanakaDev/ai-provider-example-websocket) + its FAQ:
+    # `connected` is informational and may arrive at any point in the session,
+    # including after `start` — it must be logged and the call kept alive.
+    caplog.set_level("INFO", logger="smartpbx_gateway")
     _, _, websocket, factory = await run_gateway([
-        START, {"event": "connected"},
+        START, {"event": "connected"}, {"event": "stop"},
     ])
 
-    assert websocket.close_calls == [(1008, "connected after start")]
+    assert websocket.close_calls == [(1000, "call ended")]
     assert factory.sessions[0].finish_calls == [True]
+    records = [json.loads(record.getMessage()) for record in caplog.records]
+    observed = next(item for item in records if item["event"] == "smartpbx_connected_observed")
+    assert observed["outcome"] == "ignored"
+
+
+@pytest.mark.asyncio
+async def test_connected_after_start_does_not_interrupt_surrounding_media():
+    # Media both before AND after the stray `connected` must still be
+    # processed, proving the session stays fully alive rather than merely
+    # not crashing.
+    audio_before = b"\x01\x02"
+    audio_after = b"\x03\x04"
+    _, registry, websocket, factory = await run_gateway([
+        START,
+        {"event": "media", "media": {"payload": base64.b64encode(audio_before).decode("ascii")}},
+        {"event": "connected"},
+        {"event": "media", "media": {"payload": base64.b64encode(audio_after).decode("ascii")}},
+        {"event": "stop"},
+    ])
+
+    assert websocket.close_calls == [(1000, "call ended")]
+    session = factory.sessions[0]
+    assert session.started == 1
+    assert session.audio == [audio_before, audio_after]
+    assert session.finish_calls == [True]
+    assert registry.snapshot()["active_sessions"] == 0
 
 
 @pytest.mark.asyncio

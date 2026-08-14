@@ -158,6 +158,34 @@ async def test_gateway_requires_start_then_forwards_audio_and_finishes_once():
 
 
 @pytest.mark.asyncio
+async def test_gateway_logs_and_survives_connected_after_start_mid_session(caplog):
+    # Vendor reference (ChanakaDev/ai-provider-example-websocket) + its FAQ: a
+    # post-start `connected` is informational and must not tear down the call.
+    # Media both before AND after the stray `connected` must still be processed,
+    # proving the session stays fully alive rather than merely not crashing.
+    audio_before = b"\x01\x02"
+    audio_after = b"\x03\x04"
+    caplog.set_level(logging.INFO)
+    _, registry, socket, factory = await run([
+        START,
+        {"event": "media", "media": {"payload": base64.b64encode(audio_before).decode("ascii")}},
+        {"event": "connected"},
+        {"event": "media", "media": {"payload": base64.b64encode(audio_after).decode("ascii")}},
+        {"event": "stop"},
+    ])
+
+    assert socket.close_calls == [(1000, "call ended")]
+    assert factory.sessions[0].starts == 1
+    assert factory.sessions[0].audio == [audio_before, audio_after]
+    assert factory.sessions[0].finishes == [True]
+    assert registry.snapshot()["active_sessions"] == 0
+    rows = fixed_diagnostics(caplog)
+    tuples = [(r["stage"], r["outcome"], r["failure_class"]) for r in rows]
+    assert ("context_validation", "observed", "connected_after_start") in tuples
+    assert not any(outcome == "rejected" for (_, outcome, _) in tuples)
+
+
+@pytest.mark.asyncio
 async def test_gateway_rejects_media_before_start_and_account_mismatch():
     _, _, early_socket, early_factory = await run([{"event": "media", "media": {"payload": "YQ=="}}])
     assert early_socket.close_calls == [(1008, "start required")]
@@ -540,7 +568,14 @@ async def test_gateway_late_captured_sink_is_noop_after_handle_completion(caplog
     [
         ([{"event": "media", "media": {"payload": "YQ=="}}], None, ("schema_admission", "rejected", "start_required")),
         ([{**START, "start": {**START["start"], "accountId": "other"}}], None, ("context_validation", "rejected", "account_mismatch")),
-        ([START, {"event": "connected"}], None, [("session_start", "completed", "none"), ("context_validation", "rejected", "connected_after_start")]),
+        (
+            [START, {"event": "connected"}, {"event": "stop"}], None,
+            [
+                ("session_start", "completed", "none"),
+                ("context_validation", "observed", "connected_after_start"),
+                ("terminal_cleanup", "completed", "none"),
+            ],
+        ),
         ([START, {"event": "start", "start": START["start"]}], None, [("session_start", "completed", "none"), ("context_validation", "rejected", "duplicate_start")]),
         ([START, {"event": "media", "media": {"payload": "bad"}}], None, [("session_start", "completed", "none"), ("schema_admission", "rejected", "invalid_media")]),
         ([START, {"event": "dtmf", "dtmf": {"callId": "call-1", "otherLegCallId": "other-1", "digit": "Z"}}], None, [("session_start", "completed", "none"), ("schema_admission", "rejected", "invalid_dtmf")]),

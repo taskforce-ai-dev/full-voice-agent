@@ -318,8 +318,14 @@ class SmartPBXGateway:
                 elif isinstance(event, UnknownEvent):
                     self._observe_unknown()
                 elif isinstance(event, ConnectedEvent):
-                    raise ProtocolViolation(
-                        POLICY_VIOLATION, "connected after start", "connected_after_start"
+                    # The vendor reference (ChanakaDev/ai-provider-example-websocket)
+                    # and its FAQ document that `connected` is purely informational
+                    # and may arrive at any point in the session, including after
+                    # `start` — log and keep the call alive rather than tearing it
+                    # down. Mirrors the DTMF observed-and-ignored logging above.
+                    self._log_event(
+                        "smartpbx_connected_observed", session_id, call_fingerprint,
+                        "ignored", "", started_at,
                     )
         except asyncio.TimeoutError:
             is_start_timeout = state is _SessionState.ACCEPTED
