@@ -134,7 +134,7 @@ _SMARTPBX_TURN_STAGES = frozenset({
     "started", "endpoint", "kb_start", "kb_complete", "llm_request",
     "llm_first_token", "llm_complete", "tool_start", "tool_complete",
     "tts_request", "tts_first_chunk", "first_media_sent", "queue_drained",
-    "barge_clear",
+    "barge_clear", "llm_timeout",
 })
 
 
@@ -520,12 +520,32 @@ def _resolve_smartpbx_max_tokens(raw: object) -> int:
 
 def _resolve_smartpbx_initial_filler_delay(raw: object) -> float:
     try:
-        value = float(raw) if raw not in (None, "") else 2.5
+        value = float(raw) if raw not in (None, "") else 1.5
     except (TypeError, ValueError):
-        value = 2.5
+        value = 1.5
     if not math.isfinite(value):
-        value = 2.5
+        value = 1.5
     return min(max(value, 0.5), 5.0)
+
+
+def _resolve_smartpbx_initial_response_timeout_seconds(raw: object) -> float:
+    try:
+        value = float(raw) if raw not in (None, "") else 8.0
+    except (TypeError, ValueError):
+        value = 8.0
+    if not math.isfinite(value):
+        value = 8.0
+    return min(max(value, 1.0), 30.0)
+
+
+def _resolve_smartpbx_llm_stall_timeout_seconds(raw: object) -> float:
+    try:
+        value = float(raw) if raw not in (None, "") else 8.0
+    except (TypeError, ValueError):
+        value = 8.0
+    if not math.isfinite(value):
+        value = 8.0
+    return min(max(value, 1.0), 30.0)
 
 
 SMARTPBX_MAX_TOKENS: int = _resolve_smartpbx_max_tokens(
@@ -534,8 +554,40 @@ SMARTPBX_MAX_TOKENS: int = _resolve_smartpbx_max_tokens(
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS: float = _resolve_smartpbx_initial_filler_delay(
     os.getenv("SMARTPBX_INITIAL_FILLER_DELAY_SECONDS")
 )
+SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS: float = _resolve_smartpbx_initial_response_timeout_seconds(
+    os.getenv("SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS")
+)
+SMARTPBX_LLM_STALL_TIMEOUT_SECONDS: float = _resolve_smartpbx_llm_stall_timeout_seconds(
+    os.getenv("SMARTPBX_LLM_STALL_TIMEOUT_SECONDS")
+)
 MAX_HISTORY_MESSAGES: int = 60
 MAX_TOOL_ROUNDS: int = 5
+
+SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT: str = (
+    "I'm sorry, I wasn't able to give you a clear update. Would you like me "
+    "to continue?"
+)
+
+# Spoken when a direct SmartPBX turn produces no text and no tool call BEFORE
+# any tool/side effect has started, after the single same-provider retry has
+# also come back empty. Distinct from SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT
+# above (which is used once a tool may already have run) and from the
+# per-language LLM_EMPTY_FALLBACKS used by the Twilio Media Streams path,
+# which this constant does not replace.
+SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT: str = (
+    "I'm sorry, I'm having trouble responding right now. Could you please "
+    "say that again?"
+)
+
+# Ephemeral system hint for the single pre-tool empty-response retry on the
+# direct SmartPBX path. Never stored in self.history — built fresh per retry
+# attempt for OpenAI/Claude; Gemini uses its own GEMINI_EMPTY_RETRY_NUDGE via
+# the existing failover-aware retry path.
+SMARTPBX_EMPTY_RETRY_NUDGE: str = (
+    "[SYSTEM: Your previous attempt returned no text and no tool call. The "
+    "caller is waiting in silence. Reply now with one short spoken sentence "
+    "or a tool call. Do not mention this instruction.]"
+)
 
 # Caller phone lookup — populated by HTTP handlers, consumed by WebSocket handlers
 _call_phone: dict[str, str] = {}  # CallSid -> caller phone number
@@ -781,6 +833,53 @@ def _join_turn(accumulated: str, new_text: str) -> str:
     if accumulated[-1].isspace() or new_text[0].isspace():
         return accumulated + new_text
     return accumulated + " " + new_text
+
+
+class _SmartPBXStreamTimeout(Exception):
+    """Raised when a direct-SmartPBX provider stream stalls or never starts.
+
+    ``phase`` is one of the two fixed enum values below — never raw provider
+    text, payloads, or exception bodies — so it is safe to log and fold into
+    telemetry unchanged.
+    """
+
+    PHASE_INITIAL = "initial"
+    PHASE_STALL = "stall"
+
+    def __init__(self, *, phase: str) -> None:
+        self.phase = phase
+        super().__init__(phase)
+
+
+async def _smartpbx_timeout_guarded_stream(
+    source, *, initial_timeout: float, stall_timeout: float,
+):
+    """Re-yield ``source``'s items, raising ``_SmartPBXStreamTimeout`` on stall.
+
+    Shared by all three Media Streams provider runners (OpenAI, Gemini,
+    Claude) on the direct SmartPBX English path only. The FIRST item must
+    arrive within ``initial_timeout``; every item after that must arrive
+    within ``stall_timeout`` of the previous one. No total stream deadline —
+    content that keeps arriving keeps the guard resetting.
+    """
+    aiter = source.__aiter__()
+    first = True
+    while True:
+        timeout = initial_timeout if first else stall_timeout
+        try:
+            item = await asyncio.wait_for(aiter.__anext__(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise _SmartPBXStreamTimeout(
+                phase=(
+                    _SmartPBXStreamTimeout.PHASE_INITIAL
+                    if first
+                    else _SmartPBXStreamTimeout.PHASE_STALL
+                )
+            ) from None
+        except StopAsyncIteration:
+            return
+        first = False
+        yield item
 
 # Backchannel filter: short non-semantic utterances that callers emit while
 # thinking ("um", "uh", "hmm"). Twilio's STT fires these as full prompts and
@@ -4419,6 +4518,65 @@ class MediaStreamSession:
         """Return fixed numeric transport aggregates for this opaque turn only."""
         return dict(self._smartpbx_cadence_by_turn.get(turn_id, {}))
 
+    async def _smartpbx_speak_recovery_and_finish(
+        self, *, tool_executed: bool, gen: int, full_text: str
+    ) -> str:
+        """Speak the one shared SmartPBX recovery line and end the turn.
+
+        The single policy used by all three provider runners for both
+        failure modes this phase covers: an empty response that has used up
+        its one retry, and a stream timeout/stall. ``tool_executed`` selects
+        the line — before any tool/side effect the caller hears the retry
+        line; once a tool may have started this turn is never replayed, so
+        the caller hears the "clear update" line instead. Both branches
+        revalidate ownership (via `_invoke_speak`/`_append_assistant_history`,
+        which already no-op for a stale runner) so a barge-in mid-recovery
+        never produces stale speech or history.
+        """
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return ""
+        recovery_text = (
+            SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT
+            if tool_executed
+            else SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
+        )
+        await self._invoke_speak(recovery_text, generation=gen, sentence=recovery_text)
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return ""
+        self._append_assistant_history({
+            "role": "assistant",
+            "content": recovery_text,
+        })
+        return _join_turn(full_text, recovery_text)
+
+    async def _smartpbx_handle_stream_timeout(
+        self,
+        exc: "_SmartPBXStreamTimeout",
+        *,
+        provider: str,
+        tool_executed: bool,
+        gen: int,
+        full_text: str,
+    ) -> str:
+        """Recover from an initial-response or inter-delta stall timeout.
+
+        Cancels only this runner's own in-flight round (the guarded async
+        generator has already abandoned the underlying stream read); marks
+        one bounded, fixed-enum telemetry stage; then reuses the same
+        recovery-and-finish policy an empty response uses, so a stalled
+        provider and a genuinely empty one degrade the call identically.
+        """
+        self._mark_smartpbx_turn_once("llm_timeout")
+        if self._is_smartpbx_session():
+            logger.warning(
+                "smartpbx_media event=llm_stream_timeout provider=%s phase=%s "
+                "tool_executed=%s",
+                provider, exc.phase, str(tool_executed).lower(),
+            )
+        return await self._smartpbx_speak_recovery_and_finish(
+            tool_executed=tool_executed, gen=gen, full_text=full_text,
+        )
+
     def _assistant_text_for_echo_scoring(self) -> list[str]:
         if self._is_speaking:
             return list(self._assistant_turn_generated_sentences)
@@ -5661,6 +5819,12 @@ class MediaStreamSession:
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
         smartpbx_filler_sent = False
+        smartpbx_direct = self._is_direct_smartpbx_english()
+        # Turn-scoped (not round-scoped): one retry total, and only while no
+        # tool/side effect has started this turn. Non-direct-SmartPBX callers
+        # (Twilio Media Streams ar/si/ta) are untouched — max_attempts stays 1.
+        empty_retry_used = False
+        tool_executed = False
 
         for round_idx in range(MAX_TOOL_ROUNDS):
             if self._is_smartpbx_session():
@@ -5668,68 +5832,115 @@ class MediaStreamSession:
             else:
                 logger.info("LLM round %d [%s]", round_idx + 1, self.call_sid)
 
-            text_content = ""
-            tool_calls_data: dict[int, dict[str, str]] = {}
-            sentence_buffer = ""
-            tts_tasks: list[asyncio.Task] = []
-            has_tool_use = False
             gen = self._speak_generation
             initial_filler = self._start_initial_smartpbx_filler(
                 round_idx=round_idx, generation=gen
             )
+            max_attempts = 2 if (smartpbx_direct and not tool_executed) else 1
 
-            messages = [{"role": "system", "content": self._active_system_prompt()}] + self.history
-            stream = await self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=self._provider_max_tokens(),
-                messages=messages,
-                tools=self.tools or None,
-                stream=True,
-            )
+            for attempt in range(max_attempts):
+                text_content = ""
+                tool_calls_data: dict[int, dict[str, str]] = {}
+                sentence_buffer = ""
+                tts_tasks: list[asyncio.Task] = []
+                has_tool_use = False
 
-            async for chunk in stream:
-                choice = chunk.choices[0]
-                delta = choice.delta
+                messages = [{"role": "system", "content": self._active_system_prompt()}] + self.history
+                if attempt > 0:
+                    messages = messages + [
+                        {"role": "system", "content": SMARTPBX_EMPTY_RETRY_NUDGE}
+                    ]
+                stream = await self.client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=self._provider_max_tokens(),
+                    messages=messages,
+                    tools=self.tools or None,
+                    stream=True,
+                )
+                stream_iter = (
+                    _smartpbx_timeout_guarded_stream(
+                        stream,
+                        initial_timeout=SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
+                        stall_timeout=SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
+                    )
+                    if smartpbx_direct
+                    else stream
+                )
 
-                if delta.content:
-                    if initial_filler is not None:
-                        await initial_filler.on_content_delta()
-                        if initial_filler._cleared_after_spoke:
-                            gen = self._speak_generation
-                    self._mark_smartpbx_turn_once("llm_first_token")
-                    text_content += delta.content
-                    if not has_tool_use:
-                        sentence_buffer += delta.content
-                        sentences, sentence_buffer = _extract_sentences(
-                            sentence_buffer
+                try:
+                    async for chunk in stream_iter:
+                        choice = chunk.choices[0]
+                        delta = choice.delta
+
+                        if delta.content:
+                            if initial_filler is not None:
+                                await initial_filler.on_content_delta()
+                                if initial_filler._cleared_after_spoke:
+                                    gen = self._speak_generation
+                            self._mark_smartpbx_turn_once("llm_first_token")
+                            text_content += delta.content
+                            if not has_tool_use:
+                                sentence_buffer += delta.content
+                                sentences, sentence_buffer = _extract_sentences(
+                                    sentence_buffer
+                                )
+                                for s in sentences:
+                                    task = asyncio.create_task(
+                                        self._invoke_speak(s, generation=gen, sentence=s)
+                                    )
+                                    tts_tasks.append(task)
+
+                        if delta.tool_calls:
+                            if initial_filler is not None:
+                                await initial_filler.on_tool_delta()
+                                if initial_filler._cleared_after_spoke:
+                                    gen = self._speak_generation
+                            self._mark_smartpbx_turn_once("llm_first_token")
+                            has_tool_use = True
+                            for tc_delta in delta.tool_calls:
+                                idx = tc_delta.index
+                                if idx not in tool_calls_data:
+                                    tool_calls_data[idx] = {"id": "", "name": "", "arguments": ""}
+                                if tc_delta.id:
+                                    tool_calls_data[idx]["id"] = tc_delta.id
+                                if tc_delta.function:
+                                    if tc_delta.function.name:
+                                        tool_calls_data[idx]["name"] = tc_delta.function.name
+                                    if tc_delta.function.arguments:
+                                        tool_calls_data[idx]["arguments"] += tc_delta.function.arguments
+                except _SmartPBXStreamTimeout as timeout_exc:
+                    return await self._smartpbx_handle_stream_timeout(
+                        timeout_exc, provider="openai",
+                        tool_executed=tool_executed, gen=gen, full_text=full_text,
+                    )
+
+                if not self._current_smartpbx_runner_owns_shared_state():
+                    return ""
+
+                if text_content.strip() or tool_calls_data:
+                    break
+                if not smartpbx_direct:
+                    break
+                # Only retry when there IS a next attempt to take (i.e. this
+                # turn had not yet started a tool when max_attempts was
+                # computed) and the one retry has not already been spent.
+                if attempt + 1 < max_attempts and not empty_retry_used:
+                    empty_retry_used = True
+                    if self._is_smartpbx_session():
+                        logger.warning(
+                            "smartpbx_media event=llm_empty_response provider=openai "
+                            "attempt=1 retrying=true"
                         )
-                        for s in sentences:
-                            task = asyncio.create_task(
-                                self._invoke_speak(s, generation=gen, sentence=s)
-                            )
-                            tts_tasks.append(task)
+                    continue
+                if self._is_smartpbx_session():
+                    logger.warning(
+                        "smartpbx_media event=llm_empty_response provider=openai "
+                        "attempt=%d retrying=false", attempt + 1,
+                    )
+                return await self._smartpbx_speak_recovery_and_finish(
+                    tool_executed=tool_executed, gen=gen, full_text=full_text,
+                )
 
-                if delta.tool_calls:
-                    if initial_filler is not None:
-                        await initial_filler.on_tool_delta()
-                        if initial_filler._cleared_after_spoke:
-                            gen = self._speak_generation
-                    self._mark_smartpbx_turn_once("llm_first_token")
-                    has_tool_use = True
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tool_calls_data:
-                            tool_calls_data[idx] = {"id": "", "name": "", "arguments": ""}
-                        if tc_delta.id:
-                            tool_calls_data[idx]["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                tool_calls_data[idx]["name"] = tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                tool_calls_data[idx]["arguments"] += tc_delta.function.arguments
-
-            if not self._current_smartpbx_runner_owns_shared_state():
-                return ""
             if self._is_direct_smartpbx_english():
                 full_text = _join_turn(full_text, text_content)
             else:
@@ -5807,6 +6018,11 @@ class MediaStreamSession:
                         tc["name"], parsed_input, capture_slots=False,
                     )
                     tool_error: BaseException | None = None
+                    # Set BEFORE the await: a tool that raises half-way may
+                    # already have had its effect, so this turn is no longer
+                    # replayable — the shared empty-response policy must never
+                    # retry it, only recover with the post-tool-start line.
+                    tool_executed = True
                     try:
                         if tc["name"] == "collect_number_via_keypad":
                             result_str = await self._collect_number_via_keypad(parsed_input)
@@ -5993,55 +6209,76 @@ class MediaStreamSession:
                             max_output_tokens=self._provider_max_tokens(),
                         ),
                     )
+                    response_iter = (
+                        _smartpbx_timeout_guarded_stream(
+                            response,
+                            initial_timeout=SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
+                            stall_timeout=SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
+                        )
+                        if self._is_direct_smartpbx_english()
+                        else response
+                    )
 
-                    async for kind, payload in _iter_gemini_stream(response):
-                        if kind == "finish":
-                            finish_reason = payload
-                            continue
-                        if kind == "tool":
+                    try:
+                        async for kind, payload in _iter_gemini_stream(response_iter):
+                            if kind == "finish":
+                                finish_reason = payload
+                                continue
+                            if kind == "tool":
+                                if initial_filler is not None:
+                                    await initial_filler.on_tool_delta()
+                                    if initial_filler._cleared_after_spoke:
+                                        gen = self._speak_generation
+                                self._mark_smartpbx_turn_once("llm_first_token")
+                                has_tool_use = True
+                                function_calls.append(payload)
+                                continue
+
                             if initial_filler is not None:
-                                await initial_filler.on_tool_delta()
+                                await initial_filler.on_content_delta()
                                 if initial_filler._cleared_after_spoke:
                                     gen = self._speak_generation
                             self._mark_smartpbx_turn_once("llm_first_token")
-                            has_tool_use = True
-                            function_calls.append(payload)
-                            continue
-
-                        if initial_filler is not None:
-                            await initial_filler.on_content_delta()
-                            if initial_filler._cleared_after_spoke:
-                                gen = self._speak_generation
-                        self._mark_smartpbx_turn_once("llm_first_token")
-                        text_content += payload
-                        # Once a function call has appeared the remaining text is a
-                        # pre-tool aside, and a barge-in means the caller is talking
-                        # over her right now in both cases stop scheduling speech,
-                        # but keep draining so history records the full turn.
-                        if has_tool_use or self._speak_generation != gen:
-                            continue
-                        sentence_buffer += payload
-                        sentences, sentence_buffer = _extract_sentences(sentence_buffer)
-                        if not sentences:
-                            continue
-                        for s in sentences:
-                            tts_tasks.append(
-                                asyncio.create_task(
-                                    self._invoke_speak(s, generation=gen, sentence=s)
+                            text_content += payload
+                            # Once a function call has appeared the remaining text is a
+                            # pre-tool aside, and a barge-in means the caller is talking
+                            # over her right now in both cases stop scheduling speech,
+                            # but keep draining so history records the full turn.
+                            if has_tool_use or self._speak_generation != gen:
+                                continue
+                            sentence_buffer += payload
+                            sentences, sentence_buffer = _extract_sentences(sentence_buffer)
+                            if not sentences:
+                                continue
+                            for s in sentences:
+                                tts_tasks.append(
+                                    asyncio.create_task(
+                                        self._invoke_speak(s, generation=gen, sentence=s)
+                                    )
                                 )
-                            )
-                        # Hand control to those tasks NOW. Without this the first TTS
-                        # request only started once the stream had been fully drained
-                        # (create_task alone schedules nothing until this coroutine
-                        # suspends), which is why this path used to emit a single TTS
-                        # call after llm_round_complete instead of speaking sentence
-                        # by sentence.
-                        await asyncio.sleep(0)
+                            # Hand control to those tasks NOW. Without this the first TTS
+                            # request only started once the stream had been fully drained
+                            # (create_task alone schedules nothing until this coroutine
+                            # suspends), which is why this path used to emit a single TTS
+                            # call after llm_round_complete instead of speaking sentence
+                            # by sentence.
+                            await asyncio.sleep(0)
+                    except _SmartPBXStreamTimeout as timeout_exc:
+                        return await self._smartpbx_handle_stream_timeout(
+                            timeout_exc, provider="gemini",
+                            tool_executed=tool_executed, gen=gen, full_text=full_text,
+                        )
 
                     if text_content.strip() or function_calls:
                         break
 
-                    retrying = attempt == 0 and not empty_retry_used
+                    # Only retry when no tool has started yet this turn — a
+                    # retry after a tool has run would replay the provider
+                    # turn against history that already has a committed tool
+                    # result, which the shared empty-response policy forbids.
+                    retrying = (
+                        attempt == 0 and not empty_retry_used and not tool_executed
+                    )
                     _log_gemini_empty(
                         path="media_stream",
                         attempt=attempt + 1,
@@ -6098,12 +6335,20 @@ class MediaStreamSession:
                             round_idx + 1, str(tool_executed).lower(),
                             self.call_sid or "-",
                         )
-                    fallback = LLM_EMPTY_FALLBACKS.get(
-                        self.lang, LLM_EMPTY_FALLBACKS["en"]
-                    )
                     logger.warning(
                         "gemini_diagnostic event=empty_response_fallback path=media_stream "
                         "call=%s lang=%s", self.call_sid or "-", self.lang,
+                    )
+                    # Direct SmartPBX English uses the one shared recovery
+                    # policy (same two lines OpenAI/Claude use, selected by
+                    # tool_executed); every other language/path keeps the
+                    # existing per-language canned fallback unchanged.
+                    if self._is_direct_smartpbx_english():
+                        return await self._smartpbx_speak_recovery_and_finish(
+                            tool_executed=tool_executed, gen=gen, full_text=full_text,
+                        )
+                    fallback = LLM_EMPTY_FALLBACKS.get(
+                        self.lang, LLM_EMPTY_FALLBACKS["en"]
                     )
                     await self._invoke_speak(fallback, generation=gen, sentence=fallback)
                     if not self._current_smartpbx_runner_owns_shared_state():
@@ -6112,8 +6357,6 @@ class MediaStreamSession:
                         "role": "assistant",
                         "content": fallback
                     })
-                    if self._is_direct_smartpbx_english():
-                        return _join_turn(full_text, fallback)
                     return full_text + fallback
 
                 if function_calls:
@@ -6319,6 +6562,12 @@ class MediaStreamSession:
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
         smartpbx_filler_sent = False
+        smartpbx_direct = self._is_direct_smartpbx_english()
+        # Turn-scoped (not round-scoped): one retry total, and only while no
+        # tool/side effect has started this turn. Non-direct-SmartPBX callers
+        # (Twilio Media Streams ar/si/ta) are untouched — max_attempts stays 1.
+        empty_retry_used = False
+        tool_executed = False
 
         for round_idx in range(MAX_TOOL_ROUNDS):
             if self._is_smartpbx_session():
@@ -6326,94 +6575,143 @@ class MediaStreamSession:
             else:
                 logger.info("Claude round %d [%s]", round_idx + 1, self.call_sid)
 
-            text_content = ""
-            tool_use_blocks: list[dict[str, Any]] = []
-            cur_tool_name: str | None = None
-            cur_tool_id: str | None = None
-            tool_json = ""
-
-            sentence_buffer = ""
-            tts_tasks: list[asyncio.Task] = []
-            has_tool_use = False
             gen = self._speak_generation
             initial_filler = self._start_initial_smartpbx_filler(
                 round_idx=round_idx, generation=gen
             )
+            max_attempts = 2 if (smartpbx_direct and not tool_executed) else 1
 
-            # Prompt caching: marking the system prompt with cache_control
-            # caches the entire request prefix (tools + system) for ~5 min.
-            # Cuts input tokens and ITPM pressure dramatically on the 2nd+
-            # turn of every call.
-            async with self.anthropic_client.messages.stream(
-                model=self.model,
-                max_tokens=self._provider_max_tokens(),
-                system=_build_claude_system_blocks(
+            for attempt in range(max_attempts):
+                text_content = ""
+                tool_use_blocks: list[dict[str, Any]] = []
+                cur_tool_name: str | None = None
+                cur_tool_id: str | None = None
+                tool_json = ""
+
+                sentence_buffer = ""
+                tts_tasks: list[asyncio.Task] = []
+                has_tool_use = False
+
+                # Prompt caching: marking the system prompt with cache_control
+                # caches the entire request prefix (tools + system) for ~5
+                # min. Cuts input tokens and ITPM pressure dramatically on the
+                # 2nd+ turn of every call.
+                system_blocks = _build_claude_system_blocks(
                     self.system_prompt + self._smartpbx_rhythm_rule(),
                     self._booking_slots_note(),
-                ),
-                messages=self.history,
-                tools=self.tools if self.tools else NOT_GIVEN,
-            ) as stream:
-                async for event in stream:
-                    if event.type == "content_block_start":
-                        if event.content_block.type == "tool_use":
-                            if initial_filler is not None:
-                                await initial_filler.on_tool_delta()
-                                if initial_filler._cleared_after_spoke:
-                                    gen = self._speak_generation
-                            self._mark_smartpbx_turn_once("llm_first_token")
-                            has_tool_use = True
-                            cur_tool_id = event.content_block.id
-                            cur_tool_name = event.content_block.name
-                            tool_json = ""
+                )
+                if attempt > 0:
+                    system_blocks = system_blocks + [
+                        {"type": "text", "text": SMARTPBX_EMPTY_RETRY_NUDGE}
+                    ]
 
-                    elif event.type == "content_block_delta":
-                        if event.delta.type == "text_delta":
-                            if initial_filler is not None:
-                                await initial_filler.on_content_delta()
-                                if initial_filler._cleared_after_spoke:
-                                    gen = self._speak_generation
-                            self._mark_smartpbx_turn_once("llm_first_token")
-                            text_content += event.delta.text
-                            # A text delta after a tool_use block starts must
-                            # not speak (the tool round replies next turn) —
-                            # and `sentences` only binds inside this branch.
-                            if not has_tool_use:
-                                sentence_buffer += event.delta.text
-                                sentences, sentence_buffer = _extract_sentences(
-                                    sentence_buffer
-                                )
-                                for s in sentences:
-                                    task = asyncio.create_task(
-                                        self._invoke_speak(s, generation=gen, sentence=s)
-                                    )
-                                    tts_tasks.append(task)
+                try:
+                    async with self.anthropic_client.messages.stream(
+                        model=self.model,
+                        max_tokens=self._provider_max_tokens(),
+                        system=system_blocks,
+                        messages=self.history,
+                        tools=self.tools if self.tools else NOT_GIVEN,
+                    ) as stream:
+                        stream_iter = (
+                            _smartpbx_timeout_guarded_stream(
+                                stream,
+                                initial_timeout=SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
+                                stall_timeout=SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
+                            )
+                            if smartpbx_direct
+                            else stream
+                        )
+                        async for event in stream_iter:
+                            if event.type == "content_block_start":
+                                if event.content_block.type == "tool_use":
+                                    if initial_filler is not None:
+                                        await initial_filler.on_tool_delta()
+                                        if initial_filler._cleared_after_spoke:
+                                            gen = self._speak_generation
+                                    self._mark_smartpbx_turn_once("llm_first_token")
+                                    has_tool_use = True
+                                    cur_tool_id = event.content_block.id
+                                    cur_tool_name = event.content_block.name
+                                    tool_json = ""
 
-                        elif event.delta.type == "input_json_delta":
-                            tool_json += event.delta.partial_json
+                            elif event.type == "content_block_delta":
+                                if event.delta.type == "text_delta":
+                                    if initial_filler is not None:
+                                        await initial_filler.on_content_delta()
+                                        if initial_filler._cleared_after_spoke:
+                                            gen = self._speak_generation
+                                    self._mark_smartpbx_turn_once("llm_first_token")
+                                    text_content += event.delta.text
+                                    # A text delta after a tool_use block starts must
+                                    # not speak (the tool round replies next turn) —
+                                    # and `sentences` only binds inside this branch.
+                                    if not has_tool_use:
+                                        sentence_buffer += event.delta.text
+                                        sentences, sentence_buffer = _extract_sentences(
+                                            sentence_buffer
+                                        )
+                                        for s in sentences:
+                                            task = asyncio.create_task(
+                                                self._invoke_speak(s, generation=gen, sentence=s)
+                                            )
+                                            tts_tasks.append(task)
 
-                    elif event.type == "content_block_stop":
-                        if cur_tool_name:
-                            try:
-                                parsed = json.loads(tool_json) if tool_json else {}
-                            except json.JSONDecodeError:
-                                if self._is_smartpbx_session():
-                                    logger.error("smartpbx_media event=bad_tool_json")
-                                else:
-                                    logger.error("Bad tool JSON for %s: %s",
-                                                 cur_tool_name, tool_json[:200])
-                                parsed = {}
-                            tool_use_blocks.append({
-                                "id": cur_tool_id,
-                                "name": cur_tool_name,
-                                "input": parsed,
-                            })
-                            cur_tool_name = None
-                            cur_tool_id = None
-                            tool_json = ""
+                                elif event.delta.type == "input_json_delta":
+                                    tool_json += event.delta.partial_json
 
-            if not self._current_smartpbx_runner_owns_shared_state():
-                return ""
+                            elif event.type == "content_block_stop":
+                                if cur_tool_name:
+                                    try:
+                                        parsed = json.loads(tool_json) if tool_json else {}
+                                    except json.JSONDecodeError:
+                                        if self._is_smartpbx_session():
+                                            logger.error("smartpbx_media event=bad_tool_json")
+                                        else:
+                                            logger.error("Bad tool JSON for %s: %s",
+                                                         cur_tool_name, tool_json[:200])
+                                        parsed = {}
+                                    tool_use_blocks.append({
+                                        "id": cur_tool_id,
+                                        "name": cur_tool_name,
+                                        "input": parsed,
+                                    })
+                                    cur_tool_name = None
+                                    cur_tool_id = None
+                                    tool_json = ""
+                except _SmartPBXStreamTimeout as timeout_exc:
+                    return await self._smartpbx_handle_stream_timeout(
+                        timeout_exc, provider="claude",
+                        tool_executed=tool_executed, gen=gen, full_text=full_text,
+                    )
+
+                if not self._current_smartpbx_runner_owns_shared_state():
+                    return ""
+
+                if text_content.strip() or tool_use_blocks:
+                    break
+                if not smartpbx_direct:
+                    break
+                # Only retry when there IS a next attempt to take (i.e. this
+                # turn had not yet started a tool when max_attempts was
+                # computed) and the one retry has not already been spent.
+                if attempt + 1 < max_attempts and not empty_retry_used:
+                    empty_retry_used = True
+                    if self._is_smartpbx_session():
+                        logger.warning(
+                            "smartpbx_media event=llm_empty_response provider=claude "
+                            "attempt=1 retrying=true"
+                        )
+                    continue
+                if self._is_smartpbx_session():
+                    logger.warning(
+                        "smartpbx_media event=llm_empty_response provider=claude "
+                        "attempt=%d retrying=false", attempt + 1,
+                    )
+                return await self._smartpbx_speak_recovery_and_finish(
+                    tool_executed=tool_executed, gen=gen, full_text=full_text,
+                )
+
             if self._is_direct_smartpbx_english():
                 full_text = _join_turn(full_text, text_content)
             else:
@@ -6487,6 +6785,11 @@ class MediaStreamSession:
                         tb["name"], tb["input"], capture_slots=False,
                     )
                     tool_error: BaseException | None = None
+                    # Set BEFORE the await: a tool that raises half-way may
+                    # already have had its effect, so this turn is no longer
+                    # replayable — the shared empty-response policy must never
+                    # retry it, only recover with the post-tool-start line.
+                    tool_executed = True
                     try:
                         if tb["name"] == "collect_number_via_keypad":
                             result_str = await self._collect_number_via_keypad(tb["input"])
