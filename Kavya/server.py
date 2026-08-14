@@ -134,7 +134,7 @@ _SMARTPBX_TURN_STAGES = frozenset({
     "started", "endpoint", "kb_start", "kb_complete", "llm_request",
     "llm_first_token", "llm_complete", "tool_start", "tool_complete",
     "tts_request", "tts_first_chunk", "first_media_sent", "queue_drained",
-    "barge_clear", "llm_timeout",
+    "barge_clear", "llm_timeout", "late_tool_completion",
 })
 
 
