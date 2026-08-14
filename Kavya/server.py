@@ -150,6 +150,8 @@ class _SmartPBXTurnState:
     endpoint_source: str
     stages: dict[str, int] = field(default_factory=dict)
     finished: bool = False
+    stt_interim_events: int = 0
+    stt_final_events: int = 0
 
 
 @dataclass
@@ -182,20 +184,37 @@ class SmartPBXTurnTelemetry:
         emit: Callable[..., None] = _emit_smartpbx_turn_telemetry,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         new_id: Callable[[], str] = lambda: secrets.token_urlsafe(16),
+        session_trace_id: str = "",
     ) -> None:
         self._emit = emit
         self._monotonic_ns = monotonic_ns
         self._new_id = new_id
+        self._session_trace_id = session_trace_id
         self._turns: dict[str, _SmartPBXTurnState] = {}
         self._last_turn_id: str | None = None
         self.turns_started = 0
         self.turns_summarized = 0
 
+    @property
+    def session_trace_id(self) -> str:
+        return self._session_trace_id
+
+    def set_session_trace_id(self, session_trace_id: str) -> None:
+        """Bind the opaque session trace once; never rebind mid-call."""
+        if not self._session_trace_id:
+            self._session_trace_id = session_trace_id
+
     @staticmethod
     def _bounded_ms(start_ns: int, end_ns: int) -> int:
         return min(max((end_ns - start_ns) // 1_000_000, 0), _SMARTPBX_TELEMETRY_MAX_MS)
 
-    def start_turn(self, endpoint_source: str) -> str:
+    def start_turn(
+        self,
+        endpoint_source: str,
+        *,
+        stt_interim_events: int = 0,
+        stt_final_events: int = 0,
+    ) -> str:
         endpoint_source = endpoint_source if endpoint_source in _SMARTPBX_ENDPOINT_SOURCES else "unknown"
         turn_id = self._new_id()
         # Default IDs are random, but retain a bounded collision guard so an
@@ -203,10 +222,19 @@ class SmartPBXTurnTelemetry:
         # one. Do not retain an unbounded completed-ID history.
         while turn_id in self._turns or turn_id == self._last_turn_id:
             turn_id = secrets.token_urlsafe(16)
-        self._turns[turn_id] = _SmartPBXTurnState(self._monotonic_ns(), endpoint_source)
+        self._turns[turn_id] = _SmartPBXTurnState(
+            self._monotonic_ns(),
+            endpoint_source,
+            stt_interim_events=min(max(int(stt_interim_events), 0), 100_000),
+            stt_final_events=min(max(int(stt_final_events), 0), 100_000),
+        )
         self._last_turn_id = turn_id
         self.turns_started += 1
-        self._emit("turn_stage", event="turn_stage", turn_id=turn_id, stage="started", endpoint_source=endpoint_source)
+        self._emit(
+            "turn_stage", event="turn_stage",
+            session_trace_id=self._session_trace_id,
+            turn_id=turn_id, stage="started", endpoint_source=endpoint_source,
+        )
         return turn_id
 
     def mark(self, turn_id: str, stage: str, *, at_ns: int | None = None) -> None:
@@ -216,7 +244,9 @@ class SmartPBXTurnTelemetry:
         timestamp = self._monotonic_ns() if at_ns is None else at_ns
         state.stages[stage] = timestamp
         self._emit(
-            "turn_stage", event="turn_stage", turn_id=turn_id, stage=stage,
+            "turn_stage", event="turn_stage",
+            session_trace_id=self._session_trace_id,
+            turn_id=turn_id, stage=stage,
             elapsed_ms=self._bounded_ms(state.start_ns, timestamp),
         )
 
@@ -239,8 +269,12 @@ class SmartPBXTurnTelemetry:
         outcome = outcome if outcome in _SMARTPBX_TURN_OUTCOMES else "cancelled"
         end_ns = self._monotonic_ns()
         fields: dict[str, object] = {
-            "event": "turn_summary", "turn_id": turn_id, "outcome": outcome,
+            "event": "turn_summary",
+            "session_trace_id": self._session_trace_id,
+            "turn_id": turn_id, "outcome": outcome,
             "endpoint_source": state.endpoint_source,
+            "stt_interim_events": state.stt_interim_events,
+            "stt_final_events": state.stt_final_events,
         }
         stage_fields = {
             "endpoint": "endpoint_ms",
@@ -278,6 +312,25 @@ class SmartPBXTurnTelemetry:
             # Terminal summaries contain all state needed by the session
             # aggregate. Never retain a completed turn for the call lifetime.
             self._turns.pop(turn_id, None)
+
+    def finalize_open_turns(
+        self,
+        outcome: str,
+        *,
+        counts_for_turn: Callable[[str], dict[str, int]] | None = None,
+    ) -> list[str]:
+        """Summarize every unfinished turn exactly once at pipeline teardown.
+
+        finish() pops completed turns, so a delayed runner finishing after this
+        snapshot sees no state and cannot emit a second summary.
+        """
+        open_turn_ids = [
+            turn_id for turn_id, state in self._turns.items() if not state.finished
+        ]
+        for turn_id in open_turn_ids:
+            counts = counts_for_turn(turn_id) if counts_for_turn is not None else {}
+            self.finish(turn_id, outcome, **counts)
+        return open_turn_ids
 
 # ---------------------------------------------------------------------------
 # Environment variables
@@ -4147,7 +4200,12 @@ class MediaStreamSession:
         self._record_echo_rejection: Callable[[int, float], None] | None = None
         self.transfer_pending = False
         self._turn_telemetry: SmartPBXTurnTelemetry | None = None
+        # Set by KavyaSmartPBXSession before the first turn can begin; random
+        # and opaque — never derived from Dialog, phone, CDR or transcript data.
+        self._smartpbx_session_trace_id: str | None = None
         self._active_smartpbx_turn_id: str | None = None
+        self._smartpbx_stt_interim_events = 0
+        self._smartpbx_stt_final_events = 0
         self._interrupted_smartpbx_turn_ids: set[str] = set()
         self._tool_failed_smartpbx_turn_ids: set[str] = set()
         self._tts_failed_smartpbx_turn_ids: set[str] = set()
@@ -4225,8 +4283,45 @@ class MediaStreamSession:
         if not self._is_direct_smartpbx_english():
             return None
         if self._turn_telemetry is None:
-            self._turn_telemetry = SmartPBXTurnTelemetry()
+            self._turn_telemetry = SmartPBXTurnTelemetry(
+                session_trace_id=self._smartpbx_session_trace_id or "",
+            )
+        elif self._smartpbx_session_trace_id:
+            # Injected/test telemetry may predate the session binding; the
+            # setter is set-once, so an already-bound trace is never rebound.
+            self._turn_telemetry.set_session_trace_id(self._smartpbx_session_trace_id)
         return self._turn_telemetry
+
+    def _finalize_smartpbx_turns(self) -> None:
+        """Idempotent pipeline teardown: summarize unfinished turns exactly once.
+
+        Runs immediately before session_summary. Uses the existing terminal
+        outcomes, carries the existing cadence/drop counters, and retires all
+        turn-owned state so per-turn maps are empty afterwards. A delayed
+        runner completing later finds no open turn and emits nothing.
+        """
+        telemetry = self._turn_telemetry
+        if telemetry is None:
+            return
+        outcome = "transfer_pending" if self.transfer_pending else "cancelled"
+        finalized = telemetry.finalize_open_turns(
+            outcome,
+            counts_for_turn=lambda turn_id: {
+                "dropped_frames": self._smartpbx_dropped_frames_for_turn(turn_id),
+                **self._smartpbx_cadence_counts(turn_id),
+            },
+        )
+        for turn_id in finalized:
+            self._retire_smartpbx_turn(turn_id)
+        for turn_id in list(self._interrupted_smartpbx_turn_ids):
+            self._retire_smartpbx_turn(turn_id)
+        self._interrupted_smartpbx_turn_ids.clear()
+        self._tool_failed_smartpbx_turn_ids.clear()
+        self._tts_failed_smartpbx_turn_ids.clear()
+        self._smartpbx_cadence_by_turn.clear()
+        self._smartpbx_dropped_frame_baselines.clear()
+        self._smartpbx_dropped_frames_by_turn.clear()
+        self._active_smartpbx_turn_id = None
 
     def _current_smartpbx_turn_id(self) -> str | None:
         """Use the task's captured turn while a runner is active."""
@@ -5240,6 +5335,11 @@ class MediaStreamSession:
     async def _accumulate_transcript(self, text: str):
         if self.transfer_pending:
             return
+        # Counted here (event-loop side) rather than in the STT-thread callback
+        # so the per-turn counters never race the flush that snapshots them.
+        self._smartpbx_stt_final_events = min(
+            self._smartpbx_stt_final_events + 1, 100_000
+        )
         # Caller is speaking — cancel any pending silence nudge and reset
         # the re-prompt counter so future silences start fresh.
         self._cancel_reprompt()
@@ -5272,6 +5372,10 @@ class MediaStreamSession:
         """Set pending to the latest interim (over the committed finals); reset timer."""
         if self.transfer_pending:
             return
+        # Event-loop-side count, mirroring _accumulate_transcript.
+        self._smartpbx_stt_interim_events = min(
+            self._smartpbx_stt_interim_events + 1, 100_000
+        )
         # Caller is speaking — cancel any pending silence nudge and reset
         # the re-prompt counter.
         self._cancel_reprompt()
@@ -5360,7 +5464,13 @@ class MediaStreamSession:
         )
         telemetry = self._ensure_smartpbx_turn_telemetry()
         if telemetry is not None:
-            self._active_smartpbx_turn_id = telemetry.start_turn(endpoint_source)
+            self._active_smartpbx_turn_id = telemetry.start_turn(
+                endpoint_source,
+                stt_interim_events=self._smartpbx_stt_interim_events,
+                stt_final_events=self._smartpbx_stt_final_events,
+            )
+            self._smartpbx_stt_interim_events = 0
+            self._smartpbx_stt_final_events = 0
             self._smartpbx_dropped_frame_baselines[
                 self._active_smartpbx_turn_id
             ] = self._current_smartpbx_dropped_frames()

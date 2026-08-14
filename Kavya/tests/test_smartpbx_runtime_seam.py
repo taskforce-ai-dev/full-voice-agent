@@ -1255,3 +1255,312 @@ async def test_finish_leaves_the_event_loop_responsive_for_other_calls():
         f"event loop advanced only {ticks} ticks while one call hung up; "
         "other calls' audio and timers must keep running"
     )
+
+
+# ─── Phase A: telemetry ownership — session trace + idempotent teardown ──────
+
+
+def test_every_turn_event_carries_the_bound_session_trace():
+    """turn_stage and turn_summary must be groupable by session without log order."""
+    import server
+
+    emitted: list[dict[str, object]] = []
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        new_id=lambda: "opaque-turn",
+        session_trace_id="trace-opaque-a",
+    )
+
+    turn_id = telemetry.start_turn("final", stt_interim_events=2, stt_final_events=1)
+    telemetry.mark(turn_id, "endpoint")
+    telemetry.finish(turn_id, "completed")
+
+    assert len(emitted) == 3
+    assert all(record["session_trace_id"] == "trace-opaque-a" for record in emitted)
+    summary = next(r for r in emitted if r["event"] == "turn_summary")
+    assert summary["stt_interim_events"] == 2
+    assert summary["stt_final_events"] == 1
+    assert summary["endpoint_source"] == "final"
+    forbidden = {
+        "transcript", "text", "call_id", "callSid", "caller", "phone", "payload",
+        "authorization", "token", "secret", "headers", "tool_input", "exception",
+    }
+    for record in emitted:
+        assert not (forbidden & set(record))
+
+
+def test_session_trace_binds_once_and_never_rebinds():
+    import server
+
+    telemetry = server.SmartPBXTurnTelemetry(emit=lambda *_a, **_k: None)
+    telemetry.set_session_trace_id("first")
+    telemetry.set_session_trace_id("second")
+    assert telemetry.session_trace_id == "first"
+
+    bound = server.SmartPBXTurnTelemetry(
+        emit=lambda *_a, **_k: None, session_trace_id="ctor"
+    )
+    bound.set_session_trace_id("other")
+    assert bound.session_trace_id == "ctor"
+
+
+def test_interleaved_sessions_group_by_trace_without_log_ordering():
+    """Two concurrent calls' events must separate cleanly by trace alone."""
+    import server
+
+    emitted: list[dict[str, object]] = []
+
+    def make(trace: str, prefix: str) -> "server.SmartPBXTurnTelemetry":
+        ids = iter(f"{prefix}-{i}" for i in range(10))
+        return server.SmartPBXTurnTelemetry(
+            emit=lambda _event, **fields: emitted.append(fields),
+            new_id=lambda: next(ids),
+            session_trace_id=trace,
+        )
+
+    one, two = make("trace-one", "a"), make("trace-two", "b")
+    turn_a = one.start_turn("final")
+    turn_b = two.start_turn("interim")
+    two.mark(turn_b, "endpoint")
+    one.mark(turn_a, "endpoint")
+    two.finish(turn_b, "completed")
+    one.finish(turn_a, "completed")
+
+    # Group with no reliance on emission order.
+    for records in (emitted, list(reversed(emitted))):
+        by_trace: dict[object, list[dict[str, object]]] = {}
+        for record in records:
+            by_trace.setdefault(record["session_trace_id"], []).append(record)
+        assert set(by_trace) == {"trace-one", "trace-two"}
+        assert {r["turn_id"] for r in by_trace["trace-one"]} == {turn_a}
+        assert {r["turn_id"] for r in by_trace["trace-two"]} == {turn_b}
+        for group in by_trace.values():
+            assert sum(r["event"] == "turn_summary" for r in group) == 1
+
+
+def test_stt_event_counts_are_bounded_and_endpoint_source_is_fixed_enum():
+    import server
+
+    emitted: list[dict[str, object]] = []
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        new_id=lambda: "opaque-turn",
+        session_trace_id="trace",
+    )
+    turn_id = telemetry.start_turn(
+        "not-a-real-source", stt_interim_events=10_000_000, stt_final_events=-5
+    )
+    telemetry.finish(turn_id, "completed")
+
+    summary = next(r for r in emitted if r["event"] == "turn_summary")
+    assert summary["endpoint_source"] == "unknown"
+    assert summary["stt_interim_events"] == 100_000
+    assert summary["stt_final_events"] == 0
+
+
+def _direct_smartpbx_pipeline(server, transport=None):
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", llm_provider="claude",
+        media_transport=transport if transport is not None else Transport(),
+    )
+    pipeline._smartpbx_transfer_context = object()
+    return pipeline
+
+
+@pytest.mark.asyncio
+async def test_session_teardown_summarizes_unfinished_turns_before_session_summary(
+    monkeypatch,
+):
+    """Every started turn reaches exactly one terminal summary, then the aggregate."""
+    import server
+    import smartpbx_session
+
+    order: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        smartpbx_session,
+        "_emit_smartpbx_session_summary",
+        lambda **fields: order.append(fields),
+    )
+    pipeline = _direct_smartpbx_pipeline(server)
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: order.append(fields),
+        session_trace_id="trace-teardown",
+    )
+    pipeline._turn_telemetry = telemetry
+    finished_turn = telemetry.start_turn("final")
+    telemetry.finish(finished_turn, "completed")
+    open_turn = telemetry.start_turn("interim")
+    pipeline._active_smartpbx_turn_id = open_turn
+
+    session = _session(pipeline)
+    await session.finish(False)
+
+    summaries = [r for r in order if r.get("event") == "turn_summary"]
+    assert {r["turn_id"] for r in summaries} == {finished_turn, open_turn}
+    late = next(r for r in summaries if r["turn_id"] == open_turn)
+    assert late["outcome"] == "cancelled"
+    session_summaries = [r for r in order if r.get("event") == "session_summary"]
+    assert len(session_summaries) == 1
+    assert order.index(late) < order.index(session_summaries[0])
+    assert session_summaries[0]["turns_started"] == 2
+    assert session_summaries[0]["turns_summarized"] == 2
+    assert telemetry.turns_started == telemetry.turns_summarized == 2
+
+
+@pytest.mark.asyncio
+async def test_late_runner_completion_after_teardown_is_idempotent(monkeypatch):
+    import server
+    import smartpbx_session
+
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        smartpbx_session, "_emit_smartpbx_session_summary", lambda **fields: None
+    )
+    pipeline = _direct_smartpbx_pipeline(server)
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        session_trace_id="trace-late",
+    )
+    pipeline._turn_telemetry = telemetry
+    open_turn = telemetry.start_turn("final")
+    pipeline._active_smartpbx_turn_id = open_turn
+
+    session = _session(pipeline)
+    await session.finish(False)
+    # The delayed runner unwinds after teardown and re-finishes its turn.
+    telemetry.finish(open_turn, "completed", generated_chars=5)
+
+    summaries = [r for r in emitted if r["event"] == "turn_summary"]
+    assert len(summaries) == 1
+    assert summaries[0]["outcome"] == "cancelled"
+    assert telemetry.turns_summarized == 1
+
+
+def test_pipeline_teardown_uses_transfer_pending_outcome_and_retires_turn_state():
+    import server
+
+    emitted: list[dict[str, object]] = []
+    pipeline = _direct_smartpbx_pipeline(server)
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        session_trace_id="trace-retire",
+    )
+    pipeline._turn_telemetry = telemetry
+    open_turn = telemetry.start_turn("capture")
+    pipeline._active_smartpbx_turn_id = open_turn
+    pipeline._smartpbx_cadence_by_turn[open_turn] = {"queue_underruns": 1}
+    pipeline._smartpbx_dropped_frame_baselines[open_turn] = 0
+    pipeline._smartpbx_dropped_frames_by_turn[open_turn] = 2
+    pipeline._interrupted_smartpbx_turn_ids.add("stale-turn")
+    pipeline.transfer_pending = True
+
+    pipeline._finalize_smartpbx_turns()
+
+    summary = next(r for r in emitted if r["event"] == "turn_summary")
+    assert summary["outcome"] == "transfer_pending"
+    assert summary["dropped_frames"] == 2
+    assert summary["queue_underruns"] == 1
+    # All turn-owned state is retired; per-turn maps are empty after completion.
+    assert telemetry._turns == {}
+    assert pipeline._smartpbx_cadence_by_turn == {}
+    assert pipeline._smartpbx_dropped_frame_baselines == {}
+    assert pipeline._smartpbx_dropped_frames_by_turn == {}
+    assert pipeline._interrupted_smartpbx_turn_ids == set()
+    assert pipeline._tool_failed_smartpbx_turn_ids == set()
+    assert pipeline._tts_failed_smartpbx_turn_ids == set()
+    assert pipeline._active_smartpbx_turn_id is None
+    # Idempotent: a second teardown emits nothing further.
+    before = len(emitted)
+    pipeline._finalize_smartpbx_turns()
+    assert len(emitted) == before
+
+
+class _PhaseASTT:
+    def __init__(self, **_kwargs):
+        self.on_fatal = None
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def feed(self, _payload):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_session_start_binds_a_random_opaque_trace_before_first_turn():
+    """The trace reaches telemetry before any turn and derives from no call data."""
+    import server
+
+    async def post(**_):
+        raise AssertionError("no post-call in this test")
+
+    pipeline = _direct_smartpbx_pipeline(server)
+    session = KavyaSmartPBXSession(
+        CONTEXT, Transport(), pipeline=pipeline,
+        stt_factory=lambda **kwargs: _PhaseASTT(**kwargs),
+        post_call_processor=post, welcome_text="", llm_provider="claude", model="m",
+    )
+    await session.start()
+
+    trace = pipeline._smartpbx_session_trace_id
+    assert isinstance(trace, str) and len(trace) >= 16
+    assert pipeline._turn_telemetry is not None
+    assert pipeline._turn_telemetry.session_trace_id == trace
+    # Opaque: no Dialog ids, phone numbers, or account data leak into the trace.
+    for private in (
+        CONTEXT.other_leg_call_id, CONTEXT.caller_number, CONTEXT.callee_number,
+    ):
+        assert private not in trace
+    # A second session draws a different trace: random, not derived.
+    other_pipeline = _direct_smartpbx_pipeline(server)
+    other = KavyaSmartPBXSession(
+        CONTEXT, Transport(), pipeline=other_pipeline,
+        stt_factory=lambda **kwargs: _PhaseASTT(**kwargs),
+        post_call_processor=post, welcome_text="", llm_provider="claude", model="m",
+    )
+    await other.start()
+    assert other_pipeline._smartpbx_session_trace_id != trace
+    await session.finish(False)
+    await other.finish(False)
+
+
+@pytest.mark.asyncio
+async def test_flush_snapshots_and_resets_per_turn_stt_event_counts(monkeypatch):
+    """Each summary reports only its own utterance's interim/final event counts."""
+    import server
+
+    emitted: list[dict[str, object]] = []
+    pipeline = _direct_smartpbx_pipeline(server)
+    pipeline._event_loop = asyncio.get_running_loop()
+    telemetry = server.SmartPBXTurnTelemetry(
+        emit=lambda _event, **fields: emitted.append(fields),
+        session_trace_id="trace-counts",
+    )
+    pipeline._turn_telemetry = telemetry
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+
+    async def fake_llm():
+        return "hello caller"
+
+    monkeypatch.setattr(pipeline, "_run_llm_claude", fake_llm)
+
+    await pipeline._set_transcript_interim("hel")
+    await pipeline._set_transcript_interim("hello")
+    await pipeline._accumulate_transcript("hello there")
+    await pipeline._flush_transcript()
+
+    first = next(r for r in emitted if r["event"] == "turn_summary")
+    assert first["stt_interim_events"] == 2
+    assert first["stt_final_events"] == 1
+    assert first["session_trace_id"] == "trace-counts"
+
+    emitted.clear()
+    await pipeline._set_transcript_interim("again")
+    await pipeline._flush_transcript()
+
+    second = next(r for r in emitted if r["event"] == "turn_summary")
+    assert second["stt_interim_events"] == 1
+    assert second["stt_final_events"] == 0

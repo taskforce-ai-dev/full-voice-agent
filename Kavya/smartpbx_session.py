@@ -116,6 +116,9 @@ class KavyaSmartPBXSession:
         self._load_runtime_defaults()
         pipeline = self._require_pipeline()
         self._bind_smartpbx_tool_context(pipeline)
+        # Bind the trace before telemetry can exist, so the very first turn
+        # event already carries it.
+        pipeline._smartpbx_session_trace_id = self._ensure_session_trace_id()
         ensure_telemetry = getattr(pipeline, "_ensure_smartpbx_turn_telemetry", None)
         if callable(ensure_telemetry):
             ensure_telemetry()
@@ -204,6 +207,11 @@ class KavyaSmartPBXSession:
                     )
                 )
         finally:
+            # Unfinished turns must reach exactly one terminal summary before
+            # the session aggregate that counts them.
+            finalize_turns = getattr(self._pipeline, "_finalize_smartpbx_turns", None)
+            if callable(finalize_turns):
+                finalize_turns()
             self._emit_session_summary()
             if not self._terminal_future.done():
                 self._terminal_future.set_result(None)
