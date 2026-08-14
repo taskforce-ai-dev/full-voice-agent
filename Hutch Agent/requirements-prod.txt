@@ -1,0 +1,45 @@
+# Core server
+fastapi>=0.141.1
+uvicorn[standard]>=0.52.1
+# Upper bound is NOT optional: google-genai (below) requires websockets<17.0.
+websockets>=16.1.1,<17.0
+
+# AI / LLM
+anthropic>=0.120.2
+openai>=1.0.0
+
+# Telephony (present but inert -- no Twilio number is provisioned for Hutch;
+# kept only because server.py's Twilio-mode code path imports it)
+twilio>=9.10.9
+
+# Knowledge base / RAG
+chromadb>=1.5.9
+sentence-transformers>=5.6.1
+
+# STT (Media Streams / Dialog SmartPBX)
+google-cloud-speech>=2.40.0
+azure-cognitiveservices-speech>=1.51.1
+
+# Gemini native SDK
+google-genai>=2.16.0
+
+# Dialog SmartPBX call control dependency surface note: smartpbx_gateway.py /
+# smartpbx_transport.py / smartpbx_protocol.py use only the stdlib + FastAPI's
+# own Starlette WebSocket types, so no extra package is required beyond what
+# is already listed here.
+
+# HTTP client
+httpx>=0.25.0
+
+# Form parsing (required for request.form() -- Twilio webhook body parsing)
+python-multipart>=0.0.32
+
+# Utilities
+python-dotenv>=1.2.2
+aiohttp>=3.14.3
+
+# PDF support for knowledge base (optional)
+PyPDF2>=3.0.1
+
+# Error tracking (optional; activated by SENTRY_DSN)
+sentry-sdk>=2.66.1,<3
