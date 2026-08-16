@@ -4685,6 +4685,55 @@ class MediaStreamSession:
         })
         return _join_turn(full_text, recovery_text)
 
+    async def _smartpbx_cancel_stalled_filler(self, gen: int) -> None:
+        """Cancel and await this stalled generation's initial filler.
+
+        Must run — and be fully awaited — BEFORE any generation fence or
+        recovery speech. The filler's own TTS may currently hold
+        ``_speak_lock`` (it can be mid-flight at the exact moment the
+        provider stream stalls). Cancelling its task and awaiting it lets
+        that lock release: ``_speak``'s ``async with self._speak_lock``
+        releases on ``CancelledError`` the same as any other exit, and
+        ``_invoke_tts`` never swallows cancellation. Skipping this step (or
+        doing it after the recovery line tries to speak) is exactly how the
+        recovery speak's own ``_speak_lock`` acquisition would deadlock
+        behind a filler TTS call that will otherwise never finish on its own.
+
+        Only ever touches the filler that belongs to the SAME generation that
+        just stalled, matching ``_smartpbx_fence_stalled_generation``'s own
+        guard. A filler for an older generation is already retired and
+        irrelevant; a filler for a NEWER generation belongs to a turn that has
+        already taken over (a barge-in raced ahead of this stall) and must be
+        left completely alone — cancelling it here would silence a live turn's
+        filler out from under it.
+
+        The generation check alone is NOT sufficient to identify a newer turn,
+        which is why the lookup is the task-local ``runner.initial_filler``
+        first and only falls back to the session-wide
+        ``self._smartpbx_initial_filler`` while this runner still owns the
+        active turn — the same two-step the post-turn cleanup in
+        ``_process_utterance_bound_runner`` uses. ``_speak_generation`` is
+        bumped only by barge-in, transfer-pending and this fence, NOT per
+        utterance, so a fresh turn that starts while this one is still stalled
+        shares this exact generation and would sail through a
+        generation-only guard while its own filler is live.
+        """
+        runner = _smartpbx_runner_context.get()
+        controller = runner.initial_filler if runner is not None else None
+        if controller is None and (
+            runner is None or runner.turn_id == self._active_smartpbx_turn_id
+        ):
+            controller = self._smartpbx_initial_filler
+        if controller is None or controller.generation != gen:
+            return
+        await self._finish_initial_smartpbx_filler(controller)
+        # Step 3: drop every stored reference to the retired controller.
+        # ``_finish_initial_smartpbx_filler`` clears the session-wide one; the
+        # task-local one is this method's job, so the post-turn cleanup cannot
+        # re-adopt a controller this transition has already retired.
+        if runner is not None and runner.initial_filler is controller:
+            runner.initial_filler = None
+
     async def _smartpbx_fence_stalled_generation(
         self, *, tts_tasks: list[asyncio.Task], gen: int
     ) -> int:
@@ -4695,7 +4744,9 @@ class MediaStreamSession:
         after (or on top of) the recovery line:
         1. Cancel-and-await any of THIS round's per-sentence TTS tasks that
            are still pending (queued sentences from partial content spoken
-           before the stall).
+           before the stall). The stalled generation's initial filler is
+           NOT among these — it is cancelled separately and earlier, by
+           ``_smartpbx_cancel_stalled_filler``, before this method ever runs.
         2. Fence the transport against undelivered old-generation audio the
            same way genuine barge-in does: bump ``_speak_generation`` and
            clear queued transport audio — reusing the existing generation
@@ -4706,6 +4757,16 @@ class MediaStreamSession:
         own fence and clear; this only cleans up this generation's dangling
         TTS tasks and leaves the newer turn's audio untouched (same rule the
         filler's ``clear_audio`` follows).
+
+        When this runner still owns ``gen`` and performs the bump, the
+        active runner context's ``speak_generation`` is advanced to match in
+        the same breath — otherwise the recovery speak that follows would
+        fail its own ownership check (``runner.speak_generation`` stuck on
+        the dead generation) and silently no-op instead of ever being heard.
+        A runner that had already lost ``gen`` before this call (the early
+        return above) must NOT have its runner context touched here: forcing
+        it to the current generation would hand a barged-out/stale runner
+        ownership it no longer has, letting it clobber a newer turn.
 
         Returns the generation the recovery line should speak on.
         """
@@ -4718,6 +4779,9 @@ class MediaStreamSession:
             return self._speak_generation
         self._speak_generation += 1
         await self._clear_media_audio()
+        runner = _smartpbx_runner_context.get()
+        if runner is not None:
+            runner.speak_generation = self._speak_generation
         return self._speak_generation
 
     async def _smartpbx_handle_stream_timeout(
@@ -4732,14 +4796,27 @@ class MediaStreamSession:
     ) -> str:
         """Recover from an initial-response or inter-delta stall timeout.
 
-        Cancels only this runner's own in-flight round (the guarded async
-        generator has already abandoned the underlying stream read); marks
-        one bounded, fixed-enum telemetry stage; fences this round's dead
-        generation (see ``_smartpbx_fence_stalled_generation``) so no
-        already-in-flight TTS from before the stall can land after recovery
-        starts speaking; then reuses the same recovery-and-finish policy an
-        empty response uses, so a stalled provider and a genuinely empty one
-        degrade the call identically.
+        This is one atomic, non-interleavable recovery transition, run in
+        exactly this order:
+        1-3. Cancel and fully await this generation's initial filler
+             (``_smartpbx_cancel_stalled_filler``) and drop the stored
+             reference — done first, and BEFORE any generation fence, so a
+             filler TTS call in flight when the stream stalled cannot still
+             be holding ``_speak_lock`` when the recovery line tries to
+             acquire it.
+        4-6. Cancel/await this round's remaining per-sentence TTS tasks,
+             bump ``_speak_generation`` exactly once, clear queued transport
+             audio, and advance the active runner context to that same new
+             generation (``_smartpbx_fence_stalled_generation``).
+        7.   Speak the shared timeout recovery line and end the turn
+             (``_smartpbx_speak_recovery_and_finish``) — the same
+             recovery-and-finish policy an exhausted empty response uses, so
+             a stalled provider and a genuinely empty one degrade the call
+             identically.
+
+        Step 8 (never touch a newer turn's filler) is enforced inside
+        ``_smartpbx_cancel_stalled_filler`` via its generation guard, not
+        here.
         """
         self._mark_smartpbx_turn_once("llm_timeout")
         if self._is_smartpbx_session():
@@ -4748,6 +4825,7 @@ class MediaStreamSession:
                 "tool_executed=%s",
                 provider, exc.phase, str(tool_executed).lower(),
             )
+        await self._smartpbx_cancel_stalled_filler(gen)
         fenced_gen = await self._smartpbx_fence_stalled_generation(
             tts_tasks=list(tts_tasks), gen=gen
         )

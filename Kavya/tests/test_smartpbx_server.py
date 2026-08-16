@@ -3604,6 +3604,112 @@ async def test_smartpbx_stall_recovery_cancels_delayed_tts_before_speaking_recov
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_stall_timeout_recovery_is_atomic_against_locked_filler(
+    monkeypatch, provider
+):
+    """Regression test for the atomic timeout-recovery transition (PR-266
+    follow-up fix): on a stream stall, recovery must cancel-and-await the
+    stalled generation's initial filler BEFORE the recovery line ever tries
+    to speak.
+
+    Enters through the REAL ``_process_utterance_bound`` (not a runner
+    called directly), with the real filler machinery running end to end --
+    only the filler delay is shrunk via monkeypatch, the controller class
+    and its cancel/await machinery are untouched. The fake TTS BLOCKS while
+    holding the real ``_speak_lock``, simulating in-flight filler speech at
+    the exact moment the (also faked) provider stream stalls.
+
+    Pre-fix, ``_smartpbx_handle_stream_timeout`` never touched the filler at
+    all: it would still be sitting inside ``_speak``'s ``async with
+    self._speak_lock:`` block, blocked in TTS, when the recovery line tried
+    to acquire that same lock -- a deadlock. The whole scenario is bounded
+    by ``asyncio.wait_for`` so a regression here fails with a clear timeout
+    instead of hanging the suite.
+    """
+    import server
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "SMARTPBX_INITIAL_FILLER_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.2)
+
+    client = direct_tool_client(provider, [])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    # The provider stream is acquired but never yields anything -- the
+    # initial-response deadline is what ends the round, not real content.
+    _patch_direct_hanging_stream(monkeypatch, pipeline, provider, before_events=[])
+
+    turn_summaries = []
+
+    # Same shape as the production sink `_emit_smartpbx_turn_telemetry`: the
+    # event name arrives POSITIONALLY and is ALSO repeated inside **fields, so
+    # naming this parameter `event` makes every emit raise TypeError.
+    def fake_emit(_event, **fields):
+        if _event == "turn_summary":
+            turn_summaries.append(fields)
+
+    # Mirrors exactly what `_flush_transcript` does before dispatching a
+    # turn, so `_process_utterance_bound` sees a real, telemetry-owned turn.
+    pipeline._turn_telemetry = server.SmartPBXTurnTelemetry(
+        emit=fake_emit, session_trace_id="test-trace",
+    )
+    pipeline._active_smartpbx_turn_id = pipeline._turn_telemetry.start_turn("final")
+
+    filler_started = asyncio.Event()
+    filler_release = asyncio.Event()  # never set: only cancellation ends the filler
+    filler_cancelled = []
+    delivered = []
+
+    async def fake_tts_elevenlabs(text, *, sentence=None, turn_generation=None):
+        if text == server.SMARTPBX_INITIAL_FILLER_TEXT:
+            filler_started.set()
+            try:
+                await filler_release.wait()
+            except asyncio.CancelledError:
+                filler_cancelled.append(text)
+                raise
+            return
+        delivered.append(text)
+
+    # Only the innermost TTS call is faked -- `_speak`'s real `_speak_lock`
+    # acquisition and generation-fence checks stay exactly as in production.
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", fake_tts_elevenlabs)
+
+    turn_task = asyncio.create_task(
+        pipeline._process_utterance_bound("guest asks a slow question")
+    )
+    # Confirm the filler really is mid-flight and holding _speak_lock before
+    # letting the stall timeout run its course -- otherwise the deadlock
+    # this test exists to catch would never actually be exercised.
+    await asyncio.wait_for(filler_started.wait(), timeout=2.0)
+    assert pipeline._speak_lock.locked()
+
+    await asyncio.wait_for(turn_task, timeout=5.0)
+
+    # Filler cancellation completed -- not merely requested.
+    assert filler_cancelled == [server.SMARTPBX_INITIAL_FILLER_TEXT]
+    controller = pipeline._smartpbx_initial_filler
+    assert controller is None or controller._task.done()
+
+    # Exactly one recovery sentence spoken, and no stale filler audio ever
+    # lands after (or instead of) it.
+    assert delivered == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
+    assert server.SMARTPBX_INITIAL_FILLER_TEXT not in delivered
+
+    # The turn summarizes exactly once.
+    assert len(turn_summaries) == 1
+
+    # No tasks left running behind the turn (filler task, tts tasks, ...).
+    await asyncio.sleep(0)
+    leftover = [
+        t for t in asyncio.all_tasks()
+        if t is not asyncio.current_task() and not t.done()
+    ]
+    assert leftover == []
+
+
+@pytest.mark.asyncio
 async def test_smartpbx_stream_timeout_after_tool_start_speaks_post_tool_recovery(monkeypatch):
     import server
 
