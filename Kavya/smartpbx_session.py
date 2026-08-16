@@ -152,6 +152,18 @@ class KavyaSmartPBXSession:
             pipeline = self._pipeline
             if pipeline is None:
                 return
+            # Cancel-and-await the initial-round filler BEFORE any other
+            # teardown await below. Its delay (default 1.5s) runs on its own
+            # timer, independent of the provider stream -- if it is still
+            # pending when teardown starts, an `await asyncio.to_thread(stt.
+            # stop)` or similar below could let that timer fire mid-teardown
+            # and speak (and queue audio for) a session that is already going
+            # away. `_finish_initial_smartpbx_filler` no-ops for `None` and is
+            # idempotent (safe even if a runner's own cleanup already fired
+            # it), so calling it unconditionally here is safe.
+            finish_filler = getattr(pipeline, "_finish_initial_smartpbx_filler", None)
+            if callable(finish_filler):
+                await finish_filler(getattr(pipeline, "_smartpbx_initial_filler", None))
             pipeline._cancel_reprompt()
             # Resolve any in-flight keypad collection so its awaiting turn unwinds
             # instead of hanging on the collector future.

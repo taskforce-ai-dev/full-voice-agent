@@ -27,6 +27,8 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import server
 
 
@@ -612,3 +614,173 @@ def test_fix4_tool_completes_after_teardown_races_ahead_is_discarded_but_visible
     late_events = [e for e in events if e.get("stage") == "late_tool_completion"]
     assert len(late_events) == 1, "the discarded success must be observable, not silent"
     assert late_events[0]["turn_id"] == turn_id
+
+
+# ---------------------------------------------------------------------------
+# PR-266 review round 2, item 4 — Gemini->Claude failover filler ownership
+# ---------------------------------------------------------------------------
+#
+# When Gemini fails immediately (round 0, no tool) and Claude failover runs,
+# the filler started for the Gemini round must not be orphaned (still
+# pending, later fires over Claude's speech) or double-started.
+
+
+class _GatedClaudeStream:
+    """Anthropic-shaped streaming context manager whose body doesn't start
+    yielding events until ``release`` is set -- lets a test observe the
+    (adopted) filler actually firing before any real content arrives."""
+
+    def __init__(self, events: list, release: asyncio.Event):
+        self.events = events
+        self.release = release
+
+    async def __aenter__(self):
+        async def gen():
+            await self.release.wait()
+            for event in self.events:
+                yield event
+
+        return gen()
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _GatedClaudeMessages:
+    def __init__(self, stream_obj: _GatedClaudeStream):
+        self._stream_obj = stream_obj
+        self.requests = 0
+
+    def stream(self, **_kwargs):
+        self.requests += 1
+        return self._stream_obj
+
+
+class _GatedClaudeClient:
+    def __init__(self, events: list, release: asyncio.Event):
+        self.messages = _GatedClaudeMessages(_GatedClaudeStream(events, release))
+
+
+def _claude_text_event(text: str):
+    return SimpleNamespace(
+        type="content_block_delta",
+        delta=SimpleNamespace(type="text_delta", text=text),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fix5_gemini_immediate_exception_failover_adopts_filler_fires_once(monkeypatch):
+    """Gemini raises immediately at round 0 (no tool) -- the filler it armed
+    must transfer to the Claude failover round instead of being orphaned.
+
+    Claude's own content is gated behind ``release`` so the filler has time
+    to actually fire (for real, not just get armed) before any real content
+    exists. Without the fix, Claude's round 0 starts a SECOND filler timer
+    on top of the still-running Gemini one -- both fire independently,
+    doubling the filler line. With the fix, there is exactly one controller,
+    so it fires at most once and is cleanly cancelled by Claude's first
+    delta with no overlap.
+    """
+    filler_delay = 0.03
+    monkeypatch.setattr(server, "SMARTPBX_INITIAL_FILLER_DELAY_SECONDS", filler_delay)
+
+    session, spoken = _media_stream_session(gemini_turns=[FakeToolError()])
+    release_claude_content = asyncio.Event()
+    session.anthropic_client = _GatedClaudeClient(
+        [_claude_text_event("Claude answered the turn. ")], release_claude_content
+    )
+
+    runner_task = asyncio.create_task(session._run_llm_gemini())
+
+    # Give the (adopted) filler time to actually fire -- well past its delay
+    # -- while Claude's content is still gated behind release_claude_content.
+    await asyncio.sleep(filler_delay * 4)
+    assert not runner_task.done(), "Claude's round should still be waiting on gated content"
+    assert spoken.count(server.SMARTPBX_INITIAL_FILLER_TEXT) == 1, (
+        "the filler must fire at most once -- a second, orphaned Gemini-round "
+        "controller would double it"
+    )
+
+    release_claude_content.set()
+    result = await asyncio.wait_for(runner_task, timeout=5.0)
+
+    assert "Claude answered the turn." in result
+    # No overlap: the filler line is fully spoken and gone before Claude's
+    # first real sentence appears.
+    filler_index = spoken.index(server.SMARTPBX_INITIAL_FILLER_TEXT)
+    claude_index = spoken.index("Claude answered the turn.")
+    assert filler_index < claude_index
+    # Still exactly one filler line in the whole turn.
+    assert spoken.count(server.SMARTPBX_INITIAL_FILLER_TEXT) == 1
+    # No orphaned filler task left running after the turn completes.
+    filler = session._smartpbx_initial_filler
+    assert filler is None or filler._task is None or filler._task.done()
+
+
+class _GatedFailureGeminiModels(FakeFlakyGeminiModels):
+    """Like FakeFlakyGeminiModels, but the failing call doesn't raise until
+    ``gate`` is set -- lets a test let the Gemini-round filler actually speak
+    BEFORE the exception (and therefore the failover decision) happens."""
+
+    def __init__(self, owner, gate: asyncio.Event):
+        super().__init__(owner)
+        self._gate = gate
+
+    async def generate_content_stream(self, **kwargs):
+        await self._gate.wait()
+        return await super().generate_content_stream(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_fix5_gemini_immediate_exception_failover_retires_already_spoken_filler(
+    monkeypatch,
+):
+    """If the Gemini-round filler already spoke by the time the (delayed)
+    exception hits, ``_run_claude_failover_turn`` must retire it explicitly
+    (``_finish_initial_smartpbx_filler``) rather than silently leave the
+    stale, already-spoken controller referenced -- the "cancel/await it
+    before Claude starts speaking" branch of item 4, for the case where
+    adoption (content hasn't arrived) does not apply.
+    """
+    filler_delay = 0.01
+    monkeypatch.setattr(server, "SMARTPBX_INITIAL_FILLER_DELAY_SECONDS", filler_delay)
+
+    session, spoken = _media_stream_session(gemini_turns=[FakeToolError()])
+    gate = asyncio.Event()
+    session.gemini_client.aio.models = _GatedFailureGeminiModels(session.gemini_client, gate)
+    release_claude_content = asyncio.Event()
+    session.anthropic_client = _GatedClaudeClient(
+        [_claude_text_event("Claude answered the turn. ")], release_claude_content
+    )
+
+    retired: list[object] = []
+    original_finish = session._finish_initial_smartpbx_filler
+
+    async def spy_finish(controller):
+        if controller is not None:
+            retired.append(controller)
+        await original_finish(controller)
+
+    monkeypatch.setattr(session, "_finish_initial_smartpbx_filler", spy_finish)
+
+    runner_task = asyncio.create_task(session._run_llm_gemini())
+    # Let the Gemini-round filler actually fire before the exception (still
+    # gated behind `gate`) ever reaches the failover decision.
+    await asyncio.sleep(filler_delay * 5)
+    assert spoken.count(server.SMARTPBX_INITIAL_FILLER_TEXT) == 1
+    stale_filler = session._smartpbx_initial_filler
+    assert stale_filler is not None and stale_filler.spoke
+
+    gate.set()  # now let the Gemini exception fire -> failover
+    release_claude_content.set()
+    result = await asyncio.wait_for(runner_task, timeout=5.0)
+
+    assert "Claude answered the turn." in result
+    # The already-spoken Gemini-round controller was explicitly retired
+    # (cancel-and-await, even though its task was already done) rather than
+    # silently dropped -- exactly the "cancel/await before Claude starts
+    # speaking" branch item 4 requires for the already-spoken case.
+    assert stale_filler in retired
+    # Still fired only once -- the retired controller and Claude's own fresh
+    # one (if it later fires too) are never the SAME line firing twice.
+    assert spoken.count(server.SMARTPBX_INITIAL_FILLER_TEXT) == 1

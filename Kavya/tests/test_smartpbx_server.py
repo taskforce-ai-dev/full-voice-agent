@@ -553,6 +553,70 @@ async def test_default_smartpbx_welcome_reuses_kavya_english_greeting():
     assert pipeline.spoken == [server.LANGUAGE_CONFIGS["en"]["welcome_greeting"]]
 
 
+@pytest.mark.asyncio
+async def test_dialog_finish_cancels_pending_initial_filler_before_other_teardown_awaits():
+    """Item 2 (PR-266 review round 2): KavyaSmartPBXSession._finish_once must
+    cancel-and-await the active initial-round filler BEFORE any other
+    teardown await, so a 1.5s (here, shortened) filler timer can't fire into
+    a session that is already tearing down.
+
+    Without the fix, ``_finish_once`` never touches
+    ``pipeline._smartpbx_initial_filler`` at all -- the filler task is left
+    running, and once its delay elapses it speaks straight into (and queues
+    transport audio for) an already-finished session.
+    """
+    import server
+
+    async def process_post_call(**_metadata):
+        pass
+
+    pipeline = FakePipeline()
+    spoken_generations = []
+
+    async def speak(text, *, generation):
+        spoken_generations.append((text, generation))
+
+    # Real controller (not a fake) so this exercises the actual cancel/await
+    # machinery, with a short delay so the test doesn't wait out the real
+    # 1.5s default.
+    controller = server.SmartPBXInitialFillerController(
+        speak=speak, generation=0, delay_seconds=0.05, clear_audio=None,
+    )
+    controller.start()
+    pipeline._smartpbx_initial_filler = controller
+    # FakePipeline has no _finish_initial_smartpbx_filler of its own -- bind
+    # the real MediaStreamSession implementation to it (it only touches
+    # self._smartpbx_initial_filler, which duck-types fine here).
+    pipeline._finish_initial_smartpbx_filler = (
+        lambda ctl: server.MediaStreamSession._finish_initial_smartpbx_filler(pipeline, ctl)
+    )
+
+    session = KavyaSmartPBXSession(
+        context(),
+        FakeTransport(),
+        pipeline=pipeline,
+        stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=process_post_call,
+        welcome_text=None,
+        llm_provider="claude",
+        model="test-model",
+    )
+    await session.start()
+
+    # Finish well before the filler's 0.05s delay would elapse.
+    task_at_finish_start = controller._task
+    await session.finish(False)
+
+    # The filler task must already be finished (cancelled-and-awaited) by
+    # the time finish() returns -- not merely requested to cancel.
+    assert task_at_finish_start is not None
+    assert task_at_finish_start.done()
+    assert pipeline._smartpbx_initial_filler is None
+
+    # Wait past the filler's would-be delay to prove it never fires late.
+    await asyncio.sleep(0.15)
+    assert spoken_generations == []
+
 
 @pytest.mark.asyncio
 async def test_dialog_hangup_finishes_once_and_schedules_kavya_post_call():
@@ -3218,6 +3282,48 @@ def _patch_direct_hanging_stream(monkeypatch, pipeline, provider, *, before_even
         monkeypatch.setattr(pipeline.anthropic_client.messages, "stream", stream)
 
 
+def _patch_direct_hanging_acquisition(monkeypatch, pipeline, provider):
+    """Make the ACQUISITION call itself hang forever — the awaited client
+    call that creates the stream (OpenAI/Gemini) or enters the async context
+    manager (Claude) never returns, as opposed to returning promptly and then
+    stalling on the first item.
+
+    Exercises the item-1 fix: acquisition must be bounded by the SAME
+    initial-response deadline as the wait for the first delta, not left
+    unguarded before the per-item timeout guard even starts.
+
+    Callers must monkeypatch the SMARTPBX_LLM_*_TIMEOUT_SECONDS constants to
+    a small value first, or this would genuinely wait out the default 8s.
+    """
+    if provider == "openai":
+        async def create(**_kwargs):
+            pipeline.client.requests.append(_kwargs)
+            await asyncio.Event().wait()  # never set: only wait_for ends this
+
+        monkeypatch.setattr(pipeline.client, "create", create)
+    elif provider == "gemini":
+        async def generate_content_stream(**_kwargs):
+            pipeline.gemini_client.requests.append(_kwargs)
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            pipeline.gemini_client.aio.models, "generate_content_stream", generate_content_stream
+        )
+    else:
+        class _HangingAcquisitionClaudeStream:
+            async def __aenter__(self):
+                await asyncio.Event().wait()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        def stream(**_kwargs):
+            pipeline.anthropic_client.requests.append(_kwargs)
+            return _HangingAcquisitionClaudeStream()
+
+        monkeypatch.setattr(pipeline.anthropic_client.messages, "stream", stream)
+
+
 def _provider_request_count(pipeline, provider):
     client = {"openai": pipeline.client, "gemini": pipeline.gemini_client, "claude": pipeline.anthropic_client}[provider]
     return len(client.requests)
@@ -3365,6 +3471,49 @@ async def test_smartpbx_initial_response_timeout_speaks_recovery_and_keeps_call_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_hanging_stream_acquisition_speaks_recovery_and_keeps_call_open(
+    monkeypatch, provider
+):
+    """A client call that never returns (the stream is never even created/
+    entered) must recover on the same initial-response deadline as a
+    hanging first delta — item 1 of the PR-266 review round.
+
+    Distinct from test_smartpbx_initial_response_timeout_speaks_recovery_
+    and_keeps_call_open above: that test hangs AFTER acquisition returns
+    (inside the already-guarded iteration). This one hangs INSIDE
+    acquisition itself (the awaited create()/generate_content_stream() call,
+    or Claude's ``async with ... __aenter__``), which was previously
+    unguarded and would have blocked forever.
+    """
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.02)
+    client = direct_tool_client(provider, [])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    _patch_direct_hanging_acquisition(monkeypatch, pipeline, provider)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    # Bounded wait_for around the call itself: if the acquisition guard
+    # regresses, this fails fast with a clear TimeoutError instead of
+    # hanging the test suite.
+    result = await asyncio.wait_for(_run_direct_provider(pipeline, provider), timeout=5.0)
+
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+    assert isinstance(result, str)
+    # A stream timeout (unlike an empty response) returns straight to
+    # recovery without a second attempt — exactly one acquisition call.
+    assert _provider_request_count(pipeline, provider) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
 async def test_smartpbx_stream_stall_timeout_speaks_recovery_after_partial_content(monkeypatch, provider):
     import server
 
@@ -3388,6 +3537,70 @@ async def test_smartpbx_stream_stall_timeout_speaks_recovery_after_partial_conte
     # Pre-tool: the stall counts as an empty-ish failure (no tool started),
     # so it takes the retry-exhausted line, not the post-tool line.
     assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_stall_recovery_cancels_delayed_tts_before_speaking_recovery(
+    monkeypatch, provider
+):
+    """Item 3 (PR-266 review round 2): before speaking the recovery line, a
+    stall must cancel-and-await this generation's pending per-sentence TTS
+    tasks — a TTS task whose completion is artificially delayed past the
+    stall trigger must never deliver audio after/over the recovery line.
+
+    ``never_release`` is deliberately never set, so the partial sentence's
+    TTS call can only ever finish via cancellation. ``started`` proves the
+    task actually ran (so the rest of the assertions aren't vacuous);
+    ``cancelled`` proves it was actually cancelled rather than merely
+    outlived by an early-returning round (the pre-fix bug: recovery speaks
+    immediately while this task is simply left running, orphaned, still able
+    to deliver its audio later -- including after/over the recovery line).
+    """
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.02)
+    client = direct_tool_client(provider, [])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    # Trailing space after the period: _extract_sentences only emits a
+    # complete sentence (and therefore spawns its per-sentence TTS task) on
+    # a punctuation-then-whitespace boundary -- without it the text just
+    # sits unflushed in the local sentence_buffer and no task is ever
+    # created, which would make this test vacuously pass either way.
+    partial_event = direct_text_round(provider, "Partial before the stall. ")[0]
+    _patch_direct_hanging_stream(
+        monkeypatch, pipeline, provider, before_events=[partial_event]
+    )
+    spoken = []
+    started = []
+    cancelled = []
+    never_release = asyncio.Event()
+
+    async def speak(text, generation=-1):
+        if text == "Partial before the stall.":
+            started.append(text)
+            try:
+                await never_release.wait()
+            except asyncio.CancelledError:
+                cancelled.append(text)
+                raise
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+
+    result = await asyncio.wait_for(_run_direct_provider(pipeline, provider), timeout=5.0)
+
+    # Sanity: the partial sentence's TTS task really started (otherwise the
+    # assertions below would hold vacuously in both old and new code).
+    assert started == ["Partial before the stall."]
+    # It was cancelled -- not merely outlived by an early return.
+    assert cancelled == ["Partial before the stall."]
+    # Never delivered -- cancelled before it could complete.
+    assert "Partial before the stall." not in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
 
 
 @pytest.mark.asyncio

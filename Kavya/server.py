@@ -851,6 +851,56 @@ class _SmartPBXStreamTimeout(Exception):
         super().__init__(phase)
 
 
+async def _smartpbx_acquire_stream_within_deadline(acquire, *, timeout: float):
+    """Await ``acquire()`` — the client call that creates/opens a provider
+    stream — bounded by ``timeout``.
+
+    A hung ``create()``/``generate_content_stream()`` call (the client
+    never returns) must recover exactly like a first item that never
+    arrives, so this raises the same ``_SmartPBXStreamTimeout`` with
+    ``phase=PHASE_INITIAL`` on timeout rather than letting the caller wait
+    forever before the guarded-iteration timeout ever gets a chance to run.
+    Used by the OpenAI and Gemini SmartPBX runners; Claude's stream is an
+    async context manager and uses ``_TimeoutGuardedAsyncCM`` instead.
+    """
+    try:
+        return await asyncio.wait_for(acquire(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise _SmartPBXStreamTimeout(phase=_SmartPBXStreamTimeout.PHASE_INITIAL) from None
+
+
+class _TimeoutGuardedAsyncCM:
+    """Wrap an async context manager so *entering* it is bounded by ``timeout``.
+
+    Anthropic's ``client.messages.stream(...)`` returns a context manager
+    whose ``__aenter__`` performs the actual network call — a hang there
+    (the client call never returns) must trigger the same recovery path as a
+    hanging first delta, not block forever before the per-item stall guard
+    ever starts. ``__aexit__`` is only forwarded to the wrapped context
+    manager if entry actually completed, mirroring normal ``async with``
+    semantics (a failed/timed-out ``__aenter__`` never gets a matching
+    ``__aexit__``).
+    """
+
+    def __init__(self, cm, *, timeout: float):
+        self._cm = cm
+        self._timeout = timeout
+        self._entered = False
+
+    async def __aenter__(self):
+        try:
+            result = await asyncio.wait_for(self._cm.__aenter__(), timeout=self._timeout)
+        except asyncio.TimeoutError:
+            raise _SmartPBXStreamTimeout(phase=_SmartPBXStreamTimeout.PHASE_INITIAL) from None
+        self._entered = True
+        return result
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if not self._entered:
+            return False
+        return await self._cm.__aexit__(exc_type, exc, tb)
+
+
 async def _smartpbx_timeout_guarded_stream(
     source, *, initial_timeout: float, stall_timeout: float,
 ):
@@ -861,6 +911,12 @@ async def _smartpbx_timeout_guarded_stream(
     arrive within ``initial_timeout``; every item after that must arrive
     within ``stall_timeout`` of the previous one. No total stream deadline —
     content that keeps arriving keeps the guard resetting.
+
+    ``initial_timeout`` here is expected to already be the REMAINDER of the
+    provider's initial-response budget after stream acquisition (see
+    ``_smartpbx_acquire_stream_within_deadline`` / ``_TimeoutGuardedAsyncCM``)
+    — acquisition and the wait for the first item are together bounded by
+    ``SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS`` at the call site.
     """
     aiter = source.__aiter__()
     first = True
@@ -4372,25 +4428,42 @@ class MediaStreamSession:
         ):
             return None
 
-        async def speak(text: str, *, generation: int) -> None:
-            await self._invoke_speak(text, generation=generation)
+        # Provider failover (Gemini -> Claude) runs the whole turn again on a
+        # new provider without resetting turn/generation state. If the failed
+        # round already armed a filler that hasn't spoken yet, adopt THAT
+        # controller instead of starting a second timer -- one filler per
+        # turn, not one per provider attempt. Left alone, the old controller
+        # would become unreachable (this call would overwrite both
+        # self._smartpbx_initial_filler and runner.initial_filler) while its
+        # task keeps running, orphaned, free to speak over the new provider's
+        # first sentence with nothing left able to cancel it.
+        existing = self._smartpbx_initial_filler
+        if (
+            existing is not None
+            and not existing.spoke
+            and existing.generation == generation
+        ):
+            controller = existing
+        else:
+            async def speak(text: str, *, generation: int) -> None:
+                await self._invoke_speak(text, generation=generation)
 
-        async def clear_audio() -> None:
-            # A late delta from an interrupted runner must not clear the newer
-            # turn's transport generation.
-            if generation == self._speak_generation:
-                await self._clear_media_audio()
-                runner = _smartpbx_runner_context.get()
-                if runner is not None and runner.speak_generation == generation:
-                    runner.speak_generation = self._speak_generation
+            async def clear_audio() -> None:
+                # A late delta from an interrupted runner must not clear the newer
+                # turn's transport generation.
+                if generation == self._speak_generation:
+                    await self._clear_media_audio()
+                    runner = _smartpbx_runner_context.get()
+                    if runner is not None and runner.speak_generation == generation:
+                        runner.speak_generation = self._speak_generation
 
-        controller = SmartPBXInitialFillerController(
-            speak=speak,
-            generation=generation,
-            delay_seconds=SMARTPBX_INITIAL_FILLER_DELAY_SECONDS,
-            clear_audio=clear_audio,
-        )
-        controller.start()
+            controller = SmartPBXInitialFillerController(
+                speak=speak,
+                generation=generation,
+                delay_seconds=SMARTPBX_INITIAL_FILLER_DELAY_SECONDS,
+                clear_audio=clear_audio,
+            )
+            controller.start()
         runner = _smartpbx_runner_context.get()
         if runner is not None:
             runner.initial_filler = controller
@@ -4612,6 +4685,41 @@ class MediaStreamSession:
         })
         return _join_turn(full_text, recovery_text)
 
+    async def _smartpbx_fence_stalled_generation(
+        self, *, tts_tasks: list[asyncio.Task], gen: int
+    ) -> int:
+        """Retire a stalled round's in-flight TTS before recovery speaks.
+
+        Two things must both finish before the recovery line is spoken, or a
+        late-arriving TTS task from the dead generation can deliver audio
+        after (or on top of) the recovery line:
+        1. Cancel-and-await any of THIS round's per-sentence TTS tasks that
+           are still pending (queued sentences from partial content spoken
+           before the stall).
+        2. Fence the transport against undelivered old-generation audio the
+           same way genuine barge-in does: bump ``_speak_generation`` and
+           clear queued transport audio — reusing the existing generation
+           fence / clear mechanism, not a new one.
+
+        Only fences/clears when ``gen`` is still the active generation. If a
+        newer turn or barge-in has already taken over, that path owns its
+        own fence and clear; this only cleans up this generation's dangling
+        TTS tasks and leaves the newer turn's audio untouched (same rule the
+        filler's ``clear_audio`` follows).
+
+        Returns the generation the recovery line should speak on.
+        """
+        pending = [task for task in tts_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if gen != self._speak_generation:
+            return self._speak_generation
+        self._speak_generation += 1
+        await self._clear_media_audio()
+        return self._speak_generation
+
     async def _smartpbx_handle_stream_timeout(
         self,
         exc: "_SmartPBXStreamTimeout",
@@ -4620,14 +4728,18 @@ class MediaStreamSession:
         tool_executed: bool,
         gen: int,
         full_text: str,
+        tts_tasks: list[asyncio.Task] = (),
     ) -> str:
         """Recover from an initial-response or inter-delta stall timeout.
 
         Cancels only this runner's own in-flight round (the guarded async
         generator has already abandoned the underlying stream read); marks
-        one bounded, fixed-enum telemetry stage; then reuses the same
-        recovery-and-finish policy an empty response uses, so a stalled
-        provider and a genuinely empty one degrade the call identically.
+        one bounded, fixed-enum telemetry stage; fences this round's dead
+        generation (see ``_smartpbx_fence_stalled_generation``) so no
+        already-in-flight TTS from before the stall can land after recovery
+        starts speaking; then reuses the same recovery-and-finish policy an
+        empty response uses, so a stalled provider and a genuinely empty one
+        degrade the call identically.
         """
         self._mark_smartpbx_turn_once("llm_timeout")
         if self._is_smartpbx_session():
@@ -4636,8 +4748,11 @@ class MediaStreamSession:
                 "tool_executed=%s",
                 provider, exc.phase, str(tool_executed).lower(),
             )
+        fenced_gen = await self._smartpbx_fence_stalled_generation(
+            tts_tasks=list(tts_tasks), gen=gen
+        )
         return await self._smartpbx_speak_recovery_and_finish(
-            tool_executed=tool_executed, gen=gen, full_text=full_text,
+            tool_executed=tool_executed, gen=fenced_gen, full_text=full_text,
         )
 
     def _assistant_text_for_echo_scoring(self) -> list[str]:
@@ -5928,24 +6043,32 @@ class MediaStreamSession:
                     messages = messages + [
                         {"role": "system", "content": SMARTPBX_EMPTY_RETRY_NUDGE}
                     ]
-                stream = await self.client.chat.completions.create(
-                    model=self.model,
-                    max_tokens=self._provider_max_tokens(),
-                    messages=messages,
-                    tools=self.tools or None,
-                    stream=True,
-                )
-                stream_iter = (
-                    _smartpbx_timeout_guarded_stream(
-                        stream,
-                        initial_timeout=SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
-                        stall_timeout=SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
+                async def _acquire_openai_stream():
+                    return await self.client.chat.completions.create(
+                        model=self.model,
+                        max_tokens=self._provider_max_tokens(),
+                        messages=messages,
+                        tools=self.tools or None,
+                        stream=True,
                     )
-                    if smartpbx_direct
-                    else stream
-                )
 
                 try:
+                    if smartpbx_direct:
+                        acquire_deadline = (
+                            time.monotonic() + SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS
+                        )
+                        stream = await _smartpbx_acquire_stream_within_deadline(
+                            _acquire_openai_stream,
+                            timeout=SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
+                        )
+                        stream_iter = _smartpbx_timeout_guarded_stream(
+                            stream,
+                            initial_timeout=max(acquire_deadline - time.monotonic(), 0.0),
+                            stall_timeout=SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
+                        )
+                    else:
+                        stream_iter = await _acquire_openai_stream()
+
                     async for chunk in stream_iter:
                         choice = chunk.choices[0]
                         delta = choice.delta
@@ -5990,6 +6113,7 @@ class MediaStreamSession:
                     return await self._smartpbx_handle_stream_timeout(
                         timeout_exc, provider="openai",
                         tool_executed=tool_executed, gen=gen, full_text=full_text,
+                        tts_tasks=tts_tasks,
                     )
 
                 if not self._current_smartpbx_runner_owns_shared_state():
@@ -6210,6 +6334,18 @@ class MediaStreamSession:
         """
         if not self._current_smartpbx_runner_owns_shared_state():
             return ""
+        # The failed round may have already armed its own initial filler
+        # (round 0, before the exception hit). If it already spoke, retire
+        # it now -- cancel-and-await, clearing the reference -- before
+        # Claude gets a chance to start speaking, so a stray filler task is
+        # never left running unattended. If it has NOT spoken yet,
+        # deliberately leave it alone: _start_initial_smartpbx_filler adopts
+        # a live not-yet-spoken filler for the same generation instead of
+        # starting a second one, so ownership transfers cleanly to Claude's
+        # own round 0 rather than being orphaned.
+        stale_filler = self._smartpbx_initial_filler
+        if stale_filler is not None and stale_filler.spoke:
+            await self._finish_initial_smartpbx_filler(stale_filler)
         previous_model = self.model
         previous_tools = self.tools
         previous_provider = self.llm_provider
@@ -6292,31 +6428,41 @@ class MediaStreamSession:
                     has_tool_use = False
                     finish_reason = None
 
-                    response = await _open_gemini_stream(
-                        self.gemini_client,
-                        model=self.model,
-                        contents=_history_to_gemini(self.history),
-                        config=_build_gemini_config(
-                            system=self._active_system_prompt(),
-                            tools=self.tools,
+                    async def _acquire_gemini_stream():
+                        return await _open_gemini_stream(
+                            self.gemini_client,
                             model=self.model,
-                            nudge=nudge,
-                            max_output_tokens=self._provider_max_tokens(),
-                        ),
-                    )
-                    response_iter = (
-                        _smartpbx_timeout_guarded_stream(
-                            response,
-                            initial_timeout=SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
-                            stall_timeout=SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
+                            contents=_history_to_gemini(self.history),
+                            config=_build_gemini_config(
+                                system=self._active_system_prompt(),
+                                tools=self.tools,
+                                model=self.model,
+                                nudge=nudge,
+                                max_output_tokens=self._provider_max_tokens(),
+                            ),
                         )
-                        # Capture flows keep their pre-Phase-B logic (spec §5) —
-                        # no stream-timeout guard while dictating a name/number.
-                        if self._is_direct_smartpbx_english_non_capture()
-                        else response
-                    )
+
+                    # Capture flows keep their pre-Phase-B logic (spec §5) —
+                    # no stream-timeout guard while dictating a name/number.
+                    smartpbx_direct_round = self._is_direct_smartpbx_english_non_capture()
 
                     try:
+                        if smartpbx_direct_round:
+                            acquire_deadline = (
+                                time.monotonic() + SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS
+                            )
+                            response = await _smartpbx_acquire_stream_within_deadline(
+                                _acquire_gemini_stream,
+                                timeout=SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
+                            )
+                            response_iter = _smartpbx_timeout_guarded_stream(
+                                response,
+                                initial_timeout=max(acquire_deadline - time.monotonic(), 0.0),
+                                stall_timeout=SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
+                            )
+                        else:
+                            response_iter = await _acquire_gemini_stream()
+
                         async for kind, payload in _iter_gemini_stream(response_iter):
                             if kind == "finish":
                                 finish_reason = payload
@@ -6364,6 +6510,7 @@ class MediaStreamSession:
                         return await self._smartpbx_handle_stream_timeout(
                             timeout_exc, provider="gemini",
                             tool_executed=tool_executed, gen=gen, full_text=full_text,
+                            tts_tasks=tts_tasks,
                         )
 
                     if text_content.strip() or function_calls:
@@ -6739,18 +6886,28 @@ class MediaStreamSession:
                         {"type": "text", "text": SMARTPBX_EMPTY_RETRY_NUDGE}
                     ]
 
+                acquire_deadline = time.monotonic() + SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS
+                stream_cm = self.anthropic_client.messages.stream(
+                    model=self.model,
+                    max_tokens=self._provider_max_tokens(),
+                    system=system_blocks,
+                    messages=self.history,
+                    tools=self.tools if self.tools else NOT_GIVEN,
+                )
+                if smartpbx_direct:
+                    # Entering this context manager is where the real network
+                    # call happens — a hang there must trip the same
+                    # initial-response deadline as a hanging first delta, not
+                    # block forever before the guarded generator even starts.
+                    stream_cm = _TimeoutGuardedAsyncCM(
+                        stream_cm, timeout=SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS
+                    )
                 try:
-                    async with self.anthropic_client.messages.stream(
-                        model=self.model,
-                        max_tokens=self._provider_max_tokens(),
-                        system=system_blocks,
-                        messages=self.history,
-                        tools=self.tools if self.tools else NOT_GIVEN,
-                    ) as stream:
+                    async with stream_cm as stream:
                         stream_iter = (
                             _smartpbx_timeout_guarded_stream(
                                 stream,
-                                initial_timeout=SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
+                                initial_timeout=max(acquire_deadline - time.monotonic(), 0.0),
                                 stall_timeout=SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
                             )
                             if smartpbx_direct
@@ -6817,6 +6974,7 @@ class MediaStreamSession:
                     return await self._smartpbx_handle_stream_timeout(
                         timeout_exc, provider="claude",
                         tool_executed=tool_executed, gen=gen, full_text=full_text,
+                        tts_tasks=tts_tasks,
                     )
 
                 if not self._current_smartpbx_runner_owns_shared_state():
