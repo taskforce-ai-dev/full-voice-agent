@@ -4453,6 +4453,18 @@ class MediaStreamSession:
                 # turn's transport generation.
                 if generation == self._speak_generation:
                     await self._clear_media_audio()
+                    # Retiring the filler is a handoff to this turn's own real
+                    # content, not a caller interruption. The clear bumps
+                    # _speak_generation, so the delivery tracker anchored at
+                    # turn start must be re-anchored too -- otherwise every
+                    # real sentence that follows fails the generation check in
+                    # _record_delivered_sentence, the turn is judged
+                    # interrupted, and the model's own reply is written to
+                    # history as "[interrupted]". Guarded on the tracker still
+                    # belonging to THIS generation so a stale/newer turn's
+                    # tracker is never re-anchored onto this clear.
+                    if self._assistant_turn_generation == generation:
+                        self._assistant_turn_generation = self._speak_generation
                     runner = _smartpbx_runner_context.get()
                     if runner is not None and runner.speak_generation == generation:
                         runner.speak_generation = self._speak_generation
@@ -4779,6 +4791,14 @@ class MediaStreamSession:
             return self._speak_generation
         self._speak_generation += 1
         await self._clear_media_audio()
+        # Same fence, same missed re-anchor as the filler clear above: the
+        # recovery line that follows is spoken on the NEW generation, so
+        # without this the tracker stays on the dead one, the recovery
+        # sentence is never acknowledged as delivered, and the line the
+        # caller actually heard is written to history as "[interrupted]".
+        # Guarded on the tracker still belonging to this generation.
+        if self._assistant_turn_generation == gen:
+            self._assistant_turn_generation = self._speak_generation
         runner = _smartpbx_runner_context.get()
         if runner is not None:
             runner.speak_generation = self._speak_generation

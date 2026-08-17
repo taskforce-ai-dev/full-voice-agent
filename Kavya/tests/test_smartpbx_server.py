@@ -4049,3 +4049,57 @@ async def test_genuine_barge_in_still_records_only_the_delivered_prefix():
         "content": f"{first} [interrupted]",
     }
     pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_timeout_recovery_fence_records_the_recovery_line_it_actually_spoke(
+    monkeypatch,
+):
+    """The stall fence is the filler clear's twin — same bump, same re-anchor.
+
+    ``_smartpbx_fence_stalled_generation`` bumps ``_speak_generation`` and
+    clears the transport before the recovery line is spoken, exactly as the
+    initial filler's ``clear_audio`` does.  Without re-anchoring the delivery
+    tracker across that bump, the recovery sentence the caller genuinely
+    heard is never acknowledged as delivered and the turn is written to
+    history as ``[interrupted]``.
+    """
+    import server
+
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=GenerationTrackingTransport(),
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._active_smartpbx_turn_id = "stalled-turn"
+    spoken = []
+
+    async def tts(text, *, sentence=None, turn_generation=None):
+        spoken.append(text)
+        pipeline._is_speaking = True
+        await pipeline._send_tts_done(
+            sentence=sentence, turn_generation=turn_generation,
+        )
+
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+
+    pipeline._start_assistant_turn_delivery_tracking()
+    stalled_gen = pipeline._speak_generation
+
+    fenced_gen = await pipeline._smartpbx_fence_stalled_generation(
+        tts_tasks=[], gen=stalled_gen,
+    )
+    assert fenced_gen == pipeline._speak_generation == stalled_gen + 1
+    assert pipeline._assistant_turn_generation == fenced_gen
+
+    result = await pipeline._smartpbx_speak_recovery_and_finish(
+        tool_executed=False, gen=fenced_gen, full_text="",
+    )
+
+    recovery = server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
+    assert spoken == [recovery]
+    assert result.endswith(recovery)
+    assert pipeline._assistant_turn_generated_sentences == [recovery]
+    assert pipeline._delivered_sentences == [recovery]
+    assert pipeline._assistant_turn_was_interrupted() is False
+    assert pipeline.history[-1] == {"role": "assistant", "content": recovery}
+    pipeline._cancel_reprompt()
