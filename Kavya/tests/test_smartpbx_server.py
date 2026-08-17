@@ -27,6 +27,34 @@ class FakeTransport:
         self.marks.append(name)
 
 
+class GenerationTrackingTransport(FakeTransport):
+    """Production-shaped clear fence for delivery-generation regressions."""
+
+    def __init__(self):
+        super().__init__()
+        self.generation = 0
+
+    async def clear_audio(self):
+        await super().clear_audio()
+        self.generation += 1
+
+
+class PauseFirstClearGenerationTransport(GenerationTrackingTransport):
+    """Let a newer owner clear while an older owner's clear is suspended."""
+
+    def __init__(self):
+        super().__init__()
+        self.first_clear_entered = asyncio.Event()
+        self.resume_first_clear = asyncio.Event()
+
+    async def clear_audio(self):
+        self.clears += 1
+        if self.clears == 1:
+            self.first_clear_entered.set()
+            await self.resume_first_clear.wait()
+        self.generation += 1
+
+
 class BlockingMarkTransport(FakeTransport):
     def __init__(self):
         super().__init__()
@@ -3100,10 +3128,12 @@ def test_smartpbx_initial_filler_delay_rejects_nonfinite_environment_values(raw)
 class _ControlledInitialFillerSleep:
     def __init__(self):
         self.delays = []
+        self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
     async def __call__(self, seconds):
         self.delays.append(seconds)
+        self.entered.set()
         await self.release.wait()
 
 
@@ -3854,3 +3884,412 @@ def test_smartpbx_initial_filler_delay_default_is_1_5_seconds():
     assert server.SMARTPBX_INITIAL_FILLER_DELAY_SECONDS == 1.5
     assert server._resolve_smartpbx_initial_filler_delay(None) == 1.5
     assert server._resolve_smartpbx_initial_filler_delay("") == 1.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_spoken_initial_filler_clear_preserves_real_answer_delivery_and_history(
+    monkeypatch, provider
+):
+    """A filler clear is a handoff, not a caller interruption.
+
+    Drive the real provider runner, filler controller, speak lock, generation
+    fence, delivery acknowledgement, and history writer.  The clock is
+    controlled only so CI need not spend 1.5 wall-clock seconds proving that
+    the production default won the race before the first provider content.
+    """
+    import server
+
+    answer = "I have your dates."
+    content_release = asyncio.Event()
+
+    async def delayed_content():
+        await content_release.wait()
+        for event in direct_text_round(provider, answer):
+            yield event
+
+    client = controlled_direct_tool_client(provider, [delayed_content()])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    transport = GenerationTrackingTransport()
+    pipeline._media_transport = transport
+    filler_sleep = _ControlledInitialFillerSleep()
+    filler_spoken = asyncio.Event()
+    spoken = []
+    real_controller = server.SmartPBXInitialFillerController
+
+    def controlled_controller(**kwargs):
+        return real_controller(**kwargs, sleep=filler_sleep)
+
+    async def tts(text, *, sentence=None, turn_generation=None):
+        spoken.append((text, sentence, turn_generation))
+        pipeline._is_speaking = True
+        await pipeline._send_tts_done(
+            sentence=sentence, turn_generation=turn_generation,
+        )
+        if text == server.SMARTPBX_INITIAL_FILLER_TEXT:
+            filler_spoken.set()
+
+    monkeypatch.setattr(server, "SmartPBXInitialFillerController", controlled_controller)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+
+    turn = asyncio.create_task(
+        pipeline._process_utterance_bound("guest supplied booking dates")
+    )
+    try:
+        await asyncio.wait_for(filler_sleep.entered.wait(), timeout=1)
+        assert filler_sleep.delays == [1.5]
+        assert spoken == []
+
+        filler_sleep.release.set()
+        await asyncio.wait_for(filler_spoken.wait(), timeout=1)
+        assert spoken == [(server.SMARTPBX_INITIAL_FILLER_TEXT, None, 0)]
+
+        content_release.set()
+        await asyncio.wait_for(turn, timeout=2)
+
+        assert transport.clears == 1
+        assert pipeline._speak_generation == transport.generation == 1
+        assert pipeline._smartpbx_barge_ins == 0
+        assert pipeline._assistant_turn_generation == pipeline._speak_generation
+        assert pipeline._assistant_turn_generated_sentences == [answer]
+        assert pipeline._delivered_sentences == [answer]
+        assert pipeline.history[-1] == {"role": "assistant", "content": answer}
+        assert pipeline.full_transcript[-1] == {"role": "assistant", "text": answer}
+        assert pipeline._assistant_turn_was_interrupted() is False
+    finally:
+        content_release.set()
+        filler_sleep.release.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_filler_handoff_cannot_rebind_a_barged_out_runner_to_the_new_turn(
+    monkeypatch,
+):
+    """A delivery-generation handoff must never restore stale turn ownership."""
+    import server
+
+    answer = "This old answer must stay fenced."
+    content_release = asyncio.Event()
+
+    async def delayed_content():
+        await content_release.wait()
+        for event in direct_text_round("claude", answer):
+            yield event
+
+    client = controlled_direct_tool_client("claude", [delayed_content()])
+    pipeline = direct_tool_pipeline(server, "claude", client)
+    transport = GenerationTrackingTransport()
+    pipeline._media_transport = transport
+    pipeline._active_smartpbx_turn_id = "old-turn"
+    filler_sleep = _ControlledInitialFillerSleep()
+    filler_spoken = asyncio.Event()
+    spoken = []
+    real_controller = server.SmartPBXInitialFillerController
+
+    def controlled_controller(**kwargs):
+        return real_controller(**kwargs, sleep=filler_sleep)
+
+    async def tts(text, *, sentence=None, turn_generation=None):
+        spoken.append(text)
+        pipeline._is_speaking = True
+        await pipeline._send_tts_done(
+            sentence=sentence, turn_generation=turn_generation,
+        )
+        if text == server.SMARTPBX_INITIAL_FILLER_TEXT:
+            filler_spoken.set()
+
+    monkeypatch.setattr(server, "SmartPBXInitialFillerController", controlled_controller)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+
+    turn = asyncio.create_task(pipeline._process_utterance_bound("old guest turn"))
+    try:
+        await asyncio.wait_for(filler_sleep.entered.wait(), timeout=1)
+        filler_sleep.release.set()
+        await asyncio.wait_for(filler_spoken.wait(), timeout=1)
+
+        await pipeline._handle_bargein()
+        pipeline._active_smartpbx_turn_id = "new-turn"
+        history_after_barge = list(pipeline.history)
+        content_release.set()
+        await asyncio.wait_for(turn, timeout=2)
+
+        assert pipeline._speak_generation == transport.generation == 1
+        assert pipeline._smartpbx_barge_ins == 1
+        assert spoken == [server.SMARTPBX_INITIAL_FILLER_TEXT]
+        assert pipeline.history == history_after_barge
+        assert all(
+            message.get("content") != answer
+            for message in pipeline.history
+            if isinstance(message, dict)
+        )
+    finally:
+        content_release.set()
+        filler_sleep.release.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_genuine_barge_in_still_records_only_the_delivered_prefix():
+    import server
+
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=GenerationTrackingTransport(),
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._active_smartpbx_turn_id = "interrupted-turn"
+    pipeline._start_assistant_turn_delivery_tracking()
+    generation = pipeline._assistant_turn_generation
+    first = "Your check-in date is recorded."
+    second = "Your check-out date is next."
+
+    pipeline._record_generated_sentence(first)
+    await pipeline._send_tts_done(sentence=first, turn_generation=generation)
+    pipeline._record_generated_sentence(second)
+    pipeline._is_speaking = True
+    await pipeline._handle_bargein()
+    pipeline._append_assistant_history({
+        "role": "assistant",
+        "content": f"{first} {second}",
+    })
+
+    assert pipeline._smartpbx_barge_ins == 1
+    assert pipeline._assistant_turn_was_interrupted() is True
+    assert pipeline._delivered_sentences == [first]
+    assert pipeline.history[-1] == {
+        "role": "assistant",
+        "content": f"{first} [interrupted]",
+    }
+    pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_timeout_recovery_fence_records_the_recovery_line_it_actually_spoke(
+    monkeypatch,
+):
+    """The stall fence is the filler clear's twin — same bump, same re-anchor.
+
+    ``_smartpbx_fence_stalled_generation`` bumps ``_speak_generation`` and
+    clears the transport before the recovery line is spoken, exactly as the
+    initial filler's ``clear_audio`` does.  Without re-anchoring the delivery
+    tracker across that bump, the recovery sentence the caller genuinely
+    heard is never acknowledged as delivered and the turn is written to
+    history as ``[interrupted]``.
+    """
+    import server
+
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=GenerationTrackingTransport(),
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._active_smartpbx_turn_id = "stalled-turn"
+    spoken = []
+
+    async def tts(text, *, sentence=None, turn_generation=None):
+        spoken.append(text)
+        pipeline._is_speaking = True
+        await pipeline._send_tts_done(
+            sentence=sentence, turn_generation=turn_generation,
+        )
+
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+
+    pipeline._start_assistant_turn_delivery_tracking()
+    stalled_gen = pipeline._speak_generation
+
+    fenced_gen = await pipeline._smartpbx_fence_stalled_generation(
+        tts_tasks=[], gen=stalled_gen,
+    )
+    assert fenced_gen == pipeline._speak_generation == stalled_gen + 1
+    assert pipeline._assistant_turn_generation == fenced_gen
+
+    result = await pipeline._smartpbx_speak_recovery_and_finish(
+        tool_executed=False, gen=fenced_gen, full_text="",
+    )
+
+    recovery = server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
+    assert spoken == [recovery]
+    assert result.endswith(recovery)
+    assert pipeline._assistant_turn_generated_sentences == [recovery]
+    assert pipeline._delivered_sentences == [recovery]
+    assert pipeline._assistant_turn_was_interrupted() is False
+    assert pipeline.history[-1] == {"role": "assistant", "content": recovery}
+    pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_filler_clear_resuming_after_barge_in_cannot_reanchor_old_turn(
+    monkeypatch,
+):
+    """A clear already awaiting transport must revalidate ownership on return."""
+    import server
+
+    old_turn, new_turn = "filler-old-turn", "filler-new-turn"
+    stale_answer = "This abandoned answer must never be delivered."
+    transport = PauseFirstClearGenerationTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport,
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._active_smartpbx_turn_id = old_turn
+    filler_sleep = _ControlledInitialFillerSleep()
+    filler_spoken = asyncio.Event()
+    spoken = []
+    real_controller = server.SmartPBXInitialFillerController
+
+    def controlled_controller(**kwargs):
+        return real_controller(**kwargs, sleep=filler_sleep)
+
+    async def tts(text, *, sentence=None, turn_generation=None):
+        spoken.append(text)
+        pipeline._is_speaking = True
+        await pipeline._send_tts_done(
+            sentence=sentence, turn_generation=turn_generation,
+        )
+        if text == server.SMARTPBX_INITIAL_FILLER_TEXT:
+            filler_spoken.set()
+
+    monkeypatch.setattr(server, "SmartPBXInitialFillerController", controlled_controller)
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+
+    pipeline._start_assistant_turn_delivery_tracking()
+    generation = pipeline._speak_generation
+    runner = server._SmartPBXRunnerContext(
+        turn_id=old_turn,
+        dropped_frame_baseline=0,
+        speak_generation=generation,
+        raw_utterance="",
+    )
+    token = server._smartpbx_runner_context.set(runner)
+    try:
+        controller = pipeline._start_initial_smartpbx_filler(
+            round_idx=0, generation=generation,
+        )
+    finally:
+        server._smartpbx_runner_context.reset(token)
+    assert controller is not None
+
+    stale_task = None
+    try:
+        await asyncio.wait_for(filler_sleep.entered.wait(), timeout=1)
+        filler_sleep.release.set()
+        await asyncio.wait_for(filler_spoken.wait(), timeout=1)
+
+        async def finish_old_turn():
+            await controller.on_content_delta()
+            stale_generation = pipeline._runner_speak_generation(generation)
+            await pipeline._invoke_speak(
+                stale_answer,
+                generation=stale_generation,
+                sentence=stale_answer,
+            )
+            pipeline._append_assistant_history({
+                "role": "assistant", "content": stale_answer,
+            })
+
+        token = server._smartpbx_runner_context.set(runner)
+        try:
+            stale_task = asyncio.create_task(finish_old_turn())
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+        await asyncio.wait_for(transport.first_clear_entered.wait(), timeout=1)
+        await pipeline._handle_bargein()
+        pipeline._active_smartpbx_turn_id = new_turn
+        history_after_barge = list(pipeline.history)
+        transport.resume_first_clear.set()
+        await asyncio.wait_for(stale_task, timeout=1)
+
+        assert transport.clears == 2
+        assert pipeline._smartpbx_barge_ins == 1
+        assert pipeline._active_smartpbx_turn_id == new_turn
+        assert runner.speak_generation == generation
+        assert pipeline._assistant_turn_generation == generation
+        assert pipeline._assistant_turn_was_interrupted() is True
+        assert spoken == [server.SMARTPBX_INITIAL_FILLER_TEXT]
+        assert pipeline.history == history_after_barge
+    finally:
+        filler_sleep.release.set()
+        transport.resume_first_clear.set()
+        if stale_task is not None:
+            await asyncio.gather(stale_task, return_exceptions=True)
+        await pipeline._finish_initial_smartpbx_filler(controller)
+        pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
+async def test_timeout_clear_resuming_after_barge_in_cannot_reanchor_old_turn(
+    monkeypatch,
+):
+    """A stalled runner must stay fenced when ownership changes during clear."""
+    import server
+
+    old_turn, new_turn = "timeout-old-turn", "timeout-new-turn"
+    transport = PauseFirstClearGenerationTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport,
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._active_smartpbx_turn_id = old_turn
+    spoken = []
+
+    async def tts(text, *, sentence=None, turn_generation=None):
+        spoken.append(text)
+        pipeline._is_speaking = True
+        await pipeline._send_tts_done(
+            sentence=sentence, turn_generation=turn_generation,
+        )
+
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+
+    pipeline._start_assistant_turn_delivery_tracking()
+    generation = pipeline._speak_generation
+    runner = server._SmartPBXRunnerContext(
+        turn_id=old_turn,
+        dropped_frame_baseline=0,
+        speak_generation=generation,
+        raw_utterance="",
+    )
+
+    async def finish_stalled_turn():
+        return await pipeline._smartpbx_handle_stream_timeout(
+            server._SmartPBXStreamTimeout(
+                phase=server._SmartPBXStreamTimeout.PHASE_STALL,
+            ),
+            provider="claude",
+            tool_executed=False,
+            gen=generation,
+            full_text="",
+        )
+
+    token = server._smartpbx_runner_context.set(runner)
+    try:
+        timeout_task = asyncio.create_task(finish_stalled_turn())
+    finally:
+        server._smartpbx_runner_context.reset(token)
+
+    try:
+        await asyncio.wait_for(transport.first_clear_entered.wait(), timeout=1)
+        await pipeline._handle_bargein()
+        pipeline._active_smartpbx_turn_id = new_turn
+        history_after_barge = list(pipeline.history)
+        transport.resume_first_clear.set()
+        result = await asyncio.wait_for(timeout_task, timeout=1)
+
+        assert transport.clears == 2
+        assert pipeline._smartpbx_barge_ins == 1
+        assert pipeline._active_smartpbx_turn_id == new_turn
+        assert runner.speak_generation == generation
+        assert pipeline._assistant_turn_generation == generation
+        assert pipeline._assistant_turn_was_interrupted() is True
+        assert spoken == []
+        assert pipeline.history == history_after_barge
+        assert result == ""
+    finally:
+        transport.resume_first_clear.set()
+        await asyncio.gather(timeout_task, return_exceptions=True)
+        pipeline._cancel_reprompt()
