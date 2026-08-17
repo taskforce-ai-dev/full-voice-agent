@@ -652,31 +652,52 @@ def _classify_claude_round_outcome(
     malformed blocks are discarded at accumulation time and never reach here,
     so a caller can act on this result without re-validating it.
 
-    Order matters. A max_tokens stop is reported as truncation even though it
-    also leaves an unterminated block, because the budget is the actionable
-    cause; an unterminated block under any other stop reason is a genuine
-    stream defect and is reported as such.
+    ORDER: TERMINAL FAILURE FIRST, visible output LAST. Whether the round ended
+    badly is decided before -- and independently of -- whether it happened to
+    leave anything usable behind, because partial output from a round that was
+    cut off is not evidence of success; it is the wreckage of the failure.
+    Reading it the other way round is what let a truncated round speak its
+    partial sentence and dispatch its complete tool blocks:
 
-    `saw_terminal_metadata` is True when the stream delivered a `message_delta`
-    or a `message_stop` -- i.e. the model told us the turn was over. It gates
-    TRUE_EMPTY only: "the model chose to say nothing" is a claim we may only
-    make when the model actually reported ending its turn. A stream that just
-    stops producing events proves nothing of the sort and is STREAM_ABORTED.
-    It deliberately does NOT gate the content-bearing outcomes above: a round
-    that produced visible output, an unterminated block or unparseable JSON is
-    already described precisely by those, whatever the transport did after.
+    1. `stop_reason == "max_tokens"` -> MAX_TOKENS_TRUNCATED, unconditionally.
+       The budget ran out mid-turn. The model had more to say and could not say
+       it, so whatever it DID emit is a prefix of an answer, not an answer --
+       even when that prefix is a fully-terminated tool block. A round that
+       genuinely finished never reports this stop reason.
+    2. An unterminated tool block -> INCOMPLETE_TOOL_BLOCK, and unparseable
+       tool JSON -> MALFORMED_TOOL_JSON. These sit under (1) only because
+       max_tokens names the actionable cause of the very same wreckage; under
+       any other stop reason they are the more specific description of a
+       genuine stream defect and must not be laundered into the generic
+       transport label below.
+    3. No `message_delta` and no `message_stop` -> STREAM_ABORTED. The model
+       never reported ending its turn, so the connection dropped mid-stream.
+       This is checked BEFORE visible output for the same reason as (1): text
+       that arrived before an EOF is an unfinished sentence, and a tool block
+       that arrived before an EOF belongs to a batch we never saw the end of.
+       We cannot know what else the round intended to emit.
+    4. Only then does visible output mean COMPLETED -- i.e. a terminal,
+       non-truncated, structurally sound round that produced something.
+    5. Terminal, sound, and empty is TRUE_EMPTY: the model reported ending its
+       turn having chosen to say nothing. That claim is only available once (3)
+       has ruled out an abrupt EOF.
+
+    Every outcome except COMPLETED routes to the retry-once-then-recovery path,
+    and every one that can carry partial output (all of them but TRUE_EMPTY,
+    which by construction produced none) is in
+    `SMARTPBX_CLAUDE_DISCARD_ROUND_OUTCOMES`, so the round is discarded whole
+    and its in-flight TTS fenced before anything else speaks.
     """
-    visible_output = bool(text_content.strip() or tool_use_blocks)
-    if stop_reason == "max_tokens" and (incomplete_tool_block or not visible_output):
+    if stop_reason == "max_tokens":
         return SmartPBXClaudeRoundOutcome.MAX_TOKENS_TRUNCATED
     if incomplete_tool_block:
         return SmartPBXClaudeRoundOutcome.INCOMPLETE_TOOL_BLOCK
     if malformed_tool_json:
         return SmartPBXClaudeRoundOutcome.MALFORMED_TOOL_JSON
-    if visible_output:
-        return SmartPBXClaudeRoundOutcome.COMPLETED
     if not saw_terminal_metadata:
         return SmartPBXClaudeRoundOutcome.STREAM_ABORTED
+    if text_content.strip() or tool_use_blocks:
+        return SmartPBXClaudeRoundOutcome.COMPLETED
     return SmartPBXClaudeRoundOutcome.TRUE_EMPTY
 
 
