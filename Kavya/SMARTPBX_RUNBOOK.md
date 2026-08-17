@@ -356,7 +356,8 @@ event allowlist**. It may contain only the following runtime event names:
 `llm_error`, `llm_provider_degraded`, `llm_provider_failover`, `tool_execute`,
 `tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`,
 `tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
-`silence_reprompt`, `stt_final`, `stt_provider_final`, `stt_provider_interim`,
+`silence_reprompt`, `stt_final`, `stt_post_dispatch_result`,
+`stt_provider_final`, `stt_provider_interim`,
 `capture_buffer_bounded`, `capture_final_buffered`, `capture_forced_dispatch`,
 `capture_mode_enter`, `capture_mode_exit`, `dtmf_collect_start`, and
 `dtmf_collect_done`; unlisted event names are not permitted.
@@ -387,6 +388,22 @@ are caller-derived). `output_tokens` and `attempt` are likewise clamped to the
 ranges above, so a corrupt usage payload cannot write an unbounded numeral.
 This event carries no free text, no tool names, no tool arguments and no caller
 identifiers of any kind.
+
+`stt_post_dispatch_result` emits exactly three fields, and no others:
+
+| Field | Type | Permitted values |
+| --- | --- | --- |
+| `result_type` | bounded enum | `final`, `interim` (any other value emits nothing) |
+| `action` | fixed string | `ignored_active_turn` |
+| `elapsed_ms` | bounded integer | `0`–`60000`, clamped |
+
+It records that a provider result arrived while a turn was already dispatched and
+was therefore refused before any counter, buffer or endpointing timer changed —
+the age of the owning turn, nothing about what was said. No transcript text, no
+character or token counts, no provider payload, no phone or call identifier. A
+genuine barge-in is handled on the speaking-time path and never reaches this
+event, so a rise in this counter means late duplicate provider results, not
+missed interruptions.
 
 Wire-delivery proxies describe paced transport behavior only; they are not
 playback acknowledgements. Every approved event must not contain transcript text,

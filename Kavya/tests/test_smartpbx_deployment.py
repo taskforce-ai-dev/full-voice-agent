@@ -548,6 +548,31 @@ def test_runbook_allowlists_llm_round_outcome_with_its_exact_bounded_field_set()
     assert "clamped" in normalized_cutover
 
 
+def test_runbook_allowlists_stt_post_dispatch_result_with_its_exact_bounded_field_set():
+    """The late-STT-result event is the only place the pipeline reports that it
+    threw provider speech away. It must stay a closed enum pair plus one clamped
+    integer — the tempting fields (what was said, how long it was) are exactly
+    the ones that would turn it into a transcript side channel."""
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    cutover = runbook.split("## Cutover gates", 1)[1].split("\n## ", 1)[0]
+
+    assert "`stt_post_dispatch_result`" in cutover
+    assert "emits exactly three fields, and no others" in cutover
+    for field in ("result_type", "action", "elapsed_ms"):
+        assert f"`{field}`" in cutover, field
+    for value in ("`final`", "`interim`", "`ignored_active_turn`", "`0`–`60000`"):
+        assert value in cutover, value
+
+    normalized = re.sub(r"\s+", " ", cutover).lower()
+    assert "no transcript text" in normalized
+    assert "no character or token counts" in normalized
+    assert "no phone or call identifier" in normalized
+    # A barge-in must not be miscounted here, or the operator reads the metric
+    # as "missed interruptions" and retunes endpointing for the wrong reason.
+    assert "genuine barge-in" in normalized
+    assert "never reaches this event" in normalized
+
+
 def test_runbook_names_the_sonnet_5_canary_model_and_the_600_budget_rationale():
     """The runbook template used to hand operators `claude-sonnet-4-5-20250929`
     for `.env.smartpbx` while the canary and prod ran `claude-sonnet-5` — and

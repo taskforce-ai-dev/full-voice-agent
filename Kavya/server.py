@@ -1466,6 +1466,12 @@ CAPTURE_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "CAPTURE_FINAL_GRACE_SECONDS", 1.2, 0.2, 3.0
 )
 
+# Upper bound for the only integer the post-dispatch STT telemetry emits. The
+# event records that a late provider result was ignored while a turn was already
+# dispatched; the age of that turn is useful, an unbounded number is not. Not an
+# env knob — it is a log-shape clamp, not a tuning parameter.
+POST_DISPATCH_ELAPSED_MS_MAX: int = 60_000
+
 # Domain phrase list that biases the ENGLISH Azure recognizer toward booking
 # vocabulary — digit words (phone numbers), the property and room names (from the
 # single tools source of truth), and common booking terms. English only: phrase
@@ -4521,6 +4527,10 @@ class MediaStreamSession:
         # The monotonic turn id lets an in-flight turn's own flush release the
         # guard without clobbering a newer turn started by a barge-in.
         self._utterance_dispatched = False
+        # Monotonic stamp of the moment the guard above was claimed. Only read
+        # while the guard is held, purely to bound the post-dispatch telemetry's
+        # elapsed_ms; never used for control flow.
+        self._utterance_dispatched_at: float | None = None
         self._utterance_turn = 0
         self._last_guest_utterance_raw: str = ""
         # Capture-mode keeps endpointing looser while the caller is dictating
@@ -5479,7 +5489,10 @@ class MediaStreamSession:
             logger.info("smartpbx_media event=stt_final")
         else:
             logger.info("STT final result [%s]: %r (speaking=%s)", self.call_sid, transcript, self._is_speaking)
-        self._latest_interim = ""  # clear — final supersedes interim
+        # `_latest_interim` is transcript-owned state and is therefore cleared by
+        # `_accumulate_transcript` on the event loop, NOT here: this method runs
+        # on the synchronous STT worker thread, and a cross-thread write races
+        # every loop-side reader of the transcript buffers.
         if self._event_loop is None:
             return
         if self._is_speaking:
@@ -5503,7 +5516,9 @@ class MediaStreamSession:
         """
         if self.transfer_pending:
             return
-        self._latest_interim = transcript
+        # See `_on_stt_result`: the interim is handed to the loop and recorded
+        # there by `_set_transcript_interim`. Nothing transcript-, interim- or
+        # timer-owned is mutated on this thread.
         if self._event_loop is None:
             return
         if self._is_speaking:
@@ -6015,6 +6030,55 @@ class MediaStreamSession:
 
     # â”€â”€ Endpointing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+    def _emit_post_dispatch_result(self, result_type: str) -> None:
+        """Record that a late provider result was ignored by a dispatched turn.
+
+        Privacy-safe and bounded by construction: two closed enums plus one
+        clamped integer. No transcript text, no provider payload, no header, no
+        phone/call identifier — see the runbook's event allowlist.
+        """
+        if result_type not in ("final", "interim"):
+            # Closed enum. An unrecognised caller emits nothing rather than
+            # widening the log vocabulary silently.
+            return
+        if not self._is_smartpbx_session():
+            return
+        started = self._utterance_dispatched_at
+        elapsed_ms = 0
+        if started is not None:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+        elapsed_ms = max(0, min(elapsed_ms, POST_DISPATCH_ELAPSED_MS_MAX))
+        logger.info(
+            "smartpbx_media event=stt_post_dispatch_result result_type=%s "
+            "action=ignored_active_turn elapsed_ms=%d",
+            result_type,
+            elapsed_ms,
+        )
+
+    def _reject_post_dispatch_result(self, result_type: str) -> bool:
+        """True when a dispatched turn owns the endpoint and this result is late.
+
+        Called FIRST in both accumulation paths — before any counter, buffer or
+        timer is touched — so a late provider result cannot contaminate the next
+        turn, resurrect itself as a spurious later turn, or vanish at hangup.
+        The rejected speech is deliberately NOT deferred into the next turn: the
+        caller has already been answered for the utterance it belongs to.
+
+        Genuine speaking-time barge-in is unaffected: `_on_stt_result` /
+        `_on_stt_interim` handle that branch and return before anything reaches
+        this gate, so a real interruption still stops the speech and starts a
+        fresh turn.
+
+        The silence re-prompt is deliberately NOT re-armed here. Its task is
+        already re-armed by every delivered sentence of the turn that owns the
+        guard, and touching a timer from a refused result is exactly the
+        state-mutation-before-rejection this gate exists to remove.
+        """
+        if not self._utterance_dispatched:
+            return False
+        self._emit_post_dispatch_result(result_type)
+        return True
+
     async def _accumulate_transcript(self, text: str):
         if self._smartpbx_torn_down:
             # A residual STT callback landed after teardown finalized this
@@ -6023,6 +6087,11 @@ class MediaStreamSession:
             return
         if self.transfer_pending:
             return
+        if self._reject_post_dispatch_result("final"):
+            return
+        # A final supersedes any interim of the same utterance. Cleared here, on
+        # the event loop, rather than in the STT worker-thread callback.
+        self._latest_interim = ""
         # Counted here (event-loop side) rather than in the STT-thread callback
         # so the per-turn counters never race the flush that snapshots them.
         self._smartpbx_stt_final_events = min(
@@ -6063,6 +6132,10 @@ class MediaStreamSession:
             return
         if self.transfer_pending:
             return
+        if self._reject_post_dispatch_result("interim"):
+            return
+        # Loop-side record of the latest interim, mirroring the final path.
+        self._latest_interim = text
         # Event-loop-side count, mirroring _accumulate_transcript.
         self._smartpbx_stt_interim_events = min(
             self._smartpbx_stt_interim_events + 1, 100_000
@@ -6074,22 +6147,23 @@ class MediaStreamSession:
         # Preserve any committed finals from earlier segments; on the interim-only
         # path there are none, so this is a plain overwrite of the cumulative
         # interim as before.
+        committed = self._committed_transcript
+        exact_prefix = f"{committed} "
+        has_one_exact_separator = (
+            text.startswith(exact_prefix)
+            and len(text) > len(exact_prefix)
+            and not text[len(exact_prefix)].isspace()
+        )
+        if committed and has_one_exact_separator:
+            shape = "exact_cumulative"
+        elif committed and text.casefold().startswith(committed.casefold()):
+            # A POSSIBLE cumulative shape, for counting only. Anything short of
+            # a byte-exact prefix plus exactly one separator keeps the
+            # conservative concatenation below — no fuzzy matching.
+            shape = "unknown"
+        else:
+            shape = "segment"
         if self._is_smartpbx_session():
-            committed = self._committed_transcript
-            exact_prefix = f"{committed} "
-            has_one_exact_separator = (
-                text.startswith(exact_prefix)
-                and len(text) > len(exact_prefix)
-                and not text[len(exact_prefix)].isspace()
-            )
-            if committed and has_one_exact_separator:
-                shape = "exact_cumulative"
-            elif committed and text.casefold().startswith(committed.casefold()):
-                # This identifies a possible cumulative shape for counting only.
-                # It never changes pending text or authorizes de-duplication.
-                shape = "unknown"
-            else:
-                shape = "segment"
             logger.info(
                 "smartpbx_media event=stt_interim_shape shape=%s "
                 "committed_chars=%d interim_chars=%d",
@@ -6097,11 +6171,15 @@ class MediaStreamSession:
                 len(committed),
                 len(text),
             )
-        pending = (
-            self._committed_transcript + " " + text
-            if self._committed_transcript
-            else text
-        )
+        if shape == "exact_cumulative":
+            # Google's cumulative interims already CONTAIN the committed prefix.
+            # Concatenating again emitted the prefix twice ("first segment first
+            # segment second segment"), so use the provider's own text verbatim.
+            pending = text
+        elif committed:
+            pending = committed + " " + text
+        else:
+            pending = text
         if self._is_capture_mode_active():
             pending = self._bound_capture_text(pending)
         self._pending_transcript = pending
@@ -6127,8 +6205,11 @@ class MediaStreamSession:
             self._latest_interim = ""
             return
         # Exactly-once: a turn is already dispatched and the agent is responding.
-        # A stale timer or a late final/interim of the same utterance that fires
-        # now must not start a second llm_round.
+        # A stale timer that fires now must not start a second llm_round. Late
+        # finals/interims are already refused upstream by
+        # `_reject_post_dispatch_result`, so nothing reaches here holding late
+        # buffered text — this guard is retained as defence in depth for timers
+        # armed before the dispatch claimed the turn.
         if self._utterance_dispatched:
             return
         transcript = self._pending_transcript.strip()
@@ -6142,6 +6223,7 @@ class MediaStreamSession:
         # Claim the turn synchronously, before any await, so a concurrently-queued
         # flush task sees the guard set and bails.
         self._utterance_dispatched = True
+        self._utterance_dispatched_at = time.monotonic()
         # A turn only spends the capture allowance if capture mode was already
         # armed when the caller's speech was dispatched — the turn that ARMED it
         # (the ask, or the first needs_more) is not itself a capture turn.
