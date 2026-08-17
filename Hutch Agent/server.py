@@ -43,6 +43,11 @@ import os
 
 HUTCH_SERVICE_MODE: str = os.getenv("HUTCH_SERVICE_MODE", "smartpbx").strip().lower()
 
+# Staff/operator WhatsApp number that a handover notification is sent to. Goes
+# into the n8n payload as `human_agent_whatsapp`. Left blank by default (the n8n
+# workflow may hardcode its own recipient); set in the deploy .env otherwise.
+HUTCH_HUMAN_AGENT_WHATSAPP: str = os.getenv("HUTCH_HUMAN_AGENT_WHATSAPP", "").strip()
+
 # --- Error tracking (Sentry): no-op unless SENTRY_DSN is set ---
 if os.getenv("SENTRY_DSN"):
     import sentry_sdk
@@ -857,7 +862,7 @@ class MediaStreamSession:
     def _set_handover_context(self):
         handover_context.set({
             "call_sid": self.call_sid,
-            "human_agent_whatsapp": "",
+            "human_agent_whatsapp": HUTCH_HUMAN_AGENT_WHATSAPP,
         })
 
     # -- STT callback (called from background thread) ----------------------
@@ -1459,7 +1464,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
 
             if msg_type == "setup":
                 call_sid = message.get("callSid", "unknown")
-                handover_context.set({"call_sid": call_sid, "human_agent_whatsapp": ""})
+                handover_context.set({"call_sid": call_sid, "human_agent_whatsapp": HUTCH_HUMAN_AGENT_WHATSAPP})
                 logger.info(
                     "Session setup -- CallSid: %s, StreamSid: %s",
                     call_sid, message.get("streamSid", "n/a"),
