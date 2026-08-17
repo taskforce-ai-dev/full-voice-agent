@@ -3041,7 +3041,10 @@ def test_smartpbx_health_stays_open_for_liveness_probes():
 async def test_direct_smartpbx_provider_requests_use_the_concise_output_budget(
     monkeypatch, provider
 ):
-    """Only direct Dialog sessions get the 120-token caller-rhythm budget."""
+    """Only direct Dialog sessions get the caller-rhythm budget -- 120 tokens
+    for OpenAI and Gemini, and the raised Claude-only canary budget for
+    Claude, whose default adaptive thinking spends tokens before any visible
+    block opens."""
     import server
 
     client = direct_tool_client(provider, [direct_text_round(provider, "Concise reply.")])
@@ -3057,8 +3060,73 @@ async def test_direct_smartpbx_provider_requests_use_the_concise_output_budget(
     request = client.requests[0]
     if provider == "gemini":
         assert request["config"]["max_output_tokens"] == 120
+    elif provider == "claude":
+        assert request["max_tokens"] == 600
+        assert request["max_tokens"] == server.SMARTPBX_CLAUDE_MAX_TOKENS
     else:
         assert request["max_tokens"] == 120
+
+
+def test_claude_smartpbx_budget_is_600_and_scoped_away_from_the_other_providers():
+    """The canary raises Claude alone. The shared SmartPBX budget, its
+    resolver and the global ConversationRelay budget must not move."""
+    import server
+
+    assert server.SMARTPBX_CLAUDE_MAX_TOKENS == 600
+    assert server.SMARTPBX_MAX_TOKENS == 120
+    assert server.MAX_TOKENS == 300
+    assert server._resolve_smartpbx_max_tokens(None) == 120
+    assert server._resolve_smartpbx_max_tokens("201") == 200
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 600),
+        ("", 600),
+        ("199", 200),
+        ("200", 200),
+        ("600", 600),
+        ("1024", 1024),
+        ("4096", 1024),
+        ("not-an-int", 600),
+    ],
+)
+def test_claude_smartpbx_output_token_resolver_defaults_and_clamps(raw, expected):
+    import server
+
+    assert server._resolve_smartpbx_claude_max_tokens(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("text_content", "tool_use_blocks", "incomplete", "malformed", "stop_reason", "expected"),
+    [
+        ("Hello.", [], False, False, "end_turn", "completed"),
+        ("", [{"name": "check_availability"}], False, False, "tool_use", "completed"),
+        ("", [], True, False, "max_tokens", "max_tokens_truncated"),
+        ("", [], False, False, "max_tokens", "max_tokens_truncated"),
+        ("", [], True, False, None, "incomplete_tool_block"),
+        ("", [], True, False, "end_turn", "incomplete_tool_block"),
+        ("", [], False, True, "tool_use", "malformed_tool_json"),
+        ("", [], False, False, "end_turn", "true_empty"),
+        ("   ", [], False, False, None, "true_empty"),
+    ],
+)
+def test_claude_round_outcome_classification_is_exhaustive(
+    text_content, tool_use_blocks, incomplete, malformed, stop_reason, expected
+):
+    import server
+
+    outcome = server._classify_claude_round_outcome(
+        text_content=text_content,
+        tool_use_blocks=tool_use_blocks,
+        incomplete_tool_block=incomplete,
+        malformed_tool_json=malformed,
+        stop_reason=stop_reason,
+    )
+
+    assert outcome is server.SmartPBXClaudeRoundOutcome(expected)
+    assert outcome.value == expected
 
 
 @pytest.mark.asyncio
@@ -3471,6 +3539,356 @@ async def test_smartpbx_empty_after_tool_start_never_replays_and_speaks_recovery
     assert server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT in spoken
     assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
     assert server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT in result
+
+
+# ── Claude stream-outcome classification ────────────────────────────────
+#
+# Claude Sonnet 5 runs adaptive thinking by default, which the runner had
+# never seen a fixture for, and the SDK reports WHY a turn ended only on
+# `message_delta` -- which the runner had never read. Between them, a turn
+# whose tool block was cut off by the output budget looked exactly like a
+# turn that said nothing at all. These fixtures reproduce the real stream
+# shapes so the five outcomes can be told apart.
+
+
+def claude_thinking_events(thinking="Weighing the caller's dates."):
+    """The thinking block Sonnet 5 emits before its visible output."""
+    return [
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(type="thinking"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="thinking_delta", thinking=thinking),
+        ),
+        SimpleNamespace(type="content_block_stop"),
+    ]
+
+
+def claude_message_delta(stop_reason, output_tokens):
+    return SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason=stop_reason),
+        usage=SimpleNamespace(output_tokens=output_tokens),
+    )
+
+
+def claude_truncated_tool_round(tool_name="check_availability"):
+    """The live failure: thinking, then a tool block whose JSON is cut off by
+    the output budget. No `content_block_stop` ever arrives and the turn ends
+    with `stop_reason=max_tokens`."""
+    return claude_thinking_events() + [
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(type="tool_use", id="tool-cut", name=tool_name),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json='{"check_in": "2026-09-2'),
+        ),
+        claude_message_delta("max_tokens", 600),
+    ]
+
+
+def claude_incomplete_tool_round(tool_name="create_booking"):
+    """An unterminated tool block with NO max_tokens stop -- a stream defect
+    rather than a budget truncation, so it must classify differently."""
+    return [
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(type="tool_use", id="tool-partial", name=tool_name),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json='{"guest_name": "Mi'),
+        ),
+    ]
+
+
+def claude_malformed_tool_round(tool_name="create_booking"):
+    """A tool block that DID terminate, carrying unparseable JSON."""
+    return [
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(type="tool_use", id="tool-bad", name=tool_name),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json="{not json at all"),
+        ),
+        SimpleNamespace(type="content_block_stop"),
+        claude_message_delta("tool_use", 180),
+    ]
+
+
+def _claude_outcome_pipeline(server, rounds, monkeypatch):
+    client = direct_tool_client("claude", rounds)
+    pipeline = direct_tool_pipeline(server, "claude", client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    return client, pipeline
+
+
+def _logged_round_outcomes(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "event=llm_round_outcome" in record.getMessage()
+    ]
+
+
+def _forbidden_tool(*_args, **_kwargs):
+    raise AssertionError("a discarded tool block must never be executed")
+
+
+def _history_has_tool_use(pipeline):
+    for message in pipeline.history:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content
+        ):
+            return True
+    return False
+
+
+@pytest.mark.asyncio
+async def test_claude_thinking_block_then_text_completes_and_is_spoken(monkeypatch, caplog):
+    """(a) Adaptive thinking is enabled and must pass through untouched: the
+    thinking block is neither spoken nor mistaken for content."""
+    import server
+
+    rounds = [claude_thinking_events() + direct_text_round("claude", "We have rooms free.")]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    assert "We have rooms free." in result
+    assert "We have rooms free." in spoken
+    assert "Weighing the caller's dates." not in " ".join(spoken)
+    assert len(client.requests) == 1
+    outcomes = _logged_round_outcomes(caplog)
+    assert len(outcomes) == 1
+    assert "outcome=completed" in outcomes[0]
+
+
+@pytest.mark.asyncio
+async def test_claude_thinking_block_then_complete_tool_executes(monkeypatch, caplog):
+    """(b) Thinking followed by a COMPLETE tool block still executes the tool."""
+    import server
+
+    rounds = [
+        claude_thinking_events() + direct_tool_round("claude", {"safe": "value"}),
+        direct_text_round("claude", "That is confirmed."),
+    ]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    executed = []
+
+    async def speak(*_args, **_kwargs):
+        return None
+
+    async def record_tool(name, arguments):
+        executed.append((name, arguments))
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", record_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    assert [name for name, _ in executed] == ["create_booking"]
+    assert "That is confirmed." in result
+    assert len(client.requests) == 2
+    outcomes = _logged_round_outcomes(caplog)
+    assert len(outcomes) == 2
+    assert all("outcome=completed" in line for line in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_claude_max_tokens_truncation_is_classified_and_never_runs_the_tool(
+    monkeypatch, caplog
+):
+    """(c) The live bug. A budget-truncated tool block is reported as
+    truncation -- not as an empty turn -- retried exactly once, and then
+    recovered from. The half-streamed tool must never run."""
+    import server
+
+    rounds = [claude_truncated_tool_round(), claude_truncated_tool_round()]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(server, "execute_tool", _forbidden_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    outcomes = _logged_round_outcomes(caplog)
+    assert len(outcomes) == 2
+    assert all("outcome=max_tokens_truncated" in line for line in outcomes)
+    assert "stop_reason=max_tokens" in outcomes[0]
+    assert "output_tokens=600" in outcomes[0]
+    assert "attempt=1" in outcomes[0] and "attempt=2" in outcomes[1]
+
+    # Protection #7: exactly one retry, then the existing recovery line.
+    assert len(client.requests) == 2
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+    assert not _history_has_tool_use(pipeline)
+
+
+@pytest.mark.asyncio
+async def test_claude_incomplete_tool_block_is_discarded_and_never_stored(monkeypatch, caplog):
+    """(d) A tool block that never reached `content_block_stop` is dropped
+    whole: not executed, not written to history, and reported as its own
+    outcome rather than as a truncation."""
+    import server
+
+    rounds = [claude_incomplete_tool_round(), claude_incomplete_tool_round()]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(server, "execute_tool", _forbidden_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    outcomes = _logged_round_outcomes(caplog)
+    assert len(outcomes) == 2
+    assert all("outcome=incomplete_tool_block" in line for line in outcomes)
+    assert "stop_reason=none" in outcomes[0]
+
+    assert len(client.requests) == 2
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+    assert not _history_has_tool_use(pipeline)
+
+
+@pytest.mark.asyncio
+async def test_claude_malformed_tool_json_is_discarded_and_never_stored(monkeypatch, caplog):
+    """A terminated tool block with unparseable JSON is discarded too --
+    executing it would invent arguments the model never sent."""
+    import server
+
+    rounds = [claude_malformed_tool_round(), claude_malformed_tool_round()]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(server, "execute_tool", _forbidden_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    outcomes = _logged_round_outcomes(caplog)
+    assert outcomes and all("outcome=malformed_tool_json" in line for line in outcomes)
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+    assert not _history_has_tool_use(pipeline)
+
+
+@pytest.mark.asyncio
+async def test_claude_true_empty_round_keeps_existing_retry_and_recovery(monkeypatch, caplog):
+    """(e) A clean stop with no content at all is still `true_empty`, and its
+    caller-facing handling is unchanged."""
+    import server
+
+    rounds = [
+        [claude_message_delta("end_turn", 3)],
+        [claude_message_delta("end_turn", 3)],
+    ]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    outcomes = _logged_round_outcomes(caplog)
+    assert len(outcomes) == 2
+    assert all("outcome=true_empty" in line for line in outcomes)
+    assert "stop_reason=end_turn" in outcomes[0]
+
+    assert len(client.requests) == 2
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+
+
+@pytest.mark.asyncio
+async def test_claude_plain_text_round_behaviour_is_unchanged(monkeypatch, caplog):
+    """(f) The ordinary case: one round, spoken, no retry, no recovery."""
+    import server
+
+    rounds = [direct_text_round("claude", "Certainly, Mr Fernando.")]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    assert "Certainly, Mr Fernando." in result
+    assert "Certainly, Mr Fernando." in spoken
+    assert len(client.requests) == 1
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
+    outcomes = _logged_round_outcomes(caplog)
+    assert len(outcomes) == 1
+    assert "outcome=completed" in outcomes[0]
+    assert "stop_reason=none" in outcomes[0]
+
+
+@pytest.mark.asyncio
+async def test_claude_round_outcome_log_line_carries_no_caller_content(monkeypatch, caplog):
+    """Spec §5: the outcome log is an enum, a stop reason, a token count and
+    an attempt index -- never text, tool arguments or caller identifiers."""
+    import server
+
+    secret_json = '{"guest_name": "private-guest-sentinel'
+    round_events = [
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(type="tool_use", id="tool-x", name="create_booking"),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json=secret_json),
+        ),
+        claude_message_delta("max_tokens", 600),
+    ]
+    client, pipeline = _claude_outcome_pipeline(
+        server, [round_events, list(round_events)], monkeypatch
+    )
+
+    async def speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "execute_tool", _forbidden_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        await pipeline._run_llm_claude()
+
+    for line in _logged_round_outcomes(caplog):
+        assert "private-guest-sentinel" not in line
+        assert "guest_name" not in line
+        assert "create_booking" not in line
 
 
 @pytest.mark.asyncio

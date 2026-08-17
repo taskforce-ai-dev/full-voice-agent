@@ -112,6 +112,7 @@ SMARTPBX_MAX_MESSAGE_CHARS=65536
 SMARTPBX_MAX_AUDIO_BYTES=32768
 SMARTPBX_MAX_OUTBOUND_FRAMES=512
 SMARTPBX_MAX_TOKENS=
+SMARTPBX_CLAUDE_MAX_TOKENS=
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=
 SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS=
 SMARTPBX_LLM_STALL_TIMEOUT_SECONDS=
@@ -214,6 +215,41 @@ hears "I'm sorry, I wasn't able to give you a clear update. Would you like me
 to continue?". Capture-name, capture-number and keypad flows keep their own
 specialised logic and are excluded from the initial filler and from this
 retry/recovery policy.
+
+## Claude direct SmartPBX output budget (600-token canary)
+
+`SMARTPBX_MAX_TOKENS` (default `120`, clamp `[40, 200]`) is the shared direct
+SmartPBX English output budget and still governs the OpenAI and Gemini rounds
+unchanged. Claude is the one exception:
+
+- `SMARTPBX_CLAUDE_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) — the
+  Claude-only direct SmartPBX English output budget. Leave it blank to take
+  the default.
+
+Claude Sonnet 5 runs adaptive thinking by default, and that thinking is spent
+out of the same output budget before any visible block opens. At 120 tokens a
+tool-calling turn ran out of budget part-way through the `tool_use` block: the
+block never reached `content_block_stop`, so it was never accumulated, and the
+round was misread as an empty response — the caller heard the recovery line
+and the tool never ran. Raising the Claude budget gives the thinking plus a
+full tool block room to complete. Adaptive thinking stays enabled; nothing
+passes a `thinking` parameter.
+
+Nothing else moves: the global ConversationRelay/Twilio `MAX_TOKENS` (300),
+every Twilio-path budget, and the OpenAI/Gemini SmartPBX budgets are untouched.
+
+Each Claude round now logs one privacy-safe outcome line —
+`smartpbx_media event=llm_round_outcome provider=claude outcome=<enum>
+stop_reason=<reason> output_tokens=<n> attempt=<n>` — carrying no text, no
+tool arguments and no caller identifiers. `outcome` is one of `completed`,
+`max_tokens_truncated`, `true_empty`, `incomplete_tool_block`, or
+`malformed_tool_json`; anything other than `completed` logs at WARNING.
+Watch for `max_tokens_truncated` while the canary is live: a non-zero rate
+means the budget is still too small for the turns being attempted. Truncated
+and incomplete-tool rounds keep exactly the caller-facing handling of the
+existing empty path (one retry, then the recovery line), and a truncated or
+unparseable tool block is always discarded — never executed, never written to
+history.
 
 ## Dialog dashboard fields
 

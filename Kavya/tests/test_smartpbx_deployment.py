@@ -429,6 +429,32 @@ def test_new_smartpbx_caller_rhythm_knobs_are_blank_safe_passthroughs():
     ) is None
 
 
+def test_claude_output_budget_knob_is_a_blank_safe_passthrough_everywhere():
+    """The Claude-only canary budget follows the same blank-safe convention as
+    the shared one: allowlisted in the kavya-smartpbx service, present but
+    unset in both templates, so a deploy inherits the in-code default rather
+    than a stale pinned number."""
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
+
+    assert (
+        smartpbx_env.get("SMARTPBX_CLAUDE_MAX_TOKENS")
+        == "${SMARTPBX_CLAUDE_MAX_TOKENS:-}"
+    )
+
+    example = read_text(".env.example")
+    assert re.search(r"^SMARTPBX_CLAUDE_MAX_TOKENS=$", example, re.MULTILINE)
+    assert re.search(r"^SMARTPBX_CLAUDE_MAX_TOKENS=\d", example, re.MULTILINE) is None
+
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    template = runbook.split("```dotenv", 1)[1].split("```", 1)[0]
+    assert re.search(r"^SMARTPBX_CLAUDE_MAX_TOKENS=$", template, re.MULTILINE)
+    assert re.search(r"^SMARTPBX_CLAUDE_MAX_TOKENS=\d", template, re.MULTILINE) is None
+
+    # The knob is Claude-only by documentation as well as by code.
+    assert "SMARTPBX_CLAUDE_MAX_TOKENS" in runbook
+
+
 def test_runbook_smartpbx_template_keeps_caller_rhythm_knobs_blank_and_private():
     runbook = read_text("SMARTPBX_RUNBOOK.md")
     template = runbook.split("```dotenv", 1)[1].split("```", 1)[0]
