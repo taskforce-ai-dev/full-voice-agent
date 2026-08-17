@@ -429,6 +429,32 @@ def test_new_smartpbx_caller_rhythm_knobs_are_blank_safe_passthroughs():
     ) is None
 
 
+def test_claude_output_budget_knob_is_a_blank_safe_passthrough_everywhere():
+    """The Claude-only canary budget follows the same blank-safe convention as
+    the shared one: allowlisted in the kavya-smartpbx service, present but
+    unset in both templates, so a deploy inherits the in-code default rather
+    than a stale pinned number."""
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
+
+    assert (
+        smartpbx_env.get("SMARTPBX_CLAUDE_MAX_TOKENS")
+        == "${SMARTPBX_CLAUDE_MAX_TOKENS:-}"
+    )
+
+    example = read_text(".env.example")
+    assert re.search(r"^SMARTPBX_CLAUDE_MAX_TOKENS=$", example, re.MULTILINE)
+    assert re.search(r"^SMARTPBX_CLAUDE_MAX_TOKENS=\d", example, re.MULTILINE) is None
+
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    template = runbook.split("```dotenv", 1)[1].split("```", 1)[0]
+    assert re.search(r"^SMARTPBX_CLAUDE_MAX_TOKENS=$", template, re.MULTILINE)
+    assert re.search(r"^SMARTPBX_CLAUDE_MAX_TOKENS=\d", template, re.MULTILINE) is None
+
+    # The knob is Claude-only by documentation as well as by code.
+    assert "SMARTPBX_CLAUDE_MAX_TOKENS" in runbook
+
+
 def test_runbook_smartpbx_template_keeps_caller_rhythm_knobs_blank_and_private():
     runbook = read_text("SMARTPBX_RUNBOOK.md")
     template = runbook.split("```dotenv", 1)[1].split("```", 1)[0]
@@ -483,6 +509,81 @@ def test_smartpbx_stream_timeout_knobs_are_blank_safe_and_documented():
     assert "Twilio Media Streams" in runbook.split(
         "## Direct SmartPBX English reliability timing", 1
     )[1][:600]
+
+
+def test_runbook_allowlists_llm_round_outcome_with_its_exact_bounded_field_set():
+    """A new emitted event is only permitted once it is in the finite approved
+    allowlist WITH its closed field set. Documenting the field set is the whole
+    point — `stop_reason` used to be a raw provider string, which is an open
+    text channel dressed as telemetry."""
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    cutover = runbook.split("## Cutover gates", 1)[1].split("\n## ", 1)[0]
+
+    assert "`llm_round_outcome`" in cutover
+    for field in ("provider", "outcome", "stop_reason", "output_tokens", "attempt"):
+        assert f"`{field}`" in cutover, field
+    # The complete outcome vocabulary, including the abrupt-EOF member.
+    for outcome in (
+        "completed",
+        "max_tokens_truncated",
+        "true_empty",
+        "incomplete_tool_block",
+        "malformed_tool_json",
+        "stream_aborted",
+    ):
+        assert outcome in cutover, outcome
+    # The complete stop_reason vocabulary plus both catch-all buckets.
+    for stop_reason in (
+        "end_turn",
+        "max_tokens",
+        "tool_use",
+        "stop_sequence",
+        "refusal",
+        "unknown",
+    ):
+        assert stop_reason in cutover, stop_reason
+    normalized_cutover = re.sub(r"\s+", " ", cutover).lower()
+    assert "the raw provider string is never emitted" in normalized_cutover
+    assert "clamped" in normalized_cutover
+
+
+def test_runbook_names_the_sonnet_5_canary_model_and_the_600_budget_rationale():
+    """The runbook template used to hand operators `claude-sonnet-4-5-20250929`
+    for `.env.smartpbx` while the canary and prod ran `claude-sonnet-5` — and
+    the whole reason the Claude budget is 600 is Sonnet 5's default-on adaptive
+    thinking. Resolve both in one place so the docs stop contradicting the
+    deployment."""
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    template = runbook.split("```dotenv", 1)[1].split("```", 1)[0]
+    budget = runbook.split(
+        "## Claude direct SmartPBX output budget", 1
+    )[1].split("\n## ", 1)[0]
+    normalized_budget = re.sub(r"\s+", " ", budget).lower()
+
+    assert re.search(r"^CLAUDE_MODEL=claude-sonnet-5$", template, re.MULTILINE)
+    assert "claude-sonnet-4-5-20250929" not in template
+
+    assert "claude-sonnet-5" in budget
+    # Thinking is default-on and kept on deliberately — never disabled anywhere.
+    assert "adaptive thinking on by default" in normalized_budget
+    assert "kept" in normalized_budget and "deliberately" in normalized_budget
+    # The budget rationale: thinking AND a full tool block must both fit.
+    assert "thinking block and a full tool block must both fit" in normalized_budget
+    assert "600" in budget
+    # The 4.5 default is explained, not silently contradicted.
+    assert "claude-sonnet-4-5-20250929" in budget
+
+
+def test_env_example_explains_the_smartpbx_model_and_budget_divergence():
+    example = read_text(".env.example")
+
+    claude_block = example.split("# === Claude API ===", 1)[1].split("# === ", 1)[0]
+    assert "claude-sonnet-5" in claude_block
+    assert "SMARTPBX_CLAUDE_MAX_TOKENS=600" in claude_block
+    # The Twilio-path pin itself is unchanged.
+    assert re.search(
+        r"^CLAUDE_MODEL=claude-sonnet-4-5-20250929$", example, re.MULTILINE
+    )
 
 
 def test_runbook_allows_only_privacy_safe_telemetry_and_bounded_local_retention():

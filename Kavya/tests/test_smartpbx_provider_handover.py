@@ -107,6 +107,21 @@ class FakeGemini:
         self.aio = SimpleNamespace(models=FakeGeminiModels(self))
 
 
+def _claude_terminal_events(stop_reason: str, output_tokens: int) -> list[object]:
+    """How every real Claude stream ends. The round classifier treats a stream
+    that delivered neither `message_delta` nor `message_stop` as aborted, so a
+    fixture that omits these describes a dropped connection rather than the
+    ordinary round these tests are about."""
+    return [
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason=stop_reason),
+            usage=SimpleNamespace(output_tokens=output_tokens),
+        ),
+        SimpleNamespace(type="message_stop"),
+    ]
+
+
 def _claude_tool_events(tools: list[dict[str, object]]) -> list[object]:
     events = []
     for index, tool in enumerate(tools):
@@ -128,6 +143,7 @@ def _claude_tool_events(tools: list[dict[str, object]]) -> list[object]:
                 SimpleNamespace(type="content_block_stop"),
             ]
         )
+    events.extend(_claude_terminal_events("tool_use", 180))
     return events
 
 
@@ -136,7 +152,8 @@ def _claude_text_events(text: str) -> list[object]:
         SimpleNamespace(
             type="content_block_delta",
             delta=SimpleNamespace(type="text_delta", text=text),
-        )
+        ),
+        *_claude_terminal_events("end_turn", 120),
     ]
 
 

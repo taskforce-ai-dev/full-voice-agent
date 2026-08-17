@@ -661,11 +661,24 @@ class _GatedClaudeClient:
         self.messages = _GatedClaudeMessages(_GatedClaudeStream(events, release))
 
 
-def _claude_text_event(text: str):
-    return SimpleNamespace(
-        type="content_block_delta",
-        delta=SimpleNamespace(type="text_delta", text=text),
-    )
+def _claude_text_events(text: str) -> list:
+    """One spoken text delta plus the terminal metadata every real Claude
+    stream ends with. The round classifier reads a stream that delivered
+    neither `message_delta` nor `message_stop` as aborted, so without these the
+    failover round would be discarded as a transport failure instead of
+    answering the turn."""
+    return [
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text=text),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=SimpleNamespace(output_tokens=120),
+        ),
+        SimpleNamespace(type="message_stop"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -687,7 +700,7 @@ async def test_fix5_gemini_immediate_exception_failover_adopts_filler_fires_once
     session, spoken = _media_stream_session(gemini_turns=[FakeToolError()])
     release_claude_content = asyncio.Event()
     session.anthropic_client = _GatedClaudeClient(
-        [_claude_text_event("Claude answered the turn. ")], release_claude_content
+        _claude_text_events("Claude answered the turn. "), release_claude_content
     )
 
     runner_task = asyncio.create_task(session._run_llm_gemini())
@@ -750,7 +763,7 @@ async def test_fix5_gemini_immediate_exception_failover_retires_already_spoken_f
     session.gemini_client.aio.models = _GatedFailureGeminiModels(session.gemini_client, gate)
     release_claude_content = asyncio.Event()
     session.anthropic_client = _GatedClaudeClient(
-        [_claude_text_event("Claude answered the turn. ")], release_claude_content
+        _claude_text_events("Claude answered the turn. "), release_claude_content
     )
 
     retired: list[object] = []

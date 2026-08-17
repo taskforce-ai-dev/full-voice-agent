@@ -34,6 +34,7 @@ import asyncio
 import audioop
 import base64
 import contextlib
+import enum
 import json
 import logging
 import math
@@ -518,6 +519,29 @@ def _resolve_smartpbx_max_tokens(raw: object) -> int:
     return min(max(value, 40), 200)
 
 
+def _resolve_smartpbx_claude_max_tokens(raw: object) -> int:
+    """Resolve the Claude-ONLY direct-SmartPBX output budget (canary: 600).
+
+    Claude Sonnet 5 runs adaptive thinking by default, so a tool-calling turn
+    spends its first ~50-140 output tokens inside a thinking block before the
+    tool_use block even opens. A `check_availability` call needs roughly 160
+    output tokens on its own, so at the shared 120-token SmartPBX budget the
+    turn hit stop_reason=max_tokens part-way through the tool block: the block
+    never reached `content_block_stop`, was therefore never accumulated, and
+    the round was misread as an empty response.
+
+    This budget is deliberately Claude-only. OpenAI and Gemini emit no
+    thinking tokens, their SmartPBX rounds fit inside SMARTPBX_MAX_TOKENS,
+    and they must stay on it (see `_provider_max_tokens`). The global
+    ConversationRelay/Twilio `MAX_TOKENS` is likewise untouched.
+    """
+    try:
+        value = int(raw) if raw not in (None, "") else 600
+    except (TypeError, ValueError):
+        value = 600
+    return min(max(value, 200), 1024)
+
+
 def _resolve_smartpbx_initial_filler_delay(raw: object) -> float:
     try:
         value = float(raw) if raw not in (None, "") else 1.5
@@ -551,6 +575,9 @@ def _resolve_smartpbx_llm_stall_timeout_seconds(raw: object) -> float:
 SMARTPBX_MAX_TOKENS: int = _resolve_smartpbx_max_tokens(
     os.getenv("SMARTPBX_MAX_TOKENS")
 )
+SMARTPBX_CLAUDE_MAX_TOKENS: int = _resolve_smartpbx_claude_max_tokens(
+    os.getenv("SMARTPBX_CLAUDE_MAX_TOKENS")
+)
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS: float = _resolve_smartpbx_initial_filler_delay(
     os.getenv("SMARTPBX_INITIAL_FILLER_DELAY_SECONDS")
 )
@@ -562,6 +589,162 @@ SMARTPBX_LLM_STALL_TIMEOUT_SECONDS: float = _resolve_smartpbx_llm_stall_timeout_
 )
 MAX_HISTORY_MESSAGES: int = 60
 MAX_TOOL_ROUNDS: int = 5
+
+class SmartPBXClaudeRoundOutcome(str, enum.Enum):
+    """How one Claude streaming round actually ended.
+
+    Before this existed the runner asked a single question -- "is there text
+    or a complete tool block?" -- and called everything else EMPTY. That
+    conflated a clean no-content turn with a turn whose tool block was cut
+    off mid-JSON by the output budget, which made the real failure mode
+    (max_tokens truncation) invisible in the logs. These six outcomes are
+    mutually exclusive and classified in `_classify_claude_round_outcome`.
+
+    `COMPLETED` is the ONLY outcome that may proceed to speak or dispatch
+    tools. Every other member routes to the shared retry-once-then-recovery
+    path; the classification, not an ad-hoc content check, is what decides.
+    """
+
+    COMPLETED = "completed"
+    MAX_TOKENS_TRUNCATED = "max_tokens_truncated"
+    TRUE_EMPTY = "true_empty"
+    INCOMPLETE_TOOL_BLOCK = "incomplete_tool_block"
+    MALFORMED_TOOL_JSON = "malformed_tool_json"
+    # The stream ended with no `message_delta` and no `message_stop` -- the
+    # connection dropped mid-turn rather than the model finishing one. Before
+    # this member existed such a round looked byte-identical to a clean
+    # no-content turn and was logged as `true_empty`, hiding a transport fault
+    # behind a model-behaviour label.
+    STREAM_ABORTED = "stream_aborted"
+
+
+# Outcomes whose partial output must be DISCARDED WHOLE before the retry /
+# recovery path runs: no tool from that round is dispatched (not even a
+# `content_block_stop`-complete one that shared the round with a truncated
+# sibling), and any per-sentence TTS already in flight for it is cancelled and
+# generation-fenced. Discarding the complete siblings too is what makes the
+# retry safe: nothing from the round executed, so re-asking is not a replay.
+#
+# TRUE_EMPTY is deliberately NOT here. By construction it produced no text, no
+# tool block and therefore no TTS task, so there is nothing to discard or
+# fence; it keeps exactly the caller-facing handling it always had.
+SMARTPBX_CLAUDE_DISCARD_ROUND_OUTCOMES: frozenset[SmartPBXClaudeRoundOutcome] = (
+    frozenset({
+        SmartPBXClaudeRoundOutcome.MAX_TOKENS_TRUNCATED,
+        SmartPBXClaudeRoundOutcome.INCOMPLETE_TOOL_BLOCK,
+        SmartPBXClaudeRoundOutcome.MALFORMED_TOOL_JSON,
+        SmartPBXClaudeRoundOutcome.STREAM_ABORTED,
+    })
+)
+
+
+def _classify_claude_round_outcome(
+    *,
+    text_content: str,
+    tool_use_blocks: list[dict[str, Any]],
+    incomplete_tool_block: bool,
+    malformed_tool_json: bool,
+    stop_reason: str | None,
+    saw_terminal_metadata: bool = True,
+) -> SmartPBXClaudeRoundOutcome:
+    """Classify one Claude round. `tool_use_blocks` holds ONLY blocks that
+    reached `content_block_stop` with parseable JSON -- truncated and
+    malformed blocks are discarded at accumulation time and never reach here,
+    so a caller can act on this result without re-validating it.
+
+    ORDER: TERMINAL FAILURE FIRST, visible output LAST. Whether the round ended
+    badly is decided before -- and independently of -- whether it happened to
+    leave anything usable behind, because partial output from a round that was
+    cut off is not evidence of success; it is the wreckage of the failure.
+    Reading it the other way round is what let a truncated round speak its
+    partial sentence and dispatch its complete tool blocks:
+
+    1. `stop_reason == "max_tokens"` -> MAX_TOKENS_TRUNCATED, unconditionally.
+       The budget ran out mid-turn. The model had more to say and could not say
+       it, so whatever it DID emit is a prefix of an answer, not an answer --
+       even when that prefix is a fully-terminated tool block. A round that
+       genuinely finished never reports this stop reason.
+    2. An unterminated tool block -> INCOMPLETE_TOOL_BLOCK, and unparseable
+       tool JSON -> MALFORMED_TOOL_JSON. These sit under (1) only because
+       max_tokens names the actionable cause of the very same wreckage; under
+       any other stop reason they are the more specific description of a
+       genuine stream defect and must not be laundered into the generic
+       transport label below.
+    3. No `message_delta` and no `message_stop` -> STREAM_ABORTED. The model
+       never reported ending its turn, so the connection dropped mid-stream.
+       This is checked BEFORE visible output for the same reason as (1): text
+       that arrived before an EOF is an unfinished sentence, and a tool block
+       that arrived before an EOF belongs to a batch we never saw the end of.
+       We cannot know what else the round intended to emit.
+    4. Only then does visible output mean COMPLETED -- i.e. a terminal,
+       non-truncated, structurally sound round that produced something.
+    5. Terminal, sound, and empty is TRUE_EMPTY: the model reported ending its
+       turn having chosen to say nothing. That claim is only available once (3)
+       has ruled out an abrupt EOF.
+
+    Every outcome except COMPLETED routes to the retry-once-then-recovery path,
+    and every one that can carry partial output (all of them but TRUE_EMPTY,
+    which by construction produced none) is in
+    `SMARTPBX_CLAUDE_DISCARD_ROUND_OUTCOMES`, so the round is discarded whole
+    and its in-flight TTS fenced before anything else speaks.
+    """
+    if stop_reason == "max_tokens":
+        return SmartPBXClaudeRoundOutcome.MAX_TOKENS_TRUNCATED
+    if incomplete_tool_block:
+        return SmartPBXClaudeRoundOutcome.INCOMPLETE_TOOL_BLOCK
+    if malformed_tool_json:
+        return SmartPBXClaudeRoundOutcome.MALFORMED_TOOL_JSON
+    if not saw_terminal_metadata:
+        return SmartPBXClaudeRoundOutcome.STREAM_ABORTED
+    if text_content.strip() or tool_use_blocks:
+        return SmartPBXClaudeRoundOutcome.COMPLETED
+    return SmartPBXClaudeRoundOutcome.TRUE_EMPTY
+
+
+# The complete set of `stop_reason` values the runner will ever LOG. Anthropic
+# may add new ones and a proxy may return anything at all, so the raw string
+# never reaches a log line: an unrecognised value logs as `unknown` and an
+# absent one as `none`. That keeps `stop_reason` a bounded enum field in the
+# runbook's approved telemetry allowlist rather than an open text channel that
+# could carry a stop_sequence's contents (which are caller-derived).
+SMARTPBX_CLAUDE_STOP_REASONS: frozenset[str] = frozenset({
+    "end_turn", "max_tokens", "tool_use", "stop_sequence", "refusal",
+})
+SMARTPBX_CLAUDE_STOP_REASON_ABSENT: str = "none"
+SMARTPBX_CLAUDE_STOP_REASON_UNKNOWN: str = "unknown"
+# Wide enough that no legitimate Anthropic output budget is ever clamped
+# (the largest published max_tokens is far below this), narrow enough that a
+# corrupt or hostile usage payload cannot write an unbounded numeral.
+SMARTPBX_CLAUDE_MAX_LOGGED_OUTPUT_TOKENS: int = 1_000_000
+SMARTPBX_CLAUDE_MAX_LOGGED_ATTEMPT: int = 9
+
+
+def _normalized_claude_stop_reason(raw: object) -> str:
+    """Map any stop_reason onto the fixed logging enum above."""
+    if raw is None or raw == "":
+        return SMARTPBX_CLAUDE_STOP_REASON_ABSENT
+    if isinstance(raw, str) and raw in SMARTPBX_CLAUDE_STOP_REASONS:
+        return raw
+    return SMARTPBX_CLAUDE_STOP_REASON_UNKNOWN
+
+
+def _bounded_claude_output_tokens(raw: object) -> str:
+    """Clamp the logged output-token count to a sane numeric range.
+
+    Returns `unknown` when the stream never reported usage, so the field is
+    always one of a bounded numeral or that single sentinel.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return "unknown"
+    return str(min(max(raw, 0), SMARTPBX_CLAUDE_MAX_LOGGED_OUTPUT_TOKENS))
+
+
+def _bounded_claude_attempt(raw: object) -> int:
+    """Clamp the logged attempt number to `[1, SMARTPBX_CLAUDE_MAX_LOGGED_ATTEMPT]`."""
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 1
+    return min(max(raw, 1), SMARTPBX_CLAUDE_MAX_LOGGED_ATTEMPT)
+
 
 SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT: str = (
     "I'm sorry, I wasn't able to give you a clear update. Would you like me "
@@ -4412,8 +4595,21 @@ class MediaStreamSession:
         """
         return self._is_direct_smartpbx_english() and not self._is_capture_mode_active()
 
-    def _provider_max_tokens(self) -> int:
-        return SMARTPBX_MAX_TOKENS if self._is_direct_smartpbx_english() else MAX_TOKENS
+    def _provider_max_tokens(self, provider: str | None = None) -> int:
+        """Per-provider output budget for one direct-SmartPBX English round.
+
+        Claude alone is on the raised canary budget, because Sonnet 5's
+        default adaptive thinking spends output tokens before any visible
+        block opens (see `_resolve_smartpbx_claude_max_tokens`). Passing no
+        provider keeps the original behaviour, so the OpenAI and Gemini call
+        sites are unchanged; every non-direct-SmartPBX path still gets the
+        global MAX_TOKENS.
+        """
+        if not self._is_direct_smartpbx_english():
+            return MAX_TOKENS
+        if provider == "claude":
+            return SMARTPBX_CLAUDE_MAX_TOKENS
+        return SMARTPBX_MAX_TOKENS
 
     def _start_initial_smartpbx_filler(
         self, *, round_idx: int, generation: int
@@ -7019,6 +7215,16 @@ class MediaStreamSession:
                 cur_tool_name: str | None = None
                 cur_tool_id: str | None = None
                 tool_json = ""
+                # Round-outcome inputs, reset per attempt: a retry must be
+                # classified on its own stream, never on the previous one's.
+                stop_reason: str | None = None
+                output_tokens: int | None = None
+                malformed_tool_json = False
+                # True once the stream reports the turn is OVER (`message_delta`
+                # carries the stop reason, `message_stop` closes the message).
+                # An abrupt EOF leaves this False and must never be read as a
+                # clean empty turn.
+                saw_terminal_metadata = False
 
                 sentence_buffer = ""
                 tts_tasks: list[asyncio.Task] = []
@@ -7040,7 +7246,7 @@ class MediaStreamSession:
                 acquire_deadline = time.monotonic() + SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS
                 stream_cm = self.anthropic_client.messages.stream(
                     model=self.model,
-                    max_tokens=self._provider_max_tokens(),
+                    max_tokens=self._provider_max_tokens("claude"),
                     system=system_blocks,
                     messages=self.history,
                     tools=self.tools if self.tools else NOT_GIVEN,
@@ -7112,15 +7318,46 @@ class MediaStreamSession:
                                         else:
                                             logger.error("Bad tool JSON for %s: %s",
                                                          cur_tool_name, tool_json[:200])
-                                        parsed = {}
-                                    tool_use_blocks.append({
-                                        "id": cur_tool_id,
-                                        "name": cur_tool_name,
-                                        "input": parsed,
-                                    })
+                                        # Discard, never execute. Running a
+                                        # tool on arguments we failed to parse
+                                        # invents a side effect the model never
+                                        # actually asked for; the outcome
+                                        # classification below carries the
+                                        # failure instead.
+                                        malformed_tool_json = True
+                                        parsed = None
+                                    if parsed is not None:
+                                        tool_use_blocks.append({
+                                            "id": cur_tool_id,
+                                            "name": cur_tool_name,
+                                            "input": parsed,
+                                        })
                                     cur_tool_name = None
                                     cur_tool_id = None
                                     tool_json = ""
+
+                            elif event.type == "message_delta":
+                                # The only place Claude reports WHY the turn
+                                # ended. Without it a budget-truncated tool
+                                # turn is indistinguishable from a genuinely
+                                # empty one.
+                                saw_terminal_metadata = True
+                                delta = getattr(event, "delta", None)
+                                delta_stop = getattr(delta, "stop_reason", None)
+                                if delta_stop:
+                                    stop_reason = delta_stop
+                                usage = getattr(event, "usage", None)
+                                delta_output_tokens = getattr(usage, "output_tokens", None)
+                                if delta_output_tokens is not None:
+                                    output_tokens = delta_output_tokens
+
+                            elif event.type == "message_stop":
+                                # The message closed cleanly. Recorded even
+                                # though it carries no payload: together with
+                                # `message_delta` it is the ONLY evidence that
+                                # the stream ended because the turn ended,
+                                # rather than because the connection dropped.
+                                saw_terminal_metadata = True
                 except _SmartPBXStreamTimeout as timeout_exc:
                     return await self._smartpbx_handle_stream_timeout(
                         timeout_exc, provider="claude",
@@ -7131,10 +7368,78 @@ class MediaStreamSession:
                 if not self._current_smartpbx_runner_owns_shared_state():
                     return ""
 
-                if text_content.strip() or tool_use_blocks:
+                # A tool block still open when the stream ended never reached
+                # `content_block_stop`, so it was never accumulated and must
+                # never be executed -- that is precisely the truncation bug.
+                # Drop the partial JSON here so nothing downstream can see it.
+                incomplete_tool_block = cur_tool_name is not None
+                if incomplete_tool_block:
+                    cur_tool_name = None
+                    cur_tool_id = None
+                    tool_json = ""
+                outcome = _classify_claude_round_outcome(
+                    text_content=text_content,
+                    tool_use_blocks=tool_use_blocks,
+                    incomplete_tool_block=incomplete_tool_block,
+                    malformed_tool_json=malformed_tool_json,
+                    stop_reason=stop_reason,
+                    saw_terminal_metadata=saw_terminal_metadata,
+                )
+                if self._is_smartpbx_session():
+                    # Privacy-safe by construction: an enum, a bounded stop
+                    # reason enum, a clamped token count and a clamped attempt
+                    # index -- no text, no tool arguments, no caller
+                    # identifiers, and no unbounded field of any kind.
+                    log_round_outcome = (
+                        logger.info
+                        if outcome is SmartPBXClaudeRoundOutcome.COMPLETED
+                        else logger.warning
+                    )
+                    log_round_outcome(
+                        "smartpbx_media event=llm_round_outcome provider=claude "
+                        "outcome=%s stop_reason=%s output_tokens=%s attempt=%d",
+                        outcome.value,
+                        _normalized_claude_stop_reason(stop_reason),
+                        _bounded_claude_output_tokens(output_tokens),
+                        _bounded_claude_attempt(attempt + 1),
+                    )
+
+                # THE decision point. The classified outcome -- not a re-check
+                # of what happens to be in `text_content`/`tool_use_blocks` --
+                # decides whether this round proceeds or is retried/recovered.
+                if outcome is SmartPBXClaudeRoundOutcome.COMPLETED:
                     break
                 if not smartpbx_direct:
+                    # Twilio Media Streams (ar/si/ta) never had the retry or
+                    # the shared recovery line; it proceeds with whatever the
+                    # round produced exactly as before. Only the direct
+                    # SmartPBX English path is outcome-driven.
                     break
+                if outcome in SMARTPBX_CLAUDE_DISCARD_ROUND_OUTCOMES:
+                    # Nothing this round produced may be acted on. Dropping the
+                    # COMPLETE tool blocks too is deliberate: a round that also
+                    # truncated is not a batch we may half-execute, and because
+                    # nothing has executed yet the retry below is a fresh ask,
+                    # not a replay of a committed side effect.
+                    text_content = ""
+                    tool_use_blocks = []
+                    sentence_buffer = ""
+                    # Same atomic ordering the stall path uses (filler first so
+                    # its in-flight TTS cannot still hold `_speak_lock`, then
+                    # cancel/await this round's per-sentence tasks, one
+                    # generation advance, runner context, then speak): a
+                    # preamble sentence may already be streaming when the tool
+                    # block truncated, and neither the retry nor the recovery
+                    # line may talk over it or leave it half delivered.
+                    await self._smartpbx_cancel_stalled_filler(gen)
+                    gen = await self._smartpbx_fence_stalled_generation(
+                        tts_tasks=tts_tasks, gen=gen
+                    )
+                    tts_tasks = []
+                    # The filler is retired; do not let a later delta in this
+                    # round's retry poke a controller this transition already
+                    # finished.
+                    initial_filler = None
                 # Only retry when there IS a next attempt to take (i.e. this
                 # turn had not yet started a tool when max_attempts was
                 # computed) and the one retry has not already been spent.
@@ -7149,7 +7454,8 @@ class MediaStreamSession:
                 if self._is_smartpbx_session():
                     logger.warning(
                         "smartpbx_media event=llm_empty_response provider=claude "
-                        "attempt=%d retrying=false", attempt + 1,
+                        "attempt=%d retrying=false",
+                        _bounded_claude_attempt(attempt + 1),
                     )
                 return await self._smartpbx_speak_recovery_and_finish(
                     tool_executed=tool_executed, gen=gen, full_text=full_text,
