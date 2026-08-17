@@ -71,7 +71,7 @@ and do not add Twilio credentials or `HUMAN_AGENT_PHONE`.
 ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 LLM_PROVIDER=claude
-CLAUDE_MODEL=claude-sonnet-4-5-20250929
+CLAUDE_MODEL=claude-sonnet-5
 OPENAI_MODEL=gpt-4o
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash
@@ -226,30 +226,59 @@ unchanged. Claude is the one exception:
   Claude-only direct SmartPBX English output budget. Leave it blank to take
   the default.
 
-Claude Sonnet 5 runs adaptive thinking by default, and that thinking is spent
-out of the same output budget before any visible block opens. At 120 tokens a
-tool-calling turn ran out of budget part-way through the `tool_use` block: the
-block never reached `content_block_stop`, so it was never accumulated, and the
-round was misread as an empty response — the caller heard the recovery line
-and the tool never ran. Raising the Claude budget gives the thinking plus a
-full tool block room to complete. Adaptive thinking stays enabled; nothing
-passes a `thinking` parameter.
+**Canary model: `claude-sonnet-5`.** This is what the SmartPBX canary and prod
+run, and it is what `CLAUDE_MODEL` in the `.env.smartpbx` template above is set
+to. Do not read `server.py`'s hard-coded `CLAUDE_MODEL` env-default
+(`claude-sonnet-4-5-20250929`) as the SmartPBX model — that default is the
+Twilio path's pinned non-retired snapshot and a last-resort fallback for a
+container started with no model configured at all. `.env.smartpbx` always sets
+the model explicitly, so the two never disagree in practice; the 4.5 default is
+deliberately left alone (see `tests/test_llm_default_model.py`).
+
+Sonnet 5 runs **adaptive thinking on by default, and that is kept
+deliberately** — it is what makes the model reliable at picking the right
+booking tool and arguments on a noisy phone transcript. Nothing anywhere passes
+a `thinking` parameter, and nothing disables it.
+
+**Why 600: the thinking block AND a full tool block must both fit in one
+budget.** Thinking is spent out of the same output allowance before any visible
+block opens (roughly the first 50–140 tokens), and a `check_availability` call
+needs about 160 output tokens on its own. At the shared 120-token budget a
+tool-calling turn ran out part-way through the `tool_use` block: the block
+never reached `content_block_stop`, so it was never accumulated, and the round
+was misread as an empty response — the caller heard the recovery line and the
+tool never ran. 600 leaves room for both. If `max_tokens_truncated` appears at
+a non-zero rate while the canary is live, that is this ceiling being hit again,
+not a model fault.
 
 Nothing else moves: the global ConversationRelay/Twilio `MAX_TOKENS` (300),
 every Twilio-path budget, and the OpenAI/Gemini SmartPBX budgets are untouched.
 
-Each Claude round now logs one privacy-safe outcome line —
+Each Claude round logs exactly one privacy-safe outcome line —
 `smartpbx_media event=llm_round_outcome provider=claude outcome=<enum>
-stop_reason=<reason> output_tokens=<n> attempt=<n>` — carrying no text, no
-tool arguments and no caller identifiers. `outcome` is one of `completed`,
-`max_tokens_truncated`, `true_empty`, `incomplete_tool_block`, or
-`malformed_tool_json`; anything other than `completed` logs at WARNING.
-Watch for `max_tokens_truncated` while the canary is live: a non-zero rate
-means the budget is still too small for the turns being attempted. Truncated
-and incomplete-tool rounds keep exactly the caller-facing handling of the
-existing empty path (one retry, then the recovery line), and a truncated or
-unparseable tool block is always discarded — never executed, never written to
-history.
+stop_reason=<enum> output_tokens=<bounded n|unknown> attempt=<1-9>` — carrying
+no text, no tool arguments and no caller identifiers. See the cutover-gate
+allowlist below for the exact, closed field set. `outcome` is one of
+`completed`, `max_tokens_truncated`, `true_empty`, `incomplete_tool_block`,
+`malformed_tool_json`, or `stream_aborted`; anything other than `completed`
+logs at WARNING.
+
+`true_empty` and `stream_aborted` are deliberately separate. `true_empty` means
+the model reported ending its turn (a `message_delta` or `message_stop`
+arrived) having produced nothing — a model-behaviour signal. `stream_aborted`
+means the stream simply stopped arriving with no terminal metadata at all — a
+transport/connection signal. Treat a rising `stream_aborted` rate as a network
+or upstream-proxy investigation, never as a prompt problem.
+
+**Only a `completed` round proceeds.** Every other outcome takes the shared
+retry-once-then-recovery path (one retry, then the recovery line), and a
+truncated, aborted or unparseable round is discarded WHOLE: no tool from that
+round is dispatched — not even a tool block that completed cleanly alongside a
+truncated sibling — nothing is written to history, and any per-sentence TTS
+already in flight for it is cancelled and the transport generation cleared
+before the retry or the recovery line speaks. Discarding the complete siblings
+too is what makes the retry safe: nothing executed, so re-asking the model is a
+fresh request rather than a replay of a committed booking side effect.
 
 ## Dialog dashboard fields
 
@@ -322,7 +351,8 @@ event allowlist**. It may contain only the following runtime event names:
 `smartpbx_protocol_diagnostic`, `stt_digit_class_state`, `stt_interim_shape`,
 `turn_stage`, `turn_summary`, `session_summary`, `echo_rejected`,
 `agent_response`, `assistant_turn_delivery`, `audio_dump_written`,
-`bad_tool_json`, `llm_round`, `llm_round_complete`, `llm_empty_response`,
+`bad_tool_json`, `llm_round`, `llm_round_complete`, `llm_round_outcome`,
+`llm_empty_response`,
 `llm_error`, `llm_provider_degraded`, `llm_provider_failover`, `tool_execute`,
 `tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`,
 `tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
@@ -339,6 +369,25 @@ The fixed, aggregate-only fields are `correlation_id`, `stage`, `outcome`,
 `correlation_id`, `turn_id`, and `session_trace_id` are opaque, local, randomly
 generated identifiers and are never derived from dialog. The `provider` field is
 a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, or `azure`.
+
+`llm_round_outcome` emits exactly four fields beyond `provider`, and no others:
+
+| Field | Type | Permitted values |
+| --- | --- | --- |
+| `provider` | bounded enum | `claude` only (this event is Claude-specific) |
+| `outcome` | bounded enum | `completed`, `max_tokens_truncated`, `true_empty`, `incomplete_tool_block`, `malformed_tool_json`, `stream_aborted` |
+| `stop_reason` | bounded enum | `end_turn`, `max_tokens`, `tool_use`, `stop_sequence`, `refusal`, `none` (absent), `unknown` (anything else) |
+| `output_tokens` | bounded integer | `0`–`1000000`, clamped; or `unknown` when the stream reported no usage |
+| `attempt` | bounded integer | `1`–`9`, clamped |
+
+`stop_reason` is normalized to that fixed vocabulary **before** logging: the raw
+provider string is never emitted, so a future API value or a proxy's arbitrary
+text cannot turn this field into an open channel (a `stop_sequence`'s contents
+are caller-derived). `output_tokens` and `attempt` are likewise clamped to the
+ranges above, so a corrupt usage payload cannot write an unbounded numeral.
+This event carries no free text, no tool names, no tool arguments and no caller
+identifiers of any kind.
+
 Wire-delivery proxies describe paced transport behavior only; they are not
 playback acknowledgements. Every approved event must not contain transcript text,
 audio, call ids, exception bodies, or secrets.

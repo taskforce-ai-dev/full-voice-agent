@@ -1563,8 +1563,18 @@ async def test_smartpbx_fully_injected_invalid_provider_fails_before_any_start_s
     assert getattr(pipeline, "_smartpbx_transfer_context", None) is None
 
 
+# A fake stream that never awaits also never lets the per-sentence TTS tasks it
+# spawns begin running, so a mid-stream failure would cancel work that had not
+# actually started. Fixtures place this marker where the real stream would have
+# blocked on the network, to make in-flight audio genuinely in flight.
+YIELD_TO_EVENT_LOOP = SimpleNamespace(type="__test_yield_to_loop__")
+
+
 async def _direct_tool_event_stream(events):
     for event in events:
+        if event is YIELD_TO_EVENT_LOOP:
+            await asyncio.sleep(0)
+            continue
         yield event
 
 
@@ -3889,6 +3899,433 @@ async def test_claude_round_outcome_log_line_carries_no_caller_content(monkeypat
         assert "private-guest-sentinel" not in line
         assert "guest_name" not in line
         assert "create_booking" not in line
+
+
+# ── Outcome-driven round control, TTS fencing, and stream shapes ─────────
+#
+# The runner used to decide "proceed or recover?" by re-inspecting whatever
+# happened to be in `text_content`/`tool_use_blocks`, which meant a round that
+# streamed a preamble sentence and THEN truncated its tool block looked
+# "successful": the preamble was spoken, the surviving tool blocks were
+# dispatched, and the truncation was only ever a log line. These fixtures pin
+# the opposite contract -- the classified outcome alone decides, a non-completed
+# round is discarded whole, and its in-flight audio is fenced before anything
+# else speaks.
+
+PREAMBLE_SENTENCE = "Let me check that for you."
+
+
+def claude_message_stop():
+    """The event that closes a Claude message. Its ABSENCE is the signal that
+    a stream was cut off rather than finished."""
+    return SimpleNamespace(type="message_stop")
+
+
+def claude_thinking_only_round(*, stop_reason="end_turn", output_tokens=42, terminal=True):
+    """A round that spends its whole budget inside the thinking block. With
+    terminal metadata the model told us the turn ended; without it, the stream
+    simply stopped arriving."""
+    events = claude_thinking_events()
+    if terminal:
+        events.append(claude_message_delta(stop_reason, output_tokens))
+        events.append(claude_message_stop())
+    return events
+
+
+def claude_preamble_then_truncated_tool_round(tool_name="check_availability"):
+    """The mixed case §2 exists for: a spoken preamble is already streaming to
+    the caller when the tool block runs out of budget mid-JSON."""
+    return [
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text=PREAMBLE_SENTENCE + " "),
+        ),
+        YIELD_TO_EVENT_LOOP,
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(type="tool_use", id="tool-cut", name=tool_name),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json='{"check_in": "2026-09-2'),
+        ),
+        claude_message_delta("max_tokens", 600),
+        claude_message_stop(),
+    ]
+
+
+def claude_preamble_then_malformed_tool_round(tool_name="create_booking"):
+    """Same shape, but the tool block DID terminate carrying unparseable JSON."""
+    return [
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text=PREAMBLE_SENTENCE + " "),
+        ),
+        YIELD_TO_EVENT_LOOP,
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(type="tool_use", id="tool-bad", name=tool_name),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json="{not json at all"),
+        ),
+        SimpleNamespace(type="content_block_stop"),
+        claude_message_delta("tool_use", 180),
+        claude_message_stop(),
+    ]
+
+
+def claude_complete_then_truncated_tool_round():
+    """Two tool blocks in one round: the first complete and executable, the
+    second cut off. Dispatching only the first would be a partial batch AND
+    would make the retry a replay of a committed side effect."""
+    return [
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(
+                type="tool_use", id="tool-complete", name="check_availability"
+            ),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(
+                type="input_json_delta", partial_json=json.dumps({"safe": "value"})
+            ),
+        ),
+        SimpleNamespace(type="content_block_stop"),
+        SimpleNamespace(
+            type="content_block_start",
+            content_block=SimpleNamespace(
+                type="tool_use", id="tool-cut", name="create_booking"
+            ),
+        ),
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="input_json_delta", partial_json='{"guest_name": "Mi'),
+        ),
+        claude_message_delta("max_tokens", 600),
+        claude_message_stop(),
+    ]
+
+
+def _arm_delivery_tracking(pipeline):
+    """Engage the ownership fences. A bare runner call leaves
+    `_assistant_turn_generation` at -1, which makes
+    `_smartpbx_fence_stalled_generation` correctly decline to touch a
+    generation it does not own -- so without this the fencing under test is a
+    no-op."""
+    pipeline._start_assistant_turn_delivery_tracking()
+
+
+class _GatedSpeak:
+    """Records what started speaking and what actually finished. The preamble
+    sentence blocks forever, so anything that completes it was NOT cancelled."""
+
+    def __init__(self, blocking_text):
+        self.blocking_text = blocking_text
+        self.started = []
+        self.completed = []
+        self._never = asyncio.Event()
+
+    async def __call__(self, text, generation=-1):
+        self.started.append(text)
+        if text == self.blocking_text:
+            # Bounded on purpose. The fix cancels this task within the same
+            # loop iteration, so the wait never elapses; a regression that
+            # stops cancelling fails the assertions after two seconds instead
+            # of wedging the whole suite on an un-cancelled gather.
+            try:
+                await asyncio.wait_for(self._never.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        self.completed.append(text)
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "terminal", "expected"),
+    [
+        # (a) thinking burned the whole budget; the model reported max_tokens.
+        ("max_tokens", True, "max_tokens_truncated"),
+        # (b) the model finished cleanly having chosen to say nothing.
+        ("end_turn", True, "true_empty"),
+        # (c) abrupt EOF -- no message_delta, no message_stop, no evidence the
+        # model ended anything. Must NOT be laundered into `true_empty`.
+        (None, False, "stream_aborted"),
+    ],
+)
+def test_claude_empty_round_shapes_are_told_apart_by_terminal_metadata(
+    stop_reason, terminal, expected
+):
+    import server
+
+    outcome = server._classify_claude_round_outcome(
+        text_content="",
+        tool_use_blocks=[],
+        incomplete_tool_block=False,
+        malformed_tool_json=False,
+        stop_reason=stop_reason,
+        saw_terminal_metadata=terminal,
+    )
+
+    assert outcome is server.SmartPBXClaudeRoundOutcome(expected)
+
+
+def test_claude_stream_aborted_is_a_distinct_non_clean_outcome_that_never_proceeds():
+    import server
+
+    aborted = server.SmartPBXClaudeRoundOutcome.STREAM_ABORTED
+    assert aborted is not server.SmartPBXClaudeRoundOutcome.TRUE_EMPTY
+    assert aborted is not server.SmartPBXClaudeRoundOutcome.COMPLETED
+    # It routes through the discard/fence path, not the clean-empty one.
+    assert aborted in server.SMARTPBX_CLAUDE_DISCARD_ROUND_OUTCOMES
+    assert (
+        server.SmartPBXClaudeRoundOutcome.TRUE_EMPTY
+        not in server.SMARTPBX_CLAUDE_DISCARD_ROUND_OUTCOMES
+    )
+    assert (
+        server.SmartPBXClaudeRoundOutcome.COMPLETED
+        not in server.SMARTPBX_CLAUDE_DISCARD_ROUND_OUTCOMES
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_reason", "terminal", "expected"),
+    [
+        ("max_tokens", True, "max_tokens_truncated"),
+        ("end_turn", True, "true_empty"),
+        (None, False, "stream_aborted"),
+    ],
+)
+async def test_claude_thinking_only_stream_shapes_log_distinctly_and_all_recover(
+    monkeypatch, caplog, stop_reason, terminal, expected
+):
+    """All three empty shapes take the retry-once-then-recovery path, but each
+    is logged as itself -- an aborted stream must be diagnosable as a transport
+    fault, not filed under 'the model said nothing'."""
+    import server
+
+    rounds = [
+        claude_thinking_only_round(stop_reason=stop_reason, terminal=terminal),
+        claude_thinking_only_round(stop_reason=stop_reason, terminal=terminal),
+    ]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    outcomes = _logged_round_outcomes(caplog)
+    assert len(outcomes) == 2
+    assert all(f"outcome={expected}" in line for line in outcomes)
+    assert len(client.requests) == 2
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("build_round", "expected_outcome"),
+    [
+        (claude_preamble_then_truncated_tool_round, "max_tokens_truncated"),
+        (claude_preamble_then_malformed_tool_round, "malformed_tool_json"),
+    ],
+)
+async def test_claude_preamble_with_bad_tool_block_runs_no_tool_and_fences_its_audio(
+    monkeypatch, caplog, build_round, expected_outcome
+):
+    """§3 (a) and (b). The round produced visible text, so the old
+    `text_content.strip() or tool_use_blocks` decision proceeded with it. The
+    outcome now decides instead: no tool runs, the preamble's in-flight TTS is
+    cancelled, the transport generation is cleared, and only the recovery line
+    is ever delivered."""
+    import server
+
+    rounds = [build_round(), build_round()]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    _arm_delivery_tracking(pipeline)
+    transport = pipeline._media_transport
+    speak = _GatedSpeak(PREAMBLE_SENTENCE)
+
+    monkeypatch.setattr(server, "execute_tool", _forbidden_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    outcomes = _logged_round_outcomes(caplog)
+    assert len(outcomes) == 2
+    assert all(f"outcome={expected_outcome}" in line for line in outcomes)
+
+    # The preamble started streaming and was then cancelled mid-flight; it
+    # never completed and it is not part of the turn's text.
+    assert PREAMBLE_SENTENCE in speak.started
+    assert PREAMBLE_SENTENCE not in speak.completed
+    assert PREAMBLE_SENTENCE not in result
+    # Undelivered audio was generation-cleared once per bad round.
+    assert transport.clears >= 2
+    assert pipeline._speak_generation >= 2
+
+    # Exactly one retry, then the recovery line -- and no tool, ever.
+    assert len(client.requests) == 2
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in speak.completed
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+    assert not _history_has_tool_use(pipeline)
+
+
+@pytest.mark.asyncio
+async def test_claude_complete_and_truncated_tool_in_one_round_executes_neither(
+    monkeypatch, caplog
+):
+    """§3 (c). One round, two tool blocks, one of them cut off. Executing the
+    complete one would be a half-dispatched batch and would make the retry a
+    replay of a side effect that already happened. Zero executions is what
+    makes retrying safe."""
+    import server
+
+    rounds = [
+        claude_complete_then_truncated_tool_round(),
+        claude_complete_then_truncated_tool_round(),
+    ]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    _arm_delivery_tracking(pipeline)
+    executed = []
+    spoken = []
+
+    async def record_tool(name, arguments):
+        executed.append((name, arguments))
+        return json.dumps({"status": "ok"})
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(server, "execute_tool", record_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        result = await pipeline._run_llm_claude()
+
+    assert executed == []
+    assert not _history_has_tool_use(pipeline)
+
+    outcomes = _logged_round_outcomes(caplog)
+    assert len(outcomes) == 2
+    assert all("outcome=max_tokens_truncated" in line for line in outcomes)
+    assert len(client.requests) == 2
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+
+
+@pytest.mark.asyncio
+async def test_claude_retry_after_a_discarded_round_can_still_complete_normally(
+    monkeypatch
+):
+    """The discard/fence path must leave the turn usable: the retry that
+    follows a truncated round speaks and executes normally."""
+    import server
+
+    rounds = [
+        claude_preamble_then_truncated_tool_round(),
+        direct_text_round("claude", "We have two suites free."),
+    ]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+    _arm_delivery_tracking(pipeline)
+    speak = _GatedSpeak(PREAMBLE_SENTENCE)
+
+    monkeypatch.setattr(server, "execute_tool", _forbidden_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    result = await pipeline._run_llm_claude()
+
+    assert "We have two suites free." in result
+    assert "We have two suites free." in speak.completed
+    assert PREAMBLE_SENTENCE not in result
+    assert PREAMBLE_SENTENCE not in speak.completed
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in speak.started
+    assert len(client.requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("end_turn", "end_turn"),
+        ("max_tokens", "max_tokens"),
+        ("tool_use", "tool_use"),
+        ("stop_sequence", "stop_sequence"),
+        ("refusal", "refusal"),
+        (None, "none"),
+        ("", "none"),
+        ("some_future_reason", "unknown"),
+        ("Mr Fernando, 0771234567", "unknown"),
+        (17, "unknown"),
+    ],
+)
+def test_claude_stop_reason_is_normalized_to_a_fixed_enum_before_logging(raw, expected):
+    """A raw stop_reason is provider-controlled text. Only the fixed vocabulary
+    (plus the absent/unknown buckets) may ever reach a log line."""
+    import server
+
+    assert server._normalized_claude_stop_reason(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (600, "600"),
+        (0, "0"),
+        (-5, "0"),
+        (10**12, str(1_000_000)),
+        (None, "unknown"),
+        ("600", "unknown"),
+        (True, "unknown"),
+    ],
+)
+def test_claude_logged_output_tokens_are_bounded(raw, expected):
+    import server
+
+    assert server._bounded_claude_output_tokens(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(1, 1), (2, 2), (0, 1), (-3, 1), (10**9, 9), (None, 1), ("2", 1)],
+)
+def test_claude_logged_attempt_number_is_bounded(raw, expected):
+    import server
+
+    assert server._bounded_claude_attempt(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_claude_round_outcome_never_logs_an_arbitrary_stop_reason_string(
+    monkeypatch, caplog
+):
+    """End to end: an unrecognised stop_reason (which a proxy or a future API
+    version can return verbatim) is bucketed, never echoed."""
+    import server
+
+    exotic = "guest_said_0771234567"
+    rounds = [
+        claude_thinking_events() + [claude_message_delta(exotic, 4), claude_message_stop()],
+        claude_thinking_events() + [claude_message_delta(exotic, 4), claude_message_stop()],
+    ]
+    client, pipeline = _claude_outcome_pipeline(server, rounds, monkeypatch)
+
+    async def speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    with caplog.at_level(logging.INFO):
+        await pipeline._run_llm_claude()
+
+    outcomes = _logged_round_outcomes(caplog)
+    assert outcomes
+    for line in outcomes:
+        assert exotic not in line
+        assert "0771234567" not in line
+        assert "stop_reason=unknown" in line
 
 
 @pytest.mark.asyncio
