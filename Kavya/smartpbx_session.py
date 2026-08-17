@@ -116,6 +116,9 @@ class KavyaSmartPBXSession:
         self._load_runtime_defaults()
         pipeline = self._require_pipeline()
         self._bind_smartpbx_tool_context(pipeline)
+        # Bind the trace before telemetry can exist, so the very first turn
+        # event already carries it.
+        pipeline._smartpbx_session_trace_id = self._ensure_session_trace_id()
         ensure_telemetry = getattr(pipeline, "_ensure_smartpbx_turn_telemetry", None)
         if callable(ensure_telemetry):
             ensure_telemetry()
@@ -149,6 +152,18 @@ class KavyaSmartPBXSession:
             pipeline = self._pipeline
             if pipeline is None:
                 return
+            # Cancel-and-await the initial-round filler BEFORE any other
+            # teardown await below. Its delay (default 1.5s) runs on its own
+            # timer, independent of the provider stream -- if it is still
+            # pending when teardown starts, an `await asyncio.to_thread(stt.
+            # stop)` or similar below could let that timer fire mid-teardown
+            # and speak (and queue audio for) a session that is already going
+            # away. `_finish_initial_smartpbx_filler` no-ops for `None` and is
+            # idempotent (safe even if a runner's own cleanup already fired
+            # it), so calling it unconditionally here is safe.
+            finish_filler = getattr(pipeline, "_finish_initial_smartpbx_filler", None)
+            if callable(finish_filler):
+                await finish_filler(getattr(pipeline, "_smartpbx_initial_filler", None))
             pipeline._cancel_reprompt()
             # Resolve any in-flight keypad collection so its awaiting turn unwinds
             # instead of hanging on the collector future.
@@ -204,6 +219,32 @@ class KavyaSmartPBXSession:
                     )
                 )
         finally:
+            # Unfinished turns must reach exactly one terminal summary before
+            # the session aggregate that counts them.
+            #
+            # Fix-4 (pre-merge review, in-flight tool vs. teardown race):
+            # the in-flight utterance-runner task (the `asyncio.ensure_future`
+            # spawned by `_arm_endpointing`'s endpointing timer -> `_flush_transcript`
+            # -> `_process_utterance*` -> the LLM runner -> `execute_tool`) is
+            # deliberately NOT cancelled here. A cancel could land mid-`await
+            # execute_tool(...)`, and asyncio cancellation gives no guarantee the
+            # outbound HTTP request (e.g. create_booking) had not already been
+            # sent when CancelledError is raised -- a half-committed side effect
+            # on the wire is worse than letting the call finish. Ownership is
+            # instead revalidated on the pipeline side after every awaited
+            # provider/tool boundary (`_current_smartpbx_runner_owns_shared_state`),
+            # which already discards a result when a newer turn/generation has
+            # taken over (ordinary barge-in); `_finalize_smartpbx_turns()` below
+            # clears `_active_smartpbx_turn_id`, so a runner that resumes after
+            # this point loses ownership the same way and its result is
+            # discarded rather than committed to history. The one gap that fix
+            # closes: when a tool already executed this turn, losing ownership
+            # now emits one bounded `turn_stage stage="late_tool_completion"`
+            # event first, so a late-completing tool becomes an observable
+            # event instead of a silent success with no trace.
+            finalize_turns = getattr(self._pipeline, "_finalize_smartpbx_turns", None)
+            if callable(finalize_turns):
+                finalize_turns()
             self._emit_session_summary()
             if not self._terminal_future.done():
                 self._terminal_future.set_result(None)

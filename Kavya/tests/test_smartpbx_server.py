@@ -553,6 +553,70 @@ async def test_default_smartpbx_welcome_reuses_kavya_english_greeting():
     assert pipeline.spoken == [server.LANGUAGE_CONFIGS["en"]["welcome_greeting"]]
 
 
+@pytest.mark.asyncio
+async def test_dialog_finish_cancels_pending_initial_filler_before_other_teardown_awaits():
+    """Item 2 (PR-266 review round 2): KavyaSmartPBXSession._finish_once must
+    cancel-and-await the active initial-round filler BEFORE any other
+    teardown await, so a 1.5s (here, shortened) filler timer can't fire into
+    a session that is already tearing down.
+
+    Without the fix, ``_finish_once`` never touches
+    ``pipeline._smartpbx_initial_filler`` at all -- the filler task is left
+    running, and once its delay elapses it speaks straight into (and queues
+    transport audio for) an already-finished session.
+    """
+    import server
+
+    async def process_post_call(**_metadata):
+        pass
+
+    pipeline = FakePipeline()
+    spoken_generations = []
+
+    async def speak(text, *, generation):
+        spoken_generations.append((text, generation))
+
+    # Real controller (not a fake) so this exercises the actual cancel/await
+    # machinery, with a short delay so the test doesn't wait out the real
+    # 1.5s default.
+    controller = server.SmartPBXInitialFillerController(
+        speak=speak, generation=0, delay_seconds=0.05, clear_audio=None,
+    )
+    controller.start()
+    pipeline._smartpbx_initial_filler = controller
+    # FakePipeline has no _finish_initial_smartpbx_filler of its own -- bind
+    # the real MediaStreamSession implementation to it (it only touches
+    # self._smartpbx_initial_filler, which duck-types fine here).
+    pipeline._finish_initial_smartpbx_filler = (
+        lambda ctl: server.MediaStreamSession._finish_initial_smartpbx_filler(pipeline, ctl)
+    )
+
+    session = KavyaSmartPBXSession(
+        context(),
+        FakeTransport(),
+        pipeline=pipeline,
+        stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=process_post_call,
+        welcome_text=None,
+        llm_provider="claude",
+        model="test-model",
+    )
+    await session.start()
+
+    # Finish well before the filler's 0.05s delay would elapse.
+    task_at_finish_start = controller._task
+    await session.finish(False)
+
+    # The filler task must already be finished (cancelled-and-awaited) by
+    # the time finish() returns -- not merely requested to cancel.
+    assert task_at_finish_start is not None
+    assert task_at_finish_start.done()
+    assert pipeline._smartpbx_initial_filler is None
+
+    # Wait past the filler's would-be delay to prove it never fires late.
+    await asyncio.sleep(0.15)
+    assert spoken_generations == []
+
 
 @pytest.mark.asyncio
 async def test_dialog_hangup_finishes_once_and_schedules_kavya_post_call():
@@ -3030,7 +3094,7 @@ def test_smartpbx_initial_filler_delay_rejects_nonfinite_environment_values(raw)
     resolved = server._resolve_smartpbx_initial_filler_delay(raw)
 
     assert math.isfinite(resolved)
-    assert resolved == 2.5
+    assert resolved == 1.5
 
 
 class _ControlledInitialFillerSleep:
@@ -3167,3 +3231,626 @@ async def test_capture_and_keypad_rounds_never_arm_an_initial_smartpbx_filler(ca
 
     assert sleep.delays == []
     assert spoken == []
+
+
+# ---------------------------------------------------------------------------
+# Phase B: shared empty-response policy, stream timeouts, filler default (§5)
+# ---------------------------------------------------------------------------
+
+def direct_empty_round(_provider):
+    """A provider round with no text and no tool call at all."""
+    return []
+
+
+def _patch_direct_hanging_stream(monkeypatch, pipeline, provider, *, before_events=()):
+    """Make this pipeline's provider stream yield ``before_events`` then hang
+    forever, so the timeout guard (not real content) ends the round.
+
+    Callers must monkeypatch the SMARTPBX_LLM_*_TIMEOUT_SECONDS constants to a
+    small value first, or this would genuinely wait out the default 8s.
+    """
+
+    async def hang(*_events):
+        for event in _events:
+            yield event
+        await asyncio.Event().wait()  # never set: only the wait_for timeout ends this
+
+    if provider == "openai":
+        async def create(**_kwargs):
+            pipeline.client.requests.append(_kwargs)
+            return hang(*before_events)
+        monkeypatch.setattr(pipeline.client, "create", create)
+    elif provider == "gemini":
+        async def generate_content_stream(**_kwargs):
+            pipeline.gemini_client.requests.append(_kwargs)
+            return hang(*before_events)
+        monkeypatch.setattr(
+            pipeline.gemini_client.aio.models, "generate_content_stream", generate_content_stream
+        )
+    else:
+        class _HangingClaudeStream:
+            async def __aenter__(self):
+                return hang(*before_events)
+
+            async def __aexit__(self, *_args):
+                return False
+
+        def stream(**_kwargs):
+            pipeline.anthropic_client.requests.append(_kwargs)
+            return _HangingClaudeStream()
+
+        monkeypatch.setattr(pipeline.anthropic_client.messages, "stream", stream)
+
+
+def _patch_direct_hanging_acquisition(monkeypatch, pipeline, provider):
+    """Make the ACQUISITION call itself hang forever — the awaited client
+    call that creates the stream (OpenAI/Gemini) or enters the async context
+    manager (Claude) never returns, as opposed to returning promptly and then
+    stalling on the first item.
+
+    Exercises the item-1 fix: acquisition must be bounded by the SAME
+    initial-response deadline as the wait for the first delta, not left
+    unguarded before the per-item timeout guard even starts.
+
+    Callers must monkeypatch the SMARTPBX_LLM_*_TIMEOUT_SECONDS constants to
+    a small value first, or this would genuinely wait out the default 8s.
+    """
+    if provider == "openai":
+        async def create(**_kwargs):
+            pipeline.client.requests.append(_kwargs)
+            await asyncio.Event().wait()  # never set: only wait_for ends this
+
+        monkeypatch.setattr(pipeline.client, "create", create)
+    elif provider == "gemini":
+        async def generate_content_stream(**_kwargs):
+            pipeline.gemini_client.requests.append(_kwargs)
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            pipeline.gemini_client.aio.models, "generate_content_stream", generate_content_stream
+        )
+    else:
+        class _HangingAcquisitionClaudeStream:
+            async def __aenter__(self):
+                await asyncio.Event().wait()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        def stream(**_kwargs):
+            pipeline.anthropic_client.requests.append(_kwargs)
+            return _HangingAcquisitionClaudeStream()
+
+        monkeypatch.setattr(pipeline.anthropic_client.messages, "stream", stream)
+
+
+def _provider_request_count(pipeline, provider):
+    client = {"openai": pipeline.client, "gemini": pipeline.gemini_client, "claude": pipeline.anthropic_client}[provider]
+    return len(client.requests)
+
+
+def _twilio_media_streams_pipeline(server, provider, client, lang="ar"):
+    """A genuine (non-SmartPBX) Twilio Media Streams pipeline: no
+    `_smartpbx_transfer_context`, so `_is_direct_smartpbx_english()` is False
+    and none of the Phase B SmartPBX-only behaviour applies."""
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang=lang, media_transport=FakeTransport(),
+        anthropic_client=client if provider == "claude" else None,
+        gemini_client=client if provider == "gemini" else None,
+        openai_client=client if provider == "openai" else None,
+        llm_provider=provider, model=f"{provider}-tool-model",
+    )
+    pipeline.tools = [{"provider": provider}]
+    return pipeline
+
+
+def _run_direct_provider(pipeline, provider):
+    if provider == "openai":
+        return pipeline._run_llm()
+    if provider == "gemini":
+        return pipeline._run_llm_gemini()
+    return pipeline._run_llm_claude()
+
+
+def _disable_initial_filler(monkeypatch, pipeline):
+    """These tests call a runner directly (not `_process_utterance_bound`),
+    so nothing ever runs the `finally` block that cancels an armed filler.
+    Disabling it avoids leaking a pending filler task past the test."""
+    monkeypatch.setattr(pipeline, "_start_initial_smartpbx_filler", lambda **_kwargs: None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_empty_response_retries_once_then_succeeds(monkeypatch, provider):
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_empty_round(provider),
+        direct_text_round(provider, "Recovered content."),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    result = await _run_direct_provider(pipeline, provider)
+
+    assert "Recovered content." in result
+    assert _provider_request_count(pipeline, provider) == 2
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
+    assert server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT not in spoken
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_empty_response_retries_once_then_speaks_recovery(monkeypatch, provider):
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_empty_round(provider),
+        direct_empty_round(provider),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    result = await _run_direct_provider(pipeline, provider)
+
+    # Exactly one retry: two requests total, never a third.
+    assert _provider_request_count(pipeline, provider) == 2
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT not in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_empty_after_tool_start_never_replays_and_speaks_recovery(monkeypatch, provider):
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"safe": "value"}),
+        direct_empty_round(provider),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    async def successful_tool(_name, _arguments):
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    result = await _run_direct_provider(pipeline, provider)
+
+    # Round 0 (the tool round) then round 1 (empty, post-tool): exactly two
+    # requests, never a retry attempt against round 1 -- a retry there would
+    # replay the provider turn against history that already committed a tool
+    # result.
+    assert _provider_request_count(pipeline, provider) == 2
+    assert server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
+    assert server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_initial_response_timeout_speaks_recovery_and_keeps_call_open(monkeypatch, provider):
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.02)
+    client = direct_tool_client(provider, [])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    _patch_direct_hanging_stream(monkeypatch, pipeline, provider, before_events=[])
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    result = await _run_direct_provider(pipeline, provider)
+
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+    # The call stays open: _run_llm*/_run_llm_gemini/_run_llm_claude returned
+    # normally (a string), it did not raise or close anything.
+    assert isinstance(result, str)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_hanging_stream_acquisition_speaks_recovery_and_keeps_call_open(
+    monkeypatch, provider
+):
+    """A client call that never returns (the stream is never even created/
+    entered) must recover on the same initial-response deadline as a
+    hanging first delta — item 1 of the PR-266 review round.
+
+    Distinct from test_smartpbx_initial_response_timeout_speaks_recovery_
+    and_keeps_call_open above: that test hangs AFTER acquisition returns
+    (inside the already-guarded iteration). This one hangs INSIDE
+    acquisition itself (the awaited create()/generate_content_stream() call,
+    or Claude's ``async with ... __aenter__``), which was previously
+    unguarded and would have blocked forever.
+    """
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.02)
+    client = direct_tool_client(provider, [])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    _patch_direct_hanging_acquisition(monkeypatch, pipeline, provider)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    # Bounded wait_for around the call itself: if the acquisition guard
+    # regresses, this fails fast with a clear TimeoutError instead of
+    # hanging the test suite.
+    result = await asyncio.wait_for(_run_direct_provider(pipeline, provider), timeout=5.0)
+
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+    assert isinstance(result, str)
+    # A stream timeout (unlike an empty response) returns straight to
+    # recovery without a second attempt — exactly one acquisition call.
+    assert _provider_request_count(pipeline, provider) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_stream_stall_timeout_speaks_recovery_after_partial_content(monkeypatch, provider):
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.02)
+    client = direct_tool_client(provider, [])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    partial_event = direct_text_round(provider, "Partial before the stall.")[0]
+    _patch_direct_hanging_stream(
+        monkeypatch, pipeline, provider, before_events=[partial_event]
+    )
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    result = await _run_direct_provider(pipeline, provider)
+
+    # Pre-tool: the stall counts as an empty-ish failure (no tool started),
+    # so it takes the retry-exhausted line, not the post-tool line.
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_stall_recovery_cancels_delayed_tts_before_speaking_recovery(
+    monkeypatch, provider
+):
+    """Item 3 (PR-266 review round 2): before speaking the recovery line, a
+    stall must cancel-and-await this generation's pending per-sentence TTS
+    tasks — a TTS task whose completion is artificially delayed past the
+    stall trigger must never deliver audio after/over the recovery line.
+
+    ``never_release`` is deliberately never set, so the partial sentence's
+    TTS call can only ever finish via cancellation. ``started`` proves the
+    task actually ran (so the rest of the assertions aren't vacuous);
+    ``cancelled`` proves it was actually cancelled rather than merely
+    outlived by an early-returning round (the pre-fix bug: recovery speaks
+    immediately while this task is simply left running, orphaned, still able
+    to deliver its audio later -- including after/over the recovery line).
+    """
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.02)
+    client = direct_tool_client(provider, [])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    # Trailing space after the period: _extract_sentences only emits a
+    # complete sentence (and therefore spawns its per-sentence TTS task) on
+    # a punctuation-then-whitespace boundary -- without it the text just
+    # sits unflushed in the local sentence_buffer and no task is ever
+    # created, which would make this test vacuously pass either way.
+    partial_event = direct_text_round(provider, "Partial before the stall. ")[0]
+    _patch_direct_hanging_stream(
+        monkeypatch, pipeline, provider, before_events=[partial_event]
+    )
+    spoken = []
+    started = []
+    cancelled = []
+    never_release = asyncio.Event()
+
+    async def speak(text, generation=-1):
+        if text == "Partial before the stall.":
+            started.append(text)
+            try:
+                await never_release.wait()
+            except asyncio.CancelledError:
+                cancelled.append(text)
+                raise
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+
+    result = await asyncio.wait_for(_run_direct_provider(pipeline, provider), timeout=5.0)
+
+    # Sanity: the partial sentence's TTS task really started (otherwise the
+    # assertions below would hold vacuously in both old and new code).
+    assert started == ["Partial before the stall."]
+    # It was cancelled -- not merely outlived by an early return.
+    assert cancelled == ["Partial before the stall."]
+    # Never delivered -- cancelled before it could complete.
+    assert "Partial before the stall." not in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_smartpbx_stall_timeout_recovery_is_atomic_against_locked_filler(
+    monkeypatch, provider
+):
+    """Regression test for the atomic timeout-recovery transition (PR-266
+    follow-up fix): on a stream stall, recovery must cancel-and-await the
+    stalled generation's initial filler BEFORE the recovery line ever tries
+    to speak.
+
+    Enters through the REAL ``_process_utterance_bound`` (not a runner
+    called directly), with the real filler machinery running end to end --
+    only the filler delay is shrunk via monkeypatch, the controller class
+    and its cancel/await machinery are untouched. The fake TTS BLOCKS while
+    holding the real ``_speak_lock``, simulating in-flight filler speech at
+    the exact moment the (also faked) provider stream stalls.
+
+    Pre-fix, ``_smartpbx_handle_stream_timeout`` never touched the filler at
+    all: it would still be sitting inside ``_speak``'s ``async with
+    self._speak_lock:`` block, blocked in TTS, when the recovery line tried
+    to acquire that same lock -- a deadlock. The whole scenario is bounded
+    by ``asyncio.wait_for`` so a regression here fails with a clear timeout
+    instead of hanging the suite.
+    """
+    import server
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "SMARTPBX_INITIAL_FILLER_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.2)
+
+    client = direct_tool_client(provider, [])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    # The provider stream is acquired but never yields anything -- the
+    # initial-response deadline is what ends the round, not real content.
+    _patch_direct_hanging_stream(monkeypatch, pipeline, provider, before_events=[])
+
+    turn_summaries = []
+
+    # Same shape as the production sink `_emit_smartpbx_turn_telemetry`: the
+    # event name arrives POSITIONALLY and is ALSO repeated inside **fields, so
+    # naming this parameter `event` makes every emit raise TypeError.
+    def fake_emit(_event, **fields):
+        if _event == "turn_summary":
+            turn_summaries.append(fields)
+
+    # Mirrors exactly what `_flush_transcript` does before dispatching a
+    # turn, so `_process_utterance_bound` sees a real, telemetry-owned turn.
+    pipeline._turn_telemetry = server.SmartPBXTurnTelemetry(
+        emit=fake_emit, session_trace_id="test-trace",
+    )
+    pipeline._active_smartpbx_turn_id = pipeline._turn_telemetry.start_turn("final")
+
+    filler_started = asyncio.Event()
+    filler_release = asyncio.Event()  # never set: only cancellation ends the filler
+    filler_cancelled = []
+    delivered = []
+
+    async def fake_tts_elevenlabs(text, *, sentence=None, turn_generation=None):
+        if text == server.SMARTPBX_INITIAL_FILLER_TEXT:
+            filler_started.set()
+            try:
+                await filler_release.wait()
+            except asyncio.CancelledError:
+                filler_cancelled.append(text)
+                raise
+            return
+        delivered.append(text)
+
+    # Only the innermost TTS call is faked -- `_speak`'s real `_speak_lock`
+    # acquisition and generation-fence checks stay exactly as in production.
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", fake_tts_elevenlabs)
+
+    turn_task = asyncio.create_task(
+        pipeline._process_utterance_bound("guest asks a slow question")
+    )
+    # Confirm the filler really is mid-flight and holding _speak_lock before
+    # letting the stall timeout run its course -- otherwise the deadlock
+    # this test exists to catch would never actually be exercised.
+    await asyncio.wait_for(filler_started.wait(), timeout=2.0)
+    assert pipeline._speak_lock.locked()
+
+    await asyncio.wait_for(turn_task, timeout=5.0)
+
+    # Filler cancellation completed -- not merely requested.
+    assert filler_cancelled == [server.SMARTPBX_INITIAL_FILLER_TEXT]
+    controller = pipeline._smartpbx_initial_filler
+    assert controller is None or controller._task.done()
+
+    # Exactly one recovery sentence spoken, and no stale filler audio ever
+    # lands after (or instead of) it.
+    assert delivered == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
+    assert server.SMARTPBX_INITIAL_FILLER_TEXT not in delivered
+
+    # The turn summarizes exactly once.
+    assert len(turn_summaries) == 1
+
+    # No tasks left running behind the turn (filler task, tts tasks, ...).
+    await asyncio.sleep(0)
+    leftover = [
+        t for t in asyncio.all_tasks()
+        if t is not asyncio.current_task() and not t.done()
+    ]
+    assert leftover == []
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_stream_timeout_after_tool_start_speaks_post_tool_recovery(monkeypatch):
+    import server
+
+    provider = "openai"
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.02)
+    client = direct_tool_client(provider, [direct_tool_round(provider, {"safe": "value"})])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    async def successful_tool(_name, _arguments):
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", successful_tool)
+    monkeypatch.setattr(pipeline, "_speak", speak)
+
+    original_create = pipeline.client.create
+    call_count = 0
+
+    async def create(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return await original_create(**kwargs)
+
+        async def hang():
+            await asyncio.Event().wait()
+            yield None
+
+        return hang()
+
+    monkeypatch.setattr(pipeline.client, "create", create)
+    result = await pipeline._run_llm()
+
+    assert server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT in spoken
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
+    assert result.endswith(server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT)
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_barge_in_during_empty_retry_prevents_stale_recovery_speech(monkeypatch):
+    """A barge-in that lands between the empty round and the retry's recovery
+    speech must leave no stale audio/history behind -- `_invoke_speak` and
+    `_append_assistant_history` both revalidate ownership, so the abandoned
+    runner's recovery line is silently dropped instead of spoken over the
+    caller's new turn."""
+    import server
+
+    provider = "openai"
+    client = direct_tool_client(provider, [
+        direct_empty_round(provider),
+        direct_empty_round(provider),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    old_turn, new_turn = "turn-old", "turn-new"
+    pipeline._active_smartpbx_turn_id = old_turn
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+        # Simulate a genuine barge-in landing mid-retry: a newer turn takes
+        # ownership before this stale runner's recovery line goes out.
+        pipeline._active_smartpbx_turn_id = new_turn
+        pipeline._speak_generation += 1
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+
+    runner = server._SmartPBXRunnerContext(
+        turn_id=old_turn,
+        dropped_frame_baseline=0,
+        speak_generation=pipeline._speak_generation,
+        raw_utterance="",
+    )
+    token = server._smartpbx_runner_context.set(runner)
+    try:
+        result = await pipeline._run_llm()
+    finally:
+        server._smartpbx_runner_context.reset(token)
+
+    assert result == ""
+    assert not any(
+        message.get("content") == server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
+        for message in pipeline.history
+        if isinstance(message, dict)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_twilio_media_streams_empty_response_behaviour_is_unchanged(monkeypatch, provider):
+    """Non-SmartPBX Twilio Media Streams (Arabic/Sinhala/Tamil) must not gain
+    the NEW SmartPBX-only retry-nudge/recovery-line policy -- Phase B's
+    shared empty-response policy and stream timeouts apply only to the
+    direct SmartPBX English path.
+
+    Gemini is a deliberate exception to "no retry at all": its own
+    per-turn empty-response retry (``GEMINI_EMPTY_RETRY_NUDGE`` + the
+    canned ``LLM_EMPTY_FALLBACKS`` line) predates Phase B entirely
+    (commit 716ec9e) and is unconditional -- it fires for every session,
+    not just direct SmartPBX -- so it needs a second empty round to
+    attempt against and is "unchanged" at 2 requests with the old canned
+    fallback spoken, not silence. OpenAI/Claude have no such per-provider
+    retry outside the SmartPBX-gated Phase B policy and stay silent at
+    one request, as before.
+    """
+    import server
+
+    rounds = [direct_empty_round(provider)]
+    if provider == "gemini":
+        rounds.append(direct_empty_round(provider))
+    client = direct_tool_client(provider, rounds)
+    pipeline = _twilio_media_streams_pipeline(server, provider, client, lang="ar")
+    spoken = []
+
+    async def speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(pipeline, "_speak", speak)
+    result = await _run_direct_provider(pipeline, provider)
+
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
+    assert server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT not in spoken
+    if provider == "gemini":
+        fallback = server.LLM_EMPTY_FALLBACKS["ar"]
+        assert _provider_request_count(pipeline, provider) == 2
+        assert spoken == [fallback]
+        assert result == fallback
+    else:
+        assert _provider_request_count(pipeline, provider) == 1
+        assert spoken == []
+        assert result == ""
+
+
+def test_smartpbx_initial_filler_delay_default_is_1_5_seconds():
+    import server
+
+    assert server.SMARTPBX_INITIAL_FILLER_DELAY_SECONDS == 1.5
+    assert server._resolve_smartpbx_initial_filler_delay(None) == 1.5
+    assert server._resolve_smartpbx_initial_filler_delay("") == 1.5

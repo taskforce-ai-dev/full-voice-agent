@@ -113,6 +113,8 @@ SMARTPBX_MAX_AUDIO_BYTES=32768
 SMARTPBX_MAX_OUTBOUND_FRAMES=512
 SMARTPBX_MAX_TOKENS=
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=
+SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS=
+SMARTPBX_LLM_STALL_TIMEOUT_SECONDS=
 SMARTPBX_START_TIMEOUT_SECONDS=10
 SMARTPBX_IDLE_TIMEOUT_SECONDS=90
 SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS=300
@@ -180,6 +182,38 @@ Kavya accepts `SMARTPBX_MCP_ACCOUNT_HEADER=account_id` and
 `SMARTPBX_MCP_ACCOUNT_HEADER=X-Account-ID`; Dialog must approve exactly one.
 MCP API/account headers and all MCP credentials are server-only. The dashboard WSS
 headers carry only the dedicated WSS token; they never carry MCP credentials.
+
+## Direct SmartPBX English reliability timing (Phase B)
+
+Three env-tunable knobs govern the direct SmartPBX English provider round only
+(OpenAI/Gemini/Claude, whichever `LLM_PROVIDER` selects). Twilio Media Streams
+(Arabic/Sinhala/Tamil) and the Twilio ConversationRelay path are unaffected —
+none of this timing applies outside a direct SmartPBX call.
+
+- `SMARTPBX_INITIAL_FILLER_DELAY_SECONDS` (default `1.5`, clamp `[0.5, 5.0]`) —
+  the one cancellable neutral filler for the first provider round of a call.
+  Cancels the instant real content, a tool selection, a barge-in, a
+  generation change, a transfer, or session finish pre-empts it.
+- `SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS` (default `8.0`, clamp
+  `[1.0, 30.0]`) — how long a provider round may run with zero content/tool
+  deltas before Kavya gives up on it.
+- `SMARTPBX_LLM_STALL_TIMEOUT_SECONDS` (default `8.0`, clamp `[1.0, 30.0]`) —
+  the maximum gap between successive deltas once a round has started
+  streaming. There is no total stream deadline while content keeps arriving.
+
+On either timeout, or on an empty response (no text, no tool call) that has
+already used its one same-provider retry, Kavya cancels only that turn's own
+generation, records one bounded fixed-enum telemetry stage (`llm_timeout`, or
+the existing empty-response log line), blocks any stale history/transcript/
+tool-result/audio write from that abandoned round, speaks one of two fixed
+recovery lines, and keeps the call open for the caller's next utterance:
+before any tool/side effect has started this turn, "I'm sorry, I'm having
+trouble responding right now. Could you please say that again?"; once a tool
+may have started this turn, that turn is never replayed — the caller instead
+hears "I'm sorry, I wasn't able to give you a clear update. Would you like me
+to continue?". Capture-name, capture-number and keypad flows keep their own
+specialised logic and are excluded from the initial filler and from this
+retry/recovery policy.
 
 ## Dialog dashboard fields
 

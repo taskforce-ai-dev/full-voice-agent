@@ -41,6 +41,13 @@ _SDK_LOGGERS = ("mcp.client.streamable_http", "mcp.client.session")
 # live against https://dialog.cybergate.lk:9443/ucp/v2/mcp on 2026-08-11 via
 # tools/list. Our operator config keeps the safer `tel:`/`sip:` URI allowlist
 # form, so the scheme is stripped here, at the wire boundary, and nowhere else.
+# Re-verified live on 2026-08-14 (audit follow-up): the tools/list response is
+# unchanged -- `number` is still the sole required argument, described as "the
+# specific number provided by the user", with no `tel:`/`sip:` prefix requested
+# anywhere in the schema or description. The vendor README's claim that the
+# argument is named `destination_number` and must keep its `tel:`/`sip:` scheme
+# is stale/inaccurate; do not switch this constant or `_wire_destination` to
+# match the README without a fresh live tools/list confirming a schema change.
 _TRANSFER_ARGUMENT = "number"
 _TEL_SCHEME = "tel:"
 
