@@ -4166,7 +4166,9 @@ async def test_filler_clear_resuming_after_barge_in_cannot_reanchor_old_turn(
     )
     token = server._smartpbx_runner_context.set(runner)
     try:
-        controller = pipeline._start_initial_smartpbx_filler(generation=generation)
+        controller = pipeline._start_initial_smartpbx_filler(
+            round_idx=0, generation=generation,
+        )
     finally:
         server._smartpbx_runner_context.reset(token)
     assert controller is not None

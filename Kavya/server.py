@@ -4805,21 +4805,56 @@ class MediaStreamSession:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        if gen != self._speak_generation:
+        runner = _smartpbx_runner_context.get()
+        runner_turn_id = runner.turn_id if runner is not None else None
+        active_turn_id = self._active_smartpbx_turn_id
+        barge_ins = self._smartpbx_barge_ins
+        transfer_pending = self.transfer_pending
+        if (
+            transfer_pending
+            or gen != self._speak_generation
+            or self._assistant_turn_generation != gen
+            or (
+                runner is not None
+                and (
+                    runner.speak_generation != gen
+                    or (
+                        runner_turn_id is not None
+                        and runner_turn_id != active_turn_id
+                    )
+                )
+            )
+        ):
             return self._speak_generation
         self._speak_generation += 1
+        fenced_generation = self._speak_generation
         await self._clear_media_audio()
-        # Same fence, same missed re-anchor as the filler clear above: the
-        # recovery line that follows is spoken on the NEW generation, so
-        # without this the tracker stays on the dead one, the recovery
-        # sentence is never acknowledged as delivered, and the line the
-        # caller actually heard is written to history as "[interrupted]".
-        # Guarded on the tracker still belonging to this generation.
-        if self._assistant_turn_generation == gen:
-            self._assistant_turn_generation = self._speak_generation
-        runner = _smartpbx_runner_context.get()
-        if runner is not None:
-            runner.speak_generation = self._speak_generation
+        # Re-anchor recovery only if the exact runner still owns this turn
+        # after the awaited clear. A barge-in or newer turn leaves the old
+        # runner/tracker stale so the existing recovery fences suppress it.
+        if (
+            _smartpbx_runner_context.get() is runner
+            and self._active_smartpbx_turn_id == active_turn_id
+            and self._smartpbx_barge_ins == barge_ins
+            and self.transfer_pending == transfer_pending
+            and not self.transfer_pending
+            and self._speak_generation == fenced_generation == gen + 1
+            and self._assistant_turn_generation == gen
+            and (
+                runner is None
+                or (
+                    runner.speak_generation == gen
+                    and runner.turn_id == runner_turn_id
+                    and (
+                        runner_turn_id is None
+                        or runner_turn_id == active_turn_id
+                    )
+                )
+            )
+        ):
+            if runner is not None:
+                runner.speak_generation = fenced_generation
+            self._assistant_turn_generation = fenced_generation
         return self._speak_generation
 
     async def _smartpbx_handle_stream_timeout(
