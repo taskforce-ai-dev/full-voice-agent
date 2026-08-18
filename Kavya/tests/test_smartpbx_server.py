@@ -1634,10 +1634,22 @@ async def test_smartpbx_fully_injected_invalid_provider_fails_before_any_start_s
 YIELD_TO_EVENT_LOOP = SimpleNamespace(type="__test_yield_to_loop__")
 
 
+class _DirectToolStreamPause:
+    """Suspend a provider stream at a deterministic pre-content boundary."""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+
 async def _direct_tool_event_stream(events):
     for event in events:
         if event is YIELD_TO_EVENT_LOOP:
             await asyncio.sleep(0)
+            continue
+        if isinstance(event, _DirectToolStreamPause):
+            event.entered.set()
+            await event.release.wait()
             continue
         yield event
 
@@ -3852,6 +3864,97 @@ async def test_later_transfer_early_exit_cancels_deferred_model_tts(
         if held_tts is not None and not held_tts.done():
             held_tts.cancel()
             await asyncio.gather(held_tts, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+async def test_finish_closes_deferred_tts_admission_before_late_provider_content(
+    monkeypatch, provider,
+):
+    """A runner cannot register TTS after teardown dispatch closes."""
+    import server
+
+    provider_pause = _DirectToolStreamPause()
+    client = direct_tool_client(provider, [[
+        provider_pause,
+        *direct_text_round(provider, "Late model sentence. "),
+    ]])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    bind_direct_smartpbx_turn(server, pipeline)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(
+        pipeline, "_start_initial_smartpbx_filler", lambda **_kwargs: None,
+    )
+
+    teardown_paused = asyncio.Event()
+    teardown_release = asyncio.Event()
+    tts_started = asyncio.Event()
+    tts_cancel_release = asyncio.Event()
+    summary_events: list[str] = []
+
+    async def pause_callback_drain():
+        assert pipeline._teardown_dispatch_closed is True
+        teardown_paused.set()
+        await teardown_release.wait()
+
+    async def tts(_text, **_kwargs):
+        tts_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await tts_cancel_release.wait()
+            raise
+
+    async def no_post_call(**_metadata):
+        raise AssertionError("post-call is not requested")
+
+    monkeypatch.setattr(pipeline, "_close_stt_callbacks", pause_callback_drain)
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+    turn = asyncio.create_task(pipeline._process_utterance("late provider delta"))
+    session = KavyaSmartPBXSession(
+        context(), FakeTransport(), pipeline=pipeline,
+        stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=no_post_call, welcome_text=None,
+        llm_provider=provider, model="test-model",
+    )
+    original_summary = session._emit_session_summary
+
+    def checked_summary():
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert pipeline._speak_lock.locked() is False
+        summary_events.append("summary")
+        original_summary()
+
+    session._emit_session_summary = checked_summary
+    session.terminal_future.add_done_callback(lambda _future: summary_events.append("terminal"))
+    finishing = asyncio.create_task(session.finish(False))
+    try:
+        await asyncio.wait_for(provider_pause.entered.wait(), timeout=1)
+        await asyncio.wait_for(teardown_paused.wait(), timeout=1)
+        assert pipeline._teardown_dispatch_closed is True
+
+        provider_pause.release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert tts_started.is_set() is False
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert pipeline._speak_lock.locked() is False
+        assert pipeline._media_transport.audio == []
+
+        teardown_release.set()
+        await asyncio.wait_for(finishing, timeout=1)
+        await asyncio.wait_for(turn, timeout=1)
+
+        assert summary_events == ["summary", "terminal"]
+        assert session.terminal_future.done()
+    finally:
+        provider_pause.release.set()
+        teardown_release.set()
+        tts_cancel_release.set()
+        finishing.cancel()
+        turn.cancel()
+        await asyncio.gather(finishing, turn, return_exceptions=True)
 
 
 @pytest.mark.asyncio
