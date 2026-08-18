@@ -149,6 +149,17 @@ class _BlockingThreadedSTT(_ThreadedSTT):
         self.stop_may_finish.wait(BARRIER_TIMEOUT)
 
 
+class _TwoFinalThreadedSTT(_ThreadedSTT):
+    """Delivers two material provider finals with identical text in order."""
+
+    def _run(self):
+        if not self.may_submit.wait(BARRIER_TIMEOUT):
+            return
+        self._on_final(self._text)
+        self._on_final(self._text)
+        self.submitted.set()
+
+
 def make_live_session(*, smartpbx=True, lang="en"):
     """A session bound to the REAL running loop — threads must submit into it."""
     session = server.MediaStreamSession(websocket=None, lang=lang, media_transport=None)
@@ -302,6 +313,30 @@ async def test_smartpbx_drain_completes_before_retention_and_snapshot():
         "the in-flight callback must be drained BEFORE retention, and retention "
         "before the post-call snapshot; got " + repr(order)
     )
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_teardown_retains_identical_material_finals_in_order():
+    """Text equality is not provider-result identity: "yes, yes" is two finals."""
+    session, processed = make_live_session()
+    stt = _TwoFinalThreadedSTT(
+        on_final_result=session._on_stt_result,
+        text="yes",
+    )
+    session._stt = stt
+    stt.start()
+    session._write_audio_dump = stt.release_and_join
+    dialog_session = KavyaSmartPBXSession(
+        _context(), _FakeTransport(), pipeline=session,
+        stt_factory=lambda **_kwargs: None, post_call_processor=None,
+        welcome_text="", llm_provider="claude", model="test-model",
+    )
+
+    await dialog_session.finish(schedule_post_call=False)
+    await _settle()
+
+    assert _all_texts(session.full_transcript) == ["yes yes"]
+    assert processed == []
 
 
 @pytest.mark.asyncio
@@ -489,7 +524,8 @@ async def test_twilio_teardown_retains_a_final_submitted_from_the_worker_thread(
     def factory(**kwargs):
         stt = _ThreadedSTT(**kwargs)
         created["stt"] = stt
-        stt.start()
+        # `MediaStreamSession.run()` owns start(); starting here too created a
+        # second provider worker and made a harness artifact look like a replay.
         session._write_audio_dump = stt.release_and_join
         return stt
 
