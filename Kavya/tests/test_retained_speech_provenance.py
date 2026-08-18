@@ -436,3 +436,97 @@ def test_handoff_transcript_does_not_attribute_unconfirmed_speech_to_kavya():
         "role silently lands on the wrong side of it"
     )
     assert "Guest: confirmed guest line" in rendered
+    assert "interim" in rendered
+    assert "unanswered" in rendered
+
+
+def test_handoff_retained_final_states_provenance_and_answered_state():
+    rendered = server._format_handoff_transcript(
+        [
+            {
+                "role": server.RETAINED_SPEECH_ROLE,
+                "text": "unanswered final",
+                "provenance": "final",
+                "answered": "unanswered",
+            }
+        ]
+    )
+    assert "final" in rendered
+    assert "unanswered" in rendered
+
+
+def test_extraction_renderer_replaces_unconfirmed_text_with_a_provenance_marker():
+    sentinel = "SENTINEL NAME ON 2047-09-17"
+    rendered = post_call._format_extraction_transcript(
+        [
+            {"role": "user", "text": "confirmed guest line"},
+            {
+                "role": post_call.UNCONFIRMED_TRANSCRIPT_ROLE,
+                "text": sentinel,
+                "provenance": "interim",
+                "answered": "unanswered",
+                "retention_reason": "hangup",
+            },
+        ]
+    )
+    assert "confirmed guest line" in rendered
+    assert sentinel not in rendered
+    assert "unconfirmed" in rendered.lower()
+    assert "interim" in rendered
+    assert "unanswered" in rendered
+
+
+class _RetryRecordingOpenAI:
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        content = (
+            "not json"
+            if len(self.calls) == 1
+            else '{"guest_name": null, "check_in": null, "check_out": null, '
+            '"room_preference": null, "call_outcome": "dropped", '
+            '"follow_up_needed": "Yes"}'
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+
+@pytest.mark.asyncio
+async def test_extraction_and_retry_never_receive_raw_unconfirmed_retained_text(monkeypatch):
+    sentinel = "SENTINEL NAME ON 2047-09-17"
+    http = _FakeHTTPSession()
+
+    async def get_session():
+        return http
+
+    client = _RetryRecordingOpenAI()
+    monkeypatch.setattr(booking_api, "get_session", get_session)
+    monkeypatch.setattr(post_call, "dashboard_client", None)
+    await post_call.process_post_call_data(
+        call_sid="call-id", lang="en", caller_phone="+94770000000",
+        full_transcript=[
+            {
+                "role": post_call.UNCONFIRMED_TRANSCRIPT_ROLE,
+                "text": sentinel,
+                "provenance": "interim",
+                "answered": "unanswered",
+                "retention_reason": "hangup",
+            }
+        ],
+        call_start_time="2026-08-18T00:00:00+00:00",
+        call_end_time="2026-08-18T00:01:00+00:00",
+        llm_provider="openai", openai_client=client,
+    )
+
+    assert len(client.calls) == 2, "invalid first response must exercise retry"
+    assert all(sentinel not in repr(call) for call in client.calls)
+    assert http.payloads[0]["guest_name"] is None
+    assert http.payloads[0]["check_in"] is None
+    assert http.payloads[0]["transcript"].endswith(sentinel), (
+        "the explicitly approved n8n transcript representation keeps its raw, "
+        "bounded, labelled retained evidence"
+    )

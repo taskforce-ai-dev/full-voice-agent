@@ -135,6 +135,20 @@ class _ThreadedSTT:
             self._thread.join(timeout=BARRIER_TIMEOUT)
 
 
+class _BlockingThreadedSTT(_ThreadedSTT):
+    """Stops off-loop, but only after the test releases its deterministic gate."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.stop_started = threading.Event()
+        self.stop_may_finish = threading.Event()
+
+    def stop(self):
+        self.stop_thread_ident = threading.get_ident()
+        self.stop_started.set()
+        self.stop_may_finish.wait(BARRIER_TIMEOUT)
+
+
 def make_live_session(*, smartpbx=True, lang="en"):
     """A session bound to the REAL running loop — threads must submit into it."""
     session = server.MediaStreamSession(websocket=None, lang=lang, media_transport=None)
@@ -176,6 +190,16 @@ async def _settle(times: int = 4) -> None:
     """Give any hop that escaped the fence every chance to land."""
     for _ in range(times):
         await asyncio.sleep(0)
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    assert await asyncio.to_thread(event.wait, BARRIER_TIMEOUT)
+
+
+async def _held_flush(session, release: asyncio.Event) -> None:
+    """A flush task created before teardown, released while stop is pending."""
+    await release.wait()
+    await session._flush_transcript()
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +344,89 @@ async def test_smartpbx_teardown_refuses_a_submission_made_after_the_fence_close
     assert processed == []
 
 
+@pytest.mark.asyncio
+async def test_smartpbx_teardown_closes_turn_dispatch_before_awaiting_stt_stop():
+    """A pre-created flush may not start a turn while off-loop stop is pending."""
+    session, processed = make_live_session()
+    session._pending_transcript = "pre-teardown endpoint task"
+    release_flush = asyncio.Event()
+    flush_task = asyncio.create_task(_held_flush(session, release_flush))
+    stt = _BlockingThreadedSTT(on_final_result=session._on_stt_result)
+    session._stt = stt
+    stt.start()
+    session._write_audio_dump = stt.release_and_join
+
+    dialog_session = KavyaSmartPBXSession(
+        _context(), _FakeTransport(), pipeline=session,
+        stt_factory=lambda **_kwargs: None, post_call_processor=None,
+        welcome_text="", llm_provider="claude", model="test-model",
+    )
+    finish_task = asyncio.create_task(dialog_session.finish(schedule_post_call=False))
+    await _wait_for_thread_event(stt.stop_started)
+    release_flush.set()
+    await _settle()
+    stt.stop_may_finish.set()
+    await finish_task
+    await flush_task
+    await _settle()
+
+    assert processed == [], "teardown entry must fence dispatch before its first await"
+    assert LAST_WORDS in _all_texts(session.full_transcript)
+    assert session._endpointing_handle is None
+
+
+@pytest.mark.asyncio
+async def test_stt_callback_drain_times_out_without_speech_or_exception_leakage(caplog):
+    """The fixed drain timeout reports only allowlisted outcome telemetry.
+
+    Contract: `stt_callback_drain` telemetry exposes only `outcome`, `pending`,
+    and bounded timing; retained-speech telemetry separately exposes exactly
+    reason/provenance/answered/chars with the hard 1000-character cap.
+    """
+    session, _processed = make_live_session()
+    secret = "SENTINEL-UNRETAINED-SPEECH"
+
+    async def stalled():
+        await asyncio.Event().wait()
+
+    assert session._submit_stt_callback(stalled)
+    with caplog.at_level("INFO"):
+        await asyncio.wait_for(
+            session._close_stt_callbacks(),
+            timeout=server.STT_CALLBACK_DRAIN_TIMEOUT_SECONDS * 2,
+        )
+
+    line = next(
+        record.getMessage()
+        for record in caplog.records
+        if "event=stt_callback_drain" in record.getMessage()
+    )
+    assert "outcome=timeout" in line
+    assert secret not in line
+    assert "RuntimeError" not in line
+
+
+@pytest.mark.asyncio
+async def test_stt_callback_drain_reports_raising_callback_without_swallowing_it(caplog):
+    """A raised admitted callback is observable but cannot block teardown."""
+    session, _processed = make_live_session()
+
+    async def raises():
+        raise RuntimeError("SENTINEL-CALLBACK-ERROR")
+
+    assert session._submit_stt_callback(raises)
+    with caplog.at_level("INFO"):
+        await session._close_stt_callbacks()
+
+    line = next(
+        record.getMessage()
+        for record in caplog.records
+        if "event=stt_callback_drain" in record.getMessage()
+    )
+    assert "outcome=error" in line
+    assert "SENTINEL-CALLBACK-ERROR" not in line
+
+
 # ---------------------------------------------------------------------------
 # 2. Twilio Media Streams teardown (`run()` finally)
 # ---------------------------------------------------------------------------
@@ -412,3 +519,39 @@ async def test_twilio_teardown_retains_a_final_submitted_from_the_worker_thread(
     )
     assert session._pending_transcript == ""
     assert session._committed_transcript == ""
+
+
+@pytest.mark.asyncio
+async def test_twilio_teardown_closes_turn_dispatch_before_awaiting_stt_stop(monkeypatch):
+    """Twilio shares SmartPBX's early dispatch fence and late callback drain."""
+    session, processed = make_live_session(smartpbx=False, lang="si")
+    session.ws = _FakeWebSocket()
+    session._pending_transcript = "pre-teardown endpoint task"
+    release_flush = asyncio.Event()
+    flush_task = asyncio.create_task(_held_flush(session, release_flush))
+    created: dict[str, _BlockingThreadedSTT] = {}
+
+    def factory(**kwargs):
+        stt = _BlockingThreadedSTT(**kwargs)
+        created["stt"] = stt
+        stt.start()
+        session._write_audio_dump = stt.release_and_join
+        return stt
+
+    monkeypatch.setattr(server, "_make_stt", factory)
+    monkeypatch.setattr(server, "process_post_call_data", lambda **_kwargs: None)
+    run_task = asyncio.create_task(session.run())
+    while "stt" not in created:
+        await asyncio.sleep(0)
+    stt = created["stt"]
+    await _wait_for_thread_event(stt.stop_started)
+    release_flush.set()
+    await _settle()
+    stt.stop_may_finish.set()
+    await run_task
+    await flush_task
+    await _settle()
+
+    assert processed == [], "a pre-created flush cannot start an LLM turn at hangup"
+    assert LAST_WORDS in _all_texts(session.full_transcript)
+    assert session._endpointing_handle is None
