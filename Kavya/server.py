@@ -6357,11 +6357,6 @@ class MediaStreamSession:
             return
         if self._reject_post_dispatch_result("final", text):
             return
-        # Teardown allows already-admitted finals to reach retention, but a
-        # provider replay during the closing drain must not duplicate the same
-        # retained evidence.
-        if self._stt_closing and self._committed_transcript == text:
-            return
         # A final supersedes any interim of the same utterance. Cleared here, on
         # the event loop, rather than in the STT worker-thread callback.
         self._latest_interim = ""
