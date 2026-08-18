@@ -572,6 +572,29 @@ def test_runbook_allowlists_stt_post_dispatch_result_with_its_exact_bounded_fiel
     assert "genuine barge-in" in normalized
     assert "never reaches this event" in normalized
 
+    # The event proves that a result was ignored while a turn owned dispatch —
+    # and nothing beyond that. It cannot tell a delayed tail or duplicate of the
+    # dispatched utterance from genuine new speech landing during pre-TTS LLM
+    # latency, so the runbook must not hand the operator an inference the event
+    # cannot support and a packet-loss/duplication retune it cannot justify.
+    assert "cannot distinguish a delayed tail" in normalized
+    assert "means late duplicate provider results" not in normalized
+    assert "no packet-loss diagnosis" in normalized
+    assert "no provider-duplication diagnosis" in normalized
+    assert "undetermined" in normalized
+
+    # Volume is bounded per turn, and the per-turn totals ride the already
+    # allowlisted turn_summary rather than one INFO line per ignored result.
+    assert "at most once per `result_type` per owning turn" in normalized
+    for field in (
+        "ignored_post_dispatch_finals",
+        "ignored_post_dispatch_interims",
+        "ignored_post_dispatch_max_elapsed_ms",
+    ):
+        assert f"`{field}`" in cutover, field
+    assert "`0`–`100000`" in cutover
+    assert "absent from the summary" in normalized
+
 
 def test_runbook_names_the_sonnet_5_canary_model_and_the_600_budget_rationale():
     """The runbook template used to hand operators `claude-sonnet-4-5-20250929`
