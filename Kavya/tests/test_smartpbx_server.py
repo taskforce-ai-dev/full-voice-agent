@@ -1763,6 +1763,57 @@ def direct_tool_round(provider, arguments, preamble=None, tool_name="create_book
     return events
 
 
+def direct_tool_batch_round(provider, calls, *, preamble=None, yield_before=False):
+    """One completed provider tool batch, preserving its declared call order."""
+    prefix = [YIELD_TO_EVENT_LOOP, YIELD_TO_EVENT_LOOP] if yield_before else []
+    if provider == "openai":
+        return prefix + [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+            content=preamble,
+            tool_calls=[SimpleNamespace(
+                index=index, id=f"tool-{index + 1}",
+                function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+            )
+            for index, (name, arguments) in enumerate(calls)],
+        ))])]
+    if provider == "gemini":
+        parts = []
+        if preamble is not None:
+            parts.append(SimpleNamespace(text=preamble, function_call=None))
+        parts.extend(
+            SimpleNamespace(
+                text=None,
+                function_call=SimpleNamespace(name=name, args=arguments),
+            )
+            for name, arguments in calls
+        )
+        return prefix + [SimpleNamespace(candidates=[SimpleNamespace(
+            finish_reason=None, content=SimpleNamespace(parts=parts),
+        )])]
+    events = list(prefix)
+    if preamble is not None:
+        events.append(SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text=preamble),
+        ))
+    for index, (name, arguments) in enumerate(calls):
+        events.extend([
+            SimpleNamespace(
+                type="content_block_start",
+                content_block=SimpleNamespace(
+                    type="tool_use", id=f"tool-{index + 1}", name=name,
+                ),
+            ),
+            SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(
+                    type="input_json_delta", partial_json=json.dumps(arguments),
+                ),
+            ),
+            SimpleNamespace(type="content_block_stop"),
+        ])
+    return events + claude_terminal_events("tool_use", 180)
+
+
 def direct_text_round(provider, text):
     if provider == "openai":
         return [SimpleNamespace(choices=[SimpleNamespace(
@@ -3581,6 +3632,112 @@ async def test_transfer_fences_pending_model_tts_before_canonical_delivery_barri
             "mcp:human please",
         ]
         assert pipeline._media_transport.clears == 1
+    finally:
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+@pytest.mark.parametrize("active_speech", ["specialized", "initial", "model"])
+async def test_pms_first_transfer_second_fences_active_speech_before_canonical_delivery(
+    monkeypatch, provider, active_speech,
+):
+    """A later transfer tool owns the same canonical handoff fence as the first."""
+    import server
+    import tools
+
+    model_preamble = "I can connect you now. "
+    client = direct_tool_client(provider, [
+        direct_tool_batch_round(
+            provider,
+            [
+                ("check_availability", {"nights": 2}),
+                ("transfer_to_human", {"reason": "human please"}),
+            ],
+            preamble=model_preamble if active_speech == "model" else None,
+            yield_before=active_speech == "initial",
+        ),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    pipeline._media_transport = GenerationTrackingTransport()
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(
+        server,
+        "SMARTPBX_INITIAL_FILLER_DELAY_SECONDS",
+        0.0 if active_speech == "initial" else 60.0,
+    )
+
+    specialized = server.TOOL_FILLERS["check_availability"]
+    active_text = {
+        "specialized": specialized,
+        "initial": server.SMARTPBX_INITIAL_FILLER_TEXT,
+        "model": model_preamble.strip(),
+    }[active_speech]
+    speech_started = asyncio.Event()
+    speech_cancelled = asyncio.Event()
+    check_started = asyncio.Event()
+    transfer_attempted = asyncio.Event()
+    timeline: list[str] = []
+
+    class Coordinator:
+        async def attempt(self, reason):
+            assert reason == "human please"
+            timeline.append("mcp")
+            transfer_attempted.set()
+            await pipeline.enter_transfer_pending()
+            return json.dumps({"status": "transferred"})
+
+    async def tts(text, **_kwargs):
+        if text == active_text:
+            timeline.append("active_started")
+            speech_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                timeline.append("active_cancelled")
+                speech_cancelled.set()
+                raise
+            raise AssertionError("the transfer fence must retire active speech")
+        assert text == tools.TRANSFER_ANNOUNCEMENT_TEXT
+        timeline.append("canonical")
+
+    async def delivery_barrier(_pipeline, **_kwargs):
+        timeline.append("delivery_barrier")
+
+    real_execute = tools.execute_tool
+
+    async def execute(name, arguments):
+        if name == "check_availability":
+            timeline.append("check")
+            check_started.set()
+            await asyncio.wait_for(speech_started.wait(), timeout=0.2)
+            return json.dumps({"status": "ok"})
+        assert name == "transfer_to_human"
+        return await real_execute(name, arguments)
+
+    pipeline._smartpbx_transfer_context = tools.SmartPBXTransferContext(
+        call_control=None, coordinator=Coordinator(), pipeline=pipeline,
+    )
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+    monkeypatch.setattr(server, "execute_tool", execute)
+    monkeypatch.setattr(tools, "_await_turn_delivery", delivery_barrier)
+
+    turn = asyncio.create_task(pipeline._process_utterance("availability then human"))
+    try:
+        await asyncio.wait_for(check_started.wait(), timeout=0.2)
+        await asyncio.wait_for(transfer_attempted.wait(), timeout=0.2)
+        await asyncio.wait_for(speech_cancelled.wait(), timeout=0.2)
+        await asyncio.wait_for(turn, timeout=1)
+
+        assert timeline == [
+            "active_started", "check", "active_cancelled", "canonical",
+            "delivery_barrier", "mcp",
+        ]
+        assert pipeline._media_transport.clears == 1
+        assert pipeline._speak_lock.locked() is False
+        assert not pipeline._smartpbx_tool_filler_tasks
+        assert pipeline._smartpbx_initial_filler is None
     finally:
         turn.cancel()
         await asyncio.gather(turn, return_exceptions=True)
