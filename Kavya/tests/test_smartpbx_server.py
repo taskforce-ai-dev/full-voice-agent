@@ -3744,6 +3744,186 @@ async def test_pms_first_transfer_second_fences_active_speech_before_canonical_d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+@pytest.mark.parametrize("termination", ["barge_in", "session_finish", "runner_cancel"])
+async def test_later_transfer_early_exit_cancels_deferred_model_tts(
+    monkeypatch, provider, termination,
+):
+    """A later transfer batch may not strand a pre-transfer TTS task on exit."""
+    import server
+
+    model_preamble = "I can connect you now. "
+    client = direct_tool_client(provider, [
+        direct_tool_batch_round(
+            provider,
+            [
+                ("check_availability", {"nights": 2}),
+                ("transfer_to_human", {"reason": "human please"}),
+            ],
+            preamble=model_preamble,
+        ),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "SMARTPBX_INITIAL_FILLER_DELAY_SECONDS", 60.0)
+
+    tts_started = asyncio.Event()
+    tts_cancelled = asyncio.Event()
+    check_started = asyncio.Event()
+    check_release = asyncio.Event()
+    held_tts: asyncio.Task | None = None
+
+    async def tts(text, **_kwargs):
+        nonlocal held_tts
+        assert text == model_preamble.strip()
+        held_tts = asyncio.current_task()
+        tts_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            tts_cancelled.set()
+            raise
+
+    async def execute(name, _arguments):
+        assert name == "check_availability", "transfer must not execute after ownership loss"
+        check_started.set()
+        await check_release.wait()
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+    monkeypatch.setattr(server, "execute_tool", execute)
+    turn = asyncio.create_task(pipeline._process_utterance("availability then human"))
+    finish_task = None
+    try:
+        await asyncio.wait_for(tts_started.wait(), timeout=1)
+        await asyncio.wait_for(check_started.wait(), timeout=1)
+
+        if termination == "barge_in":
+            await pipeline._handle_bargein()
+            check_release.set()
+            await asyncio.wait_for(turn, timeout=1)
+        elif termination == "session_finish":
+            async def no_post_call(**_metadata):
+                raise AssertionError("post-call is not requested")
+
+            session = KavyaSmartPBXSession(
+                context(), FakeTransport(), pipeline=pipeline,
+                stt_factory=lambda **_kwargs: FakeSTT(),
+                post_call_processor=no_post_call, welcome_text=None,
+                llm_provider=provider, model="test-model",
+            )
+            finish_task = asyncio.create_task(session.finish(False))
+            await asyncio.wait_for(finish_task, timeout=1)
+            check_release.set()
+            await asyncio.wait_for(turn, timeout=1)
+        else:
+            turn.cancel()
+            await asyncio.gather(turn, return_exceptions=True)
+
+        await asyncio.wait_for(tts_cancelled.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        assert held_tts is not None and held_tts.done()
+        assert pipeline._speak_lock.locked() is False
+        assert pipeline._media_transport.audio == []
+    finally:
+        check_release.set()
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+        if finish_task is not None:
+            await asyncio.gather(finish_task, return_exceptions=True)
+        if held_tts is not None and not held_tts.done():
+            held_tts.cancel()
+            await asyncio.gather(held_tts, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
+@pytest.mark.parametrize(
+    ("capture_tool", "capture_result", "slot", "expected"),
+    [
+        (
+            "capture_spoken_number",
+            {"status": "captured", "valid": True, "normalized": "+94771234567"},
+            "guest_phone",
+            "+94771234567",
+        ),
+        (
+            "capture_spoken_name",
+            {"status": "captured", "name": "Ada Lovelace"},
+            "guest_name",
+            "Ada Lovelace",
+        ),
+    ],
+)
+async def test_capture_then_transfer_keeps_capture_slot_without_late_completion(
+    monkeypatch, provider, capture_tool, capture_result, slot, expected,
+):
+    """A quiet capture before transfer must commit once under the transfer fence."""
+    import server
+    import tools
+
+    client = direct_tool_client(provider, [
+        direct_tool_batch_round(
+            provider,
+            [
+                (capture_tool, {"spoken": "raw capture"}),
+                ("transfer_to_human", {"reason": "human please"}),
+            ],
+        ),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    pipeline._media_transport = GenerationTrackingTransport()
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(
+        pipeline, "_start_initial_smartpbx_filler", lambda **_kwargs: None,
+    )
+
+    timeline: list[str] = []
+    telemetry: list[str] = []
+
+    class Coordinator:
+        async def attempt(self, reason):
+            assert reason == "human please"
+            timeline.append("mcp")
+            await pipeline.enter_transfer_pending()
+            return json.dumps({"status": "transferred"})
+
+    async def tts(text, **_kwargs):
+        assert text == tools.TRANSFER_ANNOUNCEMENT_TEXT
+        timeline.append("canonical")
+
+    async def delivery_barrier(_pipeline, **_kwargs):
+        timeline.append("delivery_barrier")
+
+    real_execute = tools.execute_tool
+
+    async def execute(name, arguments):
+        if name == capture_tool:
+            return json.dumps(capture_result)
+        assert name == "transfer_to_human"
+        return await real_execute(name, arguments)
+
+    def emit(_event, **fields):
+        if fields.get("stage") == "late_tool_completion":
+            telemetry.append("late_tool_completion")
+
+    pipeline._smartpbx_transfer_context = tools.SmartPBXTransferContext(
+        call_control=None, coordinator=Coordinator(), pipeline=pipeline,
+    )
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+    monkeypatch.setattr(server, "execute_tool", execute)
+    monkeypatch.setattr(server, "_emit_smartpbx_turn_telemetry", emit)
+    monkeypatch.setattr(tools, "_await_turn_delivery", delivery_barrier)
+
+    await asyncio.wait_for(pipeline._process_utterance("capture then human"), timeout=1)
+
+    assert pipeline._booking_slots[slot] == expected
+    assert timeline == ["canonical", "delivery_barrier", "mcp"]
+    assert pipeline._media_transport.clears == 1
+    assert telemetry == []
+
+
+@pytest.mark.asyncio
 async def test_transfer_prepare_does_not_reset_a_new_turn_delivery_ledger():
     """A stale transfer prelude may not clear a turn that won while it awaited."""
     import server
