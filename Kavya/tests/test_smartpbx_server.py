@@ -5134,6 +5134,85 @@ async def test_spoken_initial_filler_drains_before_real_answer_delivery_and_hist
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_live_initial_filler_delivery_blocks_provider_answer_without_a_clear(
+    monkeypatch, provider
+):
+    """First provider content waits if initial filler TTS has started.
+
+    Unlike the completed-filler contract above, this holds the real TTS path
+    before its ``send_mark``/delivery acknowledgement, then lets the provider
+    produce its first answer token.  That is the production cutoff race.
+    """
+    import server
+
+    answer = "Your room is available."
+    content_release = asyncio.Event()
+    filler_delivery_release = asyncio.Event()
+    filler_started = asyncio.Event()
+    answer_started = asyncio.Event()
+
+    async def delayed_content():
+        await content_release.wait()
+        for event in direct_text_round(provider, answer):
+            yield event
+
+    client = controlled_direct_tool_client(provider, [delayed_content()])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    transport = GenerationTrackingTransport()
+    pipeline._media_transport = transport
+    filler_sleep = _ControlledInitialFillerSleep()
+    real_controller = server.SmartPBXInitialFillerController
+
+    def controlled_controller(**kwargs):
+        return real_controller(**kwargs, sleep=filler_sleep)
+
+    async def tts(text, *, sentence=None, turn_generation=None):
+        pipeline._is_speaking = True
+        if text == server.SMARTPBX_INITIAL_FILLER_TEXT:
+            filler_started.set()
+            await filler_delivery_release.wait()
+        else:
+            answer_started.set()
+        await pipeline._send_tts_done(
+            sentence=sentence, turn_generation=turn_generation,
+        )
+
+    monkeypatch.setattr(server, "SmartPBXInitialFillerController", controlled_controller)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+
+    turn = asyncio.create_task(
+        pipeline._process_utterance_bound("guest supplied booking dates")
+    )
+    try:
+        await asyncio.wait_for(filler_sleep.entered.wait(), timeout=1)
+        filler_sleep.release.set()
+        await asyncio.wait_for(filler_started.wait(), timeout=1)
+
+        content_release.set()
+        await asyncio.sleep(0)
+        assert transport.clears == 0
+        assert pipeline._speak_generation == transport.generation == 0
+        assert not answer_started.is_set(), (
+            "the answer must wait behind a started filler, not replace it"
+        )
+
+        filler_delivery_release.set()
+        await asyncio.wait_for(turn, timeout=2)
+
+        assert answer_started.is_set()
+        assert transport.clears == 0
+        assert pipeline.history[-1] == {"role": "assistant", "content": answer}
+    finally:
+        content_release.set()
+        filler_delivery_release.set()
+        filler_sleep.release.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        pipeline._cancel_reprompt()
+
+
+@pytest.mark.asyncio
 async def test_filler_handoff_cannot_rebind_a_barged_out_runner_to_the_new_turn(
     monkeypatch,
 ):
