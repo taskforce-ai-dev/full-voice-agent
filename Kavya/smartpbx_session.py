@@ -187,6 +187,11 @@ class KavyaSmartPBXSession:
             # _audio_dump, and the SmartPBX path never runs it. STT_DEBUG_DUMP
             # produces no wavs here -- do not debug STT waiting for them.
             pipeline._write_audio_dump()
+            close_stt_callbacks = getattr(pipeline, "_close_stt_callbacks", None)
+            if callable(close_stt_callbacks):
+                pending = close_stt_callbacks()
+                if inspect.isawaitable(pending):
+                    await pending
             # Dialog hangup/stop ownership: RETAINED. Anything still buffered —
             # a half-finished number, or ordinary speech admitted while a turn
             # held the dispatch guard — goes into the transcript before the

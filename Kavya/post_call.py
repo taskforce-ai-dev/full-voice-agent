@@ -42,6 +42,12 @@ N8N_POSTCALL_WEBHOOK: str = os.getenv(
 
 EXTRACTION_MAX_TOKENS: int = 2000
 
+# A retained record represents speech that never became an answered guest turn.
+# Keep this vocabulary explicit across post-call formatting, n8n, and dashboard
+# payloads so downstream consumers cannot treat it as confirmed booking data.
+UNCONFIRMED_TRANSCRIPT_ROLE = "unconfirmed_user"
+UNCONFIRMED_TRANSCRIPT_LABEL = "Guest (unconfirmed, unanswered)"
+
 # ---------------------------------------------------------------------------
 # Extraction prompt
 # ---------------------------------------------------------------------------
@@ -78,6 +84,14 @@ CRITICAL RULES FOR guest_name:
   letter-by-letter, assemble the name from those letters.
 - If neither condition applies, extract guest_name from conversational text as you
   would normally.
+
+CRITICAL RULES FOR unconfirmed retained speech:
+- A line beginning "Guest (unconfirmed, unanswered)" is an unconfirmed provider
+  hypothesis or a final statement that never received an agent response. It is
+  evidence only, not a confirmed booking statement.
+- Never use an unconfirmed line to fill guest_name, dates, guest count,
+  room_preference, availability_result, or any other booking field. Do not infer
+  a booking from it; it may only support a dropped-call outcome.
 
 CRITICAL RULES FOR call_outcome — pick the BEST match:
 - "booking_confirmed" = guest confirmed a booking during the call
@@ -372,6 +386,9 @@ async def extract_booking_details(
 RETRY_PROMPT: str = """Extract these fields from the Hatton Hills call transcript as a short JSON object. Use null for missing fields.
 Fields: guest_name, property (always 'Hatton Hills'), num_guests, check_in (YYYY-MM-DD), check_out (YYYY-MM-DD), room_preference, availability_result, call_outcome (booking_inquiry/general_inquiry/booking_confirmed/callback_requested/dropped), follow_up_needed (Yes/No), summary (1 sentence English).
 If a System marker line appears, copy guest_name from the marker's guest_name field
+"Guest (unconfirmed, unanswered)" lines are not confirmed booking data: never
+use them for guest_name, dates, guests, room_preference, availability, or a
+booking outcome; they may only support a dropped-call outcome.
 and do not infer it from surrounding guest-side chatter.
 Room types differ per property and similar names exist at both, so a room name alone is ambiguous: if the property is not established, set both property and room_preference to null. Never write a price figure into any field.
 Return ONLY valid JSON, no markdown."""
@@ -468,9 +485,12 @@ def _format_transcript(full_transcript: list[dict[str, str]]) -> str:
     """Convert transcript list to readable text."""
     lines: list[str] = []
     for entry in full_transcript:
+        entry_role = entry.get("role")
         role = (
-            "Guest" if entry["role"] == "user"
-            else "System" if entry["role"] == "system"
+            "Guest" if entry_role == "user"
+            else "System" if entry_role == "system"
+            else UNCONFIRMED_TRANSCRIPT_LABEL
+            if entry_role == UNCONFIRMED_TRANSCRIPT_ROLE
             else "Kavya"
         )
         lines.append(f"{role}: {entry['text']}")
@@ -494,7 +514,9 @@ async def process_post_call_data(
     """Orchestrate post-call processing: extract details, POST to n8n.
 
     This runs as a background task (asyncio.create_task). All exceptions
-    are caught and logged -- never propagated.
+    are caught and logged -- never propagated. `privacy_safe` redacts this
+    function's operational logs only; it does not change transcript retention
+    or downstream payload semantics.
     """
     try:
         if privacy_safe:
