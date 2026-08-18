@@ -5661,7 +5661,7 @@ async def test_timeout_recovery_fence_records_the_recovery_line_it_actually_spok
 async def test_filler_clear_resuming_after_barge_in_cannot_reanchor_old_turn(
     monkeypatch,
 ):
-    """A clear already awaiting transport must revalidate ownership on return."""
+    """The one real barge clear must not let an old runner re-anchor state."""
     import server
 
     old_turn, new_turn = "filler-old-turn", "filler-new-turn"
@@ -5739,7 +5739,7 @@ async def test_filler_clear_resuming_after_barge_in_cannot_reanchor_old_turn(
         transport.resume_first_clear.set()
         await asyncio.wait_for(asyncio.gather(barge_task, stale_task), timeout=1)
 
-        assert transport.clears == 2
+        assert transport.clears == 1
         assert pipeline._smartpbx_barge_ins == 1
         assert pipeline._active_smartpbx_turn_id == new_turn
         assert runner.speak_generation == generation
