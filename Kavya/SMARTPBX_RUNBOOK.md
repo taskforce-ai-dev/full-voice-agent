@@ -402,8 +402,25 @@ was therefore refused before any counter, buffer or endpointing timer changed �
 the age of the owning turn, nothing about what was said. No transcript text, no
 character or token counts, no provider payload, no phone or call identifier. A
 genuine barge-in is handled on the speaking-time path and never reaches this
-event, so a rise in this counter means late duplicate provider results, not
-missed interruptions.
+event, so a rise in this counter still does not indicate missed interruptions.
+
+That is the whole of what it proves. The event **cannot distinguish a delayed
+tail or duplicate of the utterance already dispatched from genuine new caller
+speech** that lands during pre-TTS LLM latency or between the spoken sentences of
+a reply — it sees a result and the turn's age, and nothing that separates those
+cases. Draw **no packet-loss diagnosis and no provider-duplication diagnosis**
+from it. What a rise means beyond "a result was ignored while a turn owned
+dispatch" is undetermined by this event alone; establishing a cause needs the
+turn timings and the endpointing settings for the same calls, not this counter.
+
+Volume is bounded per turn: the line is emitted **at most once per `result_type`
+per owning turn**, so one turn contributes at most two lines however many results
+it refuses. Per-turn totals travel on `turn_summary` instead, as three bounded
+integers: `ignored_post_dispatch_finals` and `ignored_post_dispatch_interims`
+(each `0`–`100000`, clamped) and `ignored_post_dispatch_max_elapsed_ms`
+(`0`–`60000`, clamped, the same range as `elapsed_ms` above). All three are
+absent from the summary of a turn that refused nothing — absent, not zero, the
+same convention as `kb_ms` and `tool_ms`.
 
 Wire-delivery proxies describe paced transport behavior only; they are not
 playback acknowledgements. Every approved event must not contain transcript text,
