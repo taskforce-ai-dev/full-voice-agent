@@ -647,6 +647,70 @@ async def test_dialog_finish_cancels_pending_initial_filler_before_other_teardow
 
 
 @pytest.mark.asyncio
+async def test_dialog_finish_awaits_held_specialized_filler_before_terminal_summary():
+    """Terminal teardown must not report done while a tool filler holds TTS."""
+    import server
+
+    async def process_post_call(**_metadata):
+        raise AssertionError("no post-call work requested")
+
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=FakeTransport(),
+    )
+    pipeline._smartpbx_transfer_context = object()
+    filler_started = asyncio.Event()
+    filler_cancelled = asyncio.Event()
+    cancel_release = asyncio.Event()
+
+    async def tts(_text, **_kwargs):
+        filler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            filler_cancelled.set()
+            await cancel_release.wait()
+            raise
+
+    pipeline._tts_elevenlabs = tts
+    filler_task = pipeline._start_smartpbx_tool_filler("PMS filler.", generation=0)
+    await asyncio.wait_for(filler_started.wait(), timeout=1)
+    assert pipeline._speak_lock.locked()
+
+    session = KavyaSmartPBXSession(
+        context(),
+        FakeTransport(),
+        pipeline=pipeline,
+        stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=process_post_call,
+        welcome_text=None,
+        llm_provider="claude",
+        model="test-model",
+    )
+    finishing = asyncio.create_task(session.finish(False))
+    try:
+        await asyncio.wait_for(filler_cancelled.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert not finishing.done()
+        assert not session.terminal_future.done()
+        assert pipeline._speak_lock.locked()
+
+        cancel_release.set()
+        await asyncio.wait_for(finishing, timeout=1)
+
+        assert filler_task.done()
+        assert pipeline._speak_lock.locked() is False
+        assert session.terminal_future.done()
+    finally:
+        cancel_release.set()
+        finishing.cancel()
+        await asyncio.gather(finishing, return_exceptions=True)
+        if not filler_task.done():
+            filler_task.cancel()
+            await asyncio.gather(filler_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_dialog_hangup_finishes_once_and_schedules_kavya_post_call():
     post_call_calls = []
 
@@ -3516,10 +3580,101 @@ async def test_transfer_fences_pending_model_tts_before_canonical_delivery_barri
             "model_started", "model_cancelled", "canonical", "delivery_barrier",
             "mcp:human please",
         ]
-        assert pipeline._media_transport.clears >= 1
+        assert pipeline._media_transport.clears == 1
     finally:
         turn.cancel()
         await asyncio.gather(turn, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_transfer_prepare_does_not_reset_a_new_turn_delivery_ledger():
+    """A stale transfer prelude may not clear a turn that won while it awaited."""
+    import server
+
+    old_turn, new_turn = "transfer-old-turn", "transfer-new-turn"
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=FakeTransport(),
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline._active_smartpbx_turn_id = old_turn
+    initial_finish_entered = asyncio.Event()
+    initial_finish_release = asyncio.Event()
+
+    class StartedInitialFiller:
+        spoke = True
+
+        async def on_session_finish(self):
+            initial_finish_entered.set()
+            await initial_finish_release.wait()
+
+    initial = StartedInitialFiller()
+    pipeline._smartpbx_initial_filler = initial
+    runner = server._SmartPBXRunnerContext(
+        turn_id=old_turn, dropped_frame_baseline=0,
+        speak_generation=pipeline._speak_generation, raw_utterance="",
+    )
+
+    async def prepare():
+        token = server._smartpbx_runner_context.set(runner)
+        try:
+            return await pipeline._prepare_smartpbx_transfer_handoff(
+                tts_tasks=[], initial_filler=initial,
+                generation=pipeline._speak_generation,
+            )
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+    task = asyncio.create_task(prepare())
+    try:
+        await asyncio.wait_for(initial_finish_entered.wait(), timeout=1)
+        pipeline._active_smartpbx_turn_id = new_turn
+        pipeline._assistant_turn_generation = 77
+        pipeline._assistant_turn_generated_sentences = ["new turn sentence"]
+        pipeline._delivered_sentences = ["new turn sentence"]
+        initial_finish_release.set()
+
+        assert await asyncio.wait_for(task, timeout=1) is None
+        assert pipeline._assistant_turn_generation == 77
+        assert pipeline._assistant_turn_generated_sentences == ["new turn sentence"]
+        assert pipeline._delivered_sentences == ["new turn sentence"]
+    finally:
+        initial_finish_release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_started_initial_filler_is_fenced_once_before_transfer_canonical_path():
+    """An audible initial filler gets one pre-transfer fence, never a second clear."""
+    import server
+
+    transport = GenerationTrackingTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport,
+    )
+    pipeline._smartpbx_transfer_context = object()
+
+    class StartedInitialFiller:
+        spoke = True
+
+        async def on_session_finish(self):
+            return None
+
+    initial = StartedInitialFiller()
+    pipeline._smartpbx_initial_filler = initial
+    pipeline._start_assistant_turn_delivery_tracking()
+
+    generation = await pipeline._prepare_smartpbx_transfer_handoff(
+        tts_tasks=[], initial_filler=initial,
+        generation=pipeline._speak_generation,
+    )
+
+    assert generation == pipeline._speak_generation == 1
+    assert transport.clears == 1
+
+    await pipeline.enter_transfer_pending()
+
+    assert transport.clears == 1
 
 
 @pytest.mark.asyncio
