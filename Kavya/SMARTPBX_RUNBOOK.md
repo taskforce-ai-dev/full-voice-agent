@@ -356,9 +356,10 @@ event allowlist**. It may contain only the following runtime event names:
 `llm_error`, `llm_provider_degraded`, `llm_provider_failover`, `tool_execute`,
 `tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`,
 `tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
-`silence_reprompt`, `stt_final`, `stt_provider_final`, `stt_provider_interim`,
+`silence_reprompt`, `stt_final`, `stt_post_dispatch_result`,
+`stt_provider_final`, `stt_provider_interim`,
 `capture_buffer_bounded`, `capture_final_buffered`, `capture_forced_dispatch`,
-`capture_mode_enter`, `capture_mode_exit`, `dtmf_collect_start`, and
+`stt_callback_drain`, `capture_mode_enter`, `capture_mode_exit`, `dtmf_collect_start`, and
 `dtmf_collect_done`; unlisted event names are not permitted.
 The protocol diagnostic record is emitted as
 `event=smartpbx_protocol_diagnostic`.
@@ -387,6 +388,76 @@ are caller-derived). `output_tokens` and `attempt` are likewise clamped to the
 ranges above, so a corrupt usage payload cannot write an unbounded numeral.
 This event carries no free text, no tool names, no tool arguments and no caller
 identifiers of any kind.
+
+`stt_post_dispatch_result` emits exactly three fields, and no others:
+
+| Field | Type | Permitted values |
+| --- | --- | --- |
+| `result_type` | bounded enum | `final`, `interim` (any other value emits nothing) |
+| `action` | fixed string | `ignored_active_turn` |
+| `elapsed_ms` | bounded integer | `0`–`60000`, clamped |
+
+It records that an EMPTY provider result arrived while a turn was already
+dispatched and was therefore refused before any counter, buffer or endpointing
+timer changed — the age of the owning turn, nothing about what was said. No
+transcript text, no character or token counts, no provider payload, no phone or
+call identifier. A genuine barge-in is handled on the speaking-time path and
+never reaches this event, so a rise in this counter still does not indicate
+missed interruptions.
+
+"Empty" is the whole of the refusal test, and it is evaluated in memory and never
+logged: the result carries no material characters — nothing alphanumeric, so
+empty, whitespace or punctuation only. Every other result is ADMITTED: it is
+buffered, it cancels and resets the silence re-prompt, and it is dispatched as
+the next turn, so it never reaches this event.
+
+**This signal cannot prove whether a result was a provider tail or the caller
+repeating themselves immediately, and it no longer tries.** An earlier revision
+refused results whose text matched the dispatched utterance (equal, a
+token-boundary prefix, or a punctuation-only superset) within two seconds of
+dispatch, and called that proof of provider ownership. It is not. Establishing
+that a result belongs to the utterance already answered needs provider result
+identity, and none reaches this pipeline: `GoogleSTTStream` and `AzureSTTStream`
+both deliver a bare string to their callbacks — no result id, no segment id, no
+audio-time span — and `GoogleSTTStream._stream_epoch` is an internal gRPC-swap
+fence that is identical for a tail and for a repetition. Matching text and a
+short elapsed time are exactly what an immediate caller repetition looks like, so
+that predicate was withdrawn along with the two-second window. `elapsed_ms`
+survives as a description of the refusal, never as a gate.
+
+Consequently, what the event **cannot** tell you is anything about the provider
+or the network: draw **no packet-loss diagnosis and no provider-duplication
+diagnosis** from it — a rise means empty results were seen and refused, and the
+reason they were produced is undetermined by this event alone. Establishing that
+needs the turn timings and the endpointing settings for the same calls, not this
+counter. A rise is also not evidence of lost caller speech: a refused result had
+no speech in it, and everything with speech in it is admitted.
+
+Where that admitted speech goes is not silent either. Once it is buffered, every
+boundary that can end or divert the call gives it an explicit owner — it becomes
+a turn, or it is written into the call transcript (a barge-in supersedes it for
+dispatch but still records it; transfer-pending and both teardown paths record it
+before the post-call snapshot). Retention is reported by the existing
+`capture_forced_dispatch` event. Its complete fixed, content-free contract is
+`reason` (`barge_in`, `transfer`, `transfer_flush`, `session_end`, `hangup`),
+`provenance` (`final` or `interim`), `answered=unanswered`, and `chars` capped
+at 1000. No boundary drops the buffer silently. Teardown first closes endpoint
+and turn dispatch synchronously, then keeps callback admission open only through
+provider stop/audio dump; it closes that admission and bounded-drains it before
+retention. `stt_callback_drain` reports only fixed outcome (`drained`, `timeout`,
+or `error`), pending count, and bounded elapsed time; it never logs speech or
+exception text. `privacy_safe=True` redacts operational logs only. Raw bounded,
+labelled retained text remains only in the approved n8n transcript representation;
+post-call extraction receives a provenance-only marker and never the raw text.
+
+Volume is bounded per turn: the line is emitted **at most once per `result_type`
+per owning turn**, so one turn contributes at most two lines however many results
+it refuses. Per-turn totals travel on `turn_summary` instead, as three bounded
+integers: `ignored_post_dispatch_finals` and `ignored_post_dispatch_interims`
+(each `0`–`100000`, clamped) and `ignored_post_dispatch_max_elapsed_ms`
+(`0`–`60000`, clamped, the same range as `elapsed_ms` above). All three are
+absent from the summary of a turn that refused nothing — absent, not zero, the
+same convention as `kb_ms` and `tool_ms`.
 
 Wire-delivery proxies describe paced transport behavior only; they are not
 playback acknowledgements. Every approved event must not contain transcript text,

@@ -368,9 +368,16 @@ async def test_genuine_interruption_barges_in_and_keeps_prior_transcript(monkeyp
     )
     assert session._pending_transcript == ""
     assert session._committed_transcript == ""
-    # The call's transcript log survives the interruption; only the live
-    # buffer for the turn being interrupted is cleared.
-    assert session.full_transcript == [{"role": "user", "text": "prior turn kept intact"}]
+    # The call's transcript log survives the interruption, and so does the
+    # buffered text: barge-in ownership is SUPERSEDED for dispatch (the new
+    # utterance, not the buffer, is what the next turn answers) but RETAINED for
+    # the record. Before the post-dispatch predicate was narrowed the buffer was
+    # dropped here; now that ordinary speech is routinely admitted while a turn
+    # holds the dispatch guard, dropping it would be silent loss of guest words.
+    assert session.full_transcript == [
+        {"role": "user", "text": "prior turn kept intact"},
+        {"role": server.RETAINED_SPEECH_ROLE, "text": "stale text from interrupted turn", "provenance": "final", "answered": "unanswered", "retention_reason": "barge_in"},
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -359,11 +359,13 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "kb_error",
         "silence_reprompt",
         "stt_final",
+        "stt_post_dispatch_result",
         "stt_provider_final",
         "stt_provider_interim",
         "capture_buffer_bounded",
         "capture_final_buffered",
         "capture_forced_dispatch",
+        "stt_callback_drain",
         "capture_mode_enter",
         "capture_mode_exit",
         "dtmf_collect_start",
@@ -545,6 +547,76 @@ def test_runbook_allowlists_llm_round_outcome_with_its_exact_bounded_field_set()
     normalized_cutover = re.sub(r"\s+", " ", cutover).lower()
     assert "the raw provider string is never emitted" in normalized_cutover
     assert "clamped" in normalized_cutover
+
+
+def test_runbook_allowlists_stt_post_dispatch_result_with_its_exact_bounded_field_set():
+    """The late-STT-result event is the only place the pipeline reports that it
+    threw a provider result away. It must stay a closed enum pair plus one
+    clamped integer — the tempting fields (what was said, how long it was) are
+    exactly the ones that would turn it into a transcript side channel — and its
+    documented meaning must not over-claim: it cannot separate a provider tail
+    from an immediate caller repetition, because no provider result identity
+    reaches this pipeline."""
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    cutover = runbook.split("## Cutover gates", 1)[1].split("\n## ", 1)[0]
+
+    assert "`stt_post_dispatch_result`" in cutover
+    assert "emits exactly three fields, and no others" in cutover
+    for field in ("result_type", "action", "elapsed_ms"):
+        assert f"`{field}`" in cutover, field
+    for value in ("`final`", "`interim`", "`ignored_active_turn`", "`0`–`60000`"):
+        assert value in cutover, value
+
+    normalized = re.sub(r"\s+", " ", cutover).lower()
+    assert "no transcript text" in normalized
+    assert "no character or token counts" in normalized
+    assert "no phone or call identifier" in normalized
+    # A barge-in must not be miscounted here, or the operator reads the metric
+    # as "missed interruptions" and retunes endpointing for the wrong reason.
+    assert "genuine barge-in" in normalized
+    assert "never reaches this event" in normalized
+
+    # The event fires only for results with no material characters. The runbook
+    # must say so, must say that everything else is admitted, and must state
+    # plainly that this signal cannot prove tail-vs-repetition — an operator who
+    # believes it can will retune endpointing on a number that does not carry
+    # that information.
+    assert "no material characters" in normalized
+    assert "admitted" in normalized
+    assert (
+        "cannot prove whether a result was a provider tail or the caller "
+        "repeating themselves" in normalized
+    )
+    assert "provider result identity" in normalized
+    assert "never reaches this event" in normalized
+    # The withdrawn predicate must not be described as live policy anywhere.
+    assert "proven to be that turn's own tail" not in normalized
+    assert "means late duplicate provider results" not in normalized
+    assert "cannot distinguish a delayed tail" not in normalized
+    assert "no packet-loss diagnosis" in normalized
+    assert "no provider-duplication diagnosis" in normalized
+    assert "undetermined" in normalized
+    # And it is not a lost-speech metric: a refused result had no speech in it.
+    assert "not evidence of lost caller speech" in normalized
+
+    # Admitted speech is owned at every boundary, and the runbook must name the
+    # event and the closed reason set that report the retention.
+    assert "`capture_forced_dispatch`" in cutover
+    for reason in ("`barge_in`", "`transfer`", "`transfer_flush`", "`session_end`", "`hangup`"):
+        assert reason in cutover, reason
+    assert "no boundary drops the buffer silently" in normalized
+
+    # Volume is bounded per turn, and the per-turn totals ride the already
+    # allowlisted turn_summary rather than one INFO line per ignored result.
+    assert "at most once per `result_type` per owning turn" in normalized
+    for field in (
+        "ignored_post_dispatch_finals",
+        "ignored_post_dispatch_interims",
+        "ignored_post_dispatch_max_elapsed_ms",
+    ):
+        assert f"`{field}`" in cutover, field
+    assert "`0`–`100000`" in cutover
+    assert "absent from the summary" in normalized
 
 
 def test_runbook_names_the_sonnet_5_canary_model_and_the_600_budget_rationale():

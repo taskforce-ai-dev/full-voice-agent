@@ -152,6 +152,9 @@ class KavyaSmartPBXSession:
             pipeline = self._pipeline
             if pipeline is None:
                 return
+            close_dispatch = getattr(pipeline, "_close_teardown_dispatch", None)
+            if callable(close_dispatch):
+                close_dispatch()
             # Cancel-and-await the initial-round filler BEFORE any other
             # teardown await below. Its delay (default 1.5s) runs on its own
             # timer, independent of the provider stream -- if it is still
@@ -187,14 +190,19 @@ class KavyaSmartPBXSession:
             # _audio_dump, and the SmartPBX path never runs it. STT_DEBUG_DUMP
             # produces no wavs here -- do not debug STT waiting for them.
             pipeline._write_audio_dump()
-            # Dialog hangup/stop: force any buffered capture dictation into the
-            # transcript before it is read for post-call extraction. A number the
-            # caller half-finished must not vanish with the socket.
-            force_capture_dispatch = getattr(
-                pipeline, "_force_pending_capture_dispatch", None
-            )
-            if callable(force_capture_dispatch):
-                pending = force_capture_dispatch("hangup")
+            close_stt_callbacks = getattr(pipeline, "_close_stt_callbacks", None)
+            if callable(close_stt_callbacks):
+                pending = close_stt_callbacks()
+                if inspect.isawaitable(pending):
+                    await pending
+            # Dialog hangup/stop ownership: RETAINED. Anything still buffered —
+            # a half-finished number, or ordinary speech admitted while a turn
+            # held the dispatch guard — goes into the transcript before the
+            # snapshot below reads it for post-call extraction. It must not
+            # vanish with the socket.
+            retain_pending_speech = getattr(pipeline, "_retain_pending_speech", None)
+            if callable(retain_pending_speech):
+                pending = retain_pending_speech("hangup")
                 if inspect.isawaitable(pending):
                     await pending
             if self._smartpbx_transfer_context is not None and self._smartpbx_transfer_context.coordinator is not None:
