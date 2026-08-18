@@ -4926,6 +4926,7 @@ class MediaStreamSession:
         tts_tasks: list[asyncio.Task],
         initial_filler: SmartPBXInitialFillerController | None,
         generation: int,
+        tool_filler_task: asyncio.Task | None = None,
     ) -> int | None:
         """Fence active turn speech before the canonical transfer delivery barrier.
 
@@ -4934,6 +4935,24 @@ class MediaStreamSession:
         or specialized tool filler may delay, overlap, or be mistaken for that
         announcement.
         """
+        # A quiet failed transfer must leave the current generation and
+        # delivery ledger alone so the provider can continue its normal tool
+        # batch.  Conversely, any real model/initial/specialized preamble has
+        # to be retired before the canonical handoff line may be delivered.
+        active_preamble = (
+            bool(tts_tasks)
+            or (
+                self._assistant_turn_generation == generation
+                and bool(self._assistant_turn_generated_sentences)
+            )
+            or (
+                initial_filler is not None
+                and initial_filler.spoke
+                and not getattr(initial_filler, "_cleared_after_spoke", False)
+            )
+            or tool_filler_task is not None
+        )
+        await self._finish_smartpbx_tool_filler(tool_filler_task, cancel=True)
         await self._finish_initial_smartpbx_filler(initial_filler)
         if not self._current_smartpbx_runner_owns_shared_state():
             return None
@@ -4942,14 +4961,15 @@ class MediaStreamSession:
         # endpointing wrapper to make that ownership implicit.
         if self.transfer_pending or generation != self._speak_generation:
             return None
-        # Reset the ledger before the fence so direct provider runner callers
-        # (which have no endpointing wrapper to initialize it) still receive
-        # the one transfer clear before canonical speech.
-        self._start_assistant_turn_delivery_tracking()
+        if not active_preamble:
+            # The transfer outcome is not known until execute_tool returns.
+            # Leave a quiet handoff unfenced here; a later acknowledged
+            # enter_transfer_pending() owns its one clear and reanchors the
+            # current runner, while an immediate failure continues normally.
+            return generation
         # Transfer owns one authoritative generation fence even when no old
-        # sentence has started. Otherwise enter_transfer_pending() would bump
-        # the generation after the canonical handoff and make this same runner
-        # look stale before earlier capture results can be committed.
+        # preamble has started. Otherwise its queued audio could overlap the
+        # canonical announcement/delivery barrier.
         fenced_from_generation = generation
         generation = await self._smartpbx_fence_stalled_generation(
             tts_tasks=tts_tasks, gen=fenced_from_generation,
@@ -4969,6 +4989,10 @@ class MediaStreamSession:
             or not self._current_smartpbx_runner_owns_shared_state()
         ):
             return None
+        # Only an exact, ownership-safe fence may replace the old delivery
+        # ledger with the canonical transfer announcement's ledger. A newer
+        # turn that wins during the awaited clear keeps its own accounting.
+        self._start_assistant_turn_delivery_tracking()
         self._smartpbx_transfer_audio_fenced = True
         return generation
 
@@ -5423,6 +5447,10 @@ class MediaStreamSession:
         if self.transfer_pending:
             return
         transfer_audio_fenced = self._smartpbx_transfer_audio_fenced
+        runner = _smartpbx_runner_context.get()
+        runner_turn_id = runner.turn_id if runner is not None else None
+        active_turn_id = self._active_smartpbx_turn_id
+        pre_transfer_generation = self._speak_generation
         self._smartpbx_transfer_audio_fenced = False
         await self._cancel_smartpbx_tool_fillers()
         if self._smartpbx_initial_filler is not None:
@@ -5447,10 +5475,26 @@ class MediaStreamSession:
         self._is_speaking = False
         if not transfer_audio_fenced:
             self._speak_generation += 1
+        transfer_generation = self._speak_generation
         self._capture_mode_active = False
         self._capture_mode_turns_left = 0
         if not transfer_audio_fenced:
             await self._clear_media_audio(force=True)
+            # Quiet transfers deliberately defer their one clear until the
+            # carrier has acknowledged. Re-anchor only the exact runner that
+            # still owns the generation after that awaited clear; a barge-in
+            # or newer turn changes either identity or generation and leaves
+            # the old runner stale.
+            if (
+                _smartpbx_runner_context.get() is runner
+                and runner is not None
+                and runner.turn_id == runner_turn_id == active_turn_id
+                and runner.speak_generation == pre_transfer_generation
+                and self._active_smartpbx_turn_id == active_turn_id
+                and self._speak_generation == transfer_generation
+                and transfer_generation == pre_transfer_generation + 1
+            ):
+                runner.speak_generation = transfer_generation
 
     def _cancel_dtmf_collection(self) -> None:
         """Resolve any active keypad collection so its awaiter unwinds on teardown."""
@@ -7159,14 +7203,12 @@ class MediaStreamSession:
                         tc["name"] == "transfer_to_human"
                         and self._is_direct_smartpbx_english()
                     ):
-                        await self._finish_smartpbx_tool_filler(
-                            tool_filler_task, cancel=True
-                        )
-                        tool_filler_task = None
                         prepared_generation = await self._prepare_smartpbx_transfer_handoff(
                             tts_tasks=tts_tasks, initial_filler=initial_filler,
+                            tool_filler_task=tool_filler_task,
                             generation=gen,
                         )
+                        tool_filler_task = None
                         if prepared_generation is None:
                             return ""
                         gen = prepared_generation
@@ -7667,14 +7709,12 @@ class MediaStreamSession:
                             tc["function"]["name"] == "transfer_to_human"
                             and self._is_direct_smartpbx_english()
                         ):
-                            await self._finish_smartpbx_tool_filler(
-                                tool_filler_task, cancel=True
-                            )
-                            tool_filler_task = None
                             prepared_generation = await self._prepare_smartpbx_transfer_handoff(
                                 tts_tasks=tts_tasks, initial_filler=initial_filler,
+                                tool_filler_task=tool_filler_task,
                                 generation=gen,
                             )
+                            tool_filler_task = None
                             if prepared_generation is None:
                                 return ""
                             gen = prepared_generation
@@ -8225,14 +8265,12 @@ class MediaStreamSession:
                         tb["name"] == "transfer_to_human"
                         and self._is_direct_smartpbx_english()
                     ):
-                        await self._finish_smartpbx_tool_filler(
-                            tool_filler_task, cancel=True
-                        )
-                        tool_filler_task = None
                         prepared_generation = await self._prepare_smartpbx_transfer_handoff(
                             tts_tasks=tts_tasks, initial_filler=initial_filler,
+                            tool_filler_task=tool_filler_task,
                             generation=gen,
                         )
+                        tool_filler_task = None
                         if prepared_generation is None:
                             return ""
                         gen = prepared_generation
