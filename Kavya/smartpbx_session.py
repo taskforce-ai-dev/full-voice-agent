@@ -155,6 +155,15 @@ class KavyaSmartPBXSession:
             close_dispatch = getattr(pipeline, "_close_teardown_dispatch", None)
             if callable(close_dispatch):
                 close_dispatch()
+            # A specialized PMS filler has the same terminal ownership as the
+            # initial filler below. It may hold the shared TTS lock while a
+            # tool awaits, so cancellation alone is insufficient: terminal
+            # summary/future completion must wait for it to release the lock.
+            finish_tool_fillers = getattr(pipeline, "_cancel_smartpbx_tool_fillers", None)
+            if callable(finish_tool_fillers):
+                pending = finish_tool_fillers()
+                if inspect.isawaitable(pending):
+                    await pending
             # Cancel-and-await the initial-round filler BEFORE any other
             # teardown await below. Its delay (default 1.5s) runs on its own
             # timer, independent of the provider stream -- if it is still
