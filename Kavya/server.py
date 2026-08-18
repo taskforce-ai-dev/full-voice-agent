@@ -4575,6 +4575,7 @@ class MediaStreamSession:
         self._stt_callback_errors = 0
         self._stt_closing = False
         self._teardown_dispatch_closed = False
+        self._smartpbx_deferred_tts_closed = False
         self._is_speaking = False
         self._speaking_since = 0.0
         self._speak_lock = asyncio.Lock()
@@ -4856,8 +4857,13 @@ class MediaStreamSession:
 
     def _start_smartpbx_round_tts(
         self, text: str, *, generation: int, sentence: str,
-    ) -> asyncio.Task:
+    ) -> asyncio.Task | None:
         """Start model speech with session/runner cancellation ownership."""
+        if (
+            self._is_direct_smartpbx_english()
+            and self._smartpbx_deferred_tts_closed
+        ):
+            return None
         task = asyncio.create_task(
             self._invoke_speak(text, generation=generation, sentence=sentence)
         )
@@ -4931,21 +4937,39 @@ class MediaStreamSession:
         await self._finish_initial_smartpbx_filler(initial_filler)
         if not self._current_smartpbx_runner_owns_shared_state():
             return None
+        # A caller that has already lost its generation must not claim the
+        # transfer clear.  In particular, direct provider harnesses have no
+        # endpointing wrapper to make that ownership implicit.
+        if self.transfer_pending or generation != self._speak_generation:
+            return None
+        # Reset the ledger before the fence so direct provider runner callers
+        # (which have no endpointing wrapper to initialize it) still receive
+        # the one transfer clear before canonical speech.
+        self._start_assistant_turn_delivery_tracking()
         # Transfer owns one authoritative generation fence even when no old
         # sentence has started. Otherwise enter_transfer_pending() would bump
         # the generation after the canonical handoff and make this same runner
         # look stale before earlier capture results can be committed.
+        fenced_from_generation = generation
         generation = await self._smartpbx_fence_stalled_generation(
-            tts_tasks=tts_tasks, gen=generation,
+            tts_tasks=tts_tasks, gen=fenced_from_generation,
         )
         tts_tasks.clear()
-        if not self._current_smartpbx_runner_owns_shared_state():
+        # A transfer prelude may suppress enter_transfer_pending()'s ordinary
+        # clear only when this exact runner really advanced the generation and
+        # survived the awaited transport clear.  A no-op stale fence must not
+        # consume that later clear.
+        did_fence = (
+            generation == self._speak_generation
+            and generation == self._assistant_turn_generation
+            and generation == fenced_from_generation + 1
+        )
+        if (
+            not did_fence
+            or not self._current_smartpbx_runner_owns_shared_state()
+        ):
             return None
         self._smartpbx_transfer_audio_fenced = True
-        # `_ensure_transfer_speech_and_delivery` selects a model line whenever
-        # one is already recorded. The fenced model line is not deliverable, so
-        # start a clean delivery ledger for the canonical announcement.
-        self._start_assistant_turn_delivery_tracking()
         return generation
 
     def _ensure_smartpbx_turn_telemetry(self) -> SmartPBXTurnTelemetry | None:
@@ -5834,6 +5858,7 @@ class MediaStreamSession:
     def _close_teardown_dispatch(self) -> None:
         """Synchronously prevent all endpoint/turn dispatch before teardown awaits."""
         self._teardown_dispatch_closed = True
+        self._smartpbx_deferred_tts_closed = True
         if self._endpointing_handle is not None:
             self._endpointing_handle.cancel()
             self._endpointing_handle = None
@@ -7001,7 +7026,8 @@ class MediaStreamSession:
                                     task = self._start_smartpbx_round_tts(
                                         s, generation=gen, sentence=s,
                                     )
-                                    tts_tasks.append(task)
+                                    if task is not None:
+                                        tts_tasks.append(task)
 
                         if delta.tool_calls:
                             if initial_filler is not None:
@@ -7244,11 +7270,11 @@ class MediaStreamSession:
             # No tools — flush remaining sentence buffer
             remaining = sentence_buffer.strip()
             if remaining:
-                tts_tasks.append(
-                    self._start_smartpbx_round_tts(
-                        remaining, generation=gen, sentence=remaining,
-                    )
+                task = self._start_smartpbx_round_tts(
+                    remaining, generation=gen, sentence=remaining,
                 )
+                if task is not None:
+                    tts_tasks.append(task)
             if tts_tasks:
                 await asyncio.gather(*tts_tasks)
 
@@ -7453,11 +7479,11 @@ class MediaStreamSession:
                             if not sentences:
                                 continue
                             for s in sentences:
-                                tts_tasks.append(
-                                    self._start_smartpbx_round_tts(
-                                        s, generation=gen, sentence=s,
-                                    )
+                                task = self._start_smartpbx_round_tts(
+                                    s, generation=gen, sentence=s,
                                 )
+                                if task is not None:
+                                    tts_tasks.append(task)
                             # Hand control to those tasks NOW. Without this the first TTS
                             # request only started once the stream had been fully drained
                             # (create_task alone schedules nothing until this coroutine
@@ -7752,11 +7778,11 @@ class MediaStreamSession:
 
                 remaining = sentence_buffer.strip()
                 if remaining:
-                    tts_tasks.append(
-                        self._start_smartpbx_round_tts(
-                            remaining, generation=gen, sentence=remaining,
-                        )
+                    task = self._start_smartpbx_round_tts(
+                        remaining, generation=gen, sentence=remaining,
                     )
+                    if task is not None:
+                        tts_tasks.append(task)
                 if tts_tasks:
                     await asyncio.gather(*tts_tasks)
 
@@ -7968,7 +7994,8 @@ class MediaStreamSession:
                                             task = self._start_smartpbx_round_tts(
                                                 s, generation=gen, sentence=s,
                                             )
-                                            tts_tasks.append(task)
+                                            if task is not None:
+                                                tts_tasks.append(task)
 
                                 elif event.delta.type == "input_json_delta":
                                     tool_json += event.delta.partial_json
@@ -8315,11 +8342,11 @@ class MediaStreamSession:
             # No tools — flush remaining sentence buffer
             remaining = sentence_buffer.strip()
             if remaining:
-                tts_tasks.append(
-                    self._start_smartpbx_round_tts(
-                        remaining, generation=gen, sentence=remaining,
-                    )
+                task = self._start_smartpbx_round_tts(
+                    remaining, generation=gen, sentence=remaining,
                 )
+                if task is not None:
+                    tts_tasks.append(task)
             if tts_tasks:
                 await asyncio.gather(*tts_tasks)
 
