@@ -1477,6 +1477,44 @@ CAPTURE_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
 # env knob — it is a log-shape clamp, not a tuning parameter.
 POST_DISPATCH_ELAPSED_MS_MAX: int = 60_000
 
+# How long after a turn claims the endpoint a provider result can still be
+# PROVEN to be that turn's own tail. Production shape: finals for the dispatched
+# utterance land ~450ms later, so two seconds is generous. A result echoing the
+# dispatched text after this has stopped being a tail and starts being a caller
+# repeating themselves — which is speech, and speech is never thrown away.
+# Not an env knob and not an endpointing/re-prompt timer: it is the recency half
+# of a rejection predicate, and widening it can only lose caller speech.
+POST_DISPATCH_STALE_WINDOW_SECONDS: float = 2.0
+
+
+def _normalize_result_text(text: str) -> str:
+    """Whitespace- and case-normalised form, used ONLY for staleness comparison.
+
+    Deliberately dumb: collapse runs of whitespace, casefold, nothing else. No
+    stemming, no edit distance, no token-set overlap — a rejection predicate that
+    guesses is a predicate that deletes caller speech.
+    """
+    return " ".join((text or "").split()).casefold()
+
+
+def _has_material_text(text: str) -> bool:
+    """True when the text carries at least one letter or digit."""
+    return any(ch.isalnum() for ch in text)
+
+
+def _extends_at_token_boundary(whole: str, part: str) -> bool:
+    """True when `whole` begins with `part` and `part` ends on a token boundary.
+
+    Boundary-aware so a genuinely new utterance that merely shares an opening
+    fragment ("i wou…" of "i would like a room") is not mistaken for a prefix of
+    the dispatched text.
+    """
+    if not part or not whole.startswith(part):
+        return False
+    if len(whole) == len(part):
+        return True
+    return not whole[len(part)].isalnum()
+
 # Domain phrase list that biases the ENGLISH Azure recognizer toward booking
 # vocabulary — digit words (phone numbers), the property and room names (from the
 # single tools source of truth), and common booking terms. English only: phrase
@@ -4536,6 +4574,16 @@ class MediaStreamSession:
         # while the guard is held, purely to bound the post-dispatch telemetry's
         # elapsed_ms; never used for control flow.
         self._utterance_dispatched_at: float | None = None
+        # Normalised copy of the text the dispatched turn owns. The only thing
+        # that can PROVE a later provider result is that turn's own tail rather
+        # than new caller speech. In-memory only, exactly like
+        # `_pending_transcript`; it is never logged, emitted or persisted.
+        self._dispatched_utterance_text: str = ""
+        # Set when an endpointing deadline fired while a turn still owned the
+        # guard and left admitted caller speech buffered. The turn's release
+        # re-arms the flush so that speech becomes the next turn instead of
+        # sitting in the buffer until the caller speaks again.
+        self._deferred_flush_pending: bool = False
         self._utterance_turn = 0
         self._last_guest_utterance_raw: str = ""
         # Capture-mode keeps endpointing looser while the caller is dictating
@@ -5188,6 +5236,7 @@ class MediaStreamSession:
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
+        self._deferred_flush_pending = False
         self._utterance_dispatched = False
         self._utterance_turn += 1
         self._is_speaking = False
@@ -5581,6 +5630,9 @@ class MediaStreamSession:
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
+        # The buffer this would have re-flushed is gone; the barge-in utterance
+        # is the next turn's input.
+        self._deferred_flush_pending = False
         # Capture mode deliberately SURVIVES a barge-in. A caller talking over the
         # tail of "...could I take your number?" is a dictation starting, and
         # dropping back to the short timers there re-creates the fragment-per-turn
@@ -6090,34 +6142,87 @@ class MediaStreamSession:
             elapsed_ms,
         )
 
-    def _reject_post_dispatch_result(self, result_type: str) -> bool:
-        """True when a dispatched turn owns the endpoint and this result is late.
+    def _is_proven_stale_result(self, text: str) -> bool:
+        """True only when this result is PROVABLY the dispatched turn's own tail.
+
+        The proof is the result's normalised text relationship to the utterance
+        the turn already owns — nothing inferred about the provider, the network
+        or the caller:
+
+        * no material characters at all — there is no speech here to keep;
+        * identical to the dispatched utterance, or a token-boundary PREFIX of
+          it (a late partial of what has already been answered);
+        * a superset that starts with the dispatched utterance and adds no
+          material characters (punctuation-only tails).
+
+        Anything that adds a word is UNPROVEN and must be admitted, even though
+        it repeats the dispatched text: the new words are speech the caller has
+        not been answered for.
+        """
+        result = _normalize_result_text(text)
+        if not _has_material_text(result):
+            return True
+        dispatched = self._dispatched_utterance_text
+        if not dispatched:
+            # Nothing to compare against — never guess in the direction of
+            # discarding speech.
+            return False
+        if _extends_at_token_boundary(dispatched, result):
+            return True
+        if _extends_at_token_boundary(result, dispatched):
+            return not _has_material_text(result[len(dispatched):])
+        return False
+
+    def _reject_post_dispatch_result(self, result_type: str, text: str) -> bool:
+        """True when a dispatched turn owns the endpoint and this result is stale.
 
         Called FIRST in both accumulation paths — before any counter, buffer or
-        timer is touched — so a late provider result cannot contaminate the next
+        timer is touched — so a PROVEN stale result cannot contaminate the next
         turn, resurrect itself as a spurious later turn, or vanish at hangup.
-        The rejected speech is deliberately NOT deferred into the next turn: the
-        caller has already been answered for the utterance it belongs to.
+        Such a result is deliberately NOT deferred into the next turn: the caller
+        has already been answered for the utterance it belongs to.
+
+        Rejection is turn-scoped and requires BOTH halves of the proof: the text
+        relationship above AND arrival inside `POST_DISPATCH_STALE_WINDOW_SECONDS`
+        of the dispatch claim. Everything else — genuine new caller speech during
+        pre-TTS LLM/tool latency, or in the gap between two delivered sentences,
+        where `_is_speaking` is already False — is admitted by the normal path:
+        it accumulates into the pending buffers, cancels and resets the silence
+        re-prompt, and `_flush_transcript` defers it into the NEXT turn (the
+        turn's release re-arms that flush). Unproven speech is never discarded.
+
+        The policy is SHARED with the Twilio Media Streams path on purpose. A
+        provider tail is a provider-level hazard, not a transport-level one, and
+        Twilio Media Streams drives this exact accumulator; ConversationRelay has
+        its own handler and never reaches it. Twilio sessions simply emit no
+        SmartPBX telemetry, which the `_is_smartpbx_session` gate in the emitter
+        already handles.
 
         Genuine speaking-time barge-in is unaffected: `_on_stt_result` /
         `_on_stt_interim` handle that branch and return before anything reaches
         this gate, so a real interruption still stops the speech and starts a
         fresh turn.
 
-        The silence re-prompt is deliberately NOT re-armed here. Its task is
-        already re-armed by every delivered sentence of the turn that owns the
-        guard, and touching a timer from a refused result is exactly the
-        state-mutation-before-rejection this gate exists to remove. The nudge
+        The silence re-prompt is deliberately NOT touched on the rejection path.
+        Its task is already re-armed by every delivered sentence of the turn that
+        owns the guard, and mutating a timer from a refused result is exactly the
+        state-change-before-rejection this gate exists to remove. The nudge
         cannot voice mid-turn regardless: `_reprompt_after_silence` defers while
         this same guard is held.
 
         Volume is bounded per turn: the INFO line is emitted only for the FIRST
         result of each type an owning turn refuses (at most two lines per turn),
-        and the per-turn totals travel on the turn_summary instead.
+        and the per-turn totals travel on the turn_summary instead. Admitted
+        speech is counted nowhere here — it is not an ignored result.
         """
         if not self._utterance_dispatched:
             return False
         elapsed_ms = self._post_dispatch_elapsed_ms()
+        if elapsed_ms > POST_DISPATCH_STALE_WINDOW_SECONDS * 1000:
+            # Too old to be this turn's tail. Whatever it is, it is unproven.
+            return False
+        if not self._is_proven_stale_result(text):
+            return False
         turn_id = self._active_smartpbx_turn_id
         # Same closed enum as the emitter: an unrecognised type is neither
         # counted nor logged, so the two can never disagree.
@@ -6157,7 +6262,7 @@ class MediaStreamSession:
             return
         if self.transfer_pending:
             return
-        if self._reject_post_dispatch_result("final"):
+        if self._reject_post_dispatch_result("final", text):
             return
         # A final supersedes any interim of the same utterance. Cleared here, on
         # the event loop, rather than in the STT worker-thread callback.
@@ -6202,7 +6307,7 @@ class MediaStreamSession:
             return
         if self.transfer_pending:
             return
-        if self._reject_post_dispatch_result("interim"):
+        if self._reject_post_dispatch_result("interim", text):
             return
         # Loop-side record of the latest interim, mirroring the final path.
         self._latest_interim = text
@@ -6257,6 +6362,9 @@ class MediaStreamSession:
         self._arm_endpointing(self._capture_turn_timeout(final=False))
 
     def _arm_endpointing(self, delay: float) -> None:
+        # A live timer now owns the pending buffer, so any request to re-flush it
+        # at the end of the active turn is superseded by this deadline.
+        self._deferred_flush_pending = False
         if self._endpointing_handle:
             self._endpointing_handle.cancel()
         self._endpointing_handle = self._event_loop.call_later(
@@ -6273,14 +6381,18 @@ class MediaStreamSession:
             self._pending_transcript = ""
             self._committed_transcript = ""
             self._latest_interim = ""
+            self._deferred_flush_pending = False
             return
         # Exactly-once: a turn is already dispatched and the agent is responding.
-        # A stale timer that fires now must not start a second llm_round. Late
-        # finals/interims are already refused upstream by
-        # `_reject_post_dispatch_result`, so nothing reaches here holding late
-        # buffered text — this guard is retained as defence in depth for timers
-        # armed before the dispatch claimed the turn.
+        # A stale timer that fires now must not start a second llm_round. Results
+        # PROVEN to be that turn's own tail were already refused upstream by
+        # `_reject_post_dispatch_result`, so any buffered text here is genuine
+        # caller speech admitted during the turn (or a timer armed before the
+        # dispatch claimed it). It is neither merged into the running turn nor
+        # dropped: it stays buffered and the turn's release re-arms this flush.
         if self._utterance_dispatched:
+            if self._pending_transcript.strip():
+                self._deferred_flush_pending = True
             return
         transcript = self._pending_transcript.strip()
         had_committed_final = bool(self._committed_transcript)
@@ -6288,12 +6400,16 @@ class MediaStreamSession:
         self._committed_transcript = ""
         self._latest_interim = ""
         self._endpointing_handle = None
+        self._deferred_flush_pending = False
         if not transcript:
             return
         # Claim the turn synchronously, before any await, so a concurrently-queued
         # flush task sees the guard set and bails.
         self._utterance_dispatched = True
         self._utterance_dispatched_at = time.monotonic()
+        # What this turn owns, normalised once. The post-dispatch policy compares
+        # later provider results against it to tell a tail from new speech.
+        self._dispatched_utterance_text = _normalize_result_text(transcript)
         # A turn only spends the capture allowance if capture mode was already
         # armed when the caller's speech was dispatched — the turn that ARMED it
         # (the ask, or the first needs_more) is not itself a capture turn.
@@ -6343,6 +6459,13 @@ class MediaStreamSession:
                 if capture_turn:
                     self._consume_capture_mode_turn()
                 self._utterance_dispatched = False
+                if self._deferred_flush_pending:
+                    # Caller speech admitted during this turn had its endpointing
+                    # deadline expire while the guard was still held. The guard is
+                    # free now, so dispatch it as the next turn rather than
+                    # leaving it stranded in the buffer. `call_later(0)` keeps
+                    # this off the current stack: the flush runs as its own task.
+                    self._arm_endpointing(0.0)
 
     # â”€â”€ Utterance â†’ KB + Claude + TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 

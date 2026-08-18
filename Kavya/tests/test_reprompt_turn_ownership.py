@@ -14,9 +14,15 @@ refuses those results before the cancel sites, so the hazard is exposed. It also
 exists with no STT result at all: a tool round longer than the delay fires the
 nudge on its own.
 
-The fix is ownership, not cancellation: a rejected result must still never touch
+The fix is ownership, not cancellation: a refused result must still never touch
 a timer (that is the whole point of the gate), so the deadline defers while a
 turn holds the guard, exactly the way it already defers while the agent speaks.
+
+Scope note (post-#269 review): the gate now refuses only results PROVEN to be the
+dispatched turn's own tail, so every injection below is such a tail. Genuine new
+caller speech in the same gap IS admitted and DOES cancel and reset the nudge —
+that is `test_stt_post_dispatch_admission.py`, and it is not a contradiction:
+admitted speech is a turn, refused speech is not.
 
 Determinism: `SILENCE_REPROMPT_DELAY` is monkeypatched to 0.0 so the REAL
 re-prompt task runs without a wall-clock wait; `Event` barriers hold the turn
@@ -220,10 +226,12 @@ async def test_reprompt_deadline_in_tool_gap_never_speaks_over_the_active_turn(c
     # (a) a delivered sentence mid-turn arms the REAL re-prompt
     armed = await _deliver_sentence(session)
 
-    # (b) late results are refused AND leave the armed timer alone
+    # (b) results PROVEN to be this turn's own tail are refused AND leave the
+    #     armed timer alone (genuine new speech would instead be admitted and
+    #     would cancel the nudge — see test_stt_post_dispatch_admission.py)
     with caplog.at_level("INFO"):
-        await session._accumulate_transcript("late final nobody asked for")
-        await session._set_transcript_interim("late interim nobody asked for")
+        await session._accumulate_transcript("original utterance")
+        await session._set_transcript_interim("original")
     assert session._committed_transcript == ""
     assert session._pending_transcript == ""
     assert len(_post_dispatch_records(caplog)) >= 1, "the gate must have refused both"
@@ -346,8 +354,9 @@ async def test_reprompt_still_fires_after_a_normal_turn_with_no_tool_gap(caplog)
 async def test_rejected_results_still_do_not_cancel_or_reset_the_reprompt():
     """Preservation guard: the endpoint-ownership gate stays timer-free.
 
-    Rejected speech is deliberately not admitted as a turn, so it must not
-    cancel the nudge, re-arm it, or reset the attempt counter.
+    A result proven to be the dispatched turn's own tail is deliberately not
+    admitted as a turn, so it must not cancel the nudge, re-arm it, or reset the
+    attempt counter.
     """
     hold = asyncio.Event()
     session, loop, _spoken = make_session(hold=hold)
@@ -355,8 +364,8 @@ async def test_rejected_results_still_do_not_cancel_or_reset_the_reprompt():
     armed = await _deliver_sentence(session)
     session._reprompt_count = 1
 
-    await session._accumulate_transcript("late final")
-    await session._set_transcript_interim("late interim")
+    await session._accumulate_transcript("original utterance")
+    await session._set_transcript_interim("original")
 
     assert session._reprompt_task is armed
     assert not armed.cancelled()
@@ -403,12 +412,14 @@ async def test_post_dispatch_info_line_capped_at_one_per_result_type_per_turn(ca
     session, loop, _spoken = make_session(hold=hold)
     await _dispatch_turn(session, loop)
 
+    # Five refusals, all proven tails of "original utterance": the text itself,
+    # a token-boundary prefix, and a case/whitespace-normalised repeat.
     with caplog.at_level("INFO"):
-        await session._accumulate_transcript("late final one")
-        await session._accumulate_transcript("late final two")
-        await session._accumulate_transcript("late final three")
-        await session._set_transcript_interim("late interim one")
-        await session._set_transcript_interim("late interim two")
+        await session._accumulate_transcript("original utterance")
+        await session._accumulate_transcript("original")
+        await session._accumulate_transcript("  Original   Utterance ")
+        await session._set_transcript_interim("original")
+        await session._set_transcript_interim("original utterance")
 
     records = _post_dispatch_records(caplog)
     assert len(records) == 2, records
@@ -434,12 +445,13 @@ async def test_turn_summary_aggregates_ignored_post_dispatch_counts():
     assert turn_id is not None
 
     now = time.monotonic()
-    for age in (0.5, 2.0, 1.0):
+    # Ages stay inside the staleness window; the tails differ only in shape.
+    for age in (0.3, 1.2, 0.6):
         session._utterance_dispatched_at = now - age
-        await session._accumulate_transcript("late final")
+        await session._accumulate_transcript("original utterance")
     for age in (0.2, 0.3):
         session._utterance_dispatched_at = now - age
-        await session._set_transcript_interim("late interim")
+        await session._set_transcript_interim("original")
 
     session._finalize_smartpbx_turns()
 
@@ -448,7 +460,7 @@ async def test_turn_summary_aggregates_ignored_post_dispatch_counts():
     assert summary["ignored_post_dispatch_finals"] == 3
     assert summary["ignored_post_dispatch_interims"] == 2
     peak = summary["ignored_post_dispatch_max_elapsed_ms"]
-    assert 2000 <= peak <= 2900, peak
+    assert 1200 <= peak <= 1900, peak
     assert peak <= server.POST_DISPATCH_ELAPSED_MS_MAX
 
     hold.set()
@@ -466,9 +478,9 @@ async def test_teardown_finalize_carries_post_dispatch_counts_exactly_once():
     await _dispatch_turn(session, loop)
     turn_id = session._active_smartpbx_turn_id
 
-    await session._accumulate_transcript("late final one")
-    await session._accumulate_transcript("late final two")
-    await session._set_transcript_interim("late interim one")
+    await session._accumulate_transcript("original utterance")
+    await session._accumulate_transcript("original")
+    await session._set_transcript_interim("original utterance")
 
     telemetry = session._turn_telemetry
     session._finalize_smartpbx_turns()
@@ -522,7 +534,7 @@ async def test_post_dispatch_turn_summary_fields_are_clamped_integers_only():
     await _dispatch_turn(session, loop)
     turn_id = session._active_smartpbx_turn_id
 
-    await session._accumulate_transcript("late final")
+    await session._accumulate_transcript("original utterance")
     session._smartpbx_post_dispatch_by_turn[turn_id] = {
         "finals": 10 ** 9,
         "interims": 10 ** 9,
