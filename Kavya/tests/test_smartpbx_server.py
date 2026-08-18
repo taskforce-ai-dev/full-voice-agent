@@ -3349,22 +3349,19 @@ async def test_initial_smartpbx_filler_cancels_before_the_delay_for_every_termin
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", ["create_booking", "transfer_to_human"])
-async def test_spoken_initial_filler_is_cleared_before_a_side_effecting_tool_runs(tool_name):
+async def test_spoken_initial_filler_drains_before_a_side_effecting_tool_runs(tool_name):
     import server
 
     sleep = _ControlledInitialFillerSleep()
     filler_started = asyncio.Event()
-    filler_cancelled = asyncio.Event()
+    filler_release = asyncio.Event()
     events = []
 
     async def speak(_text, *, generation):
         events.append(("filler", generation))
         filler_started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            filler_cancelled.set()
-            raise
+        await filler_release.wait()
+        events.append(("filler_drained", generation))
 
     async def clear_audio():
         events.append(("clear", None))
@@ -3375,12 +3372,60 @@ async def test_spoken_initial_filler_is_cleared_before_a_side_effecting_tool_run
     sleep.release.set()
     await asyncio.wait_for(filler_started.wait(), timeout=1)
 
-    await controller.on_tool_delta()
-    await asyncio.wait_for(filler_cancelled.wait(), timeout=1)
+    handoff = asyncio.create_task(controller.on_tool_delta())
+    await asyncio.sleep(0)
+    assert not handoff.done(), (
+        "a tool delta must wait for already-started filler delivery, not cancel it"
+    )
+    assert events == [("filler", 7)]
+
+    filler_release.set()
+    await asyncio.wait_for(handoff, timeout=1)
     events.append((tool_name, None))
 
-    assert events == [("filler", 7), ("clear", None), (tool_name, None)]
+    assert events == [("filler", 7), ("filler_drained", 7), (tool_name, None)]
+    assert not events.count(("clear", None)), "model readiness is not a barge-in"
     assert controller.suppress_specialized_tool_filler is True
+
+
+@pytest.mark.asyncio
+async def test_spoken_initial_filler_drains_before_content_handoff_returns():
+    """A real answer waits behind an already-delivering initial filler."""
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    filler_started = asyncio.Event()
+    filler_release = asyncio.Event()
+    events = []
+
+    async def speak(_text, *, generation):
+        events.append(("filler", generation))
+        filler_started.set()
+        await filler_release.wait()
+        events.append(("filler_drained", generation))
+
+    async def clear_audio():
+        events.append(("clear", None))
+
+    controller = _initial_filler_controller(server, sleep, speak, clear_audio=clear_audio)
+    controller.start()
+    await asyncio.sleep(0)
+    sleep.release.set()
+    await asyncio.wait_for(filler_started.wait(), timeout=1)
+
+    answer_handoff = asyncio.create_task(controller.on_content_delta())
+    await asyncio.sleep(0)
+    assert not answer_handoff.done(), (
+        "the answer must wait for filler completion instead of truncating it"
+    )
+    assert events == [("filler", 7)]
+
+    filler_release.set()
+    await asyncio.wait_for(answer_handoff, timeout=1)
+    events.append(("answer", 7))
+
+    assert events == [("filler", 7), ("filler_drained", 7), ("answer", 7)]
+    assert ("clear", None) not in events
 
 
 @pytest.mark.asyncio
@@ -5012,10 +5057,10 @@ def test_smartpbx_initial_filler_delay_default_is_1_5_seconds():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
-async def test_spoken_initial_filler_clear_preserves_real_answer_delivery_and_history(
+async def test_spoken_initial_filler_drains_before_real_answer_delivery_and_history(
     monkeypatch, provider
 ):
-    """A filler clear is a handoff, not a caller interruption.
+    """A normal answer follows the delivered filler without a media clear.
 
     Drive the real provider runner, filler controller, speak lock, generation
     fence, delivery acknowledgement, and history writer.  The clock is
@@ -5072,8 +5117,8 @@ async def test_spoken_initial_filler_clear_preserves_real_answer_delivery_and_hi
         content_release.set()
         await asyncio.wait_for(turn, timeout=2)
 
-        assert transport.clears == 1
-        assert pipeline._speak_generation == transport.generation == 1
+        assert transport.clears == 0
+        assert pipeline._speak_generation == transport.generation == 0
         assert pipeline._smartpbx_barge_ins == 0
         assert pipeline._assistant_turn_generation == pipeline._speak_generation
         assert pipeline._assistant_turn_generated_sentences == [answer]

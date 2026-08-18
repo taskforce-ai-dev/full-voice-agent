@@ -797,3 +797,71 @@ async def test_fix5_gemini_immediate_exception_failover_retires_already_spoken_f
     # Still fired only once -- the retired controller and Claude's own fresh
     # one (if it later fires too) are never the SAME line firing twice.
     assert spoken.count(server.SMARTPBX_INITIAL_FILLER_TEXT) == 1
+
+
+# ---------------------------------------------------------------------------
+# PR-270 — SmartPBX filler handoff
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_pms_tool_runs_while_its_filler_drains_and_result_queues_after(
+    monkeypatch,
+):
+    """A quick PMS result must not chop its already-started wait filler.
+
+    The tool must begin while the short specialized filler is delivering, but
+    the next provider round's result cannot speak until that delivery barrier
+    has drained.  This models the real SmartPBX Gemini runner; OpenAI and
+    Claude use the same direct-path filler branch.
+    """
+    session, _spoken = _media_stream_session(gemini_turns=[
+        [_gemini_tool("check_availability", {"nights": 2})],
+        [_gemini_text("Two suites are free.")],
+    ])
+    # Isolate the PMS filler: a pending initial filler is cancelled by the
+    # tool delta before it can speak, exactly as a fast tool request requires.
+    monkeypatch.setattr(server, "SMARTPBX_INITIAL_FILLER_DELAY_SECONDS", 60.0)
+
+    filler_started = asyncio.Event()
+    filler_release = asyncio.Event()
+    tool_started = asyncio.Event()
+    timeline: list[str] = []
+    filler = server.TOOL_FILLERS["check_availability"]
+
+    async def tts(text, **_kwargs):
+        if text == filler:
+            timeline.append("filler_started")
+            filler_started.set()
+            await filler_release.wait()
+            timeline.append("filler_drained")
+        else:
+            timeline.append(f"answer:{text}")
+
+    async def execute(_name, _arguments):
+        timeline.append("tool_started")
+        tool_started.set()
+        return json.dumps({"status": "ok"})
+
+    session._tts_elevenlabs = tts
+    session._tts_openai = tts
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    turn = asyncio.create_task(session._run_llm_gemini())
+    try:
+        await asyncio.wait_for(filler_started.wait(), timeout=1)
+        await asyncio.wait_for(tool_started.wait(), timeout=0.2)
+        assert "filler_drained" not in timeline
+        assert not any(item.startswith("answer:") for item in timeline)
+
+        filler_release.set()
+        result = await asyncio.wait_for(turn, timeout=2)
+
+        assert result.endswith("Two suites are free.")
+        assert timeline == [
+            "filler_started", "tool_started", "filler_drained",
+            "answer:Two suites are free.",
+        ]
+    finally:
+        filler_release.set()
+        await asyncio.gather(turn, return_exceptions=True)
