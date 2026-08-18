@@ -44,6 +44,8 @@ import time
 import pytest
 
 import server
+from smartpbx_protocol import CallContext, MediaFormat
+from smartpbx_session import KavyaSmartPBXSession
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +170,20 @@ async def _drain_until_released(session, times: int = 40):
     raise AssertionError("the held turn never released the dispatch guard")
 
 
+class _HeldMarkTransport(_FakeTransport):
+    """Hold a real TTS completion until the SmartPBX teardown is terminal."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send_mark(self, name: str) -> None:
+        self.marks.append(name)
+        self.entered.set()
+        await self.release.wait()
+
+
 def _reprompt_records(caplog):
     return [
         record.getMessage()
@@ -195,10 +211,57 @@ def _recording_telemetry(emitted, turn_id="opaque-turn-id"):
     )
 
 
+def _smartpbx_context() -> CallContext:
+    return CallContext(
+        "media", "opaque-leg", "", "", "account",
+        MediaFormat("g711_ulaw", 8000),
+    )
+
+
 @pytest.fixture(autouse=True)
 def _instant_reprompt_deadline(monkeypatch):
     """Drive the REAL re-prompt task; the delay is read at await time."""
     monkeypatch.setattr(server, "SILENCE_REPROMPT_DELAY", 0.0)
+
+
+@pytest.mark.asyncio
+async def test_terminal_smartpbx_teardown_cannot_be_rearmed_by_a_late_tts_done(caplog):
+    """The observed post-summary re-prompt race, with no timing sleep.
+
+    Teardown cancels the existing reprompt before a TTS completion blocked in
+    `send_mark` resumes. Once the session is terminal, that completion must not
+    create a new timer, log a nudge, append a nudge to the transcript, or invoke
+    more TTS.
+    """
+    mark_transport = _HeldMarkTransport()
+    pipeline = server.MediaStreamSession(websocket=None, lang="en", media_transport=mark_transport)
+    pipeline._smartpbx_transfer_context = object()
+    spoken: list[str] = []
+
+    async def record_speech(text, *_args, **_kwargs):
+        spoken.append(text)
+
+    pipeline._invoke_speak = record_speech
+    session = KavyaSmartPBXSession(
+        _smartpbx_context(), _FakeTransport(), pipeline=pipeline,
+        stt_factory=lambda **_kwargs: None, post_call_processor=None,
+        welcome_text="", llm_provider="claude", model="test-model",
+    )
+
+    completion = asyncio.create_task(pipeline._send_tts_done(sentence="Delivered."))
+    await mark_transport.entered.wait()
+    await session.finish(schedule_post_call=False)
+    assert session.terminal_future.done(), "the teardown must already be terminal"
+
+    mark_transport.release.set()
+    with caplog.at_level("INFO"):
+        await completion
+        await _drain()
+
+    assert pipeline._reprompt_task is None
+    assert pipeline.full_transcript == []
+    assert spoken == []
+    assert _reprompt_records(caplog) == []
 
 
 POST_DISPATCH_SUMMARY_FIELDS = (

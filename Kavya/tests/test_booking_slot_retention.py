@@ -11,6 +11,10 @@ covers both the Twilio and SmartPBX paths.
 
 from __future__ import annotations
 
+import inspect
+
+import pytest
+
 import server
 
 
@@ -107,3 +111,41 @@ def test_all_provider_paths_inject_the_slot_aware_prompt():
     assert "_booking_slots_note()" in claude_src, (
         "_run_llm_claude must pass the slots note into the system blocks"
     )
+
+
+@pytest.mark.parametrize("runner_name", ("_run_llm", "_run_llm_gemini", "_run_llm_claude"))
+def test_captured_spoken_number_persists_as_a_slot_for_every_media_runner(runner_name):
+    """A completed spoken capture must survive later model turns.
+
+    Each media runner parses a tool result and calls the shared capture-completion
+    hook.  This test pins the real cross-runner boundary: a normalized successful
+    number becomes the durable `guest_phone` slot rendered into the next active
+    system prompt, rather than existing only in a soon-to-be-trimmed tool result.
+    """
+    session = make_session()
+    captured = {
+        "status": "captured",
+        "valid": True,
+        "normalized": "+94771234567",
+    }
+
+    session._record_capture_tool_completion("capture_spoken_number", captured)
+
+    assert session._booking_slots["guest_phone"] == "+94771234567"
+    assert "+94771234567" in session._active_system_prompt()
+    assert "_record_capture_tool_completion(" in inspect.getsource(
+        getattr(server.MediaStreamSession, runner_name)
+    ), f"{runner_name} must use the shared capture-result boundary"
+
+
+@pytest.mark.parametrize("result", (
+    {"status": "needs_more", "valid": False, "normalized": ""},
+    {"status": "invalid", "valid": False, "normalized": ""},
+))
+def test_incomplete_or_invalid_spoken_number_never_persists_a_guest_phone_slot(result):
+    session = make_session()
+
+    session._record_capture_tool_completion("capture_spoken_number", result)
+
+    assert "guest_phone" not in session._booking_slots
+    assert "phone:" not in session._active_system_prompt().lower()
