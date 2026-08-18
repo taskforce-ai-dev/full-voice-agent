@@ -532,7 +532,7 @@ def test_capture_mode_survives_a_bargein_so_the_dictation_stays_patient():
     # Barge-in ownership is SUPERSEDED for dispatch, RETAINED for the record:
     # the fragment does not become the next turn, but it is not lost either.
     assert session.full_transcript == [
-        {"role": "user", "text": "zero seven seven"}
+        {"role": server.RETAINED_SPEECH_ROLE, "text": "zero seven seven", "provenance": "final", "answered": "unanswered", "retention_reason": "barge_in"}
     ], "the superseded fragment must still reach the transcript"
 
 
@@ -552,7 +552,7 @@ async def test_transfer_teardown_forces_the_pending_capture_into_the_transcript(
     await session.enter_transfer_pending()
 
     assert session.full_transcript == [
-        {"role": "user", "text": "zero seven seven one two three"}
+        {"role": server.RETAINED_SPEECH_ROLE, "text": "zero seven seven one two three", "provenance": "final", "answered": "unanswered", "retention_reason": "transfer"}
     ]
     assert session._pending_transcript == ""
     assert session.transfer_pending is True
@@ -574,7 +574,7 @@ async def test_retention_covers_ordinary_speech_outside_capture_mode():
     await session._retain_pending_speech("session_end")
 
     assert session.full_transcript == [
-        {"role": "user", "text": "ordinary speech mid-utterance"}
+        {"role": server.RETAINED_SPEECH_ROLE, "text": "ordinary speech mid-utterance", "provenance": "interim", "answered": "unanswered", "retention_reason": "session_end"}
     ]
     assert session._pending_transcript == ""
 

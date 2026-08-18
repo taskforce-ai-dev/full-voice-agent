@@ -376,7 +376,7 @@ async def test_genuine_interruption_barges_in_and_keeps_prior_transcript(monkeyp
     # holds the dispatch guard, dropping it would be silent loss of guest words.
     assert session.full_transcript == [
         {"role": "user", "text": "prior turn kept intact"},
-        {"role": "user", "text": "stale text from interrupted turn"},
+        {"role": server.RETAINED_SPEECH_ROLE, "text": "stale text from interrupted turn", "provenance": "final", "answered": "unanswered", "retention_reason": "barge_in"},
     ]
 
 

@@ -486,14 +486,31 @@ def _format_transcript(full_transcript: list[dict[str, str]]) -> str:
     lines: list[str] = []
     for entry in full_transcript:
         entry_role = entry.get("role")
+        provenance = entry.get("provenance") if entry.get("provenance") in {"final", "interim"} else "interim"
+        answered = entry.get("answered") if entry.get("answered") == "unanswered" else "unanswered"
         role = (
             "Guest" if entry_role == "user"
             else "System" if entry_role == "system"
-            else UNCONFIRMED_TRANSCRIPT_LABEL
+            else f"{UNCONFIRMED_TRANSCRIPT_LABEL}; provenance={provenance}; answered={answered}"
             if entry_role == UNCONFIRMED_TRANSCRIPT_ROLE
             else "Kavya"
         )
         lines.append(f"{role}: {entry['text']}")
+    return "\n".join(lines)
+
+
+def _format_extraction_transcript(full_transcript: list[dict[str, str]]) -> str:
+    """Render only confirmed speech for extraction; retain provenance without raw unconfirmed text."""
+    lines: list[str] = []
+    for entry in full_transcript:
+        if entry.get("role") == UNCONFIRMED_TRANSCRIPT_ROLE:
+            provenance = entry.get("provenance") if entry.get("provenance") in {"final", "interim"} else "interim"
+            lines.append(
+                f"[UNCONFIRMED RETAINED SPEECH: provenance={provenance}; answered=unanswered; do not extract booking data]"
+            )
+            continue
+        role = "Guest" if entry.get("role") == "user" else "System" if entry.get("role") == "system" else "Kavya"
+        lines.append(f"{role}: {entry.get('text', '')}")
     return "\n".join(lines)
 
 
@@ -525,10 +542,11 @@ async def process_post_call_data(
             logger.info("Starting post-call processing for CallSid: %s", call_sid)
 
         transcript_text = _format_transcript(full_transcript)
+        extraction_transcript = _format_extraction_transcript(full_transcript)
 
         # Extract structured booking details via LLM
         extracted = await extract_booking_details(
-            transcript_text=transcript_text,
+            transcript_text=extraction_transcript,
             lang=lang,
             llm_provider=llm_provider,
             anthropic_client=anthropic_client,

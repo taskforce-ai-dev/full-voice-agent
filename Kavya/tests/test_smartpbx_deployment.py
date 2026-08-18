@@ -365,6 +365,7 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "capture_buffer_bounded",
         "capture_final_buffered",
         "capture_forced_dispatch",
+        "stt_callback_drain",
         "capture_mode_enter",
         "capture_mode_exit",
         "dtmf_collect_start",

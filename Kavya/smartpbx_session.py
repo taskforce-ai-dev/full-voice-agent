@@ -152,6 +152,9 @@ class KavyaSmartPBXSession:
             pipeline = self._pipeline
             if pipeline is None:
                 return
+            close_dispatch = getattr(pipeline, "_close_teardown_dispatch", None)
+            if callable(close_dispatch):
+                close_dispatch()
             # Cancel-and-await the initial-round filler BEFORE any other
             # teardown await below. Its delay (default 1.5s) runs on its own
             # timer, independent of the provider stream -- if it is still

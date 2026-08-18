@@ -133,6 +133,7 @@ logger = logging.getLogger(__name__)
 # evidence, but downstream must not mistake it for an answered statement.
 RETAINED_SPEECH_ROLE = UNCONFIRMED_TRANSCRIPT_ROLE
 RETAINED_SPEECH_MAX_CHARS = 1000
+STT_CALLBACK_DRAIN_TIMEOUT_SECONDS = 2.0
 _RETAINED_SPEECH_PROVENANCE = frozenset({"final", "interim"})
 _RETAINED_SPEECH_REASONS = frozenset(
     {"barge_in", "transfer", "transfer_flush", "session_end", "hangup"}
@@ -2658,10 +2659,12 @@ def _format_handoff_transcript(transcript: list[dict[str, str]], limit: int = 24
     lines: list[str] = []
     for entry in transcript[-limit:]:
         role = entry.get("role")
+        provenance = entry.get("provenance") if entry.get("provenance") in {"final", "interim"} else "interim"
+        answered = entry.get("answered") if entry.get("answered") == "unanswered" else "unanswered"
         who = (
             "Guest"
             if role == "user"
-            else UNCONFIRMED_TRANSCRIPT_LABEL
+            else f"{UNCONFIRMED_TRANSCRIPT_LABEL}; provenance={provenance}; answered={answered}"
             if role == RETAINED_SPEECH_ROLE
             else "Kavya"
         )
@@ -4546,7 +4549,9 @@ class MediaStreamSession:
         # closing drain or refused before it can touch event-loop state.
         self._stt_callback_lock = threading.Lock()
         self._stt_callback_futures: set[Any] = set()
+        self._stt_callback_errors = 0
         self._stt_closing = False
+        self._teardown_dispatch_closed = False
         self._is_speaking = False
         self._speaking_since = 0.0
         self._speak_lock = asyncio.Lock()
@@ -5507,6 +5512,7 @@ class MediaStreamSession:
         except Exception:
             logger.exception("Media stream error — Call: %s", self.call_sid)
         finally:
+            self._close_teardown_dispatch()
             if media_context_token is not None:
                 handover_context.reset(media_context_token)
             self._cancel_reprompt()
@@ -5610,18 +5616,51 @@ class MediaStreamSession:
 
     def _discard_stt_callback_future(self, future: Any) -> None:
         with self._stt_callback_lock:
+            if not future.cancelled():
+                try:
+                    if future.exception() is not None:
+                        self._stt_callback_errors = min(
+                            self._stt_callback_errors + 1, 100_000
+                        )
+                except Exception:
+                    self._stt_callback_errors = min(
+                        self._stt_callback_errors + 1, 100_000
+                    )
             self._stt_callback_futures.discard(future)
 
     async def _close_stt_callbacks(self) -> None:
-        """Close callback admission and drain every callback accepted before it."""
+        """Close callback admission and bounded-drain every accepted callback."""
         with self._stt_callback_lock:
             self._stt_closing = True
             pending = tuple(self._stt_callback_futures)
-        if pending:
-            await asyncio.gather(
-                *(asyncio.wrap_future(future) for future in pending),
-                return_exceptions=True,
+        started = time.monotonic()
+        wrapped = tuple(asyncio.wrap_future(future) for future in pending)
+        timed_out = False
+        if wrapped:
+            _done, still_pending = await asyncio.wait(
+                wrapped, timeout=STT_CALLBACK_DRAIN_TIMEOUT_SECONDS
             )
+            timed_out = bool(still_pending)
+            for future in still_pending:
+                future.cancel()
+            if still_pending:
+                await asyncio.gather(*still_pending, return_exceptions=True)
+        with self._stt_callback_lock:
+            errors = self._stt_callback_errors
+        outcome = "timeout" if timed_out else "error" if errors else "drained"
+        elapsed_ms = min(max(int((time.monotonic() - started) * 1000), 0), 10_000)
+        logger.info(
+            "stt_callback_drain event=stt_callback_drain outcome=%s pending=%d elapsed_ms=%d",
+            outcome, min(len(pending), 100_000), elapsed_ms,
+        )
+
+    def _close_teardown_dispatch(self) -> None:
+        """Synchronously prevent all endpoint/turn dispatch before teardown awaits."""
+        self._teardown_dispatch_closed = True
+        if self._endpointing_handle is not None:
+            self._endpointing_handle.cancel()
+            self._endpointing_handle = None
+        self._deferred_flush_pending = False
 
     def _should_barge_in(self, transcript: str) -> bool:
         """True only for a substantive interruption, filtering blips and echo."""
@@ -6416,7 +6455,7 @@ class MediaStreamSession:
         self._arm_endpointing(self._capture_turn_timeout(final=False))
 
     def _arm_endpointing(self, delay: float) -> None:
-        if self._stt_closing:
+        if self._stt_closing or self._teardown_dispatch_closed:
             return
         # A live timer now owns the pending buffer, so any request to re-flush it
         # at the end of the active turn is superseded by this deadline.
@@ -6429,7 +6468,7 @@ class MediaStreamSession:
         )
 
     async def _flush_transcript(self):
-        if self._stt_closing or self._smartpbx_torn_down:
+        if self._teardown_dispatch_closed or self._stt_closing or self._smartpbx_torn_down:
             # See _accumulate_transcript — an endpointing timer armed just
             # before teardown must not dispatch a new turn after it.
             return

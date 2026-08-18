@@ -359,7 +359,7 @@ event allowlist**. It may contain only the following runtime event names:
 `silence_reprompt`, `stt_final`, `stt_post_dispatch_result`,
 `stt_provider_final`, `stt_provider_interim`,
 `capture_buffer_bounded`, `capture_final_buffered`, `capture_forced_dispatch`,
-`capture_mode_enter`, `capture_mode_exit`, `dtmf_collect_start`, and
+`stt_callback_drain`, `capture_mode_enter`, `capture_mode_exit`, `dtmf_collect_start`, and
 `dtmf_collect_done`; unlisted event names are not permitted.
 The protocol diagnostic record is emitted as
 `event=smartpbx_protocol_diagnostic`.
@@ -438,9 +438,17 @@ boundary that can end or divert the call gives it an explicit owner — it becom
 a turn, or it is written into the call transcript (a barge-in supersedes it for
 dispatch but still records it; transfer-pending and both teardown paths record it
 before the post-call snapshot). Retention is reported by the existing
-`capture_forced_dispatch` event, whose `reason` is a fixed set of call sites —
-`barge_in`, `transfer`, `transfer_flush`, `session_end`, `hangup` — alongside a
-character count. No boundary drops the buffer silently.
+`capture_forced_dispatch` event. Its complete fixed, content-free contract is
+`reason` (`barge_in`, `transfer`, `transfer_flush`, `session_end`, `hangup`),
+`provenance` (`final` or `interim`), `answered=unanswered`, and `chars` capped
+at 1000. No boundary drops the buffer silently. Teardown first closes endpoint
+and turn dispatch synchronously, then keeps callback admission open only through
+provider stop/audio dump; it closes that admission and bounded-drains it before
+retention. `stt_callback_drain` reports only fixed outcome (`drained`, `timeout`,
+or `error`), pending count, and bounded elapsed time; it never logs speech or
+exception text. `privacy_safe=True` redacts operational logs only. Raw bounded,
+labelled retained text remains only in the approved n8n transcript representation;
+post-call extraction receives a provenance-only marker and never the raw text.
 
 Volume is bounded per turn: the line is emitted **at most once per `result_type`
 per owning turn**, so one turn contributes at most two lines however many results
