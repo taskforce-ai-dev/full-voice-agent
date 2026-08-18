@@ -4872,12 +4872,14 @@ class MediaStreamSession:
         tts_tasks: list[asyncio.Task],
         initial_filler: SmartPBXInitialFillerController | None,
         generation: int,
+        tool_filler_started: bool = False,
     ) -> int | None:
-        """Fence model speech before the canonical transfer delivery barrier.
+        """Fence active turn speech before the canonical transfer delivery barrier.
 
         The transfer tool supplies its own canonical announcement and waits for
-        its delivery before MCP execution. No model preamble or initial filler
-        may delay, overlap, or be mistaken for that announcement.
+        its delivery before MCP execution. No model preamble, initial filler,
+        or specialized tool filler may delay, overlap, or be mistaken for that
+        announcement.
         """
         initial_delivery_started = bool(
             initial_filler is not None and initial_filler.spoke
@@ -4885,7 +4887,7 @@ class MediaStreamSession:
         await self._finish_initial_smartpbx_filler(initial_filler)
         if not self._current_smartpbx_runner_owns_shared_state():
             return None
-        if tts_tasks or initial_delivery_started:
+        if tts_tasks or initial_delivery_started or tool_filler_started:
             generation = await self._smartpbx_fence_stalled_generation(
                 tts_tasks=tts_tasks, gen=generation,
             )
@@ -7017,18 +7019,11 @@ class MediaStreamSession:
                     logger.info("Tools [%s]: %s", self.call_sid, [t["name"] for t in tool_list])
                 tool_filler_task: asyncio.Task | None = None
                 first_tool = tool_list[0]["name"]
-                if (
-                    first_tool == "transfer_to_human"
-                    and self._is_direct_smartpbx_english()
-                ):
-                    prepared_generation = await self._prepare_smartpbx_transfer_handoff(
-                        tts_tasks=tts_tasks, initial_filler=initial_filler,
-                        generation=gen,
-                    )
-                    if prepared_generation is None:
-                        return ""
-                    gen = prepared_generation
-                elif tts_tasks:
+                transfer_in_batch = (
+                    self._is_direct_smartpbx_english()
+                    and any(tool["name"] == "transfer_to_human" for tool in tool_list)
+                )
+                if tts_tasks and not transfer_in_batch:
                     await asyncio.gather(*tts_tasks)
                 if self._is_direct_smartpbx_english():
                     preamble = sentence_buffer.strip()
@@ -7080,6 +7075,22 @@ class MediaStreamSession:
                 for tool_index, tc in enumerate(tool_list):
                     if not self._current_smartpbx_runner_can_execute_tools():
                         return ""
+                    if (
+                        tc["name"] == "transfer_to_human"
+                        and self._is_direct_smartpbx_english()
+                    ):
+                        tool_filler_started = tool_filler_task is not None
+                        await self._finish_smartpbx_tool_filler(
+                            tool_filler_task, cancel=True
+                        )
+                        tool_filler_task = None
+                        prepared_generation = await self._prepare_smartpbx_transfer_handoff(
+                            tts_tasks=tts_tasks, initial_filler=initial_filler,
+                            generation=gen, tool_filler_started=tool_filler_started,
+                        )
+                        if prepared_generation is None:
+                            return ""
+                        gen = prepared_generation
                     try:
                         parsed_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
                     except json.JSONDecodeError:
@@ -7124,6 +7135,11 @@ class MediaStreamSession:
                             tool_filler_task, cancel=True
                         )
                         return ""
+                    if (
+                        tc["name"] == "transfer_to_human"
+                        and not self.transfer_pending
+                    ):
+                        self._smartpbx_transfer_audio_fenced = False
                     staged_results.append(
                         (tool_index, tc, parsed_input, result_str, tool_error)
                     )
@@ -7500,18 +7516,14 @@ class MediaStreamSession:
                         logger.info("Tools [%s]: %s", self.call_sid, [fc["name"] for fc in function_calls])
                     tool_filler_task: asyncio.Task | None = None
                     first_tool = function_calls[0]["name"]
-                    if (
-                        first_tool == "transfer_to_human"
-                        and self._is_direct_smartpbx_english()
-                    ):
-                        prepared_generation = await self._prepare_smartpbx_transfer_handoff(
-                            tts_tasks=tts_tasks, initial_filler=initial_filler,
-                            generation=gen,
+                    transfer_in_batch = (
+                        self._is_direct_smartpbx_english()
+                        and any(
+                            tool["name"] == "transfer_to_human"
+                            for tool in function_calls
                         )
-                        if prepared_generation is None:
-                            return ""
-                        gen = prepared_generation
-                    elif tts_tasks:
+                    )
+                    if tts_tasks and not transfer_in_batch:
                         await asyncio.gather(*tts_tasks)
                     if self._is_direct_smartpbx_english():
                         preamble = sentence_buffer.strip()
@@ -7565,6 +7577,22 @@ class MediaStreamSession:
                     for tc in tool_calls_openai:
                         if not self._current_smartpbx_runner_can_execute_tools():
                             return ""
+                        if (
+                            tc["function"]["name"] == "transfer_to_human"
+                            and self._is_direct_smartpbx_english()
+                        ):
+                            tool_filler_started = tool_filler_task is not None
+                            await self._finish_smartpbx_tool_filler(
+                                tool_filler_task, cancel=True
+                            )
+                            tool_filler_task = None
+                            prepared_generation = await self._prepare_smartpbx_transfer_handoff(
+                                tts_tasks=tts_tasks, initial_filler=initial_filler,
+                                generation=gen, tool_filler_started=tool_filler_started,
+                            )
+                            if prepared_generation is None:
+                                return ""
+                            gen = prepared_generation
                         parsed_input = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
                         parsed_input, _ = _override_capture_spoken_argument(
                             tool_name=tc["function"]["name"],
@@ -7605,6 +7633,11 @@ class MediaStreamSession:
                                 tool_filler_task, cancel=True
                             )
                             return ""
+                        if (
+                            tc["function"]["name"] == "transfer_to_human"
+                            and not self.transfer_pending
+                        ):
+                            self._smartpbx_transfer_audio_fenced = False
                         staged_results.append(
                             (tc, parsed_input, result_str, tool_error)
                         )
@@ -8044,18 +8077,11 @@ class MediaStreamSession:
                     logger.info("Tools [%s]: %s", self.call_sid, [t["name"] for t in tool_use_blocks])
                 tool_filler_task: asyncio.Task | None = None
                 first_tool = tool_use_blocks[0]["name"]
-                if (
-                    first_tool == "transfer_to_human"
-                    and self._is_direct_smartpbx_english()
-                ):
-                    prepared_generation = await self._prepare_smartpbx_transfer_handoff(
-                        tts_tasks=tts_tasks, initial_filler=initial_filler,
-                        generation=gen,
-                    )
-                    if prepared_generation is None:
-                        return ""
-                    gen = prepared_generation
-                elif tts_tasks:
+                transfer_in_batch = (
+                    self._is_direct_smartpbx_english()
+                    and any(tool["name"] == "transfer_to_human" for tool in tool_use_blocks)
+                )
+                if tts_tasks and not transfer_in_batch:
                     await asyncio.gather(*tts_tasks)
                 if self._is_direct_smartpbx_english():
                     preamble = sentence_buffer.strip()
@@ -8102,6 +8128,22 @@ class MediaStreamSession:
                 for tool_index, tb in enumerate(tool_use_blocks):
                     if not self._current_smartpbx_runner_can_execute_tools():
                         return ""
+                    if (
+                        tb["name"] == "transfer_to_human"
+                        and self._is_direct_smartpbx_english()
+                    ):
+                        tool_filler_started = tool_filler_task is not None
+                        await self._finish_smartpbx_tool_filler(
+                            tool_filler_task, cancel=True
+                        )
+                        tool_filler_task = None
+                        prepared_generation = await self._prepare_smartpbx_transfer_handoff(
+                            tts_tasks=tts_tasks, initial_filler=initial_filler,
+                            generation=gen, tool_filler_started=tool_filler_started,
+                        )
+                        if prepared_generation is None:
+                            return ""
+                        gen = prepared_generation
                     # The capture tools must parse what the caller actually SAID,
                     # not the model's paraphrase of it — and on this path the raw
                     # utterance is the whole combined dictation. This is the
@@ -8148,6 +8190,11 @@ class MediaStreamSession:
                             tool_filler_task, cancel=True
                         )
                         return ""
+                    if (
+                        tb["name"] == "transfer_to_human"
+                        and not self.transfer_pending
+                    ):
+                        self._smartpbx_transfer_audio_fenced = False
                     staged_results.append(
                         (tool_index, tb, tb["input"], result_str, tool_error)
                     )
