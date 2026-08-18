@@ -164,6 +164,14 @@ class KavyaSmartPBXSession:
                 pending = finish_tool_fillers()
                 if inspect.isawaitable(pending):
                     await pending
+            # Model sentences deferred behind a later transfer/PMS tool are
+            # likewise session-owned. Await their release before terminal
+            # completion so an old runner cannot keep the shared TTS lock live.
+            finish_deferred_tts = getattr(pipeline, "_cancel_smartpbx_deferred_tts", None)
+            if callable(finish_deferred_tts):
+                pending = finish_deferred_tts()
+                if inspect.isawaitable(pending):
+                    await pending
             # Cancel-and-await the initial-round filler BEFORE any other
             # teardown await below. Its delay (default 1.5s) runs on its own
             # timer, independent of the provider stream -- if it is still
