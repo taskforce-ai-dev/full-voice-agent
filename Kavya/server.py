@@ -303,6 +303,11 @@ class SmartPBXTurnTelemetry:
             ("inter_send_gap_p95_ms", _SMARTPBX_TELEMETRY_MAX_MS),
             ("inter_send_gap_max_ms", _SMARTPBX_TELEMETRY_MAX_MS),
             ("queue_underruns", 100_000),
+            ("ignored_post_dispatch_finals", 100_000),
+            ("ignored_post_dispatch_interims", 100_000),
+            # The constant, not a literal: the event clamp and the summary
+            # clamp must not be able to drift apart.
+            ("ignored_post_dispatch_max_elapsed_ms", POST_DISPATCH_ELAPSED_MS_MAX),
         ):
             if name in counts:
                 fields[name] = min(max(int(counts[name]), 0), maximum)
@@ -4571,6 +4576,11 @@ class MediaStreamSession:
         self._smartpbx_cadence_by_turn: dict[str, dict[str, int]] = {}
         self._smartpbx_dropped_frame_baselines: dict[str, int] = {}
         self._smartpbx_dropped_frames_by_turn: dict[str, int] = {}
+        # Per-owning-turn tally of provider results the dispatch guard refused:
+        # {"finals": n, "interims": n, "max_elapsed_ms": n}. Keyed by turn id
+        # like the dropped-frame maps above, so the barge-in / late-runner reset
+        # race cannot mix two turns' counts. Event-loop-only mutation.
+        self._smartpbx_post_dispatch_by_turn: dict[str, dict[str, int]] = {}
         self._smartpbx_last_finished_dropped_frames = 0
         self._smartpbx_initial_filler: SmartPBXInitialFillerController | None = None
         # Defense-in-depth against a residual STT-thread callback (or an
@@ -4752,6 +4762,7 @@ class MediaStreamSession:
             counts_for_turn=lambda turn_id: {
                 "dropped_frames": self._smartpbx_dropped_frames_for_turn(turn_id),
                 **self._smartpbx_cadence_counts(turn_id),
+                **self._post_dispatch_counts_for_turn(turn_id),
             },
         )
         for turn_id in finalized:
@@ -4764,6 +4775,7 @@ class MediaStreamSession:
         self._smartpbx_cadence_by_turn.clear()
         self._smartpbx_dropped_frame_baselines.clear()
         self._smartpbx_dropped_frames_by_turn.clear()
+        self._smartpbx_post_dispatch_by_turn.clear()
         self._active_smartpbx_turn_id = None
 
     def _current_smartpbx_turn_id(self) -> str | None:
@@ -4854,6 +4866,7 @@ class MediaStreamSession:
         self._smartpbx_cadence_by_turn.pop(turn_id, None)
         self._smartpbx_dropped_frame_baselines.pop(turn_id, None)
         self._smartpbx_dropped_frames_by_turn.pop(turn_id, None)
+        self._smartpbx_post_dispatch_by_turn.pop(turn_id, None)
         self._smartpbx_last_finished_dropped_frames = (
             self._current_smartpbx_dropped_frames()
         )
@@ -6040,12 +6053,26 @@ class MediaStreamSession:
 
     # â”€â”€ Endpointing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    def _emit_post_dispatch_result(self, result_type: str) -> None:
+    def _post_dispatch_elapsed_ms(self) -> int:
+        """Age of the owning turn, clamped — the only number this event carries."""
+        started = self._utterance_dispatched_at
+        elapsed_ms = 0
+        if started is not None:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+        return max(0, min(elapsed_ms, POST_DISPATCH_ELAPSED_MS_MAX))
+
+    def _emit_post_dispatch_result(
+        self, result_type: str, elapsed_ms: int | None = None
+    ) -> None:
         """Record that a late provider result was ignored by a dispatched turn.
 
         Privacy-safe and bounded by construction: two closed enums plus one
         clamped integer. No transcript text, no provider payload, no header, no
         phone/call identifier — see the runbook's event allowlist.
+
+        `elapsed_ms` is optional so the caller can reuse the value it already
+        computed for the per-turn aggregate; omitting it computes the same
+        clamped number here.
         """
         if result_type not in ("final", "interim"):
             # Closed enum. An unrecognised caller emits nothing rather than
@@ -6053,11 +6080,9 @@ class MediaStreamSession:
             return
         if not self._is_smartpbx_session():
             return
-        started = self._utterance_dispatched_at
-        elapsed_ms = 0
-        if started is not None:
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-        elapsed_ms = max(0, min(elapsed_ms, POST_DISPATCH_ELAPSED_MS_MAX))
+        if elapsed_ms is None:
+            elapsed_ms = self._post_dispatch_elapsed_ms()
+        elapsed_ms = max(0, min(int(elapsed_ms), POST_DISPATCH_ELAPSED_MS_MAX))
         logger.info(
             "smartpbx_media event=stt_post_dispatch_result result_type=%s "
             "action=ignored_active_turn elapsed_ms=%d",
@@ -6082,12 +6107,47 @@ class MediaStreamSession:
         The silence re-prompt is deliberately NOT re-armed here. Its task is
         already re-armed by every delivered sentence of the turn that owns the
         guard, and touching a timer from a refused result is exactly the
-        state-mutation-before-rejection this gate exists to remove.
+        state-mutation-before-rejection this gate exists to remove. The nudge
+        cannot voice mid-turn regardless: `_reprompt_after_silence` defers while
+        this same guard is held.
+
+        Volume is bounded per turn: the INFO line is emitted only for the FIRST
+        result of each type an owning turn refuses (at most two lines per turn),
+        and the per-turn totals travel on the turn_summary instead.
         """
         if not self._utterance_dispatched:
             return False
-        self._emit_post_dispatch_result(result_type)
+        elapsed_ms = self._post_dispatch_elapsed_ms()
+        turn_id = self._active_smartpbx_turn_id
+        # Same closed enum as the emitter: an unrecognised type is neither
+        # counted nor logged, so the two can never disagree.
+        key = {"final": "finals", "interim": "interims"}.get(result_type)
+        first_of_type = True
+        if turn_id is not None and key is not None:
+            record = self._smartpbx_post_dispatch_by_turn.get(turn_id)
+            if record is None:
+                record = {"finals": 0, "interims": 0, "max_elapsed_ms": 0}
+                self._smartpbx_post_dispatch_by_turn[turn_id] = record
+            record[key] = min(record[key] + 1, 100_000)
+            record["max_elapsed_ms"] = max(record["max_elapsed_ms"], elapsed_ms)
+            first_of_type = record[key] == 1
+        if first_of_type:
+            self._emit_post_dispatch_result(result_type, elapsed_ms)
         return True
+
+    def _post_dispatch_counts_for_turn(self, turn_id: str | None) -> dict[str, int]:
+        """Summary fields for one turn, or {} when it refused nothing.
+
+        Absent rather than zero, matching the kb_ms / tool_ms convention.
+        """
+        record = self._smartpbx_post_dispatch_by_turn.get(turn_id or "")
+        if not record:
+            return {}
+        return {
+            "ignored_post_dispatch_finals": record["finals"],
+            "ignored_post_dispatch_interims": record["interims"],
+            "ignored_post_dispatch_max_elapsed_ms": record["max_elapsed_ms"],
+        }
 
     async def _accumulate_transcript(self, text: str):
         if self._smartpbx_torn_down:
@@ -6351,6 +6411,7 @@ class MediaStreamSession:
                     delivered_sentences=len(self._delivered_sentences),
                     dropped_frames=self._smartpbx_dropped_frames_for_turn(turn_id),
                     **self._smartpbx_cadence_counts(turn_id),
+                    **self._post_dispatch_counts_for_turn(turn_id),
                 )
                 self._retire_smartpbx_turn(turn_id)
             raise
@@ -6429,6 +6490,7 @@ class MediaStreamSession:
                     delivered_sentences=0 if stale_runner else len(self._delivered_sentences),
                     dropped_frames=self._smartpbx_dropped_frames_for_turn(turn_id),
                     **self._smartpbx_cadence_counts(turn_id),
+                    **self._post_dispatch_counts_for_turn(turn_id),
                 )
                 self._retire_smartpbx_turn(turn_id)
                 self._interrupted_smartpbx_turn_ids.discard(turn_id)
