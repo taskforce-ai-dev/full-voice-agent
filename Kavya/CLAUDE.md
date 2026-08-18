@@ -920,12 +920,19 @@ service modes are architecturally incapable of running in one process.
     `CAPTURE_MODE_MAX_TURNS` all end it. The allowance is spent AFTER the turn
     and `_enter_capture_mode` never refills a live episode, so `needs_more`
     cannot reset an exhausted one.
-  - Teardown forces the buffer into `full_transcript`
-    (`_force_pending_capture_dispatch`, called from `MediaStreamSession.run()`
-    teardown, `enter_transfer_pending`, and `KavyaSmartPBXSession._finish_once`) —
-    a half-dictated number must reach the call log and post-call extraction.
+  - Teardown forces the buffer into `full_transcript` (`_retain_pending_speech`,
+    formerly `_force_pending_capture_dispatch`, called from
+    `MediaStreamSession.run()` teardown, `enter_transfer_pending`, the
+    `_flush_transcript` transfer branch, `_handle_bargein`, and
+    `KavyaSmartPBXSession._finish_once`) — a half-dictated number must reach the
+    call log and post-call extraction. **It is no longer gated on capture mode:**
+    since the post-dispatch predicate was narrowed (below), ordinary speech
+    admitted while a turn held the dispatch guard is routinely pending too, and
+    it is retained on the same terms.
   - Capture mode deliberately survives a barge-in (the buffer does not): a
-    caller talking over the tail of the ask is a dictation starting.
+    caller talking over the tail of the ask is a dictation starting. The
+    superseded buffer is still written to `full_transcript` first — barge-in
+    ownership is SUPERSEDED for dispatch, RETAINED for the record.
   - Both knobs are env-tunable and clamped: `CAPTURE_BUFFER_MAX_CHARS`
     (600, clamp `[60, 4000]`) and `CAPTURE_DICTATION_MIN_RATIO`
     (0.3, clamp `[0.0, 1.0]`).
@@ -935,6 +942,41 @@ service modes are architecturally incapable of running in one process.
     three ConversationRelay runners. The combined dictation reaches the parser
     through that override and nowhere else, so a runner that skips it silently
     discards the fragment combining.
+
+### Post-dispatch STT results: refuse only the empty ones (Aug 2026)
+A dispatched turn owns the STT endpoint (`_utterance_dispatched`), and results
+still arrive after it claims that guard — during pre-TTS LLM/tool latency and in
+the gaps between delivered sentences, where `_is_speaking` is already False.
+`_reject_post_dispatch_result` decides what happens to them:
+
+- **Refused:** a result with no material characters (nothing alphanumeric —
+  empty, whitespace or punctuation only). Provable by construction: there is no
+  caller speech in it, so discarding it cannot discard any. Refused before any
+  counter, buffer or timer moves; bounded, privacy-safe
+  `stt_post_dispatch_result` telemetry (see `SMARTPBX_RUNBOOK.md`).
+- **Admitted:** everything else, **including a verbatim repeat of the dispatched
+  utterance, a prefix of it, or a punctuation variation of it.** Those may be a
+  provider tail — or the caller repeating/correcting themselves, which is what a
+  caller does when the agent goes quiet mid-turn. Nothing available here
+  separates the two: `GoogleSTTStream` and `AzureSTTStream` both hand their
+  callbacks a bare `str` (no result id, no segment id, no audio-time span), and
+  `_stream_epoch` is an internal gRPC-swap fence identical in both cases.
+  **Do not reintroduce a text-relationship or elapsed-time predicate here** —
+  matching text plus a short delay is not proof of provider ownership, and the
+  earlier `POST_DISPATCH_STALE_WINDOW_SECONDS` version of this gate deleted
+  genuine caller speech. Admitted speech buffers, cancels and resets the silence
+  re-prompt, and dispatches as the NEXT turn (`_deferred_flush_pending`
+  re-arms the flush when the turn releases the guard).
+- **Ownership of pending speech is explicit at every boundary** — DISPATCHED,
+  RETAINED (`_retain_pending_speech` → `full_transcript`), or TRANSFERRED, never
+  a silent clear. Barge-in: SUPERSEDED for dispatch, RETAINED for the record.
+  Transfer-pending (both `enter_transfer_pending` and the `_flush_transcript`
+  branch), SmartPBX `_finish_once`, and Twilio `run()` teardown: RETAINED before
+  the post-call snapshot.
+
+Shared with the Twilio Media Streams path on purpose (ConversationRelay has its
+own handler and never reaches this accumulator); only the SmartPBX log
+vocabulary is gated by `_is_smartpbx_session`.
 
 ### Gemini double-empty is a failover, not an outcome (Aug 2026)
 A Gemini turn that streams no text and no tool call twice in a row now raises

@@ -550,9 +550,12 @@ def test_runbook_allowlists_llm_round_outcome_with_its_exact_bounded_field_set()
 
 def test_runbook_allowlists_stt_post_dispatch_result_with_its_exact_bounded_field_set():
     """The late-STT-result event is the only place the pipeline reports that it
-    threw provider speech away. It must stay a closed enum pair plus one clamped
-    integer — the tempting fields (what was said, how long it was) are exactly
-    the ones that would turn it into a transcript side channel."""
+    threw a provider result away. It must stay a closed enum pair plus one
+    clamped integer — the tempting fields (what was said, how long it was) are
+    exactly the ones that would turn it into a transcript side channel — and its
+    documented meaning must not over-claim: it cannot separate a provider tail
+    from an immediate caller repetition, because no provider result identity
+    reaches this pipeline."""
     runbook = read_text("SMARTPBX_RUNBOOK.md")
     cutover = runbook.split("## Cutover gates", 1)[1].split("\n## ", 1)[0]
 
@@ -572,22 +575,35 @@ def test_runbook_allowlists_stt_post_dispatch_result_with_its_exact_bounded_fiel
     assert "genuine barge-in" in normalized
     assert "never reaches this event" in normalized
 
-    # The event now fires only for results PROVEN to be the owning turn's own
-    # tail — a decided text relationship, not an assumption — so the runbook must
-    # say which relationship, and must say that genuine new speech is admitted
-    # rather than counted here. It still may not hand the operator a
-    # packet-loss/duplication retune the event cannot justify.
-    assert "proven to be that turn's own tail" in normalized
-    assert "token-boundary prefix" in normalized
-    assert "two seconds" in normalized
+    # The event fires only for results with no material characters. The runbook
+    # must say so, must say that everything else is admitted, and must state
+    # plainly that this signal cannot prove tail-vs-repetition — an operator who
+    # believes it can will retune endpointing on a number that does not carry
+    # that information.
+    assert "no material characters" in normalized
+    assert "admitted" in normalized
+    assert (
+        "cannot prove whether a result was a provider tail or the caller "
+        "repeating themselves" in normalized
+    )
+    assert "provider result identity" in normalized
     assert "never reaches this event" in normalized
+    # The withdrawn predicate must not be described as live policy anywhere.
+    assert "proven to be that turn's own tail" not in normalized
     assert "means late duplicate provider results" not in normalized
     assert "cannot distinguish a delayed tail" not in normalized
     assert "no packet-loss diagnosis" in normalized
     assert "no provider-duplication diagnosis" in normalized
     assert "undetermined" in normalized
-    # And it is not a lost-speech metric: unproven results are admitted.
+    # And it is not a lost-speech metric: a refused result had no speech in it.
     assert "not evidence of lost caller speech" in normalized
+
+    # Admitted speech is owned at every boundary, and the runbook must name the
+    # event and the closed reason set that report the retention.
+    assert "`capture_forced_dispatch`" in cutover
+    for reason in ("`barge_in`", "`transfer`", "`transfer_flush`", "`session_end`", "`hangup`"):
+        assert reason in cutover, reason
+    assert "no boundary drops the buffer silently" in normalized
 
     # Volume is bounded per turn, and the per-turn totals ride the already
     # allowlisted turn_summary rather than one INFO line per ignored result.

@@ -397,31 +397,50 @@ identifiers of any kind.
 | `action` | fixed string | `ignored_active_turn` |
 | `elapsed_ms` | bounded integer | `0`–`60000`, clamped |
 
-It records that a provider result arrived while a turn was already dispatched,
-was proven to be that turn's own tail, and was therefore refused before any
-counter, buffer or endpointing timer changed — the age of the owning turn,
-nothing about what was said. No transcript text, no character or token counts,
-no provider payload, no phone or call identifier. A genuine barge-in is handled
-on the speaking-time path and never reaches this event, so a rise in this counter
-still does not indicate missed interruptions.
+It records that an EMPTY provider result arrived while a turn was already
+dispatched and was therefore refused before any counter, buffer or endpointing
+timer changed — the age of the owning turn, nothing about what was said. No
+transcript text, no character or token counts, no provider payload, no phone or
+call identifier. A genuine barge-in is handled on the speaking-time path and
+never reaches this event, so a rise in this counter still does not indicate
+missed interruptions.
 
-The proof is a text relationship the pipeline evaluates in memory and never logs:
-after normalising whitespace and case, the refused result is the dispatched
-utterance itself, a token-boundary prefix of it, a superset of it that adds no
-material characters, or carries no material characters at all — and it arrived
-within two seconds of the dispatch. Anything else is admitted: a result that adds
-words is genuine caller speech, it is buffered, it cancels the silence
-re-prompt, and it is dispatched as the next turn, so it never reaches this event.
-Every line here is therefore a refusal of a tail or duplicate of the utterance
-that had already been answered — that distinction is decided, not assumed.
+"Empty" is the whole of the refusal test, and it is evaluated in memory and never
+logged: the result carries no material characters — nothing alphanumeric, so
+empty, whitespace or punctuation only. Every other result is ADMITTED: it is
+buffered, it cancels and resets the silence re-prompt, and it is dispatched as
+the next turn, so it never reaches this event.
 
-That is the whole of what it proves. What the event still **cannot** tell you is
-anything about the provider or the network that produced the tail: draw **no
-packet-loss diagnosis and no provider-duplication diagnosis** from it — a rise
-means tails were seen and refused, and the reason they were produced is
-undetermined by this event alone. Establishing that needs the turn timings and
-the endpointing settings for the same calls, not this counter. A rise is also not
-evidence of lost caller speech: unproven results are never refused.
+**This signal cannot prove whether a result was a provider tail or the caller
+repeating themselves immediately, and it no longer tries.** An earlier revision
+refused results whose text matched the dispatched utterance (equal, a
+token-boundary prefix, or a punctuation-only superset) within two seconds of
+dispatch, and called that proof of provider ownership. It is not. Establishing
+that a result belongs to the utterance already answered needs provider result
+identity, and none reaches this pipeline: `GoogleSTTStream` and `AzureSTTStream`
+both deliver a bare string to their callbacks — no result id, no segment id, no
+audio-time span — and `GoogleSTTStream._stream_epoch` is an internal gRPC-swap
+fence that is identical for a tail and for a repetition. Matching text and a
+short elapsed time are exactly what an immediate caller repetition looks like, so
+that predicate was withdrawn along with the two-second window. `elapsed_ms`
+survives as a description of the refusal, never as a gate.
+
+Consequently, what the event **cannot** tell you is anything about the provider
+or the network: draw **no packet-loss diagnosis and no provider-duplication
+diagnosis** from it — a rise means empty results were seen and refused, and the
+reason they were produced is undetermined by this event alone. Establishing that
+needs the turn timings and the endpointing settings for the same calls, not this
+counter. A rise is also not evidence of lost caller speech: a refused result had
+no speech in it, and everything with speech in it is admitted.
+
+Where that admitted speech goes is not silent either. Once it is buffered, every
+boundary that can end or divert the call gives it an explicit owner — it becomes
+a turn, or it is written into the call transcript (a barge-in supersedes it for
+dispatch but still records it; transfer-pending and both teardown paths record it
+before the post-call snapshot). Retention is reported by the existing
+`capture_forced_dispatch` event, whose `reason` is a fixed set of call sites —
+`barge_in`, `transfer`, `transfer_flush`, `session_end`, `hangup` — alongside a
+character count. No boundary drops the buffer silently.
 
 Volume is bounded per turn: the line is emitted **at most once per `result_type`
 per owning turn**, so one turn contributes at most two lines however many results
