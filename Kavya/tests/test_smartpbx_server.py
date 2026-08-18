@@ -1920,6 +1920,16 @@ def direct_tool_pipeline(server, provider, client, lang="en"):
     return pipeline
 
 
+def bind_direct_smartpbx_turn(server, pipeline, *, endpoint_source="final"):
+    """Give direct-runner tests the same non-null ownership token as endpointing."""
+    telemetry = pipeline._ensure_smartpbx_turn_telemetry()
+    assert telemetry is not None
+    turn_id = telemetry.start_turn(endpoint_source)
+    pipeline._active_smartpbx_turn_id = turn_id
+    pipeline._assistant_turn_generation = pipeline._speak_generation
+    return turn_id
+
+
 def direct_tool_history_records(provider, history):
     """Return provider-normalized request/result identifiers from shared history."""
     if provider == "claude":
@@ -3623,14 +3633,16 @@ async def test_transfer_fences_pending_model_tts_before_canonical_delivery_barri
 
     turn = asyncio.create_task(pipeline._process_utterance("human please"))
     try:
-        await asyncio.wait_for(model_started.wait(), timeout=1)
         await asyncio.wait_for(transfer_attempted.wait(), timeout=0.2)
-        await asyncio.wait_for(model_cancelled.wait(), timeout=0.2)
+        await asyncio.sleep(0)
 
-        assert timeline[:5] == [
-            "model_started", "model_cancelled", "canonical", "delivery_barrier",
-            "mcp:human please",
-        ]
+        # The prelude may fence a task before its coroutine body is scheduled,
+        # or it may cancel an already-started task. Neither path may send model
+        # audio; the caller-facing invariant is the canonical handoff order.
+        if model_started.is_set():
+            await asyncio.wait_for(model_cancelled.wait(), timeout=0.2)
+            assert timeline[:2] == ["model_started", "model_cancelled"]
+        assert timeline[-3:] == ["canonical", "delivery_barrier", "mcp:human please"]
         assert pipeline._media_transport.clears == 1
     finally:
         turn.cancel()
@@ -3764,6 +3776,7 @@ async def test_later_transfer_early_exit_cancels_deferred_model_tts(
         ),
     ])
     pipeline = direct_tool_pipeline(server, provider, client)
+    bind_direct_smartpbx_turn(server, pipeline)
     monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
     monkeypatch.setattr(server, "SMARTPBX_INITIAL_FILLER_DELAY_SECONDS", 60.0)
 
@@ -3814,6 +3827,11 @@ async def test_later_transfer_early_exit_cancels_deferred_model_tts(
             )
             finish_task = asyncio.create_task(session.finish(False))
             await asyncio.wait_for(finish_task, timeout=1)
+            await asyncio.wait_for(tts_cancelled.wait(), timeout=0.2)
+            await asyncio.sleep(0)
+            assert held_tts is not None and held_tts.done()
+            assert pipeline._speak_lock.locked() is False
+            assert pipeline._media_transport.audio == []
             check_release.set()
             await asyncio.wait_for(turn, timeout=1)
         else:
@@ -3872,6 +3890,7 @@ async def test_capture_then_transfer_keeps_capture_slot_without_late_completion(
         ),
     ])
     pipeline = direct_tool_pipeline(server, provider, client)
+    bind_direct_smartpbx_turn(server, pipeline)
     pipeline._media_transport = GenerationTrackingTransport()
     monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
     monkeypatch.setattr(
