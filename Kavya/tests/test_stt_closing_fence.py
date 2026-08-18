@@ -570,7 +570,8 @@ async def test_twilio_teardown_closes_turn_dispatch_before_awaiting_stt_stop(mon
     def factory(**kwargs):
         stt = _BlockingThreadedSTT(**kwargs)
         created["stt"] = stt
-        stt.start()
+        # `MediaStreamSession.run()` owns start(); starting here too created a
+        # second provider worker and made a harness artifact look like a replay.
         session._write_audio_dump = stt.release_and_join
         return stt
 
@@ -589,5 +590,7 @@ async def test_twilio_teardown_closes_turn_dispatch_before_awaiting_stt_stop(mon
     await _settle()
 
     assert processed == [], "a pre-created flush cannot start an LLM turn at hangup"
-    assert LAST_WORDS in _all_texts(session.full_transcript)
+    assert _all_texts(session.full_transcript).count(LAST_WORDS) == 1, (
+        "the one admitted worker final must survive exactly once"
+    )
     assert session._endpointing_handle is None
