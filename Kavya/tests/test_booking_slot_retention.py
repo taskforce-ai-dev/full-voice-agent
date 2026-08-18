@@ -149,3 +149,31 @@ def test_incomplete_or_invalid_spoken_number_never_persists_a_guest_phone_slot(r
 
     assert "guest_phone" not in session._booking_slots
     assert "phone:" not in session._active_system_prompt().lower()
+
+
+@pytest.mark.parametrize("runner_name", ("_run_llm", "_run_llm_gemini", "_run_llm_claude"))
+def test_captured_spoken_name_persists_as_authoritative_guest_name_for_every_media_runner(
+    runner_name,
+):
+    """A successful spelling capture must stop later turns asking the name again."""
+    session = make_session()
+    captured = {"status": "captured", "name": "Ada Lovelace"}
+
+    session._record_capture_tool_completion("capture_spoken_name", captured)
+
+    assert session._booking_slots["guest_name"] == "Ada Lovelace"
+    assert "guest name: Ada Lovelace" in session._active_system_prompt()
+    assert "_record_capture_tool_completion(" in inspect.getsource(
+        getattr(server.MediaStreamSession, runner_name)
+    ), f"{runner_name} must use the shared capture-result boundary"
+
+
+def test_invalid_spoken_name_never_persists_a_guest_name_slot():
+    session = make_session()
+
+    session._record_capture_tool_completion(
+        "capture_spoken_name", {"status": "invalid", "name": ""}
+    )
+
+    assert "guest_name" not in session._booking_slots
+    assert "guest name:" not in session._active_system_prompt().lower()
