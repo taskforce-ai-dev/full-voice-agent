@@ -3586,6 +3586,88 @@ def _disable_initial_filler(monkeypatch, pipeline):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+@pytest.mark.parametrize("termination", ["barge", "teardown", "runner_cancel"])
+async def test_specialized_tool_filler_is_cancelled_and_awaited_on_owner_loss(
+    monkeypatch, provider, termination,
+):
+    """No held PMS filler may outlive its SmartPBX runner or session owner."""
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"nights": 2}, tool_name="check_availability"),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    turn_id = f"{provider}-{termination}-turn"
+    pipeline._active_smartpbx_turn_id = turn_id
+    runner = server._SmartPBXRunnerContext(
+        turn_id=turn_id, dropped_frame_baseline=0,
+        speak_generation=pipeline._speak_generation, raw_utterance="",
+    )
+    filler_started = asyncio.Event()
+    filler_cancelled = asyncio.Event()
+    tool_started = asyncio.Event()
+    tool_release = asyncio.Event()
+    filler_task = None
+    filler = server.TOOL_FILLERS["check_availability"]
+
+    async def tts(text, **_kwargs):
+        nonlocal filler_task
+        if text != filler:
+            raise AssertionError("no result speech may start after ownership loss")
+        filler_task = asyncio.current_task()
+        filler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            filler_cancelled.set()
+            raise
+
+    async def execute(_name, _arguments):
+        tool_started.set()
+        await tool_release.wait()
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    async def run():
+        token = server._smartpbx_runner_context.set(runner)
+        try:
+            return await _run_direct_provider(pipeline, provider)
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(filler_started.wait(), timeout=1)
+        await asyncio.wait_for(tool_started.wait(), timeout=1)
+
+        if termination == "barge":
+            await pipeline._handle_bargein()
+            tool_release.set()
+        elif termination == "teardown":
+            pipeline._finalize_smartpbx_turns()
+            tool_release.set()
+        else:
+            task.cancel()
+
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(filler_cancelled.wait(), timeout=0.2)
+
+        assert filler_task is not None and filler_task.done()
+        assert pipeline._speak_lock.locked() is False
+    finally:
+        tool_release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if filler_task is not None and not filler_task.done():
+            filler_task.cancel()
+            await asyncio.gather(filler_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
 async def test_smartpbx_empty_response_retries_once_then_succeeds(monkeypatch, provider):
     import server
 
@@ -5439,18 +5521,17 @@ async def test_filler_clear_resuming_after_barge_in_cannot_reanchor_old_turn(
                 "role": "assistant", "content": stale_answer,
             })
 
+        barge_task = asyncio.create_task(pipeline._handle_bargein())
+        await asyncio.wait_for(transport.first_clear_entered.wait(), timeout=1)
+        pipeline._active_smartpbx_turn_id = new_turn
         token = server._smartpbx_runner_context.set(runner)
         try:
             stale_task = asyncio.create_task(finish_old_turn())
         finally:
             server._smartpbx_runner_context.reset(token)
-
-        await asyncio.wait_for(transport.first_clear_entered.wait(), timeout=1)
-        await pipeline._handle_bargein()
-        pipeline._active_smartpbx_turn_id = new_turn
         history_after_barge = list(pipeline.history)
         transport.resume_first_clear.set()
-        await asyncio.wait_for(stale_task, timeout=1)
+        await asyncio.wait_for(asyncio.gather(barge_task, stale_task), timeout=1)
 
         assert transport.clears == 2
         assert pipeline._smartpbx_barge_ins == 1

@@ -709,8 +709,8 @@ def test_turn_telemetry_retires_finished_turn_state_but_preserves_session_aggreg
 
 
 @pytest.mark.asyncio
-async def test_filler_clear_syncs_generation_before_next_turn_bind():
-    """A filler win must fence old TTS before the next normal reply starts."""
+async def test_content_handoff_keeps_generation_before_next_turn_bind():
+    """Provider content queues behind filler delivery; it is not a barge-in."""
     import server
 
     class GenerationFencedTransport:
@@ -749,8 +749,8 @@ async def test_filler_clear_syncs_generation_before_next_turn_bind():
     await controller.on_content_delta()
     await pipeline._send_media_audio(b"\xff" * 160)
 
-    assert pipeline._speak_generation == transport._generation == 1
-    assert transport.bindings == [(1, "next-turn")]
+    assert pipeline._speak_generation == transport._generation == 0
+    assert transport.bindings == [(0, "next-turn")]
     assert transport.rejected_bindings == []
     assert transport.audio == [b"\xff" * 160]
 
