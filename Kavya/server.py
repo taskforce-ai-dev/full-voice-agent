@@ -6003,6 +6003,16 @@ class MediaStreamSession:
                 # Agent is talking — re-arm after it finishes.
                 self._schedule_reprompt()
                 return
+            if self._utterance_dispatched:
+                # A dispatched turn owns the floor. Every delivered sentence
+                # arms this timer, so the deadline routinely expires inside a
+                # tool/model gap where _is_speaking is already False but the
+                # turn is still running. Nudging there talks over the turn.
+                # Defer exactly like the speaking case; the re-arm below (or
+                # the turn's own next delivered sentence, which cancel-replaces
+                # it) carries the nudge past the release of the guard.
+                self._schedule_reprompt()
+                return
             if self._capture_dispatch_pending():
                 # A nudge mid-number is exactly the UX this buffering exists to
                 # kill: the caller is pausing between digit groups, not silent.
