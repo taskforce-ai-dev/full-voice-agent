@@ -397,21 +397,31 @@ identifiers of any kind.
 | `action` | fixed string | `ignored_active_turn` |
 | `elapsed_ms` | bounded integer | `0`–`60000`, clamped |
 
-It records that a provider result arrived while a turn was already dispatched and
-was therefore refused before any counter, buffer or endpointing timer changed —
-the age of the owning turn, nothing about what was said. No transcript text, no
-character or token counts, no provider payload, no phone or call identifier. A
-genuine barge-in is handled on the speaking-time path and never reaches this
-event, so a rise in this counter still does not indicate missed interruptions.
+It records that a provider result arrived while a turn was already dispatched,
+was proven to be that turn's own tail, and was therefore refused before any
+counter, buffer or endpointing timer changed — the age of the owning turn,
+nothing about what was said. No transcript text, no character or token counts,
+no provider payload, no phone or call identifier. A genuine barge-in is handled
+on the speaking-time path and never reaches this event, so a rise in this counter
+still does not indicate missed interruptions.
 
-That is the whole of what it proves. The event **cannot distinguish a delayed
-tail or duplicate of the utterance already dispatched from genuine new caller
-speech** that lands during pre-TTS LLM latency or between the spoken sentences of
-a reply — it sees a result and the turn's age, and nothing that separates those
-cases. Draw **no packet-loss diagnosis and no provider-duplication diagnosis**
-from it. What a rise means beyond "a result was ignored while a turn owned
-dispatch" is undetermined by this event alone; establishing a cause needs the
-turn timings and the endpointing settings for the same calls, not this counter.
+The proof is a text relationship the pipeline evaluates in memory and never logs:
+after normalising whitespace and case, the refused result is the dispatched
+utterance itself, a token-boundary prefix of it, a superset of it that adds no
+material characters, or carries no material characters at all — and it arrived
+within two seconds of the dispatch. Anything else is admitted: a result that adds
+words is genuine caller speech, it is buffered, it cancels the silence
+re-prompt, and it is dispatched as the next turn, so it never reaches this event.
+Every line here is therefore a refusal of a tail or duplicate of the utterance
+that had already been answered — that distinction is decided, not assumed.
+
+That is the whole of what it proves. What the event still **cannot** tell you is
+anything about the provider or the network that produced the tail: draw **no
+packet-loss diagnosis and no provider-duplication diagnosis** from it — a rise
+means tails were seen and refused, and the reason they were produced is
+undetermined by this event alone. Establishing that needs the turn timings and
+the endpointing settings for the same calls, not this counter. A rise is also not
+evidence of lost caller speech: unproven results are never refused.
 
 Volume is bounded per turn: the line is emitted **at most once per `result_type`
 per owning turn**, so one turn contributes at most two lines however many results

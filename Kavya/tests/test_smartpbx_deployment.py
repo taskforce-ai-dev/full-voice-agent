@@ -572,16 +572,22 @@ def test_runbook_allowlists_stt_post_dispatch_result_with_its_exact_bounded_fiel
     assert "genuine barge-in" in normalized
     assert "never reaches this event" in normalized
 
-    # The event proves that a result was ignored while a turn owned dispatch —
-    # and nothing beyond that. It cannot tell a delayed tail or duplicate of the
-    # dispatched utterance from genuine new speech landing during pre-TTS LLM
-    # latency, so the runbook must not hand the operator an inference the event
-    # cannot support and a packet-loss/duplication retune it cannot justify.
-    assert "cannot distinguish a delayed tail" in normalized
+    # The event now fires only for results PROVEN to be the owning turn's own
+    # tail — a decided text relationship, not an assumption — so the runbook must
+    # say which relationship, and must say that genuine new speech is admitted
+    # rather than counted here. It still may not hand the operator a
+    # packet-loss/duplication retune the event cannot justify.
+    assert "proven to be that turn's own tail" in normalized
+    assert "token-boundary prefix" in normalized
+    assert "two seconds" in normalized
+    assert "never reaches this event" in normalized
     assert "means late duplicate provider results" not in normalized
+    assert "cannot distinguish a delayed tail" not in normalized
     assert "no packet-loss diagnosis" in normalized
     assert "no provider-duplication diagnosis" in normalized
     assert "undetermined" in normalized
+    # And it is not a lost-speech metric: unproven results are admitted.
+    assert "not evidence of lost caller speech" in normalized
 
     # Volume is bounded per turn, and the per-turn totals ride the already
     # allowlisted turn_summary rather than one INFO line per ignored result.
