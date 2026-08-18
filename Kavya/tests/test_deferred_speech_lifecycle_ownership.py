@@ -145,7 +145,11 @@ def _context() -> CallContext:
 
 
 def _texts(transcript) -> list[str]:
-    return [entry["text"] for entry in transcript if entry.get("role") == "user"]
+    return [
+        entry["text"]
+        for entry in transcript
+        if entry.get("role") in {"user", server.RETAINED_SPEECH_ROLE}
+    ]
 
 
 # ---------------------------------------------------------------------------

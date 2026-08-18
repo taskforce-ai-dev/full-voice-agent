@@ -630,5 +630,5 @@ async def test_dialog_hangup_forces_the_pending_capture_into_the_post_call_recor
     await asyncio.sleep(0)
 
     assert seen == [
-        [{"role": "user", "text": "zero seven seven one two three four five six"}]
+        [{"role": server.RETAINED_SPEECH_ROLE, "text": "zero seven seven one two three four five six", "provenance": "final", "answered": "unanswered", "retention_reason": "hangup"}]
     ], "a half-dictated number must survive the hangup"

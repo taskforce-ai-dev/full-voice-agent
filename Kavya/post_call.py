@@ -88,7 +88,7 @@ CRITICAL RULES FOR guest_name:
 CRITICAL RULES FOR unconfirmed retained speech:
 - A line beginning "Guest (unconfirmed, unanswered)" is an unconfirmed provider
   hypothesis or a final statement that never received an agent response. It is
-  evidence only, not a confirmed booking statement.
+  evidence only, not confirmed and never a confirmed booking statement.
 - Never use an unconfirmed line to fill guest_name, dates, guest count,
   room_preference, availability_result, or any other booking field. Do not infer
   a booking from it; it may only support a dropped-call outcome.

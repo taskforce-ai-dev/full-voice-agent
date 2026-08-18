@@ -5536,21 +5536,21 @@ class MediaStreamSession:
                 self.call_sid, len(self.history), len(self.full_transcript),
             )
             if self.full_transcript:
-                asyncio.create_task(
-                    process_post_call_data(
-                        call_sid=self.call_sid,
-                        lang=self.lang,
-                        caller_phone=self.caller_phone,
-                        full_transcript=self.full_transcript,
-                        call_start_time=self.call_start_time,
-                        call_end_time=call_end_time,
-                        llm_provider=LLM_PROVIDER,
-                        anthropic_client=self.anthropic_client,
-                        openai_client=self.client,
-                        gemini_client=self.gemini_client,
-                        model=MODEL,
-                    )
+                post_call = process_post_call_data(
+                    call_sid=self.call_sid,
+                    lang=self.lang,
+                    caller_phone=self.caller_phone,
+                    full_transcript=self.full_transcript,
+                    call_start_time=self.call_start_time,
+                    call_end_time=call_end_time,
+                    llm_provider=LLM_PROVIDER,
+                    anthropic_client=self.anthropic_client,
+                    openai_client=self.client,
+                    gemini_client=self.gemini_client,
+                    model=MODEL,
                 )
+                if inspect.isawaitable(post_call):
+                    asyncio.create_task(post_call)
 
     # â”€â”€ STT callback (called from background thread) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -6356,6 +6356,11 @@ class MediaStreamSession:
         if self.transfer_pending:
             return
         if self._reject_post_dispatch_result("final", text):
+            return
+        # Teardown allows already-admitted finals to reach retention, but a
+        # provider replay during the closing drain must not duplicate the same
+        # retained evidence.
+        if self._stt_closing and self._committed_transcript == text:
             return
         # A final supersedes any interim of the same utterance. Cleared here, on
         # the event loop, rather than in the STT worker-thread callback.
