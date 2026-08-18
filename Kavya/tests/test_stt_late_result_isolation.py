@@ -16,12 +16,17 @@ Two further defects are covered here:
   * exact cumulative-interim detection existed but the code still concatenated
     the committed prefix again, duplicating the text.
 
-Scope note (post-#269 review): rejection is now turn-scoped, not unconditional.
-Only results PROVEN to be the dispatched turn's own tail — the same text, a
-token-boundary prefix of it, or a superset adding no material characters, all
-within the staleness window — are refused, and those are what this file injects.
-Genuine new caller speech landing in the same window is admitted and queued as
-the next turn; `test_stt_post_dispatch_admission.py` owns that half.
+Scope note (second #269 review round): rejection is turn-scoped and narrow. Only
+results carrying NO material characters — empty, whitespace or punctuation only —
+are refused, because that is the one thing provable without provider result
+identity, and provider result identity never reaches this code (both STT stream
+classes hand their callbacks a bare `str`). Those are what this file injects.
+ALL caller speech landing in the same window, including a verbatim repeat of the
+dispatched utterance, is admitted and queued as the next turn;
+`test_stt_post_dispatch_admission.py` and
+`test_stt_post_dispatch_material_admission.py` own that half, and
+`test_deferred_speech_lifecycle_ownership.py` owns what happens to it at every
+lifecycle boundary.
 
 Everything below is deterministic: `Event` barriers and fake timer handles,
 never a wall-clock sleep. Tests marked "preservation guard" hold in BOTH the
@@ -124,12 +129,12 @@ def _post_dispatch_records(caplog):
 
 
 # ---------------------------------------------------------------------------
-# 1. a PROVEN stale final while a turn is in flight
+# 1. a REFUSED (non-material) final while a turn is in flight
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_stale_tail_final_during_active_turn_mutates_no_transcript_state():
+async def test_refused_final_during_active_turn_mutates_no_transcript_state():
     hold = asyncio.Event()
     session, loop, processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
@@ -137,16 +142,18 @@ async def test_stale_tail_final_during_active_turn_mutates_no_transcript_state()
     timers = len(loop.scheduled)
     history = list(session.full_transcript)
 
-    # The provider re-sends the utterance this turn already owns: a proven tail.
-    await session._accumulate_transcript("original utterance")
+    # A result with no material characters: nothing here is caller speech.
+    # (A repeat of the dispatched text would now be ADMITTED — see
+    # test_stt_post_dispatch_material_admission.py.)
+    await session._accumulate_transcript("   ")
 
-    assert session._committed_transcript == "", "a stale tail must not commit text"
-    assert session._pending_transcript == "", "a stale tail must not set pending text"
+    assert session._committed_transcript == "", "a refused result must not commit text"
+    assert session._pending_transcript == "", "a refused result must not set pending text"
     assert session._latest_interim == ""
     assert session._smartpbx_stt_final_events == 0, (
         "the per-turn final counter belongs to the next turn, not the dispatched one"
     )
-    assert len(loop.scheduled) == timers, "a stale tail must not arm an endpointing timer"
+    assert len(loop.scheduled) == timers, "a refused result must not arm an endpointing timer"
     assert session._endpointing_handle is None
     assert processed == ["original utterance"], "no redispatch"
     assert session.full_transcript == history, "no history mutation"
@@ -156,12 +163,12 @@ async def test_stale_tail_final_during_active_turn_mutates_no_transcript_state()
 
 
 @pytest.mark.asyncio
-async def test_stale_tail_final_does_not_contaminate_the_next_turn():
+async def test_refused_final_does_not_contaminate_the_next_turn():
     hold = asyncio.Event()
     session, loop, processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
 
-    await session._accumulate_transcript("original utterance")
+    await session._accumulate_transcript("   ")
 
     hold.set()
     await asyncio.sleep(0)
@@ -174,7 +181,7 @@ async def test_stale_tail_final_does_not_contaminate_the_next_turn():
     await asyncio.sleep(0)
 
     assert processed == ["original utterance", "next turn speech"], (
-        "the rejected tail must not be prepended to the next guest turn"
+        "the refused result must not be prepended to the next guest turn"
     )
     assert session.full_transcript == [
         {"role": "user", "text": "original utterance"},
@@ -183,19 +190,19 @@ async def test_stale_tail_final_does_not_contaminate_the_next_turn():
 
 
 @pytest.mark.asyncio
-async def test_stale_tail_final_never_becomes_a_spurious_later_turn():
+async def test_refused_final_never_becomes_a_spurious_later_turn():
     hold = asyncio.Event()
     session, loop, processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
 
-    await session._accumulate_transcript("original utterance")
+    await session._accumulate_transcript("   ")
 
     hold.set()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
     # Every timer still live fires after the runner unwound. None of them may
-    # resurrect the refused tail as a turn of its own.
+    # resurrect the refused result as a turn of its own.
     for handle in loop.live:
         handle.callback()
     await asyncio.sleep(0)
@@ -206,27 +213,27 @@ async def test_stale_tail_final_never_becomes_a_spurious_later_turn():
 
 
 # ---------------------------------------------------------------------------
-# 2. PROVEN stale INTERIMS, both timer/runner orderings
+# 2. REFUSED (non-material) INTERIMS, both timer/runner orderings
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_stale_interim_rejected_when_timer_fires_before_runner_finishes():
+async def test_refused_interim_when_timer_fires_before_runner_finishes():
     hold = asyncio.Event()
     session, loop, processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
 
     timers = len(loop.scheduled)
-    # A trailing interim carrying only a prefix of the dispatched text.
-    await session._set_transcript_interim("original")
+    # A trailing interim carrying no material characters at all.
+    await session._set_transcript_interim(" . ")
 
-    assert session._pending_transcript == "", "a stale interim must not set pending text"
+    assert session._pending_transcript == "", "a refused interim must not set pending text"
     assert session._committed_transcript == ""
     assert session._latest_interim == ""
     assert session._smartpbx_stt_interim_events == 0, (
         "the per-turn interim counter belongs to the next turn"
     )
-    assert len(loop.scheduled) == timers, "a stale interim must not arm an endpointing timer"
+    assert len(loop.scheduled) == timers, "a refused interim must not arm an endpointing timer"
 
     # Timers fire while the runner is still held.
     for handle in loop.live:
@@ -242,13 +249,13 @@ async def test_stale_interim_rejected_when_timer_fires_before_runner_finishes():
 
 
 @pytest.mark.asyncio
-async def test_stale_interim_rejected_when_runner_finishes_before_timer():
+async def test_refused_interim_when_runner_finishes_before_timer():
     hold = asyncio.Event()
     session, loop, processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
 
     timers = len(loop.scheduled)
-    await session._set_transcript_interim("original")
+    await session._set_transcript_interim(" . ")
     assert len(loop.scheduled) == timers
 
     # Runner unwinds first, releasing the guard, and only THEN do timers fire.
@@ -263,7 +270,7 @@ async def test_stale_interim_rejected_when_runner_finishes_before_timer():
     await asyncio.sleep(0)
 
     assert processed == ["original utterance"], (
-        "a released guard must not let a refused tail dispatch as its own turn"
+        "a released guard must not let a refused result dispatch as its own turn"
     )
     assert session.full_transcript == [{"role": "user", "text": "original utterance"}]
     assert session._pending_transcript == ""
@@ -534,12 +541,13 @@ async def test_torn_down_session_drops_late_results_without_telemetry(caplog):
 
 
 @pytest.mark.asyncio
-async def test_twilio_language_session_rejects_stale_tails_without_smartpbx_logs(caplog):
+async def test_twilio_language_session_refuses_empty_results_without_smartpbx_logs(caplog):
     """Preservation guard: a Twilio Media Streams call emits no SmartPBX events.
 
     The post-dispatch policy is shared with this transport by design; only the
-    SmartPBX log vocabulary is not. (Queuing of genuine new speech on this same
-    path is pinned in `test_stt_post_dispatch_admission.py`.)
+    SmartPBX log vocabulary is not. Retargeted to what is still refused —
+    admission of a repeat on this same transport is pinned in
+    `test_stt_post_dispatch_material_admission.py`.
     """
     hold = asyncio.Event()
     session, loop, processed = make_session(hold=hold, smartpbx=False, lang="si")
@@ -552,8 +560,8 @@ async def test_twilio_language_session_rejects_stale_tails_without_smartpbx_logs
 
     timers = len(loop.scheduled)
     with caplog.at_level("INFO"):
-        await session._accumulate_transcript("mata kamarayak one")
-        await session._set_transcript_interim("mata kamarayak")
+        await session._accumulate_transcript("  ")
+        await session._set_transcript_interim(" . ")
 
     assert session._committed_transcript == ""
     assert session._pending_transcript == ""
@@ -660,8 +668,8 @@ async def test_post_dispatch_telemetry_records_both_result_types_once_each(caplo
     await _dispatch_turn(session, loop)
 
     with caplog.at_level("INFO"):
-        await session._accumulate_transcript("original utterance")
-        await session._set_transcript_interim("original")
+        await session._accumulate_transcript("   ")
+        await session._set_transcript_interim("...")
 
     records = _post_dispatch_records(caplog)
     assert len(records) == 2, records
@@ -680,12 +688,12 @@ async def test_post_dispatch_telemetry_carries_no_transcript_text_or_digits(capl
     hold = asyncio.Event()
     session, loop, _processed = make_session(hold=hold)
     secret = "my number is 0771754668 and my name is Priyanka"
-    # The turn owns the caller's number, and the provider re-sends it as a tail:
-    # the refused result carries the most sensitive text a call ever holds.
+    # The OWNING TURN holds the most sensitive text a call ever carries, and the
+    # emitter reads that turn's state. Nothing of it may reach the line.
     await _dispatch_turn(session, loop, text=secret)
 
     with caplog.at_level("INFO"):
-        await session._accumulate_transcript(secret)
+        await session._accumulate_transcript("   ")
 
     line = _post_dispatch_records(caplog)[0]
     match = _POST_DISPATCH_RE.match(line)
@@ -706,7 +714,7 @@ async def test_post_dispatch_telemetry_carries_no_transcript_text_or_digits(capl
 
 
 @pytest.mark.asyncio
-async def test_post_dispatch_elapsed_ms_is_clamped_at_both_ends(caplog, monkeypatch):
+async def test_post_dispatch_elapsed_ms_is_clamped_at_both_ends(caplog):
     hold = asyncio.Event()
     session, loop, _processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
@@ -714,16 +722,15 @@ async def test_post_dispatch_elapsed_ms_is_clamped_at_both_ends(caplog, monkeypa
     # A clock that appears to run backwards must not emit a negative integer.
     session._utterance_dispatched_at = None
     with caplog.at_level("INFO"):
-        await session._accumulate_transcript("original utterance")
+        await session._accumulate_transcript("   ")
     assert "elapsed_ms=0" in _post_dispatch_records(caplog)[0]
 
     caplog.clear()
-    # The staleness window would admit a result this old, so it is widened here:
-    # what is under test is the clamp on the emitted integer, not the window.
-    monkeypatch.setattr(server, "POST_DISPATCH_STALE_WINDOW_SECONDS", 10.0 ** 9)
+    # Age no longer gates refusal at all, so no window has to be widened here:
+    # what is under test is the clamp on the emitted integer.
     session._utterance_dispatched_at = -10_000_000.0
     with caplog.at_level("INFO"):
-        await session._set_transcript_interim("original")
+        await session._set_transcript_interim("...")
     line = _post_dispatch_records(caplog)[0]
     elapsed = int(_POST_DISPATCH_RE.match(line).group("elapsed_ms"))
     assert elapsed == server.POST_DISPATCH_ELAPSED_MS_MAX

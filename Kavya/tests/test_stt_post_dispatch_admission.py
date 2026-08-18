@@ -7,25 +7,32 @@ False: during pre-TTS LLM/tool latency, and in the gaps between delivered
 sentences of one reply. That speech was silently lost: no buffer, no timer, no
 turn, no history, nothing but one telemetry line saying a result was ignored.
 
-The policy this file pins is turn-scoped and text-relational:
+The policy this file pins is turn-scoped:
 
-  * PROVEN stale/duplicate — the result, normalised for whitespace and case, is
-    the dispatched utterance itself, a token-boundary prefix of it, or a superset
-    of it that adds no material characters — AND it arrived inside the short
-    staleness window after dispatch. Refused before any counter, buffer or timer
-    changes, with the existing bounded telemetry retained.
-  * Anything else is UNPROVEN and is admitted: it accumulates into the pending
-    buffers, cancels and resets the silence re-prompt, and is dispatched as the
-    NEXT turn once the active turn releases the exactly-once guard. It never
-    joins the running turn's history or telemetry.
+  * REFUSED — the result carries no material characters (empty, whitespace or
+    punctuation only). There is no caller speech in it to lose, which is the one
+    thing provable here without provider result identity. Refused before any
+    counter, buffer or timer changes, with the existing bounded telemetry.
+  * ADMITTED — everything else, including a result whose text repeats or
+    prefixes the dispatched utterance. It accumulates into the pending buffers,
+    cancels and resets the silence re-prompt, and is dispatched as the NEXT turn
+    once the active turn releases the exactly-once guard. It never joins the
+    running turn's history or telemetry.
 
-No fuzzy matching anywhere: exact normalised comparison only.
+Second review round: an earlier version of this file pinned a text-relational
+predicate (equal / token-boundary prefix / punctuation-only superset, inside a
+two-second window). That was withdrawn — matching text and a short elapsed time
+are exactly what an immediate caller repetition looks like, and no provider
+identity reaches this code to tell the two apart. The admission direction for
+those shapes now lives in `test_stt_post_dispatch_material_admission.py`; the
+lifecycle ownership of the speech it admits lives in
+`test_deferred_speech_lifecycle_ownership.py`.
 
 Determinism: `Event` barriers hold the turn open and `FakeLoop` captures
 endpointing timers instead of awaiting them — never a wall-clock sleep.
 
 Tests marked "preservation guard" hold in BOTH the pre-fix and post-fix trees on
-purpose: the tail/duplicate rejection, its reject-before-counters ordering, its
+purpose: the non-material rejection, its reject-before-counters ordering, its
 privacy-safe telemetry and its timer-freedom must all survive the admission path.
 """
 
@@ -326,14 +333,19 @@ async def test_cumulative_superset_that_adds_material_content_is_admitted():
 
 
 @pytest.mark.asyncio
-async def test_an_echo_of_the_dispatched_text_outside_the_stale_window_is_admitted():
-    """Recency is part of the proof: an old echo is a repeat, not a tail."""
+async def test_an_echo_of_the_dispatched_text_long_after_dispatch_is_admitted():
+    """A caller repeating themselves is speech whenever it lands.
+
+    This used to pass because 30 seconds fell outside a two-second staleness
+    window. It now passes for the simpler reason that the text is material —
+    the window is gone, and the boundary trio in
+    `test_stt_post_dispatch_material_admission.py` pins that age no longer
+    changes the answer at all.
+    """
     hold = asyncio.Event()
     session, loop, _processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
 
-    # Far outside any plausible provider-tail window (the policy's own window is
-    # a couple of seconds), without pinning the constant from the test.
     session._utterance_dispatched_at = time.monotonic() - 30.0
     await session._accumulate_transcript(DISPATCHED)
 
@@ -378,75 +390,51 @@ async def test_twilio_media_streams_session_queues_genuine_new_speech_too(caplog
 
 
 # ---------------------------------------------------------------------------
-# 2. proven stale/duplicate results are still refused (preservation guards)
+# 2. every MATERIAL shape is admitted — the four that used to be refused
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "late_text, shape",
+    [
+        (DISPATCHED, "an exact repeat of the dispatched text"),
+        ("i would like a room", "a token-boundary prefix of it"),
+        ("  I Would   Like A ROOM for two nights ", "a case/whitespace variant"),
+        (DISPATCHED + " .", "a superset adding only punctuation"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_exact_duplicate_tail_is_still_rejected():
-    """Preservation guard: the provider's own re-send of the dispatched text."""
+async def test_material_tail_shapes_are_all_admitted(late_text, shape):
+    """The four shapes this file used to refuse. Each is possible caller speech.
+
+    Replaces `test_exact_duplicate_tail_is_still_rejected`,
+    `test_prefix_tail_of_the_dispatched_utterance_is_still_rejected`,
+    `test_case_and_whitespace_normalised_duplicate_is_still_rejected` and
+    `test_superset_adding_only_punctuation_is_still_rejected`. Each of those
+    asserted that a provider tail had been identified; none of them could
+    distinguish that tail from the caller saying the same thing again, because
+    the provider hands this code a bare string.
+    """
     hold = asyncio.Event()
     session, loop, processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
 
     timers = len(loop.scheduled)
-    await session._accumulate_transcript(DISPATCHED)
+    await session._accumulate_transcript(late_text)
 
-    assert session._committed_transcript == ""
-    assert session._pending_transcript == ""
-    assert len(loop.scheduled) == timers, "a duplicate must not arm endpointing"
-    assert processed == [DISPATCHED]
-
-    await _release(session, hold)
-    _fire_live(loop)
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    assert processed == [DISPATCHED], "a duplicate must never become a second turn"
-
-
-@pytest.mark.asyncio
-async def test_prefix_tail_of_the_dispatched_utterance_is_still_rejected():
-    """Preservation guard: a late partial of what was already answered."""
-    hold = asyncio.Event()
-    session, loop, _processed = make_session(hold=hold)
-    await _dispatch_turn(session, loop)
-
-    await session._set_transcript_interim("i would like a room")
-
-    assert session._pending_transcript == ""
-    assert session._latest_interim == ""
+    assert session._committed_transcript == late_text, shape
+    assert session._pending_transcript == late_text, shape
+    assert len(loop.scheduled) == timers + 1, (
+        "admitted speech must arm endpointing so it can become a turn"
+    )
+    assert processed == [DISPATCHED], "the running turn must not be re-entered"
 
     await _release(session, hold)
 
 
-@pytest.mark.asyncio
-async def test_case_and_whitespace_normalised_duplicate_is_still_rejected():
-    """Preservation guard: normalisation is whitespace + case, nothing fuzzier."""
-    hold = asyncio.Event()
-    session, loop, _processed = make_session(hold=hold)
-    await _dispatch_turn(session, loop)
-
-    await session._accumulate_transcript("  I Would   Like A ROOM for two nights ")
-
-    assert session._committed_transcript == ""
-    assert session._pending_transcript == ""
-
-    await _release(session, hold)
-
-
-@pytest.mark.asyncio
-async def test_superset_adding_only_punctuation_is_still_rejected():
-    """Preservation guard: a tail that adds a full stop adds nothing."""
-    hold = asyncio.Event()
-    session, loop, _processed = make_session(hold=hold)
-    await _dispatch_turn(session, loop)
-
-    await session._accumulate_transcript(DISPATCHED + " .")
-
-    assert session._committed_transcript == ""
-    assert session._pending_transcript == ""
-
-    await _release(session, hold)
+# ---------------------------------------------------------------------------
+# 3. non-material results are still refused (preservation guards)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -468,8 +456,13 @@ async def test_blank_result_during_an_active_turn_is_still_rejected():
 
 
 @pytest.mark.asyncio
-async def test_rejected_tail_still_leaves_the_reprompt_timer_alone():
-    """Preservation guard: the rejection path mutates no timer and no counter."""
+async def test_rejected_empty_result_still_leaves_the_reprompt_timer_alone():
+    """Preservation guard: the rejection path mutates no timer and no counter.
+
+    Was driven by a repeat of the dispatched text; that is admitted now (and
+    admitted speech DOES cancel the nudge, pinned above), so the guard is driven
+    by what is still refused — a result with no material characters.
+    """
     hold = asyncio.Event()
     session, loop, _processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
@@ -480,11 +473,11 @@ async def test_rejected_tail_still_leaves_the_reprompt_timer_alone():
     assert armed is not None
     session._reprompt_count = 1
 
-    await session._accumulate_transcript(DISPATCHED)
-    await session._set_transcript_interim("i would like a room")
+    await session._accumulate_transcript("   ")
+    await session._set_transcript_interim("...")
 
-    assert session._reprompt_task is armed, "a rejected tail must not re-arm the nudge"
-    assert not armed.cancelled(), "a rejected tail must not cancel the nudge"
+    assert session._reprompt_task is armed, "a refused result must not re-arm the nudge"
+    assert not armed.cancelled(), "a refused result must not cancel the nudge"
     assert session._reprompt_count == 1
 
     session._cancel_reprompt()
@@ -492,15 +485,19 @@ async def test_rejected_tail_still_leaves_the_reprompt_timer_alone():
 
 
 @pytest.mark.asyncio
-async def test_rejected_tail_still_emits_bounded_privacy_safe_telemetry(caplog):
-    """Preservation guard: reject-before-counters ordering and the closed event."""
+async def test_rejected_empty_result_still_emits_bounded_privacy_safe_telemetry(caplog):
+    """Preservation guard: reject-before-counters ordering and the closed event.
+
+    Same retarget as the timer guard above: the event now fires only for
+    non-material refusals, so that is what drives it.
+    """
     hold = asyncio.Event()
     session, loop, _processed = make_session(hold=hold)
     await _dispatch_turn(session, loop)
 
     with caplog.at_level("INFO"):
-        await session._accumulate_transcript(DISPATCHED)
-        await session._set_transcript_interim("i would like a room")
+        await session._accumulate_transcript("   ")
+        await session._set_transcript_interim("...")
 
     records = _post_dispatch_records(caplog)
     assert len(records) == 2, records
@@ -523,17 +520,22 @@ async def test_rejected_tail_still_emits_bounded_privacy_safe_telemetry(caplog):
 
 
 @pytest.mark.asyncio
-async def test_twilio_media_streams_session_rejects_a_stale_tail_without_smartpbx_logs(
+async def test_twilio_media_streams_session_rejects_an_empty_result_without_smartpbx_logs(
     caplog,
 ):
-    """Preservation guard for the SHARED policy on the Twilio transport."""
+    """Preservation guard for the SHARED policy on the Twilio transport.
+
+    Retargeted from a repeat of the dispatched text (now admitted on both
+    transports — see `test_twilio_media_streams_admits_an_exact_repeat_too`) to
+    what the shared policy still refuses.
+    """
     hold = asyncio.Event()
     session, loop, processed = make_session(hold=hold, smartpbx=False, lang="si")
     await _dispatch_turn(session, loop, "mata kamarayak one")
 
     timers = len(loop.scheduled)
     with caplog.at_level("INFO"):
-        await session._accumulate_transcript("mata kamarayak one")
+        await session._accumulate_transcript("  ")
 
     assert session._committed_transcript == ""
     assert session._pending_transcript == ""

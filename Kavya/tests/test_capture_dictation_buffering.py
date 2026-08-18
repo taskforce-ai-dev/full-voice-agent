@@ -528,7 +528,12 @@ def test_capture_mode_survives_a_bargein_so_the_dictation_stays_patient():
     asyncio.run(session._handle_bargein())
 
     assert session._is_capture_mode_active() is True
-    assert session._pending_transcript == "", "the interrupted buffer is still dropped"
+    assert session._pending_transcript == "", "the interrupted buffer no longer dispatches"
+    # Barge-in ownership is SUPERSEDED for dispatch, RETAINED for the record:
+    # the fragment does not become the next turn, but it is not lost either.
+    assert session.full_transcript == [
+        {"role": "user", "text": "zero seven seven"}
+    ], "the superseded fragment must still reach the transcript"
 
 
 # --- (c2) nothing buffered may be lost at teardown ------------------------
@@ -554,14 +559,24 @@ async def test_transfer_teardown_forces_the_pending_capture_into_the_transcript(
 
 
 @pytest.mark.asyncio
-async def test_forced_dispatch_is_a_noop_outside_capture_mode():
+async def test_retention_covers_ordinary_speech_outside_capture_mode():
+    """Flipped from `test_forced_dispatch_is_a_noop_outside_capture_mode`.
+
+    The capture-mode gate was right when a half-dictated number was the only
+    thing that could be left buffered at teardown. Since the post-dispatch
+    predicate was narrowed, ordinary speech admitted while a turn held the
+    dispatch guard is routinely pending too — and it is no less the guest's
+    words, so it is retained on exactly the same terms.
+    """
     session, _loop, _processed = make_session()
     session._pending_transcript = "ordinary speech mid-utterance"
 
-    await session._force_pending_capture_dispatch("session_end")
+    await session._retain_pending_speech("session_end")
 
-    assert session.full_transcript == []
-    assert session._pending_transcript == "ordinary speech mid-utterance"
+    assert session.full_transcript == [
+        {"role": "user", "text": "ordinary speech mid-utterance"}
+    ]
+    assert session._pending_transcript == ""
 
 
 def _context() -> CallContext:
