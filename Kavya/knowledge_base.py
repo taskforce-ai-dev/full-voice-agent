@@ -430,7 +430,7 @@ def initialize_kb(docs_directory: str = DEFAULT_DOCS_DIRECTORY) -> bool:
 # Semantic retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve_context(query: str, n_results: int = 3) -> str:
+def retrieve_context(query: str, n_results: int = 3, call_sid: str = "") -> str:
     """Run a semantic search against the knowledge base.
 
     Uses the LRU-cached ``_cached_embed_query`` so that repeated identical
@@ -438,6 +438,11 @@ def retrieve_context(query: str, n_results: int = 3) -> str:
 
     Returns a formatted string of the top *n_results* chunks, or an empty
     string when the KB is unavailable / empty.
+
+    ``call_sid`` is optional and used only to tag the chunk-ID retrieval log
+    line so a specific turn's retrieval can be traced later — it never
+    appears alongside chunk text, and omitting it is safe for any caller
+    that has no call context (e.g. the local demo scripts).
     """
     client = _get_chroma_client()
     if client is None:
@@ -479,6 +484,20 @@ def retrieve_context(query: str, n_results: int = 3) -> str:
             metadatas[i].get("source", "unknown") if i < len(metadatas) else "unknown"
         )
         formatted_parts.append(f"[Source: {source}]\n{doc}")
+
+    # Chunk IDENTIFIERS only — SHA-256 hashes from _stable_id, never chunk
+    # text/rates/caller data. This is what lets a specific turn be checked
+    # against a known chunk ID (e.g. the resident-rate section) after the
+    # fact, without the log line itself carrying anything sensitive.
+    chunk_ids = results.get("ids", [[]])[0] if results.get("ids") else []
+    distances = results.get("distances", [[]])[0] if results.get("distances") else []
+    logger.info(
+        "kb_retrieval event=chunks_returned call_sid=%s chunk_count=%d chunk_ids=%s top_distance=%s",
+        call_sid or "unknown",
+        len(documents),
+        ",".join(chunk_ids) if chunk_ids else "",
+        f"{distances[0]:.4f}" if distances else "",
+    )
 
     return "\n\n---\n\n".join(formatted_parts)
 

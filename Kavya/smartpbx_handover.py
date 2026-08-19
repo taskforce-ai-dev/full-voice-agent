@@ -60,12 +60,18 @@ class SmartPBXHandoverCoordinator:
                  caller_phone: str, transcript: Callable[[], Any],
                  dashboard_sender: Callable[..., Awaitable[None]] | None,
                  notification_sender: Callable[..., Awaitable[dict[str, Any]]] | None,
-                 human_agent_whatsapp: str) -> None:
+                 human_agent_whatsapp: str,
+                 guest_name: Callable[[], Any] | None = None) -> None:
         self._call_control, self._pipeline = call_control, pipeline
         self._call_sid, self._caller_phone = call_sid, caller_phone
         self._transcript = transcript
         self._dashboard_sender, self._notification_sender = dashboard_sender, notification_sender
         self._human_agent_whatsapp = human_agent_whatsapp
+        # Optional: the name captured earlier in the call (capture_spoken_name),
+        # so the fallback WhatsApp notification does not have to say "Unknown"
+        # when the caller did in fact give their name. None/missing/empty all
+        # degrade to "Unknown" — this must never raise.
+        self._guest_name = guest_name
         self._phase = HandoverPhase.IDLE
         self._lock = asyncio.Lock()
         self._result: str | None = None
@@ -166,6 +172,19 @@ class SmartPBXHandoverCoordinator:
         except Exception:
             return
 
+    def _resolve_customer_name(self) -> str:
+        """Best-effort captured name, bounded and control-char-stripped like
+        the reason/transcript fields. Never raises — a broken accessor must
+        not cost the notification, just the name in it."""
+        if self._guest_name is None:
+            return "Unknown"
+        try:
+            name = self._guest_name()
+        except Exception:
+            return "Unknown"
+        name = _CONTROL.sub(" ", str(name or "")).strip()
+        return name[:120] if name else "Unknown"
+
     async def _deliver_notification(self, outcome: str) -> str:
         if self._notification_state == "sent":
             return "sent"
@@ -195,7 +214,7 @@ class SmartPBXHandoverCoordinator:
             async with asyncio.timeout(5):
                 notification_outcome = await self._notification_sender(
                     call_sid=self._call_sid,
-                    customer_name="Unknown",
+                    customer_name=self._resolve_customer_name(),
                     customer_whatsapp=self._caller_phone,
                     call_summary=summary[:3628],
                     human_agent_whatsapp=self._human_agent_whatsapp,

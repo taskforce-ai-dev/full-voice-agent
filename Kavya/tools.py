@@ -780,6 +780,30 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     elif tool_name == "transfer_to_human":
         if transfer_context is not None:
             if transfer_context.coordinator is not None:
+                # Pre-handover capture nudge: the FIRST transfer_to_human call
+                # this session is deflected if neither name nor number has
+                # been attempted yet, so a call cannot go straight from
+                # availability checking to a live transfer with zero attempt
+                # (the diagnosed failure). transfer_attempted then makes this
+                # a one-time nudge, not a hard block — a caller who declines,
+                # or whose capture genuinely can't resolve, still reaches a
+                # human on the model's next transfer_to_human call rather
+                # than being trapped.
+                if (
+                    not transfer_context.transfer_attempted
+                    and not _pre_handover_capture_attempted(transfer_context.pipeline)
+                ):
+                    transfer_context.transfer_attempted = True
+                    logger.info("smartpbx_tool event=transfer outcome=capture_first")
+                    return json.dumps({
+                        "status": "capture_first",
+                        "message": (
+                            "Before transferring, ask for the caller's name and "
+                            "a callback number, one at a time, so the team can "
+                            "reach them if the transfer does not connect. If "
+                            "they decline, call transfer_to_human again."
+                        ),
+                    })
                 await _ensure_transfer_speech_and_delivery(transfer_context)
                 return await transfer_context.coordinator.attempt(tool_input.get("reason"))
             async with transfer_context.lock:
@@ -960,6 +984,24 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     else:
         logger.info("smartpbx_tool event=result tool=%s", tool_name)
     return json.dumps(result)
+
+
+def _pre_handover_capture_attempted(pipeline: Any) -> bool:
+    """True once the caller has been asked for BOTH a name and a callback
+    number this call, regardless of whether either capture succeeded.
+
+    "Attempted" is the bar, not "captured" — a caller who was asked and
+    declined, or whose number never validated, still counts. `pipeline` is
+    None only in contexts with no session to check (e.g. a bare unit test
+    exercising the dispatch layer directly), where there is nothing to gate
+    on, so this returns True rather than blocking something it cannot see.
+    """
+    if pipeline is None:
+        return True
+    return bool(
+        getattr(pipeline, "_capture_attempted_name", False)
+        and getattr(pipeline, "_capture_attempted_number", False)
+    )
 
 
 async def _ensure_transfer_speech_and_delivery(context: SmartPBXTransferContext) -> None:

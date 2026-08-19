@@ -1982,7 +1982,8 @@ def _build_system_prompt(lang: str = "en") -> str:
     if lang == "en":
         handoff_rules = (
             "HUMAN HANDOFF:\n"
-            "- If the guest explicitly asks for a human, agent, manager, or real person, immediately acknowledge and transfer in the same turn with one clear sentence. Call transfer_to_human with a one-sentence reason. Do NOT promise a callback; the tool handles the live transfer.\n"
+            "- If the guest explicitly asks for a human, agent, manager, or real person, acknowledge warmly in one sentence, then ask for their name and a callback number, one at a time, using capture_spoken_name and capture_spoken_number (or collect_number_via_keypad) exactly as during booking — this is what lets the team call the guest back if the live transfer does not connect. Skip this only if the guest declines to give the details or asks to be transferred right away; do not ask twice.\n"
+            "- Once you have asked for both (captured, declined, or the guest insisted on immediate transfer), call transfer_to_human with a one-sentence reason. Do NOT promise a callback; the tool handles the live transfer.\n"
             "- Do not ask for separate confirmation if the request is explicit. Ask one clarifying question only if the request is ambiguous.\n"
             "- If you do NOT know the answer to a guest's question, or the request is outside what you can help with (e.g. complex booking changes, special packages, complaints, anything not covered by Hatton Hills booking/general info), PROACTIVELY offer transfer and take the next obvious handoff step.\n"
             "- Some requests are things you personally cannot finalise but a human team member CAN arrange - for example discounts, special rates, price negotiation, long-stay or off-season deals, or booking the whole property, a large group, a buyout, a wedding, or a corporate event. Do NOT simply refuse or say 'no, we don't do that', even if the hotel information would let you answer with a flat no. Treat these as handoff opportunities: briefly and warmly acknowledge the request, then proactively connect them.\n"
@@ -4560,6 +4561,12 @@ class MediaStreamSession:
         # context every turn so they survive history trimming (a long
         # number-retry loop would otherwise evict the early date/guest turns).
         self._booking_slots: dict[str, str] = {}
+        # Set once a capture tool for name/number has COMPLETED this call,
+        # regardless of success — an attempt, not a capture. Gates the
+        # pre-handover capture nudge in tools.transfer_to_human (see
+        # _record_capture_tool_completion below).
+        self._capture_attempted_name: bool = False
+        self._capture_attempted_number: bool = False
         # Active DTMF keypad collector while collect_number_via_keypad is running.
         self._dtmf_collector: DtmfCollector | None = None
         self.history: list[dict] = []
@@ -6242,6 +6249,14 @@ class MediaStreamSession:
     def _record_capture_tool_completion(self, tool_name: str, result: dict[str, Any]) -> None:
         if tool_name not in self._capture_complete_tools():
             return
+        # An attempt, not a capture: set the moment the tool completes at all,
+        # regardless of success/needs_more/invalid below. This is what the
+        # pre-handover gate checks — the caller was asked and something was
+        # tried, which is the bar the task sets ("attempt", not "succeed").
+        if tool_name == "capture_spoken_name":
+            self._capture_attempted_name = True
+        elif tool_name in ("capture_spoken_number", "collect_number_via_keypad"):
+            self._capture_attempted_number = True
         if self._capture_followup_required(result):
             self._enter_capture_mode(reason="tool_needs_more")
             return
@@ -9860,7 +9875,7 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                     kb_context = ""
                 else:
                     try:
-                        kb_context = retrieve_context(user_text)
+                        kb_context = retrieve_context(user_text, call_sid=call_sid)
                     except Exception:
                         logger.exception("KB retrieval failed")
                         kb_context = ""

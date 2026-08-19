@@ -402,6 +402,11 @@ class KavyaSmartPBXSession:
             transcript=lambda: getattr(pipeline, "full_transcript", []),
             dashboard_sender=dashboard_sender, notification_sender=handover.send_handover_notification,
             human_agent_whatsapp=os.getenv("SMARTPBX_HUMAN_AGENT_WHATSAPP", ""),
+            # A name captured earlier via capture_spoken_name (see
+            # server.py _record_capture_tool_completion) so the fallback
+            # WhatsApp notification is not hard-coded to "Unknown" when the
+            # caller did in fact give their name.
+            guest_name=lambda: getattr(pipeline, "_booking_slots", {}).get("guest_name", ""),
         )
         self._smartpbx_transfer_context = SmartPBXTransferContext(
             control,
