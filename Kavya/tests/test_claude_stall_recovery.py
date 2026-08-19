@@ -427,8 +427,49 @@ async def test_completed_tool_then_later_stall_keeps_post_tool_recovery_without_
 
     assert len(client.requests) == 2
     assert executed == [("create_booking", {"guest_name": "Jane"})]
-    assert spoken == [server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT]
+    assert spoken == [
+        server.TOOL_FILLERS["create_booking"],
+        server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT,
+    ]
+    assert spoken.count(server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT) == 1
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
     assert assistant_texts(pipeline) == [server.SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT]
+    assistant_tool_messages = [
+        message for message in pipeline.history
+        if message.get("role") == "assistant"
+        and any(
+            block.get("type") == "tool_use"
+            for block in message.get("content", [])
+            if isinstance(block, dict)
+        )
+    ]
+    assert len(assistant_tool_messages) == 1
+    tool_use = next(
+        block for block in assistant_tool_messages[0]["content"]
+        if block.get("type") == "tool_use"
+    )
+    assert tool_use == {
+        "type": "tool_use",
+        "id": "tool-complete-1",
+        "name": "create_booking",
+        "input": {"guest_name": "Jane"},
+    }
+    tool_result_messages = [
+        message for message in pipeline.history
+        if message.get("role") == "user"
+        and any(
+            block.get("type") == "tool_result"
+            for block in message.get("content", [])
+            if isinstance(block, dict)
+        )
+    ]
+    assert len(tool_result_messages) == 1
+    tool_result = next(
+        block for block in tool_result_messages[0]["content"]
+        if block.get("type") == "tool_result"
+    )
+    assert tool_result["tool_use_id"] == tool_use["id"]
+    assert tool_result["content"] == json.dumps({"status": "ok"})
 
 
 @pytest.mark.asyncio
