@@ -5357,6 +5357,10 @@ class MediaStreamSession:
         gen: int,
         full_text: str,
         tts_tasks: list[asyncio.Task] = (),
+        progress: str = "none",
+        retrying: bool = False,
+        attempt: int = 1,
+        recover: bool = True,
     ) -> str:
         """Recover from an initial-response or inter-delta stall timeout.
 
@@ -5383,16 +5387,31 @@ class MediaStreamSession:
         here.
         """
         self._mark_smartpbx_turn_once("llm_timeout")
+        phase = (
+            exc.phase
+            if exc.phase in {
+                _SmartPBXStreamTimeout.PHASE_INITIAL,
+                _SmartPBXStreamTimeout.PHASE_STALL,
+            }
+            else _SmartPBXStreamTimeout.PHASE_STALL
+        )
         if self._is_smartpbx_session():
             logger.warning(
                 "smartpbx_media event=llm_stream_timeout provider=%s phase=%s "
-                "tool_executed=%s",
-                provider, exc.phase, str(tool_executed).lower(),
+                "tool_executed=%s progress=%s retrying=%s attempt=%d",
+                provider,
+                phase,
+                str(tool_executed).lower(),
+                progress if progress in {"none", "metadata", "thinking", "text", "tool"} else "none",
+                str(retrying).lower(),
+                _bounded_claude_attempt(attempt),
             )
         await self._smartpbx_cancel_stalled_filler(gen)
         fenced_gen = await self._smartpbx_fence_stalled_generation(
             tts_tasks=list(tts_tasks), gen=gen
         )
+        if not recover:
+            return ""
         return await self._smartpbx_speak_recovery_and_finish(
             tool_executed=tool_executed, gen=fenced_gen, full_text=full_text,
         )
@@ -7960,6 +7979,10 @@ class MediaStreamSession:
                 sentence_buffer = ""
                 tts_tasks: list[asyncio.Task] = []
                 has_tool_use = False
+                # Claude may spend a long interval in adaptive thinking before
+                # opening visible text. Keep only this closed progress enum;
+                # never retain or log thinking content.
+                stream_progress = "none"
 
                 # Prompt caching: marking the system prompt with cache_control
                 # caches the entire request prefix (tools + system) for ~5
@@ -8002,8 +8025,12 @@ class MediaStreamSession:
                             else stream
                         )
                         async for event in stream_iter:
-                            if event.type == "content_block_start":
+                            if event.type == "message_start":
+                                stream_progress = "metadata"
+
+                            elif event.type == "content_block_start":
                                 if event.content_block.type == "tool_use":
+                                    stream_progress = "tool"
                                     if initial_filler is not None:
                                         await initial_filler.on_tool_delta()
                                         if initial_filler._cleared_after_spoke:
@@ -8013,9 +8040,13 @@ class MediaStreamSession:
                                     cur_tool_id = event.content_block.id
                                     cur_tool_name = event.content_block.name
                                     tool_json = ""
+                                elif event.content_block.type == "thinking":
+                                    stream_progress = "thinking"
 
                             elif event.type == "content_block_delta":
                                 if event.delta.type == "text_delta":
+                                    if not has_tool_use and event.delta.text:
+                                        stream_progress = "text"
                                     if initial_filler is not None:
                                         await initial_filler.on_content_delta()
                                         if initial_filler._cleared_after_spoke:
@@ -8038,6 +8069,7 @@ class MediaStreamSession:
                                                 tts_tasks.append(task)
 
                                 elif event.delta.type == "input_json_delta":
+                                    stream_progress = "tool"
                                     tool_json += event.delta.partial_json
 
                             elif event.type == "content_block_stop":
@@ -8091,11 +8123,40 @@ class MediaStreamSession:
                                 # rather than because the connection dropped.
                                 saw_terminal_metadata = True
                 except _SmartPBXStreamTimeout as timeout_exc:
-                    return await self._smartpbx_handle_stream_timeout(
-                        timeout_exc, provider="claude",
-                        tool_executed=tool_executed, gen=gen, full_text=full_text,
-                        tts_tasks=tts_tasks,
+                    # Only a direct SmartPBX Claude stall after metadata or
+                    # thinking progress is safely retryable. Initial
+                    # acquisition timeouts remain one request/one recovery;
+                    # visible text, a tool-use start, a completed tool, and
+                    # any ownership loss are all fail-closed.
+                    retry_eligible = (
+                        smartpbx_direct
+                        and timeout_exc.phase == _SmartPBXStreamTimeout.PHASE_STALL
+                        and stream_progress in {"metadata", "thinking"}
+                        and not has_tool_use
+                        and not tool_executed
+                        and attempt + 1 < max_attempts
+                        and self._current_smartpbx_runner_owns_shared_state()
                     )
+                    timeout_result = await self._smartpbx_handle_stream_timeout(
+                        timeout_exc,
+                        provider="claude",
+                        tool_executed=tool_executed,
+                        gen=gen,
+                        full_text=full_text,
+                        tts_tasks=tts_tasks,
+                        progress=stream_progress,
+                        retrying=retry_eligible,
+                        attempt=attempt + 1,
+                        recover=not retry_eligible,
+                    )
+                    if not retry_eligible:
+                        return timeout_result
+                    if not self._current_smartpbx_runner_owns_shared_state():
+                        return ""
+                    empty_retry_used = True
+                    initial_filler = None
+                    gen = self._speak_generation
+                    continue
 
                 if not self._current_smartpbx_runner_owns_shared_state():
                     return ""

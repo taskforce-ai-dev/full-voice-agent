@@ -356,6 +356,7 @@ event allowlist**. It may contain only the following runtime event names:
 `llm_error`, `llm_provider_degraded`, `llm_provider_failover`, `tool_execute`,
 `tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`,
 `tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
+`llm_stream_timeout`,
 `silence_reprompt`, `stt_final`, `stt_post_dispatch_result`,
 `stt_provider_final`, `stt_provider_interim`,
 `capture_buffer_bounded`, `capture_final_buffered`, `capture_forced_dispatch`,
@@ -388,6 +389,27 @@ are caller-derived). `output_tokens` and `attempt` are likewise clamped to the
 ranges above, so a corrupt usage payload cannot write an unbounded numeral.
 This event carries no free text, no tool names, no tool arguments and no caller
 identifiers of any kind.
+
+`llm_stream_timeout` emits exactly seven fields, and no others:
+
+| Field | Type | Permitted values |
+| --- | --- | --- |
+| `provider` | bounded enum | `openai`, `gemini`, `claude` |
+| `phase` | bounded enum | `initial`, `stall` |
+| `tool_executed` | boolean enum | `true`, `false` |
+| `progress` | bounded enum | `none`, `metadata`, `thinking`, `text`, `tool` |
+| `retrying` | boolean enum | `true`, `false` |
+| `attempt` | bounded integer | `1`–`9`, clamped |
+
+The complete log line is `event=llm_stream_timeout provider=<enum>
+phase=<initial|stall> tool_executed=<true|false> progress=<none|metadata|thinking|text|tool>
+retrying=<true|false> attempt=<1-9>`. Claude records `metadata` for
+`message_start` and `thinking` for thinking-block progress without exposing
+thinking text. Only direct SmartPBX Claude `stall` progress before visible text,
+a tool-use start, or tool execution may retry; an initial timeout remains one
+request/one recovery. The raw provider value is never logged, and this event
+contains no thinking text, transcript text, tool names, tool arguments, caller
+identifiers, or exception bodies.
 
 `stt_post_dispatch_result` emits exactly three fields, and no others:
 
