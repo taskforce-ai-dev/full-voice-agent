@@ -19,6 +19,7 @@ import pytest
 TIMEOUT_LOG_FIELDS = frozenset({
     "event", "provider", "phase", "tool_executed", "progress", "retrying", "attempt",
 })
+TIMEOUT_PROVIDER_VALUES = frozenset({"openai", "gemini", "claude", "unknown"})
 TIMEOUT_PROGRESS_VALUES = frozenset({"none", "metadata", "thinking", "text", "tool"})
 YIELD_TO_LOOP = object()
 
@@ -223,11 +224,14 @@ def timeout_log_fields(line: str) -> dict[str, str]:
     }
 
 
-def assert_timeout_log_contract(line: str, *, progress: str, phase: str, retrying: str):
+def assert_timeout_log_contract(
+    line: str, *, progress: str, phase: str, retrying: str, provider: str = "claude"
+):
     fields = timeout_log_fields(line)
     assert set(fields) == TIMEOUT_LOG_FIELDS
     assert fields["event"] == "llm_stream_timeout"
-    assert fields["provider"] == "claude"
+    assert fields["provider"] == provider
+    assert fields["provider"] in TIMEOUT_PROVIDER_VALUES
     assert fields["phase"] == phase
     assert fields["tool_executed"] in {"true", "false"}
     assert fields["progress"] == progress
@@ -309,6 +313,38 @@ async def test_metadata_only_stall_retries_once_and_logs_metadata_progress(monke
 
 
 @pytest.mark.asyncio
+async def test_thinking_progress_stays_sticky_after_late_message_start(monkeypatch, caplog):
+    import server
+
+    client = ScriptedClaude([
+        timeout_round([
+            *thinking_events("private reasoning"),
+            message_start(),
+            YIELD_TO_LOOP,
+        ]),
+        completed_round([message_start(), text_event("Thinking retry answer."), *terminal_events()]),
+    ])
+    pipeline = direct_pipeline(server, client)
+    install_deterministic_stream(monkeypatch, server)
+    install_quiet_filler(monkeypatch, pipeline)
+    spoken = install_recording_speak(monkeypatch, pipeline)
+
+    with caplog.at_level(logging.WARNING):
+        result = await pipeline._run_llm_claude()
+
+    assert len(client.requests) == 2
+    assert result == "Thinking retry answer."
+    assert spoken == ["Thinking retry answer."]
+    timeout_lines = [
+        line for line in caplog.messages if "event=llm_stream_timeout" in line
+    ]
+    assert timeout_lines
+    assert_timeout_log_contract(
+        timeout_lines[0], progress="thinking", phase="stall", retrying="true"
+    )
+
+
+@pytest.mark.asyncio
 async def test_initial_no_event_timeout_stays_single_attempt_and_is_classified_none(monkeypatch, caplog):
     import server
 
@@ -337,6 +373,54 @@ async def test_visible_text_stall_is_fenced_without_retry_or_partial_replay(monk
 
     client = ScriptedClaude([
         timeout_round([message_start(), text_event("Partial visible sentence. "), YIELD_TO_LOOP]),
+    ])
+    pipeline = direct_pipeline(server, client)
+    install_deterministic_stream(monkeypatch, server)
+    install_quiet_filler(monkeypatch, pipeline)
+    spoken = install_recording_speak(monkeypatch, pipeline)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    lifecycle: list[str] = []
+
+    async def blocked_tts(_text, **_kwargs):
+        started.set()
+        lifecycle.append("started")
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            lifecycle.append("cancelled")
+            raise
+
+    def start_tts(text, *, generation, sentence):
+        return asyncio.create_task(blocked_tts(text, generation=generation, sentence=sentence))
+
+    generation = pipeline._speak_generation
+    monkeypatch.setattr(pipeline, "_start_smartpbx_round_tts", start_tts)
+    await pipeline._run_llm_claude()
+
+    assert len(client.requests) == 1
+    assert spoken == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
+    assert started.is_set()
+    assert cancelled.is_set()
+    assert lifecycle == ["started", "cancelled"]
+    assert pipeline._speak_generation > generation
+    assert not pipeline._smartpbx_deferred_tts_tasks
+    assert assistant_texts(pipeline) == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
+
+
+@pytest.mark.asyncio
+async def test_visible_text_then_late_thinking_stall_is_fenced_without_retry_or_replay(monkeypatch):
+    import server
+
+    client = ScriptedClaude([
+        timeout_round([
+            message_start(),
+            text_event("Partial visible sentence. "),
+            *thinking_events("late private reasoning"),
+            YIELD_TO_LOOP,
+        ]),
+        completed_round([message_start(), text_event("Unexpected retry answer."), *terminal_events()]),
     ])
     pipeline = direct_pipeline(server, client)
     install_deterministic_stream(monkeypatch, server)
@@ -567,6 +651,32 @@ async def test_timeout_telemetry_is_closed_bounded_and_cannot_leak_thinking_text
     )
     assert sentinel not in caplog.text
     assert "RAW_NEWLINE_SENTINEL" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stream_timeout_unknown_provider_is_bounded_and_privacy_safe(caplog):
+    import server
+
+    pipeline = direct_pipeline(server, ScriptedClaude([]))
+    sentinel = "claude\nPHONE_SENTINEL_0771234567"
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._smartpbx_handle_stream_timeout(
+            server._SmartPBXStreamTimeout(phase="stall"),
+            provider=sentinel,
+            tool_executed=False,
+            gen=pipeline._speak_generation,
+            full_text="",
+            recover=False,
+        )
+
+    timeout_lines = [line for line in caplog.messages if "llm_stream_timeout" in line]
+    assert timeout_lines
+    assert_timeout_log_contract(
+        timeout_lines[0], progress="none", phase="stall", retrying="false", provider="unknown"
+    )
+    assert sentinel not in caplog.text
+    assert "PHONE_SENTINEL_0771234567" not in caplog.text
 
 
 @pytest.mark.asyncio
