@@ -120,3 +120,4 @@ service-account*.json
 n8n-workflows/*.json
 !n8n-workflows/treehouse-post-call-processor.json
 !n8n-workflows/kavya-handover-whatsapp.json
+!n8n-workflows/hutch-handover-whatsapp.json

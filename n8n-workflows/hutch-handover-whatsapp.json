@@ -1,0 +1,161 @@
+{
+  "name": "selina — Handover WhatsApp Notify (No Answer) HUTCH",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Selina (Hutch) Handover → WhatsApp\n\nThe Voice Agent (Selina) collects the guest's name + WhatsApp,\nthen POSTs the payload here → we WhatsApp the human agent.\n\n**Before use:**\n1. Replace the scrubbed token in the *Send WhatsApp* node (see n8n UI).\n2. Activate the workflow, then use the **Production** webhook URL in the Voice Agent.\n3. The recipient comes from the payload's human_agent_whatsapp — set\n   HUTCH_HUMAN_AGENT_WHATSAPP in the agent's deploy .env.\n\n**Expected POST body:**\n```\n{\n  \"customer_name\": \"Chanya\",\n  \"customer_whatsapp\": \"94771234567\",\n  \"call_summary\": \"...\",\n  \"human_agent_whatsapp\": \"94770000000\",\n  \"timestamp\": \"2026-07-31T08:30:00Z\"\n}\n```",
+        "height": 420,
+        "width": 380
+      },
+      "id": "39b7ad34-f79a-4268-a2b7-4b88816dc86d",
+      "name": "README",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        -48
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "7eac5da8-8683-453e-8e50-d6bd79f27372",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "0bc9e1fd-81b0-4c66-9059-ffa48b148b13",
+      "name": "Webhook - Handover",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        464,
+        192
+      ],
+      "webhookId": "7eac5da8-8683-453e-8e50-d6bd79f27372"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1000000-0000-4000-8000-000000000101",
+              "name": "human_agent_whatsapp",
+              "value": "={{ $json.body.human_agent_whatsapp }}",
+              "type": "string"
+            },
+            {
+              "id": "f1000000-0000-4000-8000-000000000102",
+              "name": "whatsapp_message",
+              "value": "=🔔 *Missed Call — Guest Wants a Callback*\n\nA guest asked to speak with you, but the call wasn't answered. They've left their details:\n\n👤 Name: {{ $json.body.customer_name }}\n📱 WhatsApp: {{ $json.body.customer_whatsapp }}\n🕐 {{ $json.body.timestamp }}\n\n📋 *Call Summary:*\n{{ $json.body.call_summary }}\n\nPlease reach out to them directly. 🙏\n— Selina · Hutch —",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c295a56f-80b1-4692-ab38-43d9d730135f",
+      "name": "Build Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        688,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.wasenderapi.com/api/send-message",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer <WASENDER_TOKEN — see n8n UI>"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ to: $json.human_agent_whatsapp, text: $json.whatsapp_message }) }}",
+        "options": {}
+      },
+      "id": "3925aa67-146d-4a56-8e92-6051adb0dd52",
+      "name": "Send WhatsApp to Human Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        912,
+        192
+      ],
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true }) }}",
+        "options": {}
+      },
+      "id": "a59ac8bd-40b4-47d6-96d5-79d3f788fd50",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        192
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Handover": {
+      "main": [
+        [
+          {
+            "node": "Build Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Message": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp to Human Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp to Human Agent": {
+      "main": [
+        [
+          {
+            "node": "Respond 200 OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "IBO30UWBFfOtn7TO",
+  "tags": [
+    {
+      "name": "Chanya"
+    }
+  ]
+}

@@ -1,0 +1,134 @@
+# ============================================================
+# Docker Compose — Hutch Voice Agent (Selina)
+# ============================================================
+# Hutch has NO Twilio number -- Dialog SmartPBX ("Client Connect") is the
+# only real ingress. Two services:
+#   hutch            -- local dev/testing convenience, HUTCH_SERVICE_MODE
+#                        defaults to "smartpbx" in server.py; override via
+#                        .env to exercise the (inert) Twilio code paths.
+#   hutch-smartpbx   -- the real target, isolated Compose profile "smartpbx",
+#                        modeled on Kavya's kavya-smartpbx isolation pattern:
+#                        explicit environment allowlist, no env_file, no
+#                        Twilio credentials, its own Chroma volume.
+#
+# Usage:
+#   docker compose up -d                              # local dev (hutch)
+#   docker compose --profile smartpbx up -d            # + hutch-smartpbx
+#   docker compose logs -f hutch
+#   docker compose down
+# ============================================================
+
+services:
+  hutch:
+    build: .
+    container_name: hutch-voice-agent
+
+    # Local dev / testing convenience port.
+    ports:
+      - "127.0.0.1:8040:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json
+
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./knowledge_docs:/app/knowledge_docs
+      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Isolated Dialog SmartPBX ingress -- the real production target for Hutch.
+  # This profile is off unless explicitly selected.
+  hutch-smartpbx:
+    profiles: ["smartpbx"]
+    build: .
+    container_name: hutch-smartpbx
+
+    # Host Nginx is the public TLS boundary; keep the application loopback-only.
+    ports:
+      - "127.0.0.1:8041:8000"
+
+    # Do not use env_file here: this is a complete, explicit SmartPBX
+    # allowlist, mirroring Kavya's kavya-smartpbx isolation pattern. Populate
+    # it only via `docker compose --env-file .env.smartpbx --profile smartpbx ...`.
+    # In particular, never pass Twilio credentials here -- Hutch has none.
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-credentials.json
+      HUTCH_SERVICE_MODE: smartpbx
+      ENABLE_SMARTPBX_WSS: "true"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      LLM_PROVIDER: "${LLM_PROVIDER}"
+      CLAUDE_MODEL: "${CLAUDE_MODEL}"
+      OPENAI_MODEL: "${OPENAI_MODEL}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
+      GEMINI_MODEL: "${GEMINI_MODEL}"
+      ELEVENLABS_API_KEY: "${ELEVENLABS_API_KEY}"
+      ELEVENLABS_VOICE_ID: "${ELEVENLABS_VOICE_ID}"
+      STT_PROVIDER: "${STT_PROVIDER}"
+      AZURE_SPEECH_KEY: "${AZURE_SPEECH_KEY}"
+      AZURE_SPEECH_REGION: "${AZURE_SPEECH_REGION}"
+      N8N_BASE_URL: "${N8N_BASE_URL}"
+      N8N_HANDOVER_WEBHOOK: "${N8N_HANDOVER_WEBHOOK}"
+      WHATSAPP_COUNTRY_CODE: "${WHATSAPP_COUNTRY_CODE}"
+      HUTCH_HUMAN_AGENT_WHATSAPP: "${HUTCH_HUMAN_AGENT_WHATSAPP}"
+      DASHBOARD_API_URL: "${DASHBOARD_API_URL}"
+      DASHBOARD_API_KEY: "${DASHBOARD_API_KEY}"
+      DASHBOARD_AGENT_ID: "${DASHBOARD_AGENT_ID}"
+      SENTRY_DSN: "${SENTRY_DSN}"
+      SENTRY_TRACES_SAMPLE_RATE: "${SENTRY_TRACES_SAMPLE_RATE}"
+      SENTRY_ENV: "${SENTRY_ENV}"
+      SENTRY_SEND_PII: "false"
+      SENTRY_ENABLE_LOGS: "false"
+      KB_DOCS_DIRECTORY: /app/knowledge_docs
+      SMARTPBX_WS_TOKEN: "${SMARTPBX_WS_TOKEN}"
+      SMARTPBX_ACCOUNT_ID: "${SMARTPBX_ACCOUNT_ID}"
+      SMARTPBX_MAX_CALLS: "4"
+      SMARTPBX_MAX_MESSAGE_CHARS: "${SMARTPBX_MAX_MESSAGE_CHARS}"
+      SMARTPBX_MAX_AUDIO_BYTES: "${SMARTPBX_MAX_AUDIO_BYTES}"
+      SMARTPBX_MAX_OUTBOUND_FRAMES: "${SMARTPBX_MAX_OUTBOUND_FRAMES}"
+      SMARTPBX_START_TIMEOUT_SECONDS: "${SMARTPBX_START_TIMEOUT_SECONDS}"
+      SMARTPBX_IDLE_TIMEOUT_SECONDS: "${SMARTPBX_IDLE_TIMEOUT_SECONDS}"
+
+    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws-max-size", "65536"]
+
+    volumes:
+      # Never share the dev service's writable Chroma store.
+      - ./chroma_db_hutch_smartpbx:/app/chroma_db
+      - ./knowledge_docs:/app/knowledge_docs:ro
+      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+
+    mem_limit: 1024m
+    cpus: 1.5
+    pids_limit: 256
+
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
