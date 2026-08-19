@@ -52,6 +52,8 @@ async def test_transfer_deflected_when_no_capture_ever_attempted():
 
     assert json.loads(result)["status"] == "capture_first"
     assert coordinator.attempt_calls == []
+    assert context.capture_nudge_sent is True
+    assert context.capture_outcome == ""
 
 
 @pytest.mark.asyncio
@@ -105,6 +107,73 @@ async def test_transfer_proceeds_immediately_when_both_already_attempted():
 
     assert json.loads(result)["status"] == "transferred"
     assert coordinator.attempt_calls == ["wants a human"]
+    # Attempted and satisfied -- never nudged, and recorded as "captured"
+    # even though the model never had to say so via capture_outcome.
+    assert context.capture_nudge_sent is False
+    assert context.capture_outcome == "captured"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["declined", "insisted"])
+async def test_second_call_records_explicit_capture_outcome(outcome):
+    coordinator = _FakeCoordinator()
+    pipeline = _FakePipeline(name_attempted=False, number_attempted=False)
+    context = _make_context(pipeline, coordinator)
+
+    token = tools.smartpbx_transfer_context.set(context)
+    try:
+        first = await tools.execute_tool("transfer_to_human", {"reason": "wants a human"})
+        assert json.loads(first)["status"] == "capture_first"
+
+        second = await tools.execute_tool(
+            "transfer_to_human",
+            {"reason": "proceeding", "capture_outcome": outcome},
+        )
+    finally:
+        tools.smartpbx_transfer_context.reset(token)
+
+    assert json.loads(second)["status"] == "transferred"
+    assert context.capture_outcome == outcome
+
+
+@pytest.mark.asyncio
+async def test_second_call_without_capture_outcome_is_recorded_as_unspecified():
+    """Not a hard block: a model that forgets the argument still proceeds,
+    but the release is auditable rather than silently unexplained."""
+    coordinator = _FakeCoordinator()
+    pipeline = _FakePipeline(name_attempted=False, number_attempted=False)
+    context = _make_context(pipeline, coordinator)
+
+    token = tools.smartpbx_transfer_context.set(context)
+    try:
+        await tools.execute_tool("transfer_to_human", {"reason": "wants a human"})
+        second = await tools.execute_tool("transfer_to_human", {"reason": "still wants a human"})
+    finally:
+        tools.smartpbx_transfer_context.reset(token)
+
+    assert json.loads(second)["status"] == "transferred"
+    assert context.capture_outcome == "unspecified"
+
+
+@pytest.mark.asyncio
+async def test_capture_outcome_argument_is_ignored_on_the_first_call():
+    """capture_outcome only means something on the retry after a nudge --
+    a model that supplies it up front must still be nudged once."""
+    coordinator = _FakeCoordinator()
+    pipeline = _FakePipeline(name_attempted=False, number_attempted=False)
+    context = _make_context(pipeline, coordinator)
+
+    token = tools.smartpbx_transfer_context.set(context)
+    try:
+        result = await tools.execute_tool(
+            "transfer_to_human",
+            {"reason": "wants a human", "capture_outcome": "insisted"},
+        )
+    finally:
+        tools.smartpbx_transfer_context.reset(token)
+
+    assert json.loads(result)["status"] == "capture_first"
+    assert coordinator.attempt_calls == []
 
 
 @pytest.mark.asyncio

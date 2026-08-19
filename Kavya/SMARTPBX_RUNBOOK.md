@@ -355,7 +355,7 @@ event allowlist**. It may contain only the following runtime event names:
 `llm_empty_response`,
 `llm_error`, `llm_provider_degraded`, `llm_provider_failover`, `tool_execute`,
 `tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`,
-`tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
+`tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`, `kb_retrieval`,
 `silence_reprompt`, `stt_final`, `stt_post_dispatch_result`,
 `stt_provider_final`, `stt_provider_interim`,
 `capture_buffer_bounded`, `capture_final_buffered`, `capture_forced_dispatch`,
@@ -462,6 +462,29 @@ same convention as `kb_ms` and `tool_ms`.
 Wire-delivery proxies describe paced transport behavior only; they are not
 playback acknowledgements. Every approved event must not contain transcript text,
 audio, call ids, exception bodies, or secrets.
+
+`kb_retrieval` (emitted as `kb_retrieval event=chunks_returned ...` from
+`knowledge_base.retrieve_context`, not under the `smartpbx_media` prefix since
+it is shared with the non-SmartPBX Twilio ConversationRelay path) exists to
+answer one question after the fact: which knowledge-base section reached the
+model on a given turn, without the log line itself carrying anything sensitive.
+It emits exactly four fields, and no others:
+
+| Field | Type | Permitted values |
+| --- | --- | --- |
+| `trace_id` | opaque, local, bounded string | `<session_trace_id>:<turn_id>` on the SmartPBX path, a per-turn `secrets.token_urlsafe(8)` on the Twilio ConversationRelay path, or `unknown` if none was bound |
+| `chunk_count` | bounded integer | number of chunks returned this query (`n_results`, default `3`) |
+| `chunk_ids` | comma-joined list of SHA-256 hex strings | the stable chunk ids `knowledge_base._stable_id` assigned at index time -- identifiers only, never chunk text |
+| `top_distance` | bounded float | the nearest chunk's vector distance, four decimal places |
+
+`trace_id` is deliberately **not** the Twilio CallSid or any Dialog/PSTN call
+identifier: a call/session identifier is a joinable key into other systems
+(Twilio's own CDRs, call recordings) that already store the caller's phone
+number, so logging it here — even alongside only chunk ids — would still not
+be privacy-safe. The bounded local id set via `knowledge_base.set_kb_trace_id`
+carries no such correlation value. `chunk_ids` lets a specific answer be
+checked against a known chunk (e.g. the resident-rate section) after the fact
+without the line ever carrying rates, chunk text, or caller data.
 
 1. Bad or missing WSS auth is rejected.
 2. A bidirectional call proves caller audio reaches STT, an LLM turn completes,

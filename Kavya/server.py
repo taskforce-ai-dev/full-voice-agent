@@ -77,7 +77,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import Response
 from twilio.rest import Client as TwilioRestClient
 
-from knowledge_base import retrieve_context, initialize_kb, prewarm, reload_kb_from_content
+from knowledge_base import retrieve_context, initialize_kb, prewarm, reload_kb_from_content, set_kb_trace_id
 from tools import (
     get_tools,
     get_tools_openai,
@@ -1982,7 +1982,7 @@ def _build_system_prompt(lang: str = "en") -> str:
     if lang == "en":
         handoff_rules = (
             "HUMAN HANDOFF:\n"
-            "- If the guest explicitly asks for a human, agent, manager, or real person, acknowledge warmly in one sentence, then ask for their name and a callback number, one at a time, using capture_spoken_name and capture_spoken_number exactly as during booking — this is what lets the team call the guest back if the live transfer does not connect. Skip this only if the guest declines to give the details or asks to be transferred right away; do not ask twice.\n"
+            "- If the guest explicitly asks for a human, agent, manager, or real person, acknowledge warmly in one sentence, then ask for their name and a callback number, one at a time, using capture_spoken_name and capture_spoken_number exactly as during booking (spoken capture first; only offer collect_number_via_keypad as a fallback after repeated failed spoken attempts) — this is what lets the team call the guest back if the live transfer does not connect. Skip this only if the guest declines to give the details or asks to be transferred right away; do not ask twice.\n"
             "- Once you have asked for both (captured, declined, or the guest insisted on immediate transfer), call transfer_to_human with a one-sentence reason. Do NOT promise a callback; the tool handles the live transfer.\n"
             "- Do not ask for separate confirmation if the request is explicit. Ask one clarifying question only if the request is ambiguous.\n"
             "- If you do NOT know the answer to a guest's question, or the request is outside what you can help with (e.g. complex booking changes, special packages, complaints, anything not covered by Hatton Hills booking/general info), PROACTIVELY offer transfer and take the next obvious handoff step.\n"
@@ -6893,6 +6893,13 @@ class MediaStreamSession:
         response_text = ""
         try:
             self._mark_smartpbx_turn_once("kb_start")
+            # Bounded, call-local trace id for the kb_retrieval log line --
+            # reuses the same opaque session/turn ids as the rest of the
+            # SmartPBX telemetry (never the Dialog/PSTN call identifier
+            # itself). asyncio.to_thread copies the current context, so this
+            # is visible inside the offloaded call below.
+            if telemetry is not None and turn_id:
+                set_kb_trace_id(f"{telemetry.session_trace_id}:{turn_id}")
             # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
             # this loop is shared by every concurrent call, so keep it off-loop.
             kb_context = await asyncio.to_thread(retrieve_context, text)
@@ -9875,7 +9882,12 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", mode: str = ""
                     kb_context = ""
                 else:
                     try:
-                        kb_context = retrieve_context(user_text, call_sid=call_sid)
+                        # Bounded, call-local id for the kb_retrieval trace
+                        # line -- NOT call_sid, which is a joinable key into
+                        # Twilio's own CDRs/recordings and so is not
+                        # privacy-safe on its own even without chunk text.
+                        set_kb_trace_id(secrets.token_urlsafe(8))
+                        kb_context = retrieve_context(user_text)
                     except Exception:
                         logger.exception("KB retrieval failed")
                         kb_context = ""

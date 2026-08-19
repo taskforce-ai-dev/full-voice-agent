@@ -75,7 +75,22 @@ class SmartPBXTransferContext:
     coordinator: Any | None = None
     pipeline: Any | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Legacy call_control path only: guards against a double live-dispatch
+    # when two transfer_to_human calls race (see the `async with lock`
+    # branch below). NOT used by the coordinator path -- that path has its
+    # own, separate capture_nudge_sent/capture_outcome state below, so one
+    # flag never has to mean two different things.
     transfer_attempted: bool = False
+    # Coordinator path only (see _capture_preflight): whether the one-time
+    # capture_first nudge has already been sent this call.
+    capture_nudge_sent: bool = False
+    # Coordinator path only: the model's stated reason for proceeding past
+    # the capture gate without both name and number attempted -- "captured",
+    # "declined", "insisted", or "unspecified" if the model gave no reason.
+    # Empty until the gate has actually released a transfer. Audit/telemetry
+    # only; the gate is a one-time nudge, not a hard block, on purpose (a
+    # caller who declines must still reach a human on the retry).
+    capture_outcome: str = ""
 
 
 smartpbx_transfer_context: ContextVar[SmartPBXTransferContext | None] = ContextVar(
@@ -433,7 +448,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Transfer the live phone call to a human agent. Call this ONLY when "
             "the caller explicitly asks to speak to a human, agent, manager, or "
-            "real person. Do not use for routine questions you can answer yourself."
+            "real person. Do not use for routine questions you can answer yourself. "
+            "Before the FIRST call this call, ask for the caller's name and a "
+            "callback number (capture_spoken_name / capture_spoken_number) unless "
+            "the caller declines or insists on an immediate transfer. If this is "
+            "your SECOND call to this tool this call, set capture_outcome to say "
+            "why: 'captured' if you got the details, 'declined' if the caller "
+            "declined to give them, or 'insisted' if the caller insisted on an "
+            "immediate transfer without giving them."
         ),
         "input_schema": {
             "type": "object",
@@ -441,6 +463,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "reason": {
                     "type": "string",
                     "description": "One short sentence summarising why the caller is being transferred (e.g. 'caller wants to discuss a special booking request').",
+                },
+                "capture_outcome": {
+                    "type": "string",
+                    "enum": ["captured", "declined", "insisted"],
+                    "description": (
+                        "Only set on a second transfer_to_human call this call, "
+                        "after an earlier capture_first response. Explains why "
+                        "you are calling again without both name and number "
+                        "attempted: 'captured' (got them), 'declined' (caller "
+                        "declined to give them), or 'insisted' (caller insisted "
+                        "on an immediate transfer). Omit on the first call."
+                    ),
                 },
             },
             "required": ["reason"],
@@ -780,30 +814,9 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     elif tool_name == "transfer_to_human":
         if transfer_context is not None:
             if transfer_context.coordinator is not None:
-                # Pre-handover capture nudge: the FIRST transfer_to_human call
-                # this session is deflected if neither name nor number has
-                # been attempted yet, so a call cannot go straight from
-                # availability checking to a live transfer with zero attempt
-                # (the diagnosed failure). transfer_attempted then makes this
-                # a one-time nudge, not a hard block — a caller who declines,
-                # or whose capture genuinely can't resolve, still reaches a
-                # human on the model's next transfer_to_human call rather
-                # than being trapped.
-                if (
-                    not transfer_context.transfer_attempted
-                    and not _pre_handover_capture_attempted(transfer_context.pipeline)
-                ):
-                    transfer_context.transfer_attempted = True
-                    logger.info("smartpbx_tool event=transfer outcome=capture_first")
-                    return json.dumps({
-                        "status": "capture_first",
-                        "message": (
-                            "Before transferring, ask for the caller's name and "
-                            "a callback number, one at a time, so the team can "
-                            "reach them if the transfer does not connect. If "
-                            "they decline, call transfer_to_human again."
-                        ),
-                    })
+                preflight_result = _capture_preflight(transfer_context, tool_input)
+                if preflight_result is not None:
+                    return preflight_result
                 await _ensure_transfer_speech_and_delivery(transfer_context)
                 return await transfer_context.coordinator.attempt(tool_input.get("reason"))
             async with transfer_context.lock:
@@ -1002,6 +1015,58 @@ def _pre_handover_capture_attempted(pipeline: Any) -> bool:
         getattr(pipeline, "_capture_attempted_name", False)
         and getattr(pipeline, "_capture_attempted_number", False)
     )
+
+
+_CAPTURE_OUTCOMES = frozenset({"captured", "declined", "insisted"})
+
+
+def _capture_preflight(context: SmartPBXTransferContext, tool_input: dict[str, Any]) -> str | None:
+    """Provider-agnostic pre-handover capture gate.
+
+    Runs before ANY transfer audio/generation preparation
+    (_ensure_transfer_speech_and_delivery) or live-transfer attempt
+    (coordinator.attempt) -- callers must check its return value before
+    doing either. Returns a JSON string to short-circuit transfer_to_human
+    with, or None once the call may proceed to the live transfer.
+
+    The FIRST transfer_to_human call this session is deflected with a
+    capture_first nudge if neither name nor number has been attempted yet,
+    so a call cannot go straight from availability checking to a live
+    transfer with zero attempt (the diagnosed failure). capture_nudge_sent
+    then makes this a ONE-TIME nudge, not a hard block: a caller who
+    declines, or whose capture genuinely can't resolve, still reaches a
+    human on the model's next transfer_to_human call. That second call is
+    expected to carry `capture_outcome` explaining why (captured / declined
+    / insisted) -- recorded on the context for telemetry/audit even though
+    it is never itself grounds to block. A second call with no
+    capture_outcome at all still proceeds (never trap a caller on a model
+    that forgot the argument) but is recorded as "unspecified" rather than
+    silently indistinguishable from an explained release.
+    """
+    if _pre_handover_capture_attempted(context.pipeline):
+        context.capture_outcome = "captured"
+        return None
+    if not context.capture_nudge_sent:
+        context.capture_nudge_sent = True
+        logger.info("smartpbx_tool event=transfer outcome=capture_first")
+        return json.dumps({
+            "status": "capture_first",
+            "message": (
+                "Before transferring, ask for the caller's name and a "
+                "callback number, one at a time, so the team can reach "
+                "them if the transfer does not connect. If they decline, "
+                "call transfer_to_human again with "
+                "capture_outcome=\"declined\"; if they insist on an "
+                "immediate transfer, use capture_outcome=\"insisted\"."
+            ),
+        })
+    outcome = str(tool_input.get("capture_outcome") or "").strip().lower()
+    context.capture_outcome = outcome if outcome in _CAPTURE_OUTCOMES else "unspecified"
+    logger.info(
+        "smartpbx_tool event=transfer outcome=capture_gate_release capture_outcome=%s",
+        context.capture_outcome,
+    )
+    return None
 
 
 async def _ensure_transfer_speech_and_delivery(context: SmartPBXTransferContext) -> None:
