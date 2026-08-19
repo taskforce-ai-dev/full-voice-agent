@@ -440,8 +440,17 @@ async def test_visible_text_then_late_thinking_stall_is_fenced_without_retry_or_
             lifecycle.append("cancelled")
             raise
 
+    async def immediate_tts(text, *, generation, sentence):
+        await pipeline._speak(text, generation=generation, sentence=sentence)
+
     def start_tts(text, *, generation, sentence):
-        return asyncio.create_task(blocked_tts(text, generation=generation, sentence=sentence))
+        if text == "Partial visible sentence.":
+            return asyncio.create_task(
+                blocked_tts(text, generation=generation, sentence=sentence)
+            )
+        return asyncio.create_task(
+            immediate_tts(text, generation=generation, sentence=sentence)
+        )
 
     generation = pipeline._speak_generation
     monkeypatch.setattr(pipeline, "_start_smartpbx_round_tts", start_tts)
