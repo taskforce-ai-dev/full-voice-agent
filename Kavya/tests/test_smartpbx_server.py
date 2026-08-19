@@ -1929,6 +1929,12 @@ def direct_tool_pipeline(server, provider, client, lang="en"):
     )
     pipeline._smartpbx_transfer_context = object()
     pipeline.tools = [{"provider": provider}]
+    # These direct-runner fixtures exercise transfer/fencing/delivery ordering,
+    # not the pre-handover capture gate (tests/test_smartpbx_capture_gate.py
+    # covers that in isolation) -- default to "already attempted" so
+    # transfer_to_human reaches the coordinator the way it always has here.
+    pipeline._capture_attempted_name = True
+    pipeline._capture_attempted_number = True
     return pipeline
 
 

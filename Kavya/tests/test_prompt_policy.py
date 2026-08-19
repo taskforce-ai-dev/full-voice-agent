@@ -470,14 +470,21 @@ def test_prompt_exempts_foreign_numbers_from_the_nine_digit_rule():
     assert "nine-digit rule does NOT apply" in PROMPT
 
 
-def test_prompt_requires_immediate_proactive_transfer_on_explicit_request():
+def test_prompt_requires_capture_attempt_before_transfer_on_explicit_request():
     """Transfer requests should not be followed by silence or a confirm prompt.
 
-    When the guest explicitly asks for a human, the path should be announced
-    and executed in the same turn unless the request is genuinely ambiguous.
+    When the guest explicitly asks for a human, Kavya acknowledges in the
+    same turn, then attempts to capture a name and callback number before
+    calling transfer_to_human -- unless the guest declines or insists on an
+    immediate transfer, in which case she does not ask twice.
     """
     assert "If the guest explicitly asks for a human, agent, manager, or real person" in PROMPT
-    assert "immediately acknowledge and transfer in the same turn" in PROMPT
+    assert "ask for their name and a callback number" in PROMPT
+    assert "Skip this only if the guest declines to give the details or asks to be transferred right away" in PROMPT
+    assert (
+        "Once you have asked for both (captured, declined, or the guest "
+        "insisted on immediate transfer), call transfer_to_human"
+    ) in PROMPT
     assert "Do not ask for separate confirmation if the request is explicit" in PROMPT
 
 

@@ -40,6 +40,11 @@ class _TransferPipelineStub:
         self._track_assistant_turn_delivery = True
         self._speak_generation = 0
         self._auto_deliver = auto_deliver
+        # These tests exercise the announce-then-attempt sequencing, not the
+        # pre-handover capture gate (tests/test_smartpbx_capture_gate.py
+        # covers that in isolation) -- default to "already attempted".
+        self._capture_attempted_name = True
+        self._capture_attempted_number = True
 
     async def _invoke_speak(self, text: str, generation: int = -1, sentence: str | None = None) -> None:
         self.events.append(("speak", sentence or text))
