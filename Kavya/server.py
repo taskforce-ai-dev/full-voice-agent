@@ -611,6 +611,42 @@ SMARTPBX_LLM_STALL_TIMEOUT_SECONDS: float = _resolve_smartpbx_llm_stall_timeout_
 MAX_HISTORY_MESSAGES: int = 60
 MAX_TOOL_ROUNDS: int = 5
 
+SMARTPBX_CLAUDE_STREAM_PROGRESS_VALUES: frozenset[str] = frozenset({
+    "none", "metadata", "thinking", "text", "tool",
+})
+SMARTPBX_CLAUDE_STREAM_PROGRESS_RANK: dict[str, int] = {
+    "none": 0,
+    "metadata": 1,
+    "thinking": 2,
+    "text": 3,
+    "tool": 4,
+}
+SMARTPBX_TIMEOUT_PROVIDERS: frozenset[str] = frozenset({
+    "openai", "gemini", "claude",
+})
+
+
+def _advance_claude_stream_progress(current: str, candidate: str) -> str:
+    """Keep Claude timeout progress monotonic and within its closed enum."""
+    if candidate not in SMARTPBX_CLAUDE_STREAM_PROGRESS_VALUES:
+        return current
+    if current not in SMARTPBX_CLAUDE_STREAM_PROGRESS_VALUES:
+        current = "none"
+    if (
+        SMARTPBX_CLAUDE_STREAM_PROGRESS_RANK[candidate]
+        > SMARTPBX_CLAUDE_STREAM_PROGRESS_RANK[current]
+    ):
+        return candidate
+    return current
+
+
+def _normalized_smartpbx_timeout_provider(raw: object) -> str:
+    """Map timeout provider input to the finite logging provider enum."""
+    if isinstance(raw, str) and raw in SMARTPBX_TIMEOUT_PROVIDERS:
+        return raw
+    return "unknown"
+
+
 class SmartPBXClaudeRoundOutcome(str, enum.Enum):
     """How one Claude streaming round actually ended.
 
@@ -5357,6 +5393,10 @@ class MediaStreamSession:
         gen: int,
         full_text: str,
         tts_tasks: list[asyncio.Task] = (),
+        progress: str = "none",
+        retrying: bool = False,
+        attempt: int = 1,
+        recover: bool = True,
     ) -> str:
         """Recover from an initial-response or inter-delta stall timeout.
 
@@ -5372,27 +5412,46 @@ class MediaStreamSession:
              bump ``_speak_generation`` exactly once, clear queued transport
              audio, and advance the active runner context to that same new
              generation (``_smartpbx_fence_stalled_generation``).
-        7.   Speak the shared timeout recovery line and end the turn
-             (``_smartpbx_speak_recovery_and_finish``) — the same
-             recovery-and-finish policy an exhausted empty response uses, so
-             a stalled provider and a genuinely empty one degrade the call
-             identically.
+        7.   When ``recover`` is true, speak the shared timeout recovery line
+             and end the turn (``_smartpbx_speak_recovery_and_finish``) — the
+             same recovery-and-finish policy an exhausted empty response uses,
+             so a stalled provider and a genuinely empty one degrade the call
+             identically. When ``recover`` is false, stop after the fence and
+             return without recovery speech; the caller uses that fence-only
+             path to prepare an eligible Claude retry and revalidates exact
+             runner ownership before issuing the next request.
 
         Step 8 (never touch a newer turn's filler) is enforced inside
         ``_smartpbx_cancel_stalled_filler`` via its generation guard, not
         here.
         """
         self._mark_smartpbx_turn_once("llm_timeout")
+        normalized_provider = _normalized_smartpbx_timeout_provider(provider)
+        phase = (
+            exc.phase
+            if exc.phase in {
+                _SmartPBXStreamTimeout.PHASE_INITIAL,
+                _SmartPBXStreamTimeout.PHASE_STALL,
+            }
+            else _SmartPBXStreamTimeout.PHASE_STALL
+        )
         if self._is_smartpbx_session():
             logger.warning(
                 "smartpbx_media event=llm_stream_timeout provider=%s phase=%s "
-                "tool_executed=%s",
-                provider, exc.phase, str(tool_executed).lower(),
+                "tool_executed=%s progress=%s retrying=%s attempt=%d",
+                normalized_provider,
+                phase,
+                "true" if tool_executed is True else "false",
+                progress if progress in SMARTPBX_CLAUDE_STREAM_PROGRESS_VALUES else "none",
+                "true" if retrying is True else "false",
+                _bounded_claude_attempt(attempt),
             )
         await self._smartpbx_cancel_stalled_filler(gen)
         fenced_gen = await self._smartpbx_fence_stalled_generation(
             tts_tasks=list(tts_tasks), gen=gen
         )
+        if not recover:
+            return ""
         return await self._smartpbx_speak_recovery_and_finish(
             tool_executed=tool_executed, gen=fenced_gen, full_text=full_text,
         )
@@ -7960,6 +8019,10 @@ class MediaStreamSession:
                 sentence_buffer = ""
                 tts_tasks: list[asyncio.Task] = []
                 has_tool_use = False
+                # Claude may spend a long interval in adaptive thinking before
+                # opening visible text. Keep only this closed progress enum;
+                # never retain or log thinking content.
+                stream_progress = "none"
 
                 # Prompt caching: marking the system prompt with cache_control
                 # caches the entire request prefix (tools + system) for ~5
@@ -8002,8 +8065,16 @@ class MediaStreamSession:
                             else stream
                         )
                         async for event in stream_iter:
-                            if event.type == "content_block_start":
+                            if event.type == "message_start":
+                                stream_progress = _advance_claude_stream_progress(
+                                    stream_progress, "metadata"
+                                )
+
+                            elif event.type == "content_block_start":
                                 if event.content_block.type == "tool_use":
+                                    stream_progress = _advance_claude_stream_progress(
+                                        stream_progress, "tool"
+                                    )
                                     if initial_filler is not None:
                                         await initial_filler.on_tool_delta()
                                         if initial_filler._cleared_after_spoke:
@@ -8013,9 +8084,17 @@ class MediaStreamSession:
                                     cur_tool_id = event.content_block.id
                                     cur_tool_name = event.content_block.name
                                     tool_json = ""
+                                elif event.content_block.type == "thinking":
+                                    stream_progress = _advance_claude_stream_progress(
+                                        stream_progress, "thinking"
+                                    )
 
                             elif event.type == "content_block_delta":
                                 if event.delta.type == "text_delta":
+                                    if not has_tool_use and event.delta.text:
+                                        stream_progress = _advance_claude_stream_progress(
+                                            stream_progress, "text"
+                                        )
                                     if initial_filler is not None:
                                         await initial_filler.on_content_delta()
                                         if initial_filler._cleared_after_spoke:
@@ -8038,6 +8117,9 @@ class MediaStreamSession:
                                                 tts_tasks.append(task)
 
                                 elif event.delta.type == "input_json_delta":
+                                    stream_progress = _advance_claude_stream_progress(
+                                        stream_progress, "tool"
+                                    )
                                     tool_json += event.delta.partial_json
 
                             elif event.type == "content_block_stop":
@@ -8091,11 +8173,40 @@ class MediaStreamSession:
                                 # rather than because the connection dropped.
                                 saw_terminal_metadata = True
                 except _SmartPBXStreamTimeout as timeout_exc:
-                    return await self._smartpbx_handle_stream_timeout(
-                        timeout_exc, provider="claude",
-                        tool_executed=tool_executed, gen=gen, full_text=full_text,
-                        tts_tasks=tts_tasks,
+                    # Only a direct SmartPBX Claude stall after metadata or
+                    # thinking progress is safely retryable. Initial
+                    # acquisition timeouts remain one request/one recovery;
+                    # visible text, a tool-use start, a completed tool, and
+                    # any ownership loss are all fail-closed.
+                    retry_eligible = (
+                        smartpbx_direct
+                        and timeout_exc.phase == _SmartPBXStreamTimeout.PHASE_STALL
+                        and stream_progress in {"metadata", "thinking"}
+                        and not has_tool_use
+                        and not tool_executed
+                        and attempt + 1 < max_attempts
+                        and self._current_smartpbx_runner_owns_shared_state()
                     )
+                    timeout_result = await self._smartpbx_handle_stream_timeout(
+                        timeout_exc,
+                        provider="claude",
+                        tool_executed=tool_executed,
+                        gen=gen,
+                        full_text=full_text,
+                        tts_tasks=tts_tasks,
+                        progress=stream_progress,
+                        retrying=retry_eligible,
+                        attempt=attempt + 1,
+                        recover=not retry_eligible,
+                    )
+                    if not retry_eligible:
+                        return timeout_result
+                    if not self._current_smartpbx_runner_owns_shared_state():
+                        return ""
+                    empty_retry_used = True
+                    initial_filler = None
+                    gen = self._speak_generation
+                    continue
 
                 if not self._current_smartpbx_runner_owns_shared_state():
                     return ""
