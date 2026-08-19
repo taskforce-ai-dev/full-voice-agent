@@ -611,6 +611,42 @@ SMARTPBX_LLM_STALL_TIMEOUT_SECONDS: float = _resolve_smartpbx_llm_stall_timeout_
 MAX_HISTORY_MESSAGES: int = 60
 MAX_TOOL_ROUNDS: int = 5
 
+SMARTPBX_CLAUDE_STREAM_PROGRESS_VALUES: frozenset[str] = frozenset({
+    "none", "metadata", "thinking", "text", "tool",
+})
+SMARTPBX_CLAUDE_STREAM_PROGRESS_RANK: dict[str, int] = {
+    "none": 0,
+    "metadata": 1,
+    "thinking": 2,
+    "text": 3,
+    "tool": 4,
+}
+SMARTPBX_TIMEOUT_PROVIDERS: frozenset[str] = frozenset({
+    "openai", "gemini", "claude",
+})
+
+
+def _advance_claude_stream_progress(current: str, candidate: str) -> str:
+    """Keep Claude timeout progress monotonic and within its closed enum."""
+    if candidate not in SMARTPBX_CLAUDE_STREAM_PROGRESS_VALUES:
+        return current
+    if current not in SMARTPBX_CLAUDE_STREAM_PROGRESS_VALUES:
+        current = "none"
+    if (
+        SMARTPBX_CLAUDE_STREAM_PROGRESS_RANK[candidate]
+        > SMARTPBX_CLAUDE_STREAM_PROGRESS_RANK[current]
+    ):
+        return candidate
+    return current
+
+
+def _normalized_smartpbx_timeout_provider(raw: object) -> str:
+    """Map timeout provider input to the finite logging provider enum."""
+    if isinstance(raw, str) and raw in SMARTPBX_TIMEOUT_PROVIDERS:
+        return raw
+    return "unknown"
+
+
 class SmartPBXClaudeRoundOutcome(str, enum.Enum):
     """How one Claude streaming round actually ended.
 
@@ -5376,17 +5412,21 @@ class MediaStreamSession:
              bump ``_speak_generation`` exactly once, clear queued transport
              audio, and advance the active runner context to that same new
              generation (``_smartpbx_fence_stalled_generation``).
-        7.   Speak the shared timeout recovery line and end the turn
-             (``_smartpbx_speak_recovery_and_finish``) — the same
-             recovery-and-finish policy an exhausted empty response uses, so
-             a stalled provider and a genuinely empty one degrade the call
-             identically.
+        7.   When ``recover`` is true, speak the shared timeout recovery line
+             and end the turn (``_smartpbx_speak_recovery_and_finish``) — the
+             same recovery-and-finish policy an exhausted empty response uses,
+             so a stalled provider and a genuinely empty one degrade the call
+             identically. When ``recover`` is false, stop after the fence and
+             return without recovery speech; the caller uses that fence-only
+             path to prepare an eligible Claude retry and revalidates exact
+             runner ownership before issuing the next request.
 
         Step 8 (never touch a newer turn's filler) is enforced inside
         ``_smartpbx_cancel_stalled_filler`` via its generation guard, not
         here.
         """
         self._mark_smartpbx_turn_once("llm_timeout")
+        normalized_provider = _normalized_smartpbx_timeout_provider(provider)
         phase = (
             exc.phase
             if exc.phase in {
@@ -5399,11 +5439,11 @@ class MediaStreamSession:
             logger.warning(
                 "smartpbx_media event=llm_stream_timeout provider=%s phase=%s "
                 "tool_executed=%s progress=%s retrying=%s attempt=%d",
-                provider,
+                normalized_provider,
                 phase,
-                str(tool_executed).lower(),
-                progress if progress in {"none", "metadata", "thinking", "text", "tool"} else "none",
-                str(retrying).lower(),
+                "true" if tool_executed is True else "false",
+                progress if progress in SMARTPBX_CLAUDE_STREAM_PROGRESS_VALUES else "none",
+                "true" if retrying is True else "false",
                 _bounded_claude_attempt(attempt),
             )
         await self._smartpbx_cancel_stalled_filler(gen)
@@ -8026,11 +8066,15 @@ class MediaStreamSession:
                         )
                         async for event in stream_iter:
                             if event.type == "message_start":
-                                stream_progress = "metadata"
+                                stream_progress = _advance_claude_stream_progress(
+                                    stream_progress, "metadata"
+                                )
 
                             elif event.type == "content_block_start":
                                 if event.content_block.type == "tool_use":
-                                    stream_progress = "tool"
+                                    stream_progress = _advance_claude_stream_progress(
+                                        stream_progress, "tool"
+                                    )
                                     if initial_filler is not None:
                                         await initial_filler.on_tool_delta()
                                         if initial_filler._cleared_after_spoke:
@@ -8041,12 +8085,16 @@ class MediaStreamSession:
                                     cur_tool_name = event.content_block.name
                                     tool_json = ""
                                 elif event.content_block.type == "thinking":
-                                    stream_progress = "thinking"
+                                    stream_progress = _advance_claude_stream_progress(
+                                        stream_progress, "thinking"
+                                    )
 
                             elif event.type == "content_block_delta":
                                 if event.delta.type == "text_delta":
                                     if not has_tool_use and event.delta.text:
-                                        stream_progress = "text"
+                                        stream_progress = _advance_claude_stream_progress(
+                                            stream_progress, "text"
+                                        )
                                     if initial_filler is not None:
                                         await initial_filler.on_content_delta()
                                         if initial_filler._cleared_after_spoke:
@@ -8069,7 +8117,9 @@ class MediaStreamSession:
                                                 tts_tasks.append(task)
 
                                 elif event.delta.type == "input_json_delta":
-                                    stream_progress = "tool"
+                                    stream_progress = _advance_claude_stream_progress(
+                                        stream_progress, "tool"
+                                    )
                                     tool_json += event.delta.partial_json
 
                             elif event.type == "content_block_stop":

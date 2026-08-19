@@ -370,7 +370,9 @@ The fixed, aggregate-only fields are `correlation_id`, `stage`, `outcome`,
 `session_trace_id`, and `provider` where the named event emits that field.
 `correlation_id`, `turn_id`, and `session_trace_id` are opaque, local, randomly
 generated identifiers and are never derived from dialog. The `provider` field is
-a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, or `azure`.
+a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, or `azure`;
+the `llm_stream_timeout` event additionally permits its normalized `unknown`
+sentinel as documented below.
 
 `llm_round_outcome` emits exactly four fields beyond `provider`, and no others:
 
@@ -394,7 +396,7 @@ identifiers of any kind.
 
 | Field | Type | Permitted values |
 | --- | --- | --- |
-| `provider` | bounded enum | `openai`, `gemini`, `claude` |
+| `provider` | bounded enum | `openai`, `gemini`, `claude`, `unknown` |
 | `phase` | bounded enum | `initial`, `stall` |
 | `tool_executed` | boolean enum | `true`, `false` |
 | `progress` | bounded enum | `none`, `metadata`, `thinking`, `text`, `tool` |
@@ -403,7 +405,9 @@ identifiers of any kind.
 
 The complete log line is `event=llm_stream_timeout provider=<enum>
 phase=<initial|stall> tool_executed=<true|false> progress=<none|metadata|thinking|text|tool>
-retrying=<true|false> attempt=<1-9>`. Claude records `metadata` for
+retrying=<true|false> attempt=<1-9>`. The provider is normalized to
+`openai`, `gemini`, `claude`, or `unknown`; arbitrary or malformed provider
+values are always logged as `unknown`. Claude records `metadata` for
 `message_start` and `thinking` for thinking-block progress without exposing
 thinking text. Only direct SmartPBX Claude `stall` progress before visible text,
 a tool-use start, or tool execution may retry; an initial timeout remains one
