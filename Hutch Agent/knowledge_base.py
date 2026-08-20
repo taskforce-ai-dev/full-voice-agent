@@ -395,7 +395,17 @@ def initialize_kb(docs_directory: str = DEFAULT_DOCS_DIRECTORY) -> bool:
 # Semantic retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve_context(query: str, n_results: int = 3) -> str:
+# Number of KB chunks handed to the LLM per turn. Hutch has 30+ short,
+# self-contained plan paragraphs, and many of them share words like
+# "unlimited", "30 days" or "data" -- so with only a few chunks the specific
+# plan/price a caller asks about is easily crowded out, and Selina answers
+# "no price available for that" even though the paragraph exists. 8 gives good
+# recall without bloating the turn. Tunable via KB_N_RESULTS (no rebuild once
+# the env var is wired through docker-compose).
+KB_N_RESULTS: int = max(1, int(os.getenv("KB_N_RESULTS", "8")))
+
+
+def retrieve_context(query: str, n_results: int = KB_N_RESULTS) -> str:
     """Run a semantic search against the knowledge base.
 
     Uses the LRU-cached ``_cached_embed_query`` so that repeated identical
