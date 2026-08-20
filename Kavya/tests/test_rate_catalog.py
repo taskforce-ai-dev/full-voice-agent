@@ -7,6 +7,8 @@ no model response is mocked to manufacture a price.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -162,6 +164,17 @@ def test_one_canonical_room_in_an_availability_request_is_captured_but_two_are_a
 
 
 @pytest.mark.parametrize(
+    "utterance",
+    (
+        "Is Mount Monarch Chalets available?",
+        "Is Mount Monarch ChaletSuite available?",
+    ),
+)
+def test_room_matching_rejects_suffix_and_prefix_collisions(utterance):
+    assert rate_catalog.recognize_selected_room(utterance) is None
+
+
+@pytest.mark.parametrize(
     ("utterance", "expected"),
     (
         ("A guest from overseas is arriving too.", None),
@@ -192,6 +205,32 @@ def test_foreign_rate_respects_the_existing_demo_rate_kill_switch(monkeypatch):
     assert not result.is_quotable
     assert result.nightly_rate is None
     assert result.reason == "rates_disabled"
+
+
+def test_resident_rate_respects_the_existing_demo_rate_kill_switch(monkeypatch):
+    monkeypatch.setattr("yanolja_service.DEMO_RATES_ENABLED", False)
+
+    result = resolve("Mount Monarch Chalet", "resident", "2026-09-26", "2026-09-29")
+
+    assert not result.is_quotable
+    assert result.nightly_rate is None
+    assert result.reason == "rates_disabled"
+
+
+@pytest.mark.parametrize(
+    ("utterance", "expected"),
+    (
+        ("I'm local", "resident"),
+        ("I'm not local", "foreign"),
+        ("I'm a foreign guest", "foreign"),
+    ),
+)
+def test_contracted_explicit_residency_statements_persist(utterance, expected):
+    session = server.MediaStreamSession(websocket=None, lang="en", media_transport=None)
+
+    session._capture_explicit_residency(utterance)
+
+    assert session._booking_slots["residency"] == expected
 
 
 async def _one_event_stream(event):
@@ -378,3 +417,75 @@ async def test_completed_rate_state_still_uses_descriptive_kb_for_an_unrelated_t
     request_text = _request_text("openai", client)
     assert "POOL_DETAILS" in request_text
     assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
+async def test_costume_remains_a_descriptive_kb_turn_after_rate_state_exists(monkeypatch):
+    session, client = _provider_session("openai")
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "COSTUME_DETAILS: forest theme.")
+
+    await session._process_utterance_bound("Please describe the costume theme.")
+
+    request_text = _request_text("openai", client)
+    assert "COSTUME_DETAILS" in request_text
+    assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
+async def test_stale_smartpbx_runner_cannot_inherit_a_newer_turn_rate_context(monkeypatch):
+    session, client = _provider_session("openai")
+    session._smartpbx_transfer_context = object()
+    session._media_transport = SimpleNamespace(frames_dropped_total=0)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    entered_kb = threading.Event()
+    release_kb = threading.Event()
+    compositions: list[tuple[str, str, str]] = []
+    original_compose = session._compose_turn_user_message
+
+    def retrieve(text: str) -> str:
+        if text == "Please describe the pool.":
+            entered_kb.set()
+            assert release_kb.wait(timeout=5), "test must release the blocked KB call"
+            return "STALE_POOL_DETAILS"
+        return "UNEXPECTED_KB"
+
+    def record_compose(text: str, kb_context: str) -> str:
+        message = original_compose(text, kb_context)
+        compositions.append((text, kb_context, message))
+        return message
+
+    monkeypatch.setattr(server, "retrieve_context", retrieve)
+    monkeypatch.setattr(session, "_compose_turn_user_message", record_compose)
+
+    session._active_smartpbx_turn_id = "turn-a"
+    stale_task = asyncio.create_task(
+        session._process_utterance_bound("Please describe the pool.")
+    )
+    assert await asyncio.to_thread(entered_kb.wait, 1)
+
+    session._active_smartpbx_turn_id = "turn-b"
+    session._speak_generation += 1
+    await session._process_utterance_bound("Sri Lankan resident")
+
+    release_kb.set()
+    await stale_task
+
+    assert len(client.requests) == 1
+    request_text = _request_text("openai", client)
+    assert "rate_per_room_per_night: 315000" in request_text
+    assert "STALE_POOL_DETAILS" not in request_text
+    assert not any(text == "Please describe the pool." for text, _kb, _message in compositions)
+    assert not any(
+        message.get("content") == "Please describe the pool."
+        for message in session.history
+    )
