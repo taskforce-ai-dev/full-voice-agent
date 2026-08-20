@@ -473,6 +473,66 @@ async def test_room_scoped_non_price_cost_language_keeps_descriptive_kb_availabl
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_indirect_selection_phrase_with_dinner_cost_keeps_descriptive_kb(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "DINNER_DETAILS")
+
+    await session._process_utterance_bound(
+        "I would like to know what dinner costs at Mount Monarch Chalet."
+    )
+
+    request_text = _request_text(provider, client)
+    assert "DINNER_DETAILS" in request_text
+    assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_direct_selection_captures_room_without_inventing_a_rate(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNUSED_KB")
+
+    await session._process_utterance_bound("I would like Mount Monarch Chalet.")
+
+    request_text = _request_text(provider, client)
+    assert session._booking_slots["room_type"] == "Mount Monarch Chalet"
+    assert "rate_per_room_per_night" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_direct_selection_then_explicit_room_rate_sends_authoritative_rate(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNUSED_KB")
+
+    await session._process_utterance_bound("I would like Mount Monarch Chalet.")
+    await session._process_utterance_bound("What is the room rate?")
+
+    request_text = _request_text(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert "rate_per_room_per_night: 315000" in request_text
+    assert "UNUSED_KB" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
 async def test_explicit_room_rate_wording_still_sends_the_authoritative_rate_record(
     monkeypatch, provider
 ):
