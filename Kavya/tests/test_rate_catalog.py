@@ -887,6 +887,67 @@ async def test_unknown_room_explicit_rate_request_is_authoritative_no_quote(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "What is the price of Royal Villa?",
+        "How much does Royal Villa cost?",
+    ),
+)
+async def test_unknown_room_price_grammar_cannot_reuse_a_persisted_room(
+    monkeypatch, provider, utterance
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNKNOWN_ROOM_KB")
+
+    await session._process_utterance_bound(utterance)
+
+    request_text = _request_text(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert "status: no_quote" in request_text
+    assert "reason: unknown_room" in request_text
+    assert "Mount Monarch Chalet" not in request_text
+    assert "rate_per_room_per_night" not in request_text
+    assert "UNKNOWN_ROOM_KB" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "What does a costume cost?",
+        "What are the breakfast rates?",
+        "What is the airport-transfer price?",
+    ),
+)
+async def test_non_room_price_grammar_stays_semantic_without_a_denylist(
+    monkeypatch, provider, utterance
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "SUBJECT_KB")
+
+    await session._process_utterance_bound(utterance)
+
+    request_text = _request_text(provider, client)
+    assert "SUBJECT_KB" in request_text
+    assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
 async def test_explicit_rate_follow_up_expires_after_a_non_rate_turn(
     monkeypatch, provider
 ):
@@ -984,9 +1045,8 @@ async def test_stale_smartpbx_runner_cannot_inherit_a_newer_turn_rate_context(mo
     )
 
 
-@pytest.mark.asyncio
-async def test_stale_smartpbx_runner_cannot_commit_selection_or_residency_state(
-    monkeypatch,
+async def _assert_stale_runner_cannot_commit_rate_state(
+    monkeypatch, utterance: str, slot: str,
 ):
     session, _client = _provider_session("openai")
     session._smartpbx_transfer_context = object()
@@ -995,7 +1055,7 @@ async def test_stale_smartpbx_runner_cannot_commit_selection_or_residency_state(
     release_kb = threading.Event()
 
     def retrieve(text: str) -> str:
-        if text.startswith("I would like Mount Monarch Chalet"):
+        if text == utterance:
             entered_kb.set()
             assert release_kb.wait(timeout=5), "test must release the blocked KB call"
         return "KB_DETAILS"
@@ -1003,9 +1063,7 @@ async def test_stale_smartpbx_runner_cannot_commit_selection_or_residency_state(
     monkeypatch.setattr(server, "retrieve_context", retrieve)
     session._active_smartpbx_turn_id = "turn-a"
     stale_task = asyncio.create_task(
-        session._process_utterance_bound(
-            "I would like Mount Monarch Chalet. I am local."
-        )
+        session._process_utterance_bound(utterance)
     )
     try:
         assert await asyncio.to_thread(entered_kb.wait, 1)
@@ -1016,5 +1074,26 @@ async def test_stale_smartpbx_runner_cannot_commit_selection_or_residency_state(
         release_kb.set()
         await stale_task
 
-    assert "room_type" not in session._booking_slots
-    assert "residency" not in session._booking_slots
+    assert slot not in session._booking_slots
+
+
+@pytest.mark.asyncio
+async def test_stale_smartpbx_runner_cannot_commit_a_recognized_direct_selection(
+    monkeypatch,
+):
+    assert rate_catalog.recognize_selected_room(
+        "I would like Mount Monarch Chalet."
+    ) == "Mount Monarch Chalet"
+    await _assert_stale_runner_cannot_commit_rate_state(
+        monkeypatch, "I would like Mount Monarch Chalet.", "room_type",
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_smartpbx_runner_cannot_commit_explicit_residency(
+    monkeypatch,
+):
+    assert rate_catalog.recognize_residency("I am local.") == "resident"
+    await _assert_stale_runner_cannot_commit_rate_state(
+        monkeypatch, "I am local.", "residency",
+    )
