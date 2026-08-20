@@ -175,10 +175,10 @@ def _target_before_cost(tokens: tuple[str, ...]) -> tuple[str, ...] | None:
 def _amount_target(tokens: tuple[str, ...]) -> tuple[str, ...] | None:
     """Extract one bounded singular/plural amount target before classifying it."""
     for prefix in (
-        ("how", "much", "is"),
         ("how", "much", "is", "the"),
-        ("how", "much", "are"),
+        ("how", "much", "is"),
         ("how", "much", "are", "the"),
+        ("how", "much", "are"),
     ):
         if tokens[:len(prefix)] != prefix:
             continue

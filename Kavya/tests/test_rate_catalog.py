@@ -481,6 +481,14 @@ def _current_turn_request_text(provider: str, client) -> str:
     return str(request["system"]) + str(current_user["content"])
 
 
+def _current_authoritative_rate_record(provider: str, client) -> str:
+    """Return the current turn's record, excluding legitimate prior slot history."""
+    _before, marker, record = _current_turn_request_text(provider, client).partition(
+        "AUTHORITATIVE RATE RECORD"
+    )
+    return marker + record
+
+
 def _availability_input() -> dict[str, str]:
     return {"check_in": "2026-09-26", "check_out": "2026-09-29"}
 
@@ -992,13 +1000,14 @@ async def test_unknown_room_price_grammar_cannot_reuse_a_persisted_room(
 
     await session._process_utterance_bound(utterance)
 
-    request_text = _request_text(provider, client)
-    assert "AUTHORITATIVE RATE RECORD" in request_text
-    assert "status: no_quote" in request_text
-    assert "reason: unknown_room" in request_text
-    assert "Mount Monarch Chalet" not in request_text
-    assert "rate_per_room_per_night" not in request_text
-    assert "UNKNOWN_ROOM_KB" not in request_text
+    current_turn = _current_turn_request_text(provider, client)
+    rate_record = _current_authoritative_rate_record(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in rate_record
+    assert "status: no_quote" in rate_record
+    assert "reason: unknown_room" in rate_record
+    assert "Mount Monarch Chalet" not in rate_record
+    assert "rate_per_room_per_night" not in rate_record
+    assert "UNKNOWN_ROOM_KB" not in current_turn
 
 
 @pytest.mark.asyncio
