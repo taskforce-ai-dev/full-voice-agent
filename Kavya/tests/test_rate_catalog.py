@@ -495,6 +495,64 @@ async def test_explicit_room_rate_wording_still_sends_the_authoritative_rate_rec
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_explicit_canonical_room_amount_question_sends_authoritative_rate(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNUSED_KB")
+
+    await session._process_utterance_bound("How much is Mount Monarch Chalet?")
+
+    request_text = _request_text(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert "rate_per_room_per_night: 315000" in request_text
+    assert "UNUSED_KB" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_grounded_amount_pronoun_follow_up_sends_authoritative_rate(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNUSED_KB")
+
+    await session._process_utterance_bound("How much is it?")
+
+    request_text = _request_text(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert "rate_per_room_per_night: 315000" in request_text
+    assert "UNUSED_KB" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_ungrounded_amount_pronoun_remains_a_descriptive_kb_turn(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "GENERAL_DETAILS")
+
+    await session._process_utterance_bound("How much is it?")
+
+    request_text = _request_text(provider, client)
+    assert "GENERAL_DETAILS" in request_text
+    assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
 async def test_stale_smartpbx_runner_cannot_inherit_a_newer_turn_rate_context(monkeypatch):
     session, client = _provider_session("openai")
     session._smartpbx_transfer_context = object()
