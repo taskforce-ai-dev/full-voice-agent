@@ -959,6 +959,18 @@ class MediaStreamSession:
             logger.exception("KB retrieval failed")
             kb_context = ""
 
+        # Diagnostic: log the exact KB text handed to the LLM for this turn, so
+        # a "no price available" answer can be traced to retrieval (price not in
+        # the context -> retrieval/KB_N_RESULTS issue) vs. the LLM (price IS in
+        # the context but the model still refused -> prompt/model issue).
+        logger.info(
+            "KB retrieved [%s] query=%r (%d chars):\n%s",
+            self.call_sid,
+            text,
+            len(kb_context),
+            kb_context,
+        )
+
         if kb_context and "No knowledge base loaded" not in kb_context:
             user_msg = f"[Reference context: {kb_context}]\n\nCaller: {text}"
         else:
