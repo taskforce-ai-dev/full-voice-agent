@@ -517,6 +517,57 @@ async def test_explicit_canonical_room_amount_question_sends_authoritative_rate(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "How much is Mount Monarch Chalet?",
+        "How much is Mount Monarch Chalet per night?",
+    ),
+)
+async def test_canonical_room_amount_controls_remain_authoritative(
+    monkeypatch, provider, utterance
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNUSED_KB")
+
+    await session._process_utterance_bound(utterance)
+
+    request_text = _request_text(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert "rate_per_room_per_night: 315000" in request_text
+    assert "UNUSED_KB" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_possessive_room_name_dinner_amount_question_remains_descriptive(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "DINNER_DETAILS")
+
+    await session._process_utterance_bound(
+        "How much is Mount Monarch Chalet's dinner?"
+    )
+
+    request_text = _request_text(provider, client)
+    assert "DINNER_DETAILS" in request_text
+    assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
 async def test_grounded_amount_pronoun_follow_up_sends_authoritative_rate(
     monkeypatch, provider
 ):
