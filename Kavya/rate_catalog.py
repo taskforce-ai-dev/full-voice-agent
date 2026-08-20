@@ -81,7 +81,7 @@ def recognize_residency(utterance: str) -> str | None:
         and any(term in normalized for term in ("foreign", "overseas", "non resident"))
     ):
         return None
-    subject = r"(?:i am|im|we are|were|my party is|our party is)"
+    subject = r"(?:i am|i m|im|we are|we re|were|my party is|our party is)"
     candidates: set[str] = set()
     if re.search(rf"\b{subject}\s+(?:a\s+)?(?:sri lankan resident|local resident|local)\b", normalized):
         candidates.add(RESIDENT)
@@ -106,18 +106,22 @@ def recognize_residency(utterance: str) -> str | None:
 
 def recognize_selected_room(utterance: str) -> str | None:
     """Return one canonical room only from a clear guest selection statement."""
-    normalized = " ".join(re.findall(r"[a-z]+", str(utterance).lower()))
-    if not normalized:
+    tokens = tuple(re.findall(r"[a-z]+", str(utterance).lower()))
+    if not tokens:
         return None
+    normalized = " ".join(tokens)
     matches: list[str] = []
     for room in yanolja_service.DEMO_NIGHTLY_RATE_USD:
-        room_words = " ".join(re.findall(r"[a-z]+", room.lower()))
-        if room_words not in normalized:
+        room_tokens = tuple(re.findall(r"[a-z]+", room.lower()))
+        if not any(
+            tokens[index:index + len(room_tokens)] == room_tokens
+            for index in range(len(tokens) - len(room_tokens) + 1)
+        ):
             continue
         matches.append(room)
     if len(matches) != 1:
         return None
-    if normalized == " ".join(re.findall(r"[a-z]+", matches[0].lower())):
+    if tokens == tuple(re.findall(r"[a-z]+", matches[0].lower())):
         return matches[0]
     if any(prefix in normalized for prefix in _ROOM_SELECTION_PREFIXES):
         return matches[0]

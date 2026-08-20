@@ -179,6 +179,7 @@ class _SmartPBXRunnerContext:
     dropped_frame_baseline: int
     speak_generation: int
     raw_utterance: str
+    rate_context: str = ""
     initial_filler: Any | None = None
     tool_filler_tasks: set[asyncio.Task] = field(default_factory=set)
 
@@ -4713,9 +4714,6 @@ class MediaStreamSession:
         # context every turn so they survive history trimming (a long
         # number-retry loop would otherwise evict the early date/guest turns).
         self._booking_slots: dict[str, str] = {}
-        # A rate record is turn-scoped: it controls only a rate decision and
-        # must not suppress descriptive KB retrieval on later unrelated turns.
-        self._turn_rate_context: str = ""
         # Active DTMF keypad collector while collect_number_via_keypad is running.
         self._dtmf_collector: DtmfCollector | None = None
         self.history: list[dict] = []
@@ -5818,9 +5816,10 @@ class MediaStreamSession:
         rate_related = (
             recognize_residency(text) is not None
             or recognize_selected_room(text) is not None
-            or any(phrase in normalized for phrase in (
-                "rate", "price", "cost", "quote", "how much", "per night", "lkr", "usd",
-            ))
+            or re.search(
+                r"\b(?:rate|price|cost|quote|lkr|usd)\b|\bhow\s+much\b|\bper\s+night\b",
+                normalized,
+            ) is not None
         )
         if not rate_related:
             return ""
@@ -5833,9 +5832,14 @@ class MediaStreamSession:
         )
         return resolution.authoritative_context()
 
+    def _current_rate_context(self) -> str:
+        """Return this runner's rate record without sharing it across turns."""
+        runner = _smartpbx_runner_context.get()
+        return "" if runner is None else runner.rate_context
+
     def _compose_turn_user_message(self, text: str, kb_context: str) -> str:
         """Keep semantic KB prose out of a deterministic-rate model request."""
-        if self._turn_rate_context:
+        if self._current_rate_context():
             return text
         if kb_context and "No knowledge base loaded" not in kb_context:
             return f"[Reference context: {kb_context}]\n\nGuest: {text}"
@@ -5872,7 +5876,7 @@ class MediaStreamSession:
             lines.append(f"- room: {room}")
         if slots.get("guest_phone"):
             lines.append(f"- phone: {slots['guest_phone']}")
-        rate_context = self._turn_rate_context
+        rate_context = self._current_rate_context()
         if not lines and not rate_context:
             return ""
         joined = "\n".join(lines)
@@ -7127,7 +7131,9 @@ class MediaStreamSession:
         self._last_guest_utterance_raw = text
         self._capture_selected_room(text)
         self._capture_explicit_residency(text)
-        self._turn_rate_context = self._rate_context_for_turn(text)
+        runner = _smartpbx_runner_context.get()
+        if runner is not None:
+            runner.rate_context = self._rate_context_for_turn(text)
         self._capture_success_this_turn = False
         self._start_assistant_turn_delivery_tracking()
         outcome = "completed"
@@ -7137,7 +7143,7 @@ class MediaStreamSession:
             # An exact price record is authoritative and deliberately excludes
             # semantic rate prose for this turn. General descriptive turns keep
             # the normal KB retrieval path.
-            if self._turn_rate_context:
+            if self._current_rate_context():
                 kb_context = ""
             else:
                 # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
@@ -7163,6 +7169,14 @@ class MediaStreamSession:
             kb_context = ""
         finally:
             self._mark_smartpbx_turn("kb_complete")
+
+        # A direct SmartPBX turn may lose ownership while its KB lookup is
+        # awaiting a worker thread. Do not compose history or construct an LLM
+        # request after that handoff; legacy/non-SmartPBX sessions retain their
+        # existing permissive behavior through the shared ownership predicate.
+        if not self._current_smartpbx_runner_owns_shared_state():
+            outcome = "interrupted"
+            return
 
         user_msg = self._compose_turn_user_message(text, kb_context)
 
