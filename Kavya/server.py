@@ -93,7 +93,12 @@ from booking_api import close_session, is_configured
 # agree on whether rates may be quoted. Already loaded transitively via
 # booking_api; the explicit import keeps the single source of truth visible.
 import yanolja_service
-from rate_catalog import recognize_residency, recognize_selected_room, resolve_rate
+from rate_catalog import (
+    is_room_rate_intent,
+    recognize_residency,
+    recognize_selected_room,
+    resolve_rate,
+)
 from post_call import (
     UNCONFIRMED_TRANSCRIPT_LABEL,
     UNCONFIRMED_TRANSCRIPT_ROLE,
@@ -5816,10 +5821,7 @@ class MediaStreamSession:
         rate_related = (
             recognize_residency(text) is not None
             or recognize_selected_room(text) is not None
-            or re.search(
-                r"\b(?:rate|price|cost|quote|lkr|usd)\b|\bhow\s+much\b|\bper\s+night\b",
-                normalized,
-            ) is not None
+            or is_room_rate_intent(normalized)
         )
         if not rate_related:
             return ""

@@ -31,6 +31,14 @@ _ROOM_SELECTION_PREFIXES = (
     "i want ", "we want ", "i will take ", "we will take ",
     "ill take ", "well take ",
 )
+_ROOM_RATE_INTENT = re.compile(
+    r"\b(?:room\s+)?rates?\b"
+    r"|\b(?:room|nightly|stay|accommodation)\s+(?:price|cost)\b"
+    r"|\b(?:price|cost)\s+(?:for|of)\s+(?:the\s+)?(?:room|stay|accommodation)\b"
+    r"|\bhow\s+much\s+(?:is|does)\s+(?:the\s+)?(?:room|stay|accommodation)\b"
+    r"|\bper\s+(?:room\s+)?night\b"
+    r"|\b(?:lkr|usd)\b"
+)
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,12 @@ def recognize_residency(utterance: str) -> str | None:
     return candidates.pop()
 
 
+def is_room_rate_intent(utterance: str) -> bool:
+    """Recognize only bounded language that prices a room stay itself."""
+    normalized = " ".join(re.findall(r"[a-z]+", str(utterance).lower()))
+    return bool(_ROOM_RATE_INTENT.search(normalized))
+
+
 def recognize_selected_room(utterance: str) -> str | None:
     """Return one canonical room only from a clear guest selection statement."""
     tokens = tuple(re.findall(r"[a-z]+", str(utterance).lower()))
@@ -125,9 +139,7 @@ def recognize_selected_room(utterance: str) -> str | None:
         return matches[0]
     if any(prefix in normalized for prefix in _ROOM_SELECTION_PREFIXES):
         return matches[0]
-    if any(phrase in normalized for phrase in (
-        "available", "availability", "rate", "price", "cost", "quote", "how much", "per night",
-    )):
+    if re.search(r"\b(?:available|availability)\b", normalized) or is_room_rate_intent(normalized):
         return matches[0]
     return None
 
