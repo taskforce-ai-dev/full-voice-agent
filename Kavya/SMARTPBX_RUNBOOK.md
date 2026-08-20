@@ -116,6 +116,7 @@ SMARTPBX_CLAUDE_MAX_TOKENS=
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=
 SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS=
 SMARTPBX_LLM_STALL_TIMEOUT_SECONDS=
+SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS=
 SMARTPBX_START_TIMEOUT_SECONDS=10
 SMARTPBX_IDLE_TIMEOUT_SECONDS=90
 SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS=300
@@ -186,7 +187,7 @@ headers carry only the dedicated WSS token; they never carry MCP credentials.
 
 ## Direct SmartPBX English reliability timing (Phase B)
 
-Three env-tunable knobs govern the direct SmartPBX English provider round only
+Four env-tunable knobs govern the direct SmartPBX English provider round only
 (OpenAI/Gemini/Claude, whichever `LLM_PROVIDER` selects). Twilio Media Streams
 (Arabic/Sinhala/Tamil) and the Twilio ConversationRelay path are unaffected —
 none of this timing applies outside a direct SmartPBX call.
@@ -201,6 +202,12 @@ none of this timing applies outside a direct SmartPBX call.
 - `SMARTPBX_LLM_STALL_TIMEOUT_SECONDS` (default `8.0`, clamp `[1.0, 30.0]`) —
   the maximum gap between successive deltas once a round has started
   streaming. There is no total stream deadline while content keeps arriving.
+- `SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS` (default `12.0`, clamp
+  `[1.0, 30.0]`, effective minimum the shared stall timeout) — Claude-only
+  first-attempt grace after a verified thinking block. Metadata-only, visible
+  text, tool generation, every retry, OpenAI, and Gemini keep the shared
+  timeout. Setting it to `8.0` restores the previous timing; thinking remains
+  enabled and the Claude output ceiling remains `1024`.
 
 On either timeout, or on an empty response (no text, no tool call) that has
 already used its one same-provider retry, Kavya cancels only that turn's own
@@ -392,7 +399,7 @@ ranges above, so a corrupt usage payload cannot write an unbounded numeral.
 This event carries no free text, no tool names, no tool arguments and no caller
 identifiers of any kind.
 
-`llm_stream_timeout` emits exactly seven fields, and no others:
+`llm_stream_timeout` emits exactly eight fields, and no others:
 
 | Field | Type | Permitted values |
 | --- | --- | --- |
@@ -402,11 +409,13 @@ identifiers of any kind.
 | `progress` | bounded enum | `none`, `metadata`, `thinking`, `text`, `tool` |
 | `retrying` | boolean enum | `true`, `false` |
 | `attempt` | bounded integer | `1`–`9`, clamped |
+| `timeout_ms` | bounded integer | `1000`–`30000`, clamped |
 
 The complete log line is `event=llm_stream_timeout provider=<enum>
 phase=<initial|stall> tool_executed=<true|false> progress=<none|metadata|thinking|text|tool>
-retrying=<true|false> attempt=<1-9>`. The provider is normalized to
-`openai`, `gemini`, `claude`, or `unknown`; arbitrary or malformed provider
+retrying=<true|false> attempt=<1-9> timeout_ms=<1000-30000>`. The provider is
+normalized to `openai`, `gemini`, `claude`, or `unknown`; `timeout_ms` is the
+bounded timeout that fired. Arbitrary or malformed provider
 values are always logged as `unknown`. Claude records `metadata` for
 `message_start` and `thinking` for thinking-block progress without exposing
 thinking text. Only direct SmartPBX Claude `stall` progress before visible text,
