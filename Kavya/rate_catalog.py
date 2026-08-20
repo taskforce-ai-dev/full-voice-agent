@@ -93,6 +93,10 @@ def recognize_residency(utterance: str) -> str | None:
         candidates.add(FOREIGN)
     # A terse direct answer is safe only when it contains no other subject or
     # competing residency classification.
+    if normalized in {"sri lankan resident", "local resident"}:
+        candidates.add(RESIDENT)
+    if normalized in {"foreign guest", "foreign visitor", "international guest", "non resident"}:
+        candidates.add(FOREIGN)
     if normalized in {"not a sri lankan resident", "not sri lankan resident", "not local"}:
         candidates.add(FOREIGN)
     if len(candidates) != 1:
@@ -105,12 +109,22 @@ def recognize_selected_room(utterance: str) -> str | None:
     normalized = " ".join(re.findall(r"[a-z]+", str(utterance).lower()))
     if not normalized:
         return None
+    matches: list[str] = []
     for room in yanolja_service.DEMO_NIGHTLY_RATE_USD:
         room_words = " ".join(re.findall(r"[a-z]+", room.lower()))
         if room_words not in normalized:
             continue
-        if normalized == room_words or any(prefix in normalized for prefix in _ROOM_SELECTION_PREFIXES):
-            return room
+        matches.append(room)
+    if len(matches) != 1:
+        return None
+    if normalized == " ".join(re.findall(r"[a-z]+", matches[0].lower())):
+        return matches[0]
+    if any(prefix in normalized for prefix in _ROOM_SELECTION_PREFIXES):
+        return matches[0]
+    if any(phrase in normalized for phrase in (
+        "available", "availability", "rate", "price", "cost", "quote", "how much", "per night",
+    )):
+        return matches[0]
     return None
 
 
