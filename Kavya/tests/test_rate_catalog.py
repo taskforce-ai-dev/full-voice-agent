@@ -233,6 +233,86 @@ def test_contracted_explicit_residency_statements_persist(utterance, expected):
     assert session._booking_slots["residency"] == expected
 
 
+def _rate_intent(utterance: str):
+    return rate_catalog.classify_room_rate_intent(utterance)
+
+
+@pytest.mark.parametrize(
+    ("utterance", "kind", "rooms"),
+    (
+        (
+            "What is the room rate for Mount Monarch Chalet or Mount Luxe Chalet?",
+            "AMBIGUOUS_RATE",
+            ("Mount Monarch Chalet", "Mount Luxe Chalet"),
+        ),
+        (
+            "How much are Mount Monarch Chalet and Mount Luxe Chalet?",
+            "AMBIGUOUS_RATE",
+            ("Mount Monarch Chalet", "Mount Luxe Chalet"),
+        ),
+        ("How much does Mount Monarch Chalet cost?", "RATE", ("Mount Monarch Chalet",)),
+        ("What is the price of Mount Monarch Chalet?", "RATE", ("Mount Monarch Chalet",)),
+        ("What is the price of the Mount Monarch Chalet?", "RATE", ("Mount Monarch Chalet",)),
+        ("How much is Mount Monarch Chalet for one night?", "RATE", ("Mount Monarch Chalet",)),
+    ),
+)
+def test_room_rate_classifier_has_structured_ambiguous_and_natural_price_results(
+    utterance, kind, rooms
+):
+    classification = _rate_intent(utterance)
+
+    assert classification.kind == kind
+    assert classification.rooms == rooms
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "What are the spa rates?",
+        "How much does dinner cost?",
+        "What is the activity price in USD?",
+        "What is the spa cost in LKR per night?",
+        "Does the room cost include dinner?",
+    ),
+)
+def test_room_rate_classifier_rejects_non_room_price_subjects(utterance):
+    classification = _rate_intent(utterance)
+
+    assert classification.kind == "NONE"
+    assert classification.rooms == ()
+
+
+@pytest.mark.parametrize(
+    ("utterance", "expected"),
+    (
+        ("I would like Mount Monarch Chalet.", "Mount Monarch Chalet"),
+        ("Is Mount Monarch Chalet available?", "Mount Monarch Chalet"),
+        ("I would like to know what dinner costs at Mount Monarch Chalet.", None),
+        ("I would like Mount Monarch Chalet dinner.", None),
+        ("Is dinner available at Mount Monarch Chalet?", None),
+        ("How much is Mount Monarch Chalet's dinner?", None),
+    ),
+)
+def test_room_selection_is_direct_and_separate_from_availability_and_price_subjects(
+    utterance, expected
+):
+    assert rate_catalog.recognize_selected_room(utterance) == expected
+
+
+@pytest.mark.parametrize(
+    ("utterance", "expected"),
+    (
+        ("We're local", "resident"),
+        ("I am an international guest", "foreign"),
+        ("Were local residents welcome to the spa?", None),
+    ),
+)
+def test_residency_recognition_handles_contractions_without_were_false_positives(
+    utterance, expected
+):
+    assert rate_catalog.recognize_residency(utterance) == expected
+
+
 async def _one_event_stream(event):
     yield event
 
@@ -628,7 +708,7 @@ async def test_possessive_room_name_dinner_amount_question_remains_descriptive(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
-async def test_grounded_amount_pronoun_follow_up_sends_authoritative_rate(
+async def test_explicit_rate_turn_enables_grounded_amount_pronoun_follow_up(
     monkeypatch, provider
 ):
     session, client = _provider_session(provider)
@@ -640,6 +720,7 @@ async def test_grounded_amount_pronoun_follow_up_sends_authoritative_rate(
     })
     monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNUSED_KB")
 
+    await session._process_utterance_bound("What is the room rate?")
     await session._process_utterance_bound("How much is it?")
 
     request_text = _request_text(provider, client)
@@ -660,6 +741,192 @@ async def test_ungrounded_amount_pronoun_remains_a_descriptive_kb_turn(
 
     request_text = _request_text(provider, client)
     assert "GENERAL_DETAILS" in request_text
+    assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "What is the room rate for Mount Monarch Chalet or Mount Luxe Chalet?",
+        "How much are Mount Monarch Chalet and Mount Luxe Chalet?",
+    ),
+)
+async def test_ambiguous_multi_room_rate_requests_are_no_quote_without_stale_room(
+    monkeypatch, provider, utterance
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "AMBIGUOUS_KB")
+
+    await session._process_utterance_bound(utterance)
+
+    request_text = _request_text(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert "status: no_quote" in request_text
+    assert "reason: ambiguous_room" in request_text
+    assert "rate_per_room_per_night" not in request_text
+    assert "AMBIGUOUS_KB" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "What are the spa rates?",
+        "How much does dinner cost?",
+        "What is the activity price in USD?",
+        "What is the spa cost in LKR per night?",
+        "Does the room cost include dinner?",
+    ),
+)
+async def test_non_room_price_subjects_keep_semantic_kb(
+    monkeypatch, provider, utterance
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "SEMANTIC_KB")
+
+    await session._process_utterance_bound(utterance)
+
+    request_text = _request_text(provider, client)
+    assert "SEMANTIC_KB" in request_text
+    assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+@pytest.mark.parametrize(
+    ("utterance", "expected_room"),
+    (
+        ("I would like Mount Monarch Chalet.", "Mount Monarch Chalet"),
+        ("Is Mount Monarch Chalet available?", "Mount Monarch Chalet"),
+        ("I would like to know what dinner costs at Mount Monarch Chalet.", None),
+        ("Is dinner available at Mount Monarch Chalet?", None),
+    ),
+)
+async def test_selection_and_availability_do_not_activate_room_pricing(
+    monkeypatch, provider, utterance, expected_room
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "SELECTION_KB")
+
+    await session._process_utterance_bound(utterance)
+
+    request_text = _request_text(provider, client)
+    assert session._booking_slots.get("room_type") == expected_room
+    assert "SELECTION_KB" in request_text
+    assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "How much does Mount Monarch Chalet cost?",
+        "What is the price of Mount Monarch Chalet?",
+        "What is the price of the Mount Monarch Chalet?",
+        "How much is Mount Monarch Chalet for one night?",
+    ),
+)
+async def test_natural_explicit_room_price_forms_send_authoritative_rate(
+    monkeypatch, provider, utterance
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNUSED_KB")
+
+    await session._process_utterance_bound(utterance)
+
+    request_text = _request_text(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert "rate_per_room_per_night: 315000" in request_text
+    assert "UNUSED_KB" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_unknown_room_explicit_rate_request_is_authoritative_no_quote(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNKNOWN_ROOM_KB")
+
+    await session._process_utterance_bound(
+        "What is the room rate for Royal Villa?"
+    )
+
+    request_text = _request_text(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert "status: no_quote" in request_text
+    assert "reason: unknown_room" in request_text
+    assert "UNKNOWN_ROOM_KB" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_explicit_rate_follow_up_expires_after_a_non_rate_turn(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+        "check_in": "2026-09-26",
+        "check_out": "2026-09-29",
+    })
+
+    def retrieve(text: str) -> str:
+        return "FOLLOWUP_KB" if text == "How much is it?" else "SPA_KB"
+
+    monkeypatch.setattr(server, "retrieve_context", retrieve)
+    await session._process_utterance_bound("What is the room rate?")
+    await session._process_utterance_bound("Please tell me about the spa.")
+    await session._process_utterance_bound("How much is it?")
+
+    request_text = _request_text(provider, client)
+    assert "FOLLOWUP_KB" in request_text
+    assert "AUTHORITATIVE RATE RECORD" not in request_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_incomplete_rate_state_does_not_ground_an_amount_pronoun(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update({
+        "room_type": "Mount Monarch Chalet",
+        "residency": "resident",
+    })
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "INCOMPLETE_KB")
+
+    await session._process_utterance_bound("How much is it?")
+
+    request_text = _request_text(provider, client)
+    assert "INCOMPLETE_KB" in request_text
     assert "AUTHORITATIVE RATE RECORD" not in request_text
 
 
@@ -715,3 +982,39 @@ async def test_stale_smartpbx_runner_cannot_inherit_a_newer_turn_rate_context(mo
         message.get("content") == "Please describe the pool."
         for message in session.history
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_smartpbx_runner_cannot_commit_selection_or_residency_state(
+    monkeypatch,
+):
+    session, _client = _provider_session("openai")
+    session._smartpbx_transfer_context = object()
+    session._media_transport = SimpleNamespace(frames_dropped_total=0)
+    entered_kb = threading.Event()
+    release_kb = threading.Event()
+
+    def retrieve(text: str) -> str:
+        if text.startswith("I would like Mount Monarch Chalet"):
+            entered_kb.set()
+            assert release_kb.wait(timeout=5), "test must release the blocked KB call"
+        return "KB_DETAILS"
+
+    monkeypatch.setattr(server, "retrieve_context", retrieve)
+    session._active_smartpbx_turn_id = "turn-a"
+    stale_task = asyncio.create_task(
+        session._process_utterance_bound(
+            "I would like Mount Monarch Chalet. I am local."
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered_kb.wait, 1)
+        session._active_smartpbx_turn_id = "turn-b"
+        session._speak_generation += 1
+        await session._process_utterance_bound("Please tell me about the pool.")
+    finally:
+        release_kb.set()
+        await stale_task
+
+    assert "room_type" not in session._booking_slots
+    assert "residency" not in session._booking_slots
