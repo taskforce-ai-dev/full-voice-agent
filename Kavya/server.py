@@ -1254,10 +1254,12 @@ def _join_turn(accumulated: str, new_text: str) -> str:
 
 def _bounded_smartpbx_timeout_ms(raw: object) -> int:
     try:
-        value = int(round(float(raw)))
+        value = float(raw)
     except (TypeError, ValueError):
-        value = 8_000
-    return min(max(value, 1_000), 30_000)
+        return 8_000
+    if not math.isfinite(value):
+        return 8_000
+    return min(max(int(round(value)), 1_000), 30_000)
 
 
 def _smartpbx_timeout_seconds_to_ms(timeout: float) -> int:

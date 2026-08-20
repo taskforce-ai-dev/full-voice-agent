@@ -207,7 +207,8 @@ none of this timing applies outside a direct SmartPBX call.
   first-attempt grace after a verified thinking block. Metadata-only, visible
   text, tool generation, every retry, OpenAI, and Gemini keep the shared
   timeout. Setting it to `8.0` restores the previous timing; thinking remains
-  enabled and the Claude output ceiling remains `1024`.
+  enabled and this timeout change does not alter the separately configured
+  Claude output ceiling.
 
 On either timeout, or on an empty response (no text, no tool call) that has
 already used its one same-provider retry, Kavya cancels only that turn's own
