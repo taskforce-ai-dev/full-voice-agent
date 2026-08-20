@@ -5817,14 +5817,6 @@ class MediaStreamSession:
 
     def _rate_context_for_turn(self, text: str) -> str:
         """Return an authoritative rate/no-quote record only for a rate turn."""
-        normalized = str(text).lower()
-        rate_related = (
-            recognize_residency(text) is not None
-            or recognize_selected_room(text) is not None
-            or is_room_rate_intent(normalized)
-        )
-        if not rate_related:
-            return ""
         slots = self._booking_slots
         resolution = resolve_rate(
             room=slots.get("room_type", slots.get("room_name", "")),
@@ -5832,6 +5824,18 @@ class MediaStreamSession:
             check_in=slots.get("check_in", ""),
             check_out=slots.get("check_out", ""),
         )
+        has_grounded_rate_state = resolution.reason not in {
+            "unknown_room", "unknown_residency", "invalid_dates",
+        }
+        rate_related = (
+            recognize_residency(text) is not None
+            or recognize_selected_room(text) is not None
+            or is_room_rate_intent(
+                text, has_grounded_rate_state=has_grounded_rate_state,
+            )
+        )
+        if not rate_related:
+            return ""
         return resolution.authoritative_context()
 
     def _current_rate_context(self) -> str:

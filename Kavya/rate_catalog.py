@@ -112,10 +112,37 @@ def recognize_residency(utterance: str) -> str | None:
     return candidates.pop()
 
 
-def is_room_rate_intent(utterance: str) -> bool:
-    """Recognize only bounded language that prices a room stay itself."""
-    normalized = " ".join(re.findall(r"[a-z]+", str(utterance).lower()))
-    return bool(_ROOM_RATE_INTENT.search(normalized))
+def _matching_canonical_rooms(tokens: tuple[str, ...]) -> list[str]:
+    matches: list[str] = []
+    for room in yanolja_service.DEMO_NIGHTLY_RATE_USD:
+        room_tokens = tuple(re.findall(r"[a-z]+", room.lower()))
+        if any(
+            tokens[index:index + len(room_tokens)] == room_tokens
+            for index in range(len(tokens) - len(room_tokens) + 1)
+        ):
+            matches.append(room)
+    return matches
+
+
+def is_room_rate_intent(
+    utterance: str, *, has_grounded_rate_state: bool = False,
+) -> bool:
+    """Recognize bounded room-price language, never arbitrary price subjects."""
+    tokens = tuple(re.findall(r"[a-z]+", str(utterance).lower()))
+    normalized = " ".join(tokens)
+    if _ROOM_RATE_INTENT.search(normalized):
+        return True
+    if has_grounded_rate_state and tokens == ("how", "much", "is", "it"):
+        return True
+    matches = _matching_canonical_rooms(tokens)
+    if len(matches) != 1:
+        return False
+    room_tokens = tuple(re.findall(r"[a-z]+", matches[0].lower()))
+    return any(
+        tokens[index:index + 3] == ("how", "much", "is")
+        and tokens[index + 3:index + 3 + len(room_tokens)] == room_tokens
+        for index in range(len(tokens) - len(room_tokens) - 2)
+    )
 
 
 def recognize_selected_room(utterance: str) -> str | None:
@@ -124,15 +151,7 @@ def recognize_selected_room(utterance: str) -> str | None:
     if not tokens:
         return None
     normalized = " ".join(tokens)
-    matches: list[str] = []
-    for room in yanolja_service.DEMO_NIGHTLY_RATE_USD:
-        room_tokens = tuple(re.findall(r"[a-z]+", room.lower()))
-        if not any(
-            tokens[index:index + len(room_tokens)] == room_tokens
-            for index in range(len(tokens) - len(room_tokens) + 1)
-        ):
-            continue
-        matches.append(room)
+    matches = _matching_canonical_rooms(tokens)
     if len(matches) != 1:
         return None
     if tokens == tuple(re.findall(r"[a-z]+", matches[0].lower())):
