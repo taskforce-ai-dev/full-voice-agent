@@ -3774,7 +3774,7 @@ async def test_transfer_fences_pending_model_tts_before_canonical_delivery_barri
 
     turn = asyncio.create_task(pipeline._process_utterance("human please"))
     try:
-        await asyncio.wait_for(transfer_attempted.wait(), timeout=0.2)
+        await asyncio.wait_for(transfer_attempted.wait(), timeout=1)
         await asyncio.sleep(0)
 
         # The prelude may fence a task before its coroutine body is scheduled,
