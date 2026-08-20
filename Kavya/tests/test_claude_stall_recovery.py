@@ -163,13 +163,22 @@ def completed_tool_events():
 
 
 async def deterministic_timeout_guard(
-    source, *, initial_timeout: float, stall_timeout: float
+    source, *, initial_timeout: float, stall_timeout: float,
+    stall_timeout_getter=None,
 ):
     first = True
     async for event in source:
         if isinstance(event, IdleFor):
-            timeout = initial_timeout if first else stall_timeout
-            source.observed_stall_timeouts.append(stall_timeout)
+            timeout = (
+                initial_timeout
+                if first
+                else (
+                    stall_timeout_getter()
+                    if stall_timeout_getter is not None
+                    else stall_timeout
+                )
+            )
+            source.observed_stall_timeouts.append(timeout)
             if event.seconds > timeout:
                 import server
 
@@ -267,7 +276,7 @@ def assert_timeout_log_contract(
     assert fields["retrying"] in {"true", "false"}
     assert re.fullmatch(r"[1-9]", fields["attempt"])
     assert re.fullmatch(r"[0-9]{1,6}", fields["timeout_ms"])
-    assert 0 <= int(fields["timeout_ms"]) <= 600_000
+    assert 1_000 <= int(fields["timeout_ms"]) <= 30_000
 
 
 def thinking_idle(seconds: float) -> IdleFor:
@@ -363,9 +372,12 @@ async def test_thinking_attempts_both_past_limits_recover_once_without_third_req
     [
         (None, 8.0, 12.0),
         ("", 8.0, 12.0),
-        ("9", 8.0, 12.0),
+        ("invalid", 8.0, 12.0),
+        ("8", 8.0, 8.0),
+        ("9", 8.0, 9.0),
         ("12", 8.0, 12.0),
         ("20", 8.0, 20.0),
+        ("8", 16.0, 16.0),
         ("12", 16.0, 16.0),
     ],
 )
@@ -380,6 +392,43 @@ def test_claude_thinking_stall_timeout_is_blank_safe_defaulted_and_maxed(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("events", "progress"),
+    [
+        ([message_start(), thinking_idle(9.0)], "metadata"),
+        (
+            [
+                message_start(),
+                text_event("Visible text without a terminal stop"),
+                thinking_idle(9.0),
+            ],
+            "text",
+        ),
+        ([message_start(), *tool_start_events(), thinking_idle(9.0)], "tool"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_first_attempt_non_thinking_stalls_keep_the_general_budget(
+    monkeypatch, events, progress,
+):
+    """Only verified thinking may extend an initial Claude stall window."""
+    import server
+
+    first_round = timeout_round(events)
+    client = ScriptedClaude([first_round])
+    pipeline = direct_pipeline(server, client)
+    install_deterministic_stream(monkeypatch, server)
+    install_quiet_filler(monkeypatch, pipeline)
+    spoken = install_recording_speak(monkeypatch, pipeline)
+
+    result = await pipeline._run_llm_claude()
+
+    assert first_round.observed_stall_timeouts == [8.0], progress
+    assert len(client.requests) == 1
+    assert spoken == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
+    assert result == server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
 
 
 @pytest.mark.asyncio
