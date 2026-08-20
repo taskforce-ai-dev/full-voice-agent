@@ -5929,7 +5929,8 @@ class MediaStreamSession:
     def _booking_slots_note(self) -> str:
         """Render the captured slots as a context block, or '' when empty."""
         slots = self._booking_slots
-        if not slots:
+        rate_context = self._current_rate_context()
+        if not slots and not rate_context:
             return ""
         lines: list[str] = []
         if slots.get("guest_name"):
@@ -5957,9 +5958,6 @@ class MediaStreamSession:
             lines.append(f"- room: {room}")
         if slots.get("guest_phone"):
             lines.append(f"- phone: {slots['guest_phone']}")
-        rate_context = self._current_rate_context()
-        if not lines and not rate_context:
-            return ""
         joined = "\n".join(lines)
         return _BOOKING_SLOTS_NOTE_PREFIX + joined + (
             f"\n\n{rate_context}" if rate_context else ""

@@ -39,9 +39,7 @@ _ROOM_AMOUNT_SUFFIXES = frozenset({
     ("per", "room", "per", "night"),
     ("for", "one", "night"),
 })
-_NON_ROOM_PRICE_SUBJECTS = frozenset({
-    "spa", "dinner", "activity", "activities", "restaurant",
-})
+_ROOM_TARGET_NOUNS = frozenset({"room", "suite", "chalet", "villa"})
 
 
 @dataclass(frozen=True)
@@ -135,13 +133,6 @@ def _matching_canonical_rooms(tokens: tuple[str, ...]) -> list[str]:
     return [room for _index, room in sorted(matches)]
 
 
-def _contains_tokens(tokens: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
-    return any(
-        tokens[index:index + len(phrase)] == phrase
-        for index in range(len(tokens) - len(phrase) + 1)
-    )
-
-
 def _room_after(
     tokens: tuple[str, ...],
     prefix: tuple[str, ...],
@@ -156,6 +147,76 @@ def _room_after(
         ):
             return tokens[room_end:]
     return None
+
+
+def _target_after_prefix(
+    tokens: tuple[str, ...], prefix: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    """Return a non-empty explicit target immediately after ``prefix``."""
+    for index in range(len(tokens) - len(prefix) + 1):
+        if tokens[index:index + len(prefix)] == prefix:
+            target = tokens[index + len(prefix):]
+            if target[:1] == ("the",):
+                target = target[1:]
+            return target or None
+    return None
+
+
+def _target_before_cost(tokens: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Return a target from the bounded ``how much does TARGET cost`` form."""
+    for prefix in (("how", "much", "does"), ("how", "much", "does", "the")):
+        if tokens[:len(prefix)] != prefix or tokens[-1:] != ("cost",):
+            continue
+        target = tokens[len(prefix):-1]
+        return target or None
+    return None
+
+
+def _is_room_like_target(target: tuple[str, ...] | None) -> bool:
+    """Accept unknown targets only when their noun explicitly denotes a room."""
+    return bool(target) and target[-1] in _ROOM_TARGET_NOUNS
+
+
+def _is_targetless_generic_room_rate(tokens: tuple[str, ...]) -> bool:
+    """Recognize only direct room-rate questions that rely on stored room state."""
+    for prefix in ((), ("what", "is"), ("what", "are")):
+        tail = tokens[len(prefix):]
+        if tail in {
+            ("room", "rate"),
+            ("the", "room", "rate"),
+            ("nightly", "rate"),
+            ("the", "nightly", "rate"),
+        }:
+            return True
+    return False
+
+
+def _is_canonical_room_list(
+    target: tuple[str, ...] | None, rooms: tuple[str, ...],
+) -> bool:
+    """Require an explicit list made entirely of the canonical room targets."""
+    if not target:
+        return False
+    index = 0
+    matched: list[str] = []
+    while index < len(target):
+        if target[index] in {"and", "or"}:
+            index += 1
+            continue
+        room = next(
+            (
+                candidate
+                for candidate in rooms
+                if target[index:index + len(re.findall(r"[a-z]+", candidate.lower()))]
+                == tuple(re.findall(r"[a-z]+", candidate.lower()))
+            ),
+            None,
+        )
+        if room is None or room in matched:
+            return False
+        matched.append(room)
+        index += len(re.findall(r"[a-z]+", room.lower()))
+    return len(matched) == len(rooms)
 
 
 def _is_room_rate_form(tokens: tuple[str, ...], room: str) -> bool:
@@ -175,42 +236,59 @@ def _is_room_rate_form(tokens: tuple[str, ...], room: str) -> bool:
         suffix = _room_after(tokens, prefix, room_tokens)
         if suffix in suffixes:
             return True
-    return _contains_tokens(tokens, ("room", "rate")) or _contains_tokens(
-        tokens, ("nightly", "rate")
-    )
+    return _is_targetless_generic_room_rate(tokens)
 
 
-def _looks_like_rate_request(tokens: tuple[str, ...]) -> bool:
-    return (
-        _contains_tokens(tokens, ("room", "rate"))
-        or _contains_tokens(tokens, ("nightly", "rate"))
-        or tokens[:2] == ("how", "much")
-        or "price" in tokens
-        or "cost" in tokens
-        or "rate" in tokens
-        or "rates" in tokens
-    )
+def _is_explicit_unknown_room_target(tokens: tuple[str, ...]) -> bool:
+    """Recognize only room-bound grammar for an unknown named room target."""
+    for prefix in (("room", "rate", "for"), ("nightly", "rate", "for")):
+        if _target_after_prefix(tokens, prefix):
+            return True
+    for prefix in (("rate", "for"), ("price", "of"), ("cost", "of")):
+        if _is_room_like_target(_target_after_prefix(tokens, prefix)):
+            return True
+    return _is_room_like_target(_target_before_cost(tokens))
+
+
+def _is_ambiguous_room_rate_form(
+    tokens: tuple[str, ...], rooms: tuple[str, ...],
+) -> bool:
+    """Accept only explicit price grammar whose target is exactly those rooms."""
+    if tokens[:3] == ("how", "much", "are") and _is_canonical_room_list(
+        tokens[3:], rooms,
+    ):
+        return True
+    for prefix in (
+        ("room", "rate", "for"),
+        ("nightly", "rate", "for"),
+        ("rate", "for"),
+        ("price", "of"),
+        ("cost", "of"),
+    ):
+        if _is_canonical_room_list(_target_after_prefix(tokens, prefix), rooms):
+            return True
+    target = _target_before_cost(tokens)
+    return _is_canonical_room_list(target, rooms)
 
 
 def classify_room_rate_intent(utterance: str) -> RoomRateIntent:
     """Classify only grammar-bound room-price requests, never price-like prose."""
     tokens = tuple(re.findall(r"[a-z]+", str(utterance).lower()))
-    if not tokens or _NON_ROOM_PRICE_SUBJECTS.intersection(tokens):
+    if not tokens:
         return RoomRateIntent("NONE")
     rooms = tuple(_matching_canonical_rooms(tokens))
     if len(rooms) > 1:
         return (
             RoomRateIntent("AMBIGUOUS_RATE", rooms)
-            if _looks_like_rate_request(tokens)
+            if _is_ambiguous_room_rate_form(tokens, rooms)
             else RoomRateIntent("NONE")
         )
     if len(rooms) == 1 and _is_room_rate_form(tokens, rooms[0]):
         return RoomRateIntent("RATE", rooms)
-    if not rooms and _looks_like_rate_request(tokens):
-        return RoomRateIntent(
-            "RATE",
-            unresolved=_contains_tokens(tokens, ("room", "rate", "for")),
-        )
+    if not rooms and _is_explicit_unknown_room_target(tokens):
+        return RoomRateIntent("RATE", unresolved=True)
+    if not rooms and _is_targetless_generic_room_rate(tokens):
+        return RoomRateIntent("RATE")
     return RoomRateIntent("NONE")
 
 

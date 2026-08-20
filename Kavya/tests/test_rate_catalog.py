@@ -417,6 +417,22 @@ def _request_text(provider: str, client) -> str:
     return str(request["system"]) + str(request["messages"])
 
 
+def _current_turn_request_text(provider: str, client) -> str:
+    """Return only the system/current-user request scope, not prior turn history."""
+    request = client.requests[-1]
+    if provider == "openai":
+        messages = request["messages"]
+        current_user = next(
+            message for message in reversed(messages) if message["role"] == "user"
+        )
+        return str(messages[0]["content"]) + str(current_user["content"])
+    if provider == "gemini":
+        current_user = request["contents"][-1]
+        return str(request["config"]["system_instruction"]) + str(current_user)
+    current_user = request["messages"][-1]
+    return str(request["system"]) + str(current_user["content"])
+
+
 def _availability_input() -> dict[str, str]:
     return {"check_in": "2026-09-26", "check_out": "2026-09-29"}
 
@@ -445,7 +461,7 @@ async def test_real_availability_then_selected_room_then_residency_sends_one_exa
     await session._process_utterance_bound("I am a Sri Lankan resident.")
 
     assert session._booking_slots["room_type"] == "Mount Monarch Chalet"
-    request_text = _request_text(provider, client)
+    request_text = _current_turn_request_text(provider, client)
     assert "AUTHORITATIVE RATE RECORD" in request_text
     assert "rate_per_room_per_night: 315000" in request_text
     assert "CONTRADICTORY_RATE" not in request_text
@@ -605,7 +621,7 @@ async def test_direct_selection_then_explicit_room_rate_sends_authoritative_rate
     await session._process_utterance_bound("I would like Mount Monarch Chalet.")
     await session._process_utterance_bound("What is the room rate?")
 
-    request_text = _request_text(provider, client)
+    request_text = _current_turn_request_text(provider, client)
     assert "AUTHORITATIVE RATE RECORD" in request_text
     assert "rate_per_room_per_night: 315000" in request_text
     assert "UNUSED_KB" not in request_text
