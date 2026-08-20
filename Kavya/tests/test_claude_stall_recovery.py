@@ -395,6 +395,40 @@ def test_claude_thinking_stall_timeout_is_blank_safe_defaulted_and_maxed(
 
 
 @pytest.mark.parametrize(
+    "raw",
+    (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "malformed-timeout",
+    ),
+)
+def test_timeout_ms_coercion_falls_back_safely_for_nonfinite_and_malformed_values(raw):
+    """External timeout input must never escape the bounded telemetry contract."""
+    import server
+
+    assert server._bounded_smartpbx_timeout_ms(raw) == 8_000
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "malformed-timeout",
+    ),
+)
+def test_stream_timeout_binds_adversarial_timeout_values_before_recovery(raw):
+    import server
+
+    timeout = server._SmartPBXStreamTimeout(phase="stall", timeout_ms=raw)
+
+    assert timeout.timeout_ms == 8_000
+    assert 1_000 <= timeout.timeout_ms <= 30_000
+
+
+@pytest.mark.parametrize(
     ("events", "progress"),
     [
         (
@@ -901,6 +935,41 @@ async def test_stream_timeout_unknown_provider_is_bounded_and_privacy_safe(caplo
     )
     assert sentinel not in caplog.text
     assert "PHONE_SENTINEL_0771234567" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "malformed-timeout PRIVATE_TIMEOUT_SENTINEL",
+    ),
+)
+@pytest.mark.asyncio
+async def test_timeout_recovery_logs_only_the_bounded_numeric_deadline_for_adversarial_input(
+    raw, caplog
+):
+    import server
+
+    pipeline = direct_pipeline(server, ScriptedClaude([]))
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._smartpbx_handle_stream_timeout(
+            server._SmartPBXStreamTimeout(phase="stall", timeout_ms=raw),
+            provider="claude",
+            tool_executed=False,
+            gen=pipeline._speak_generation,
+            full_text="",
+            recover=False,
+        )
+
+    timeout_lines = [line for line in caplog.messages if "llm_stream_timeout" in line]
+    assert timeout_lines
+    assert_timeout_log_contract(
+        timeout_lines[0], progress="none", phase="stall", retrying="false"
+    )
+    assert "PRIVATE_TIMEOUT_SENTINEL" not in caplog.text
 
 
 @pytest.mark.asyncio

@@ -514,6 +514,16 @@ def test_smartpbx_stream_timeout_knobs_are_blank_safe_and_documented():
     assert "Twilio Media Streams" in runbook.split(
         "## Direct SmartPBX English reliability timing", 1
     )[1][:600]
+    timing = runbook.split("## Direct SmartPBX English reliability timing", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    assert "does not alter the separately configured Claude output ceiling" in timing
+    assert "output ceiling remains `1024`" not in timing
+
+    budget = runbook.split("## Claude direct SmartPBX output budget", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    assert "600" in budget
 
 
 def test_runbook_allowlists_llm_round_outcome_with_its_exact_bounded_field_set():
