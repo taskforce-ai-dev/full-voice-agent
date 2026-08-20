@@ -39,6 +39,11 @@ _ROOM_RATE_INTENT = re.compile(
     r"|\bper\s+(?:room\s+)?night\b"
     r"|\b(?:lkr|usd)\b"
 )
+_ROOM_AMOUNT_SUFFIXES = frozenset({
+    (),
+    ("per", "night"),
+    ("per", "room", "per", "night"),
+})
 
 
 @dataclass(frozen=True)
@@ -138,11 +143,15 @@ def is_room_rate_intent(
     if len(matches) != 1:
         return False
     room_tokens = tuple(re.findall(r"[a-z]+", matches[0].lower()))
-    return any(
-        tokens[index:index + 3] == ("how", "much", "is")
-        and tokens[index + 3:index + 3 + len(room_tokens)] == room_tokens
-        for index in range(len(tokens) - len(room_tokens) - 2)
-    )
+    for index in range(len(tokens) - len(room_tokens) - 2):
+        room_end = index + 3 + len(room_tokens)
+        if (
+            tokens[index:index + 3] == ("how", "much", "is")
+            and tokens[index + 3:room_end] == room_tokens
+            and tokens[room_end:] in _ROOM_AMOUNT_SUFFIXES
+        ):
+            return True
+    return False
 
 
 def recognize_selected_room(utterance: str) -> str | None:
