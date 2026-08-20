@@ -474,17 +474,18 @@ def test_runbook_smartpbx_template_keeps_caller_rhythm_knobs_blank_and_private()
 
 
 def test_smartpbx_stream_timeout_knobs_are_blank_safe_and_documented():
-    # Phase B: SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS/
-    # SMARTPBX_LLM_STALL_TIMEOUT_SECONDS must be deliverable through the
-    # smartpbx service's explicit environment allowlist (not env_file), blank
-    # in .env.example/the runbook template (resolved in code, default 8.0s),
-    # and documented in the runbook narrative.
+    # Phase B: the direct SmartPBX timeout knobs must be deliverable through
+    # the smartpbx service's explicit environment allowlist (not env_file),
+    # blank in .env.example/the runbook template (resolved in code), and
+    # documented in the runbook narrative. Claude's thinking grace defaults
+    # to 12.0s and is still subject to the effective general-stall maximum.
     compose = yaml.safe_load(read_text("docker-compose.yml"))
     smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
 
     for name in (
         "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS",
         "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS",
+        "SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS",
     ):
         assert smartpbx_env.get(name) == f"${{{name}:-}}", (
             f"{name} must be in the smartpbx environment allowlist to reach the container"
@@ -494,6 +495,7 @@ def test_smartpbx_stream_timeout_knobs_are_blank_safe_and_documented():
     for name in (
         "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS",
         "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS",
+        "SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS",
     ):
         assert re.search(rf"^{name}=$", example, re.MULTILINE)
         assert re.search(rf"^{name}=\d", example, re.MULTILINE) is None
@@ -503,6 +505,7 @@ def test_smartpbx_stream_timeout_knobs_are_blank_safe_and_documented():
     for name in (
         "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS",
         "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS",
+        "SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS",
     ):
         assert re.search(rf"^{name}=$", template, re.MULTILINE)
         assert re.search(rf"^{name}=\d", template, re.MULTILINE) is None
