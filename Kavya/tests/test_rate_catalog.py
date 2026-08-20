@@ -268,11 +268,51 @@ def test_room_rate_classifier_has_structured_ambiguous_and_natural_price_results
 @pytest.mark.parametrize(
     "utterance",
     (
+        "How much is Mount Monarch Chalet or Mount Luxe Chalet?",
+        "How much are Mount Monarch Chalet and Mount Luxe Chalet?",
+        "How much is Mount Monarch Chalet or Mount Luxe Chalet per night?",
+        "How much are Mount Monarch Chalet and Mount Luxe Chalet per night?",
+        "How much is Mount Monarch Chalet or Mount Luxe Chalet per room per night?",
+        "How much are Mount Monarch Chalet and Mount Luxe Chalet per room per night?",
+        "How much is Mount Monarch Chalet or Mount Luxe Chalet for one night?",
+        "How much are Mount Monarch Chalet and Mount Luxe Chalet for one night?",
+    ),
+)
+def test_room_rate_classifier_resolves_ambiguous_amount_grammar_before_target_count(
+    utterance,
+):
+    classification = _rate_intent(utterance)
+
+    assert classification.kind == "AMBIGUOUS_RATE"
+    assert classification.rooms == ("Mount Monarch Chalet", "Mount Luxe Chalet")
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "How much is Royal Villa?",
+        "How much is Royal Villa per night?",
+        "How much is Royal Villa per room per night?",
+        "How much is Royal Villa for one night?",
+    ),
+)
+def test_room_rate_classifier_marks_unknown_room_noun_amount_forms_unresolved(utterance):
+    classification = _rate_intent(utterance)
+
+    assert classification.kind == "RATE"
+    assert classification.rooms == ()
+    assert classification.unresolved
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    (
         "What are the spa rates?",
         "How much does dinner cost?",
         "What is the activity price in USD?",
         "What is the spa cost in LKR per night?",
         "Does the room cost include dinner?",
+        "How much is dinner?",
     ),
 )
 def test_room_rate_classifier_rejects_non_room_price_subjects(utterance):
@@ -766,7 +806,14 @@ async def test_ungrounded_amount_pronoun_remains_a_descriptive_kb_turn(
     "utterance",
     (
         "What is the room rate for Mount Monarch Chalet or Mount Luxe Chalet?",
+        "How much is Mount Monarch Chalet or Mount Luxe Chalet?",
         "How much are Mount Monarch Chalet and Mount Luxe Chalet?",
+        "How much is Mount Monarch Chalet or Mount Luxe Chalet per night?",
+        "How much are Mount Monarch Chalet and Mount Luxe Chalet per night?",
+        "How much is Mount Monarch Chalet or Mount Luxe Chalet per room per night?",
+        "How much are Mount Monarch Chalet and Mount Luxe Chalet per room per night?",
+        "How much is Mount Monarch Chalet or Mount Luxe Chalet for one night?",
+        "How much are Mount Monarch Chalet and Mount Luxe Chalet for one night?",
     ),
 )
 async def test_ambiguous_multi_room_rate_requests_are_no_quote_without_stale_room(
@@ -801,6 +848,7 @@ async def test_ambiguous_multi_room_rate_requests_are_no_quote_without_stale_roo
         "What is the activity price in USD?",
         "What is the spa cost in LKR per night?",
         "Does the room cost include dinner?",
+        "How much is dinner?",
     ),
 )
 async def test_non_room_price_subjects_keep_semantic_kb(
@@ -908,6 +956,10 @@ async def test_unknown_room_explicit_rate_request_is_authoritative_no_quote(
     (
         "What is the price of Royal Villa?",
         "How much does Royal Villa cost?",
+        "How much is Royal Villa?",
+        "How much is Royal Villa per night?",
+        "How much is Royal Villa per room per night?",
+        "How much is Royal Villa for one night?",
     ),
 )
 async def test_unknown_room_price_grammar_cannot_reuse_a_persisted_room(
