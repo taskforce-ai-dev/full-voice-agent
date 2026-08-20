@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date
 import re
 
-from yanolja_service import DEMO_NIGHTLY_RATE_USD
+import yanolja_service
 
 
 RESIDENT = "resident"
@@ -26,6 +26,11 @@ _RESIDENT_NIGHTLY_RATE_LKR: dict[str, tuple[int, int]] = {
 }
 _OFF_PEAK_MONTHS = frozenset({2, 3, 5, 6, 7, 8, 9, 10, 11})
 _PEAK_MONTHS = frozenset({4, 12})
+_ROOM_SELECTION_PREFIXES = (
+    "i choose ", "we choose ", "i would like ", "we would like ",
+    "i want ", "we want ", "i will take ", "we will take ",
+    "ill take ", "well take ",
+)
 
 
 @dataclass(frozen=True)
@@ -51,15 +56,13 @@ class RateResolution:
                 f"- rate_per_room_per_night: {self.nightly_rate}\n"
                 "- quote only this exact record; do not select a price from reference context."
             )
-        if self.reason == "mixed_period":
-            return (
-                "AUTHORITATIVE RATE RECORD:\n"
-                f"- room: {self.room}\n"
-                f"- residency: {self.residency}\n"
-                "- status: mixed_period\n"
-                "- do not quote one nightly rate; ask for clarification or offer human confirmation."
-            )
-        return ""
+        return (
+            "AUTHORITATIVE RATE RECORD:\n"
+            "- status: no_quote\n"
+            f"- reason: {self.reason}\n"
+            "- do not quote a rate from reference context; ask for the missing "
+            "detail or offer human confirmation."
+        )
 
 
 def recognize_residency(utterance: str) -> str | None:
@@ -72,28 +75,42 @@ def recognize_residency(utterance: str) -> str | None:
     normalized = " ".join(re.findall(r"[a-z]+", str(utterance).lower()))
     if not normalized:
         return None
-    foreign_phrases = (
-        "not a sri lankan resident",
-        "not sri lankan resident",
-        "not local",
-        "foreign guest",
-        "foreign visitor",
-        "international guest",
-        "from overseas",
-        "non resident",
-    )
-    if any(phrase in normalized for phrase in foreign_phrases):
-        return FOREIGN
-    resident_phrases = (
-        "sri lankan resident",
-        "local resident",
-        "i am local",
-        "im local",
-        "we are local",
-        "were local",
-    )
-    if any(phrase in normalized for phrase in resident_phrases):
-        return RESIDENT
+    if (
+        " but " in normalized
+        and any(term in normalized for term in ("local", "sri lankan resident"))
+        and any(term in normalized for term in ("foreign", "overseas", "non resident"))
+    ):
+        return None
+    subject = r"(?:i am|im|we are|were|my party is|our party is)"
+    candidates: set[str] = set()
+    if re.search(rf"\b{subject}\s+(?:a\s+)?(?:sri lankan resident|local resident|local)\b", normalized):
+        candidates.add(RESIDENT)
+    if re.search(
+        rf"\b{subject}\s+(?:not\s+(?:a\s+)?(?:sri lankan resident|local)|"
+        r"(?:a\s+)?(?:foreign guest|foreign visitor|foreign|international guest|non resident))\b",
+        normalized,
+    ):
+        candidates.add(FOREIGN)
+    # A terse direct answer is safe only when it contains no other subject or
+    # competing residency classification.
+    if normalized in {"not a sri lankan resident", "not sri lankan resident", "not local"}:
+        candidates.add(FOREIGN)
+    if len(candidates) != 1:
+        return None
+    return candidates.pop()
+
+
+def recognize_selected_room(utterance: str) -> str | None:
+    """Return one canonical room only from a clear guest selection statement."""
+    normalized = " ".join(re.findall(r"[a-z]+", str(utterance).lower()))
+    if not normalized:
+        return None
+    for room in yanolja_service.DEMO_NIGHTLY_RATE_USD:
+        room_words = " ".join(re.findall(r"[a-z]+", room.lower()))
+        if room_words not in normalized:
+            continue
+        if normalized == room_words or any(prefix in normalized for prefix in _ROOM_SELECTION_PREFIXES):
+            return room
     return None
 
 
@@ -137,18 +154,23 @@ def resolve_rate(
     canonical_room = str(room).strip()
     normalized_residency = _normalize_residency(residency)
     stay = _parse_stay(check_in, check_out)
-    if not canonical_room or canonical_room not in DEMO_NIGHTLY_RATE_USD:
+    if not canonical_room or canonical_room not in yanolja_service.DEMO_NIGHTLY_RATE_USD:
         return RateResolution(None, normalized_residency, None, None, "unknown_room")
     if normalized_residency is None:
         return RateResolution(canonical_room, None, None, None, "unknown_residency")
     if stay is None:
         return RateResolution(canonical_room, normalized_residency, None, None, "invalid_dates")
+    if not yanolja_service.DEMO_RATES_ENABLED:
+        return RateResolution(canonical_room, normalized_residency, None, None, "rates_disabled")
     if normalized_residency == FOREIGN:
+        rate = yanolja_service.demo_rate_for(canonical_room)
+        if rate is None:
+            return RateResolution(canonical_room, FOREIGN, None, None, "rates_disabled")
         return RateResolution(
             canonical_room,
             FOREIGN,
             "USD",
-            DEMO_NIGHTLY_RATE_USD[canonical_room],
+            rate,
         )
 
     season = _resident_season(*stay)

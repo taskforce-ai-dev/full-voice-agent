@@ -93,7 +93,7 @@ from booking_api import close_session, is_configured
 # agree on whether rates may be quoted. Already loaded transitively via
 # booking_api; the explicit import keeps the single source of truth visible.
 import yanolja_service
-from rate_catalog import recognize_residency, resolve_rate
+from rate_catalog import recognize_residency, recognize_selected_room, resolve_rate
 from post_call import (
     UNCONFIRMED_TRANSCRIPT_LABEL,
     UNCONFIRMED_TRANSCRIPT_ROLE,
@@ -4713,6 +4713,9 @@ class MediaStreamSession:
         # context every turn so they survive history trimming (a long
         # number-retry loop would otherwise evict the early date/guest turns).
         self._booking_slots: dict[str, str] = {}
+        # A rate record is turn-scoped: it controls only a rate decision and
+        # must not suppress descriptive KB retrieval on later unrelated turns.
+        self._turn_rate_context: str = ""
         # Active DTMF keypad collector while collect_number_via_keypad is running.
         self._dtmf_collector: DtmfCollector | None = None
         self.history: list[dict] = []
@@ -5800,11 +5803,27 @@ class MediaStreamSession:
     def _capture_explicit_residency(self, utterance: str) -> None:
         """Persist an explicit residency statement without inferring identity."""
         residency = recognize_residency(utterance)
-        if residency and "residency" not in self._booking_slots:
+        if residency:
             self._booking_slots["residency"] = residency
 
-    def _authoritative_rate_context(self) -> str:
-        """Return an exact price record only when booking state is sufficient."""
+    def _capture_selected_room(self, utterance: str) -> None:
+        """Persist a confirmed canonical room from the guest's selection turn."""
+        room = recognize_selected_room(utterance)
+        if room:
+            self._booking_slots["room_type"] = room
+
+    def _rate_context_for_turn(self, text: str) -> str:
+        """Return an authoritative rate/no-quote record only for a rate turn."""
+        normalized = str(text).lower()
+        rate_related = (
+            recognize_residency(text) is not None
+            or recognize_selected_room(text) is not None
+            or any(phrase in normalized for phrase in (
+                "rate", "price", "cost", "quote", "how much", "per night", "lkr", "usd",
+            ))
+        )
+        if not rate_related:
+            return ""
         slots = self._booking_slots
         resolution = resolve_rate(
             room=slots.get("room_type", slots.get("room_name", "")),
@@ -5816,7 +5835,7 @@ class MediaStreamSession:
 
     def _compose_turn_user_message(self, text: str, kb_context: str) -> str:
         """Keep semantic KB prose out of a deterministic-rate model request."""
-        if self._authoritative_rate_context():
+        if self._turn_rate_context:
             return text
         if kb_context and "No knowledge base loaded" not in kb_context:
             return f"[Reference context: {kb_context}]\n\nGuest: {text}"
@@ -5853,7 +5872,7 @@ class MediaStreamSession:
             lines.append(f"- room: {room}")
         if slots.get("guest_phone"):
             lines.append(f"- phone: {slots['guest_phone']}")
-        rate_context = self._authoritative_rate_context()
+        rate_context = self._turn_rate_context
         if not lines and not rate_context:
             return ""
         joined = "\n".join(lines)
@@ -7106,7 +7125,9 @@ class MediaStreamSession:
         telemetry: SmartPBXTurnTelemetry | None,
     ) -> None:
         self._last_guest_utterance_raw = text
+        self._capture_selected_room(text)
         self._capture_explicit_residency(text)
+        self._turn_rate_context = self._rate_context_for_turn(text)
         self._capture_success_this_turn = False
         self._start_assistant_turn_delivery_tracking()
         outcome = "completed"
@@ -7116,7 +7137,7 @@ class MediaStreamSession:
             # An exact price record is authoritative and deliberately excludes
             # semantic rate prose for this turn. General descriptive turns keep
             # the normal KB retrieval path.
-            if self._authoritative_rate_context():
+            if self._turn_rate_context:
                 kb_context = ""
             else:
                 # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
