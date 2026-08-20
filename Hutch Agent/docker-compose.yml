@@ -97,6 +97,7 @@ services:
       SENTRY_SEND_PII: "false"
       SENTRY_ENABLE_LOGS: "false"
       KB_DOCS_DIRECTORY: /app/knowledge_docs
+      KB_N_RESULTS: "${KB_N_RESULTS:-8}"
       SMARTPBX_WS_TOKEN: "${SMARTPBX_WS_TOKEN}"
       SMARTPBX_ACCOUNT_ID: "${SMARTPBX_ACCOUNT_ID}"
       SMARTPBX_MAX_CALLS: "4"
