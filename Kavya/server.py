@@ -607,6 +607,25 @@ def _resolve_smartpbx_llm_stall_timeout_seconds(raw: object) -> float:
     return min(max(value, 1.0), 30.0)
 
 
+def _resolve_smartpbx_claude_thinking_stall_timeout_seconds(
+    raw: object, general_stall_timeout: float,
+) -> float:
+    """Resolve Claude's first-attempt thinking grace without weakening stalls.
+
+    An explicit value may lower the grace to the normal stall deadline for a
+    fast rollback. The general deadline remains the floor, so this setting can
+    never make any direct SmartPBX stream less responsive than the shared
+    policy.
+    """
+    try:
+        value = float(raw) if raw not in (None, "") else 12.0
+    except (TypeError, ValueError):
+        value = 12.0
+    if not math.isfinite(value):
+        value = 12.0
+    return max(min(max(value, 1.0), 30.0), general_stall_timeout)
+
+
 SMARTPBX_MAX_TOKENS: int = _resolve_smartpbx_max_tokens(
     os.getenv("SMARTPBX_MAX_TOKENS")
 )
@@ -621,6 +640,12 @@ SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS: float = _resolve_smartpbx_initial
 )
 SMARTPBX_LLM_STALL_TIMEOUT_SECONDS: float = _resolve_smartpbx_llm_stall_timeout_seconds(
     os.getenv("SMARTPBX_LLM_STALL_TIMEOUT_SECONDS")
+)
+SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS: float = (
+    _resolve_smartpbx_claude_thinking_stall_timeout_seconds(
+        os.getenv("SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS"),
+        SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
+    )
 )
 MAX_HISTORY_MESSAGES: int = 60
 MAX_TOOL_ROUNDS: int = 5
@@ -1227,6 +1252,20 @@ def _join_turn(accumulated: str, new_text: str) -> str:
     return accumulated + " " + new_text
 
 
+def _bounded_smartpbx_timeout_ms(raw: object) -> int:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 8_000
+    if not math.isfinite(value):
+        return 8_000
+    return min(max(int(round(value)), 1_000), 30_000)
+
+
+def _smartpbx_timeout_seconds_to_ms(timeout: float) -> int:
+    return _bounded_smartpbx_timeout_ms(timeout * 1_000)
+
+
 class _SmartPBXStreamTimeout(Exception):
     """Raised when a direct-SmartPBX provider stream stalls or never starts.
 
@@ -1238,8 +1277,13 @@ class _SmartPBXStreamTimeout(Exception):
     PHASE_INITIAL = "initial"
     PHASE_STALL = "stall"
 
-    def __init__(self, *, phase: str) -> None:
+    def __init__(self, *, phase: str, timeout_ms: int | None = None) -> None:
         self.phase = phase
+        self.timeout_ms = (
+            _bounded_smartpbx_timeout_ms(timeout_ms)
+            if timeout_ms is not None
+            else None
+        )
         super().__init__(phase)
 
 
@@ -1258,7 +1302,10 @@ async def _smartpbx_acquire_stream_within_deadline(acquire, *, timeout: float):
     try:
         return await asyncio.wait_for(acquire(), timeout=timeout)
     except asyncio.TimeoutError:
-        raise _SmartPBXStreamTimeout(phase=_SmartPBXStreamTimeout.PHASE_INITIAL) from None
+        raise _SmartPBXStreamTimeout(
+            phase=_SmartPBXStreamTimeout.PHASE_INITIAL,
+            timeout_ms=_smartpbx_timeout_seconds_to_ms(timeout),
+        ) from None
 
 
 class _TimeoutGuardedAsyncCM:
@@ -1283,7 +1330,10 @@ class _TimeoutGuardedAsyncCM:
         try:
             result = await asyncio.wait_for(self._cm.__aenter__(), timeout=self._timeout)
         except asyncio.TimeoutError:
-            raise _SmartPBXStreamTimeout(phase=_SmartPBXStreamTimeout.PHASE_INITIAL) from None
+            raise _SmartPBXStreamTimeout(
+                phase=_SmartPBXStreamTimeout.PHASE_INITIAL,
+                timeout_ms=_smartpbx_timeout_seconds_to_ms(self._timeout),
+            ) from None
         self._entered = True
         return result
 
@@ -1294,15 +1344,21 @@ class _TimeoutGuardedAsyncCM:
 
 
 async def _smartpbx_timeout_guarded_stream(
-    source, *, initial_timeout: float, stall_timeout: float,
+    source,
+    *,
+    initial_timeout: float,
+    stall_timeout: float,
+    stall_timeout_getter: Callable[[], float] | None = None,
 ):
     """Re-yield ``source``'s items, raising ``_SmartPBXStreamTimeout`` on stall.
 
     Shared by all three Media Streams provider runners (OpenAI, Gemini,
     Claude) on the direct SmartPBX English path only. The FIRST item must
     arrive within ``initial_timeout``; every item after that must arrive
-    within ``stall_timeout`` of the previous one. No total stream deadline —
-    content that keeps arriving keeps the guard resetting.
+    within ``stall_timeout`` of the previous one. Callers may provide a
+    bounded ``stall_timeout_getter`` when their already-closed progress state
+    changes that interval. No total stream deadline — content that keeps
+    arriving keeps the guard resetting.
 
     ``initial_timeout`` here is expected to already be the REMAINDER of the
     provider's initial-response budget after stream acquisition (see
@@ -1313,7 +1369,15 @@ async def _smartpbx_timeout_guarded_stream(
     aiter = source.__aiter__()
     first = True
     while True:
-        timeout = initial_timeout if first else stall_timeout
+        timeout = (
+            initial_timeout
+            if first
+            else (
+                stall_timeout_getter()
+                if stall_timeout_getter is not None
+                else stall_timeout
+            )
+        )
         try:
             item = await asyncio.wait_for(aiter.__anext__(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -1322,7 +1386,8 @@ async def _smartpbx_timeout_guarded_stream(
                     _SmartPBXStreamTimeout.PHASE_INITIAL
                     if first
                     else _SmartPBXStreamTimeout.PHASE_STALL
-                )
+                ),
+                timeout_ms=_smartpbx_timeout_seconds_to_ms(timeout),
             ) from None
         except StopAsyncIteration:
             return
@@ -5560,6 +5625,7 @@ class MediaStreamSession:
         progress: str = "none",
         retrying: bool = False,
         attempt: int = 1,
+        timeout_ms: int | None = None,
         recover: bool = True,
     ) -> str:
         """Recover from an initial-response or inter-delta stall timeout.
@@ -5599,16 +5665,30 @@ class MediaStreamSession:
             }
             else _SmartPBXStreamTimeout.PHASE_STALL
         )
+        effective_timeout_ms = _bounded_smartpbx_timeout_ms(
+            timeout_ms
+            if timeout_ms is not None
+            else (
+                exc.timeout_ms
+                if exc.timeout_ms is not None
+                else _smartpbx_timeout_seconds_to_ms(
+                    SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS
+                    if phase == _SmartPBXStreamTimeout.PHASE_INITIAL
+                    else SMARTPBX_LLM_STALL_TIMEOUT_SECONDS
+                )
+            )
+        )
         if self._is_smartpbx_session():
             logger.warning(
                 "smartpbx_media event=llm_stream_timeout provider=%s phase=%s "
-                "tool_executed=%s progress=%s retrying=%s attempt=%d",
+                "tool_executed=%s progress=%s retrying=%s attempt=%d timeout_ms=%d",
                 normalized_provider,
                 phase,
                 "true" if tool_executed is True else "false",
                 progress if progress in SMARTPBX_CLAUDE_STREAM_PROGRESS_VALUES else "none",
                 "true" if retrying is True else "false",
                 _bounded_claude_attempt(attempt),
+                effective_timeout_ms,
             )
         await self._smartpbx_cancel_stalled_filler(gen)
         fenced_gen = await self._smartpbx_fence_stalled_generation(
@@ -8359,6 +8439,13 @@ class MediaStreamSession:
                                 stream,
                                 initial_timeout=max(acquire_deadline - time.monotonic(), 0.0),
                                 stall_timeout=SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
+                                stall_timeout_getter=(
+                                    lambda: (
+                                        SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS
+                                        if attempt == 0 and stream_progress == "thinking"
+                                        else SMARTPBX_LLM_STALL_TIMEOUT_SECONDS
+                                    )
+                                ),
                             )
                             if smartpbx_direct
                             else stream

@@ -18,10 +18,18 @@ import pytest
 
 TIMEOUT_LOG_FIELDS = frozenset({
     "event", "provider", "phase", "tool_executed", "progress", "retrying", "attempt",
+    "timeout_ms",
 })
 TIMEOUT_PROVIDER_VALUES = frozenset({"openai", "gemini", "claude", "unknown"})
 TIMEOUT_PROGRESS_VALUES = frozenset({"none", "metadata", "thinking", "text", "tool"})
 YIELD_TO_LOOP = object()
+
+
+class IdleFor:
+    """A virtual inter-delta pause consumed by the deterministic guard."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
 
 
 class RecordingTransport:
@@ -36,6 +44,7 @@ class ScriptedSource:
     def __init__(self, events, *, timeout_phase: str | None = None) -> None:
         self.events = list(events)
         self.timeout_phase = timeout_phase
+        self.observed_stall_timeouts: list[float] = []
 
     def __aiter__(self):
         async def iterate():
@@ -153,12 +162,39 @@ def completed_tool_events():
     ]
 
 
-async def deterministic_timeout_guard(source, **_kwargs):
+async def deterministic_timeout_guard(
+    source, *, initial_timeout: float, stall_timeout: float,
+    stall_timeout_getter=None,
+):
+    first = True
     async for event in source:
+        if isinstance(event, IdleFor):
+            timeout = (
+                initial_timeout
+                if first
+                else (
+                    stall_timeout_getter()
+                    if stall_timeout_getter is not None
+                    else stall_timeout
+                )
+            )
+            source.observed_stall_timeouts.append(timeout)
+            if event.seconds > timeout:
+                import server
+
+                raise server._SmartPBXStreamTimeout(
+                    phase=(
+                        server._SmartPBXStreamTimeout.PHASE_INITIAL
+                        if first
+                        else server._SmartPBXStreamTimeout.PHASE_STALL
+                    )
+                )
+            continue
         if event is YIELD_TO_LOOP:
             await asyncio.sleep(0)
             continue
         yield event
+        first = False
     phase = getattr(source, "timeout_phase", None)
     if phase is not None:
         import server
@@ -239,6 +275,218 @@ def assert_timeout_log_contract(
     assert fields["retrying"] == retrying
     assert fields["retrying"] in {"true", "false"}
     assert re.fullmatch(r"[1-9]", fields["attempt"])
+    assert re.fullmatch(r"[0-9]{1,6}", fields["timeout_ms"])
+    assert 1_000 <= int(fields["timeout_ms"]) <= 30_000
+
+
+def thinking_idle(seconds: float) -> IdleFor:
+    return IdleFor(seconds)
+
+
+@pytest.mark.asyncio
+async def test_thinking_idle_between_general_and_claude_limits_answers_once_without_retry(
+    monkeypatch,
+):
+    """A verified thinking event gets the Claude-only grace window."""
+    import server
+
+    first_round = completed_round([
+        message_start(),
+        *thinking_events("private reasoning"),
+        thinking_idle(9.0),
+        text_event("Answer after thinking."),
+        *terminal_events(),
+    ])
+    client = ScriptedClaude([first_round])
+    pipeline = direct_pipeline(server, client)
+    install_deterministic_stream(monkeypatch, server)
+    install_quiet_filler(monkeypatch, pipeline)
+    spoken = install_recording_speak(monkeypatch, pipeline)
+
+    result = await pipeline._run_llm_claude()
+
+    assert first_round.observed_stall_timeouts == [12.0]
+    assert len(client.requests) == 1
+    assert result == "Answer after thinking."
+    assert spoken == ["Answer after thinking."]
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
+
+
+@pytest.mark.asyncio
+async def test_thinking_idle_past_claude_limit_retries_with_general_stall_budget(
+    monkeypatch,
+):
+    import server
+
+    first_round = timeout_round([
+        message_start(), *thinking_events("private first attempt"), thinking_idle(13.0)
+    ])
+    retry_round = completed_round([
+        message_start(), thinking_idle(7.0), text_event("Retry answer."), *terminal_events()
+    ])
+    client = ScriptedClaude([first_round, retry_round])
+    pipeline = direct_pipeline(server, client)
+    install_deterministic_stream(monkeypatch, server)
+    install_quiet_filler(monkeypatch, pipeline)
+    spoken = install_recording_speak(monkeypatch, pipeline)
+
+    result = await pipeline._run_llm_claude()
+
+    assert first_round.observed_stall_timeouts == [12.0]
+    assert retry_round.observed_stall_timeouts == [8.0]
+    assert len(client.requests) == 2
+    assert result == "Retry answer."
+    assert spoken == ["Retry answer."]
+    assert server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT not in spoken
+
+
+@pytest.mark.asyncio
+async def test_thinking_attempts_both_past_limits_recover_once_without_third_request(
+    monkeypatch,
+):
+    import server
+
+    first_round = timeout_round([
+        message_start(), *thinking_events("private first attempt"), thinking_idle(13.0)
+    ])
+    retry_round = timeout_round([
+        message_start(), *thinking_events("private retry attempt"), thinking_idle(9.0)
+    ])
+    client = ScriptedClaude([first_round, retry_round])
+    pipeline = direct_pipeline(server, client)
+    install_deterministic_stream(monkeypatch, server)
+    install_quiet_filler(monkeypatch, pipeline)
+    spoken = install_recording_speak(monkeypatch, pipeline)
+
+    result = await pipeline._run_llm_claude()
+
+    assert first_round.observed_stall_timeouts == [12.0]
+    assert retry_round.observed_stall_timeouts == [8.0]
+    assert len(client.requests) == 2
+    assert spoken == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
+    assert result == server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
+
+
+@pytest.mark.parametrize(
+    ("raw", "general_stall", "expected"),
+    [
+        (None, 8.0, 12.0),
+        ("", 8.0, 12.0),
+        ("invalid", 8.0, 12.0),
+        ("8", 8.0, 8.0),
+        ("9", 8.0, 9.0),
+        ("12", 8.0, 12.0),
+        ("20", 8.0, 20.0),
+        ("8", 16.0, 16.0),
+        ("12", 16.0, 16.0),
+    ],
+)
+def test_claude_thinking_stall_timeout_is_blank_safe_defaulted_and_maxed(
+    raw, general_stall, expected
+):
+    import server
+
+    assert (
+        server._resolve_smartpbx_claude_thinking_stall_timeout_seconds(
+            raw, general_stall
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "malformed-timeout",
+    ),
+)
+def test_timeout_ms_coercion_falls_back_safely_for_nonfinite_and_malformed_values(raw):
+    """External timeout input must never escape the bounded telemetry contract."""
+    import server
+
+    assert server._bounded_smartpbx_timeout_ms(raw) == 8_000
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "malformed-timeout",
+    ),
+)
+def test_stream_timeout_binds_adversarial_timeout_values_before_recovery(raw):
+    import server
+
+    timeout = server._SmartPBXStreamTimeout(phase="stall", timeout_ms=raw)
+
+    assert timeout.timeout_ms == 8_000
+    assert 1_000 <= timeout.timeout_ms <= 30_000
+
+
+@pytest.mark.parametrize(
+    ("events", "progress"),
+    [
+        (
+            [
+                message_start(),
+                text_event("Visible text without a terminal stop"),
+                thinking_idle(9.0),
+            ],
+            "text",
+        ),
+        ([message_start(), *tool_start_events(), thinking_idle(9.0)], "tool"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_first_attempt_non_thinking_stalls_keep_the_general_budget(
+    monkeypatch, events, progress,
+):
+    """Only verified thinking may extend an initial Claude stall window."""
+    import server
+
+    first_round = timeout_round(events)
+    client = ScriptedClaude([first_round])
+    pipeline = direct_pipeline(server, client)
+    install_deterministic_stream(monkeypatch, server)
+    install_quiet_filler(monkeypatch, pipeline)
+    spoken = install_recording_speak(monkeypatch, pipeline)
+
+    result = await pipeline._run_llm_claude()
+
+    assert first_round.observed_stall_timeouts == [8.0], progress
+    assert len(client.requests) == 1
+    assert spoken == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
+    assert result == server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_metadata_stall_keeps_general_budget_and_retries_once(
+    monkeypatch,
+):
+    """Metadata remains retryable, but it must not receive thinking grace."""
+    import server
+
+    first_round = timeout_round([message_start(), thinking_idle(9.0)])
+    retry_round = completed_round([
+        message_start(), text_event("Metadata retry answer."), *terminal_events(),
+    ])
+    client = ScriptedClaude([first_round, retry_round])
+    pipeline = direct_pipeline(server, client)
+    install_deterministic_stream(monkeypatch, server)
+    install_quiet_filler(monkeypatch, pipeline)
+    spoken = install_recording_speak(monkeypatch, pipeline)
+
+    result = await pipeline._run_llm_claude()
+
+    assert first_round.observed_stall_timeouts == [8.0]
+    assert len(client.requests) == 2
+    assert result == "Metadata retry answer."
+    assert spoken == ["Metadata retry answer."]
 
 
 @pytest.mark.asyncio
@@ -676,6 +924,7 @@ async def test_stream_timeout_unknown_provider_is_bounded_and_privacy_safe(caplo
             tool_executed=False,
             gen=pipeline._speak_generation,
             full_text="",
+            timeout_ms=12_000,
             recover=False,
         )
 
@@ -686,6 +935,41 @@ async def test_stream_timeout_unknown_provider_is_bounded_and_privacy_safe(caplo
     )
     assert sentinel not in caplog.text
     assert "PHONE_SENTINEL_0771234567" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "malformed-timeout PRIVATE_TIMEOUT_SENTINEL",
+    ),
+)
+@pytest.mark.asyncio
+async def test_timeout_recovery_logs_only_the_bounded_numeric_deadline_for_adversarial_input(
+    raw, caplog
+):
+    import server
+
+    pipeline = direct_pipeline(server, ScriptedClaude([]))
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._smartpbx_handle_stream_timeout(
+            server._SmartPBXStreamTimeout(phase="stall", timeout_ms=raw),
+            provider="claude",
+            tool_executed=False,
+            gen=pipeline._speak_generation,
+            full_text="",
+            recover=False,
+        )
+
+    timeout_lines = [line for line in caplog.messages if "llm_stream_timeout" in line]
+    assert timeout_lines
+    assert_timeout_log_contract(
+        timeout_lines[0], progress="none", phase="stall", retrying="false"
+    )
+    assert "PRIVATE_TIMEOUT_SENTINEL" not in caplog.text
 
 
 @pytest.mark.asyncio
