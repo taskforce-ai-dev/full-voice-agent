@@ -144,6 +144,26 @@ def test_residency_recognition_requires_an_explicit_safe_statement(utterance, ex
 @pytest.mark.parametrize(
     ("utterance", "expected"),
     (
+        ("Sri Lankan resident", "resident"),
+        ("foreign guest", "foreign"),
+    ),
+)
+def test_terse_residency_answers_are_safe_direct_replies(utterance, expected):
+    assert rate_catalog.recognize_residency(utterance) == expected
+
+
+def test_one_canonical_room_in_an_availability_request_is_captured_but_two_are_ambiguous():
+    assert rate_catalog.recognize_selected_room(
+        "Is Mount Monarch Chalet available from September 26 to 29?"
+    ) == "Mount Monarch Chalet"
+    assert rate_catalog.recognize_selected_room(
+        "Is Mount Monarch Chalet or Mount Luxe Chalet available?"
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("utterance", "expected"),
+    (
         ("A guest from overseas is arriving too.", None),
         ("I am local but my partner is foreign.", None),
         ("Foreign guests have different prices, right?", None),
@@ -300,7 +320,9 @@ async def test_real_availability_then_selected_room_then_residency_sends_one_exa
         lambda _text: "CONTRADICTORY_RATE: 1400 USD and 368000 LKR.",
     )
 
-    await session._process_utterance_bound("I choose the Mount Monarch Chalet.")
+    await session._process_utterance_bound(
+        "Is Mount Monarch Chalet available from September 26 to 29?"
+    )
     await session._process_utterance_bound("I am a Sri Lankan resident.")
 
     assert session._booking_slots["room_type"] == "Mount Monarch Chalet"
