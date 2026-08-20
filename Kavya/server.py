@@ -93,6 +93,7 @@ from booking_api import close_session, is_configured
 # agree on whether rates may be quoted. Already loaded transitively via
 # booking_api; the explicit import keeps the single source of truth visible.
 import yanolja_service
+from rate_catalog import recognize_residency, resolve_rate
 from post_call import (
     UNCONFIRMED_TRANSCRIPT_LABEL,
     UNCONFIRMED_TRANSCRIPT_ROLE,
@@ -5796,6 +5797,31 @@ class MediaStreamSession:
             if text:
                 self._booking_slots[key] = text
 
+    def _capture_explicit_residency(self, utterance: str) -> None:
+        """Persist an explicit residency statement without inferring identity."""
+        residency = recognize_residency(utterance)
+        if residency and "residency" not in self._booking_slots:
+            self._booking_slots["residency"] = residency
+
+    def _authoritative_rate_context(self) -> str:
+        """Return an exact price record only when booking state is sufficient."""
+        slots = self._booking_slots
+        resolution = resolve_rate(
+            room=slots.get("room_type", slots.get("room_name", "")),
+            residency=slots.get("residency", ""),
+            check_in=slots.get("check_in", ""),
+            check_out=slots.get("check_out", ""),
+        )
+        return resolution.authoritative_context()
+
+    def _compose_turn_user_message(self, text: str, kb_context: str) -> str:
+        """Keep semantic KB prose out of a deterministic-rate model request."""
+        if self._authoritative_rate_context():
+            return text
+        if kb_context and "No knowledge base loaded" not in kb_context:
+            return f"[Reference context: {kb_context}]\n\nGuest: {text}"
+        return text
+
     def _booking_slots_note(self) -> str:
         """Render the captured slots as a context block, or '' when empty."""
         slots = self._booking_slots
@@ -5827,10 +5853,13 @@ class MediaStreamSession:
             lines.append(f"- room: {room}")
         if slots.get("guest_phone"):
             lines.append(f"- phone: {slots['guest_phone']}")
-        if not lines:
+        rate_context = self._authoritative_rate_context()
+        if not lines and not rate_context:
             return ""
         joined = "\n".join(lines)
-        return _BOOKING_SLOTS_NOTE_PREFIX + joined
+        return _BOOKING_SLOTS_NOTE_PREFIX + joined + (
+            f"\n\n{rate_context}" if rate_context else ""
+        )
 
     def _smartpbx_rhythm_rule(self) -> str:
         return (
@@ -7077,15 +7106,22 @@ class MediaStreamSession:
         telemetry: SmartPBXTurnTelemetry | None,
     ) -> None:
         self._last_guest_utterance_raw = text
+        self._capture_explicit_residency(text)
         self._capture_success_this_turn = False
         self._start_assistant_turn_delivery_tracking()
         outcome = "completed"
         response_text = ""
         try:
             self._mark_smartpbx_turn_once("kb_start")
-            # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
-            # this loop is shared by every concurrent call, so keep it off-loop.
-            kb_context = await asyncio.to_thread(retrieve_context, text)
+            # An exact price record is authoritative and deliberately excludes
+            # semantic rate prose for this turn. General descriptive turns keep
+            # the normal KB retrieval path.
+            if self._authoritative_rate_context():
+                kb_context = ""
+            else:
+                # Embedding + Chroma query is tens of ms of CPU. On the SmartPBX path
+                # this loop is shared by every concurrent call, so keep it off-loop.
+                kb_context = await asyncio.to_thread(retrieve_context, text)
         except asyncio.CancelledError:
             if telemetry is not None and turn_id is not None:
                 telemetry.finish(
@@ -7107,10 +7143,7 @@ class MediaStreamSession:
         finally:
             self._mark_smartpbx_turn("kb_complete")
 
-        if kb_context and "No knowledge base loaded" not in kb_context:
-            user_msg = f"[Reference context: {kb_context}]\n\nGuest: {text}"
-        else:
-            user_msg = text
+        user_msg = self._compose_turn_user_message(text, kb_context)
 
         self.history.append({"role": "user", "content": user_msg})
         self.history = _trim_history(self.history)
