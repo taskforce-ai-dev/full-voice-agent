@@ -223,6 +223,40 @@ branch explicitly.
   consolidated into one `hutch_info.txt`, discarding repeated navigation
   menus, footers, and image alt-text that added no retrieval value.
 
+## Deployment — MANUAL (not auto-deploy)
+
+Hutch is **deliberately not in** `.github/workflows/deploy-on-push.yml`'s agent
+list (see "Pending operator setup" #5), so **merging to `main` does NOT deploy
+Hutch**. Production is updated by hand on the VPS (`67.207.90.109`), where the
+repo is checked out at `/opt/hutch` and the SmartPBX container runs from
+`/opt/hutch/Hutch Agent`.
+
+```bash
+ssh root@67.207.90.109
+cd /opt/hutch && git pull origin main
+cd "Hutch Agent"
+docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate hutch-smartpbx
+sleep 25 && curl http://127.0.0.1:8041/health   # -> {"status":"ok","service_mode":"smartpbx"}
+```
+
+> **The `--env-file .env.smartpbx` flag is MANDATORY.** The `hutch-smartpbx`
+> service intentionally has **no `env_file:`** in `docker-compose.yml` — it uses
+> an explicit `environment:` allowlist of `${VAR}` references (Kavya isolation
+> pattern). Compose fills those `${VAR}` from the `--env-file` you pass (or the
+> shell / a plain `.env`, neither of which exists here). Run a plain
+> `docker compose ... up` without `--env-file .env.smartpbx` and **every**
+> setting resolves to a blank string — you'll see a wall of
+> `WARN ... variable is not set. Defaulting to a blank string`, the container
+> starts with no API keys / token / voice ID, and `/health` returns an empty
+> reply / connection reset. The fix is always to re-run **with** the flag.
+
+After a KB or `KB_N_RESULTS` change, `--force-recreate` is enough (no `--build`
+needed unless `requirements*.txt` / `Dockerfile` changed). On startup the
+container re-ingests `knowledge_docs/hutch_info.txt` into ChromaDB — expect a
+20-40s boot window where `/health` connection-resets before
+`Application startup complete` appears in the logs. Watch it with:
+`docker compose --env-file .env.smartpbx --profile smartpbx logs --tail=30 hutch-smartpbx`.
+
 ## Pending operator setup
 
 Before this agent can go live, the operator still needs to:
