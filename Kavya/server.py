@@ -94,7 +94,9 @@ from booking_api import close_session, is_configured
 # booking_api; the explicit import keeps the single source of truth visible.
 import yanolja_service
 from rate_catalog import (
-    is_room_rate_intent,
+    RateResolution,
+    classify_room_rate_intent,
+    is_room_rate_follow_up,
     recognize_residency,
     recognize_selected_room,
     resolve_rate,
@@ -185,6 +187,11 @@ class _SmartPBXRunnerContext:
     speak_generation: int
     raw_utterance: str
     rate_context: str = ""
+    pending_room: str | None = None
+    pending_residency: str | None = None
+    rate_turn: bool = False
+    clear_rate_followup: bool = False
+    rate_followup_eligible: bool = False
     initial_filler: Any | None = None
     tool_filler_tasks: set[asyncio.Task] = field(default_factory=set)
 
@@ -4817,6 +4824,10 @@ class MediaStreamSession:
         # race cannot mix two turns' counts. Event-loop-only mutation.
         self._smartpbx_post_dispatch_by_turn: dict[str, dict[str, int]] = {}
         self._smartpbx_last_finished_dropped_frames = 0
+        # This permits exactly the immediately following bounded amount
+        # pronoun after a deterministic rate answer or clarification. It is
+        # read into each runner and committed only by the current owner.
+        self._rate_followup_eligible = False
         self._smartpbx_filler_rotation = _CallFillerRotation()
         self._smartpbx_initial_filler: SmartPBXInitialFillerController | None = None
         # Direct SmartPBX specialized tool fillers are session-owned. A runner
@@ -5815,28 +5826,92 @@ class MediaStreamSession:
         if room:
             self._booking_slots["room_type"] = room
 
-    def _rate_context_for_turn(self, text: str) -> str:
-        """Return an authoritative rate/no-quote record only for a rate turn."""
-        slots = self._booking_slots
-        resolution = resolve_rate(
-            room=slots.get("room_type", slots.get("room_name", "")),
+    def _staged_rate_slots(self, runner: _SmartPBXRunnerContext) -> dict[str, str]:
+        """Return this runner's prospective slots without mutating the session."""
+        slots = dict(self._booking_slots)
+        if runner.pending_room:
+            slots["room_type"] = runner.pending_room
+        if runner.pending_residency:
+            slots["residency"] = runner.pending_residency
+        return slots
+
+    @staticmethod
+    def _rate_resolution_for_slots(
+        slots: dict[str, str], *, room: str | None = None,
+    ) -> RateResolution:
+        return resolve_rate(
+            room=(
+                room
+                if room is not None
+                else slots.get("room_type", slots.get("room_name", ""))
+            ),
             residency=slots.get("residency", ""),
             check_in=slots.get("check_in", ""),
             check_out=slots.get("check_out", ""),
         )
-        has_grounded_rate_state = resolution.reason not in {
+
+    def _rate_context_for_turn(
+        self,
+        text: str,
+        runner: _SmartPBXRunnerContext,
+    ) -> str:
+        """Return a classifier-bound rate/no-quote record for this runner only."""
+        slots = self._staged_rate_slots(runner)
+        intent = classify_room_rate_intent(text)
+        if intent.kind == "AMBIGUOUS_RATE":
+            runner.rate_turn = True
+            return RateResolution(
+                None, None, None, None, "ambiguous_room",
+            ).authoritative_context()
+        if intent.kind == "RATE":
+            runner.rate_turn = True
+            target_room = (
+                intent.rooms[0]
+                if intent.rooms
+                else "" if intent.unresolved else None
+            )
+            return self._rate_resolution_for_slots(
+                slots, room=target_room,
+            ).authoritative_context()
+        resolution = self._rate_resolution_for_slots(slots)
+        has_complete_rate_state = resolution.reason not in {
             "unknown_room", "unknown_residency", "invalid_dates",
         }
-        rate_related = (
-            recognize_residency(text) is not None
-            or recognize_selected_room(text) is not None
-            or is_room_rate_intent(
-                text, has_grounded_rate_state=has_grounded_rate_state,
-            )
-        )
-        if not rate_related:
-            return ""
-        return resolution.authoritative_context()
+        if (
+            is_room_rate_follow_up(text)
+            and runner.rate_followup_eligible
+            and has_complete_rate_state
+        ):
+            runner.rate_turn = True
+            return resolution.authoritative_context()
+        if runner.pending_residency and has_complete_rate_state:
+            runner.rate_turn = True
+            return resolution.authoritative_context()
+        runner.clear_rate_followup = True
+        return ""
+
+    def _stage_turn_rate_state(
+        self, text: str, runner: _SmartPBXRunnerContext,
+    ) -> None:
+        """Capture turn input locally; shared slots are committed only after fencing."""
+        intent = classify_room_rate_intent(text)
+        selected_room = recognize_selected_room(text)
+        if intent.kind == "RATE" and intent.rooms:
+            selected_room = intent.rooms[0]
+        runner.pending_room = selected_room
+        runner.pending_residency = recognize_residency(text)
+        runner.rate_context = self._rate_context_for_turn(text, runner)
+
+    def _commit_staged_turn_rate_state(
+        self, runner: _SmartPBXRunnerContext,
+    ) -> None:
+        """Commit this current runner's local classification after ownership fencing."""
+        if runner.pending_room:
+            self._booking_slots["room_type"] = runner.pending_room
+        if runner.pending_residency:
+            self._booking_slots["residency"] = runner.pending_residency
+        if runner.clear_rate_followup:
+            self._rate_followup_eligible = False
 
     def _current_rate_context(self) -> str:
         """Return this runner's rate record without sharing it across turns."""
@@ -7121,6 +7196,7 @@ class MediaStreamSession:
             dropped_frame_baseline=dropped_frame_baseline,
             speak_generation=self._speak_generation,
             raw_utterance=text,
+            rate_followup_eligible=self._rate_followup_eligible,
         )
         runner_token = _smartpbx_runner_context.set(runner)
         try:
@@ -7134,12 +7210,12 @@ class MediaStreamSession:
         turn_id: str | None,
         telemetry: SmartPBXTurnTelemetry | None,
     ) -> None:
-        self._last_guest_utterance_raw = text
-        self._capture_selected_room(text)
-        self._capture_explicit_residency(text)
+        if not self._current_smartpbx_runner_owns_shared_state():
+            return
         runner = _smartpbx_runner_context.get()
         if runner is not None:
-            runner.rate_context = self._rate_context_for_turn(text)
+            self._stage_turn_rate_state(text, runner)
+        self._last_guest_utterance_raw = text
         self._capture_success_this_turn = False
         self._start_assistant_turn_delivery_tracking()
         outcome = "completed"
@@ -7184,6 +7260,9 @@ class MediaStreamSession:
             outcome = "interrupted"
             return
 
+        if runner is not None:
+            self._commit_staged_turn_rate_state(runner)
+
         user_msg = self._compose_turn_user_message(text, kb_context)
 
         self.history.append({"role": "user", "content": user_msg})
@@ -7200,6 +7279,8 @@ class MediaStreamSession:
             if not self._current_smartpbx_runner_owns_shared_state():
                 outcome = "interrupted"
                 return
+            if runner is not None and runner.rate_turn:
+                self._rate_followup_eligible = True
             self._mark_smartpbx_turn("llm_complete")
             if response_text:
                 if self._is_smartpbx_session():

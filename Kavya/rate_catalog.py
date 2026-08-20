@@ -27,23 +27,30 @@ _RESIDENT_NIGHTLY_RATE_LKR: dict[str, tuple[int, int]] = {
 _OFF_PEAK_MONTHS = frozenset({2, 3, 5, 6, 7, 8, 9, 10, 11})
 _PEAK_MONTHS = frozenset({4, 12})
 _ROOM_SELECTION_PREFIXES = (
-    "i choose ", "we choose ", "i would like ", "we would like ",
-    "i want ", "we want ", "i will take ", "we will take ",
-    "ill take ", "well take ",
-)
-_ROOM_RATE_INTENT = re.compile(
-    r"\b(?:room\s+)?rates?\b"
-    r"|\b(?:room|nightly|stay|accommodation)\s+(?:price|cost)\b"
-    r"|\b(?:price|cost)\s+(?:for|of)\s+(?:the\s+)?(?:room|stay|accommodation)\b"
-    r"|\bhow\s+much\s+(?:is|does)\s+(?:the\s+)?(?:room|stay|accommodation)\b"
-    r"|\bper\s+(?:room\s+)?night\b"
-    r"|\b(?:lkr|usd)\b"
+    ("i", "choose"), ("we", "choose"),
+    ("i", "would", "like"), ("we", "would", "like"),
+    ("i", "want"), ("we", "want"),
+    ("i", "will", "take"), ("we", "will", "take"),
+    ("ill", "take"), ("well", "take"),
 )
 _ROOM_AMOUNT_SUFFIXES = frozenset({
     (),
     ("per", "night"),
     ("per", "room", "per", "night"),
+    ("for", "one", "night"),
 })
+_NON_ROOM_PRICE_SUBJECTS = frozenset({
+    "spa", "dinner", "activity", "activities", "restaurant",
+})
+
+
+@dataclass(frozen=True)
+class RoomRateIntent:
+    """A room-price request with an explicit target, ambiguity, or neither."""
+
+    kind: str
+    rooms: tuple[str, ...] = ()
+    unresolved: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,13 +101,13 @@ def recognize_residency(utterance: str) -> str | None:
         and any(term in normalized for term in ("foreign", "overseas", "non resident"))
     ):
         return None
-    subject = r"(?:i am|i m|im|we are|we re|were|my party is|our party is)"
+    subject = r"(?:i am|i m|im|we are|we re|my party is|our party is)"
     candidates: set[str] = set()
-    if re.search(rf"\b{subject}\s+(?:a\s+)?(?:sri lankan resident|local resident|local)\b", normalized):
+    if re.search(rf"\b{subject}\s+(?:(?:a|an)\s+)?(?:sri lankan resident|local resident|local)\b", normalized):
         candidates.add(RESIDENT)
     if re.search(
-        rf"\b{subject}\s+(?:not\s+(?:a\s+)?(?:sri lankan resident|local)|"
-        r"(?:a\s+)?(?:foreign guest|foreign visitor|foreign|international guest|non resident))\b",
+        rf"\b{subject}\s+(?:not\s+(?:(?:a|an)\s+)?(?:sri lankan resident|local)|"
+        r"(?:(?:a|an)\s+)?(?:foreign guest|foreign visitor|foreign|international guest|non resident))\b",
         normalized,
     ):
         candidates.add(FOREIGN)
@@ -118,40 +125,106 @@ def recognize_residency(utterance: str) -> str | None:
 
 
 def _matching_canonical_rooms(tokens: tuple[str, ...]) -> list[str]:
-    matches: list[str] = []
+    matches: list[tuple[int, str]] = []
     for room in yanolja_service.DEMO_NIGHTLY_RATE_USD:
         room_tokens = tuple(re.findall(r"[a-z]+", room.lower()))
-        if any(
-            tokens[index:index + len(room_tokens)] == room_tokens
-            for index in range(len(tokens) - len(room_tokens) + 1)
+        for index in range(len(tokens) - len(room_tokens) + 1):
+            if tokens[index:index + len(room_tokens)] == room_tokens:
+                matches.append((index, room))
+                break
+    return [room for _index, room in sorted(matches)]
+
+
+def _contains_tokens(tokens: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
+    return any(
+        tokens[index:index + len(phrase)] == phrase
+        for index in range(len(tokens) - len(phrase) + 1)
+    )
+
+
+def _room_after(
+    tokens: tuple[str, ...],
+    prefix: tuple[str, ...],
+    room_tokens: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    for index in range(len(tokens) - len(prefix) - len(room_tokens) + 1):
+        room_start = index + len(prefix)
+        room_end = room_start + len(room_tokens)
+        if (
+            tokens[index:room_start] == prefix
+            and tokens[room_start:room_end] == room_tokens
         ):
-            matches.append(room)
-    return matches
+            return tokens[room_end:]
+    return None
+
+
+def _is_room_rate_form(tokens: tuple[str, ...], room: str) -> bool:
+    room_tokens = tuple(re.findall(r"[a-z]+", room.lower()))
+    for prefix, suffixes in (
+        (("how", "much", "is"), _ROOM_AMOUNT_SUFFIXES),
+        (("how", "much", "is", "the"), _ROOM_AMOUNT_SUFFIXES),
+        (("how", "much", "does"), frozenset({("cost",)})),
+        (("how", "much", "does", "the"), frozenset({("cost",)})),
+        (("price", "of"), frozenset({()})),
+        (("price", "of", "the"), frozenset({()})),
+        (("cost", "of"), frozenset({()})),
+        (("cost", "of", "the"), frozenset({()})),
+        (("rate", "for"), frozenset({()})),
+        (("rate", "for", "the"), frozenset({()})),
+    ):
+        suffix = _room_after(tokens, prefix, room_tokens)
+        if suffix in suffixes:
+            return True
+    return _contains_tokens(tokens, ("room", "rate")) or _contains_tokens(
+        tokens, ("nightly", "rate")
+    )
+
+
+def _looks_like_rate_request(tokens: tuple[str, ...]) -> bool:
+    return (
+        _contains_tokens(tokens, ("room", "rate"))
+        or _contains_tokens(tokens, ("nightly", "rate"))
+        or tokens[:2] == ("how", "much")
+        or "price" in tokens
+        or "cost" in tokens
+        or "rate" in tokens
+        or "rates" in tokens
+    )
+
+
+def classify_room_rate_intent(utterance: str) -> RoomRateIntent:
+    """Classify only grammar-bound room-price requests, never price-like prose."""
+    tokens = tuple(re.findall(r"[a-z]+", str(utterance).lower()))
+    if not tokens or _NON_ROOM_PRICE_SUBJECTS.intersection(tokens):
+        return RoomRateIntent("NONE")
+    rooms = tuple(_matching_canonical_rooms(tokens))
+    if len(rooms) > 1:
+        return (
+            RoomRateIntent("AMBIGUOUS_RATE", rooms)
+            if _looks_like_rate_request(tokens)
+            else RoomRateIntent("NONE")
+        )
+    if len(rooms) == 1 and _is_room_rate_form(tokens, rooms[0]):
+        return RoomRateIntent("RATE", rooms)
+    if not rooms and _looks_like_rate_request(tokens):
+        return RoomRateIntent(
+            "RATE",
+            unresolved=_contains_tokens(tokens, ("room", "rate", "for")),
+        )
+    return RoomRateIntent("NONE")
 
 
 def is_room_rate_intent(
     utterance: str, *, has_grounded_rate_state: bool = False,
 ) -> bool:
-    """Recognize bounded room-price language, never arbitrary price subjects."""
-    tokens = tuple(re.findall(r"[a-z]+", str(utterance).lower()))
-    normalized = " ".join(tokens)
-    if _ROOM_RATE_INTENT.search(normalized):
-        return True
-    if has_grounded_rate_state and tokens == ("how", "much", "is", "it"):
-        return True
-    matches = _matching_canonical_rooms(tokens)
-    if len(matches) != 1:
-        return False
-    room_tokens = tuple(re.findall(r"[a-z]+", matches[0].lower()))
-    for index in range(len(tokens) - len(room_tokens) - 2):
-        room_end = index + 3 + len(room_tokens)
-        if (
-            tokens[index:index + 3] == ("how", "much", "is")
-            and tokens[index + 3:room_end] == room_tokens
-            and tokens[room_end:] in _ROOM_AMOUNT_SUFFIXES
-        ):
-            return True
-    return False
+    """Compatibility wrapper for callers that need only a boolean result."""
+    return classify_room_rate_intent(utterance).kind != "NONE"
+
+
+def is_room_rate_follow_up(utterance: str) -> bool:
+    return tuple(re.findall(r"[a-z]+", str(utterance).lower())) == (
+        "how", "much", "is", "it",
+    )
 
 
 def recognize_selected_room(utterance: str) -> str | None:
@@ -159,15 +232,26 @@ def recognize_selected_room(utterance: str) -> str | None:
     tokens = tuple(re.findall(r"[a-z]+", str(utterance).lower()))
     if not tokens:
         return None
-    normalized = " ".join(tokens)
     matches = _matching_canonical_rooms(tokens)
     if len(matches) != 1:
         return None
-    if tokens == tuple(re.findall(r"[a-z]+", matches[0].lower())):
+    room_tokens = tuple(re.findall(r"[a-z]+", matches[0].lower()))
+    if tokens == room_tokens:
         return matches[0]
-    if any(prefix in normalized for prefix in _ROOM_SELECTION_PREFIXES):
-        return matches[0]
-    if re.search(r"\b(?:available|availability)\b", normalized) or is_room_rate_intent(normalized):
+    for prefix in _ROOM_SELECTION_PREFIXES:
+        if tokens[:len(prefix)] != prefix:
+            continue
+        room_end = len(prefix) + len(room_tokens)
+        if tokens[len(prefix):room_end] == room_tokens and tokens[room_end:] == ():
+            return matches[0]
+    for index in range(len(tokens) - len(room_tokens) + 1):
+        room_end = index + len(room_tokens)
+        if (
+            tokens[index:room_end] == room_tokens
+            and tokens[room_end:room_end + 1] in {("available",), ("availability",)}
+        ):
+            return matches[0]
+    if classify_room_rate_intent(utterance).kind == "RATE":
         return matches[0]
     return None
 
