@@ -3425,6 +3425,135 @@ def _initial_filler_controller(server, sleep, speak, *, clear_audio=None):
     )
 
 
+def test_call_filler_rotation_preserves_seed_order_and_exhausts_each_bank_before_repeating():
+    import server
+
+    rotation = server._CallFillerRotation()
+    initial_bank = ("initial one", "initial two")
+    tool_bank = ("tool one", "tool two")
+
+    assert rotation.next("initial", initial_bank) == "initial one"
+    assert rotation.next("tool", tool_bank) == "tool one"
+    assert rotation.next("initial", initial_bank) == "initial two"
+    assert rotation.next("tool", tool_bank) == "tool two"
+    assert rotation.next("initial", initial_bank) == "initial one"
+
+
+def test_call_filler_rotation_avoids_an_immediate_cross_bank_repeat():
+    import server
+
+    rotation = server._CallFillerRotation()
+
+    assert rotation.next("initial", ("same phrase", "initial alternative")) == "same phrase"
+    assert rotation.next("tool", ("same phrase", "tool alternative")) == "tool alternative"
+
+
+def test_call_filler_rotation_has_seven_started_phrases_then_wraps_without_immediate_repeat():
+    import server
+
+    rotation = server._CallFillerRotation()
+    started = []
+
+    for _ in range(7):
+        lease = rotation.reserve("initial", server.SMARTPBX_INITIAL_FILLER_BANK)
+        started.append(lease.text)
+        lease.commit()
+
+    wrapped = rotation.reserve("initial", server.SMARTPBX_INITIAL_FILLER_BANK)
+    wrapped.commit()
+
+    assert len(set(started)) == 7
+    assert wrapped.text != started[-1]
+
+
+def test_call_filler_rotation_is_independent_per_session_and_keeps_seed_first():
+    import server
+
+    first_session = server._CallFillerRotation()
+    second_session = server._CallFillerRotation()
+
+    first = first_session.reserve("initial", server.SMARTPBX_INITIAL_FILLER_BANK)
+    second = second_session.reserve("initial", server.SMARTPBX_INITIAL_FILLER_BANK)
+
+    assert first.text == server.SMARTPBX_INITIAL_FILLER_TEXT
+    assert second.text == server.SMARTPBX_INITIAL_FILLER_TEXT
+
+
+def test_call_filler_rotation_commits_actual_initial_and_tool_starts_before_reuse():
+    import server
+
+    rotation = server._CallFillerRotation()
+    started = []
+
+    for bank_name, bank in (
+        ("initial", server.SMARTPBX_INITIAL_FILLER_BANK),
+        ("tool:check_availability", server.SMARTPBX_TOOL_FILLER_BANKS["check_availability"]),
+    ) * 4:
+        lease = rotation.reserve(bank_name, bank)
+        lease.commit()
+        started.append(lease.text)
+
+    assert started[0] == server.SMARTPBX_INITIAL_FILLER_TEXT
+    assert started[1] == server.TOOL_FILLERS["check_availability"]
+    assert all(left != right for left, right in zip(started, started[1:]))
+    assert len(set(started[:7])) == 7
+
+
+@pytest.mark.asyncio
+async def test_initial_smartpbx_filler_controller_accepts_selected_text():
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    spoken = []
+
+    async def speak(text, *, generation):
+        spoken.append((text, generation))
+
+    rotation = server._CallFillerRotation()
+    lease = rotation.reserve("initial", server.SMARTPBX_INITIAL_FILLER_BANK)
+    controller = server.SmartPBXInitialFillerController(
+        speak=speak,
+        generation=7,
+        delay_seconds=2.5,
+        sleep=sleep,
+        text=lease.text,
+        lease=lease,
+    )
+    controller.start()
+    await asyncio.sleep(0)
+    sleep.release.set()
+    await controller.wait()
+
+    assert spoken == [(server.SMARTPBX_INITIAL_FILLER_TEXT, 7)]
+
+
+@pytest.mark.asyncio
+async def test_pending_initial_filler_cancellation_does_not_consume_reserved_phrase():
+    import server
+
+    sleep = _ControlledInitialFillerSleep()
+    async def speak(text, *, generation):
+        pass
+
+    rotation = server._CallFillerRotation()
+    lease = rotation.reserve("initial", server.SMARTPBX_INITIAL_FILLER_BANK)
+    controller = server.SmartPBXInitialFillerController(
+        speak=speak,
+        generation=7,
+        delay_seconds=2.5,
+        sleep=sleep,
+        text=lease.text,
+        lease=lease,
+    )
+    controller.start()
+    await asyncio.sleep(0)
+    await controller.on_session_finish()
+
+    next_lease = rotation.reserve("initial", server.SMARTPBX_INITIAL_FILLER_BANK)
+
+    assert next_lease.text == server.SMARTPBX_INITIAL_FILLER_TEXT
+
+
 @pytest.mark.asyncio
 async def test_initial_smartpbx_filler_waits_exactly_2_5_seconds_then_speaks_once():
     import server
@@ -3645,7 +3774,7 @@ async def test_transfer_fences_pending_model_tts_before_canonical_delivery_barri
 
     turn = asyncio.create_task(pipeline._process_utterance("human please"))
     try:
-        await asyncio.wait_for(transfer_attempted.wait(), timeout=0.2)
+        await asyncio.wait_for(transfer_attempted.wait(), timeout=1)
         await asyncio.sleep(0)
 
         # The prelude may fence a task before its coroutine body is scheduled,

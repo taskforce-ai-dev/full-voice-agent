@@ -953,6 +953,112 @@ _SMARTPBX_CAPTURE_TOOLS = frozenset({
     "capture_spoken_number", "capture_spoken_name", "collect_number_via_keypad",
 })
 
+SMARTPBX_FILLER_ALTERNATES: tuple[str, ...] = (
+    "I am looking into that for you.",
+    "Let me review those details carefully.",
+    "I will gather the information.",
+    "I am taking a closer look.",
+    "I can help with that request.",
+    "I will handle that with care.",
+)
+SMARTPBX_INITIAL_FILLER_BANK: tuple[str, ...] = (
+    SMARTPBX_INITIAL_FILLER_TEXT,
+    *SMARTPBX_FILLER_ALTERNATES,
+)
+SMARTPBX_TOOL_FILLER_BANKS: dict[str, tuple[str, ...]] = {
+    "check_availability": (
+        TOOL_FILLERS["check_availability"],
+        *SMARTPBX_FILLER_ALTERNATES,
+    ),
+    "create_booking": (
+        TOOL_FILLERS["create_booking"],
+        *SMARTPBX_FILLER_ALTERNATES,
+    ),
+    "retrieve_booking": (
+        TOOL_FILLERS["retrieve_booking"],
+        *SMARTPBX_FILLER_ALTERNATES,
+    ),
+    "cancel_booking": (
+        TOOL_FILLERS["cancel_booking"],
+        *SMARTPBX_FILLER_ALTERNATES,
+    ),
+    "notify_human_handover": (
+        TOOL_FILLERS["notify_human_handover"],
+        *SMARTPBX_FILLER_ALTERNATES,
+    ),
+}
+SMARTPBX_DEFAULT_FILLER_BANK: tuple[str, ...] = (
+    DEFAULT_FILLER,
+    *SMARTPBX_FILLER_ALTERNATES,
+)
+
+
+class _CallFillerLease:
+    """A reserved phrase committed only once its delivery task starts."""
+
+    def __init__(self, rotation, bank_name: str, text: str) -> None:
+        self._rotation = rotation
+        self.bank_name = bank_name
+        self.text = text
+        self._active = True
+
+    def commit(self) -> None:
+        if self._active:
+            self._active = False
+            self._rotation._commit(self)
+
+    def release(self) -> None:
+        if self._active:
+            self._active = False
+            self._rotation._release(self)
+
+
+class _CallFillerRotation:
+    """Deterministic per-call selection with actual-start commit semantics."""
+
+    def __init__(self) -> None:
+        self._used: set[str] = set()
+        self._reserved: set[str] = set()
+        self._last_spoken: str | None = None
+
+    def reserve(self, bank_name: str, phrases: tuple[str, ...]) -> _CallFillerLease:
+        candidates = tuple(dict.fromkeys(phrase for phrase in phrases if phrase))
+        if not candidates:
+            raise ValueError("filler rotation bank must not be empty")
+
+        available = [
+            phrase
+            for phrase in candidates
+            if phrase not in self._used and phrase not in self._reserved
+        ]
+        if not available:
+            self._used.clear()
+            available = [phrase for phrase in candidates if phrase not in self._reserved]
+        non_repeating = [phrase for phrase in available if phrase != self._last_spoken]
+        if non_repeating:
+            selected = non_repeating[0]
+        elif available:
+            selected = available[0]
+        else:
+            selected = candidates[0]
+
+        self._reserved.add(selected)
+        return _CallFillerLease(self, bank_name, selected)
+
+    def next(self, bank_name: str, phrases: tuple[str, ...]) -> str:
+        """Select and immediately commit a phrase for small synchronous callers."""
+        lease = self.reserve(bank_name, phrases)
+        lease.commit()
+        return lease.text
+
+    def _commit(self, lease: _CallFillerLease) -> None:
+        self._reserved.discard(lease.text)
+        self._used.add(lease.text)
+        self._last_spoken = lease.text
+
+    def _release(self, lease: _CallFillerLease) -> None:
+        self._reserved.discard(lease.text)
+
 
 class SmartPBXInitialFillerController:
     """One cancellable neutral filler for a direct SmartPBX first provider round.
@@ -972,12 +1078,16 @@ class SmartPBXInitialFillerController:
         delay_seconds: float,
         sleep=asyncio.sleep,
         clear_audio=None,
+        text: str = SMARTPBX_INITIAL_FILLER_TEXT,
+        lease: _CallFillerLease | None = None,
     ) -> None:
         self._speak = speak
         self.generation = generation
         self.delay_seconds = delay_seconds
         self._sleep = sleep
         self._clear_audio = clear_audio
+        self.text = text
+        self._lease = lease
         self._task: asyncio.Task | None = None
         self.spoke = False
         self._cleared_after_spoke = False
@@ -997,7 +1107,9 @@ class SmartPBXInitialFillerController:
             # Mark before awaiting TTS so an arriving tool suppresses a second
             # specialized filler while this one drains to its delivery barrier.
             self.spoke = True
-            await self._speak(SMARTPBX_INITIAL_FILLER_TEXT, generation=self.generation)
+            if self._lease is not None:
+                self._lease.commit()
+            await self._speak(self.text, generation=self.generation)
         except asyncio.CancelledError:
             return
 
@@ -1014,6 +1126,8 @@ class SmartPBXInitialFillerController:
         ):
             self._cleared_after_spoke = True
             await self._clear_audio()
+        if not self.spoke and self._lease is not None:
+            self._lease.release()
 
     async def _cancel_pending_or_drain_delivery(self) -> None:
         """Let model readiness cancel only a timer that has not spoken yet.
@@ -1057,6 +1171,8 @@ class SmartPBXInitialFillerController:
     async def wait(self) -> None:
         if self._task is not None:
             await asyncio.gather(self._task, return_exceptions=True)
+        if not self.spoke and self._lease is not None:
+            self._lease.release()
 
 
 def _next_tool_filler(tool_name: str) -> str:
@@ -4694,6 +4810,7 @@ class MediaStreamSession:
         # race cannot mix two turns' counts. Event-loop-only mutation.
         self._smartpbx_post_dispatch_by_turn: dict[str, dict[str, int]] = {}
         self._smartpbx_last_finished_dropped_frames = 0
+        self._smartpbx_filler_rotation = _CallFillerRotation()
         self._smartpbx_initial_filler: SmartPBXInitialFillerController | None = None
         # Direct SmartPBX specialized tool fillers are session-owned. A runner
         # can return early, be cancelled, or lose a turn while one still holds
@@ -4738,6 +4855,17 @@ class MediaStreamSession:
         method directly.
         """
         return self._is_direct_smartpbx_english() and not self._is_capture_mode_active()
+
+    def _reserve_smartpbx_initial_filler(self) -> _CallFillerLease:
+        return self._smartpbx_filler_rotation.reserve(
+            "initial", SMARTPBX_INITIAL_FILLER_BANK
+        )
+
+    def _reserve_smartpbx_tool_filler(self, tool_name: str) -> _CallFillerLease:
+        bank = SMARTPBX_TOOL_FILLER_BANKS.get(
+            tool_name, SMARTPBX_DEFAULT_FILLER_BANK
+        )
+        return self._smartpbx_filler_rotation.reserve(f"tool:{tool_name}", bank)
 
     def _provider_max_tokens(self, provider: str | None = None) -> int:
         """Per-provider output budget for one direct-SmartPBX English round.
@@ -4827,11 +4955,14 @@ class MediaStreamSession:
                     runner.speak_generation = self._speak_generation
                     self._assistant_turn_generation = self._speak_generation
 
+            filler_lease = self._reserve_smartpbx_initial_filler()
             controller = SmartPBXInitialFillerController(
                 speak=speak,
                 generation=generation,
                 delay_seconds=SMARTPBX_INITIAL_FILLER_DELAY_SECONDS,
                 clear_audio=clear_audio,
+                text=filler_lease.text,
+                lease=filler_lease,
             )
             controller.start()
         runner = _smartpbx_runner_context.get()
@@ -4915,12 +5046,27 @@ class MediaStreamSession:
         return task
 
     def _start_smartpbx_tool_filler(
-        self, text: str, *, generation: int
+        self,
+        text: str,
+        *,
+        generation: int,
+        lease: _CallFillerLease | None = None,
     ) -> asyncio.Task:
         """Start a direct-path specialized filler under runner/session ownership."""
-        task = asyncio.create_task(
-            self._invoke_speak(text, generation=generation, sentence=text)
-        )
+        started = False
+
+        async def speak_filler() -> None:
+            nonlocal started
+            started = True
+            if lease is not None:
+                lease.commit()
+            await self._invoke_speak(text, generation=generation, sentence=text)
+
+        task = asyncio.create_task(speak_filler())
+        if lease is not None:
+            task.add_done_callback(
+                lambda _task: lease.release() if not started else None
+            )
         self._smartpbx_tool_filler_tasks.add(task)
         task.add_done_callback(self._smartpbx_tool_filler_tasks.discard)
         runner = _smartpbx_runner_context.get()
@@ -7222,9 +7368,9 @@ class MediaStreamSession:
                             and initial_filler.suppress_specialized_tool_filler
                         )
                     ):
-                        filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
+                        filler_lease = self._reserve_smartpbx_tool_filler(first_tool)
                         tool_filler_task = self._start_smartpbx_tool_filler(
-                            filler, generation=gen,
+                            filler_lease.text, generation=gen, lease=filler_lease,
                         )
                         await asyncio.sleep(0)
                         smartpbx_filler_sent = True
@@ -7726,9 +7872,9 @@ class MediaStreamSession:
                                 and initial_filler.suppress_specialized_tool_filler
                             )
                         ):
-                            filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
+                            filler_lease = self._reserve_smartpbx_tool_filler(first_tool)
                             tool_filler_task = self._start_smartpbx_tool_filler(
-                                filler, generation=gen,
+                                filler_lease.text, generation=gen, lease=filler_lease,
                             )
                             await asyncio.sleep(0)
                             smartpbx_filler_sent = True
@@ -8341,9 +8487,9 @@ class MediaStreamSession:
                             and initial_filler.suppress_specialized_tool_filler
                         )
                     ):
-                        filler = TOOL_FILLERS.get(first_tool, DEFAULT_FILLER)
+                        filler_lease = self._reserve_smartpbx_tool_filler(first_tool)
                         tool_filler_task = self._start_smartpbx_tool_filler(
-                            filler, generation=gen,
+                            filler_lease.text, generation=gen, lease=filler_lease,
                         )
                         await asyncio.sleep(0)
                         smartpbx_filler_sent = True
