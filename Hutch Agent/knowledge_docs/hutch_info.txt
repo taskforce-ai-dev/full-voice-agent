@@ -18,6 +18,10 @@ Hutch customers can check their prepaid balance by dialing the USSD code star-th
 
 Hutch's general USSD activation menu for many prepaid plans is star-one-three-one-hash (*131#). Postpaid customers activate or request plan changes mainly through the Hutch App, or by contacting the Hutch hotline at 1788, emailing cs@hutchison.lk, or visiting a Hutch shop.
 
+=================================================
+PREPAID — DATA PLANS
+=================================================
+
 HUTCH 15 — PREPAID NONSTOP SOCIAL MEDIA PLAN
 ---------------------------------------------
 
@@ -32,13 +36,6 @@ There is also a Hutch 15 prepaid plan at Rs 358 for 30 days, which includes 2.5G
 Hutch 15 prepaid plans can be activated via Reload, the Hutch App, the Hutch website, or by dialing the USSD code *131#. Any Hutch prepaid or postpaid customer is eligible to activate a Hutch 15 plan, though only the Rs 1,199 plan is available to postpaid customers.
 
 There are no daily limits on the Anytime data quota in Hutch 15 plans, and video streaming through the nonstop apps is capped at 360p resolution (240p after the fair-use limit is reached) since the plan is designed for smartphone use only.
-
-HUTCH 15 — POSTPAID VERSION
------------------------------
-
-The Hutch 15 postpaid plan costs Rs 1,199 per month, discounted by the Rs 100 Freeload to an effective Rs 1,099 (including tax) per month, appearing as a line-item discount on the invoice. It includes 35GB Anytime data, unlimited any-net calls, 1GB of roaming data, and free news, sports and business alerts.
-
-Hutch 15 postpaid can be activated online via the Hutch website or the Hutch App by any existing or new Hutch postpaid customer. Its nonstop social media fair-use limit is 75GB, after which video resolution steps down from 360p to 240p.
 
 HOURLY / TIME-BASED UNLIMITED DATA PLANS
 -------------------------------------------
@@ -79,6 +76,8 @@ Hutch cliQ is a time-based (not data-quota-based) internet service: customers pa
 
 Hutch cliQ 4G Break Free plans (prices inclusive of tax, speeds up to 10 Mbps) are: 2 days for Rs 199, 4 days for Rs 341, 7 days for Rs 665, 10 days for Rs 765, 15 days for Rs 935, and 30 days for Rs 1,669. After a plan's fair-use data volume is reached, speed is reduced to around 1 Mbps for the remainder of the validity period rather than being cut off.
 
+Each Hutch cliQ 4G Break Free tier has its own fair-use (FUP) data threshold: the Rs 199 (2 days) plan has a 5GB FUP, the Rs 341 (4 days) plan has a 7.5GB FUP, the Rs 665 (7 days) plan has a 15GB FUP, the Rs 765 (10 days) plan has a 15GB FUP, the Rs 935 (15 days) plan has a 20GB FUP, and the Rs 1,669 (30 days) plan has a 35GB FUP. Beyond the FUP, speed drops to around 1 Mbps for the rest of the validity period.
+
 Multiple Hutch cliQ plans can be purchased and their remaining duration accumulates in the cliQ app. While a cliQ plan is active, standard "pay as you go" data charging from the main balance is disabled to prevent unexpected charges; any of Hutch's standard prepaid data plans can still be added on top when no cliQ plan is active.
 
 WORK FROM HOME AND STUDY FROM HOME PLANS
@@ -101,6 +100,10 @@ HUTCH 2X — MOBILE HOTSPOT AND HOME BROADBAND IN ONE
 Hutch 2X converts a customer's smartphone into a Wi-Fi hotspot to cover both mobile data and home broadband needs from one connection, with no router or installation costs, saving up to 60 percent compared to running separate connections. It is available to both prepaid and postpaid Hutch customers.
 
 Hutch 2X plans, all with 30-day validity, are: 50GB for Rs 1,099, 100GB for Rs 2,099, 200GB for Rs 3,999, and a non-stop (unlimited) data option for Rs 4,999. On the unlimited Rs 4,999 Hutch 2X plan, speed steps down to a maximum of 5 Mbps after 250GB of usage, which still supports 1080p HD video streaming. Android hotspot devices support up to 10 connected devices; iOS supports up to 5.
+
+=================================================
+PREPAID — ANNUAL AND BUNDLED PLANS
+=================================================
 
 ONE LOAD — ANNUAL PREPAID AND POSTPAID PLAN
 -------------------------------------------------
@@ -138,6 +141,17 @@ Hutch Ultimate combines nonstop (effectively unlimited) Anytime data with unlimi
 
 The Rs 619 Hutch Ultimate plan (7 days, prepaid only) includes nonstop data with a 25GB fair-use threshold before speed steps down to 1 Mbps, unlimited any-net calls, 125 any-net SMS, and a Rs 25 Freeload. Both Hutch Ultimate tiers can be activated via reload, the Hutch App, or USSD *131# for prepaid; postpaid customers activate via the Hutch App.
 
+=================================================
+POSTPAID PLANS
+=================================================
+
+HUTCH 15 — POSTPAID VERSION
+-----------------------------
+
+The Hutch 15 postpaid plan costs Rs 1,199 per month, discounted by the Rs 100 Freeload to an effective Rs 1,099 (including tax) per month, appearing as a line-item discount on the invoice. It includes 35GB Anytime data, unlimited any-net calls, 1GB of roaming data, and free news, sports and business alerts.
+
+Hutch 15 postpaid can be activated online via the Hutch website or the Hutch App by any existing or new Hutch postpaid customer. Its nonstop social media fair-use limit is 75GB, after which video resolution steps down from 360p to 240p.
+
 POSTPAID COMBO PLANS
 ------------------------
 
@@ -146,6 +160,15 @@ Hutch Postpaid Combo plans bundle nonstop data, unlimited social media, and unli
 The Rs 998 Hutch Postpaid Combo plan (30 days, the Level-up postpaid tier) includes nonstop access to 11 social media apps, unlimited any-net calls, 30GB Anytime data with no daily limits, 1GB of free roaming data, and free sports, business and news alerts.
 
 The Rs 599 Hutch Postpaid Combo plan (30 days) includes unlimited any-net calls, 500 any-net SMS, and 3GB Anytime data. Usage beyond any Hutch Postpaid Combo bundle is charged at Rs 0.25 per SMS, Rs 1.50 per minute of calls, and Rs 0.20 per MB of data, with speed limits of 10 Mbps uplink, up to 20 Mbps downlink on 4G, and up to 7.2 Mbps downlink on 3G.
+
+SHARED PREPAID/POSTPAID PLANS FOR POSTPAID CUSTOMERS
+-------------------------------------------------------
+
+Several Hutch plans are shared across prepaid and postpaid and are also available to postpaid customers at the same tiers described in the prepaid sections above: Hutch 2X (the mobile hotspot / home broadband plan at Rs 1,099 / Rs 2,099 / Rs 3,999 / Rs 4,999), Hutch OneLoad (the annual plan at Rs 2,499 / Rs 8,999 / Rs 14,999), and the Hutch Gaurawa Plan (Rs 342 / Rs 549 / Rs 779 for government, pensioners, journalists and clergy). Hutch Level-up and Unlimited Any Net Calls are likewise available to postpaid customers.
+
+=================================================
+STANDARD RATES AND GENERAL POLICIES
+=================================================
 
 STANDARD RATES (OUTSIDE ANY BUNDLE)
 ---------------------------------------
