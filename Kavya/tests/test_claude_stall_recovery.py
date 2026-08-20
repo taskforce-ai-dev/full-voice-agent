@@ -397,7 +397,6 @@ def test_claude_thinking_stall_timeout_is_blank_safe_defaulted_and_maxed(
 @pytest.mark.parametrize(
     ("events", "progress"),
     [
-        ([message_start(), thinking_idle(9.0)], "metadata"),
         (
             [
                 message_start(),
@@ -429,6 +428,31 @@ async def test_first_attempt_non_thinking_stalls_keep_the_general_budget(
     assert len(client.requests) == 1
     assert spoken == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
     assert result == server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_metadata_stall_keeps_general_budget_and_retries_once(
+    monkeypatch,
+):
+    """Metadata remains retryable, but it must not receive thinking grace."""
+    import server
+
+    first_round = timeout_round([message_start(), thinking_idle(9.0)])
+    retry_round = completed_round([
+        message_start(), text_event("Metadata retry answer."), *terminal_events(),
+    ])
+    client = ScriptedClaude([first_round, retry_round])
+    pipeline = direct_pipeline(server, client)
+    install_deterministic_stream(monkeypatch, server)
+    install_quiet_filler(monkeypatch, pipeline)
+    spoken = install_recording_speak(monkeypatch, pipeline)
+
+    result = await pipeline._run_llm_claude()
+
+    assert first_round.observed_stall_timeouts == [8.0]
+    assert len(client.requests) == 2
+    assert result == "Metadata retry answer."
+    assert spoken == ["Metadata retry answer."]
 
 
 @pytest.mark.asyncio
