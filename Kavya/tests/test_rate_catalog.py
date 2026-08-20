@@ -276,6 +276,14 @@ def test_room_rate_classifier_has_structured_ambiguous_and_natural_price_results
         "How much are Mount Monarch Chalet and Mount Luxe Chalet per room per night?",
         "How much is Mount Monarch Chalet or Mount Luxe Chalet for one night?",
         "How much are Mount Monarch Chalet and Mount Luxe Chalet for one night?",
+        "How much is the Mount Monarch Chalet or Mount Luxe Chalet?",
+        "How much are the Mount Monarch Chalet and Mount Luxe Chalet?",
+        "How much is the Mount Monarch Chalet or Mount Luxe Chalet per night?",
+        "How much are the Mount Monarch Chalet and Mount Luxe Chalet per night?",
+        "How much is the Mount Monarch Chalet or Mount Luxe Chalet per room per night?",
+        "How much are the Mount Monarch Chalet and Mount Luxe Chalet per room per night?",
+        "How much is the Mount Monarch Chalet or Mount Luxe Chalet for one night?",
+        "How much are the Mount Monarch Chalet and Mount Luxe Chalet for one night?",
     ),
 )
 def test_room_rate_classifier_resolves_ambiguous_amount_grammar_before_target_count(
@@ -814,6 +822,14 @@ async def test_ungrounded_amount_pronoun_remains_a_descriptive_kb_turn(
         "How much are Mount Monarch Chalet and Mount Luxe Chalet per room per night?",
         "How much is Mount Monarch Chalet or Mount Luxe Chalet for one night?",
         "How much are Mount Monarch Chalet and Mount Luxe Chalet for one night?",
+        "How much is the Mount Monarch Chalet or Mount Luxe Chalet?",
+        "How much are the Mount Monarch Chalet and Mount Luxe Chalet?",
+        "How much is the Mount Monarch Chalet or Mount Luxe Chalet per night?",
+        "How much are the Mount Monarch Chalet and Mount Luxe Chalet per night?",
+        "How much is the Mount Monarch Chalet or Mount Luxe Chalet per room per night?",
+        "How much are the Mount Monarch Chalet and Mount Luxe Chalet per room per night?",
+        "How much is the Mount Monarch Chalet or Mount Luxe Chalet for one night?",
+        "How much are the Mount Monarch Chalet and Mount Luxe Chalet for one night?",
     ),
 )
 async def test_ambiguous_multi_room_rate_requests_are_no_quote_without_stale_room(
