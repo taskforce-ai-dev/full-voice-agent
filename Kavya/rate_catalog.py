@@ -172,6 +172,25 @@ def _target_before_cost(tokens: tuple[str, ...]) -> tuple[str, ...] | None:
     return None
 
 
+def _amount_target(tokens: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Extract one bounded singular/plural amount target before classifying it."""
+    for prefix in (
+        ("how", "much", "is"),
+        ("how", "much", "is", "the"),
+        ("how", "much", "are"),
+        ("how", "much", "are", "the"),
+    ):
+        if tokens[:len(prefix)] != prefix:
+            continue
+        target = tokens[len(prefix):]
+        for suffix in sorted(_ROOM_AMOUNT_SUFFIXES, key=len, reverse=True):
+            if suffix and target[-len(suffix):] == suffix:
+                target = target[:-len(suffix)]
+                break
+        return target or None
+    return None
+
+
 def _is_room_like_target(target: tuple[str, ...] | None) -> bool:
     """Accept unknown targets only when their noun explicitly denotes a room."""
     return bool(target) and target[-1] in _ROOM_TARGET_NOUNS
@@ -247,16 +266,16 @@ def _is_explicit_unknown_room_target(tokens: tuple[str, ...]) -> bool:
     for prefix in (("rate", "for"), ("price", "of"), ("cost", "of")):
         if _is_room_like_target(_target_after_prefix(tokens, prefix)):
             return True
-    return _is_room_like_target(_target_before_cost(tokens))
+    return _is_room_like_target(
+        _target_before_cost(tokens) or _amount_target(tokens)
+    )
 
 
 def _is_ambiguous_room_rate_form(
     tokens: tuple[str, ...], rooms: tuple[str, ...],
 ) -> bool:
     """Accept only explicit price grammar whose target is exactly those rooms."""
-    if tokens[:3] == ("how", "much", "are") and _is_canonical_room_list(
-        tokens[3:], rooms,
-    ):
+    if _is_canonical_room_list(_amount_target(tokens), rooms):
         return True
     for prefix in (
         ("room", "rate", "for"),
