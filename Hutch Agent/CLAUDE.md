@@ -151,6 +151,43 @@ notification failure must never affect the live call.
   connects straight to ConversationRelay with no language `<Gather>` menu
   (mirrors Flico's `rodrigo` brand, which also has no IVR).
 
+## Barge-in echo gating (Aug 2026)
+
+Dialog SmartPBX has no echo cancellation on the media path, so Selina's own
+TTS audio leaks back into the mic and STT reports it as caller speech. The
+original `_on_stt_result`/`_on_stt_interim` callbacks called `_handle_bargein()`
+unconditionally whenever `_is_speaking` was true — any echo blip, however
+short, cleared her audio and dropped her mid-sentence, which surfaced as two
+apparently separate bugs: unreliable "stop and listen" barge-in, and
+sentences frequently cut off before finishing.
+
+Ported Kavya's proven fix: `BARGEIN_MIN_CHARS` (default `12`, clamp
+`[0, 200]`) and `BARGEIN_DEBOUNCE_SECONDS` (default `0.6`, clamp `[0.0, 5.0]`),
+plus a `_speaking_since` timestamp set when TTS starts and cleared when it
+stops. `_should_barge_in()` only allows a barge-in when the STT result is at
+least `BARGEIN_MIN_CHARS` long AND arrives at least `BARGEIN_DEBOUNCE_SECONDS`
+after TTS started — short/early results (echo) are silently dropped instead
+of interrupting her. A genuine interruption ("wait", "stop", a real question)
+still barges in correctly; it just has to clear this bar first.
+
+**Related fix, same investigation:** `_is_speaking` was only ever reset to
+`False` on a clean (non-barge-in) finish by Twilio's `mark`/`tts_done` event
+being **echoed back** through `run()`'s inbound WebSocket loop. Dialog
+SmartPBX has no such echo — `_TransportWebSocketAdapter.send_text()` forwards
+the `mark` to the transport's own internal flag and never calls back into
+`pipeline._is_speaking`. Since SmartPBX is Hutch's only live path, this left
+`_is_speaking` stuck `True` after the first sentence of any answer, for the
+rest of the call. Depending on timing this cut both ways: sometimes false
+barge-in on echo (fixed above), and sometimes a **missed** real interruption
+— because an earlier spurious flip had already forced `_is_speaking` back to
+`False`, so the caller's new question was accumulated as an ordinary
+utterance instead of a barge-in, and had to wait behind the `_speak_lock`
+the still-playing paragraph was holding: the old answer played out in full,
+then the new one started immediately after with no natural gap. Fixed by
+setting `_is_speaking = False` / `_speaking_since = None` directly in
+`_tts_elevenlabs()`'s success path, right after sending the mark, instead of
+waiting on an echo that never arrives on the live path.
+
 ## Environment Setup
 
 Copy `.env.example` to `.env`. Key groups:
