@@ -1254,6 +1254,18 @@ class MediaStreamSession:
                         "streamSid": self.stream_sid,
                         "mark": {"name": "tts_done"},
                     }))
+                # Twilio's Media Streams path relies on the "mark" event being
+                # echoed back through the inbound WebSocket loop (run(), which
+                # sets _is_speaking = False on receipt) to know playback has
+                # actually finished. Dialog SmartPBX has no such echo -- the
+                # transport adapter swallows the mark locally and never calls
+                # back in -- so without this, _is_speaking would stay stuck
+                # True for the rest of the call on that (the only live) path,
+                # making later barge-in detection unreliable in both
+                # directions. Clearing it here is a no-op for the inert Twilio
+                # path (already cleared again when its echo arrives).
+                self._is_speaking = False
+                self._speaking_since = None
             else:
                 logger.info("ElevenLabs TTS interrupted by barge-in [%s]", self.call_sid)
 

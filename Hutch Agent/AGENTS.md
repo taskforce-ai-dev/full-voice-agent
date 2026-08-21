@@ -170,6 +170,24 @@ after TTS started — short/early results (echo) are silently dropped instead
 of interrupting her. A genuine interruption ("wait", "stop", a real question)
 still barges in correctly; it just has to clear this bar first.
 
+**Related fix, same investigation:** `_is_speaking` was only ever reset to
+`False` on a clean (non-barge-in) finish by Twilio's `mark`/`tts_done` event
+being **echoed back** through `run()`'s inbound WebSocket loop. Dialog
+SmartPBX has no such echo — `_TransportWebSocketAdapter.send_text()` forwards
+the `mark` to the transport's own internal flag and never calls back into
+`pipeline._is_speaking`. Since SmartPBX is Hutch's only live path, this left
+`_is_speaking` stuck `True` after the first sentence of any answer, for the
+rest of the call. Depending on timing this cut both ways: sometimes false
+barge-in on echo (fixed above), and sometimes a **missed** real interruption
+— because an earlier spurious flip had already forced `_is_speaking` back to
+`False`, so the caller's new question was accumulated as an ordinary
+utterance instead of a barge-in, and had to wait behind the `_speak_lock`
+the still-playing paragraph was holding: the old answer played out in full,
+then the new one started immediately after with no natural gap. Fixed by
+setting `_is_speaking = False` / `_speaking_since = None` directly in
+`_tts_elevenlabs()`'s success path, right after sending the mark, instead of
+waiting on an echo that never arrives on the live path.
+
 ## Environment Setup
 
 Copy `.env.example` to `.env`. Key groups:
