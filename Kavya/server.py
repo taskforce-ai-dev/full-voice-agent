@@ -189,6 +189,7 @@ class _SmartPBXRunnerContext:
     rate_context: str = ""
     pending_room: str | None = None
     pending_residency: str | None = None
+    residency_question_asked: bool = False
     rate_turn: bool = False
     clear_rate_followup: bool = False
     rate_followup_eligible: bool = False
@@ -5900,6 +5901,57 @@ class MediaStreamSession:
         if residency:
             self._booking_slots["residency"] = residency
 
+    @staticmethod
+    def _assistant_content_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, dict):
+            text = content.get("text")
+            return text if isinstance(text, str) else ""
+        if isinstance(content, list):
+            return " ".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            )
+        return ""
+
+    @classmethod
+    def _is_explicit_residency_question(cls, text: str) -> bool:
+        normalized = " ".join(re.findall(r"[a-z]+", str(text).lower()))
+        if "?" not in str(text) or not normalized:
+            return False
+        has_residency_term = any(
+            term in normalized for term in ("resident", "local")
+        )
+        has_question_lead = any(
+            phrase in normalized
+            for phrase in ("are you", "is your party", "may i know", "whether you are")
+        )
+        return has_residency_term and has_question_lead
+
+    def _latest_assistant_asked_residency(self) -> bool:
+        """Return whether the immediately preceding assistant turn asked it."""
+        if self.history:
+            for message in reversed(self.history):
+                if not isinstance(message, dict):
+                    continue
+                if message.get("role") != "assistant":
+                    continue
+                return self._is_explicit_residency_question(
+                    self._assistant_content_text(message.get("content"))
+                )
+            return False
+        for message in reversed(self.full_transcript):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") != "assistant":
+                continue
+            return self._is_explicit_residency_question(
+                self._assistant_content_text(message.get("text"))
+            )
+        return False
+
     def _capture_selected_room(self, utterance: str) -> None:
         """Persist a confirmed canonical room from the guest's selection turn."""
         room = recognize_selected_room(utterance)
@@ -5979,7 +6031,9 @@ class MediaStreamSession:
         if intent.kind == "RATE" and intent.rooms:
             selected_room = intent.rooms[0]
         runner.pending_room = selected_room
-        runner.pending_residency = recognize_residency(text)
+        runner.pending_residency = recognize_residency(
+            text, allow_terse=runner.residency_question_asked,
+        )
         runner.rate_context = self._rate_context_for_turn(text, runner)
 
     def _commit_staged_turn_rate_state(
@@ -7292,6 +7346,7 @@ class MediaStreamSession:
             return
         runner = _smartpbx_runner_context.get()
         if runner is not None:
+            runner.residency_question_asked = self._latest_assistant_asked_residency()
             self._stage_turn_rate_state(text, runner)
         self._last_guest_utterance_raw = text
         self._capture_success_this_turn = False
