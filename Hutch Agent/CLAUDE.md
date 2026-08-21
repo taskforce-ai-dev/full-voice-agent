@@ -151,6 +151,25 @@ notification failure must never affect the live call.
   connects straight to ConversationRelay with no language `<Gather>` menu
   (mirrors Flico's `rodrigo` brand, which also has no IVR).
 
+## Barge-in echo gating (Aug 2026)
+
+Dialog SmartPBX has no echo cancellation on the media path, so Selina's own
+TTS audio leaks back into the mic and STT reports it as caller speech. The
+original `_on_stt_result`/`_on_stt_interim` callbacks called `_handle_bargein()`
+unconditionally whenever `_is_speaking` was true — any echo blip, however
+short, cleared her audio and dropped her mid-sentence, which surfaced as two
+apparently separate bugs: unreliable "stop and listen" barge-in, and
+sentences frequently cut off before finishing.
+
+Ported Kavya's proven fix: `BARGEIN_MIN_CHARS` (default `12`, clamp
+`[0, 200]`) and `BARGEIN_DEBOUNCE_SECONDS` (default `0.6`, clamp `[0.0, 5.0]`),
+plus a `_speaking_since` timestamp set when TTS starts and cleared when it
+stops. `_should_barge_in()` only allows a barge-in when the STT result is at
+least `BARGEIN_MIN_CHARS` long AND arrives at least `BARGEIN_DEBOUNCE_SECONDS`
+after TTS started — short/early results (echo) are silently dropped instead
+of interrupting her. A genuine interruption ("wait", "stop", a real question)
+still barges in correctly; it just has to clear this bar first.
+
 ## Environment Setup
 
 Copy `.env.example` to `.env`. Key groups:

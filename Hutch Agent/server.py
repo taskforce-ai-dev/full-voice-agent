@@ -63,6 +63,7 @@ if os.getenv("SENTRY_DSN"):
 import queue
 import re
 import threading
+import time
 import xml.sax.saxutils
 from contextlib import asynccontextmanager
 from datetime import date
@@ -195,6 +196,14 @@ STT_ALTERNATIVES: dict[str, list[str]] = {"en": []}
 
 # Silence (seconds) after last STT result before an utterance is considered complete
 ENDPOINTING_SILENCE: float = 1.0
+
+# Barge-in echo gating -- Dialog SmartPBX has no echo cancellation on the media
+# path, so Selina's own TTS otherwise leaks back into STT and is misread as the
+# caller interrupting. A genuine interruption is required to be at least this
+# many characters and to arrive after a short debounce from when TTS started;
+# anything shorter/earlier is treated as echo and dropped rather than acted on.
+BARGEIN_MIN_CHARS: int = max(0, min(200, int(os.getenv("BARGEIN_MIN_CHARS", "12"))))
+BARGEIN_DEBOUNCE_SECONDS: float = max(0.0, min(5.0, float(os.getenv("BARGEIN_DEBOUNCE_SECONDS", "0.6"))))
 
 # Welcome greeting spoken via TTS on stream start (Media Streams / SmartPBX)
 MEDIA_STREAM_WELCOME: dict[str, str] = {
@@ -784,6 +793,7 @@ class MediaStreamSession:
 
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._is_speaking = False
+        self._speaking_since: float | None = None
         self._speak_lock = asyncio.Lock()
         self._ws_lock = asyncio.Lock()
         self._speak_generation: int = 0
@@ -839,6 +849,7 @@ class MediaStreamSession:
                     logger.info("Mark received [%s]: %s", self.call_sid, mark_name)
                     if mark_name == "tts_done":
                         self._is_speaking = False
+                        self._speaking_since = None
                         logger.info("TTS done -- listening for caller speech [%s]", self.call_sid)
 
                 elif event == "stop":
@@ -874,9 +885,10 @@ class MediaStreamSession:
         if self._event_loop is None:
             return
         if self._is_speaking:
-            asyncio.run_coroutine_threadsafe(
-                self._handle_bargein(), self._event_loop,
-            )
+            if self._should_barge_in(transcript):
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_bargein(), self._event_loop,
+                )
             return
         asyncio.run_coroutine_threadsafe(
             self._accumulate_transcript(transcript), self._event_loop,
@@ -892,17 +904,35 @@ class MediaStreamSession:
         if self._event_loop is None:
             return
         if self._is_speaking:
-            asyncio.run_coroutine_threadsafe(
-                self._handle_bargein(), self._event_loop,
-            )
+            if self._should_barge_in(transcript):
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_bargein(), self._event_loop,
+                )
             return
         asyncio.run_coroutine_threadsafe(
             self._set_transcript_interim(transcript), self._event_loop,
         )
 
+    def _should_barge_in(self, transcript: str) -> bool:
+        """Gate barge-in against Selina's own TTS echo.
+
+        Dialog SmartPBX has no echo cancellation, so without this a short STT
+        blip caused by Selina's own voice leaking into the mic gets misread as
+        the caller interrupting -- cutting her off mid-sentence and dropping
+        into a false barge-in instead of letting her finish.
+        """
+        text = (transcript or "").strip()
+        if len(text) < BARGEIN_MIN_CHARS:
+            return False
+        if BARGEIN_DEBOUNCE_SECONDS > 0 and self._speaking_since:
+            if (time.monotonic() - self._speaking_since) < BARGEIN_DEBOUNCE_SECONDS:
+                return False
+        return True
+
     async def _handle_bargein(self):
         logger.info("Barge-in detected [%s]", self.call_sid)
         self._is_speaking = False
+        self._speaking_since = None
         self._speak_generation += 1
         self._pending_transcript = ""
         self._latest_interim = ""
@@ -1175,6 +1205,7 @@ class MediaStreamSession:
             return
 
         self._is_speaking = True
+        self._speaking_since = time.monotonic()
         url = (
             ELEVENLABS_TTS_URL.format(voice_id=ELEVENLABS_VOICE_ID)
             + "?output_format=ulaw_8000"
