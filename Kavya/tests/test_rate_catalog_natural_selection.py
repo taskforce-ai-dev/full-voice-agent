@@ -59,6 +59,8 @@ RESIDENCY_ASKS = (
     "May I know if you are a Sri Lankan resident or a foreign guest?",
 )
 
+TERSE_RESIDENCY_REPLIES = ("Resident.", "Resident", "resident", "Local.", "Local", "local")
+
 NON_RESIDENCY_ASKS = (
     "Which room would you like?",
     "May I have your name, please?",
@@ -162,14 +164,7 @@ def test_natural_selection_grammar_stays_bounded(utterance):
 
 # ── rate_catalog: terse residency only while the session awaits it ────────────
 
-@pytest.mark.parametrize("utterance", ("Resident.", "Resident", "resident"))
-def test_terse_resident_is_recognized_only_while_awaiting_residency(utterance):
-    assert rate_catalog.recognize_residency(
-        utterance, awaiting_residency=True
-    ) == "resident"
-
-
-@pytest.mark.parametrize("utterance", ("Resident.", "Resident", "resident"))
+@pytest.mark.parametrize("utterance", TERSE_RESIDENCY_REPLIES)
 def test_terse_resident_is_never_inferred_globally(utterance):
     assert rate_catalog.recognize_residency(utterance) is None
 
@@ -183,12 +178,10 @@ def test_terse_resident_is_never_inferred_globally(utterance):
         "Resident parking is included, right?",
     ),
 )
-def test_awaiting_residency_does_not_unlock_ambiguous_or_third_party_statements(
+def test_terse_residency_context_never_unlocks_ambiguous_or_third_party_statements(
     utterance,
 ):
-    assert rate_catalog.recognize_residency(
-        utterance, awaiting_residency=True
-    ) is None
+    assert rate_catalog.recognize_residency(utterance) is None
 
 
 @pytest.mark.parametrize(
@@ -199,13 +192,8 @@ def test_awaiting_residency_does_not_unlock_ambiguous_or_third_party_statements(
         ("foreign guest", "foreign"),
     ),
 )
-def test_awaiting_residency_preserves_the_existing_explicit_statements(
-    utterance, expected
-):
+def test_explicit_residency_statements_remain_supported(utterance, expected):
     assert rate_catalog.recognize_residency(utterance) == expected
-    assert rate_catalog.recognize_residency(
-        utterance, awaiting_residency=True
-    ) == expected
 
 
 # ── rate_catalog: natural local / October rate classification ────────────────
@@ -391,25 +379,20 @@ def _october_session(provider: str, **slots):
     return session, client
 
 
-def _request_text(provider: str, client) -> str:
-    """Return the whole recorded request.
+def _seed_delivered_residency_question(session, question: str = RESIDENCY_ASKS[0]):
+    """Seed the prior assistant turn that explicitly arms a terse reply.
 
-    The Claude runner hands ``messages.stream()`` the live history list, so the
-    assistant reply is appended to the very object the recorder captured.  Any
-    assertion that a marker is PRESENT must therefore scan the whole request
-    rather than index the last message, or it reads the reply back instead of
-    the guest turn.
+    Room and date slots are deliberately not enough.  The production boundary
+    must carry forward an actual assistant residency question, and stale-runner
+    fencing must still prevent that evidence from being committed by an old
+    owned turn.
     """
-    request = client.requests[-1]
-    if provider == "openai":
-        return str(request["messages"])
-    if provider == "gemini":
-        return str(request["config"]) + str(request["contents"])
-    return str(request["system"]) + str(request["messages"])
+    session.history.append({"role": "assistant", "content": question})
+    session.full_transcript.append({"role": "assistant", "text": question})
 
 
 def _current_turn_request_text(provider: str, client) -> str:
-    """Return only the system/current-user request scope, not prior turn history."""
+    """Return only the system/current-user input, never prior turn history."""
     request = client.requests[-1]
     if provider == "openai":
         messages = request["messages"]
@@ -420,7 +403,10 @@ def _current_turn_request_text(provider: str, client) -> str:
     if provider == "gemini":
         current_user = request["contents"][-1]
         return str(request["config"]["system_instruction"]) + str(current_user)
-    current_user = request["messages"][-1]
+    current_user = next(
+        message for message in reversed(request["messages"])
+        if message.get("role") == "user"
+    )
     return str(request["system"]) + str(current_user["content"])
 
 
@@ -482,7 +468,7 @@ async def test_incident_mount_luxe_then_terse_resident_quotes_the_october_rate(
     queries = _legacy_kb(monkeypatch)
 
     await session._process_utterance_bound("I'd like to go with the Mount Luxe Chalet.")
-    session._delivered_sentences = [residency_ask]
+    _seed_delivered_residency_question(session, residency_ask)
     await session._process_utterance_bound("Resident.")
 
     assert session._booking_slots["room_type"] == "Mount Luxe Chalet"
@@ -517,25 +503,63 @@ async def test_incident_mount_monarch_with_trailing_thanks_quotes_the_october_ra
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("non_residency_ask", NON_RESIDENCY_ASKS)
+@pytest.mark.parametrize("utterance", TERSE_RESIDENCY_REPLIES)
 async def test_terse_resident_is_ignored_when_the_session_is_not_awaiting_residency(
-    monkeypatch, non_residency_ask
+    monkeypatch, non_residency_ask, utterance
 ):
     """A bare session — nothing asked, no room, no dates — must stay inert.
 
-    Deliberately scoped to a session that is unambiguously NOT awaiting
-    residency under any arming rule.  Whether a slot state of "room and dates
-    captured, residency the only gap" also counts as an explicit await is a
-    separate question, settled by the pending-slot contract in
-    ``test_rate_catalog.py``; this test must not pre-empt it.
+    Deliberately seed a delivered assistant turn that asks about a different
+    field.  Even with a live assistant turn in history, that is not evidence
+    that Kavya asked the residency question.
     """
     session, client = _provider_session("openai")
     _legacy_kb(monkeypatch)
-    session._delivered_sentences = [non_residency_ask]
+    _seed_delivered_residency_question(session, non_residency_ask)
 
-    await session._process_utterance_bound("Resident.")
+    await session._process_utterance_bound(utterance)
 
     assert "residency" not in session._booking_slots
-    assert "rate_per_room_per_night" not in _request_text("openai", client)
+    assert "rate_per_room_per_night" not in _current_turn_request_text(
+        "openai", client
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("utterance", ("Resident.", "Local."))
+async def test_room_and_dates_alone_do_not_admit_a_terse_resident_reply(
+    monkeypatch, utterance
+):
+    """A slot gap is not evidence that Kavya asked the residency question."""
+    session, client = _october_session(
+        "openai", room_type="Mount Luxe Chalet",
+    )
+    _legacy_kb(monkeypatch)
+
+    await session._process_utterance_bound(utterance)
+
+    assert "residency" not in session._booking_slots
+    record = _current_authoritative_rate_record("openai", client)
+    assert "status: no_quote" not in record
+    assert "rate_per_room_per_night" not in record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("utterance", ("Resident.", "Local."))
+async def test_explicit_residency_question_arms_the_terse_reply(
+    monkeypatch, utterance
+):
+    session, client = _october_session(
+        "openai", room_type="Mount Luxe Chalet",
+    )
+    _legacy_kb(monkeypatch)
+    _seed_delivered_residency_question(session)
+
+    await session._process_utterance_bound(utterance)
+
+    assert session._booking_slots["residency"] == "resident"
+    record = _current_authoritative_rate_record("openai", client)
+    assert "rate_per_room_per_night: 259000" in record
 
 
 # ── The rate is quoted before identity capture, never handed to a human ──────
@@ -555,6 +579,12 @@ async def test_known_october_rate_is_quoted_before_any_name_or_phone_is_captured
     assert "rate_per_room_per_night: 214000" in record
     assert "no_quote" not in record
     assert "human confirmation" not in record
+    turn_text = _current_turn_request_text(provider, client)
+    assert "I'm a Sri Lankan resident." in turn_text
+    assert session.history[-1]["role"] == "assistant"
+    assert "capture_spoken_name" not in str(session.history[-1]["content"])
+    assert "capture_spoken_number" not in str(session.history[-1]["content"])
+    assert session.transfer_pending is False
     assert "guest_name" not in session._booking_slots
     assert "guest_phone" not in session._booking_slots
 
@@ -606,11 +636,12 @@ async def test_generic_plural_local_rate_request_without_a_room_asks_which_room(
 
     await session._process_utterance_bound(utterance)
 
-    turn_text = _request_text(provider, client)
+    turn_text = _current_turn_request_text(provider, client)
     record = _current_authoritative_rate_record(provider, client)
     assert "AUTHORITATIVE RATE RECORD" in record
     assert "status: no_quote" in record
     assert "reason: unknown_room" in record
+    assert utterance in turn_text
     for room, rate in OCTOBER_RESIDENT_RATE_LKR.items():
         assert room not in record, "a missing room must not be guessed"
         assert str(rate) not in turn_text, "rates must not be enumerated"
@@ -733,7 +764,7 @@ async def test_unknown_room_month_rate_request_is_an_authoritative_no_quote(
 
     await session._process_utterance_bound("rate for Royal Villa in October")
 
-    turn_text = _request_text(provider, client)
+    turn_text = _current_turn_request_text(provider, client)
     record = _current_authoritative_rate_record(provider, client)
     assert "status: no_quote" in record
     assert "reason: unknown_room" in record
@@ -761,7 +792,7 @@ async def test_non_room_price_questions_keep_the_semantic_knowledge_base(
 
     await session._process_utterance_bound(utterance)
 
-    turn_text = _request_text(provider, client)
+    turn_text = _current_turn_request_text(provider, client)
     assert "LEGACY_KB" in turn_text
     assert "AUTHORITATIVE RATE RECORD" not in turn_text
 
@@ -784,7 +815,7 @@ async def test_the_selection_turn_itself_never_quotes_a_rate(
 
     await session._process_utterance_bound(utterance)
 
-    turn_text = _request_text(provider, client)
+    turn_text = _current_turn_request_text(provider, client)
     assert session._booking_slots["room_type"] == expected_room
     assert "LEGACY_KB" in turn_text
     assert "rate_per_room_per_night" not in turn_text
@@ -807,7 +838,7 @@ async def test_shared_twilio_media_session_gets_the_same_october_rate(monkeypatc
 
 
 async def _assert_stale_runner_cannot_commit(
-    monkeypatch, utterance: str, slot: str, *, delivered: list[str] | None = None,
+    monkeypatch, utterance: str, slot: str, *, question: str | None = None,
 ):
     session, _client = _october_session("openai")
     session._smartpbx_transfer_context = object()
@@ -822,8 +853,8 @@ async def _assert_stale_runner_cannot_commit(
         return "KB_DETAILS"
 
     monkeypatch.setattr(server, "retrieve_context", retrieve)
-    if delivered is not None:
-        session._delivered_sentences = list(delivered)
+    if question is not None:
+        _seed_delivered_residency_question(session, question)
     session._active_smartpbx_turn_id = "turn-a"
     stale_task = asyncio.create_task(session._process_utterance_bound(utterance))
     try:
@@ -850,9 +881,6 @@ async def test_stale_runner_cannot_commit_an_aliased_natural_selection(monkeypat
 
 @pytest.mark.asyncio
 async def test_stale_runner_cannot_commit_a_terse_awaited_residency(monkeypatch):
-    assert rate_catalog.recognize_residency(
-        "Resident.", awaiting_residency=True
-    ) == "resident"
     await _assert_stale_runner_cannot_commit(
-        monkeypatch, "Resident.", "residency", delivered=[RESIDENCY_ASKS[0]],
+        monkeypatch, "Resident.", "residency", question=RESIDENCY_ASKS[0],
     )
