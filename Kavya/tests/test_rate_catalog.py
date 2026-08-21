@@ -361,6 +361,174 @@ def test_residency_recognition_handles_contractions_without_were_false_positives
     assert rate_catalog.recognize_residency(utterance) == expected
 
 
+@pytest.mark.parametrize(
+    ("utterance", "expected"),
+    (
+        ("the Sunrise Vista, please.", "Sunrise Vista Premium Suite"),
+        ("go with the Mount Luxe", "Mount Luxe Chalet"),
+        ("I'll go with Mount Monarch.", "Mount Monarch Chalet"),
+        (
+            "Well, I'll go with the Mount Monarch Chalet, please. Thank you.",
+            "Mount Monarch Chalet",
+        ),
+    ),
+)
+def test_room_selection_accepts_closed_set_aliases_and_bounded_natural_forms(
+    utterance, expected
+):
+    assert rate_catalog.recognize_selected_room(utterance) == expected
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "the Sunrise View, please.",
+        "go with Mount Luxe Villa",
+        "I'll go with Mount Monarch Chalets.",
+        "please book whichever mountain room is cheapest",
+    ),
+)
+def test_room_selection_rejects_arbitrary_fuzzy_or_unbounded_room_phrases(utterance):
+    assert rate_catalog.recognize_selected_room(utterance) is None
+
+
+def test_terse_resident_is_not_a_global_residency_signal():
+    assert rate_catalog.recognize_residency("Resident.") is None
+
+
+@pytest.mark.asyncio
+async def test_session_accepts_terse_resident_only_when_room_dates_make_residency_pending(
+    monkeypatch,
+):
+    session, client = _provider_session("openai")
+    session._booking_slots.update(
+        {
+            "room_type": "Sunrise Vista Premium Suite",
+            "check_in": "2026-10-10",
+            "check_out": "2026-10-12",
+        }
+    )
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "STALE_RATE_KB")
+
+    await session._process_utterance_bound("Resident.")
+
+    assert session._booking_slots["residency"] == "resident"
+    request_text = _current_turn_request_text("openai", client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert "rate_per_room_per_night: 214000" in request_text
+    assert "STALE_RATE_KB" not in request_text
+
+
+@pytest.mark.parametrize(
+    ("utterance", "kind", "rooms"),
+    (
+        ("local rates for October", "RATE", ()),
+        ("what are the local rates for October", "RATE", ()),
+        (
+            "rate for Forest Escape Suite in October",
+            "RATE",
+            ("Forest Escape Suite",),
+        ),
+        (
+            "what is the resident rate for Mount Monarch Chalet in October",
+            "RATE",
+            ("Mount Monarch Chalet",),
+        ),
+    ),
+)
+def test_natural_local_and_resident_october_rate_requests_are_classified(
+    utterance, kind, rooms
+):
+    classification = rate_catalog.classify_room_rate_intent(utterance)
+
+    assert classification.kind == kind
+    assert classification.rooms == rooms
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_generic_local_october_rate_request_asks_for_room_without_enumerating(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "LEGACY_RATE_KB")
+
+    await session._process_utterance_bound("What are the local rates for October?")
+
+    rate_record = _current_authoritative_rate_record(provider, client)
+    assert "status: no_quote" in rate_record
+    assert "reason: unknown_room" in rate_record
+    assert "rate_per_room_per_night" not in rate_record
+    assert "LEGACY_RATE_KB" not in _current_turn_request_text(provider, client)
+    assert not any(
+        room in rate_record for room in DEMO_NIGHTLY_RATE_USD
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+@pytest.mark.parametrize(
+    ("selection", "expected_room", "expected_rate"),
+    (
+        ("the Sunrise Vista, please.", "Sunrise Vista Premium Suite", 214000),
+        ("go with the Mount Luxe", "Mount Luxe Chalet", 259000),
+        ("I'll go with Mount Monarch. Thank you.", "Mount Monarch Chalet", 315000),
+    ),
+)
+async def test_alias_selection_then_terse_residency_quotes_exact_october_rate_without_kb(
+    monkeypatch, provider, selection, expected_room, expected_rate
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update(
+        {
+            "check_in": "2026-10-10",
+            "check_out": "2026-10-12",
+        }
+    )
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "CONTRADICTORY_KB")
+
+    await session._process_utterance_bound(selection)
+    await session._process_utterance_bound("Resident.")
+
+    assert session._booking_slots["room_type"] == expected_room
+    assert session._booking_slots["residency"] == "resident"
+    request_text = _current_turn_request_text(provider, client)
+    assert "AUTHORITATIVE RATE RECORD" in request_text
+    assert f"rate_per_room_per_night: {expected_rate}" in request_text
+    assert "status: no_quote" not in _current_authoritative_rate_record(provider, client)
+    assert "CONTRADICTORY_KB" not in request_text
+    assert session.transfer_pending is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("openai", "gemini", "claude"))
+async def test_known_rate_remains_quotable_before_name_or_phone_capture(
+    monkeypatch, provider
+):
+    session, client = _provider_session(provider)
+    session._booking_slots.update(
+        {
+            "room_type": "Mount Luxe Chalet",
+            "residency": "resident",
+            "check_in": "2026-10-10",
+            "check_out": "2026-10-12",
+            "guest_name": "Pending Guest",
+            "guest_phone": "+94770000000",
+        }
+    )
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "UNTRUSTED_RATE_KB")
+
+    await session._process_utterance_bound(
+        "What is the resident rate for Mount Luxe Chalet in October?"
+    )
+
+    rate_record = _current_authoritative_rate_record(provider, client)
+    assert "rate_per_room_per_night: 259000" in rate_record
+    assert "status: no_quote" not in rate_record
+    assert "UNTRUSTED_RATE_KB" not in _current_turn_request_text(provider, client)
+    assert session.transfer_pending is False
+
+
 async def _one_event_stream(event):
     yield event
 
