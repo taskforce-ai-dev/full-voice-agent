@@ -430,7 +430,18 @@ def initialize_kb(docs_directory: str = DEFAULT_DOCS_DIRECTORY) -> bool:
 # Semantic retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve_context(query: str, n_results: int = 3) -> str:
+# Number of KB chunks handed to the LLM per turn. The hotel KB has several
+# paragraphs that look alike to the embedder -- the foreign-rate block, the
+# resident-rate block, the peak-season block and each room's own paragraph all
+# share words like "per room per night", "half board" and "rupees". With only a
+# few chunks the specific rate a caller asks about (especially the resident /
+# local rate, which lives in a separate block from the room's own paragraph) is
+# easily crowded out, and Kavya answers "I don't have that rate". 8 gives good
+# recall without bloating the turn. Tunable via KB_N_RESULTS; no rebuild needed.
+KB_N_RESULTS: int = max(1, int(os.getenv("KB_N_RESULTS", "8")))
+
+
+def retrieve_context(query: str, n_results: int = KB_N_RESULTS) -> str:
     """Run a semantic search against the knowledge base.
 
     Uses the LRU-cached ``_cached_embed_query`` so that repeated identical
