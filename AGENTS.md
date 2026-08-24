@@ -79,6 +79,11 @@ via `.github/workflows/deploy-on-push.yml` → `deploy.yml`:
   human gate is the pre-push risk analysis. Manual: Actions → "Deploy Agent", or
   `gh workflow run deploy.yml -f agent=<id> -f ref=main -f mode=fast|build`.
 - **Sentry → Claude auto-triage** uses **Opus 4.8** (`claude-opus-4-8`), draft-PR only.
+- **Kavya** is excluded from this matrix — see `Kavya/SMARTPBX_RUNBOOK.md`'s guarded
+  probe → publish → deploy pipeline instead. **Hutch** is also excluded (its VPS shape
+  doesn't fit the flat-rsync model here) but has its own auto-deploy on push to `main`
+  under `Hutch Agent/**` — see `.github/workflows/deploy-hutch.yml` and
+  `Hutch Agent/AGENTS.md`'s Deployment section.
 
 ## Handover — revert the prod server to clean (Jul 1 2026)
 

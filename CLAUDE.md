@@ -92,6 +92,12 @@ Pushing to `main` **auto-deploys** each changed agent to prod
   `gh workflow run deploy.yml -f agent=<id> -f ref=main -f mode=fast|build`.
 - **Sentry → Claude auto-triage** uses **Opus 4.8** (`claude-opus-4-8`),
   draft-PR only, never deploys.
+- **Kavya** is excluded from this matrix — see `Kavya/SMARTPBX_RUNBOOK.md`'s
+  guarded probe → publish → deploy pipeline instead. **Hutch** is also
+  excluded, for the same reason (its VPS shape doesn't fit the flat-rsync
+  model this engine assumes) but has its own auto-deploy on push to `main`
+  under `Hutch Agent/**` — see `.github/workflows/deploy-hutch.yml` and
+  `Hutch Agent/CLAUDE.md`'s Deployment section.
 
 ## Handover — revert the prod server to clean (Jul 1 2026)
 

@@ -1,0 +1,155 @@
+# ============================================================================
+# Auto-Deploy Hutch (Selina) on push to main
+# ----------------------------------------------------------------------------
+# Hutch is NOT part of the shared deploy-on-push.yml / deploy.yml matrix.
+# Its on-VPS shape differs from every other agent there: it lives inside a
+# full git clone at /opt/hutch/Hutch Agent (not a flat rsync target), and its
+# only live container (hutch-smartpbx) is an opt-in Compose profile that
+# needs --profile smartpbx --env-file .env.smartpbx -- flags the generic
+# engine's plain `docker compose up -d --build` never passes. Adding Hutch to
+# that matrix as-is would silently build/restart the inert dev "hutch"
+# service instead of the real one. Same reasoning as Kavya's separate
+# probe/build workflows -- a different topology gets its own pipeline instead
+# of being forced into the shared one. This file only triggers on changes
+# under "Hutch Agent/" and only ever touches that agent.
+#
+# MODE (auto-chosen from changed files, same convention as deploy.yml):
+#   fast  — only code / knowledge_docs changed -> docker cp the changed .py
+#           files into the running container + restart. No rebuild, seconds.
+#   build — requirements*.txt / Dockerfile / docker-compose.yml changed ->
+#           rebuild the image on the VPS and recreate the container. Frees
+#           Docker build cache first -- Hutch has a known history of disk
+#           exhaustion from torch/CUDA layers (see Hutch Agent/CLAUDE.md).
+#
+# THERE IS NO APPROVAL STEP, matching deploy-on-push.yml's policy: the human
+# gate is the review before the push/merge to main, not a gate here. A
+# py_compile syntax check on changed .py files blocks an obviously-broken
+# push from shipping. .env.smartpbx and the runtime Chroma store on the VPS
+# are never touched (rsync excludes them; no --delete flag is used).
+# ============================================================================
+
+name: Auto-Deploy Hutch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Hutch Agent/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-hutch
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+
+      - name: Determine changed files + mode
+        id: changes
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if git rev-parse --quiet --verify "${BEFORE}^{commit}" >/dev/null 2>&1; then
+            CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" -- "Hutch Agent/")
+          else
+            CHANGED=$(git diff --name-only "${AFTER}~1" "$AFTER" -- "Hutch Agent/" 2>/dev/null || true)
+          fi
+          echo "Changed Hutch files:"; printf '%s\n' "$CHANGED"
+          if [ -z "$CHANGED" ]; then
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+            echo "No Hutch Agent/ files changed — nothing to deploy."
+            exit 0
+          fi
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              # A renamed/deleted file still appears in CHANGED but is gone on
+              # disk — only syntax-check files that still exist (same guard
+              # deploy-on-push.yml uses, learned from a real deploy break).
+              *.py) [ -f "$f" ] || continue
+                    python3 -m py_compile "$f" || { echo "::error::Syntax error in $f — aborting deploy"; exit 1; } ;;
+            esac
+          done <<< "$CHANGED"
+          mode=fast
+          printf '%s\n' "$CHANGED" | grep -qE 'requirements.*\.txt|Dockerfile|docker-compose\.ya?ml' && mode=build
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "-> mode=$mode"
+
+      - name: Set up SSH
+        if: steps.changes.outputs.mode != 'none'
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Sync Hutch source to the VPS (preserves .env.smartpbx + chroma db)
+        if: steps.changes.outputs.mode != 'none'
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          rsync -az \
+            --exclude='.env' --exclude='.env.*' \
+            --exclude='.git/' --exclude='.github/' \
+            --exclude='venv/' --exclude='.venv/' --exclude='__pycache__/' \
+            --exclude='chroma_db/' --exclude='chroma_db_hutch_smartpbx/' \
+            --exclude='node_modules/' --exclude='*.log' --exclude='*.bak' \
+            -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no" \
+            "Hutch Agent/" "$VPS_USER@$VPS_HOST:/opt/hutch/Hutch\ Agent/"
+
+      - name: Apply — FAST (hot-swap code + restart, no rebuild)
+        if: steps.changes.outputs.mode == 'fast'
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" bash -s <<'REMOTE'
+          set -e
+          OPT="/opt/hutch/Hutch Agent"
+          CON="hutch-smartpbx"
+          for f in "$OPT"/*.py; do
+            [ -f "$f" ] || continue
+            docker cp "$f" "$CON:/app/$(basename "$f")" 2>/dev/null \
+              || echo "  skip hot-swap (bind-mounted or busy): $(basename "$f")"
+          done
+          docker restart "$CON"
+          REMOTE
+
+      - name: Apply — BUILD (rebuild image + recreate, on the VPS)
+        if: steps.changes.outputs.mode == 'build'
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" bash -s <<'REMOTE'
+          set -e
+          cd "/opt/hutch/Hutch Agent"
+          # Hutch has a known history of disk exhaustion from torch/CUDA build
+          # layers (see CLAUDE.md). Free build cache before rebuilding -- the
+          # same recovery step that fixed it manually.
+          docker builder prune -f || true
+          docker compose --env-file .env.smartpbx --profile smartpbx build hutch-smartpbx
+          docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate hutch-smartpbx
+          docker image prune -f || true
+          REMOTE
+
+      - name: Health check
+        if: steps.changes.outputs.mode != 'none'
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          sleep 5
+          ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no "$VPS_USER@$VPS_HOST" \
+            "docker ps --filter name=hutch-smartpbx --format '{{.Names}}  {{.Status}}'"
