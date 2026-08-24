@@ -183,19 +183,12 @@ def _matches_room_type(property_name: str, room_type: str) -> bool:
     )
 
 
-def _is_capture_done_utterance(raw: Any) -> bool:
-    """Return True when the caller explicitly ends number dictation."""
-    text = str(raw or "").strip().lower()
-    if not text:
-        return False
-    return any(
-        phrase in text
-        for phrase in (
-            " done", " that's it", " that's enough", " that's all", " complete",
-            " done.", " done,", " finished", " all done", "all done",
-            " that's all.", " that's all,", " that's enough.",
-        )
-    )
+RETRY_WHOLE_NUMBER_MESSAGE = (
+    "That attempt was discarded. Ask the guest to say their whole number again "
+    "from the start, in one go, and pass those words verbatim in a single call. "
+    "Do not add these digits to an earlier attempt and do not apply a correction "
+    "such as 'double six at the end' to a number you already have."
+)
 
 
 def _build_capture_result_payload(
@@ -204,29 +197,37 @@ def _build_capture_result_payload(
     normalized: str,
     *,
     attempts: int,
-    status: str = "invalid",
 ) -> dict[str, Any]:
-    """Build a capture tool payload with shared accumulation metadata."""
-    if status == "needs_more":
+    """Build a capture tool payload for one self-contained attempt.
+
+    An attempt that does not normalise is DISCARDED, so its payload never
+    carries a readback: reading back a wrong or half-heard number invites the
+    caller to correct it positionally ("double six at the end"), and there is
+    no stored number left to correct.
+    """
+    if not normalized:
         return {
-            "status": status,
+            # Existing runners use needs_more to retain their capture episode.
+            # The attempt's digits are still discarded; this is compatibility,
+            # not permission to append a later tool call.
+            "status": "needs_more",
             "digits": digits,
             "readback": "",
             "length": len(digits),
             "valid": False,
-            "normalized": normalized,
+            "normalized": "",
             "attempts": attempts,
             "fallback_allowed": attempts >= 2,
             "spoken": spoken,
+            "message": RETRY_WHOLE_NUMBER_MESSAGE,
         }
 
-    valid = bool(normalized)
     return {
-        "status": "captured" if valid else status,
+        "status": "captured",
         "digits": digits,
         "readback": " ".join(digits),
         "length": len(digits),
-        "valid": valid,
+        "valid": True,
         "normalized": normalized,
         "attempts": attempts,
         "fallback_allowed": attempts >= 2,
@@ -456,10 +457,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "Pass the number EXACTLY as the caller said it, words and all (e.g. "
             "'nought seven six triple seven double five one'), in the `spoken` "
             "field — do NOT convert double/triple/treble/nought yourself, and "
-            "never do the digit arithmetic in your head. The tool returns the "
-            "digits and a spaced `readback`; read that back to the caller to "
-            "confirm. If `valid` is false the number was the wrong length — "
-            "ask the caller to repeat it."
+            "never do the digit arithmetic in your head. Read the spaced "
+            "`readback` to confirm only when `valid` is true. If `valid` is "
+            "false, that whole attempt was discarded: ask for the complete "
+            "number again from the start and never add these digits to an "
+            "earlier attempt."
         ),
         "input_schema": {
             "type": "object",
@@ -848,72 +850,37 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
 
         spoken = tool_input.get("spoken") or ""
         digits = spoken_number_to_digits(spoken)
-        explicit_done = _is_capture_done_utterance(spoken)
 
         ctx = _get_handover_context()
         state = ctx.setdefault("_capture_spoken_number", {})
-        prior_digits = str(state.get("digits", ""))
         prior_attempts = int(state.get("attempts", 0))
-        combined_digits = prior_digits + digits
 
-        if explicit_done:
-            state_attempts = prior_attempts + 1
-            normalized = normalize_whatsapp(combined_digits)
-            if normalized:
-                ctx.pop("_capture_spoken_number", None)
-                return json.dumps(_build_capture_result_payload(
-                    spoken=spoken,
-                    digits=combined_digits,
-                    normalized=normalized,
-                    attempts=state_attempts,
-                    status="captured",
-                ))
-            if len(combined_digits) >= 9:
-                state.update({"digits": combined_digits, "attempts": state_attempts})
-                return json.dumps(_build_capture_result_payload(
-                    spoken=spoken,
-                    digits=combined_digits,
-                    normalized="",
-                    attempts=state_attempts,
-                    status="invalid",
-                ))
-            state.update({"digits": combined_digits, "attempts": state_attempts})
-            return json.dumps(_build_capture_result_payload(
-                spoken=spoken,
-                digits=combined_digits,
-                normalized="",
-                attempts=state_attempts,
-                status="needs_more",
-            ))
-
-        if len(combined_digits) < 9:
-            attempts = prior_attempts + 1
-            state.update({"digits": combined_digits, "attempts": attempts})
-            return json.dumps(_build_capture_result_payload(
-                spoken=spoken,
-                digits=combined_digits,
-                normalized="",
-                attempts=attempts,
-                status="needs_more",
-            ))
-
-        normalized = normalize_whatsapp(combined_digits)
+        normalized = normalize_whatsapp(digits)
         if normalized:
             ctx.pop("_capture_spoken_number", None)
             return json.dumps(_build_capture_result_payload(
                 spoken=spoken,
-                digits=combined_digits,
+                digits=digits,
                 normalized=normalized,
                 attempts=prior_attempts,
-                status="captured",
             ))
-        state.update({"digits": combined_digits, "attempts": prior_attempts + 1})
+
+        # EVERY ATTEMPT STANDS ALONE. A recognizer that drops an operand ("double"
+        # without its digit) or a caller who restarts mid-number used to leave
+        # digits behind that were concatenated onto the next tool call, so one
+        # bad attempt corrupted every later one and a correction phrase read as a
+        # positional edit. Only the attempt COUNT survives -- it is what gates the
+        # keypad fallback offer -- and the model is told to ask for the whole
+        # number again. Fragments of one dictation are combined upstream by
+        # capture mode, so a genuine multi-part number still arrives here whole.
+        attempts = prior_attempts + 1
+        state.clear()
+        state["attempts"] = attempts
         return json.dumps(_build_capture_result_payload(
             spoken=spoken,
-            digits=combined_digits,
+            digits=digits,
             normalized="",
-            attempts=prior_attempts + 1,
-            status="needs_more",
+            attempts=attempts,
         ))
 
     elif tool_name == "collect_number_via_keypad":

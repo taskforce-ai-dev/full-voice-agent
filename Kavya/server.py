@@ -2493,12 +2493,15 @@ def _build_system_prompt(lang: str = "en") -> str:
         "it — words and all, e.g. 'nought seven six triple seven double five "
         "one'. Do NOT convert double, triple, treble or nought into digits "
         "yourself and never do the digit arithmetic in your head; that is the "
-        "tool's job. If the tool result status is `needs_more`, keep listening "
-        "patiently and read back only when the status changes to `captured`. "
-        "Read back the tool's `readback` digits to confirm (for example, "
-        "'I've got 0 7 6 7 7 7 5 5 1 — is that right?'). If the tool says "
-        "the number is not valid, ask the guest to say it again and call the "
-        "tool with the new attempt. Only after at least two full failed spoken "
+        "tool's job. Each tool call is ONE complete attempt: read back only "
+        "when the status is `captured`, using the tool's `readback` digits (for "
+        "example, 'I've got 0 7 6 7 7 7 5 5 1 0 — is that right?'). If the "
+        "status is anything else the attempt was discarded — ask the guest to "
+        "say their WHOLE number again from the start and pass those new words "
+        "verbatim. Never add digits to an earlier attempt, and never apply a "
+        "correction such as 'double six at the end' to a number you already "
+        "have; ask for the complete number instead. Only after at least two "
+        "full failed spoken "
         "attempts, or if the guest is struggling or asks to use the keypad, "
         "offer collect_number_via_keypad as a fallback. The fallback may be "
         "offered only after `attempts >= 2`.\n"
@@ -5800,6 +5803,8 @@ class MediaStreamSession:
         await self._retain_pending_speech("transfer")
         self.transfer_pending = True
         self._cancel_reprompt()
+        # A keypad entry in flight belongs to a conversation that is over.
+        self._cancel_dtmf_collection()
         if self._endpointing_handle:
             self._endpointing_handle.cancel()
             self._endpointing_handle = None
@@ -5837,6 +5842,7 @@ class MediaStreamSession:
         """Resolve any active keypad collection so its awaiter unwinds on teardown."""
         collector = self._dtmf_collector
         if collector is not None:
+            self._dtmf_collector = None
             collector.cancel()
 
     async def feed_dtmf(self, digit: str) -> bool:
@@ -5848,10 +5854,13 @@ class MediaStreamSession:
         return True
 
     async def _collect_number_via_keypad(self, tool_input: Any) -> str:
-        """Speak the keypad instruction, then collect the guest's number via DTMF.
+        """Collect the guest's number via DTMF, guarded by the keypad instruction.
 
-        The instruction is spoken and awaited BEFORE collection begins, so the
-        caller always hears "key it in, then press hash" before the wait starts.
+        The collector is installed BEFORE the instruction is spoken, because
+        guests start keying in over the prompt and the collector buffers input
+        it has not been started for. The instruction is still spoken and awaited
+        in full — early digits do not interrupt it — and only then is the overall
+        entry window armed, so the guest keeps the whole window.
         Returns the collected digits (with a spaced readback) or a failure so the
         model can fall back to asking the guest to say the number.
         """
@@ -5866,14 +5875,10 @@ class MediaStreamSession:
             label = str(tool_input.get("label") or "").strip()
         spoken_label = label or "your number"
 
-        # Speak the precise keypad instruction first and wait for it to be
-        # delivered; only then start collecting.
         instruction = (
             f"Please key in {spoken_label} on your phone's keypad now, "
             "then press the hash key when you're done."
         )
-        await self._invoke_speak(instruction)
-
         collector = DtmfCollector(
             loop=self._event_loop,
             interdigit_timeout=DTMF_INTERDIGIT_TIMEOUT_SECONDS,
@@ -5881,16 +5886,37 @@ class MediaStreamSession:
             max_digits=DTMF_MAX_DIGITS,
         )
         self._dtmf_collector = collector
-        collector.start()
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=dtmf_collect_start")
         try:
+            # Digits pressed over this prompt are already being buffered.
+            await self._invoke_speak(instruction)
+        except BaseException:
+            # A prompt the guest never heard cannot be answered on the keypad:
+            # drop the entry rather than leave a collector nothing will resolve.
+            self._release_dtmf_collector(collector)
+            collector.cancel("prompt_failed")
+            raise
+        # The entry window starts when the guest has heard what to do. An entry
+        # already completed over the prompt leaves start() a no-op.
+        collector.start()
+        try:
             result = await collector.future
         finally:
-            self._dtmf_collector = None
+            # External task cancellation also cancels the awaited Future, but
+            # not this collector's timer handles. The collector's cancellation
+            # is idempotent, so it safely cleans that case as well as the normal
+            # result paths before the identity-fenced ownership release below.
+            collector.cancel()
+            self._release_dtmf_collector(collector)
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=dtmf_collect_done status=%s", result.get("status"))
         return json.dumps(result)
+
+    def _release_dtmf_collector(self, collector: DtmfCollector) -> None:
+        """Clear the session slot only while this collection still owns it."""
+        if self._dtmf_collector is collector:
+            self._dtmf_collector = None
 
     def _log_tool_execution(
         self, tool_name: str, tool_input: Any, *, capture_slots: bool = True,
