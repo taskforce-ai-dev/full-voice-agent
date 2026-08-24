@@ -35,6 +35,14 @@ on:
     branches: [main]
     paths:
       - 'Hutch Agent/**'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Force a mode instead of auto-detecting from a diff (for manual redeploys with no new Hutch commit, e.g. after a fixed deploy pipeline)"
+        required: true
+        type: choice
+        options: [fast, build]
+        default: fast
 
 permissions:
   contents: read
@@ -55,7 +63,14 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_MODE: ${{ inputs.mode }}
         run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "mode=$DISPATCH_MODE" >> "$GITHUB_OUTPUT"
+            echo "-> manual dispatch, mode=$DISPATCH_MODE (skipping diff detection)"
+            exit 0
+          fi
           if git rev-parse --quiet --verify "${BEFORE}^{commit}" >/dev/null 2>&1; then
             CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" -- "Hutch Agent/")
           else
@@ -99,14 +114,23 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
-          rsync -az \
+          # -s/--protect-args stops rsync from re-splitting args through a
+          # remote shell, so the space in "Hutch Agent" survives intact with
+          # no manual backslash-escaping needed. A prior version of this
+          # command hand-escaped the space inside a double-quoted string
+          # (`Hutch\ Agent`) -- bash does NOT interpret backslash-space
+          # specially inside double quotes, so that backslash was sent
+          # through literally, and every deploy silently wrote into a
+          # never-read sibling directory actually named `Hutch\ Agent`
+          # (with a literal backslash in the name) while reporting success.
+          rsync -az -s \
             --exclude='.env' --exclude='.env.*' \
             --exclude='.git/' --exclude='.github/' \
             --exclude='venv/' --exclude='.venv/' --exclude='__pycache__/' \
             --exclude='chroma_db/' --exclude='chroma_db_hutch_smartpbx/' \
             --exclude='node_modules/' --exclude='*.log' --exclude='*.bak' \
             -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no" \
-            "Hutch Agent/" "$VPS_USER@$VPS_HOST:/opt/hutch/Hutch\ Agent/"
+            "Hutch Agent/" "$VPS_USER@$VPS_HOST:/opt/hutch/Hutch Agent/"
 
       - name: Apply — FAST (hot-swap code + restart, no rebuild)
         if: steps.changes.outputs.mode == 'fast'

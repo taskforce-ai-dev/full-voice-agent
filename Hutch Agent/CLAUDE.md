@@ -316,14 +316,38 @@ push/merge, not a gate in CI.
 - `.env.smartpbx` and the runtime `chroma_db_hutch_smartpbx/` store are never
   touched by the rsync (excluded explicitly, and no `--delete` flag is used
   regardless).
-- Manual redeploy: re-run the "Auto-Deploy Hutch" workflow from the Actions
-  tab (`workflow_dispatch` is not wired — trigger by pushing a no-op commit
-  touching `Hutch Agent/`, or ask an operator with Actions access to re-run
-  the last run).
+- Manual redeploy: `workflow_dispatch` on "Auto-Deploy Hutch" from the Actions
+  tab, choosing `mode: fast` or `mode: build` — it bypasses diff detection
+  entirely for a manual run, since a `push` event's before/after SHAs don't
+  exist on a dispatch.
 - **Verifying a deploy landed**, since this container has no CI-based image
-  tag to compare against: `docker inspect hutch-smartpbx --format='{{.Created}}'`
-  (should be recent) and `docker exec hutch-smartpbx grep -n "<a string
-  unique to the change>" server.py` (should match what's on `main`).
+  tag to compare against: `docker exec hutch-smartpbx grep -n "<a string
+  unique to the change>" server.py` (or `smartpbx_transport.py`, etc. —
+  should match what's on `main`). Do **not** rely on `docker inspect
+  --format='{{.Created}}'` alone for fast mode — a `docker restart` does not
+  change that timestamp (only a full recreate does), so an old `Created` time
+  is normal and does not by itself mean the deploy failed.
+
+> **Incident (Aug 24 2026): the rsync destination path silently wrote to the
+> wrong directory for two deploys.** `Hutch Agent` has a space in its name;
+> the rsync step's destination was written as
+> `"$VPS_USER@$VPS_HOST:/opt/hutch/Hutch\ Agent/"` inside a double-quoted
+> bash string. Bash does **not** interpret `\ ` specially inside double
+> quotes, so the backslash was sent through literally instead of escaping
+> the space — every run silently created and wrote into a sibling directory
+> actually named `Hutch\ Agent` (a literal backslash character in the
+> directory name) instead of the real `Hutch Agent/`. `docker cp` in the
+> FAST step reads from the correctly-hardcoded real path, so it kept
+> re-copying stale, unchanged files into the container while every step of
+> the workflow reported success and the health check passed — there was no
+> error anywhere to catch this on. Caught only by manually diffing the
+> container's code against what was expected after a deploy that should have
+> changed observable behavior but didn't. Fixed by adding `-s`/
+> `--protect-args` to the rsync invocation (the standard, documented rsync
+> fix for exactly this class of remote-path-with-spaces bug) and dropping
+> the manual backslash escape entirely. The stray `Hutch\ Agent/` directory
+> was removed by hand on the VPS; nothing under the real `Hutch Agent/` was
+> ever touched by the bug.
 
 ## Pending operator setup
 
