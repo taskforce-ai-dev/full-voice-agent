@@ -188,6 +188,7 @@ def test_normalize_whatsapp_never_double_prefixes():
         ("0771 754 double 6 8", "0771 754 66 8"),
         ("0771234567", "0771234567"),           # already expanded -> no-op
         ("seven seven", "seven seven"),         # no shorthand -> untouched
+        ("double room", "double room"),         # ordinary booking speech is unchanged
         ("", ""),
         (None, ""),
     ],

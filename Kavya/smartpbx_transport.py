@@ -21,6 +21,9 @@ _ULAW_BYTES_PER_SECOND = 8000
 # At one byte/sample that is exactly 160 bytes.  Reframing belongs here, before
 # the bounded queue, so the queue still reasons about wire frames.
 _ULAW_FRAME_BYTES = 160
+# G.711 μ-law's all-ones codeword is digital silence.  Use it only to finish a
+# final short TTS chunk into the 20 ms wire frame Dialog expects.
+_ULAW_SILENCE = b"\xff"
 _MAX_CADENCE_GAPS = 256
 # Grace window a full outbound queue waits for the realtime sender to drain
 # before it gives up and drops the newest frame. Bursty TTS outruns realtime
@@ -236,7 +239,8 @@ class SmartPBXMediaTransport:
         self._close_generation_for_cadence(generation)
         residual = self._residual_by_generation.pop(generation, b"")
         if residual:
-            await self._enqueue_frame(residual, generation)
+            padded = residual + _ULAW_SILENCE * (_ULAW_FRAME_BYTES - len(residual))
+            await self._enqueue_frame(padded, generation)
         if not self.is_active or generation != self._generation:
             return
         await self._queue.join()
