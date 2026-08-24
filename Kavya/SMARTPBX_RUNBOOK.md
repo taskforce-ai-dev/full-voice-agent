@@ -499,7 +499,7 @@ Wire-delivery proxies describe paced transport behavior only; they are not
 playback acknowledgements. Every approved event must not contain transcript text,
 audio, call ids, exception bodies, or secrets.
 
-### Break-glass pilot transcript logging
+**Break-glass pilot transcript logging**
 
 `SMARTPBX_PILOT_TRANSCRIPT_LOGGING=0` is the required normal state. For a
 controlled pilot call with no customer traffic, a separately approved diagnostic
