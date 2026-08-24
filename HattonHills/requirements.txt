@@ -20,7 +20,7 @@ google-cloud-speech>=2.40.0
 
 # Knowledge base / RAG
 chromadb>=0.4.0
-sentence-transformers>=2.2.0
+sentence-transformers>=5.7.0
 
 # Utilities
 python-dotenv>=1.0.0
