@@ -4,7 +4,9 @@ Dialog sends clean ``dtmf`` events, so keypad entry bypasses STT entirely and is
 100% accurate for phone/reference numbers. The collector buffers the digits and
 resolves an :class:`asyncio.Future` when the entry terminates (``#``, an
 inter-digit pause, an overall timeout, the max-length guard, or teardown). It
-holds no transport or session state, so the same core can drive any provider.
+accepts keys before :meth:`start`, because guests key in over the prompt that
+asks them to; the timeouts only begin at :meth:`start`. It holds no transport or
+session state, so the same core can drive any provider.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ class DtmfCollector:
         self._max_digits = max_digits
         self._buffer: list[str] = []
         self._done = False
+        self._started = False
         self._future: asyncio.Future = loop.create_future()
         self._interdigit_handle: Any = None
         self._overall_handle: Any = None
@@ -42,7 +45,22 @@ class DtmfCollector:
         return self._future
 
     def start(self) -> None:
-        """Arm the overall timeout. The inter-digit timer arms on the first digit."""
+        """Open the entry window: arm the timeouts that measure the guest's typing.
+
+        Called after the keypad instruction has been spoken, so the guest gets
+        the whole window to key in. Digits pressed over the prompt are buffered
+        before this, but they are not timed until here — an entry begun early
+        must not expire against speech the guest is still listening to. An entry
+        the guest already ended with '#' over the prompt is left alone: arming a
+        timer for a finished collection would leave a handle nothing cancels.
+        """
+        if self._done or self._started:
+            return
+        self._started = True
+        if self._buffer:
+            # Digits tapped over the instruction: their pause window opens now,
+            # so listening to the rest of the prompt cannot cut the entry short.
+            self._arm_interdigit()
         self._overall_handle = self._loop.call_later(
             self._overall_timeout, self._on_overall_timeout
         )
@@ -53,7 +71,8 @@ class DtmfCollector:
             return
         if key in _DIGITS:
             self._buffer.append(key)
-            self._arm_interdigit()
+            if self._started:
+                self._arm_interdigit()
             if len(self._buffer) >= self._max_digits:
                 self._finalize_collected()
         elif key == "#":

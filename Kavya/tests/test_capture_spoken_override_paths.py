@@ -256,3 +256,96 @@ def test_conversation_relay_claude_capture_tool_parses_the_raw_utterance(monkeyp
     assert seen == [{"name": "capture_spoken_number", "spoken": RAW_DICTATION}], (
         "the reference-context prefix must be stripped and the raw words passed"
     )
+
+
+# --- one capture turn, one tool invocation ---------------------------------
+
+class _Scheduled:
+    def __init__(self, delay, callback):
+        self.delay = delay
+        self.callback = callback
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class _RecordingLoop:
+    """call_later recorder so the combining window is fired deterministically."""
+
+    def __init__(self):
+        self.scheduled: list[_Scheduled] = []
+
+    def call_later(self, delay, callback):
+        handle = _Scheduled(delay, callback)
+        self.scheduled.append(handle)
+        return handle
+
+    @property
+    def last(self) -> _Scheduled:
+        return self.scheduled[-1]
+
+
+@pytest.mark.asyncio
+async def test_fragments_of_one_dictation_reach_the_real_tool_as_a_single_call(monkeypatch):
+    """Genuine STT fragments still combine INSIDE the turn: one dispatch, one tool call.
+
+    Each tool call now stands alone, so a number split across recognizer finals
+    can only succeed if capture mode combines the fragments before dispatch and
+    the raw-utterance override hands that combined text to the parser.
+    """
+    import handover
+    import tools
+
+    session = server.MediaStreamSession(websocket=None, lang="en", media_transport=None)
+    session._smartpbx_transfer_context = object()
+    session._event_loop = _RecordingLoop()
+    session.tools = []
+    session.anthropic_client = FakeAnthropicClient([
+        _tool_use_events("capture_spoken_number", {"spoken": MODEL_PARAPHRASE}),
+        [_text_delta("Thank you.")],
+    ])
+
+    async def _noop_speak(*_args, **_kwargs):
+        return None
+
+    session._invoke_speak = _noop_speak
+    dispatched: list[str] = []
+    executed: list[dict] = []
+
+    async def run_turn(text: str) -> None:
+        dispatched.append(text)
+        session._last_guest_utterance_raw = text
+        session.history = [{"role": "user", "content": text}]
+        await session._run_llm_claude()
+
+    session._process_utterance = run_turn
+
+    real_execute = tools.execute_tool
+
+    async def execute(name, arguments):
+        result = await real_execute(name, arguments)
+        executed.append({"name": name, "spoken": arguments.get("spoken"), "result": json.loads(result)})
+        return result
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    token = handover.handover_context.set({})
+    try:
+        session._enter_capture_mode()
+        for fragment in ("zero seven seven", "one two three", "four five six eight"):
+            await session._accumulate_transcript(fragment)
+            assert dispatched == [], "a fragment must refresh the window, not dispatch"
+        session._event_loop.last.callback()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    finally:
+        handover.handover_context.reset(token)
+
+    assert dispatched == ["zero seven seven one two three four five six eight"]
+    assert len(executed) == 1, "the combined dictation must cost exactly one tool call"
+    assert executed[0]["spoken"] == "zero seven seven one two three four five six eight"
+    assert executed[0]["result"]["status"] == "captured"
+    assert executed[0]["result"]["digits"] == "0771234568"
+    assert executed[0]["result"]["normalized"] == "94771234568"
