@@ -48,6 +48,127 @@ ULAW_SILENCE_FRAME = b"\xff" * 160
 
 
 @pytest.mark.asyncio
+async def test_startup_preroll_sends_five_full_silence_frames_and_waits_for_the_wire():
+    websocket = FakeWebSocket()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    try:
+        assert await transport.send_startup_preroll(5) is True
+
+        assert decoded_media_frames(websocket) == [ULAW_SILENCE_FRAME] * 5
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_preroll_is_claimed_before_await_so_concurrent_calls_send_once():
+    websocket = FakeWebSocket()
+    websocket.allow_send.clear()
+    transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    first = asyncio.create_task(transport.send_startup_preroll(5))
+    try:
+        await asyncio.wait_for(websocket.send_started.wait(), timeout=1)
+        second = asyncio.create_task(transport.send_startup_preroll(5))
+        websocket.allow_send.set()
+        results = await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+
+        assert results == [True, False]
+        assert decoded_media_frames(websocket) == [ULAW_SILENCE_FRAME] * 5
+    finally:
+        websocket.allow_send.set()
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_preroll_has_no_turn_bound_delivery_or_first_media_events():
+    websocket = FakeWebSocket()
+    events = []
+    transport = SmartPBXMediaTransport(
+        websocket, CONTEXT, max_queue_frames=8,
+        on_transport_event=lambda *event: events.append(event),
+    )
+    transport.start()
+    try:
+        assert await transport.send_startup_preroll(5) is True
+
+        assert events == []
+        assert transport.cadence_summary_for_generation(transport.generation) == {
+            "frames_160b": 0,
+            "frames_partial": 0,
+            "frames_other": 0,
+            "inter_send_gap_p95_ms": 0,
+            "inter_send_gap_max_ms": 0,
+            "queue_underruns": 0,
+        }
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_real_turn_after_startup_preroll_keeps_its_own_first_media_and_cadence():
+    websocket = FakeWebSocket()
+    events = []
+    transport = SmartPBXMediaTransport(
+        websocket,
+        CONTEXT,
+        max_queue_frames=8,
+        on_transport_event=lambda turn_id, generation, stage, *_: events.append(
+            (turn_id, generation, stage)
+        ),
+    )
+    transport.start()
+    real_frame = b"\xa5" * 160
+    try:
+        assert await transport.send_startup_preroll(5) is True
+        transport.bind_turn(transport.generation, "turn-1")
+        await transport.send_audio(real_frame)
+        await transport.send_mark("turn-1-done")
+
+        assert decoded_media_frames(websocket) == [ULAW_SILENCE_FRAME] * 5 + [real_frame]
+        assert events == [
+            ("turn-1", 0, "first_media_sent"),
+            ("turn-1", 0, "queue_drained"),
+        ]
+        assert transport.cadence_summary_for_generation(transport.generation) == {
+            "frames_160b": 1,
+            "frames_partial": 0,
+            "frames_other": 0,
+            "inter_send_gap_p95_ms": 0,
+            "inter_send_gap_max_ms": 0,
+            "queue_underruns": 0,
+        }
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_preroll_returns_false_when_its_generation_changes_mid_enqueue():
+    class GenerationChangingTransport(SmartPBXMediaTransport):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._cleared = False
+
+        async def _enqueue_frame(self, audio, generation, *, startup_preroll=False):
+            accepted = await super()._enqueue_frame(
+                audio, generation, startup_preroll=startup_preroll
+            )
+            if accepted and not self._cleared:
+                self._cleared = True
+                await self.clear_audio()
+            return accepted
+
+    websocket = FakeWebSocket()
+    transport = GenerationChangingTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    try:
+        assert await transport.send_startup_preroll(5) is False
+        assert decoded_media_frames(websocket) == []
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
 async def test_reframes_a_640_byte_mulaw_chunk_into_four_ordered_20ms_frames():
     websocket = FakeWebSocket()
     transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)

@@ -34,6 +34,10 @@ _INTEGER_SETTINGS = {
     # ~640B per frame, so 512 frames is ~40s of speech and ~320KB per call.
     # Deep enough that pacing never makes the queue the binding constraint.
     "SMARTPBX_MAX_OUTBOUND_FRAMES": ("max_outbound_frames", 512, 1, 512),
+    # Digital μ-law silence before the welcome greeting can prime a carrier
+    # decoder/jitter buffer.  It is deliberately default-off and must be an
+    # exact 20 ms wire-frame multiple.
+    "SMARTPBX_STARTUP_PREROLL_MS": ("startup_preroll_ms", 0, 0, 500),
     "SMARTPBX_START_TIMEOUT_SECONDS": ("start_timeout_seconds", 10, 1, 30),
     "SMARTPBX_IDLE_TIMEOUT_SECONDS": ("idle_timeout_seconds", 90, 10, 300),
     # An acknowledged transfer legitimately outlives ordinary idleness, but a
@@ -51,6 +55,7 @@ class SmartPBXSettings:
     max_message_chars: int
     max_audio_bytes: int
     max_outbound_frames: int
+    startup_preroll_ms: int
     start_timeout_seconds: int
     idle_timeout_seconds: int
     transfer_pending_timeout_seconds: int
@@ -72,6 +77,8 @@ class SmartPBXSettings:
         if not isinstance(token, str) or not isinstance(account_id, str):
             raise _configuration_error()
         settings = cls(True, token, account_id, **values, auth_header_name=header)
+        if settings.startup_preroll_ms and settings.startup_preroll_ms % 20:
+            raise _configuration_error()
         if not settings.configured:
             raise _configuration_error()
         return settings
@@ -233,6 +240,12 @@ class SmartPBXGateway:
                 on_frame_dropped=self._registry.record_frame_dropped,
             )
             transport.start()
+            if self._settings.startup_preroll_ms:
+                preroll_complete = await transport.send_startup_preroll(
+                    self._settings.startup_preroll_ms // 20
+                )
+                if not preroll_complete or transport.send_failed:
+                    raise _TransportSendFailure()
             try:
                 session = await session_factory(context, transport, sink)
             except Exception:
