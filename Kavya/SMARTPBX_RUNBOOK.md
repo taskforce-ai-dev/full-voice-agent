@@ -86,6 +86,7 @@ STT_PROVIDER=azure
 STT_ENDPOINTING_SILENCE_SECONDS=1.0
 STT_FINAL_GRACE_SECONDS=0.5
 STT_DIGIT_CLASS_BOOST=
+SMARTPBX_PILOT_TRANSCRIPT_LOGGING=0
 DTMF_INTERDIGIT_TIMEOUT_SECONDS=6
 DTMF_OVERALL_TIMEOUT_SECONDS=30
 DTMF_MAX_DIGITS=15
@@ -497,6 +498,35 @@ same convention as `kb_ms` and `tool_ms`.
 Wire-delivery proxies describe paced transport behavior only; they are not
 playback acknowledgements. Every approved event must not contain transcript text,
 audio, call ids, exception bodies, or secrets.
+
+### Break-glass pilot transcript logging
+
+`SMARTPBX_PILOT_TRANSCRIPT_LOGGING=0` is the required normal state. For a
+controlled pilot call with no customer traffic, a separately approved diagnostic
+may set it to `1` only in the protected `.env.smartpbx`. This does not relax the
+provider logger: raw STT interims, identifiers, prompts, KB context, tools,
+credentials, and provider payloads remain redacted. It adds only these two local
+records, with control characters escaped into a single line:
+
+```text
+smartpbx_pilot_transcript role=guest text='final dispatched guest phrase'
+smartpbx_pilot_transcript role=kavya text='exact phrase submitted to TTS'
+```
+
+Render `docker compose --env-file .env.smartpbx --profile smartpbx config`, then
+recreate only `kavya-smartpbx` with the same pinned image. Verify image identity,
+health, and Flico/legacy Kavya isolation before placing the controlled call. Tail
+only the dedicated class locally:
+
+```sh
+docker logs --since 2m -f kavya-smartpbx 2>&1 \
+  | grep --line-buffered 'smartpbx_pilot_transcript'
+```
+
+Do not export raw logs. Immediately after diagnosis, restore
+`SMARTPBX_PILOT_TRANSCRIPT_LOGGING=0`, recreate the same pinned image again, and
+repeat the identity, health, and isolation checks. Docker's bounded log rotation
+remains the retention limit for records already written.
 
 1. Bad or missing WSS auth is rejected.
 2. A bidirectional call proves caller audio reaches STT, an LLM turn completes,
