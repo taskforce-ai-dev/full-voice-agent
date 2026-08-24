@@ -38,7 +38,7 @@ durationpy==0.10
 fastapi==0.141.1
 flatbuffers==25.12.19
 frozenlist==1.8.0
-google-api-core==2.33.0
+google-api-core==2.34.0
 google-auth==2.56.2
 google-cloud-speech==2.40.0
 google-genai==2.16.0
