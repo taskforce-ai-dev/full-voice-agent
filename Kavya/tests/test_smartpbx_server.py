@@ -4527,6 +4527,299 @@ def _disable_initial_filler(monkeypatch, pipeline):
 
 
 @pytest.mark.asyncio
+async def test_direct_claude_valid_spoken_number_uses_deterministic_readback_without_second_stream(
+    monkeypatch,
+):
+    """A verified spoken number must not spend another Claude round on readback."""
+    import server
+
+    readback = "0 7 1 1 7 5 4 6 6 8"
+    confirmation = f"I've got that as {readback} — is that correct?"
+    client = direct_tool_client("claude", [
+        direct_tool_round(
+            "claude", {"spoken": "zero seven one one seven five four double six eight"},
+            tool_name="capture_spoken_number",
+        ),
+        direct_text_round("claude", "This must not be requested."),
+    ])
+    pipeline = direct_tool_pipeline(server, "claude", client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    bind_direct_smartpbx_turn(server, pipeline)
+    spoken: list[str] = []
+
+    async def tts(text, *, sentence=None, turn_generation=None):
+        spoken.append(text)
+        await pipeline._send_tts_done(
+            sentence=sentence, turn_generation=turn_generation,
+        )
+
+    async def execute(_name, _arguments):
+        return json.dumps({
+            "status": "captured",
+            "valid": True,
+            "normalized": "94711754668",
+            "readback": readback,
+        })
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", execute)
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+
+    try:
+        await pipeline._process_utterance_bound(
+            "zero seven one one seven five four double six eight"
+        )
+
+        assert len(client.requests) == 1
+        assert spoken == [confirmation]
+        assert pipeline._assistant_turn_generated_sentences == [confirmation]
+        assert pipeline._delivered_sentences == [confirmation]
+        assert pipeline.full_transcript[-1] == {"role": "assistant", "text": confirmation}
+        assert [
+            message["content"]
+            for message in pipeline.history
+            if message.get("role") == "assistant" and isinstance(message.get("content"), str)
+        ] == [confirmation]
+    finally:
+        reprompt_task = pipeline._reprompt_task
+        pipeline._cancel_reprompt()
+        if reprompt_task is not None:
+            await asyncio.gather(reprompt_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_direct_claude_number_needing_more_input_keeps_second_stream(monkeypatch):
+    """An incomplete number still needs Claude to decide the follow-up wording."""
+    import server
+
+    client = direct_tool_client("claude", [
+        direct_tool_round("claude", {"spoken": "zero seven seven"}, tool_name="capture_spoken_number"),
+        direct_text_round("claude", "Please say the full number again."),
+    ])
+    pipeline = direct_tool_pipeline(server, "claude", client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    spoken: list[str] = []
+
+    async def speak(text, **_kwargs):
+        spoken.append(text)
+
+    async def execute(_name, _arguments):
+        return json.dumps({"status": "needs_more", "valid": False, "readback": ""})
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+    monkeypatch.setattr(pipeline, "_invoke_speak", speak)
+
+    await pipeline._run_llm_claude()
+
+    assert len(client.requests) == 2
+    assert spoken == ["Please say the full number again."]
+
+
+@pytest.mark.asyncio
+async def test_direct_claude_unsafe_number_readback_keeps_second_stream(monkeypatch):
+    """A malformed tool payload never becomes caller-facing deterministic speech."""
+    import server
+
+    client = direct_tool_client("claude", [
+        direct_tool_round("claude", {"spoken": "zero seven seven"}, tool_name="capture_spoken_number"),
+        direct_text_round("claude", "Could you confirm the number once more?"),
+    ])
+    pipeline = direct_tool_pipeline(server, "claude", client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    spoken: list[str] = []
+
+    async def speak(text, **_kwargs):
+        spoken.append(text)
+
+    async def execute(_name, _arguments):
+        return json.dumps({
+            "status": "captured", "valid": True, "readback": "zero seven cats",
+        })
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+    monkeypatch.setattr(pipeline, "_invoke_speak", speak)
+
+    await pipeline._run_llm_claude()
+
+    assert len(client.requests) == 2
+    assert spoken == ["Could you confirm the number once more?"]
+
+
+@pytest.mark.asyncio
+async def test_direct_claude_non_ascii_number_readback_keeps_second_stream(monkeypatch):
+    """Unicode numerals are not a safe transport-independent phone readback."""
+    import server
+
+    client = direct_tool_client("claude", [
+        direct_tool_round("claude", {"spoken": "zero seven seven"}, tool_name="capture_spoken_number"),
+        direct_text_round("claude", "Could you say the number again, please?"),
+    ])
+    pipeline = direct_tool_pipeline(server, "claude", client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    spoken: list[str] = []
+
+    async def speak(text, **_kwargs):
+        spoken.append(text)
+
+    async def execute(_name, _arguments):
+        return json.dumps({
+            "status": "captured", "valid": True, "readback": "٠ ٧ ٧ ١ ٢ ٣ ٤ ٥ ٦ ٨",
+        })
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+    monkeypatch.setattr(pipeline, "_invoke_speak", speak)
+
+    await pipeline._run_llm_claude()
+
+    assert len(client.requests) == 2
+    assert spoken == ["Could you say the number again, please?"]
+
+
+@pytest.mark.asyncio
+async def test_direct_claude_number_in_multi_tool_batch_keeps_second_stream(monkeypatch):
+    """A mixed batch must preserve Claude's normal tool-result deliberation."""
+    import server
+
+    client = direct_tool_client("claude", [
+        direct_tool_batch_round("claude", [
+            ("capture_spoken_number", {"spoken": "zero seven seven"}),
+            ("check_availability", {"check_in": "2026-10-01"}),
+        ]),
+        direct_text_round("claude", "I have both details."),
+    ])
+    pipeline = direct_tool_pipeline(server, "claude", client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    spoken: list[str] = []
+
+    async def speak(text, **_kwargs):
+        spoken.append(text)
+
+    async def execute(name, _arguments):
+        if name == "capture_spoken_number":
+            return json.dumps({
+                "status": "captured", "valid": True, "readback": "0 7 7 1 2 3 4 5 6 8",
+            })
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+    monkeypatch.setattr(pipeline, "_invoke_speak", speak)
+
+    await pipeline._run_llm_claude()
+
+    assert len(client.requests) == 2
+    assert spoken == ["I have both details."]
+
+
+@pytest.mark.asyncio
+async def test_direct_claude_stale_capture_completion_never_speaks_or_records_confirmation(
+    monkeypatch,
+):
+    """A newer turn winning at the tool boundary fences the deterministic readback."""
+    import server
+
+    client = direct_tool_client("claude", [
+        direct_tool_round("claude", {"spoken": "zero seven seven"}, tool_name="capture_spoken_number"),
+    ])
+    pipeline = direct_tool_pipeline(server, "claude", client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    pipeline._active_smartpbx_turn_id = "capture-turn"
+    runner = server._SmartPBXRunnerContext(
+        turn_id="capture-turn", dropped_frame_baseline=0,
+        speak_generation=pipeline._speak_generation, raw_utterance="zero seven seven",
+    )
+    spoken: list[str] = []
+
+    async def speak(text, **_kwargs):
+        spoken.append(text)
+
+    async def execute(_name, _arguments):
+        pipeline._active_smartpbx_turn_id = "newer-turn"
+        return json.dumps({
+            "status": "captured", "valid": True, "readback": "0 7 7 1 2 3 4 5 6 8",
+        })
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+    monkeypatch.setattr(pipeline, "_invoke_speak", speak)
+    token = server._smartpbx_runner_context.set(runner)
+    try:
+        await pipeline._run_llm_claude()
+    finally:
+        server._smartpbx_runner_context.reset(token)
+
+    assert spoken == []
+    assert not any(
+        message.get("role") == "assistant"
+        and message.get("content") == "I've got that as 0 7 7 1 2 3 4 5 6 8 — is that correct?"
+        for message in pipeline.history
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_claude_teardown_cancels_registered_number_confirmation_before_history(
+    monkeypatch,
+):
+    """Teardown owns a blocked deterministic confirmation through the TTS registry."""
+    import server
+
+    readback = "0 7 7 1 2 3 4 5 6 8"
+    confirmation = f"I've got that as {readback} — is that correct?"
+    client = direct_tool_client("claude", [
+        direct_tool_round("claude", {"spoken": "zero seven seven"}, tool_name="capture_spoken_number"),
+    ])
+    pipeline = direct_tool_pipeline(server, "claude", client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    pipeline._active_smartpbx_turn_id = "capture-turn"
+    runner = server._SmartPBXRunnerContext(
+        turn_id="capture-turn", dropped_frame_baseline=0,
+        speak_generation=pipeline._speak_generation, raw_utterance="zero seven seven",
+    )
+    tts_started = asyncio.Event()
+    tts_cancelled = asyncio.Event()
+
+    async def tts(_text, **_kwargs):
+        tts_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            tts_cancelled.set()
+            raise
+
+    async def execute(_name, _arguments):
+        return json.dumps({
+            "status": "captured", "valid": True, "readback": readback,
+        })
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+
+    async def run():
+        token = server._smartpbx_runner_context.set(runner)
+        try:
+            return await pipeline._run_llm_claude()
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(tts_started.wait(), timeout=1)
+        await pipeline._cancel_smartpbx_deferred_tts()
+        outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+
+        assert isinstance(outcome, asyncio.CancelledError)
+        assert tts_cancelled.is_set()
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert not any(
+            message.get("role") == "assistant"
+            and message.get("content") == confirmation
+            for message in pipeline.history
+        )
+        assert pipeline.full_transcript == []
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
 @pytest.mark.parametrize("termination", ["barge", "teardown", "runner_cancel"])
 async def test_specialized_tool_filler_is_cancelled_and_awaited_on_owner_loss(
