@@ -40,6 +40,7 @@ _MAX_COUNTER = (1 << 63) - 1
 class _QueuedAudio:
     generation: int
     audio: bytes
+    startup_preroll: bool = False
 
 
 @dataclass
@@ -85,6 +86,7 @@ class SmartPBXMediaTransport:
         self._in_flight_generation: int | None = None
         self._underrun_tasks: dict[int, asyncio.Task[None]] = {}
         self._truncating_generation: int | None = None
+        self._startup_preroll_claimed = False
         self._closed = False
         self._send_failed = asyncio.Event()
 
@@ -222,6 +224,38 @@ class SmartPBXMediaTransport:
         if residual:
             self._residual_by_generation[generation] = residual
 
+    async def send_startup_preroll(self, frame_count: int) -> bool:
+        """Send one transport-only run of complete μ-law silence frames.
+
+        This happens before any session has a turn, so it deliberately bypasses
+        cadence/delivery telemetry and cannot become first media for a reply.
+        The claim precedes the first await, making accidental concurrent calls
+        harmless while retaining the normal paced sender and queue semantics.
+        Returns true only after every requested frame reaches the wire on the
+        original active generation without a sender failure.
+        """
+        if isinstance(frame_count, bool) or not isinstance(frame_count, int) or frame_count < 0:
+            raise ValueError("frame_count must be a non-negative integer")
+        if not frame_count or not self.is_active or self._startup_preroll_claimed:
+            return False
+        self._startup_preroll_claimed = True
+        generation = self._generation
+        for _ in range(frame_count):
+            if not await self._enqueue_frame(
+                _ULAW_SILENCE * _ULAW_FRAME_BYTES,
+                generation,
+                startup_preroll=True,
+            ):
+                return False
+        if not self.is_active or generation != self._generation:
+            return False
+        await self._queue.join()
+        return (
+            self.is_active
+            and generation == self._generation
+            and not self._send_failed.is_set()
+        )
+
     async def send_mark(self, _name: str) -> None:
         """Report speech completion once queued audio has reached the wire.
 
@@ -281,7 +315,9 @@ class SmartPBXMediaTransport:
         self._drain_queue()
         self._retire_all_generations()
 
-    async def _enqueue_frame(self, audio: bytes, generation: int) -> bool:
+    async def _enqueue_frame(
+        self, audio: bytes, generation: int, *, startup_preroll: bool = False
+    ) -> bool:
         """Apply the original bounded newest-frame policy to one wire frame."""
         if not audio or not self.is_active or generation != self._generation:
             return False
@@ -305,7 +341,7 @@ class SmartPBXMediaTransport:
                 self._truncating_generation = generation
                 self._record_dropped_frame(generation)
                 return False
-        self._queue.put_nowait(_QueuedAudio(generation, audio))
+        self._queue.put_nowait(_QueuedAudio(generation, audio, startup_preroll))
         self._queued_frames_by_generation[generation] = (
             self._queued_frames_by_generation.get(generation, 0) + 1
         )
@@ -351,12 +387,14 @@ class SmartPBXMediaTransport:
                     # Never echo the wire error: it can carry payload bytes.
                     self._record_send_failure()
                     return
-                self._record_wire_frame(queued.generation, len(queued.audio))
-                if queued.generation == self._generation and queued.generation not in self._first_sent_generations:
-                    self._first_sent_generations.add(queued.generation)
-                    self._emit_transport_event(queued.generation, "first_media_sent")
+                if not queued.startup_preroll:
+                    self._record_wire_frame(queued.generation, len(queued.audio))
+                    if queued.generation == self._generation and queued.generation not in self._first_sent_generations:
+                        self._first_sent_generations.add(queued.generation)
+                        self._emit_transport_event(queued.generation, "first_media_sent")
                 next_send_at += len(queued.audio) / _ULAW_BYTES_PER_SECOND
-                self._schedule_underrun_check(queued.generation, next_send_at)
+                if not queued.startup_preroll:
+                    self._schedule_underrun_check(queued.generation, next_send_at)
             finally:
                 if self._in_flight_generation == queued.generation:
                     self._in_flight_generation = None

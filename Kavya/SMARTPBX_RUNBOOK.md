@@ -112,6 +112,7 @@ SMARTPBX_ACCOUNT_ID=
 SMARTPBX_MAX_MESSAGE_CHARS=65536
 SMARTPBX_MAX_AUDIO_BYTES=32768
 SMARTPBX_MAX_OUTBOUND_FRAMES=512
+SMARTPBX_STARTUP_PREROLL_MS=0
 SMARTPBX_MAX_TOKENS=
 SMARTPBX_CLAUDE_MAX_TOKENS=
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=
@@ -131,6 +132,25 @@ SMARTPBX_MCP_READ_TIMEOUT_SECONDS=15
 SMARTPBX_MCP_MAX_RESPONSE_BYTES=1048576
 SMARTPBX_MCP_RETRIES=1
 ```
+
+## Controlled startup pre-roll canary
+
+`SMARTPBX_STARTUP_PREROLL_MS` is a one-time, transport-only run of digital
+G.711 μ-law silence immediately after Dialog's authenticated `start` event and
+before Kavya's welcome greeting. It is default-off (`0`). The only initial
+canary is `SMARTPBX_STARTUP_PREROLL_MS=100`: five exact 20 ms/160-byte silent
+frames, fully sent before the greeting begins. Its purpose is to test whether
+priming the carrier decoder/jitter buffer removes startup crackle.
+
+This is not an Opus migration. Keep the Dialog dashboard and Kavya media
+contract at `g711_ulaw` and `8000` Hz throughout this experiment.
+
+To canary, change only the protected `.env.smartpbx` value to
+`SMARTPBX_STARTUP_PREROLL_MS=100`, render the compose configuration, and use
+the normal guarded recreate of the same pinned image. If the result is worse or
+inconclusive, set `SMARTPBX_STARTUP_PREROLL_MS=0` and recreate the same pinned
+image immediately. Do not use this knob before replies, fillers, transfers, or
+any later sentence in a call.
 
 ## Later reviewed English digit-class rollout
 

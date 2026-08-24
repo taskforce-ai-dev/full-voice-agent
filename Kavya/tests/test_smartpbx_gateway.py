@@ -114,6 +114,15 @@ def test_settings_default_to_the_kavya_token_header_and_documented_bounds():
     assert "test-token" not in repr(configuration)
 
 
+def test_startup_preroll_setting_defaults_to_zero_accepts_100_and_rejects_unsafe_values():
+    assert settings().startup_preroll_ms == 0
+    assert SmartPBXSettings.from_env({"ENABLE_SMARTPBX_WSS": "false"}).startup_preroll_ms == 0
+    assert settings(SMARTPBX_STARTUP_PREROLL_MS="100").startup_preroll_ms == 100
+    for value in ("-20", "520", "1", "110"):
+        with pytest.raises(ValueError):
+            settings(SMARTPBX_STARTUP_PREROLL_MS=value)
+
+
 @pytest.mark.asyncio
 async def test_gateway_checks_token_before_accepting():
     _, registry, socket, factory = await run([], token="wrong-token")
@@ -155,6 +164,109 @@ async def test_gateway_requires_start_then_forwards_audio_and_finishes_once():
     assert factory.sessions[0].audio == [audio]
     assert factory.sessions[0].finishes == [True]
     assert registry.snapshot()["active_sessions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_default_preroll_emits_no_media_before_session_creation():
+    socket = FakeWebSocket([START, {"event": "stop"}])
+    configuration = settings()
+    gateway = SmartPBXGateway(configuration, SmartPBXSessionRegistry(configuration.max_calls))
+    starts_seen_media_counts = []
+
+    class StartObservingSession(FakeSession):
+        async def start(self):
+            starts_seen_media_counts.append(len(socket.sent))
+            await super().start()
+
+    async def factory(context, transport, sink=None):
+        return StartObservingSession(context, transport)
+
+    await gateway.handle(socket, factory)
+
+    assert socket.sent == []
+    assert starts_seen_media_counts == [0]
+
+
+@pytest.mark.asyncio
+async def test_gateway_drains_configured_preroll_before_creating_or_starting_session():
+    socket = FakeWebSocket([START, {"event": "stop"}])
+    configuration = settings(SMARTPBX_STARTUP_PREROLL_MS="100")
+    gateway = SmartPBXGateway(configuration, SmartPBXSessionRegistry(configuration.max_calls))
+    factory_seen_media_counts = []
+    starts_seen_media_counts = []
+
+    class StartObservingSession(FakeSession):
+        async def start(self):
+            starts_seen_media_counts.append(len(socket.sent))
+            await super().start()
+
+    async def factory(context, transport, sink=None):
+        factory_seen_media_counts.append(len(socket.sent))
+        return StartObservingSession(context, transport)
+
+    await gateway.handle(socket, factory)
+
+    frames = [base64.b64decode(json.loads(row)["media"]["payload"]) for row in socket.sent]
+    assert factory_seen_media_counts == [5]
+    assert starts_seen_media_counts == [5]
+    assert frames == [b"\xff" * 160] * 5
+
+
+@pytest.mark.asyncio
+async def test_gateway_does_not_start_session_when_startup_preroll_send_fails(caplog):
+    class BrokenPreRollSocket(FakeWebSocket):
+        async def send_text(self, message):
+            raise RuntimeError("wire unavailable")
+
+    caplog.set_level(logging.INFO)
+    socket = BrokenPreRollSocket([START])
+    configuration = settings(SMARTPBX_STARTUP_PREROLL_MS="100")
+    registry = SmartPBXSessionRegistry(configuration.max_calls)
+    gateway = SmartPBXGateway(configuration, registry)
+    factory = Factory()
+
+    await gateway.handle(socket, factory)
+
+    assert factory.sessions == []
+    assert socket.close_calls == [(1011, "internal error")]
+    rows = fixed_diagnostics(caplog)
+    assert ("terminal_cleanup", "failed", "transport_send") in {
+        (row["stage"], row["outcome"], row["failure_class"]) for row in rows
+    }
+
+
+@pytest.mark.asyncio
+async def test_gateway_does_not_start_session_when_startup_preroll_is_incomplete(monkeypatch, caplog):
+    import smartpbx_gateway as gateway_module
+
+    class IncompleteTransport:
+        def __init__(self, *_args, **_kwargs):
+            self.send_failed = False
+
+        def start(self):
+            return None
+
+        async def send_startup_preroll(self, _frame_count):
+            return False
+
+        async def close(self):
+            return None
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(gateway_module, "SmartPBXMediaTransport", IncompleteTransport)
+    socket = FakeWebSocket([START])
+    configuration = settings(SMARTPBX_STARTUP_PREROLL_MS="100")
+    registry = SmartPBXSessionRegistry(configuration.max_calls)
+    factory = Factory()
+
+    await SmartPBXGateway(configuration, registry).handle(socket, factory)
+
+    assert factory.sessions == []
+    assert socket.close_calls == [(1011, "internal error")]
+    rows = fixed_diagnostics(caplog)
+    assert ("terminal_cleanup", "failed", "transport_send") in {
+        (row["stage"], row["outcome"], row["failure_class"]) for row in rows
+    }
 
 
 @pytest.mark.asyncio
