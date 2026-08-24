@@ -6768,6 +6768,52 @@ class MediaStreamSession:
             return CAPTURE_ENDPOINTING_SILENCE_SECONDS
         return STT_FINAL_GRACE_SECONDS if final else ENDPOINTING_SILENCE
 
+    def _direct_smartpbx_captured_number_confirmation(
+        self,
+        tool_use_blocks: list[dict[str, Any]],
+        staged_results: list[tuple[int, dict[str, Any], Any, str, BaseException | None]],
+    ) -> str | None:
+        """Return the one safe deterministic readback for a completed tool batch.
+
+        Only the direct SmartPBX English Claude path calls this after it has
+        committed the normal Anthropic tool-use/result pair.  The parser owns
+        number correctness; this guard merely refuses a malformed result rather
+        than turning arbitrary tool output into caller-facing speech.
+        """
+        if (
+            not self._is_direct_smartpbx_english()
+            or len(tool_use_blocks) != 1
+            or len(staged_results) != 1
+            or tool_use_blocks[0].get("name") != "capture_spoken_number"
+        ):
+            return None
+        _tool_index, tool, _tool_input, result_str, tool_error = staged_results[0]
+        if tool_error is not None or tool.get("name") != "capture_spoken_number":
+            return None
+        try:
+            result = json.loads(result_str)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if (
+            not isinstance(result, dict)
+            or str(result.get("status", "")).lower() != "captured"
+            or result.get("valid") is False
+        ):
+            return None
+        readback = result.get("readback")
+        if not isinstance(readback, str):
+            return None
+        digits = readback.replace(" ", "")
+        if (
+            not digits
+            or len(digits) > DTMF_MAX_DIGITS
+            or not digits.isascii()
+            or any(char not in "0123456789" for char in digits)
+            or readback != " ".join(digits)
+        ):
+            return None
+        return f"I've got that as {readback} — is that correct?"
+
     def _record_capture_tool_completion(self, tool_name: str, result: dict[str, Any]) -> None:
         if tool_name not in self._capture_complete_tools():
             return
@@ -8987,6 +9033,30 @@ class MediaStreamSession:
                     self._log_tool_result(tb["name"], result_str)
                 if self.transfer_pending:
                     return full_text
+                confirmation = self._direct_smartpbx_captured_number_confirmation(
+                    tool_use_blocks, staged_results,
+                )
+                if confirmation is not None:
+                    # The normal tool boundary above has already drained the
+                    # initial/tool fillers and committed the native Anthropic
+                    # request/result messages.  A valid deterministic parser
+                    # result therefore needs no second Claude stream merely to
+                    # read its own digits back.
+                    confirmation_task = self._start_smartpbx_round_tts(
+                        confirmation, generation=gen, sentence=confirmation,
+                    )
+                    if confirmation_task is None:
+                        return ""
+                    await confirmation_task
+                    if not self._current_smartpbx_runner_owns_shared_state(
+                        tool_executed=tool_executed
+                    ):
+                        return ""
+                    self._append_assistant_history({
+                        "role": "assistant",
+                        "content": self._assistant_turn_text_for_history(confirmation),
+                    })
+                    return _join_turn(full_text, confirmation)
                 continue
 
             # No tools — flush remaining sentence buffer
