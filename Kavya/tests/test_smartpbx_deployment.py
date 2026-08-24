@@ -2981,6 +2981,29 @@ def test_digit_class_boost_is_allowlisted_without_a_committed_runtime_value():
     assert "digit_class_enabled" in runbook
 
 
+def test_pilot_transcript_logging_is_explicit_off_by_default_and_reversible():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
+
+    assert smartpbx_env.get("SMARTPBX_PILOT_TRANSCRIPT_LOGGING") == (
+        "${SMARTPBX_PILOT_TRANSCRIPT_LOGGING:-0}"
+    )
+
+    example = read_text(".env.example")
+    assert re.search(
+        r"^SMARTPBX_PILOT_TRANSCRIPT_LOGGING=0$", example, re.MULTILINE
+    )
+
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    normalized = re.sub(r"\s+", " ", runbook).lower()
+    assert "smartpbx_pilot_transcript" in runbook
+    assert "role=guest" in runbook
+    assert "role=kavya" in runbook
+    assert "same pinned image" in normalized
+    assert "restore" in normalized
+    assert "do not export" in normalized
+
+
 def test_dtmf_knobs_are_deliverable_through_the_documented_path():
     # The smartpbx service uses an explicit environment allowlist, so a knob set
     # but not listed there never reaches the container. The kavya (Twilio) service

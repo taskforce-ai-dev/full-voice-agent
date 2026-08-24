@@ -838,6 +838,71 @@ async def test_dialog_media_logs_never_contain_transcript_agent_text_or_call_id(
 
 
 @pytest.mark.asyncio
+async def test_pilot_transcript_logging_emits_final_guest_phrase_without_identifier(
+    caplog, monkeypatch,
+):
+    import server
+
+    guest_phrase = "zero seven double six\nnot-a-second-log-record"
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=FakeTransport()
+    )
+    pipeline._smartpbx_transfer_context = object()
+    pipeline.call_sid = "pilot-call-id-must-not-appear"
+    pipeline._pending_transcript = guest_phrase
+    pipeline._event_loop = asyncio.get_running_loop()
+
+    async def no_process(_text):
+        return None
+
+    pipeline._process_utterance = no_process
+    monkeypatch.setattr(
+        server, "SMARTPBX_PILOT_TRANSCRIPT_LOGGING", True, raising=False
+    )
+
+    with caplog.at_level(logging.INFO):
+        await pipeline._flush_transcript()
+
+    assert (
+        "smartpbx_pilot_transcript role=guest "
+        "text='zero seven double six\\nnot-a-second-log-record'"
+    ) in caplog.text
+    assert "pilot-call-id-must-not-appear" not in caplog.text
+    assert caplog.text.count("smartpbx_pilot_transcript role=guest") == 1
+
+
+@pytest.mark.asyncio
+async def test_pilot_transcript_logging_emits_exact_kavya_tts_phrase(
+    caplog, monkeypatch,
+):
+    import server
+
+    kavya_phrase = "Let us try that number again."
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=FakeTransport()
+    )
+    pipeline._smartpbx_transfer_context = object()
+    spoken = []
+
+    async def elevenlabs(text):
+        spoken.append(text)
+
+    pipeline._tts_elevenlabs = elevenlabs
+    monkeypatch.setattr(
+        server, "SMARTPBX_PILOT_TRANSCRIPT_LOGGING", True, raising=False
+    )
+
+    with caplog.at_level(logging.INFO):
+        await pipeline._speak(kavya_phrase)
+
+    assert spoken == [kavya_phrase]
+    assert (
+        "smartpbx_pilot_transcript role=kavya "
+        f"text={kavya_phrase!r}"
+    ) in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_legacy_media_logs_keep_existing_transcript_and_call_id_semantics(caplog):
     import server
 

@@ -484,6 +484,14 @@ STT_PROVIDER: str = os.getenv("STT_PROVIDER", "google").lower()
 # Debug: dump live call audio to an 8 kHz PCM16 wav for offline STT benchmarking.
 STT_DEBUG_DUMP: bool = os.getenv("STT_DEBUG_DUMP", "0") == "1"
 STT_DEBUG_DIR: str = os.getenv("STT_DEBUG_DIR", "stt_dumps")
+# Break-glass phrase visibility for controlled SmartPBX pilot calls. The exact
+# value ``1`` is required; the default keeps the production privacy contract.
+# Provider interims, identifiers, prompts and tool data remain redacted even
+# when this is enabled -- only finalized guest turns and TTS-submitted Kavya
+# phrases use the dedicated pilot record below.
+SMARTPBX_PILOT_TRANSCRIPT_LOGGING: bool = (
+    os.getenv("SMARTPBX_PILOT_TRANSCRIPT_LOGGING", "0") == "1"
+)
 
 # LLM provider selection: "claude" (default), "openai", or "gemini"
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "claude")
@@ -1761,6 +1769,16 @@ POST_DISPATCH_ELAPSED_MS_MAX: int = 60_000
 def _has_material_text(text: str) -> bool:
     """True when the text carries at least one letter or digit."""
     return any(ch.isalnum() for ch in text)
+
+
+def _log_smartpbx_pilot_transcript(role: str, phrase: str) -> None:
+    """Log one explicitly enabled pilot phrase without any call identifier."""
+    if not SMARTPBX_PILOT_TRANSCRIPT_LOGGING:
+        return
+    if role not in {"guest", "kavya"} or not isinstance(phrase, str) or not phrase:
+        return
+    # %r escapes embedded newlines/control characters into this one log record.
+    logger.info("smartpbx_pilot_transcript role=%s text=%r", role, phrase)
 
 # Domain phrase list that biases the ENGLISH Google and Azure recognizers toward
 # booking vocabulary — digit words (phone numbers), the property and room names
@@ -7285,6 +7303,7 @@ class MediaStreamSession:
         turn = self._utterance_turn
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=guest_utterance")
+            _log_smartpbx_pilot_transcript("guest", transcript)
         else:
             logger.info("Guest [%s]: %s", self.call_sid, transcript)
         self.full_transcript.append({"role": "user", "text": transcript})
@@ -8988,6 +9007,8 @@ class MediaStreamSession:
                 return
             if sentence is not None and self._track_assistant_turn_delivery:
                 self._record_generated_sentence(sentence)
+            if self._is_smartpbx_session():
+                _log_smartpbx_pilot_transcript("kavya", text)
             if self.lang in ("en", "ta", "ar"):
                 await self._invoke_tts(
                     self._tts_elevenlabs,
