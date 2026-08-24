@@ -188,6 +188,39 @@ setting `_is_speaking = False` / `_speaking_since = None` directly in
 `_tts_elevenlabs()`'s success path, right after sending the mark, instead of
 waiting on an echo that never arrives on the live path.
 
+**Third fix, same investigation, found after live-testing the two above:**
+even with correct barge-in detection, Selina kept finishing her whole answer
+before responding to an interruption instead of stopping in real time.
+Root cause was in `smartpbx_transport.py`, not `server.py`:
+`SmartPBXMediaTransport._send_queued_audio()` sent queued frames as fast as
+it could dequeue them, with no pacing. TTS generation (ElevenLabs streaming
++ the WebSocket send) is much faster than the audio's own playback duration,
+so a whole reply's audio reached Dialog's own playback buffer within a
+second or two of being generated — long before a caller's interruption could
+even be recognized. Dialog SmartPBX has no wire-level "clear"/"stop talking"
+event (unlike Twilio's `mark` echo), so once bytes are sent they cannot be
+recalled; `clear_audio()` can only discard frames still sitting in *this*
+transport's own outbound queue, and by the time a barge-in fired, that queue
+was already empty — there was nothing left to cancel.
+
+Fixed by pacing `_send_queued_audio()` to realtime: each frame is held until
+its predecessor's audio would have finished playing (`len(audio) /
+8000` seconds, since g711_ulaw at 8 kHz is one byte per sample), tracked via
+a `next_send_at` deadline that resets whenever the generation changes (a
+barge-in, or the start of a new reply) so the first frame of anything new
+still goes out immediately. This is the same design Kavya's
+`smartpbx_transport.py` already uses, and its docstring says exactly why:
+"Frames are paced at realtime so barge-in has queued audio left to cancel."
+Hutch's port had dropped that pacing.
+
+Pacing means the queue now fills up during any real reply instead of
+draining instantly, so `send_audio()`'s overflow policy was fixed to match:
+on a full queue it now drops the **newest** frame (the tail not yet queued,
+after a short backpressure grace window), not the oldest. Dropping the
+oldest would cut a hole out of the *middle* of already-committed speech,
+since that frame hasn't been sent yet and is earlier in the utterance than
+whatever triggered the overflow — a worse artifact than a clipped tail.
+
 ## Environment Setup
 
 Copy `.env.example` to `.env`. Key groups:
