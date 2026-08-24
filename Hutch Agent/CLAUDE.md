@@ -260,6 +260,38 @@ branch explicitly.
   consolidated into one `hutch_info.txt`, discarding repeated navigation
   menus, footers, and image alt-text that added no retrieval value.
 
+## Deployment — auto-deploy on push (Aug 2026)
+
+Pushing to `main` with changes under `Hutch Agent/**` auto-deploys to the
+live `hutch-smartpbx` container on `67.207.90.109` via
+`.github/workflows/deploy-hutch.yml` — a dedicated workflow, **not** part of
+the shared `deploy-on-push.yml`/`deploy.yml` matrix the other 8 agents use
+(see "Pending operator setup" #5 below for why). No approval gate — same
+policy as the rest of the fleet: the human gate is the review before the
+push/merge, not a gate in CI.
+
+- **fast** (code / `knowledge_docs` only): rsync to `/opt/hutch/Hutch Agent`
+  + hot-swap the changed `.py` into the running container (`docker cp`) +
+  `docker restart hutch-smartpbx`. Seconds, no rebuild.
+- **build** (`requirements*.txt` / `Dockerfile` / `docker-compose.yml`
+  changed): rsync + `docker builder prune -f` (Hutch has a history of disk
+  exhaustion from torch/CUDA build cache — see the Aug 2026 incident notes in
+  this file's git history) + `docker compose --env-file .env.smartpbx
+  --profile smartpbx build hutch-smartpbx` + `up -d --force-recreate`.
+- A `py_compile` syntax gate on changed `.py` files blocks an obviously
+  broken push before it ever reaches the VPS.
+- `.env.smartpbx` and the runtime `chroma_db_hutch_smartpbx/` store are never
+  touched by the rsync (excluded explicitly, and no `--delete` flag is used
+  regardless).
+- Manual redeploy: re-run the "Auto-Deploy Hutch" workflow from the Actions
+  tab (`workflow_dispatch` is not wired — trigger by pushing a no-op commit
+  touching `Hutch Agent/`, or ask an operator with Actions access to re-run
+  the last run).
+- **Verifying a deploy landed**, since this container has no CI-based image
+  tag to compare against: `docker inspect hutch-smartpbx --format='{{.Created}}'`
+  (should be recent) and `docker exec hutch-smartpbx grep -n "<a string
+  unique to the change>" server.py` (should match what's on `main`).
+
 ## Pending operator setup
 
 Before this agent can go live, the operator still needs to:
@@ -275,11 +307,16 @@ Before this agent can go live, the operator still needs to:
 4. **Build the `N8N_HANDOVER_WEBHOOK` workflow in n8n** — `/webhook/hutch-handover`
    does not exist yet. Until it does, `notify_human_handover` fails silently
    (fail-open by design) and no Hutch operator is actually notified.
-5. **Add this agent to `.github/workflows/deploy-on-push.yml`'s agent list**
-   — deliberately NOT done yet. No Dialog account or secrets exist to deploy
-   against, so wiring auto-deploy now would just mean the workflow silently
-   does nothing (or fails) on every push. This is a later, deliberate step
-   for the operator once the above are ready.
+5. ~~Add this agent to `.github/workflows/deploy-on-push.yml`'s agent list~~
+   — **done differently, Aug 2026.** Hutch is not in that shared matrix and
+   never will be: its on-VPS shape (a full git clone at `/opt/hutch/Hutch
+   Agent`, a Compose profile needing `--profile smartpbx --env-file
+   .env.smartpbx`) doesn't fit the generic engine's flat-rsync-target model,
+   the same reason Kavya has its own separate workflows instead of joining
+   that matrix. See `.github/workflows/deploy-hutch.yml` — a dedicated
+   workflow, triggered only by changes under `Hutch Agent/`, fast/build mode
+   auto-chosen the same way deploy.yml does. It cannot affect any other
+   agent's deploy path.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 
