@@ -44,6 +44,7 @@ def decoded_media_frames(websocket):
 
 
 ULAW_640 = bytes(range(256)) * 2 + bytes(range(128))
+ULAW_SILENCE_FRAME = b"\xff" * 160
 
 
 @pytest.mark.asyncio
@@ -83,7 +84,7 @@ async def test_reframes_fragmented_mulaw_input_without_reordering_bytes():
 
 
 @pytest.mark.asyncio
-async def test_send_mark_flushes_only_the_final_mulaw_residual_frame():
+async def test_send_mark_pads_the_final_mulaw_residual_to_a_20ms_silence_frame():
     websocket = FakeWebSocket()
     transport = SmartPBXMediaTransport(websocket, CONTEXT, max_queue_frames=8)
     transport.start()
@@ -99,7 +100,7 @@ async def test_send_mark_flushes_only_the_final_mulaw_residual_frame():
         await transport.send_mark("tts_done")
         assert decoded_media_frames(websocket) == [
             audio[offset:offset + 160] for offset in range(0, 640, 160)
-        ] + [b"\xfe"]
+        ] + [b"\xfe" + ULAW_SILENCE_FRAME[1:]]
     finally:
         await transport.close()
 
@@ -119,6 +120,39 @@ async def test_clear_audio_discards_a_live_generation_residual_before_it_can_sen
 
         assert decoded_media_frames(websocket) == [b"\xb2" * 160]
     finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_clear_during_final_residual_enqueue_discards_the_stale_padded_frame():
+    class BlockingResidualTransport(SmartPBXMediaTransport):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.enqueue_entered = asyncio.Event()
+            self.resume_enqueue = asyncio.Event()
+
+        async def _enqueue_frame(self, audio, generation):
+            self.enqueue_entered.set()
+            await self.resume_enqueue.wait()
+            return await super()._enqueue_frame(audio, generation)
+
+    websocket = FakeWebSocket()
+    transport = BlockingResidualTransport(websocket, CONTEXT, max_queue_frames=8)
+    transport.start()
+    try:
+        await transport.send_audio(b"\xd4" * 159)
+        marker = asyncio.create_task(transport.send_mark("tts_done"))
+        await asyncio.wait_for(transport.enqueue_entered.wait(), timeout=1)
+        await transport.clear_audio()
+        transport.resume_enqueue.set()
+        await asyncio.wait_for(marker, timeout=1)
+
+        await transport.send_audio(b"\xe5" * 160)
+        await asyncio.wait_for(wait_for_sent(websocket, 1), timeout=1)
+        await transport.send_mark("current")
+        assert decoded_media_frames(websocket) == [b"\xe5" * 160]
+    finally:
+        transport.resume_enqueue.set()
         await transport.close()
 
 
@@ -145,7 +179,9 @@ async def test_sends_only_the_documented_media_envelope():
 
     assert json.loads(websocket.sent[0]) == {
         "event": "media", "callId": "call-1", "accountId": "account-1",
-        "media": {"payload": base64.b64encode(b"audio").decode("ascii")},
+        "media": {
+            "payload": base64.b64encode(b"audio" + ULAW_SILENCE_FRAME[5:]).decode("ascii")
+        },
     }
     await transport.close()
 
