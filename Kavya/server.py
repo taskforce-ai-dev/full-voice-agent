@@ -1762,14 +1762,28 @@ def _has_material_text(text: str) -> bool:
     """True when the text carries at least one letter or digit."""
     return any(ch.isalnum() for ch in text)
 
-# Domain phrase list that biases the ENGLISH Azure recognizer toward booking
-# vocabulary — digit words (phone numbers), the property and room names (from the
-# single tools source of truth), and common booking terms. English only: phrase
-# lists are language-specific and the Sinhala/Tamil/Arabic Azure configs are left
-# as the owner keeps them. Applied via PhraseListGrammar in AzureSTTStream.start.
+# Domain phrase list that biases the ENGLISH Google and Azure recognizers toward
+# booking vocabulary — digit words (phone numbers), the property and room names
+# (from the single tools source of truth), and common booking terms. English only:
+# phrase lists are language-specific and the Sinhala/Tamil/Arabic configs are left
+# as the owner keeps them. Applied via Google SpeechContext and Azure
+# PhraseListGrammar.
 _STT_DIGIT_WORDS: tuple[str, ...] = (
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
     "nine", "oh", "double", "triple", "treble", "nought", "naught",
+)
+_STT_REPEAT_OPERANDS: tuple[str, ...] = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "oh", "o", "nought", "naught", "0", "1", "2", "3", "4", "5",
+    "6", "7", "8", "9",
+)
+# Individual repeat words are not enough when the telephony recognizer has to
+# decide whether the word binds to the following digit. Keep these phrases in
+# the phone-number STT vocabulary; no free-form text is expanded here.
+_STT_REPEAT_PHRASES: tuple[str, ...] = tuple(
+    f"{repeat} {operand}"
+    for repeat in ("double", "triple")
+    for operand in _STT_REPEAT_OPERANDS
 )
 _STT_BOOKING_TERMS: tuple[str, ...] = (
     "Hatton Hills", "check-in", "check in", "check-out", "check out",
@@ -1782,6 +1796,7 @@ EN_STT_PHRASE_LIST: tuple[str, ...] = (
     tuple(ROOM_TYPES_BY_PROPERTY[PROPERTY_HATTON])
     + _STT_BOOKING_TERMS
     + _STT_DIGIT_WORDS
+    + _STT_REPEAT_PHRASES
 )
 
 

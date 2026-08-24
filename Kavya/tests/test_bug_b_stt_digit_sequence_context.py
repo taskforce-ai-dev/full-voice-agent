@@ -17,6 +17,31 @@ def test_english_speech_context_includes_digit_sequence_oov_class(monkeypatch):
     assert contexts[1].kwargs["boost"] == server.STT_DIGIT_CLASS_BOOST
 
 
+def test_english_speech_context_includes_compound_repeat_phrases(monkeypatch):
+    """Keep repeat phrases in the general context when digit-class boost is off."""
+    fake, _recorded = _fake_google_speech()
+    monkeypatch.setattr(server, "google_speech", fake)
+    monkeypatch.setattr(server, "STT_DIGIT_CLASS_BOOST", 0.0)
+
+    stt = _stream(lang="en")
+    config = stt._streaming_config(
+        "en-US", server.STT_ALTERNATIVES.get("en", []), enhanced=True
+    )
+
+    contexts = config.kwargs["config"].kwargs["speech_contexts"]
+    assert len(contexts) == 1, "the disabled digit class must not supply a fallback context"
+    phrases = contexts[0].kwargs["phrases"]
+    for repeat in ("double", "triple"):
+        for word, numeral in zip(
+            ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"),
+            "0123456789",
+        ):
+            assert f"{repeat} {word}" in phrases
+            assert f"{repeat} {numeral}" in phrases
+        for zero_alias in ("oh", "o", "nought", "naught"):
+            assert f"{repeat} {zero_alias}" in phrases
+
+
 def test_english_speech_context_omits_digit_sequence_oov_class_when_disabled(monkeypatch):
     fake, _recorded = _fake_google_speech()
     monkeypatch.setattr(server, "google_speech", fake)

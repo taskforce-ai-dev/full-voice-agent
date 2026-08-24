@@ -16,6 +16,22 @@ import handover
 from handover import normalize_whatsapp, spoken_number_to_digits
 
 
+@pytest.mark.parametrize("repeat,count", [("double", 2), ("triple", 3)])
+@pytest.mark.parametrize(
+    "operand,digit",
+    [
+        ("zero", "0"), ("one", "1"), ("two", "2"), ("three", "3"),
+        ("four", "4"), ("five", "5"), ("six", "6"), ("seven", "7"),
+        ("eight", "8"), ("nine", "9"),
+        ("oh", "0"), ("o", "0"), ("nought", "0"), ("naught", "0"),
+        ("0", "0"), ("1", "1"), ("2", "2"), ("3", "3"), ("4", "4"),
+        ("5", "5"), ("6", "6"), ("7", "7"), ("8", "8"), ("9", "9"),
+    ],
+)
+def test_spoken_number_to_digits_expands_every_repeat_operand(operand, digit, repeat, count):
+    assert spoken_number_to_digits(f"{repeat} {operand}") == digit * count
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
