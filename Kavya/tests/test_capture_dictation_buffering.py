@@ -81,6 +81,60 @@ def _deliver(session, *sentences):
         session._record_delivered_sentence(sentence, generation)
 
 
+async def _submit_provider_callback(session, method_name: str, text: str) -> None:
+    """Run a synchronous provider callback through its loop-side coroutine.
+
+    Production Azure and Google callbacks enter `_on_stt_result` and
+    `_on_stt_interim` synchronously, respectively.  The focused fake loop used
+    in this file deliberately is not an asyncio event loop, so capture the
+    callback submission and await the exact coroutine it hands to the shared
+    accumulator.
+    """
+    submitted = []
+    original_submit = session._submit_stt_callback
+
+    def capture_submit(callback, *args):
+        submitted.append((callback, args))
+        return True
+
+    session._submit_stt_callback = capture_submit
+    try:
+        getattr(session, method_name)(text)
+    finally:
+        session._submit_stt_callback = original_submit
+
+    assert len(submitted) == 1
+    callback, args = submitted[0]
+    await callback(*args)
+
+
+async def _start_held_turn(session, loop, processed, text="original turn"):
+    """Dispatch one ordinary turn and keep its real release `finally` pending."""
+    release = asyncio.Event()
+
+    async def hold_turn(utterance):
+        processed.append(utterance)
+        await release.wait()
+
+    session._process_utterance = hold_turn
+    await session._accumulate_transcript(text)
+    loop.last.callback()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert session._utterance_dispatched is True
+    assert processed == [text]
+    return release
+
+
+async def _wait_for_turn_release(session):
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if session._utterance_dispatched is False:
+            return
+    assert session._utterance_dispatched is False, "held turn did not release"
+
+
 # --- (a) the ask detector -------------------------------------------------
 
 CAPTURE_ASKS = [
@@ -248,6 +302,141 @@ def test_outside_capture_mode_a_final_still_endpoints_on_the_short_grace():
     asyncio.run(session._accumulate_transcript("i would like a room"))
 
     assert loop.last.delay == server.STT_FINAL_GRACE_SECONDS
+
+
+# --- (b1) a capture ask that lands while the prior turn is in flight --------
+
+@pytest.mark.asyncio
+async def test_azure_final_deferred_during_capture_ask_waits_then_combines():
+    """An Azure final must not bypass the delivered ask's capture patience.
+
+    The final lands while the prior turn still owns dispatch, its first timer
+    expires there, and the ask becomes delivered before that turn releases.
+    Current production reaches the real release seam and schedules `0.0`; the
+    first delay assertion below is deliberately RED until that seam chooses the
+    existing capture-final timeout instead.
+    """
+    session, loop, processed = make_session()
+    release = await _start_held_turn(session, loop, processed)
+
+    await _submit_provider_callback(session, "_on_stt_result", "07")
+    assert session._committed_transcript == "07"
+    loop.last.callback()
+    await asyncio.sleep(0)
+    assert session._deferred_flush_pending is True
+
+    _deliver(session, "Could I take your phone number, please?")
+    session._maybe_enter_capture_mode_from_ask()
+    assert session._is_capture_mode_active() is True
+
+    release.set()
+    await _wait_for_turn_release(session)
+
+    # RED on current production: the release branch unconditionally arms 0.0.
+    assert loop.last.delay == session._capture_turn_timeout(final=True)
+    assert processed == ["original turn"]
+
+    # Complete the number before the patient release timer fires.  Provider
+    # finals are segmented natural digit groups, so this is not synthetic
+    # concatenation done by the test.
+    await _submit_provider_callback(session, "_on_stt_result", "1175")
+    await _submit_provider_callback(session, "_on_stt_result", "4668")
+    assert len(loop.live) == 1
+    loop.last.callback()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert processed == ["original turn", "07 1175 4668"]
+
+
+@pytest.mark.asyncio
+async def test_google_interim_deferred_during_capture_ask_waits_then_combines():
+    """Google interims use the same release seam and retain cumulative text."""
+    session, loop, processed = make_session()
+    release = await _start_held_turn(session, loop, processed)
+
+    await _submit_provider_callback(session, "_on_stt_interim", "zero seven")
+    assert session._committed_transcript == ""
+    assert session._latest_interim == "zero seven"
+    loop.last.callback()
+    await asyncio.sleep(0)
+    assert session._deferred_flush_pending is True
+
+    _deliver(session, "May I have your mobile number?")
+    session._maybe_enter_capture_mode_from_ask()
+    assert session._is_capture_mode_active() is True
+
+    release.set()
+    await _wait_for_turn_release(session)
+
+    # RED on current production for the same reason as the Azure-final shape.
+    assert loop.last.delay == session._capture_turn_timeout(final=False)
+    assert processed == ["original turn"]
+
+    await _submit_provider_callback(
+        session, "_on_stt_interim", "zero seven one one seven five"
+    )
+    await _submit_provider_callback(
+        session, "_on_stt_interim", "zero seven one one seven five four six six eight"
+    )
+    assert len(loop.live) == 1
+    loop.last.callback()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert processed == [
+        "original turn",
+        "zero seven one one seven five four six six eight",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deferred_non_capture_speech_still_releases_at_zero_delay():
+    """The capture fix must not add number-dictation latency to normal speech."""
+    session, loop, processed = make_session()
+    release = await _start_held_turn(session, loop, processed)
+
+    await _submit_provider_callback(
+        session, "_on_stt_result", "Could you also tell me about breakfast?"
+    )
+    loop.last.callback()
+    await asyncio.sleep(0)
+    assert session._deferred_flush_pending is True
+    assert session._is_capture_mode_active() is False
+
+    release.set()
+    await _wait_for_turn_release(session)
+
+    assert loop.last.delay == 0.0
+    assert processed == ["original turn"]
+
+
+@pytest.mark.asyncio
+async def test_substantive_speaking_time_callback_still_barges_in_immediately():
+    """The capture release fix must not affect the earlier barge-in branch."""
+    session, loop, processed = make_session()
+    session._media_transport = object()
+
+    async def clear_media_audio(*_args, **_kwargs):
+        return None
+
+    session._clear_media_audio = clear_media_audio
+    release = await _start_held_turn(session, loop, processed)
+    session._is_speaking = True
+    session._speaking_since = 0.0
+
+    await _submit_provider_callback(
+        session,
+        "_on_stt_result",
+        "Actually, I would like to change that booking.",
+    )
+
+    assert session._is_speaking is False
+    assert session._smartpbx_barge_ins == 1
+    assert session._utterance_dispatched is False
+    assert session._deferred_flush_pending is False
+
+    release.set()
 
 
 # --- (b2) the echo gate runs BEFORE the buffer ----------------------------
