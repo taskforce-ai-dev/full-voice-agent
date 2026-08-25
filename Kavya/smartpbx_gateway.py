@@ -37,7 +37,7 @@ _INTEGER_SETTINGS = {
     # Digital μ-law silence before the welcome greeting can prime a carrier
     # decoder/jitter buffer.  It is deliberately default-off and must be an
     # exact 20 ms wire-frame multiple.
-    "SMARTPBX_STARTUP_PREROLL_MS": ("startup_preroll_ms", 0, 0, 500),
+    "SMARTPBX_STARTUP_PREROLL_MS": ("startup_preroll_ms", 0, 0, 2000),
     "SMARTPBX_START_TIMEOUT_SECONDS": ("start_timeout_seconds", 10, 1, 30),
     "SMARTPBX_IDLE_TIMEOUT_SECONDS": ("idle_timeout_seconds", 90, 10, 300),
     # An acknowledged transfer legitimately outlives ordinary idleness, but a

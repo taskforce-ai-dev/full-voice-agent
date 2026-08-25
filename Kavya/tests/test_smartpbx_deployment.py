@@ -33,7 +33,7 @@ def test_kavya_smartpbx_is_loopback_only_and_uses_its_own_port():
     assert service["environment"]["SMARTPBX_MAX_CALLS"] == "4"
 
 
-def test_startup_preroll_is_explicitly_default_off_and_has_a_documented_canary_rollback():
+def test_startup_preroll_is_explicitly_default_off_and_has_a_documented_two_second_canary_rollback():
     compose = yaml.safe_load(read_text("docker-compose.yml"))
     environment = compose["services"]["kavya-smartpbx"]["environment"]
     example = read_text(".env.example")
@@ -41,6 +41,8 @@ def test_startup_preroll_is_explicitly_default_off_and_has_a_documented_canary_r
 
     assert environment["SMARTPBX_STARTUP_PREROLL_MS"] == "${SMARTPBX_STARTUP_PREROLL_MS:-0}"
     assert re.search(r"^SMARTPBX_STARTUP_PREROLL_MS=0$", example, re.MULTILINE)
+    assert "20 ms multiples in [0, 2000]" in example
+    assert "SMARTPBX_STARTUP_PREROLL_MS=2000" in runbook
     assert "SMARTPBX_STARTUP_PREROLL_MS=100" in runbook
     assert "SMARTPBX_STARTUP_PREROLL_MS=0" in runbook
     assert "not an Opus migration" in runbook
