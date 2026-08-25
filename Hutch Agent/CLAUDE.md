@@ -358,9 +358,10 @@ Before this agent can go live, the operator still needs to:
    concurrent-call capacity (-> `SMARTPBX_MAX_CALLS`).
 2. **DNS + TLS certificate** for `smartpbx-hutch.taskforceai.tech` (the
    hostname `nginx-smartpbx.conf` is written for).
-3. **A distinct ElevenLabs voice ID for Selina** — `ELEVENLABS_VOICE_ID` is
-   blank in `.env.example`; either a stock library voice or a newly cloned
-   one, but not shared with another agent's persona.
+3. ~~A distinct ElevenLabs voice ID for Selina~~ — **done, Aug 2026**:
+   `19STyYD15bswVz51nqLf`, not shared with any other agent's persona
+   (previously a Kavya-voice placeholder). Set in `.env.example` and live in
+   `/opt/hutch/Hutch Agent/.env.smartpbx` on the VPS.
 4. **Build the `N8N_HANDOVER_WEBHOOK` workflow in n8n** — `/webhook/hutch-handover`
    does not exist yet. Until it does, `notify_human_handover` fails silently
    (fail-open by design) and no Hutch operator is actually notified.
