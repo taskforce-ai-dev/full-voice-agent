@@ -359,7 +359,7 @@ Before this agent can go live, the operator still needs to:
 2. **DNS + TLS certificate** for `smartpbx-hutch.taskforceai.tech` (the
    hostname `nginx-smartpbx.conf` is written for).
 3. ~~A distinct ElevenLabs voice ID for Selina~~ — **done, Aug 2026**:
-   `QJksobp1edMNvmwcG5lm`, not shared with any other agent's persona
+   `19STyYD15bswVz51nqLf`, not shared with any other agent's persona
    (previously a Kavya-voice placeholder). Set in `.env.example` and live in
    `/opt/hutch/Hutch Agent/.env.smartpbx` on the VPS.
 4. **Build the `N8N_HANDOVER_WEBHOOK` workflow in n8n** — `/webhook/hutch-handover`
