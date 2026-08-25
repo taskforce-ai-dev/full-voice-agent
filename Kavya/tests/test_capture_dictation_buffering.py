@@ -17,6 +17,7 @@ The fix has three moving parts, all pinned here at the seams a caller can hear:
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 
@@ -133,6 +134,16 @@ async def _wait_for_turn_release(session):
         if session._utterance_dispatched is False:
             return
     assert session._utterance_dispatched is False, "held turn did not release"
+
+
+def _capture_deferred_rearm_records(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith(
+            "smartpbx_media event=capture_deferred_rearm "
+        )
+    ]
 
 
 # --- (a) the ask detector -------------------------------------------------
@@ -307,7 +318,7 @@ def test_outside_capture_mode_a_final_still_endpoints_on_the_short_grace():
 # --- (b1) a capture ask that lands while the prior turn is in flight --------
 
 @pytest.mark.asyncio
-async def test_azure_final_deferred_during_capture_ask_waits_then_combines():
+async def test_azure_final_deferred_during_capture_ask_waits_then_combines(caplog):
     """An Azure final must not bypass the delivered ask's capture patience.
 
     The final lands while the prior turn still owns dispatch, its first timer
@@ -329,12 +340,32 @@ async def test_azure_final_deferred_during_capture_ask_waits_then_combines():
     session._maybe_enter_capture_mode_from_ask()
     assert session._is_capture_mode_active() is True
 
-    release.set()
-    await _wait_for_turn_release(session)
+    with caplog.at_level("INFO"):
+        release.set()
+        await _wait_for_turn_release(session)
 
     # RED on current production: the release branch unconditionally arms 0.0.
     assert loop.last.delay == session._capture_turn_timeout(final=True)
     assert processed == ["original turn"]
+
+    records = _capture_deferred_rearm_records(caplog)
+    assert len(records) == 1, records
+    line = records[0]
+    match = re.match(
+        r"^smartpbx_media event=capture_deferred_rearm "
+        r"provenance=(final|interim) delay_ms=(\d+)$",
+        line,
+    )
+    assert match, line
+    assert match.group("provenance") == "final"
+    assert 0 <= int(match.group("delay_ms")) <= 5000
+    assert line.split(" ")[1:] == [
+        "event=capture_deferred_rearm",
+        "provenance=final",
+        f"delay_ms={match.group('delay_ms')}",
+    ]
+    for secret in ("07", "original turn", "phone number"):
+        assert secret not in line
 
     # Complete the number before the patient release timer fires.  Provider
     # finals are segmented natural digit groups, so this is not synthetic
@@ -350,7 +381,7 @@ async def test_azure_final_deferred_during_capture_ask_waits_then_combines():
 
 
 @pytest.mark.asyncio
-async def test_google_interim_deferred_during_capture_ask_waits_then_combines():
+async def test_google_interim_deferred_during_capture_ask_waits_then_combines(caplog):
     """Google interims use the same release seam and retain cumulative text."""
     session, loop, processed = make_session()
     release = await _start_held_turn(session, loop, processed)
@@ -366,12 +397,21 @@ async def test_google_interim_deferred_during_capture_ask_waits_then_combines():
     session._maybe_enter_capture_mode_from_ask()
     assert session._is_capture_mode_active() is True
 
-    release.set()
-    await _wait_for_turn_release(session)
+    with caplog.at_level("INFO"):
+        release.set()
+        await _wait_for_turn_release(session)
 
     # RED on current production for the same reason as the Azure-final shape.
     assert loop.last.delay == session._capture_turn_timeout(final=False)
     assert processed == ["original turn"]
+
+    records = _capture_deferred_rearm_records(caplog)
+    assert len(records) == 1, records
+    assert records[0].startswith(
+        "smartpbx_media event=capture_deferred_rearm "
+        "provenance=interim delay_ms="
+    )
+    assert "zero seven" not in records[0]
 
     await _submit_provider_callback(
         session, "_on_stt_interim", "zero seven one one seven five"

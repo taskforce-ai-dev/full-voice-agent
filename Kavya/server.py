@@ -7393,10 +7393,32 @@ class MediaStreamSession:
                 if self._deferred_flush_pending:
                     # Caller speech admitted during this turn had its endpointing
                     # deadline expire while the guard was still held. The guard is
-                    # free now, so dispatch it as the next turn rather than
-                    # leaving it stranded in the buffer. `call_later(0)` keeps
-                    # this off the current stack: the flush runs as its own task.
-                    self._arm_endpointing(0.0)
+                    # free now, so re-arm it as the next turn rather than leaving
+                    # it stranded in the buffer. A delivered capture ask may have
+                    # armed capture mode while this turn was in flight: retain
+                    # that existing patient window for its dictation fragments.
+                    # Ordinary deferred speech keeps the zero-delay release.
+                    capture_rearm = self._is_capture_mode_active()
+                    final = bool(self._committed_transcript)
+                    delay = (
+                        self._capture_turn_timeout(final=final)
+                        if capture_rearm
+                        else 0.0
+                    )
+                    if (
+                        capture_rearm
+                        and delay > 0.0
+                        and self._is_smartpbx_session()
+                    ):
+                        provenance = "final" if final else "interim"
+                        delay_ms = max(0, min(int(delay * 1000), 5000))
+                        logger.info(
+                            "smartpbx_media event=capture_deferred_rearm "
+                            "provenance=%s delay_ms=%d",
+                            provenance,
+                            delay_ms,
+                        )
+                    self._arm_endpointing(delay)
 
     # â”€â”€ Utterance â†’ KB + Claude + TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
