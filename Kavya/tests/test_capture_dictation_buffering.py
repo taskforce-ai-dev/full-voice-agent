@@ -353,7 +353,8 @@ async def test_azure_final_deferred_during_capture_ask_waits_then_combines(caplo
     line = records[0]
     match = re.match(
         r"^smartpbx_media event=capture_deferred_rearm "
-        r"provenance=(final|interim) delay_ms=(\d+)$",
+        r"provenance=(?P<provenance>final|interim) "
+        r"delay_ms=(?P<delay_ms>\d+)$",
         line,
     )
     assert match, line
@@ -370,9 +371,14 @@ async def test_azure_final_deferred_during_capture_ask_waits_then_combines(caplo
     # Complete the number before the patient release timer fires.  Provider
     # finals are segmented natural digit groups, so this is not synthetic
     # concatenation done by the test.
+    prior_endpointing = session._endpointing_handle
     await _submit_provider_callback(session, "_on_stt_result", "1175")
+    assert prior_endpointing.cancelled is True
+    assert session._endpointing_handle is loop.last
+    prior_endpointing = session._endpointing_handle
     await _submit_provider_callback(session, "_on_stt_result", "4668")
-    assert len(loop.live) == 1
+    assert prior_endpointing.cancelled is True
+    assert session._endpointing_handle is loop.last
     loop.last.callback()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -413,13 +419,18 @@ async def test_google_interim_deferred_during_capture_ask_waits_then_combines(ca
     )
     assert "zero seven" not in records[0]
 
+    prior_endpointing = session._endpointing_handle
     await _submit_provider_callback(
         session, "_on_stt_interim", "zero seven one one seven five"
     )
+    assert prior_endpointing.cancelled is True
+    assert session._endpointing_handle is loop.last
+    prior_endpointing = session._endpointing_handle
     await _submit_provider_callback(
         session, "_on_stt_interim", "zero seven one one seven five four six six eight"
     )
-    assert len(loop.live) == 1
+    assert prior_endpointing.cancelled is True
+    assert session._endpointing_handle is loop.last
     loop.last.callback()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
