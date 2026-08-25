@@ -114,11 +114,12 @@ def test_settings_default_to_the_kavya_token_header_and_documented_bounds():
     assert "test-token" not in repr(configuration)
 
 
-def test_startup_preroll_setting_defaults_to_zero_accepts_100_and_rejects_unsafe_values():
+def test_startup_preroll_setting_defaults_to_zero_accepts_two_seconds_and_rejects_unsafe_values():
     assert settings().startup_preroll_ms == 0
     assert SmartPBXSettings.from_env({"ENABLE_SMARTPBX_WSS": "false"}).startup_preroll_ms == 0
     assert settings(SMARTPBX_STARTUP_PREROLL_MS="100").startup_preroll_ms == 100
-    for value in ("-20", "520", "1", "110"):
+    assert settings(SMARTPBX_STARTUP_PREROLL_MS="2000").startup_preroll_ms == 2000
+    for value in ("-20", "2020", "1", "110"):
         with pytest.raises(ValueError):
             settings(SMARTPBX_STARTUP_PREROLL_MS=value)
 
@@ -188,9 +189,9 @@ async def test_gateway_default_preroll_emits_no_media_before_session_creation():
 
 
 @pytest.mark.asyncio
-async def test_gateway_drains_configured_preroll_before_creating_or_starting_session():
+async def test_gateway_drains_two_second_preroll_before_creating_or_starting_session():
     socket = FakeWebSocket([START, {"event": "stop"}])
-    configuration = settings(SMARTPBX_STARTUP_PREROLL_MS="100")
+    configuration = settings(SMARTPBX_STARTUP_PREROLL_MS="2000")
     gateway = SmartPBXGateway(configuration, SmartPBXSessionRegistry(configuration.max_calls))
     factory_seen_media_counts = []
     starts_seen_media_counts = []
@@ -207,9 +208,9 @@ async def test_gateway_drains_configured_preroll_before_creating_or_starting_ses
     await gateway.handle(socket, factory)
 
     frames = [base64.b64decode(json.loads(row)["media"]["payload"]) for row in socket.sent]
-    assert factory_seen_media_counts == [5]
-    assert starts_seen_media_counts == [5]
-    assert frames == [b"\xff" * 160] * 5
+    assert factory_seen_media_counts == [100]
+    assert starts_seen_media_counts == [100]
+    assert frames == [b"\xff" * 160] * 100
 
 
 @pytest.mark.asyncio
