@@ -387,7 +387,8 @@ event allowlist**. It may contain only the following runtime event names:
 `llm_stream_timeout`,
 `silence_reprompt`, `stt_final`, `stt_post_dispatch_result`,
 `stt_provider_final`, `stt_provider_interim`,
-`capture_buffer_bounded`, `capture_final_buffered`, `capture_forced_dispatch`,
+`capture_buffer_bounded`, `capture_final_buffered`, `capture_deferred_rearm`,
+`capture_forced_dispatch`,
 `stt_callback_drain`, `capture_mode_enter`, `capture_mode_exit`, `dtmf_collect_start`, and
 `dtmf_collect_done`; unlisted event names are not permitted.
 The protocol diagnostic record is emitted as
@@ -419,6 +420,20 @@ are caller-derived). `output_tokens` and `attempt` are likewise clamped to the
 ranges above, so a corrupt usage payload cannot write an unbounded numeral.
 This event carries no free text, no tool names, no tool arguments and no caller
 identifiers of any kind.
+
+`capture_deferred_rearm` emits exactly three fields, and no others:
+
+| Field | Type | Permitted values |
+| --- | --- | --- |
+| `event` | fixed literal | `capture_deferred_rearm` |
+| `provenance` | bounded enum | `final`, `interim` |
+| `delay_ms` | bounded integer | `0`–`5000`, clamped |
+
+It appears only for direct SmartPBX capture speech whose endpointing deadline
+expired while a prior turn was still active. It proves that, after the capture
+ask was delivered, the buffered caller fragment received the existing capture
+window instead of immediate dispatch. The record contains no transcript text,
+length, phone digits, caller identifier, prompt, or tool data.
 
 `llm_stream_timeout` emits exactly eight fields, and no others:
 
