@@ -477,6 +477,7 @@ async def test_substantive_speaking_time_callback_still_barges_in_immediately():
     assert session._deferred_flush_pending is False
 
     release.set()
+    await _wait_for_turn_release(session)
 
 
 # --- (b2) the echo gate runs BEFORE the buffer ----------------------------
