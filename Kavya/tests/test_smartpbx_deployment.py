@@ -2964,7 +2964,12 @@ def test_stt_endpointing_knobs_are_deliverable_through_the_documented_path():
     kavya = compose["services"]["kavya"]
     assert ".env" in kavya["env_file"], "the Twilio service forwards .env vars via env_file"
 
-    for name in ("STT_ENDPOINTING_SILENCE_SECONDS", "STT_FINAL_GRACE_SECONDS"):
+    for name in (
+        "STT_ENDPOINTING_SILENCE_SECONDS",
+        "STT_FINAL_GRACE_SECONDS",
+        "CAPTURE_ENDPOINTING_SILENCE_SECONDS",
+        "CAPTURE_FINAL_GRACE_SECONDS",
+    ):
         assert smartpbx_env.get(name) == f"${{{name}}}", (
             f"{name} must be in the smartpbx environment allowlist to reach the container"
         )
@@ -2974,6 +2979,8 @@ def test_stt_endpointing_knobs_are_deliverable_through_the_documented_path():
     for name, default in (
         ("STT_ENDPOINTING_SILENCE_SECONDS", "1.0"),
         ("STT_FINAL_GRACE_SECONDS", "0.5"),
+        ("CAPTURE_ENDPOINTING_SILENCE_SECONDS", "1.5"),
+        ("CAPTURE_FINAL_GRACE_SECONDS", "1.2"),
     ):
         assert f"{name}={default}" in example, f"{name} missing from .env.example"
         assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
