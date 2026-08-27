@@ -535,6 +535,159 @@ async def test_protocol_failure_does_not_retry_and_stays_fail_closed():
 
 
 @pytest.mark.asyncio
+async def test_exact_transfer_call_not_found_reopens_one_fresh_session_and_succeeds():
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(FakeMcpError(
+            -32602, "tool 'transfer_call' not found: tool not found"
+        )),
+        AcknowledgedResult(),
+    )
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(True, None)
+    assert len(fake_mcp.calls) == 2
+    assert fake_mcp.sessions[0] is not fake_mcp.sessions[1]
+
+
+@pytest.mark.asyncio
+async def test_second_exact_transfer_call_not_found_stops_after_two_attempts():
+    fake_mcp = FakeSessionFactory(*[
+        AfterDispatch(FakeMcpError(-32602, "tool 'transfer_call' not found: tool not found"))
+        for _ in range(2)
+    ])
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(False, "protocol")
+    assert len(fake_mcp.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_exact_transfer_call_not_found_does_not_retry_when_operator_disables_retries():
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(FakeMcpError(-32602, "tool 'transfer_call' not found: tool not found")),
+        AcknowledgedResult(),
+    )
+
+    result = await DialogMCPCallControl(
+        settings(SMARTPBX_MCP_RETRIES="0"), context(), fake_mcp,
+    ).transfer_call("human_support")
+
+    assert result == smartpbx_mcp.TransferResult(False, "protocol")
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_predispatch_retry_then_exact_not_found_never_opens_a_third_session():
+    fake_mcp = FakeSessionFactory(
+        httpx.ConnectError("down"),
+        AfterDispatch(FakeMcpError(-32602, "tool 'transfer_call' not found: tool not found")),
+        AcknowledgedResult(),
+    )
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(False, "protocol")
+    assert len(fake_mcp.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_casefolded_double_quoted_transfer_call_not_found_retries_once():
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(FakeMcpError(-32602, 'TOOL "TRANSFER_CALL" NOT FOUND')),
+        AcknowledgedResult(),
+    )
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(True, None)
+    assert len(fake_mcp.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_mixed_not_found_and_ambiguous_protocol_leaves_do_not_retry():
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(ExceptionGroup("mixed", [
+            FakeMcpError(-32602, "tool 'transfer_call' not found: tool not found"),
+            FakeMcpError(-32602, "provider rejected the request"),
+        ])),
+        AcknowledgedResult(),
+    )
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(False, "protocol")
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_unrelated_jsonrpc_invalid_params_error_does_not_retry():
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(FakeMcpError(-32602, "required argument 'tier_name' not found")),
+        AcknowledgedResult(),
+    )
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(False, "protocol")
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_post_dispatch_protocol_failure_does_not_retry():
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(FakeMcpError(-32602, "provider rejected the request")),
+        AcknowledgedResult(),
+    )
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(False, "protocol")
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_cancellation_propagates_without_retry():
+    fake_mcp = FakeSessionFactory(
+        AfterDispatch(asyncio.CancelledError("cancelled")), AcknowledgedResult(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+            "human_support"
+        )
+
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_success_never_dispatches_a_duplicate_transfer_attempt():
+    fake_mcp = FakeSessionFactory(AcknowledgedResult(), AcknowledgedResult())
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result == smartpbx_mcp.TransferResult(True, None)
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_genuine_network_failure_is_still_classified_as_transport():
     """The protocol class must not swallow the case it was carved out of."""
     fake_mcp = FakeSessionFactory(AfterDispatch(httpx.ReadError("connection reset")))

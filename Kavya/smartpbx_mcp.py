@@ -35,6 +35,9 @@ _MAX_ACCOUNT_ID_CHARS = 256
 _MAX_CALL_ID_CHARS = 256
 
 _SDK_LOGGERS = ("mcp.client.streamable_http", "mcp.client.session")
+_TRANSFER_CALL_NOT_FOUND = re.compile(
+    r"\btool\s+['\"]?transfer_call['\"]?\s+not\s+found\b"
+)
 
 # Authenticated Dialog UCP MCP tools/list on 2026-08-27 requires these exact
 # `transfer_call` keys. The production handover is the documented `BYPASS`
@@ -251,6 +254,13 @@ class DialogMCPCallControl:
                 ):
                     _log_result("retryable_failure", attempt)
                     continue
+                if (
+                    tool_dispatched
+                    and attempt <= self._settings.retries
+                    and _is_retryable_transfer_call_not_found(error, tool_name)
+                ):
+                    _log_result("retryable_tool_not_found", attempt)
+                    continue
                 failure = _failure_class(cause)
                 _log_result(failure, attempt, _log_detail(cause))
                 return TransferResult(False, failure)
@@ -455,6 +465,22 @@ def _is_protocol_error(error: BaseException) -> bool:
 def _jsonrpc_error_code(error: BaseException) -> object:
     """Read `McpError.error.code` without importing the SDK."""
     return getattr(getattr(error, "error", None), "code", None)
+
+
+def _is_retryable_transfer_call_not_found(
+    error: BaseException, tool_name: str,
+) -> bool:
+    """Recognize only Dialog's safe pre-execution `transfer_call` lookup miss."""
+    leaves = tuple(_exception_leaves(error))
+    if len(leaves) != 1:
+        return False
+    error = leaves[0]
+    if tool_name != "transfer_call" or _jsonrpc_error_code(error) != -32602:
+        return False
+    message = getattr(getattr(error, "error", None), "message", None)
+    if not isinstance(message, str) or len(message) > _MAX_LOG_DETAIL_CHARS:
+        return False
+    return bool(_TRANSFER_CALL_NOT_FOUND.search(message.casefold()))
 
 
 def _result_detail(outcome: str, result: object) -> str:
