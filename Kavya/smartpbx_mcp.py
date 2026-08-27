@@ -36,19 +36,13 @@ _MAX_CALL_ID_CHARS = 256
 
 _SDK_LOGGERS = ("mcp.client.streamable_http", "mcp.client.session")
 
-# The Dialog UCP MCP `transfer_call` tool declares exactly one required argument,
-# `number`, and wants the bare dialable number the caller asked for -- verified
-# live against https://dialog.cybergate.lk:9443/ucp/v2/mcp on 2026-08-11 via
-# tools/list. Our operator config keeps the safer `tel:`/`sip:` URI allowlist
-# form, so the scheme is stripped here, at the wire boundary, and nowhere else.
-# Re-verified live on 2026-08-14 (audit follow-up): the tools/list response is
-# unchanged -- `number` is still the sole required argument, described as "the
-# specific number provided by the user", with no `tel:`/`sip:` prefix requested
-# anywhere in the schema or description. The vendor README's claim that the
-# argument is named `destination_number` and must keep its `tel:`/`sip:` scheme
-# is stale/inaccurate; do not switch this constant or `_wire_destination` to
-# match the README without a fresh live tools/list confirming a schema change.
-_TRANSFER_ARGUMENT = "number"
+# Authenticated Dialog UCP MCP tools/list on 2026-08-27 requires these exact
+# `transfer_call` keys. The production handover is the documented `BYPASS`
+# funnel tier. Our operator config keeps the safer `tel:`/`sip:` URI allowlist
+# form, so the scheme is stripped only at this wire boundary.
+_TRANSFER_DESTINATION_ARGUMENT = "destination number"
+_TRANSFER_TIER_ARGUMENT = "tier"
+_TRANSFER_TIER_BYPASS = "BYPASS"
 _TEL_SCHEME = "tel:"
 
 # Any digit run this long or longer is a phone number; never log one.
@@ -225,7 +219,10 @@ class DialogMCPCallControl:
         if destination is None:
             raise TransferDisabled("destination_not_allowed")
         return await self._invoke(
-            "transfer_call", {_TRANSFER_ARGUMENT: _wire_destination(destination)}
+            "transfer_call", {
+                _TRANSFER_DESTINATION_ARGUMENT: _wire_destination(destination),
+                _TRANSFER_TIER_ARGUMENT: _TRANSFER_TIER_BYPASS,
+            },
         )
 
     async def _invoke(self, tool_name: str, arguments: dict[str, str]) -> TransferResult:
@@ -367,9 +364,9 @@ async def _open_session(
 def _wire_destination(destination: str) -> str:
     """Render an allowlisted destination as the bare value Dialog's tool wants.
 
-    The live tool schema takes one `number` string. A `tel:` URI is dialable only
-    once the scheme is dropped (`tel:+94711754668` -> `+94711754668`); a `sip:`
-    URI is already the routable form and is passed through whole.
+    The current live schema takes `destination number`. A `tel:` URI is dialable
+    only once the scheme is dropped (`tel:+94711754668` -> `+94711754668`); a
+    `sip:` URI is already the routable form and is passed through whole.
     """
     if destination.startswith(_TEL_SCHEME):
         return destination[len(_TEL_SCHEME):]

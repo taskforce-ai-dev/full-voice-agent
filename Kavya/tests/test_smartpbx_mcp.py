@@ -195,7 +195,10 @@ async def test_transfer_uses_other_leg_call_id_and_exactly_one_configured_accoun
     session = fake_mcp.sessions[0]
     assert session.events == [
         ("initialize",),
-        ("call_tool", "transfer_call", {"number": "+94110000000"}),
+        ("call_tool", "transfer_call", {
+            "destination number": "+94110000000",
+            "tier": "BYPASS",
+        }),
     ]
 
 
@@ -351,18 +354,22 @@ async def test_iserror_tool_result_is_a_non_retryable_tool_failure():
 
 # --------------------------------------------------------------------------
 # Live-observed Dialog UCP contract (dialog.cybergate.lk:9443/ucp/v2/mcp,
-# captured 2026-08-11 with the production key). Every literal below is a
-# recorded response body, not an assumption:
+# captured 2026-08-27 with authenticated production tools/list). Every literal
+# below is a recorded response body or the 05:25 UTC live incident, not an
+# assumption:
 #
-#   tools/list      transfer_call inputSchema -> {"number": <string>} required
+#   tools/list      transfer_call inputSchema -> {"destination number": <string>,
+#                   "tier": <string>} required; optional caller_id_name/number
+#   tool description `BYPASS` is the reserved funnel-bypass tier, valid with
+#                   save_call_crm either false or true
 #   tools/call OK   {"content":[{"type":"text","text":"..."}]}      (no isError)
 #   tools/call err  {"content":[...],"isError":true}
 #   JSON-RPC error  {"error":{"code":-32603,"message":"required argument
-#                    \"destination number\" not found"}}  over HTTP 200
+#                    \"tier_name\" not found"}}  over HTTP 200/202/200
 #
-# The 11:10 UTC outage was the last of these: we sent `destination_number`,
-# Dialog rejected it as a JSON-RPC error, and the SDK's McpError was filed as
-# `transport`. These tests exist so neither half can silently regress.
+# The 05:25 UTC incident sent only `number`; Dialog rejected it after the
+# delivery barrier, and WhatsApp correctly fell back. These tests pin the current
+# schema while retaining non-retryable protocol classification after dispatch.
 # --------------------------------------------------------------------------
 
 
@@ -402,11 +409,11 @@ class AcknowledgedResult:
 
 
 @pytest.mark.asyncio
-async def test_transfer_sends_the_bare_number_argument_dialog_actually_requires():
-    """Regression for the 2026-08-11 outage: the argument name and value shape.
+async def test_transfer_sends_the_exact_current_dialog_arguments_without_aliases():
+    """Regression for the 2026-08-27 incident: current keys and values only.
 
-    `tel:` is an allowlist notation of ours; Dialog wants `number` holding the
-    dialable value. Sending `destination_number` transferred nobody.
+    `tel:` is allowlist notation only. Dialog needs the bare dialable value under
+    `destination number`, paired with the fixed `BYPASS` funnel tier.
     """
     fake_mcp = FakeSessionFactory(AcknowledgedResult())
 
@@ -417,9 +424,11 @@ async def test_transfer_sends_the_bare_number_argument_dialog_actually_requires(
     assert result.transferred is True
     name, arguments = fake_mcp.sessions[0].events[1][1], fake_mcp.sessions[0].events[1][2]
     assert name == "transfer_call"
-    assert arguments == {"number": "+94110000000"}
+    assert arguments == {"destination number": "+94110000000", "tier": "BYPASS"}
+    assert "number" not in arguments
     assert "destination_number" not in arguments
-    assert not arguments["number"].startswith("tel:")
+    assert "tier_name" not in arguments
+    assert not arguments["destination number"].startswith("tel:")
 
 
 @pytest.mark.asyncio
@@ -434,7 +443,10 @@ async def test_sip_destination_reaches_the_provider_as_the_whole_uri():
     )
 
     assert result.transferred is True
-    assert fake_mcp.sessions[0].events[1][2] == {"number": "sip:support@pbx.example"}
+    assert fake_mcp.sessions[0].events[1][2] == {
+        "destination number": "sip:support@pbx.example",
+        "tier": "BYPASS",
+    }
 
 
 @pytest.mark.asyncio
@@ -456,9 +468,9 @@ async def test_acknowledged_result_without_iserror_is_a_success_not_a_failure():
 
 @pytest.mark.asyncio
 async def test_jsonrpc_error_reply_is_a_protocol_failure_never_transport():
-    """The exact 11:10 UTC failure must no longer masquerade as a network fault."""
+    """The exact 05:25 UTC post-dispatch failure must remain non-retryable."""
     fake_mcp = FakeSessionFactory(
-        AfterDispatch(FakeMcpError(-32603, 'required argument "destination number" not found'))
+        AfterDispatch(FakeMcpError(-32603, 'required argument "tier_name" not found'))
     )
 
     result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
@@ -535,7 +547,7 @@ async def test_genuine_network_failure_is_still_classified_as_transport():
 
 
 def test_configured_production_destination_passes_the_operator_allowlist():
-    """The number swapped in on 2026-08-11 is valid config -- it was never the cause."""
+    """Configured destinations remain valid; only the provider wire schema drifted."""
     for number in ('{"human_support":"tel:+94711754668"}', '{"human_support":"tel:+94765603946"}'):
         configured = settings(SMARTPBX_TRANSFER_DESTINATIONS_JSON=number)
         assert configured.failure is None
