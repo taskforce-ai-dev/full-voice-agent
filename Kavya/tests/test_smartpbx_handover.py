@@ -157,7 +157,10 @@ async def test_dialog_acknowledgement_transfers_and_never_whatsapps_the_manager(
 
     result = json.loads(await coordinator.attempt("guest asked for a human"))
 
-    assert calls == [("transfer_call", {"number": "+94711754668"})]
+    assert calls == [(
+        "transfer_call",
+        {"destination number": "+94711754668", "tier": "BYPASS"},
+    )]
     assert result == {"status": "transferred", "confirmation": "provider_acknowledged"}
     assert coordinator.transfer_pending is True
     assert len(notifications) == 1
