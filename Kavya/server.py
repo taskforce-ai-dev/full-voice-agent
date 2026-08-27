@@ -42,6 +42,7 @@ import os
 import inspect
 import difflib
 import secrets
+from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
@@ -67,7 +68,7 @@ import xml.sax.saxutils
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from html import escape as html_escape
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 from urllib.parse import quote as url_quote
 
 import httpx
@@ -2104,6 +2105,94 @@ def _elevenlabs_stream_url(voice_id: str) -> str:
     if ELEVENLABS_OPTIMIZE_STREAMING_LATENCY:
         url += f"&optimize_streaming_latency={ELEVENLABS_OPTIMIZE_STREAMING_LATENCY}"
     return url
+
+
+_SMARTPBX_WELCOME_FADE_SAMPLES = 480  # 60 ms at 8 kHz
+_SMARTPBX_WELCOME_MATERIAL_PCM_ABS = 256
+_SMARTPBX_WELCOME_AUDIO_CACHE_MAX_ENTRIES = 8
+_SMARTPBX_WELCOME_AUDIO_CACHE: OrderedDict[tuple[object, ...], bytes] = OrderedDict()
+_SMARTPBX_WELCOME_AUDIO_LOCK = threading.Lock()
+
+
+def _smartpbx_welcome_audio_cache_key(
+    text: str,
+    url: str,
+    model_id: str,
+    voice_settings: Mapping[str, object],
+) -> tuple[object, ...]:
+    """Return the complete canonical ElevenLabs request identity for welcome bytes."""
+    return (
+        text,
+        url,
+        model_id,
+        tuple(sorted((str(name), repr(value)) for name, value in voice_settings.items())),
+    )
+
+
+def _fade_smartpbx_welcome_mulaw(raw: bytes) -> bytes:
+    """Fade only the first material 60 ms of 8 kHz μ-law, or return raw on failure."""
+    if audioop is None or not raw:
+        return raw
+    try:
+        pcm = audioop.ulaw2lin(raw, 2)
+        onset = next(
+            (
+                offset // 2
+                for offset in range(0, len(pcm) - 1, 2)
+                if abs(int.from_bytes(pcm[offset:offset + 2], "little", signed=True))
+                >= _SMARTPBX_WELCOME_MATERIAL_PCM_ABS
+            ),
+            None,
+        )
+        if onset is None:
+            return raw
+        fade_samples = min(_SMARTPBX_WELCOME_FADE_SAMPLES, len(raw) - onset)
+        faded_pcm = bytearray()
+        for index in range(fade_samples):
+            sample_offset = (onset + index) * 2
+            sample = int.from_bytes(pcm[sample_offset:sample_offset + 2], "little", signed=True)
+            scale = index / (_SMARTPBX_WELCOME_FADE_SAMPLES - 1)
+            faded_pcm.extend(round(sample * scale).to_bytes(2, "little", signed=True))
+        faded_mulaw = audioop.lin2ulaw(bytes(faded_pcm), 2)
+        return raw[:onset] + faded_mulaw + raw[onset + fade_samples:]
+    except Exception:
+        return raw
+
+
+async def _get_cached_smartpbx_welcome_audio(
+    key: tuple[object, ...], fetch: Callable[[], Awaitable[bytes]],
+) -> bytes:
+    """Fetch per caller, then atomically publish or reuse immutable welcome bytes."""
+    with _SMARTPBX_WELCOME_AUDIO_LOCK:
+        cached = _SMARTPBX_WELCOME_AUDIO_CACHE.get(key)
+        if cached is not None:
+            _SMARTPBX_WELCOME_AUDIO_CACHE.move_to_end(key)
+            return cached
+
+    raw = await fetch()
+    if not isinstance(raw, bytes):
+        raise TypeError("ElevenLabs welcome audio must be bytes")
+    if not raw:
+        raise _ElevenLabsWelcomeEmptyAudio()
+    processed = _fade_smartpbx_welcome_mulaw(raw)
+    with _SMARTPBX_WELCOME_AUDIO_LOCK:
+        cached = _SMARTPBX_WELCOME_AUDIO_CACHE.get(key)
+        if cached is not None:
+            _SMARTPBX_WELCOME_AUDIO_CACHE.move_to_end(key)
+            return cached
+        _SMARTPBX_WELCOME_AUDIO_CACHE[key] = processed
+        _SMARTPBX_WELCOME_AUDIO_CACHE.move_to_end(key)
+        while len(_SMARTPBX_WELCOME_AUDIO_CACHE) > _SMARTPBX_WELCOME_AUDIO_CACHE_MAX_ENTRIES:
+            _SMARTPBX_WELCOME_AUDIO_CACHE.popitem(last=False)
+    return processed
+
+
+class _ElevenLabsWelcomeHTTPStatus(Exception):
+    """The greeting fetch already recorded its precise provider failure."""
+
+
+class _ElevenLabsWelcomeEmptyAudio(Exception):
+    """A successful provider status without greeting audio is not delivery."""
 
 # Silence (seconds) after greeting / agent turn before we re-prompt the caller.
 # If the caller never speaks, we re-greet them or ask if they're still online,
@@ -4903,6 +4992,7 @@ class MediaStreamSession:
         self._reprompt_count: int = 0
         # Set only by KavyaSmartPBXSession. None preserves legacy Twilio tools.
         self._smartpbx_transfer_context: Any | None = None
+        self._smartpbx_welcome_audio_pending: str | None = None
         self._smartpbx_caller_context: dict[str, str] | None = None
         self._record_echo_rejection: Callable[[int, float], None] | None = None
         self.transfer_pending = False
@@ -4962,6 +5052,16 @@ class MediaStreamSession:
             and self._media_transport is not None
             and self.lang == "en"
         )
+
+    def _consume_smartpbx_welcome_audio_marker(self, text: str) -> bool:
+        """Claim the one direct-English welcome request before it can be retried."""
+        if (
+            not self._is_direct_smartpbx_english()
+            or self._smartpbx_welcome_audio_pending != text
+        ):
+            return False
+        self._smartpbx_welcome_audio_pending = None
+        return True
 
     def _is_direct_smartpbx_english_non_capture(self) -> bool:
         """Gate for the Phase B empty-retry-nudge and stream-timeout-guard
@@ -9189,6 +9289,59 @@ class MediaStreamSession:
         url = _elevenlabs_stream_url(voice_id)
         headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
         payload: dict[str, Any] = {"text": text, "model_id": model_id, "voice_settings": voice_settings}
+
+        if self._consume_smartpbx_welcome_audio_marker(text):
+            cache_key = _smartpbx_welcome_audio_cache_key(
+                text, url, model_id, voice_settings,
+            )
+
+            async def fetch_welcome_audio() -> bytes:
+                async with httpx.AsyncClient() as http:
+                    async with http.stream(
+                        "POST", url, json=payload, headers=headers, timeout=15.0,
+                    ) as resp:
+                        if resp.status_code != 200:
+                            await resp.aread()
+                            self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
+                            self._emit_smartpbx_tts_diagnostic(
+                                DiagnosticFailureClass.TTS_HTTP_STATUS
+                            )
+                            raise _ElevenLabsWelcomeHTTPStatus()
+                        chunks: list[bytes] = []
+                        async for chunk in resp.aiter_bytes(chunk_size=640):
+                            if chunk:
+                                chunks.append(chunk)
+                        return b"".join(chunks)
+
+            try:
+                audio = await _get_cached_smartpbx_welcome_audio(cache_key, fetch_welcome_audio)
+                if not self._is_speaking:
+                    logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                    return
+                self._mark_smartpbx_turn_once("tts_first_chunk")
+                await self._send_media_audio(audio)
+                if self._is_speaking:
+                    await self._send_tts_done(
+                        sentence=sentence,
+                        turn_generation=turn_generation,
+                    )
+                else:
+                    logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+            except _ElevenLabsWelcomeHTTPStatus:
+                self._is_speaking = False
+            except _ElevenLabsWelcomeEmptyAudio:
+                self._log_tts_failure("elevenlabs", "empty_audio")
+                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
+                self._is_speaking = False
+            except httpx.TimeoutException:
+                self._log_tts_failure("elevenlabs", "timeout")
+                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_TIMEOUT)
+                self._is_speaking = False
+            except Exception:
+                self._log_tts_failure("elevenlabs", "exception")
+                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
+                self._is_speaking = False
+            return
 
         try:
             async with httpx.AsyncClient() as http:

@@ -142,6 +142,7 @@ class KavyaSmartPBXSession:
         self._wire_stt_fatal_signal(pipeline._stt)
         pipeline._stt.start()
         if self._welcome_text:
+            pipeline._smartpbx_welcome_audio_pending = self._welcome_text
             self._welcome_task = asyncio.create_task(
                 pipeline._speak(self._welcome_text)
             )
