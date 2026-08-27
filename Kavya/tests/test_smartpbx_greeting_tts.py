@@ -197,6 +197,7 @@ async def test_welcome_provider_failure_uses_existing_smartpbx_diagnostic(monkey
     import server
     from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
 
+    server._SMARTPBX_WELCOME_AUDIO_CACHE.clear()
     _configure_english_voice(monkeypatch, server)
     response = Response([])
     response.status_code = 503
