@@ -40,7 +40,7 @@ async def test_acknowledged_transfer_enters_pending_and_reports_privately_once()
         dashboard_calls.append(kwargs)
 
     coordinator = SmartPBXHandoverCoordinator(
-        call_control=_Control(result=type("Result", (), {"transferred": True})()),
+        call_control=_Control(result=type("Result", (), {"acknowledged": True})()),
         pipeline=_Pipeline(),
         call_sid="call-secret",
         caller_phone="+94771234567",
@@ -53,7 +53,7 @@ async def test_acknowledged_transfer_enters_pending_and_reports_privately_once()
     result = await coordinator.attempt("  ask\x00  manager  ")
 
     assert json.loads(result) == {
-        "status": "transferred", "confirmation": "provider_acknowledged"
+        "status": "transfer_requested", "confirmation": "provider_acknowledged"
     }
     assert coordinator.phase is HandoverPhase.ACKNOWLEDGED
     assert coordinator.transfer_pending is True
@@ -111,7 +111,7 @@ async def test_immediate_failure_keeps_pipeline_active_and_notifies_once_then_re
 
     pipeline = _Pipeline()
     coordinator = SmartPBXHandoverCoordinator(
-        call_control=_Control(result=type("Result", (), {"transferred": False})()),
+        call_control=_Control(result=type("Result", (), {"acknowledged": False})()),
         pipeline=pipeline,
         call_sid="safe-call",
         caller_phone="0771234567",
@@ -177,8 +177,8 @@ def _session_factory(outcome):
 
 
 @pytest.mark.asyncio
-async def test_dialog_acknowledgement_transfers_and_never_whatsapps_the_manager():
-    """A provider-approved transfer still sends one WhatsApp heads-up."""
+async def test_dialog_acknowledgement_requests_transfer_and_notifies_the_manager():
+    """A provider acknowledgement still sends one neutral WhatsApp heads-up."""
     acknowledged = type("Result", (), {"content": [type("T", (), {"text": "ok"})()]})()
     factory, calls = _session_factory(acknowledged)
     notifications = []
@@ -197,12 +197,12 @@ async def test_dialog_acknowledgement_transfers_and_never_whatsapps_the_manager(
 
     assert calls == [(
         "transfer_call",
-        {"destination number": "+94711754668", "tier": "BYPASS"},
+        {"destination number": "94711754668", "tier": "BYPASS"},
     )]
-    assert result == {"status": "transferred", "confirmation": "provider_acknowledged"}
+    assert result == {"status": "transfer_requested", "confirmation": "provider_acknowledged"}
     assert coordinator.transfer_pending is True
     assert len(notifications) == 1
-    assert notifications[0]["outcome"] == "transfer_succeeded"
+    assert notifications[0]["outcome"] == "transfer_acknowledged"
 
 
 @pytest.mark.asyncio
@@ -239,7 +239,7 @@ async def test_rejected_request_still_falls_back_to_the_manager_whatsapp():
 
 @pytest.mark.asyncio
 async def test_concurrent_attempts_dispatch_and_notify_only_once_per_attempt():
-    control = _Control(result=type("Result", (), {"transferred": False})())
+    control = _Control(result=type("Result", (), {"acknowledged": False})())
     notifications = []
 
     async def notify(**kwargs):
@@ -261,25 +261,25 @@ async def test_concurrent_attempts_dispatch_and_notify_only_once_per_attempt():
 
 
 @pytest.mark.asyncio
-async def test_transfer_succeeded_and_failed_outcomes_are_in_payload():
+async def test_transfer_acknowledged_and_failed_outcomes_are_in_payload():
     notifications = []
 
     async def notify(**kwargs):
         notifications.append((kwargs["call_sid"], kwargs.get("outcome")))
         return {"ok": True}
 
-    success = SmartPBXHandoverCoordinator(
-        call_control=_Control(result=type("Result", (), {"transferred": True})()),
-        pipeline=_Pipeline(), call_sid="success-call", caller_phone="0771234567", transcript=lambda: [],
+    acknowledged = SmartPBXHandoverCoordinator(
+        call_control=_Control(result=type("Result", (), {"acknowledged": True})()),
+        pipeline=_Pipeline(), call_sid="acknowledged-call", caller_phone="0771234567", transcript=lambda: [],
         dashboard_sender=None, notification_sender=notify, human_agent_whatsapp="0770000000",
     )
     failure = SmartPBXHandoverCoordinator(
-        call_control=_Control(result=type("Result", (), {"transferred": False})()),
+        call_control=_Control(result=type("Result", (), {"acknowledged": False})()),
         pipeline=_Pipeline(), call_sid="failed-call", caller_phone="0771234567", transcript=lambda: [],
         dashboard_sender=None, notification_sender=notify, human_agent_whatsapp="0770000000",
     )
 
-    await success.attempt("first")
+    await acknowledged.attempt("first")
     await failure.attempt("second")
 
-    assert notifications == [("success-call", "transfer_succeeded"), ("failed-call", "transfer_failed")]
+    assert notifications == [("acknowledged-call", "transfer_acknowledged"), ("failed-call", "transfer_failed")]

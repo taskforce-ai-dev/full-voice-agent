@@ -101,7 +101,7 @@ async def test_real_acknowledged_transfer_stays_open_until_dialog_stop_and_posts
 
     async def transfer_call(_self, target: str):
         transfer_calls.append(target)
-        return SimpleNamespace(transferred=True)
+        return SimpleNamespace(acknowledged=True)
 
     async def dashboard_ack(**_kwargs) -> None:
         return None
@@ -164,7 +164,7 @@ async def test_real_acknowledged_transfer_stays_open_until_dialog_stop_and_posts
 
     result = json.loads(await coordinator.attempt("Guest requested a person."))
     assert result == {
-        "status": "transferred",
+        "status": "transfer_requested",
         "confirmation": "provider_acknowledged",
     }
     assert transfer_calls == ["human_support"]

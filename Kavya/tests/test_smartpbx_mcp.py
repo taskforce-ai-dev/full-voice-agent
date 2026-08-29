@@ -185,7 +185,7 @@ async def test_transfer_uses_other_leg_call_id_and_exactly_one_configured_accoun
 
     result = await control.transfer_call("human_support")
 
-    assert result.transferred is True
+    assert result.acknowledged is True
     assert fake_mcp.calls[0]["headers"] == {
         "X-API-Key": "api-key-marker",
         "account_id": "account-1",
@@ -196,7 +196,7 @@ async def test_transfer_uses_other_leg_call_id_and_exactly_one_configured_accoun
     assert session.events == [
         ("initialize",),
         ("call_tool", "transfer_call", {
-            "destination number": "+94110000000",
+            "destination number": "94110000000",
             "tier": "BYPASS",
         }),
     ]
@@ -211,7 +211,7 @@ async def test_retryable_initial_connection_failure_retries_once_only():
 
     result = await control.transfer_call("human_support")
 
-    assert result.transferred is True
+    assert result.acknowledged is True
     assert len(fake_mcp.calls) == 2
 
 
@@ -225,7 +225,7 @@ async def test_nested_lifecycle_connect_failure_retries_before_dispatch_only():
 
     result = await control.transfer_call("human_support")
 
-    assert result.transferred is True
+    assert result.acknowledged is True
     assert len(fake_mcp.calls) == 2
 
 
@@ -272,7 +272,7 @@ async def test_nested_predispatch_retry_requires_every_leaf_to_be_retryable(
 
     assert len(fake_mcp.calls) == expected_calls
     if expected_failure is None:
-        assert result.transferred is True
+        assert result.acknowledged is True
     else:
         assert result == smartpbx_mcp.TransferResult(False, expected_failure)
 
@@ -421,10 +421,10 @@ async def test_transfer_sends_the_exact_current_dialog_arguments_without_aliases
         "human_support"
     )
 
-    assert result.transferred is True
+    assert result.acknowledged is True
     name, arguments = fake_mcp.sessions[0].events[1][1], fake_mcp.sessions[0].events[1][2]
     assert name == "transfer_call"
-    assert arguments == {"destination number": "+94110000000", "tier": "BYPASS"}
+    assert arguments == {"destination number": "94110000000", "tier": "BYPASS"}
     assert "number" not in arguments
     assert "destination_number" not in arguments
     assert "tier_name" not in arguments
@@ -442,7 +442,7 @@ async def test_sip_destination_reaches_the_provider_as_the_whole_uri():
         "human_support"
     )
 
-    assert result.transferred is True
+    assert result.acknowledged is True
     assert fake_mcp.sessions[0].events[1][2] == {
         "destination number": "sip:support@pbx.example",
         "tier": "BYPASS",
@@ -450,20 +450,19 @@ async def test_sip_destination_reaches_the_provider_as_the_whole_uri():
 
 
 @pytest.mark.asyncio
-async def test_acknowledged_result_without_iserror_is_a_success_not_a_failure():
-    """Dialog omits `isError` when it accepts the call. That is an acknowledgement.
-
-    Treating the absent flag as malformed would fail closed on a transfer that
-    really happened -- guest handed to a human AND the manager WhatsApped.
-    """
+async def test_acknowledged_result_without_iserror_logs_acknowledged_not_success(caplog):
+    """Dialog omits `isError` when it accepts the transfer request."""
     fake_mcp = FakeSessionFactory(AcknowledgedResult())
 
-    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
-        "human_support"
-    )
+    with caplog.at_level(logging.INFO, logger="smartpbx_mcp"):
+        result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+            "human_support"
+        )
 
-    assert result == smartpbx_mcp.TransferResult(True, None)
+    assert result == smartpbx_mcp.TransferResult(acknowledged=True, failure=None)
     assert len(fake_mcp.calls) == 1
+    assert "smartpbx_mcp_result outcome=acknowledged attempt=1" in caplog.text
+    assert "outcome=success" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -597,12 +596,12 @@ async def test_protocol_failure_does_not_retry_and_stays_fail_closed():
         "human_support"
     )
 
-    assert result.transferred is False
+    assert result.acknowledged is False
     assert len(fake_mcp.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_exact_transfer_call_not_found_reopens_one_fresh_session_and_succeeds():
+async def test_exact_transfer_call_not_found_reopens_one_fresh_session_and_is_acknowledged():
     fake_mcp = FakeSessionFactory(
         AfterDispatch(FakeMcpError(
             -32602, "tool 'transfer_call' not found: tool not found"
@@ -614,7 +613,7 @@ async def test_exact_transfer_call_not_found_reopens_one_fresh_session_and_succe
         "human_support"
     )
 
-    assert result == smartpbx_mcp.TransferResult(True, None)
+    assert result == smartpbx_mcp.TransferResult(acknowledged=True, failure=None)
     assert len(fake_mcp.calls) == 2
     assert fake_mcp.sessions[0] is not fake_mcp.sessions[1]
 
@@ -676,7 +675,7 @@ async def test_casefolded_double_quoted_transfer_call_not_found_retries_once():
         "human_support"
     )
 
-    assert result == smartpbx_mcp.TransferResult(True, None)
+    assert result == smartpbx_mcp.TransferResult(acknowledged=True, failure=None)
     assert len(fake_mcp.calls) == 2
 
 
@@ -743,14 +742,14 @@ async def test_post_dispatch_cancellation_propagates_without_retry():
 
 
 @pytest.mark.asyncio
-async def test_success_never_dispatches_a_duplicate_transfer_attempt():
+async def test_acknowledgement_never_dispatches_a_duplicate_transfer_attempt():
     fake_mcp = FakeSessionFactory(AcknowledgedResult(), AcknowledgedResult())
 
     result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
         "human_support"
     )
 
-    assert result == smartpbx_mcp.TransferResult(True, None)
+    assert result == smartpbx_mcp.TransferResult(acknowledged=True, failure=None)
     assert len(fake_mcp.calls) == 1
 
 
@@ -851,7 +850,7 @@ async def test_tool_failure_is_not_retried_after_dispatch():
 
     result = await control.transfer_call("human_support")
 
-    assert result.transferred is False
+    assert result.acknowledged is False
     assert result.failure == "timeout"
     assert len(fake_mcp.calls) == 1
 
@@ -950,7 +949,7 @@ async def test_smartpbx_concurrent_transfer_tool_calls_dispatch_only_once():
     finally:
         smartpbx_transfer_context.reset(token)
 
-    assert results == ['{"status": "transferred"}', '{"status": "unavailable"}']
+    assert results == ['{"status": "transfer_requested"}', '{"status": "unavailable"}']
     assert len(fake_mcp.calls) == 1
 
 

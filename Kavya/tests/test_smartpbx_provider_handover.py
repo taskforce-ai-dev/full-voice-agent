@@ -249,7 +249,7 @@ async def test_acknowledged_transfer_stops_same_batch_without_followup_provider_
         executed.append(name)
         if name == "transfer_to_human":
             await pipeline.enter_transfer_pending()
-            return json.dumps({"status": "transferred"})
+            return json.dumps({"status": "transfer_requested"})
         raise AssertionError("a later same-batch tool must not run after transfer")
 
     monkeypatch.setattr(server, "execute_tool", execute)

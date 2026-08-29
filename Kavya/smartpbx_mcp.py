@@ -42,7 +42,7 @@ _TRANSFER_CALL_NOT_FOUND = re.compile(
 # Authenticated Dialog UCP MCP tools/list on 2026-08-27 requires these exact
 # `transfer_call` keys. The production handover is the documented `BYPASS`
 # funnel tier. Our operator config keeps the safer `tel:`/`sip:` URI allowlist
-# form, so the scheme is stripped only at this wire boundary.
+# form, so its scheme and plus sign are stripped only at this wire boundary.
 _TRANSFER_DESTINATION_ARGUMENT = "destination number"
 _TRANSFER_TIER_ARGUMENT = "tier"
 _TRANSFER_TIER_BYPASS = "BYPASS"
@@ -76,9 +76,9 @@ class MCPUnsupportedContentEncoding(httpx.TransportError):
 
 @dataclass(frozen=True)
 class TransferResult:
-    """A bounded, non-sensitive classification of a transfer attempt."""
+    """A bounded, non-sensitive classification of a transfer request."""
 
-    transferred: bool
+    acknowledged: bool
     failure: str | None = None
 
 
@@ -263,12 +263,15 @@ class DialogMCPCallControl:
                     continue
                 failure = _failure_class(cause)
                 _log_result(failure, attempt, _log_detail(cause))
-                return TransferResult(False, failure)
+                return TransferResult(acknowledged=False, failure=failure)
 
             outcome = _result_outcome(result)
             _log_result(outcome, attempt, _result_detail(outcome, result))
-            return TransferResult(outcome == "success", None if outcome == "success" else outcome)
-        return TransferResult(False, "request_failed")
+            return TransferResult(
+                acknowledged=outcome == "acknowledged",
+                failure=None if outcome == "acknowledged" else outcome,
+            )
+        return TransferResult(acknowledged=False, failure="request_failed")
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -374,12 +377,12 @@ async def _open_session(
 def _wire_destination(destination: str) -> str:
     """Render an allowlisted destination as the bare value Dialog's tool wants.
 
-    The current live schema takes `destination number`. A `tel:` URI is dialable
-    only once the scheme is dropped (`tel:+94711754668` -> `+94711754668`); a
-    `sip:` URI is already the routable form and is passed through whole.
+    The current live schema takes `destination number` as digits for PSTN. A
+    `tel:` URI is operator-only notation (`tel:+94711754668` ->
+    `94711754668`); a `sip:` URI is already routable and is passed through whole.
     """
     if destination.startswith(_TEL_SCHEME):
-        return destination[len(_TEL_SCHEME):]
+        return destination[len(_TEL_SCHEME):].lstrip("+")
     return destination
 
 
@@ -393,7 +396,7 @@ def _result_outcome(result: object) -> str:
         is_error = False
     if not isinstance(is_error, bool) or not isinstance(content, list) or not content:
         return "malformed_result"
-    return "tool_error" if is_error else "success"
+    return "tool_error" if is_error else "acknowledged"
 
 
 def _unwrap_lifecycle_error(error: BaseException) -> BaseException:
@@ -486,7 +489,7 @@ def _is_retryable_transfer_call_not_found(
 def _result_detail(outcome: str, result: object) -> str:
     """Surface why the provider refused, bounded and digit-masked.
 
-    Only for a refusal: a success needs no explanation, and the reply text is
+    Only for a refusal: an acknowledgement needs no explanation, and the reply text is
     provider-authored, so it is masked exactly like a protocol error message.
     """
     if outcome != "tool_error":

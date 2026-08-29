@@ -3812,7 +3812,7 @@ async def test_transfer_fences_pending_model_tts_before_canonical_delivery_barri
             timeline.append(f"mcp:{reason}")
             transfer_attempted.set()
             await pipeline.enter_transfer_pending()
-            return json.dumps({"status": "transferred"})
+            return json.dumps({"status": "transfer_requested"})
 
     async def tts(text, *, sentence=None, **_kwargs):
         if text == model_preamble:
@@ -3904,7 +3904,7 @@ async def test_pms_first_transfer_second_fences_active_speech_before_canonical_d
             timeline.append("mcp")
             transfer_attempted.set()
             await pipeline.enter_transfer_pending()
-            return json.dumps({"status": "transferred"})
+            return json.dumps({"status": "transfer_requested"})
 
     async def tts(text, **_kwargs):
         if text == active_text:
@@ -4202,7 +4202,7 @@ async def test_capture_then_transfer_keeps_capture_slot_without_late_completion(
             assert reason == "human please"
             timeline.append("mcp")
             await pipeline.enter_transfer_pending()
-            return json.dumps({"status": "transferred"})
+            return json.dumps({"status": "transfer_requested"})
 
     async def tts(text, **_kwargs):
         assert text == tools.TRANSFER_ANNOUNCEMENT_TEXT
