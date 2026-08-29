@@ -467,6 +467,73 @@ async def test_acknowledged_result_without_iserror_is_a_success_not_a_failure():
 
 
 @pytest.mark.asyncio
+async def test_dialog_wire_uses_digits_only_for_tel_allowlists_without_legacy_aliases():
+    """The provider accepts only digits for PSTN transfer destinations.
+
+    Operator configuration remains canonical ``tel:+...``; only the Dialog wire
+    boundary may remove the URI scheme and plus sign. The live schema permits no
+    legacy aliases, so this checks the whole outbound arguments object.
+    """
+    pstn_mcp = FakeSessionFactory(AcknowledgedResult())
+    pstn_control = DialogMCPCallControl(
+        settings(
+            SMARTPBX_TRANSFER_DESTINATIONS_JSON=(
+                '{"human_support":"tel:+94711754668"}'
+            )
+        ),
+        context(),
+        pstn_mcp,
+    )
+
+    await pstn_control.transfer_call("human_support")
+
+    pstn_arguments = pstn_mcp.sessions[0].events[1][2]
+    assert pstn_arguments == {
+        "destination number": "94711754668",
+        "tier": "BYPASS",
+    }
+    assert not {"number", "destination_number", "tier_name"} & pstn_arguments.keys()
+
+
+@pytest.mark.asyncio
+async def test_dialog_wire_preserves_sip_allowlist_uri():
+    """A SIP URI is already dialable and must reach Dialog unchanged."""
+    sip_mcp = FakeSessionFactory(AcknowledgedResult())
+    sip_control = DialogMCPCallControl(
+        settings(
+            SMARTPBX_TRANSFER_DESTINATIONS_JSON=(
+                '{"human_support":"sip:support@pbx.example"}'
+            )
+        ),
+        context(),
+        sip_mcp,
+    )
+
+    await sip_control.transfer_call("human_support")
+
+    assert sip_mcp.sessions[0].events[1][2] == {
+        "destination number": "sip:support@pbx.example",
+        "tier": "BYPASS",
+    }
+
+
+@pytest.mark.asyncio
+async def test_non_error_mcp_reply_is_acknowledged_not_transferred_or_connected():
+    """A "Transfer initiated" reply proves only that Dialog accepted the request."""
+    fake_mcp = FakeSessionFactory(AcknowledgedResult())
+
+    result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
+        "human_support"
+    )
+
+    assert result.acknowledged is True
+    assert not hasattr(result, "transferred")
+    assert not hasattr(result, "connected")
+    assert result.failure is None
+    assert len(fake_mcp.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_jsonrpc_error_reply_is_a_protocol_failure_never_transport():
     """The exact 05:25 UTC post-dispatch failure must remain non-retryable."""
     fake_mcp = FakeSessionFactory(

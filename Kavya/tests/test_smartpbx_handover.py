@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -61,6 +62,43 @@ async def test_acknowledged_transfer_enters_pending_and_reports_privately_once()
     assert dashboard_calls[0]["privacy_safe"] is True
     assert dashboard_calls[0]["transfer_target"] == "human_support"
     assert dashboard_calls[0]["transfer_confirmation"] == "provider_acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_transfer_is_requested_not_connected_and_notifies_neutrally():
+    """An MCP acknowledgement never asserts that a human answered the call."""
+    notifications = []
+
+    async def notify(**kwargs):
+        notifications.append(kwargs)
+        return {"ok": True}
+
+    pipeline = _Pipeline()
+    coordinator = SmartPBXHandoverCoordinator(
+        call_control=_Control(result=SimpleNamespace(acknowledged=True, failure=None)),
+        pipeline=pipeline,
+        call_sid="safe-call",
+        caller_phone="0771234567",
+        transcript=lambda: [],
+        dashboard_sender=None,
+        notification_sender=notify,
+        human_agent_whatsapp="0770000000",
+    )
+
+    result = json.loads(await coordinator.attempt("guest asked for a manager"))
+
+    assert result == {
+        "status": "transfer_requested",
+        "confirmation": "provider_acknowledged",
+    }
+    assert coordinator.phase is HandoverPhase.ACKNOWLEDGED
+    assert coordinator.transfer_pending is True
+    assert pipeline.entered == 1
+    assert len(notifications) == 1
+    assert notifications[0]["outcome"] == "transfer_acknowledged"
+    assert "transfer_succeeded" not in notifications[0].values()
+    assert notifications[0]["call_summary"].startswith("Live transfer was requested.")
+    assert "answered" not in notifications[0]["call_summary"].lower()
 
 
 @pytest.mark.asyncio
