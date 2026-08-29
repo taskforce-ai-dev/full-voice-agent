@@ -93,16 +93,16 @@ class SmartPBXHandoverCoordinator:
                 raise
             except Exception:
                 result = None
-            if getattr(result, "transferred", False):
+            if getattr(result, "acknowledged", False):
                 self._phase = HandoverPhase.ACKNOWLEDGED
-                self._result = json.dumps({"status": "transferred", "confirmation": "provider_acknowledged"})
+                self._result = json.dumps({"status": "transfer_requested", "confirmation": "provider_acknowledged"})
                 try:
                     await self._enter_pending()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     pass
-                await self._deliver_notification(outcome="transfer_succeeded")
+                await self._deliver_notification(outcome="transfer_acknowledged")
                 await self._send_dashboard()
                 return self._result
             self._phase = HandoverPhase.IMMEDIATE_FAILED
@@ -186,8 +186,8 @@ class SmartPBXHandoverCoordinator:
         self._notification_attempts += 1
         self._notification_state = "failed"
         summary = "Live transfer could not be started; please call the guest back. " + self._reason
-        if outcome == "transfer_succeeded":
-            summary = "Live transfer was started; please call the guest back if needed. " + self._reason
+        if outcome == "transfer_acknowledged":
+            summary = "Live transfer was requested. " + self._reason
         tail = bound_transcript_tail(self._transcript())
         if tail:
             summary += "\n\nLast exchanges:\n" + tail

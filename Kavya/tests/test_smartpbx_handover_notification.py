@@ -11,7 +11,7 @@ from smartpbx_handover import SmartPBXHandoverCoordinator
 
 class _Control:
     async def transfer_call(self, _target):
-        return type("Result", (), {"transferred": False})()
+        return type("Result", (), {"acknowledged": False})()
 
 
 class _Pipeline:
@@ -59,7 +59,7 @@ async def test_unnotifiable_caller_emits_a_diagnostic_instead_of_going_silent():
 
     class Control:
         async def transfer_call(self, _target):
-            return type("R", (), {"transferred": False})()
+            return type("R", (), {"acknowledged": False})()
 
     async def notify(**_):
         raise AssertionError("an unnotifiable number must not reach the sender")
@@ -97,7 +97,7 @@ async def test_a_notifiable_caller_emits_no_handover_diagnostic():
 
     class Control:
         async def transfer_call(self, _target):
-            return type("R", (), {"transferred": False})()
+            return type("R", (), {"acknowledged": False})()
 
     async def notify(**_):
         return {"ok": True}

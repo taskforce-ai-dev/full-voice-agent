@@ -26,7 +26,7 @@ class _Control:
 
     async def transfer_call(self, _target):
         self.calls += 1
-        return type("Result", (), {"transferred": True})()
+        return type("Result", (), {"acknowledged": True})()
 
 
 def _context():
@@ -86,7 +86,7 @@ async def test_cancelled_pending_entry_never_redispatches_acknowledged_mcp_trans
     result = json.loads(await coordinator.attempt("again"))
 
     assert control.calls == 1
-    assert result == {"status": "transferred", "confirmation": "provider_acknowledged"}
+    assert result == {"status": "transfer_requested", "confirmation": "provider_acknowledged"}
 
 
 @pytest.mark.asyncio
@@ -108,7 +108,7 @@ async def test_cancelled_dashboard_acknowledgement_never_redispatches_mcp():
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert json.loads(await coordinator.attempt("again"))["status"] == "transferred"
+    assert json.loads(await coordinator.attempt("again"))["status"] == "transfer_requested"
     assert control.calls == 1
 
 

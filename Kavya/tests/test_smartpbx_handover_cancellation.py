@@ -9,7 +9,7 @@ class Control:
     async def transfer_call(self, _):
         self.calls += 1
         if self.gate: await self.gate.wait()
-        return type("R", (), {"transferred": self.success})()
+        return type("R", (), {"acknowledged": self.success})()
 class Pipeline:
     async def enter_transfer_pending(self): pass
 

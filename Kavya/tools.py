@@ -797,9 +797,9 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
                 except Exception:
                     logger.info("smartpbx_tool event=transfer outcome=unavailable")
                     return json.dumps({"status": "unavailable"})
-                if getattr(transfer, "transferred", False):
-                    logger.info("smartpbx_tool event=transfer outcome=transferred")
-                    return json.dumps({"status": "transferred"})
+                if getattr(transfer, "acknowledged", False):
+                    logger.info("smartpbx_tool event=transfer outcome=acknowledged")
+                    return json.dumps({"status": "transfer_requested"})
                 logger.info("smartpbx_tool event=transfer outcome=unavailable")
                 return json.dumps({"status": "unavailable"})
         reason = (tool_input.get("reason") or "").strip() or "Caller requested human assistance."
