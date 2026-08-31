@@ -3236,7 +3236,7 @@ def _get_gemini_tts_client():
     return _gemini_tts_client
 
 
-async def _iter_gemini_tts_audio_deltas(stream: Any) -> AsyncIterator[str]:
+async def _iter_gemini_tts_audio_deltas(stream: Any) -> AsyncIterator[tuple[str, Any]]:
     """Yield base64 audio payloads from the documented Interactions SSE shape."""
     async for event in stream:
         if getattr(event, "event_type", None) != "step.delta":
@@ -3246,7 +3246,7 @@ async def _iter_gemini_tts_audio_deltas(stream: Any) -> AsyncIterator[str]:
             continue
         data = getattr(delta, "data", None)
         if isinstance(data, str) and data:
-            yield data
+            yield data, delta
 
 
 def _history_to_gemini(history: list[dict]) -> list[dict]:
@@ -5509,6 +5509,23 @@ class MediaStreamSession:
         """Use the runner's current fence after a filler-only clear."""
         runner = _smartpbx_runner_context.get()
         return fallback if runner is None else runner.speak_generation
+
+    def _owns_smartpbx_tts_delivery(self, expected_generation: int) -> bool:
+        """Fence Sinhala SmartPBX audio without changing general runner semantics."""
+        if not self._is_smartpbx_session():
+            return True
+        if (
+            self._smartpbx_torn_down
+            or self._speak_generation != expected_generation
+        ):
+            return False
+        runner = _smartpbx_runner_context.get()
+        if runner is None or runner.turn_id is None:
+            return True
+        return (
+            runner.turn_id == self._active_smartpbx_turn_id
+            and runner.speak_generation == expected_generation
+        )
 
     def _current_smartpbx_runner_owns_shared_state(
         self, *, tool_executed: bool = False
@@ -9354,6 +9371,12 @@ class MediaStreamSession:
                 stream=True,
                 response_modalities=["AUDIO"],
                 response_mime_type="audio/l16",
+                response_format={
+                    "type": "audio",
+                    "mime_type": "audio/l16",
+                    "sample_rate": 24000,
+                    "delivery": "inline",
+                },
                 generation_config={
                     "speech_config": [{
                         "language": "si-LK",
@@ -9364,11 +9387,11 @@ class MediaStreamSession:
                 timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
             )
 
-            async for audio_b64 in _iter_gemini_tts_audio_deltas(stream):
+            async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
                 if (
                     not self._is_speaking
                     or self._speak_generation != expected_generation
-                    or not self._current_smartpbx_runner_owns_shared_state()
+                    or not self._owns_smartpbx_tts_delivery(expected_generation)
                     or (
                         turn_generation is not None
                         and turn_generation >= 0
@@ -9377,6 +9400,25 @@ class MediaStreamSession:
                 ):
                     cancelled = True
                     break
+                if (
+                    (
+                        getattr(audio_delta, "mime_type", None) is not None
+                        and getattr(audio_delta, "mime_type") != "audio/l16"
+                    )
+                    or (
+                        getattr(audio_delta, "channels", None) is not None
+                        and getattr(audio_delta, "channels") != 1
+                    )
+                    or (
+                        getattr(audio_delta, "sample_rate", None) is not None
+                        and getattr(audio_delta, "sample_rate") != 24000
+                    )
+                ):
+                    self._log_tts_failure("gemini", "invalid_audio_metadata")
+                    self._emit_smartpbx_tts_diagnostic(
+                        DiagnosticFailureClass.TTS_EXCEPTION
+                    )
+                    return
                 try:
                     chunk = base64.b64decode(audio_b64, validate=True)
                 except (binascii.Error, ValueError, TypeError):
@@ -9404,7 +9446,7 @@ class MediaStreamSession:
                     if (
                         not self._is_speaking
                         or self._speak_generation != expected_generation
-                        or not self._current_smartpbx_runner_owns_shared_state()
+                        or not self._owns_smartpbx_tts_delivery(expected_generation)
                     ):
                         cancelled = True
                         break
@@ -9415,17 +9457,27 @@ class MediaStreamSession:
                 if cancelled:
                     break
 
+            if pcm_tail and not cancelled:
+                self._log_tts_failure("gemini", "malformed_audio")
+                self._emit_smartpbx_tts_diagnostic(
+                    DiagnosticFailureClass.TTS_EXCEPTION
+                )
+                return
+
             if (
                 not cancelled
                 and self._is_speaking
                 and self._speak_generation == expected_generation
-                and self._current_smartpbx_runner_owns_shared_state()
+                and self._owns_smartpbx_tts_delivery(expected_generation)
                 and mulaw_buf
             ):
+                mulaw_buf += b"\xff" * (640 - len(mulaw_buf))
                 self._mark_smartpbx_turn_once("tts_first_chunk")
                 await self._send_media_audio(mulaw_buf)
                 audio_emitted = True
-            elif not cancelled and self._speak_generation != expected_generation:
+            elif not cancelled and not self._owns_smartpbx_tts_delivery(
+                expected_generation
+            ):
                 cancelled = True
 
             if (
@@ -9433,7 +9485,7 @@ class MediaStreamSession:
                 and not cancelled
                 and self._is_speaking
                 and self._speak_generation == expected_generation
-                and self._current_smartpbx_runner_owns_shared_state()
+                and self._owns_smartpbx_tts_delivery(expected_generation)
             ):
                 await self._send_tts_done(
                     sentence=sentence,
@@ -9445,6 +9497,16 @@ class MediaStreamSession:
                     DiagnosticFailureClass.TTS_EXCEPTION
                 )
 
+        except httpx.HTTPStatusError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if not isinstance(status, int) or isinstance(status, bool):
+                status = None
+            elif status < 100 or status > 599:
+                status = max(100, min(status, 599))
+            self._log_tts_failure("gemini", "http_status", status)
+            self._emit_smartpbx_tts_diagnostic(
+                DiagnosticFailureClass.TTS_HTTP_STATUS
+            )
         except TimeoutError:
             self._log_tts_failure("gemini", "timeout")
             self._emit_smartpbx_tts_diagnostic(
