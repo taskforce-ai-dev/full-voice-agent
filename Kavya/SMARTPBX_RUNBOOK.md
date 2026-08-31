@@ -121,6 +121,7 @@ SMARTPBX_MAX_OUTBOUND_FRAMES=512
 SMARTPBX_STARTUP_PREROLL_MS=0
 SMARTPBX_MAX_TOKENS=
 SMARTPBX_CLAUDE_MAX_TOKENS=
+SMARTPBX_SINHALA_CLAUDE_EFFORT=
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=
 SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS=
 SMARTPBX_LLM_STALL_TIMEOUT_SECONDS=
@@ -262,10 +263,12 @@ headers carry only the dedicated WSS token; they never carry MCP credentials.
 
 ## Direct SmartPBX English reliability timing (Phase B)
 
-Four env-tunable knobs govern the direct SmartPBX English provider round only
-(OpenAI/Gemini/Claude, whichever `LLM_PROVIDER` selects). Twilio Media Streams
-(Arabic/Sinhala/Tamil) and the Twilio ConversationRelay path are unaffected —
-none of this timing applies outside a direct SmartPBX call.
+The shared timeout knobs govern direct SmartPBX English provider rounds and
+direct SmartPBX Sinhala Claude rounds. OpenAI/Gemini keep their existing
+English-only scope, and the initial filler remains an English-only policy.
+Twilio Media Streams (Arabic/Sinhala/Tamil) and the Twilio ConversationRelay
+path are unaffected — none of this timing applies outside a direct SmartPBX
+call.
 
 - `SMARTPBX_INITIAL_FILLER_DELAY_SECONDS` (default `1.5`, clamp `[0.5, 5.0]`) —
   the one cancellable neutral filler for the first provider round of a call.
@@ -305,8 +308,14 @@ SmartPBX English output budget and still governs the OpenAI and Gemini rounds
 unchanged. Claude is the one exception:
 
 - `SMARTPBX_CLAUDE_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) — the
-  Claude-only direct SmartPBX English output budget. Leave it blank to take
-  the default.
+  Claude-only direct SmartPBX English/Sinhala output budget. Leave it blank to
+  take the default.
+
+For direct Sinhala SmartPBX only, `SMARTPBX_SINHALA_CLAUDE_EFFORT` accepts
+`medium` (default) or `high`. Thinking remains enabled in both modes; set
+`high` for an immediate rollback to the deeper prior effort level. Missing,
+blank, or whitespace values take the `medium` default; a nonblank invalid or
+unknown value resolves safely to `high`.
 
 **Canary model: `claude-sonnet-5`.** This is what the SmartPBX canary and prod
 run, and it is what `CLAUDE_MODEL` in the `.env.smartpbx` template above is set
