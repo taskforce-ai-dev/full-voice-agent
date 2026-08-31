@@ -1145,6 +1145,7 @@ async def test_session_ends_the_call_when_stt_gives_up():
         diagnostic_sink=lambda stage, outcome, failure: emitted.append((stage, outcome, failure)),
     )
     await session.start()
+    await session.feed_dtmf("1")
 
     assert callable(stt.on_fatal), "the session must wire the STT fatal signal"
     stt.on_fatal()  # invoked from the STT worker thread in production

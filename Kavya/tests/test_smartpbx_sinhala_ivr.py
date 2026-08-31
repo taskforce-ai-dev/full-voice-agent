@@ -127,8 +127,13 @@ async def test_digit_one_and_timeout_start_english_once(monkeypatch):
     timeout_session, timeout_pipeline, timeout_stt = make_session()
     monkeypatch.setattr(server, "SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS", 0)
     await timeout_session.start()
-    await asyncio.sleep(0)
+    await asyncio.wait_for(_wait_for_stt_start(timeout_stt), timeout=1)
     assert (timeout_pipeline.lang, timeout_stt.starts) == ("en", 1)
+
+
+async def _wait_for_stt_start(stt: RecordingStt) -> None:
+    while stt.starts != 1:
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
