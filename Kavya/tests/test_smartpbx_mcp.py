@@ -196,7 +196,7 @@ async def test_transfer_uses_other_leg_call_id_and_exactly_one_configured_accoun
     assert session.events == [
         ("initialize",),
         ("call_tool", "transfer_call", {
-            "destination number": "94110000000",
+            "destination number": "tel:+94110000000",
             "tier": "BYPASS",
         }),
     ]
@@ -461,13 +461,8 @@ async def test_acknowledged_result_without_iserror_logs_acknowledged_not_success
 
 
 @pytest.mark.asyncio
-async def test_dialog_wire_uses_digits_only_for_tel_allowlists_without_legacy_aliases():
-    """The provider accepts only digits for PSTN transfer destinations.
-
-    Operator configuration remains canonical ``tel:+...``; only the Dialog wire
-    boundary may remove the URI scheme and plus sign. The live schema permits no
-    legacy aliases, so this checks the whole outbound arguments object.
-    """
+async def test_dialog_wire_preserves_canonical_tel_allowlists_without_legacy_aliases():
+    """Dialog receives the configured canonical TEL allowlist value unchanged."""
     pstn_mcp = FakeSessionFactory(AcknowledgedResult())
     pstn_control = DialogMCPCallControl(
         settings(
@@ -483,7 +478,7 @@ async def test_dialog_wire_uses_digits_only_for_tel_allowlists_without_legacy_al
 
     pstn_arguments = pstn_mcp.sessions[0].events[1][2]
     assert pstn_arguments == {
-        "destination number": "94711754668",
+        "destination number": "tel:+94711754668",
         "tier": "BYPASS",
     }
     assert not {"number", "destination_number", "tier_name"} & pstn_arguments.keys()

@@ -197,7 +197,7 @@ async def test_dialog_acknowledgement_requests_transfer_and_notifies_the_manager
 
     assert calls == [(
         "transfer_call",
-        {"destination number": "94711754668", "tier": "BYPASS"},
+        {"destination number": "tel:+94711754668", "tier": "BYPASS"},
     )]
     assert result == {"status": "transfer_requested", "confirmation": "provider_acknowledged"}
     assert coordinator.transfer_pending is True
