@@ -244,7 +244,7 @@ async def test_sustained_pre_audio_stt_cancels_sinhala_synthesis_and_admits_once
 
     session, _transport = _direct_sinhala(server)
     admitted: list[str] = []
-    ticks = iter((10.0, 10.3, 10.3))
+    ticks = iter((10.0, 10.3))
 
     async def _record(text):
         admitted.append(text)
@@ -252,7 +252,7 @@ async def test_sustained_pre_audio_stt_cancels_sinhala_synthesis_and_admits_once
     async def _no_clear(*_args, **_kwargs):
         return 0
 
-    monkeypatch.setattr(server.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(ticks, 10.3))
     monkeypatch.setattr(session, "_accumulate_transcript", _record)
     monkeypatch.setattr(session, "_clear_media_audio", _no_clear)
     session._tts_synthesis_in_flight = True
@@ -306,7 +306,7 @@ async def test_pre_audio_callbacks_keep_latest_cumulative_hypothesis_once(monkey
     monkeypatch.setattr(server, "SMARTPBX_PRE_AUDIO_STT_MIN_SECONDS", 0.0)
 
     session._on_stt_interim("I need")
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
     session._on_stt_result("I need a room")
     await asyncio.sleep(0.02)
 
