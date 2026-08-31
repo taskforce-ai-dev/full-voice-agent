@@ -1761,7 +1761,7 @@ SMARTPBX_SINHALA_GEMINI_TTS_MODEL = os.getenv(
     "SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"
 )
 SMARTPBX_SINHALA_GEMINI_TTS_VOICE = os.getenv(
-    "SMARTPBX_SINHALA_GEMINI_TTS_VOICE", "Kore"
+    "SMARTPBX_SINHALA_GEMINI_TTS_VOICE", "Vindemiatrix"
 )
 SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS = _parse_endpointing_seconds(
     os.environ,
