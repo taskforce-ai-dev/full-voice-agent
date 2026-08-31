@@ -13,8 +13,8 @@ Add an initial language-selection state to the Dialog SmartPBX session only:
 The selected-language session uses the existing Claude LLM and the existing STT
 provider configuration.  Sinhala speech output uses Gemini
 `gemini-3.1-flash-tts-preview`, streamed as 24 kHz PCM and converted through
-the existing 24 kHz PCM to 8 kHz G.711 mu-law framing path.  The existing
-OpenAI Sinhala TTS is the automatic fallback.
+the existing 24 kHz PCM to 8 kHz G.711 mu-law framing path.  It does not fall
+back to OpenAI or any other TTS provider.
 
 This is deliberately SmartPBX-only.  The Twilio IVR, Twilio routes, Twilio
 codec behaviour, English voice path, Claude model, and STT selection are out
@@ -37,9 +37,9 @@ delivery contracts rather than create a second transport path.
 
 1. **Recommended: a SmartPBX-only selection state plus streamed Gemini TTS.**
    The session consumes exactly the initial selection digit, then starts the
-   normal pipeline in the selected language.  Gemini audio is streamed and
-   falls back to OpenAI TTS.  It keeps the existing English path unchanged,
-   minimises first-audio delay, and provides a safe rollback switch.
+   normal pipeline in the selected language.  Gemini audio is streamed without
+   a cross-provider fallback.  It keeps the existing English path unchanged
+   and minimises first-audio delay.
 
 2. **Batch Gemini synthesis.**  This would wait for an entire response before
    sending audio.  It is simpler at the HTTP boundary but would discard the
@@ -85,9 +85,9 @@ The implementation will add one narrow Sinhala TTS adapter beside
   conversion, mu-law conversion, 640-byte SmartPBX media frames, generation
   fencing, cancellation, and `_send_tts_done` semantics.
 - Treat a missing API key, unavailable client, non-audio-only response, invalid
-  audio, timeout, HTTP failure, or exception as a failed Gemini attempt.  If
-  speech has not begun, invoke the existing OpenAI Sinhala TTS for the same
-  sentence.  Do not mix two providers in one audible sentence.
+  audio, timeout, HTTP failure, or exception as a failed Gemini attempt.  End
+  that sentence through the normal TTS failure path; do not retry it through
+  OpenAI or any other provider, and do not mix providers in one call.
 - Do not log prompt text, raw audio, API keys, caller data, or model response
   bodies.  A privacy-safe SmartPBX diagnostic may record provider and a closed
   failure class only.
@@ -100,19 +100,16 @@ explicitly to that allowlist.
 
 ## Configuration and rollback
 
-Use SmartPBX-specific configuration so this change cannot alter Twilio:
+Use SmartPBX-specific Gemini configuration so this change cannot alter Twilio:
 
-- `SMARTPBX_SINHALA_TTS_PROVIDER=gemini|openai`, defaulting to `openai` in
-  source for safe compatibility.
 - `SMARTPBX_SINHALA_GEMINI_TTS_MODEL`, defaulting to
-  `gemini-3.1-flash-tts-preview` when Gemini is selected.
+  `gemini-3.1-flash-tts-preview`.
 - A bounded Gemini TTS timeout and a configured Gemini voice, with safe
   source defaults documented in `.env.example` without secrets.
 
-The first production canary sets the provider to `gemini` only in the
-root-owned SmartPBX environment.  If it is not acceptable, set the provider
-back to `openai` and recreate only `kavya-smartpbx`; this is a configuration
-rollback, not an image rollback.  English is unaffected either way.
+The first production canary uses Gemini only from the root-owned SmartPBX
+environment.  If it is not acceptable, roll back to the prior reviewed image;
+there is no provider-switch rollback.  English is unaffected either way.
 
 ## Test and acceptance matrix
 
@@ -127,8 +124,8 @@ The implementation is test-first and must prove:
 - English SmartPBX remains on its current TTS path.
 - Gemini PCM chunks preserve alignment/frame order, obey cancellation and
   generation fencing, and complete delivery exactly once.
-- Each Gemini failure class falls back to OpenAI before audible output, while
-  no fallback occurs after Gemini audio has started.
+- Each Gemini failure class has one privacy-safe, closed-class diagnostic and
+  never invokes OpenAI or another TTS provider.
 - Telemetry contains no transcript, phone number, audio, or secret.
 
 CI will run the complete Kavya suite.  Local validation is limited to syntax
