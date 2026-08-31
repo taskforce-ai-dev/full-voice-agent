@@ -20,6 +20,25 @@ def read_text(name: str) -> str:
     return (PROJECT_ROOT / name).read_text(encoding="utf-8")
 
 
+def active_env_assignments(text: str, name: str) -> list[str]:
+    """Return active values for one dotenv key, ignoring blank/comment lines."""
+    values = []
+    for line in text.splitlines():
+        active = line.strip()
+        if not active or active.startswith("#") or "=" not in active:
+            continue
+        key, value = active.split("=", 1)
+        if key == name:
+            values.append(value)
+    return values
+
+
+def assert_exactly_one_blank_env_assignment(text: str, name: str) -> None:
+    assert active_env_assignments(text, name) == [""], (
+        f"{name} must appear exactly once as an active blank assignment"
+    )
+
+
 def test_kavya_smartpbx_is_loopback_only_and_uses_its_own_port():
     compose = yaml.safe_load(read_text("docker-compose.yml"))
     service = compose["services"]["kavya-smartpbx"]
@@ -3117,3 +3136,86 @@ def test_kavya_generic_rejection_and_reviewed_image_gates_remain_intact():
     assert "expected_sha" in publisher
     assert "fresh successful read-only probe" in publisher
     assert "org.opencontainers.image.revision" in publisher
+
+
+def test_sinhala_smartpbx_settings_are_explicit_and_secret_safe():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    environment = compose["services"]["kavya-smartpbx"]["environment"]
+
+    assert environment["SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS"] == (
+        "${SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS:-8.0}"
+    )
+    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_MODEL"] == (
+        "${SMARTPBX_SINHALA_GEMINI_TTS_MODEL:-gemini-3.1-flash-tts-preview}"
+    )
+    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_VOICE"] == (
+        "${SMARTPBX_SINHALA_GEMINI_TTS_VOICE:-Vindemiatrix}"
+    )
+    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS"] == (
+        "${SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS:-15.0}"
+    )
+    assert environment["GEMINI_API_KEY"] == "${GEMINI_API_KEY:-}"
+
+    example = read_text(".env.example")
+    for name, default in (
+        ("SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS", "8.0"),
+        ("SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
+        ("SMARTPBX_SINHALA_GEMINI_TTS_VOICE", "Vindemiatrix"),
+        ("SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS", "15.0"),
+    ):
+        assert re.search(rf"^{name}={re.escape(default)}$", example, re.MULTILINE)
+    assert_exactly_one_blank_env_assignment(example, "GEMINI_API_KEY")
+
+
+def test_gemini_key_assignment_contract_rejects_later_or_duplicate_nonblank_values():
+    # Comments are documentation, not dotenv assignments. Any later active
+    # value, including a duplicate, must violate the same helper used above.
+    commented_blank = "# GEMINI_API_KEY=ignored-comment\nGEMINI_API_KEY=\n"
+    assert_exactly_one_blank_env_assignment(commented_blank, "GEMINI_API_KEY")
+
+    for invalid in (
+        "GEMINI_API_KEY=nonblank-value\n",
+        "GEMINI_API_KEY=\nGEMINI_API_KEY=later-nonblank-value\n",
+    ):
+        with pytest.raises(AssertionError, match="exactly once as an active blank"):
+            assert_exactly_one_blank_env_assignment(invalid, "GEMINI_API_KEY")
+
+
+def test_sinhala_smartpbx_runbook_documents_the_closed_gemini_tts_contract():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    section = runbook.split("## SmartPBX Sinhala menu and Gemini TTS", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    normalized = re.sub(r"\s+", " ", section)
+    folded_normalized = normalized.casefold()
+
+    for required in (
+        "1 English, 2 Sinhala",
+        "timeout defaults to English",
+        "invalid selection replays once then defaults to English",
+        "Twilio behavior is unchanged",
+        "existing Claude LLM",
+        "existing STT selection",
+        "Only its TTS uses Gemini",
+        "gemini-3.1-flash-tts-preview",
+        "Vindemiatrix",
+        "There is deliberately no OpenAI, ElevenLabs, or Azure fallback for SmartPBX Sinhala TTS.",
+        "failure is closed/diagnostic",
+        "Gemini API key presence check",
+        "GEMINI_API_KEY` only when Sinhala is enabled",
+        "does not print the key",
+        "health/status checks",
+        "two-language canary call checklist",
+        "restore the prior image/config",
+    ):
+        assert required.casefold() in folded_normalized
+    assert "authenticated `/smartpbx/status`".casefold() in folded_normalized
+    assert "bounded provider/event/outcome diagnostics".casefold() in folded_normalized
+    assert "grep -Eq '^GEMINI_API_KEY=.+$' /opt/kavya/.env.smartpbx" in section
+
+    fallback_sentences = re.findall(r"[^.]*\bfallback\b[^.]*\.", normalized, re.IGNORECASE)
+    assert fallback_sentences
+    assert all(
+        re.search(r"\b(?:no|do not)\b", sentence, re.IGNORECASE)
+        for sentence in fallback_sentences
+    ), "the Sinhala section must not describe an enabled fallback"

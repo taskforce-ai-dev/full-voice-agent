@@ -576,9 +576,15 @@ async def test_default_smartpbx_welcome_reuses_kavya_english_greeting():
 
     await session.start()
     await asyncio.sleep(0)
+    menu_segments = list(pipeline.spoken)
+    assert menu_segments == ["For English, press 1.", "සිංහල සඳහා, 2 ඔබන්න."]
+    await session.feed_dtmf("1")
+    await asyncio.sleep(0)
     await session.finish(False)
 
-    assert pipeline.spoken == [server.LANGUAGE_CONFIGS["en"]["welcome_greeting"]]
+    assert pipeline.spoken == menu_segments + [
+        server.LANGUAGE_CONFIGS["en"]["welcome_greeting"]
+    ]
 
 
 @pytest.mark.asyncio
@@ -719,6 +725,7 @@ async def test_dialog_hangup_finishes_once_and_schedules_kavya_post_call():
 
     session, pipeline, stt, _ = make_session(post_call_processor=process_post_call)
     await session.start()
+    await session.feed_dtmf("1")
     await asyncio.gather(session.finish(True), session.finish(True))
     await asyncio.sleep(0)
 
@@ -740,6 +747,7 @@ async def test_dialog_audio_and_post_call_metadata_come_from_validated_context(c
     session, pipeline, stt, _ = make_session(post_call_processor=process_post_call)
     with caplog.at_level(logging.INFO):
         await session.start()
+        await session.feed_dtmf("1")
         await session.feed_audio(b"\x01\x02")
         await session.finish(True)
         await asyncio.sleep(0)
@@ -1108,6 +1116,7 @@ async def test_finish_cancels_and_awaits_inflight_welcome_speech():
         post_call_processor=process_post_call, pipeline=HangingPipeline()
     )
     await session.start()
+    await session.feed_dtmf("1")
     await entered.wait()
     try:
         await session.finish(False)
@@ -1289,10 +1298,18 @@ async def test_smartpbx_session_installs_default_noop_sink_on_pipeline_before_we
 
     session, pipeline, _, _ = make_session(post_call_processor=process_post_call)
     await session.start()
+    await asyncio.sleep(0)
+    assert pipeline.spoken == ["For English, press 1.", "සිංහල සඳහා, 2 ඔබන්න."]
+    await session.feed_dtmf("1")
+    await asyncio.sleep(0)
     try:
         sink = getattr(pipeline, "_smartpbx_diagnostic_sink", None)
         assert callable(sink)
-        assert pipeline.spoken == ["Welcome to Hatton Hills."]
+        assert pipeline.spoken == [
+            "For English, press 1.",
+            "සිංහල සඳහා, 2 ඔබන්න.",
+            "Welcome to Hatton Hills.",
+        ]
     finally:
         await session.finish(False)
 
@@ -1313,10 +1330,19 @@ async def test_default_diagnostic_sink_is_callable_before_welcome_speak():
     pipeline = SinkObservingPipeline()
     session, _, _, _ = make_session(post_call_processor=process_post_call, pipeline=pipeline)
     await session.start()
+    await asyncio.sleep(0)
+    await session.feed_dtmf("1")
+    await asyncio.sleep(0)
     try:
-        assert pipeline.spoken == ["Welcome to Hatton Hills."]
-        assert len(pipeline.sinks_seen_at_speak) == 1
-        assert callable(pipeline.sinks_seen_at_speak[0])
+        assert pipeline.spoken == [
+            "For English, press 1.",
+            "සිංහල සඳහා, 2 ඔබන්න.",
+            "Welcome to Hatton Hills.",
+        ]
+        assert len(pipeline.sinks_seen_at_speak) == 3
+        sink = getattr(pipeline, "_smartpbx_diagnostic_sink", None)
+        assert callable(sink)
+        assert pipeline.sinks_seen_at_speak == [sink] * 3
     finally:
         await session.finish(False)
 
@@ -1336,8 +1362,11 @@ async def test_explicit_diagnostic_sink_reaches_pipeline_before_welcome_by_ident
         llm_provider="claude", model="test-model", diagnostic_sink=explicit_sink,
     )
     await session.start()
+    await asyncio.sleep(0)
+    await session.feed_dtmf("1")
+    await asyncio.sleep(0)
     try:
-        assert pipeline.sinks_seen_at_speak == [explicit_sink]
+        assert pipeline.sinks_seen_at_speak == [explicit_sink] * 3
     finally:
         await session.finish(False)
 
@@ -1367,8 +1396,11 @@ async def test_explicit_falsey_diagnostic_sink_is_preserved_and_used_before_welc
         llm_provider="claude", model="test-model", diagnostic_sink=explicit_sink,
     )
     await session.start()
+    await asyncio.sleep(0)
+    await session.feed_dtmf("1")
+    await asyncio.sleep(0)
     try:
-        assert pipeline.sinks_seen_at_speak == [explicit_sink]
+        assert pipeline.sinks_seen_at_speak == [explicit_sink] * 3
         pipeline._smartpbx_diagnostic_sink(
             DiagnosticStage.SESSION_START,
             DiagnosticOutcome.COMPLETED,
@@ -1599,6 +1631,7 @@ async def test_smartpbx_start_uses_exact_configured_stt_factory_with_private_eng
     )
 
     await session.start()
+    await session.feed_dtmf("1")
     try:
         assert session._stt_factory is configured_factory
         assert len(calls) == 1

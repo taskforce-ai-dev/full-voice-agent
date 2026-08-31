@@ -9,7 +9,7 @@ import os
 import secrets
 import time
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from smartpbx_diagnostics import SmartPBXDiagnosticSink
 from smartpbx_protocol import CallContext
@@ -56,6 +56,7 @@ class KavyaSmartPBXSession:
         self._stt_factory = stt_factory
         self._post_call_processor = post_call_processor
         self._welcome_text = welcome_text
+        self._welcome_uses_language_default = welcome_text is None
         self._llm_provider = llm_provider
         self._model = model
         self._diagnostic_sink = diagnostic_sink if diagnostic_sink is not None else _noop_diagnostic
@@ -68,6 +69,10 @@ class KavyaSmartPBXSession:
         self._start_task: asyncio.Task[None] | None = None
         self._finish_task: asyncio.Task[None] | None = None
         self._welcome_task: asyncio.Task[None] | None = None
+        self._selected_language: str | None = None
+        self._language_menu_task: asyncio.Task[None] | None = None
+        self._language_timeout_handle: asyncio.TimerHandle | None = None
+        self._invalid_language_selections = 0
         self._post_call_task: asyncio.Task[None] | None = None
         self._call_start_time = ""
         self._smartpbx_transfer_context: Any | None = None
@@ -102,6 +107,23 @@ class KavyaSmartPBXSession:
         if getattr(pipeline, "_stt", None) is not None:
             pipeline._stt.feed(bytes(payload))
 
+    async def feed_dtmf(self, digit: str) -> bool:
+        """Handle the session-owned language menu before normal DTMF collection."""
+        if self._selected_language is None:
+            if digit == "1":
+                await self._activate_language("en", "digit")
+                return True
+            if digit == "2":
+                await self._activate_language("si", "digit")
+                return True
+            self._invalid_language_selections += 1
+            if self._invalid_language_selections == 1:
+                await self._restart_language_menu()
+            else:
+                await self._activate_language("en", "invalid")
+            return True
+        return await self._require_pipeline().feed_dtmf(digit)
+
     async def finish(self, schedule_post_call: bool = False) -> None:
         async with self._finish_lock:
             if self._finish_task is None:
@@ -112,6 +134,8 @@ class KavyaSmartPBXSession:
         await asyncio.shield(task)
 
     async def _start_once(self) -> None:
+        import server
+
         self._ensure_session_trace_id()
         self._load_runtime_defaults()
         pipeline = self._require_pipeline()
@@ -133,19 +157,85 @@ class KavyaSmartPBXSession:
         pipeline.call_start_time = self._call_start_time
         pipeline._event_loop = asyncio.get_running_loop()
         pipeline._smartpbx_diagnostic_sink = self._diagnostic_sink
+        self._language_menu_task = asyncio.create_task(self._speak_language_menu())
+        loop = asyncio.get_running_loop()
+        self._language_timeout_handle = loop.call_later(
+            server.SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS,
+            lambda: asyncio.create_task(self._activate_language("en", "timeout")),
+        )
+
+    async def _restart_language_menu(self) -> None:
+        """Replay the menu once without turning an invalid key into barge-in."""
+        menu_task = self._language_menu_task
+        if menu_task is not None and not menu_task.done():
+            menu_task.cancel()
+            await asyncio.gather(menu_task, return_exceptions=True)
+        if self._selected_language is None:
+            self._language_menu_task = asyncio.create_task(self._speak_language_menu())
+
+    async def _speak_language_menu(self) -> None:
+        """Speak the pre-STT menu only while this session still awaits selection."""
+        pipeline = self._require_pipeline()
+        segments = (
+            ("en", "For English, press 1."),
+            ("si", "සිංහල සඳහා, 2 ඔබන්න."),
+        )
+        for lang, text in segments:
+            if self._selected_language is not None:
+                return
+            pipeline.lang = lang
+            await pipeline._speak(text)
+            if self._selected_language is not None:
+                return
+
+    async def _activate_language(
+        self,
+        lang: Literal["en", "si"],
+        source: Literal["digit", "timeout", "invalid"],
+    ) -> None:
+        """Commit one language selection and start the caller's STT pipeline."""
+        if self._selected_language is not None or self._finish_task is not None:
+            return
+        self._selected_language = lang
+        timeout_handle = self._language_timeout_handle
+        self._language_timeout_handle = None
+        if timeout_handle is not None:
+            timeout_handle.cancel()
+
+        pipeline = self._require_pipeline()
+        pipeline._is_speaking = False
+        pipeline._speak_generation = getattr(pipeline, "_speak_generation", 0) + 1
+        menu_task = self._language_menu_task
+        if menu_task is not None and not menu_task.done():
+            menu_task.cancel()
+        await self._transport.clear_audio()
+        if menu_task is not None:
+            await asyncio.gather(menu_task, return_exceptions=True)
+
+        pipeline.lang = lang
+        import server
+        pipeline.system_prompt = server._build_system_prompt(lang)
+        if lang != "en":
+            pipeline.tools = [
+                tool for tool in getattr(pipeline, "tools", [])
+                if tool.get("name") != "transfer_to_human"
+            ]
         pipeline._stt = self._stt_factory(
             on_final_result=pipeline._on_stt_result,
             on_interim_result=pipeline._on_stt_interim,
-            lang="en",
+            lang=lang,
             privacy_safe=True,
         )
         self._wire_stt_fatal_signal(pipeline._stt)
         pipeline._stt.start()
-        if self._welcome_text:
-            pipeline._smartpbx_welcome_audio_pending = self._welcome_text
-            self._welcome_task = asyncio.create_task(
-                pipeline._speak(self._welcome_text)
-            )
+        welcome_text = (
+            server.LANGUAGE_CONFIGS[lang]["welcome_greeting"]
+            if self._welcome_uses_language_default
+            else self._welcome_text
+        )
+        if welcome_text:
+            pipeline._smartpbx_welcome_audio_pending = welcome_text
+            self._welcome_task = asyncio.create_task(pipeline._speak(welcome_text))
 
 
     async def _finish_once(self, schedule_post_call: bool) -> None:
@@ -153,6 +243,14 @@ class KavyaSmartPBXSession:
             pipeline = self._pipeline
             if pipeline is None:
                 return
+            timeout_handle = self._language_timeout_handle
+            self._language_timeout_handle = None
+            if timeout_handle is not None:
+                timeout_handle.cancel()
+            menu_task = self._language_menu_task
+            if menu_task is not None and not menu_task.done():
+                menu_task.cancel()
+                await asyncio.gather(menu_task, return_exceptions=True)
             close_dispatch = getattr(pipeline, "_close_teardown_dispatch", None)
             if callable(close_dispatch):
                 close_dispatch()
@@ -231,7 +329,7 @@ class KavyaSmartPBXSession:
                 self._post_call_task = asyncio.create_task(
                     self._post_call_processor(
                         call_sid=self._context.other_leg_call_id,
-                        lang="en",
+                        lang=self._selected_language or "en",
                         caller_phone=self._context.caller_number,
                         full_transcript=transcript,
                         call_start_time=self._call_start_time,

@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import audioop
 import base64
+import binascii
 import contextlib
 import enum
 import json
@@ -1749,6 +1750,26 @@ CAPTURE_ENDPOINTING_SILENCE_SECONDS: float = _parse_endpointing_seconds(
 CAPTURE_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "CAPTURE_FINAL_GRACE_SECONDS", 1.2, 0.2, 3.0
 )
+SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS = _parse_endpointing_seconds(
+    os.environ,
+    "SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS",
+    8.0,
+    3.0,
+    20.0,
+)
+SMARTPBX_SINHALA_GEMINI_TTS_MODEL = os.getenv(
+    "SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"
+)
+SMARTPBX_SINHALA_GEMINI_TTS_VOICE = os.getenv(
+    "SMARTPBX_SINHALA_GEMINI_TTS_VOICE", "Vindemiatrix"
+)
+SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS = _parse_endpointing_seconds(
+    os.environ,
+    "SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS",
+    15.0,
+    3.0,
+    30.0,
+)
 
 # Upper bound for the only integer the post-dispatch STT telemetry emits. The
 # event records that a late provider result was ignored while a turn was already
@@ -3164,6 +3185,7 @@ def _build_handoff_failsafe_prompt(state: dict) -> str:
 _anthropic_client: AsyncAnthropic | None = None
 _openai_client: AsyncOpenAI | None = None
 _gemini_client: Any = None  # google.genai.Client when available
+_gemini_tts_client: Any = None  # independent Gemini TTS client
 
 
 def _get_anthropic_client() -> AsyncAnthropic:
@@ -3199,6 +3221,32 @@ def _get_gemini_client():
         _gemini_client = google_genai.Client(api_key=GEMINI_API_KEY)
         logger.info("Initialized native Gemini client with model %s", MODEL)
     return _gemini_client
+
+
+def _get_gemini_tts_client():
+    """Return the isolated lazy Gemini client used only for SmartPBX Sinhala TTS."""
+    global _gemini_tts_client
+    if _gemini_tts_client is None:
+        if not GOOGLE_GENAI_AVAILABLE:
+            raise RuntimeError("google-genai package not installed")
+        if not GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is not set")
+        _gemini_tts_client = google_genai.Client(api_key=GEMINI_API_KEY)
+        logger.info("Initialized native Gemini client for SmartPBX Sinhala TTS")
+    return _gemini_tts_client
+
+
+async def _iter_gemini_tts_audio_deltas(stream: Any) -> AsyncIterator[tuple[str, Any]]:
+    """Yield base64 audio payloads from the documented Interactions SSE shape."""
+    async for event in stream:
+        if getattr(event, "event_type", None) != "step.delta":
+            continue
+        delta = getattr(event, "delta", None)
+        if getattr(delta, "type", None) != "audio":
+            continue
+        data = getattr(delta, "data", None)
+        if isinstance(data, str) and data:
+            yield data, delta
 
 
 def _history_to_gemini(history: list[dict]) -> list[dict]:
@@ -4897,6 +4945,7 @@ class MediaStreamSession:
         self.anthropic_client = anthropic_client
         self.client = openai_client  # OpenAI client (kept for openai provider)
         self.gemini_client = gemini_client
+        self._gemini_tts_client: Any = None
         self.lang = lang
         self.llm_provider = LLM_PROVIDER if llm_provider is None else llm_provider
         if self.llm_provider not in {"claude", "gemini", "openai"}:
@@ -5460,6 +5509,23 @@ class MediaStreamSession:
         """Use the runner's current fence after a filler-only clear."""
         runner = _smartpbx_runner_context.get()
         return fallback if runner is None else runner.speak_generation
+
+    def _owns_smartpbx_tts_delivery(self, expected_generation: int) -> bool:
+        """Fence Sinhala SmartPBX audio without changing general runner semantics."""
+        if not self._is_smartpbx_session():
+            return True
+        if (
+            self._smartpbx_torn_down
+            or self._speak_generation != expected_generation
+        ):
+            return False
+        runner = _smartpbx_runner_context.get()
+        if runner is None or runner.turn_id is None:
+            return True
+        return (
+            runner.turn_id == self._active_smartpbx_turn_id
+            and runner.speak_generation == expected_generation
+        )
 
     def _current_smartpbx_runner_owns_shared_state(
         self, *, tool_executed: bool = False
@@ -6302,7 +6368,7 @@ class MediaStreamSession:
     # â”€â”€ Main event loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _emit_smartpbx_tts_diagnostic(self, failure_class: DiagnosticFailureClass) -> None:
-        if self.lang != "en" or not self._is_smartpbx_session():
+        if self.lang not in {"en", "si"} or not self._is_smartpbx_session():
             return
         diagnostic_sink = getattr(self, "_smartpbx_diagnostic_sink", None)
         if not callable(diagnostic_sink):
@@ -9214,7 +9280,8 @@ class MediaStreamSession:
 
         English        â†’ protected canonical ElevenLabs eleven_flash_v2_5 profile
         Tamil / Arabic â†’ retained ElevenLabs eleven_multilingual_v2 voices
-        Sinhala        â†’ OpenAI gpt-4o-mini-tts (nova)
+        SmartPBX Sinhala â†’ Gemini gemini-3.1-flash-tts-preview
+        Twilio Sinhala   â†’ existing OpenAI gpt-4o-mini-tts (nova)
         """
         if self.transfer_pending:
             return
@@ -9230,6 +9297,13 @@ class MediaStreamSession:
             if self.lang in ("en", "ta", "ar"):
                 await self._invoke_tts(
                     self._tts_elevenlabs,
+                    text,
+                    sentence=sentence,
+                    turn_generation=generation,
+                )
+            elif self.lang == "si" and self._is_smartpbx_session():
+                await self._invoke_tts(
+                    self._tts_gemini_sinhala,
                     text,
                     sentence=sentence,
                     turn_generation=generation,
@@ -9253,6 +9327,196 @@ class MediaStreamSession:
                 )
 
     # â”€â”€ ElevenLabs TTS (Tamil) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    async def _tts_gemini_sinhala(
+        self,
+        text: str,
+        *,
+        sentence: str | None = None,
+        turn_generation: int | None = None,
+    ) -> None:
+        """Stream Gemini 24 kHz PCM to SmartPBX as 8 kHz mu-law frames only."""
+        text = text.strip()
+        if not text:
+            return
+        if not GEMINI_API_KEY:
+            self._log_tts_failure("gemini", "missing_api_key")
+            self._emit_smartpbx_tts_diagnostic(
+                DiagnosticFailureClass.TTS_MISSING_API_KEY
+            )
+            return
+
+        expected_generation = self._speak_generation
+        if turn_generation is not None and turn_generation >= 0:
+            if turn_generation != expected_generation:
+                return
+
+        self._is_speaking = True
+        self._speaking_since = time.monotonic()
+        self._mark_smartpbx_turn_once("tts_request")
+        ratecv_state = None
+        pcm_tail = b""
+        mulaw_buf = b""
+        audio_emitted = False
+        cancelled = False
+
+        try:
+            client = self._gemini_tts_client
+            if client is None:
+                client = _get_gemini_tts_client()
+                self._gemini_tts_client = client
+            stream = await client.aio.interactions.create(
+                model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
+                input=text,
+                stream=True,
+                response_modalities=["AUDIO"],
+                response_mime_type="audio/l16",
+                response_format={
+                    "type": "audio",
+                    "mime_type": "audio/l16",
+                    "sample_rate": 24000,
+                    "delivery": "inline",
+                },
+                generation_config={
+                    "speech_config": [{
+                        "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
+                    }],
+                },
+                timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
+            )
+
+            async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
+                if (
+                    not self._is_speaking
+                    or self._speak_generation != expected_generation
+                    or not self._owns_smartpbx_tts_delivery(expected_generation)
+                    or (
+                        turn_generation is not None
+                        and turn_generation >= 0
+                        and turn_generation != self._speak_generation
+                    )
+                ):
+                    cancelled = True
+                    break
+                if (
+                    (
+                        getattr(audio_delta, "mime_type", None) is not None
+                        and getattr(audio_delta, "mime_type") != "audio/l16"
+                    )
+                    or (
+                        getattr(audio_delta, "channels", None) is not None
+                        and getattr(audio_delta, "channels") != 1
+                    )
+                    or (
+                        getattr(audio_delta, "sample_rate", None) is not None
+                        and getattr(audio_delta, "sample_rate") != 24000
+                    )
+                ):
+                    self._log_tts_failure("gemini", "invalid_audio_metadata")
+                    self._emit_smartpbx_tts_diagnostic(
+                        DiagnosticFailureClass.TTS_EXCEPTION
+                    )
+                    return
+                try:
+                    chunk = base64.b64decode(audio_b64, validate=True)
+                except (binascii.Error, ValueError, TypeError):
+                    self._log_tts_failure("gemini", "malformed_audio")
+                    self._emit_smartpbx_tts_diagnostic(
+                        DiagnosticFailureClass.TTS_EXCEPTION
+                    )
+                    return
+                if not chunk:
+                    continue
+
+                data = pcm_tail + chunk
+                if len(data) % 2:
+                    data, pcm_tail = data[:-1], data[-1:]
+                else:
+                    pcm_tail = b""
+                if not data:
+                    continue
+                pcm8k, ratecv_state = audioop.ratecv(
+                    data, 2, 1, 24000, 8000, ratecv_state
+                )
+                mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+
+                while len(mulaw_buf) >= 640:
+                    if (
+                        not self._is_speaking
+                        or self._speak_generation != expected_generation
+                        or not self._owns_smartpbx_tts_delivery(expected_generation)
+                    ):
+                        cancelled = True
+                        break
+                    frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
+                    self._mark_smartpbx_turn_once("tts_first_chunk")
+                    await self._send_media_audio(frame)
+                    audio_emitted = True
+                if cancelled:
+                    break
+
+            if pcm_tail and not cancelled:
+                self._log_tts_failure("gemini", "malformed_audio")
+                self._emit_smartpbx_tts_diagnostic(
+                    DiagnosticFailureClass.TTS_EXCEPTION
+                )
+                return
+
+            if (
+                not cancelled
+                and self._is_speaking
+                and self._speak_generation == expected_generation
+                and self._owns_smartpbx_tts_delivery(expected_generation)
+                and mulaw_buf
+            ):
+                mulaw_buf += b"\xff" * (640 - len(mulaw_buf))
+                self._mark_smartpbx_turn_once("tts_first_chunk")
+                await self._send_media_audio(mulaw_buf)
+                audio_emitted = True
+            elif not cancelled and not self._owns_smartpbx_tts_delivery(
+                expected_generation
+            ):
+                cancelled = True
+
+            if (
+                audio_emitted
+                and not cancelled
+                and self._is_speaking
+                and self._speak_generation == expected_generation
+                and self._owns_smartpbx_tts_delivery(expected_generation)
+            ):
+                await self._send_tts_done(
+                    sentence=sentence,
+                    turn_generation=expected_generation,
+                )
+            elif not audio_emitted and not cancelled:
+                self._log_tts_failure("gemini", "empty_audio")
+                self._emit_smartpbx_tts_diagnostic(
+                    DiagnosticFailureClass.TTS_EXCEPTION
+                )
+
+        except httpx.HTTPStatusError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if not isinstance(status, int) or isinstance(status, bool):
+                status = None
+            elif status < 100 or status > 599:
+                status = max(100, min(status, 599))
+            self._log_tts_failure("gemini", "http_status", status)
+            self._emit_smartpbx_tts_diagnostic(
+                DiagnosticFailureClass.TTS_HTTP_STATUS
+            )
+        except TimeoutError:
+            self._log_tts_failure("gemini", "timeout")
+            self._emit_smartpbx_tts_diagnostic(
+                DiagnosticFailureClass.TTS_TIMEOUT
+            )
+        except Exception:
+            self._log_tts_failure("gemini", "exception")
+            self._emit_smartpbx_tts_diagnostic(
+                DiagnosticFailureClass.TTS_EXCEPTION
+            )
+        finally:
+            self._is_speaking = False
 
     async def _tts_elevenlabs(
         self,

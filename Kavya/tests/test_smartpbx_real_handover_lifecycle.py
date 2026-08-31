@@ -152,6 +152,18 @@ async def test_real_acknowledged_transfer_stays_open_until_dialog_stop_and_posts
     gateway = SmartPBXGateway(configuration, registry)
     socket = QueueWebSocket()
     gateway_task = asyncio.create_task(gateway.handle(socket, session_factory))
+    socket.messages.put_nowait(
+        json.dumps(
+            {
+                "event": "dtmf",
+                "dtmf": {
+                    "callId": "dialog-media-leg",
+                    "otherLegCallId": "dialog-safe-call",
+                    "digit": "1",
+                },
+            }
+        )
+    )
 
     await asyncio.wait_for(started.wait(), timeout=1)
     session = sessions[0]
