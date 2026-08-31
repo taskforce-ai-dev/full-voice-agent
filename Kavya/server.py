@@ -9369,14 +9369,7 @@ class MediaStreamSession:
                 model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
                 input=text,
                 stream=True,
-                response_modalities=["audio"],
-                response_mime_type="audio/l16",
-                response_format={
-                    "type": "audio",
-                    "mime_type": "audio/l16",
-                    "sample_rate": 24000,
-                    "delivery": "inline",
-                },
+                response_format={"type": "audio"},
                 generation_config={
                     "speech_config": [{
                         "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
