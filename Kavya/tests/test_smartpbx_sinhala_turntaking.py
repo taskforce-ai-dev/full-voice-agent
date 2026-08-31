@@ -15,6 +15,8 @@ class _Transport:
         self.marks: list[str] = []
         self.session = None
         self.speaking_at_send: list[bool] = []
+        self.generation = 0
+        self.clears = 0
 
     async def send_audio(self, audio: bytes) -> None:
         if self.session is not None:
@@ -22,7 +24,9 @@ class _Transport:
         self.audio.append(audio)
 
     async def clear_audio(self) -> int:
-        return 0
+        self.clears += 1
+        self.generation += 1
+        return self.generation
 
     async def send_mark(self, name: str) -> None:
         self.marks.append(name)
@@ -300,17 +304,18 @@ def test_sinhala_effort_knob_is_allowlisted_and_has_a_high_safety_fallback():
 async def test_pre_audio_callbacks_keep_latest_cumulative_hypothesis_once(monkeypatch):
     import server
 
-    session, _transport = _direct_sinhala(server)
+    session, transport = _direct_sinhala(server)
     session._event_loop = asyncio.get_running_loop()
     session._tts_synthesis_in_flight = True
     session._tts_synthesis_generation = session._speak_generation
     monkeypatch.setattr(server, "SMARTPBX_PRE_AUDIO_STT_MIN_SECONDS", 0.0)
 
     session._on_stt_interim("I need")
-    await asyncio.sleep(0.01)
     session._on_stt_result("I need a room")
-    await asyncio.sleep(0.02)
+    await session._close_stt_callbacks()
 
+    assert session._stt_callback_errors == 0
+    assert transport.clears == 1
     assert session._speak_generation == 1
     assert session._pending_transcript == "I need a room"
     assert "I need I need" not in session._pending_transcript

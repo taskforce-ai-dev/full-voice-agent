@@ -261,7 +261,7 @@ Kavya accepts `SMARTPBX_MCP_ACCOUNT_HEADER=account_id` and
 MCP API/account headers and all MCP credentials are server-only. The dashboard WSS
 headers carry only the dedicated WSS token; they never carry MCP credentials.
 
-## Direct SmartPBX reliability timing (Phase B)
+## Direct SmartPBX English reliability timing (Phase B)
 
 The shared timeout knobs govern direct SmartPBX English provider rounds and
 direct SmartPBX Sinhala Claude rounds. OpenAI/Gemini keep their existing
