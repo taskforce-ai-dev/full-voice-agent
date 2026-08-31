@@ -3169,3 +3169,4 @@ def test_sinhala_smartpbx_runbook_documents_the_closed_gemini_tts_contract():
         "restore the prior image/config",
     ):
         assert required in runbook
+    assert "grep -Eq '^GEMINI_API_KEY=.+$' /opt/kavya/.env.smartpbx" in runbook

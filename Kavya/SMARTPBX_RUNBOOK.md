@@ -160,7 +160,7 @@ Before enabling Sinhala, perform this Gemini API key presence check. It requires
 ```sh
 set -euo pipefail
 cd /opt/kavya
-if ! grep -q '^GEMINI_API_KEY=.+$' /opt/kavya/.env.smartpbx; then
+if ! grep -Eq '^GEMINI_API_KEY=.+$' /opt/kavya/.env.smartpbx; then
   echo "GEMINI_API_KEY is required before enabling SmartPBX Sinhala" >&2
   exit 1
 fi
