@@ -262,7 +262,8 @@ async def test_sustained_pre_audio_stt_cancels_sinhala_synthesis_and_admits_once
     await session._handle_pre_audio_stt("final", "with more detail")
 
     assert session._speak_generation == 1
-    assert admitted == ["caller continues with more detail"]
+    # A final supersedes the interim hypothesis for the same provider segment.
+    assert admitted == ["with more detail"]
 
 
 @pytest.mark.asyncio
