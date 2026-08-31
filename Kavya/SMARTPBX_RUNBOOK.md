@@ -75,6 +75,10 @@ CLAUDE_MODEL=claude-sonnet-5
 OPENAI_MODEL=gpt-4o
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash
+SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS=8.0
+SMARTPBX_SINHALA_GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
+SMARTPBX_SINHALA_GEMINI_TTS_VOICE=Vindemiatrix
+SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS=15.0
 OPENAI_TTS_MODEL=gpt-4o-mini-tts
 OPENAI_TTS_VOICE=nova
 OPENAI_TTS_INSTRUCTIONS=
@@ -134,6 +138,51 @@ SMARTPBX_MCP_READ_TIMEOUT_SECONDS=15
 SMARTPBX_MCP_MAX_RESPONSE_BYTES=1048576
 SMARTPBX_MCP_RETRIES=1
 ```
+
+## SmartPBX Sinhala menu and Gemini TTS
+
+The SmartPBX call menu is **1 English, 2 Sinhala**. The timeout defaults to
+English; an invalid selection replays once then defaults to English. This is a
+direct SmartPBX-only choice: Twilio behavior is unchanged.
+
+Sinhala retains the existing Claude LLM and existing STT selection. Only its
+TTS uses Gemini, with `gemini-3.1-flash-tts-preview` and voice
+`Vindemiatrix`.
+
+There is deliberately no OpenAI, ElevenLabs, or Azure fallback for SmartPBX Sinhala TTS.
+A Gemini TTS failure is closed/diagnostic: retain the caller-facing failure
+behavior, inspect only the bounded provider/event/outcome diagnostics, and do
+not route speech to another provider.
+
+Before enabling Sinhala, perform this Gemini API key presence check. It requires
+`GEMINI_API_KEY` only when Sinhala is enabled and does not print the key:
+
+```sh
+set -euo pipefail
+cd /opt/kavya
+if ! grep -q '^GEMINI_API_KEY=.+$' /opt/kavya/.env.smartpbx; then
+  echo "GEMINI_API_KEY is required before enabling SmartPBX Sinhala" >&2
+  exit 1
+fi
+SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
+```
+
+After the established guarded pinned-image recreate, run the normal authenticated
+health/status checks and this two-language canary call checklist:
+
+1. Call the SmartPBX endpoint, select `1`, and confirm the existing English
+   Claude/STT/TTS path responds.
+2. Call again, select `2`, and confirm Sinhala retains Claude and STT while the
+   caller hears Gemini `Vindemiatrix` TTS from
+   `gemini-3.1-flash-tts-preview`.
+3. Confirm `/health` and authenticated `/smartpbx/status` are healthy, then
+   inspect only bounded Sinhala Gemini failure diagnostics if the second call
+   fails.
+
+If either canary fails, restore the prior image/config, recreate only
+`kavya-smartpbx` through the established guarded deployment path, and repeat
+the authenticated health/status checks. Do not substitute a fallback TTS
+provider during rollback or diagnosis.
 
 ## Controlled startup pre-roll canary
 
