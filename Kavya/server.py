@@ -658,6 +658,20 @@ SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS: float = (
         SMARTPBX_LLM_STALL_TIMEOUT_SECONDS,
     )
 )
+# Adaptive thinking remains enabled.  Sinhala SmartPBX may use medium effort
+# to reduce the otherwise long think-before-first-token interval; `high` is
+# the explicit rollback and any invalid deployment value fails closed to it.
+_SMARTPBX_SINHALA_CLAUDE_EFFORT_VALUES = frozenset({"medium", "high"})
+
+
+def _resolve_smartpbx_sinhala_claude_effort(raw: object) -> str:
+    value = str(raw).strip().lower() if raw is not None else "medium"
+    return value if value in _SMARTPBX_SINHALA_CLAUDE_EFFORT_VALUES else "high"
+
+
+SMARTPBX_SINHALA_CLAUDE_EFFORT = _resolve_smartpbx_sinhala_claude_effort(
+    os.getenv("SMARTPBX_SINHALA_CLAUDE_EFFORT")
+)
 MAX_HISTORY_MESSAGES: int = 60
 MAX_TOOL_ROUNDS: int = 5
 
@@ -2053,6 +2067,11 @@ BARGEIN_MIN_CHARS: int = _parse_clamped_int(
 BARGEIN_DEBOUNCE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "BARGEIN_DEBOUNCE_SECONDS", 0.6, 0.0, 5.0
 )
+# Before any response audio is accepted, a single callback can be a late STT
+# tail.  Require two callbacks spanning this bounded interval before treating
+# it as the caller continuing their utterance and cancelling synthesis.
+SMARTPBX_PRE_AUDIO_STT_MIN_EVENTS = 2
+SMARTPBX_PRE_AUDIO_STT_MIN_SECONDS = 0.25
 ECHO_MATCH_MIN_RATIO: float = _parse_clamped_float(
     os.environ, "ECHO_MATCH_MIN_RATIO", 0.8, 0.5, 1.0
 )
@@ -4984,6 +5003,15 @@ class MediaStreamSession:
         self._smartpbx_deferred_tts_closed = False
         self._is_speaking = False
         self._speaking_since = 0.0
+        # Gemini synthesis is not audible speech.  Keeping the states separate
+        # prevents an STT tail arriving while Gemini is still connecting from
+        # being treated as an audible-response barge-in.
+        self._tts_synthesis_in_flight = False
+        self._tts_synthesis_generation: int | None = None
+        self._pre_audio_stt_generation: int | None = None
+        self._pre_audio_stt_first_at = 0.0
+        self._pre_audio_stt_events = 0
+        self._pre_audio_stt_texts: list[str] = []
         self._speak_lock = asyncio.Lock()
         self._ws_lock = asyncio.Lock()
         self._speak_generation: int = 0
@@ -5095,10 +5123,15 @@ class MediaStreamSession:
     def _is_smartpbx_session(self) -> bool:
         return self._smartpbx_transfer_context is not None
 
-    def _is_direct_smartpbx_english(self) -> bool:
+    def _is_direct_smartpbx(self) -> bool:
         return (
             self._is_smartpbx_session()
             and self._media_transport is not None
+        )
+
+    def _is_direct_smartpbx_english(self) -> bool:
+        return (
+            self._is_direct_smartpbx()
             and self.lang == "en"
         )
 
@@ -5125,6 +5158,10 @@ class MediaStreamSession:
         """
         return self._is_direct_smartpbx_english() and not self._is_capture_mode_active()
 
+    def _is_direct_smartpbx_non_capture(self) -> bool:
+        """Shared direct-call timeout/retry policy, excluding dictation flows."""
+        return self._is_direct_smartpbx() and not self._is_capture_mode_active()
+
     def _reserve_smartpbx_initial_filler(self) -> _CallFillerLease:
         return self._smartpbx_filler_rotation.reserve(
             "initial", SMARTPBX_INITIAL_FILLER_BANK
@@ -5146,7 +5183,7 @@ class MediaStreamSession:
         sites are unchanged; every non-direct-SmartPBX path still gets the
         global MAX_TOKENS.
         """
-        if not self._is_direct_smartpbx_english():
+        if not self._is_direct_smartpbx():
             return MAX_TOKENS
         if provider == "claude":
             return SMARTPBX_CLAUDE_MAX_TOKENS
@@ -5296,14 +5333,14 @@ class MediaStreamSession:
     ) -> asyncio.Task | None:
         """Start model speech with session/runner cancellation ownership."""
         if (
-            self._is_direct_smartpbx_english()
+            self._is_direct_smartpbx()
             and self._smartpbx_deferred_tts_closed
         ):
             return None
         task = asyncio.create_task(
             self._invoke_speak(text, generation=generation, sentence=sentence)
         )
-        if not self._is_direct_smartpbx_english():
+        if not self._is_direct_smartpbx():
             return task
         self._smartpbx_deferred_tts_tasks.add(task)
         task.add_done_callback(self._smartpbx_deferred_tts_tasks.discard)
@@ -5448,7 +5485,7 @@ class MediaStreamSession:
         return generation
 
     def _ensure_smartpbx_turn_telemetry(self) -> SmartPBXTurnTelemetry | None:
-        if not self._is_direct_smartpbx_english():
+        if not self._is_direct_smartpbx():
             return None
         if self._turn_telemetry is None:
             self._turn_telemetry = SmartPBXTurnTelemetry(
@@ -5548,7 +5585,7 @@ class MediaStreamSession:
         discarding — otherwise a successfully-executed tool becomes a silent
         success with no trace.
         """
-        if not self._is_direct_smartpbx_english():
+        if not self._is_direct_smartpbx():
             return True
         runner = _smartpbx_runner_context.get()
         # Older injected/direct callers may have no task-local wrapper or no
@@ -5578,7 +5615,7 @@ class MediaStreamSession:
     def _smartpbx_runner_raw_utterance(self) -> str:
         """Return raw capture input owned by this task, never a newer turn's."""
         runner = _smartpbx_runner_context.get()
-        if self._is_direct_smartpbx_english() and runner is not None:
+        if self._is_direct_smartpbx() and runner is not None:
             return runner.raw_utterance
         return self._last_guest_utterance_raw
 
@@ -5660,11 +5697,20 @@ class MediaStreamSession:
         """
         if not self._current_smartpbx_runner_owns_shared_state():
             return ""
-        recovery_text = (
-            SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT
-            if tool_executed
-            else SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
-        )
+        if self.lang == "si":
+            recovery_text = (
+                "සමාවෙන්න, මට පැහැදිලි යාවත්කාලීනයක් දෙන්න බැරි වුණා. "
+                "මට දිගටම උදව් කරන්නද?"
+                if tool_executed
+                else "සමාවෙන්න, මට දැන් පිළිතුරු දෙන්න අපහසුයි. "
+                "කරුණාකර නැවත කියන්න පුළුවන්ද?"
+            )
+        else:
+            recovery_text = (
+                SMARTPBX_LLM_TOOL_STARTED_RECOVERY_TEXT
+                if tool_executed
+                else SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT
+            )
         await self._invoke_speak(recovery_text, generation=gen, sentence=recovery_text)
         if not self._current_smartpbx_runner_owns_shared_state():
             return ""
@@ -6327,7 +6373,7 @@ class MediaStreamSession:
             "\n\nSMARTPBX CALLER RHYTHM:\n"
             "- Answer first in one or two concise sentences.\n"
             "- Ask no more than one necessary next question.\n"
-            if self._is_direct_smartpbx_english()
+            if self._is_direct_smartpbx()
             else ""
         )
 
@@ -6494,6 +6540,58 @@ class MediaStreamSession:
 
     # â”€â”€ STT callback (called from background thread) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+    def _pre_audio_synthesis_active(self) -> bool:
+        return (
+            self._is_direct_smartpbx()
+            and self._tts_synthesis_in_flight
+            and not self._is_speaking
+            and self._tts_synthesis_generation == self._speak_generation
+        )
+
+    def _clear_pre_audio_stt(self) -> list[str]:
+        texts = self._pre_audio_stt_texts
+        self._pre_audio_stt_generation = None
+        self._pre_audio_stt_first_at = 0.0
+        self._pre_audio_stt_events = 0
+        self._pre_audio_stt_texts = []
+        return texts
+
+    async def _flush_pre_audio_stt(self) -> None:
+        """Admit one unproven pre-audio tail without cancelling real speech."""
+        texts = self._clear_pre_audio_stt()
+        if texts:
+            await self._accumulate_transcript(" ".join(texts))
+
+    async def _handle_pre_audio_stt(self, result_type: str, text: str) -> None:
+        """Yield only on bounded continuing STT activity before audio exists."""
+        if not self._pre_audio_synthesis_active():
+            if result_type == "final":
+                await self._accumulate_transcript(text)
+            else:
+                await self._set_transcript_interim(text)
+            return
+        generation = self._speak_generation
+        now = time.monotonic()
+        if self._pre_audio_stt_generation != generation:
+            self._clear_pre_audio_stt()
+            self._pre_audio_stt_generation = generation
+            self._pre_audio_stt_first_at = now
+        self._pre_audio_stt_events += 1
+        self._pre_audio_stt_texts.append(text)
+        sustained = (
+            self._pre_audio_stt_events >= SMARTPBX_PRE_AUDIO_STT_MIN_EVENTS
+            and now - self._pre_audio_stt_first_at >= SMARTPBX_PRE_AUDIO_STT_MIN_SECONDS
+        )
+        if not sustained:
+            return
+        caller_text = " ".join(self._clear_pre_audio_stt())
+        # The shared barge-in transition cancels and joins the pending direct
+        # TTS, fences its generation, and clears queued media before this new
+        # caller speech becomes the next dispatch exactly once.
+        await self._handle_bargein()
+        if caller_text:
+            await self._accumulate_transcript(caller_text)
+
     def _on_stt_result(self, transcript: str):
         """Called from STT thread on FINAL results."""
         if self.transfer_pending:
@@ -6507,6 +6605,9 @@ class MediaStreamSession:
         # on the synchronous STT worker thread, and a cross-thread write races
         # every loop-side reader of the transcript buffers.
         if self._event_loop is None:
+            return
+        if self._pre_audio_synthesis_active():
+            self._submit_stt_callback(self._handle_pre_audio_stt, "final", transcript)
             return
         if self._is_speaking:
             if self._is_echo(transcript):
@@ -6529,6 +6630,9 @@ class MediaStreamSession:
         # there by `_set_transcript_interim`. Nothing transcript-, interim- or
         # timer-owned is mutated on this thread.
         if self._event_loop is None:
+            return
+        if self._pre_audio_synthesis_active():
+            self._submit_stt_callback(self._handle_pre_audio_stt, "interim", transcript)
             return
         if self._is_speaking:
             if self._is_echo(transcript):
@@ -6624,7 +6728,7 @@ class MediaStreamSession:
         await self._cancel_smartpbx_tool_fillers()
         if self._smartpbx_initial_filler is not None:
             await self._smartpbx_initial_filler.on_barge_in()
-        if self._is_direct_smartpbx_english():
+        if self._is_direct_smartpbx():
             self._smartpbx_barge_ins += 1
             if self._active_smartpbx_turn_id is not None:
                 self._interrupted_smartpbx_turn_ids.add(self._active_smartpbx_turn_id)
@@ -6663,13 +6767,24 @@ class MediaStreamSession:
             self._endpointing_handle = None
         await self._clear_media_audio()
 
-    async def _send_media_audio(self, audio: bytes) -> None:
+    def _mark_tts_audible(self, expected_generation: int) -> bool:
+        """Enter speaking state only after current-generation media was accepted."""
+        if (
+            self._speak_generation != expected_generation
+            or not self._owns_smartpbx_tts_delivery(expected_generation)
+        ):
+            return False
+        self._is_speaking = True
+        self._speaking_since = time.monotonic()
+        return True
+
+    async def _send_media_audio(self, audio: bytes) -> bool:
         """Send raw mulaw through the active provider-specific media transport."""
         if self.transfer_pending:
-            return
+            return False
         runner = _smartpbx_runner_context.get()
         if runner is not None and runner.speak_generation != self._speak_generation:
-            return
+            return False
         if self._media_transport is not None:
             turn_id = self._current_smartpbx_turn_id()
             if turn_id is not None:
@@ -6677,13 +6792,14 @@ class MediaStreamSession:
                 if callable(bind_turn):
                     bind_turn(self._speak_generation, turn_id)
             await self._media_transport.send_audio(audio)
-            return
+            return True
         async with self._ws_lock:
             await self.ws.send_text(json.dumps({
                 "event": "media",
                 "streamSid": self.stream_sid,
                 "media": {"payload": base64.b64encode(audio).decode("ascii")},
             }))
+        return True
 
     async def _clear_media_audio(self, force: bool = False) -> None:
         """Clear pending speech without leaking one provider's wire protocol."""
@@ -7780,7 +7896,7 @@ class MediaStreamSession:
         # Capture-name/number/keypad flows are excluded here (spec §5): they
         # keep their pre-Phase-B specialised logic, not the new retry-nudge/
         # timeout-guard/shared-recovery policy this flag drives below.
-        smartpbx_direct = self._is_direct_smartpbx_english_non_capture()
+        smartpbx_direct = self._is_direct_smartpbx_non_capture()
         # Turn-scoped (not round-scoped): one retry total, and only while no
         # tool/side effect has started this turn. Non-direct-SmartPBX callers
         # (Twilio Media Streams ar/si/ta) are untouched — max_attempts stays 1.
@@ -8766,12 +8882,22 @@ class MediaStreamSession:
                     ]
 
                 acquire_deadline = time.monotonic() + SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS
+                claude_request: dict[str, Any] = {
+                    "model": self.model,
+                    "max_tokens": self._provider_max_tokens("claude"),
+                    "system": system_blocks,
+                    "messages": self.history,
+                    "tools": self.tools if self.tools else NOT_GIVEN,
+                }
+                # Do not disable adaptive thinking.  Medium effort is a
+                # Sinhala-only latency setting; English retains its current
+                # request shape and `high` remains the explicit rollback.
+                if self.lang == "si" and self._is_direct_smartpbx():
+                    claude_request["output_config"] = {
+                        "effort": SMARTPBX_SINHALA_CLAUDE_EFFORT,
+                    }
                 stream_cm = self.anthropic_client.messages.stream(
-                    model=self.model,
-                    max_tokens=self._provider_max_tokens("claude"),
-                    system=system_blocks,
-                    messages=self.history,
-                    tools=self.tools if self.tools else NOT_GIVEN,
+                    **claude_request,
                 )
                 if smartpbx_direct:
                     # Entering this context manager is where the real network
@@ -9351,8 +9477,8 @@ class MediaStreamSession:
             if turn_generation != expected_generation:
                 return
 
-        self._is_speaking = True
-        self._speaking_since = time.monotonic()
+        self._tts_synthesis_in_flight = True
+        self._tts_synthesis_generation = expected_generation
         self._mark_smartpbx_turn_once("tts_request")
         ratecv_state = None
         pcm_tail = b""
@@ -9442,9 +9568,13 @@ class MediaStreamSession:
                         cancelled = True
                         break
                     frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
-                    self._mark_smartpbx_turn_once("tts_first_chunk")
-                    await self._send_media_audio(frame)
-                    audio_emitted = True
+                    if await self._send_media_audio(frame):
+                        await self._flush_pre_audio_stt()
+                        self._mark_smartpbx_turn_once("tts_first_chunk")
+                        audio_emitted = self._mark_tts_audible(expected_generation)
+                        if not audio_emitted:
+                            cancelled = True
+                            break
                 if cancelled:
                     break
 
@@ -9463,9 +9593,12 @@ class MediaStreamSession:
                 and mulaw_buf
             ):
                 mulaw_buf += b"\xff" * (640 - len(mulaw_buf))
-                self._mark_smartpbx_turn_once("tts_first_chunk")
-                await self._send_media_audio(mulaw_buf)
-                audio_emitted = True
+                if await self._send_media_audio(mulaw_buf):
+                    await self._flush_pre_audio_stt()
+                    self._mark_smartpbx_turn_once("tts_first_chunk")
+                    audio_emitted = self._mark_tts_audible(expected_generation)
+                    if not audio_emitted:
+                        cancelled = True
             elif not cancelled and not self._owns_smartpbx_tts_delivery(
                 expected_generation
             ):
@@ -9509,7 +9642,13 @@ class MediaStreamSession:
                 DiagnosticFailureClass.TTS_EXCEPTION
             )
         finally:
-            self._is_speaking = False
+            if self._tts_synthesis_generation == expected_generation:
+                self._tts_synthesis_in_flight = False
+                self._tts_synthesis_generation = None
+                if not audio_emitted:
+                    await self._flush_pre_audio_stt()
+            if not audio_emitted:
+                self._is_speaking = False
 
     async def _tts_elevenlabs(
         self,

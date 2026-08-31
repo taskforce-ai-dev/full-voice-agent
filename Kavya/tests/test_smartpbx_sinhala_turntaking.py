@@ -168,3 +168,113 @@ async def test_sinhala_claude_request_keeps_thinking_and_sets_medium_effort(monk
     request = client.requests[0]
     assert request["output_config"] == {"effort": "medium"}
     assert "thinking" not in request
+
+
+@pytest.mark.asyncio
+async def test_english_claude_request_keeps_its_existing_effort_shape(monkeypatch):
+    import server
+
+    client = _ClaudeClient([
+        SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text="Short reply."),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=SimpleNamespace(output_tokens=12),
+        ),
+        SimpleNamespace(type="message_stop"),
+    ])
+    session = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=_Transport(),
+        llm_provider="claude", anthropic_client=client,
+    )
+    session._smartpbx_transfer_context = object()
+
+    async def _no_speak(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(session, "_speak", _no_speak)
+    await session._process_utterance_bound("guest question")
+
+    assert "output_config" not in client.requests[0]
+    assert "thinking" not in client.requests[0]
+
+
+@pytest.mark.asyncio
+async def test_single_pre_audio_stt_tail_does_not_cancel_sinhala_synthesis(monkeypatch):
+    import server
+
+    session, _transport = _direct_sinhala(server)
+    admitted: list[str] = []
+
+    async def _record(text):
+        admitted.append(text)
+
+    monkeypatch.setattr(session, "_accumulate_transcript", _record)
+    session._tts_synthesis_in_flight = True
+    session._tts_synthesis_generation = session._speak_generation
+
+    await session._handle_pre_audio_stt("final", "late provider tail")
+
+    assert session._speak_generation == 0
+    assert admitted == []
+    await session._flush_pre_audio_stt()
+    assert admitted == ["late provider tail"]
+
+
+@pytest.mark.asyncio
+async def test_sustained_pre_audio_stt_cancels_sinhala_synthesis_and_admits_once(monkeypatch):
+    import server
+
+    session, _transport = _direct_sinhala(server)
+    admitted: list[str] = []
+    ticks = iter((10.0, 10.3, 10.3))
+
+    async def _record(text):
+        admitted.append(text)
+
+    async def _no_clear(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(session, "_accumulate_transcript", _record)
+    monkeypatch.setattr(session, "_clear_media_audio", _no_clear)
+    session._tts_synthesis_in_flight = True
+    session._tts_synthesis_generation = session._speak_generation
+
+    await session._handle_pre_audio_stt("interim", "caller continues")
+    await session._handle_pre_audio_stt("final", "with more detail")
+
+    assert session._speak_generation == 1
+    assert admitted == ["caller continues with more detail"]
+
+
+@pytest.mark.asyncio
+async def test_sinhala_recovery_is_never_the_english_fallback(monkeypatch):
+    import server
+
+    session, _transport = _direct_sinhala(server)
+    spoken: list[str] = []
+
+    async def _speak(text, **_kwargs):
+        spoken.append(text)
+
+    monkeypatch.setattr(session, "_speak", _speak)
+    await session._smartpbx_speak_recovery_and_finish(
+        tool_executed=False, gen=0, full_text=""
+    )
+
+    assert len(spoken) == 1
+    assert "I'm sorry" not in spoken[0]
+
+
+def test_sinhala_effort_knob_is_allowlisted_and_has_a_high_safety_fallback():
+    import server
+
+    assert server._resolve_smartpbx_sinhala_claude_effort(None) == "medium"
+    assert server._resolve_smartpbx_sinhala_claude_effort("medium") == "medium"
+    assert server._resolve_smartpbx_sinhala_claude_effort("high") == "high"
+    assert server._resolve_smartpbx_sinhala_claude_effort("invalid") == "high"
