@@ -151,6 +151,7 @@ def install_smartpbx_sink(pipeline):
 async def test_smartpbx_sinhala_gemini_pcm_is_downsampled_and_completed_once(monkeypatch):
     import server
 
+    assert server.SMARTPBX_SINHALA_GEMINI_TTS_VOICE == "Vindemiatrix"
     pipeline, transport = make_sinhala_smartpbx_pipeline(server)
     monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
     pcm24k = bytes(range(256)) * 20
@@ -182,8 +183,8 @@ async def test_smartpbx_sinhala_gemini_pcm_is_downsampled_and_completed_once(mon
         "generation_config": {
             "speech_config": [{
                 "language": "si-LK",
-                "speaker": "Kore",
-                "voice": "Kore",
+                "speaker": "Vindemiatrix",
+                "voice": "Vindemiatrix",
             }],
         },
         "timeout": 15.0,
