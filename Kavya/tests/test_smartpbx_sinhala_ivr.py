@@ -137,14 +137,36 @@ async def test_first_invalid_digit_replays_menu_and_second_defaults_to_english()
     await session.start()
     await asyncio.sleep(0)
     first_menu = list(pipeline.spoken)
+    assert [lang for lang, _text in first_menu] == ["en", "si"]
 
     assert await session.feed_dtmf("#") is True
     await asyncio.sleep(0)
-    assert len(pipeline.spoken) == len(first_menu) * 2
+    replayed_menu = pipeline.spoken[len(first_menu):]
+    assert [lang for lang, _text in replayed_menu] == ["en", "si"]
     assert stt.starts == 0
 
     assert await session.feed_dtmf("*") is True
     assert (pipeline.lang, stt.starts) == ("en", 1)
+
+
+@pytest.mark.asyncio
+async def test_sinhala_removes_only_human_transfer_while_english_keeps_every_tool():
+    sinhala_session, sinhala_pipeline, _sinhala_stt = make_session()
+    original_sinhala_tools = list(sinhala_pipeline.tools)
+    await sinhala_session.start()
+    await sinhala_session.feed_dtmf("2")
+
+    assert sinhala_pipeline.tools == [
+        tool for tool in original_sinhala_tools
+        if tool["name"] != "transfer_to_human"
+    ]
+
+    english_session, english_pipeline, _english_stt = make_session()
+    original_english_tools = list(english_pipeline.tools)
+    await english_session.start()
+    await english_session.feed_dtmf("1")
+
+    assert english_pipeline.tools == original_english_tools
 
 
 @pytest.mark.asyncio
