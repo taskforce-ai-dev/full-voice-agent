@@ -1749,6 +1749,13 @@ CAPTURE_ENDPOINTING_SILENCE_SECONDS: float = _parse_endpointing_seconds(
 CAPTURE_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "CAPTURE_FINAL_GRACE_SECONDS", 1.2, 0.2, 3.0
 )
+SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS = _parse_endpointing_seconds(
+    os.environ,
+    "SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS",
+    8.0,
+    3.0,
+    20.0,
+)
 
 # Upper bound for the only integer the post-dispatch STT telemetry emits. The
 # event records that a late provider result was ignored while a turn was already
