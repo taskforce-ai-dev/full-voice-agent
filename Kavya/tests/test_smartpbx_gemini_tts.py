@@ -151,7 +151,9 @@ def install_smartpbx_sink(pipeline):
 async def test_smartpbx_sinhala_gemini_pcm_is_downsampled_and_completed_once(monkeypatch):
     import server
 
-    assert server.SMARTPBX_SINHALA_GEMINI_TTS_VOICE == "Vindemiatrix"
+    monkeypatch.setattr(
+        server, "SMARTPBX_SINHALA_GEMINI_TTS_VOICE", "Vindemiatrix"
+    )
     pipeline, transport = make_sinhala_smartpbx_pipeline(server)
     monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
     pcm24k = bytes(range(256)) * 20
@@ -468,6 +470,27 @@ async def test_sinhala_smartpbx_stale_runner_cannot_send_after_supersession(monk
 
     assert transport.audio == []
     assert transport.marks == []
+
+
+@pytest.mark.asyncio
+async def test_smartpbx_sinhala_cancellation_cleans_speaking_without_media(monkeypatch):
+    import server
+
+    pipeline, transport = make_sinhala_smartpbx_pipeline(server)
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
+    stream = GatedAsyncStream([audio_event(bytes(range(256)) * 4)])
+    pipeline._gemini_tts_client = FakeGeminiTTSClient(stream)
+
+    task = asyncio.create_task(pipeline._tts_gemini_sinhala("සිංහල පිළිතුර"))
+    await stream.entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.done()
+    assert transport.audio == []
+    assert transport.marks == []
+    assert pipeline._is_speaking is False
 
 
 @pytest.mark.asyncio
