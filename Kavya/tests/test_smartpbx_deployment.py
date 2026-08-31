@@ -3117,3 +3117,55 @@ def test_kavya_generic_rejection_and_reviewed_image_gates_remain_intact():
     assert "expected_sha" in publisher
     assert "fresh successful read-only probe" in publisher
     assert "org.opencontainers.image.revision" in publisher
+
+
+def test_sinhala_smartpbx_settings_are_explicit_and_secret_safe():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    environment = compose["services"]["kavya-smartpbx"]["environment"]
+
+    assert environment["SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS"] == (
+        "${SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS:-8.0}"
+    )
+    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_MODEL"] == (
+        "${SMARTPBX_SINHALA_GEMINI_TTS_MODEL:-gemini-3.1-flash-tts-preview}"
+    )
+    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_VOICE"] == (
+        "${SMARTPBX_SINHALA_GEMINI_TTS_VOICE:-Vindemiatrix}"
+    )
+    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS"] == (
+        "${SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS:-15.0}"
+    )
+    assert environment["GEMINI_API_KEY"] == "${GEMINI_API_KEY:-}"
+
+    example = read_text(".env.example")
+    for name, default in (
+        ("SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS", "8.0"),
+        ("SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
+        ("SMARTPBX_SINHALA_GEMINI_TTS_VOICE", "Vindemiatrix"),
+        ("SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS", "15.0"),
+    ):
+        assert re.search(rf"^{name}={re.escape(default)}$", example, re.MULTILINE)
+    assert re.search(r"^GEMINI_API_KEY=$", example, re.MULTILINE)
+    assert "your_gemini_api_key_here" not in example
+
+
+def test_sinhala_smartpbx_runbook_documents_the_closed_gemini_tts_contract():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+
+    for required in (
+        "1 English, 2 Sinhala",
+        "timeout defaults to English",
+        "invalid selection replays once then defaults to English",
+        "existing Claude LLM",
+        "existing STT selection",
+        "gemini-3.1-flash-tts-preview",
+        "Vindemiatrix",
+        "There is deliberately no OpenAI, ElevenLabs, or Azure fallback for SmartPBX Sinhala TTS.",
+        "failure is closed/diagnostic",
+        "Gemini API key presence check",
+        "does not print the key",
+        "health/status checks",
+        "two-language canary call checklist",
+        "restore the prior image/config",
+    ):
+        assert required in runbook
