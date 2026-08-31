@@ -9379,8 +9379,6 @@ class MediaStreamSession:
                 },
                 generation_config={
                     "speech_config": [{
-                        "language": "si-LK",
-                        "speaker": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
                         "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
                     }],
                 },

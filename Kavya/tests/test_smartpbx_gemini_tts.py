@@ -184,8 +184,6 @@ async def test_smartpbx_sinhala_gemini_pcm_is_downsampled_and_completed_once(mon
         },
         "generation_config": {
             "speech_config": [{
-                "language": "si-LK",
-                "speaker": "Vindemiatrix",
                 "voice": "Vindemiatrix",
             }],
         },
