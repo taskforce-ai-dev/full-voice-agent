@@ -12,15 +12,20 @@ import pytest
 class _Transport:
     def __init__(self) -> None:
         self.audio: list[bytes] = []
+        self.marks: list[str] = []
+        self.session = None
+        self.speaking_at_send: list[bool] = []
 
     async def send_audio(self, audio: bytes) -> None:
+        if self.session is not None:
+            self.speaking_at_send.append(self.session._is_speaking)
         self.audio.append(audio)
 
     async def clear_audio(self) -> int:
         return 0
 
-    async def send_mark(self, _name: str) -> None:
-        return None
+    async def send_mark(self, name: str) -> None:
+        self.marks.append(name)
 
 
 def _direct_sinhala(server):
@@ -29,6 +34,7 @@ def _direct_sinhala(server):
         websocket=None, lang="si", media_transport=transport, llm_provider="claude",
     )
     session._smartpbx_transfer_context = object()
+    transport.session = session
     return session, transport
 
 
@@ -137,6 +143,13 @@ async def test_sinhala_is_not_speaking_until_gemini_emits_current_generation_aud
     stream.release.set()
     await task
     assert transport.audio
+    assert transport.speaking_at_send[0] is False
+    assert transport.marks == ["tts_done"]
+    assert session._is_speaking is False
+    assert session._tts_synthesis_in_flight is False
+    assert session._tts_synthesis_generation is None
+    assert task.done()
+    assert session._smartpbx_deferred_tts_tasks == set()
 
 
 @pytest.mark.asyncio
@@ -278,3 +291,58 @@ def test_sinhala_effort_knob_is_allowlisted_and_has_a_high_safety_fallback():
     assert server._resolve_smartpbx_sinhala_claude_effort("medium") == "medium"
     assert server._resolve_smartpbx_sinhala_claude_effort("high") == "high"
     assert server._resolve_smartpbx_sinhala_claude_effort("invalid") == "high"
+
+
+class _HangingClaudeStream:
+    async def __aenter__(self):
+        await asyncio.Event().wait()
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _HangingClaudeClient:
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+        self.messages = SimpleNamespace(stream=self.stream)
+
+    def stream(self, **kwargs):
+        self.requests.append(kwargs)
+        return _HangingClaudeStream()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lang", ["si", "en"])
+async def test_direct_claude_initial_timeout_recovers_in_the_selected_language(
+    monkeypatch, lang,
+):
+    import server
+
+    client = _HangingClaudeClient()
+    transport = _Transport()
+    session = server.MediaStreamSession(
+        websocket=None, lang=lang, media_transport=transport,
+        llm_provider="claude", anthropic_client=client,
+    )
+    transport.session = session
+    session._smartpbx_transfer_context = object()
+    spoken: list[str] = []
+
+    async def _speak(text, **_kwargs):
+        spoken.append(text)
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(server, "SMARTPBX_LLM_STALL_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(session, "_speak", _speak)
+
+    await asyncio.wait_for(
+        session._process_utterance_bound("caller question"), timeout=1.0
+    )
+
+    assert len(client.requests) == 1
+    assert len(spoken) == 1
+    if lang == "si":
+        assert "I'm sorry" not in spoken[0]
+    else:
+        assert spoken == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
