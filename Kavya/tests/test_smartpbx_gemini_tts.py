@@ -174,7 +174,7 @@ async def test_smartpbx_sinhala_gemini_pcm_is_downsampled_and_completed_once(mon
         "model": "gemini-3.1-flash-tts-preview",
         "input": "සිංහල පිළිතුර",
         "stream": True,
-        "response_modalities": ["AUDIO"],
+        "response_modalities": ["audio"],
         "response_mime_type": "audio/l16",
         "response_format": {
             "type": "audio",
