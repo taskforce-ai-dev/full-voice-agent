@@ -9368,6 +9368,7 @@ class MediaStreamSession:
                 if (
                     not self._is_speaking
                     or self._speak_generation != expected_generation
+                    or not self._current_smartpbx_runner_owns_shared_state()
                     or (
                         turn_generation is not None
                         and turn_generation >= 0
@@ -9403,6 +9404,7 @@ class MediaStreamSession:
                     if (
                         not self._is_speaking
                         or self._speak_generation != expected_generation
+                        or not self._current_smartpbx_runner_owns_shared_state()
                     ):
                         cancelled = True
                         break
@@ -9417,6 +9419,7 @@ class MediaStreamSession:
                 not cancelled
                 and self._is_speaking
                 and self._speak_generation == expected_generation
+                and self._current_smartpbx_runner_owns_shared_state()
                 and mulaw_buf
             ):
                 self._mark_smartpbx_turn_once("tts_first_chunk")
@@ -9430,6 +9433,7 @@ class MediaStreamSession:
                 and not cancelled
                 and self._is_speaking
                 and self._speak_generation == expected_generation
+                and self._current_smartpbx_runner_owns_shared_state()
             ):
                 await self._send_tts_done(
                     sentence=sentence,
