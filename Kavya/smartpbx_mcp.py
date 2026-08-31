@@ -42,11 +42,10 @@ _TRANSFER_CALL_NOT_FOUND = re.compile(
 # Authenticated Dialog UCP MCP tools/list on 2026-08-27 requires these exact
 # `transfer_call` keys. The production handover is the documented `BYPASS`
 # funnel tier. Our operator config keeps the safer `tel:`/`sip:` URI allowlist
-# form, so its scheme and plus sign are stripped only at this wire boundary.
+# form, and Dialog receives that validated configured value unchanged.
 _TRANSFER_DESTINATION_ARGUMENT = "destination number"
 _TRANSFER_TIER_ARGUMENT = "tier"
 _TRANSFER_TIER_BYPASS = "BYPASS"
-_TEL_SCHEME = "tel:"
 
 # Any digit run this long or longer is a phone number; never log one.
 _LOGGABLE_DIGITS = re.compile(r"[0-9]{5,}")
@@ -375,14 +374,7 @@ async def _open_session(
 
 
 def _wire_destination(destination: str) -> str:
-    """Render an allowlisted destination as the bare value Dialog's tool wants.
-
-    The current live schema takes `destination number` as digits for PSTN. A
-    `tel:` URI is operator-only notation (`tel:+94711754668` ->
-    `94711754668`); a `sip:` URI is already routable and is passed through whole.
-    """
-    if destination.startswith(_TEL_SCHEME):
-        return destination[len(_TEL_SCHEME):].lstrip("+")
+    """Pass the validated operator allowlist value unchanged to Dialog."""
     return destination
 
 

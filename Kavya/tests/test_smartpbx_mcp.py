@@ -196,7 +196,7 @@ async def test_transfer_uses_other_leg_call_id_and_exactly_one_configured_accoun
     assert session.events == [
         ("initialize",),
         ("call_tool", "transfer_call", {
-            "destination number": "94110000000",
+            "destination number": "tel:+94110000000",
             "tier": "BYPASS",
         }),
     ]
@@ -409,12 +409,8 @@ class AcknowledgedResult:
 
 
 @pytest.mark.asyncio
-async def test_transfer_sends_the_exact_current_dialog_arguments_without_aliases():
-    """Regression for the 2026-08-27 incident: current keys and values only.
-
-    `tel:` is allowlist notation only. Dialog needs the bare dialable value under
-    `destination number`, paired with the fixed `BYPASS` funnel tier.
-    """
+async def test_transfer_preserves_canonical_tel_destination_under_live_keys():
+    """The canonical allowlisted TEL destination is sent unchanged to Dialog."""
     fake_mcp = FakeSessionFactory(AcknowledgedResult())
 
     result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
@@ -424,11 +420,10 @@ async def test_transfer_sends_the_exact_current_dialog_arguments_without_aliases
     assert result.acknowledged is True
     name, arguments = fake_mcp.sessions[0].events[1][1], fake_mcp.sessions[0].events[1][2]
     assert name == "transfer_call"
-    assert arguments == {"destination number": "94110000000", "tier": "BYPASS"}
+    assert arguments == {"destination number": "tel:+94110000000", "tier": "BYPASS"}
     assert "number" not in arguments
     assert "destination_number" not in arguments
     assert "tier_name" not in arguments
-    assert not arguments["destination number"].startswith("tel:")
 
 
 @pytest.mark.asyncio
@@ -466,13 +461,8 @@ async def test_acknowledged_result_without_iserror_logs_acknowledged_not_success
 
 
 @pytest.mark.asyncio
-async def test_dialog_wire_uses_digits_only_for_tel_allowlists_without_legacy_aliases():
-    """The provider accepts only digits for PSTN transfer destinations.
-
-    Operator configuration remains canonical ``tel:+...``; only the Dialog wire
-    boundary may remove the URI scheme and plus sign. The live schema permits no
-    legacy aliases, so this checks the whole outbound arguments object.
-    """
+async def test_dialog_wire_preserves_canonical_tel_allowlists_without_legacy_aliases():
+    """Dialog receives the configured canonical TEL allowlist value unchanged."""
     pstn_mcp = FakeSessionFactory(AcknowledgedResult())
     pstn_control = DialogMCPCallControl(
         settings(
@@ -488,7 +478,7 @@ async def test_dialog_wire_uses_digits_only_for_tel_allowlists_without_legacy_al
 
     pstn_arguments = pstn_mcp.sessions[0].events[1][2]
     assert pstn_arguments == {
-        "destination number": "94711754668",
+        "destination number": "tel:+94711754668",
         "tier": "BYPASS",
     }
     assert not {"number", "destination_number", "tier_name"} & pstn_arguments.keys()
