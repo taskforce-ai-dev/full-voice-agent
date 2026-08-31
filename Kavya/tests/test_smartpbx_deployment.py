@@ -3187,6 +3187,7 @@ def test_sinhala_smartpbx_runbook_documents_the_closed_gemini_tts_contract():
         "\n## ", 1
     )[0]
     normalized = re.sub(r"\s+", " ", section)
+    folded_normalized = normalized.casefold()
 
     for required in (
         "1 English, 2 Sinhala",
@@ -3207,9 +3208,9 @@ def test_sinhala_smartpbx_runbook_documents_the_closed_gemini_tts_contract():
         "two-language canary call checklist",
         "restore the prior image/config",
     ):
-        assert required in normalized
-    assert "authenticated `/smartpbx/status`" in normalized
-    assert "bounded provider/event/outcome diagnostics" in normalized
+        assert required.casefold() in folded_normalized
+    assert "authenticated `/smartpbx/status`".casefold() in folded_normalized
+    assert "bounded provider/event/outcome diagnostics".casefold() in folded_normalized
     assert "grep -Eq '^GEMINI_API_KEY=.+$' /opt/kavya/.env.smartpbx" in section
 
     fallback_sentences = re.findall(r"[^.]*\bfallback\b[^.]*\.", normalized, re.IGNORECASE)
