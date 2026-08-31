@@ -288,9 +288,33 @@ def test_sinhala_effort_knob_is_allowlisted_and_has_a_high_safety_fallback():
     import server
 
     assert server._resolve_smartpbx_sinhala_claude_effort(None) == "medium"
+    assert server._resolve_smartpbx_sinhala_claude_effort("") == "medium"
+    assert server._resolve_smartpbx_sinhala_claude_effort("   ") == "medium"
     assert server._resolve_smartpbx_sinhala_claude_effort("medium") == "medium"
     assert server._resolve_smartpbx_sinhala_claude_effort("high") == "high"
     assert server._resolve_smartpbx_sinhala_claude_effort("invalid") == "high"
+
+
+@pytest.mark.asyncio
+async def test_pre_audio_callbacks_keep_latest_cumulative_hypothesis_once(monkeypatch):
+    import server
+
+    session, _transport = _direct_sinhala(server)
+    session._event_loop = asyncio.get_running_loop()
+    session._tts_synthesis_in_flight = True
+    session._tts_synthesis_generation = session._speak_generation
+    monkeypatch.setattr(server, "SMARTPBX_PRE_AUDIO_STT_MIN_SECONDS", 0.0)
+
+    session._on_stt_interim("I need")
+    await asyncio.sleep(0)
+    session._on_stt_result("I need a room")
+    await asyncio.sleep(0.02)
+
+    assert session._speak_generation == 1
+    assert session._pending_transcript == "I need a room"
+    assert "I need I need" not in session._pending_transcript
+    if session._endpointing_handle is not None:
+        session._endpointing_handle.cancel()
 
 
 class _HangingClaudeStream:
