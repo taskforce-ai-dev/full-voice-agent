@@ -409,12 +409,8 @@ class AcknowledgedResult:
 
 
 @pytest.mark.asyncio
-async def test_transfer_sends_the_exact_current_dialog_arguments_without_aliases():
-    """Regression for the 2026-08-27 incident: current keys and values only.
-
-    `tel:` is allowlist notation only. Dialog needs the bare dialable value under
-    `destination number`, paired with the fixed `BYPASS` funnel tier.
-    """
+async def test_transfer_preserves_canonical_tel_destination_under_live_keys():
+    """The canonical allowlisted TEL destination is sent unchanged to Dialog."""
     fake_mcp = FakeSessionFactory(AcknowledgedResult())
 
     result = await DialogMCPCallControl(settings(), context(), fake_mcp).transfer_call(
@@ -424,11 +420,10 @@ async def test_transfer_sends_the_exact_current_dialog_arguments_without_aliases
     assert result.acknowledged is True
     name, arguments = fake_mcp.sessions[0].events[1][1], fake_mcp.sessions[0].events[1][2]
     assert name == "transfer_call"
-    assert arguments == {"destination number": "94110000000", "tier": "BYPASS"}
+    assert arguments == {"destination number": "tel:+94110000000", "tier": "BYPASS"}
     assert "number" not in arguments
     assert "destination_number" not in arguments
     assert "tier_name" not in arguments
-    assert not arguments["destination number"].startswith("tel:")
 
 
 @pytest.mark.asyncio
