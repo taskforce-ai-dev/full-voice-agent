@@ -59,7 +59,7 @@ assignment_count() {
     /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
     $0 ~ "^[[:space:]]*" key "=" { count += 1 }
     END { print count + 0 }
-  ' -- "$1" 2>/dev/null
+  ' "$1" 2>/dev/null
 }
 
 candidate_is_claude() {
@@ -71,7 +71,7 @@ candidate_is_claude() {
       if ($0 != key "=" value) exit 1
     }
     END { exit seen == 1 ? 0 : 1 }
-  ' -- "$1" >/dev/null 2>&1
+  ' "$1" >/dev/null 2>&1
 }
 
 write_candidate() {
@@ -79,7 +79,7 @@ write_candidate() {
     /^[[:space:]]*#/ || /^[[:space:]]*$/ { print; next }
     $0 ~ "^[[:space:]]*" key "=" { print key "=" value; next }
     { print }
-  ' -- "$1" >"$2" 2>/dev/null
+  ' "$1" >"$2" 2>/dev/null
 }
 
 write_normalized_copy() {
@@ -87,7 +87,7 @@ write_normalized_copy() {
     /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
     $0 ~ "^[[:space:]]*" key "=" { print sentinel; next }
     { print }
-  ' -- "$1" >"$2" 2>/dev/null
+  ' "$1" >"$2" 2>/dev/null
 }
 
 record_metadata() {

@@ -3525,7 +3525,8 @@ def test_documented_sinhala_rollback_transaction_orders_failures_and_cleanup(tmp
             "docker",
             'printf "docker %s\\n" "$*" >> "$FAKE_LOG"\n'
             '[[ "$*" == *" config"* ]] || exit 1\n'
-            '[[ ${FAKE_CONFIG_FAIL:-0} == 1 ]] && exit 1\n',
+            'if [[ ${FAKE_CONFIG_FAIL:-0} == 1 ]]; then exit 1; fi\n'
+            'exit 0\n',
         )
         fake(
             "curl",
@@ -3618,7 +3619,10 @@ def test_documented_sinhala_rollback_transaction_orders_failures_and_cleanup(tmp
     deploys = [line for line in operations if line.startswith("deploy ")]
     assert len(deploys) == 2 and deploys[0] == deploys[1]
     restore_index = next(i for i, line in enumerate(operations) if line.startswith("updater restore "))
-    assert restore_index < operations.index(deploys[1])
+    second_deploy_index = [
+        i for i, line in enumerate(operations) if line.startswith("deploy ")
+    ][1]
+    assert restore_index < second_deploy_index
     assert operations.index("cleanup_backup_present") < next(
         i for i, line in enumerate(operations) if line.startswith("curl ")
     )

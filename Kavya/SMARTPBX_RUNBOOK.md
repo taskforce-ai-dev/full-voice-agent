@@ -235,7 +235,7 @@ exactly once.
 Never run `docker compose up`, `recreate`, or `restart` directly for this
 rollback.
 
-After the guarded deployment, run this two-language canary checklist:
+After the guarded deployment, run this **two-language canary call checklist**:
 
 1. Call the SmartPBX endpoint, press `1`, and confirm the English pipeline.
 2. Call again, press `2`, and confirm Azure `si-LK`, Gemini LLM, and Gemini
