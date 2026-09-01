@@ -3427,7 +3427,7 @@ def test_sinhala_provider_updater_transaction_uses_only_its_private_backup(tmp_p
     protected = tmp_path / "protected.env"
     transaction = tmp_path / "rollback"
     protected.write_text(
-        "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=gemini\n",
+        "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=gemini\nSMARTPBX_WS_TOKEN=fake\n",
         encoding="utf-8",
     )
     transaction.mkdir(mode=0o700)
@@ -3476,7 +3476,7 @@ fi
     assert applied.returncode == 0
     assert applied.stdout == "SMARTPBX_SINHALA_PROVIDER_APPLIED\n"
     assert protected.read_text(encoding="utf-8") == (
-        "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=claude\n"
+        "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=claude\nSMARTPBX_WS_TOKEN=fake\n"
     )
     assert {entry.name for entry in transaction.iterdir()} == {"backup.env", "metadata", "pending"}
 
