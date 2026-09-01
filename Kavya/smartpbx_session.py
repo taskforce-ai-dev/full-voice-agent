@@ -385,7 +385,15 @@ class KavyaSmartPBXSession:
             tools = _without_transfer_tool(server.get_tools_gemini(), "gemini")
         elif profile.llm_provider == "claude":
             client = getattr(pipeline, "anthropic_client", None) or server._get_anthropic_client()
-            tools = _without_transfer_tool(server.get_tools(), "claude")
+            # An injected Claude pipeline already owns its provider-native
+            # schema; preserve that contract while copying it below. A provider
+            # switch instead rebuilds the native Claude definition.
+            tools = (
+                getattr(pipeline, "tools", [])
+                if getattr(pipeline, "llm_provider", None) == "claude"
+                else server.get_tools()
+            )
+            tools = _without_transfer_tool(tools, "claude")
         elif profile.llm_provider == "openai":
             client = getattr(pipeline, "client", None) or server._get_client()
             tools = _without_transfer_tool(server.get_tools_openai(), "openai")
@@ -415,7 +423,12 @@ class KavyaSmartPBXSession:
                 tools = _without_transfer_tool(server.get_tools_gemini(), "gemini")
             elif profile.llm_provider == "claude":
                 client = getattr(pipeline, "anthropic_client", None) or server._get_anthropic_client()
-                tools = _without_transfer_tool(server.get_tools(), "claude")
+                tools = _without_transfer_tool(
+                    getattr(pipeline, "tools", [])
+                    if getattr(pipeline, "llm_provider", None) == "claude"
+                    else server.get_tools(),
+                    "claude",
+                )
             else:
                 client = getattr(pipeline, "client", None) or server._get_client()
                 tools = _without_transfer_tool(server.get_tools_openai(), "openai")
