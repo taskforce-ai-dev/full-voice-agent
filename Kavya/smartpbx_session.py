@@ -27,6 +27,14 @@ class _LanguageProfileSTTUnavailable(Exception):
     """A selected profile's recognizer could not be constructed pre-commit."""
 
 
+class _LanguageProfileClientUnavailable(Exception):
+    """The selected LLM provider has no usable client."""
+
+
+class _LanguageProfileSetupUnavailable(Exception):
+    """A provider-native tool/filter setup failed without exposing details."""
+
+
 @dataclass(frozen=True)
 class SmartPBXLanguageProfile:
     """The immutable provider/STT choices for one selected IVR language."""
@@ -343,6 +351,10 @@ class KavyaSmartPBXSession:
         self, pipeline: Any, requested: SmartPBXLanguageProfile,
     ) -> tuple[SmartPBXLanguageProfile, Any, list[dict[str, Any]], Any] | None:
         """Acquire one complete profile and recognizer without mutating a call."""
+        if requested.lang == "si" and requested.llm_provider not in {"gemini", "claude"}:
+            self._emit_language_profile_unavailable(requested, provider="invalid")
+            self._end_call_without_language_profile(requested)
+            return None
         try:
             return self._prepare_language_profile(pipeline, requested)
         except asyncio.CancelledError:
@@ -351,11 +363,18 @@ class KavyaSmartPBXSession:
             self._emit_language_profile_unavailable(requested)
             self._end_call_without_language_profile(requested)
             return None
-        except Exception:
+        except _LanguageProfileClientUnavailable:
             if requested.lang != "si" or requested.llm_provider != "gemini":
-                self._emit_language_profile_unavailable(requested)
+                self._emit_language_profile_unavailable(requested, provider=requested.llm_provider)
                 self._end_call_without_language_profile(requested)
                 return None
+            fallback_reason = "client_unavailable"
+        except (_LanguageProfileSetupUnavailable, Exception):
+            if requested.lang != "si" or requested.llm_provider != "gemini":
+                self._emit_language_profile_unavailable(requested, provider=requested.llm_provider)
+                self._end_call_without_language_profile(requested)
+                return None
+            fallback_reason = "provider_setup_unavailable"
         # A Gemini client/setup failure has one bounded Sinhala Claude rollback.
         import server
         fallback = SmartPBXLanguageProfile(
@@ -370,13 +389,17 @@ class KavyaSmartPBXSession:
             self._emit_language_profile_unavailable(fallback)
             self._end_call_without_language_profile(fallback)
             return None
-        except Exception:
+        except _LanguageProfileClientUnavailable:
             self._emit_language_profile_unavailable(fallback, provider="none")
+            self._end_call_without_language_profile(fallback)
+            return None
+        except (_LanguageProfileSetupUnavailable, Exception):
+            self._emit_language_profile_unavailable(fallback, provider="claude")
             self._end_call_without_language_profile(fallback)
             return None
         logger.warning(
             "smartpbx_media event=language_profile_fallback lang=si "
-            "from=gemini to=claude reason=client_unavailable"
+            "from=gemini to=claude reason=%s", fallback_reason
         )
         return prepared
 
@@ -393,19 +416,39 @@ class KavyaSmartPBXSession:
             client = None
             tools = getattr(pipeline, "tools", [])
         elif profile.llm_provider == "gemini":
-            client = getattr(pipeline, "gemini_client", None) or server._get_gemini_client()
-            tools = _without_transfer_tool(server.get_tools_gemini(), "gemini")
+            try:
+                client = getattr(pipeline, "gemini_client", None) or server._get_gemini_client()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise _LanguageProfileClientUnavailable from exc
+            try:
+                tools = _without_transfer_tool(server.get_tools_gemini(), "gemini")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise _LanguageProfileSetupUnavailable from exc
         elif profile.llm_provider == "claude":
-            client = getattr(pipeline, "anthropic_client", None) or server._get_anthropic_client()
+            try:
+                client = getattr(pipeline, "anthropic_client", None) or server._get_anthropic_client()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise _LanguageProfileClientUnavailable from exc
             # An injected Claude pipeline already owns its provider-native
             # schema; preserve that contract while copying it below. A provider
             # switch instead rebuilds the native Claude definition.
-            tools = (
-                getattr(pipeline, "tools", [])
-                if getattr(pipeline, "llm_provider", None) == "claude"
-                else server.get_tools()
-            )
-            tools = _without_transfer_tool(tools, "claude")
+            try:
+                tools = (
+                    getattr(pipeline, "tools", [])
+                    if getattr(pipeline, "llm_provider", None) == "claude"
+                    else server.get_tools()
+                )
+                tools = _without_transfer_tool(tools, "claude")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise _LanguageProfileSetupUnavailable from exc
         elif profile.llm_provider == "openai":
             client = getattr(pipeline, "client", None) or server._get_client()
             tools = _without_transfer_tool(server.get_tools_openai(), "openai")
@@ -488,7 +531,7 @@ class KavyaSmartPBXSession:
         self._prepared_stt_cleanup_ids.add(id(stt))
         stop = getattr(stt, "stop", None)
         if callable(stop):
-            result = stop()
+            result = await asyncio.to_thread(stop)
             if inspect.isawaitable(result):
                 await result
 
