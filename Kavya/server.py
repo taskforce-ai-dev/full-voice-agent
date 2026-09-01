@@ -4964,8 +4964,16 @@ def _make_stt(
         azure_ready = (
             AZURE_STT_AVAILABLE
             and audioop is not None
-            and isinstance(AZURE_SPEECH_KEY, str)
-            and bool(AZURE_SPEECH_KEY.strip())
+            # Omitted provider is the legacy global-STT path, whose readiness
+            # predated Task 2 and deliberately did not validate the key here.
+            # Explicit Azure selection is the new fail-closed profile contract.
+            and (
+                provider is None
+                or (
+                    isinstance(AZURE_SPEECH_KEY, str)
+                    and bool(AZURE_SPEECH_KEY.strip())
+                )
+            )
         )
         if azure_ready:
             return AzureSTTStream(on_final_result, on_interim_result, lang, privacy_safe)
