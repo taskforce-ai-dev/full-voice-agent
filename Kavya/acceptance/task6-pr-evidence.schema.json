@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://taskforceai.dev/schemas/kavya/task6-pr-evidence-v1.json",
+  "title": "Kavya Task 6 PR acceptance evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "phase",
+    "identity",
+    "observations",
+    "operator_review",
+    "senior_review"
+  ],
+  "properties": {
+    "schema_version": {"const": "task6-pr-evidence/v1"},
+    "phase": {"const": "pr"},
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reviewed_pr_sha", "pr_number", "ci_run_id", "ci_run_attempt"],
+      "properties": {
+        "reviewed_pr_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "pr_number": {"type": "integer", "minimum": 1},
+        "ci_run_id": {"type": "integer", "minimum": 1, "maximum": 1000000000000},
+        "ci_run_attempt": {"type": "integer", "minimum": 1, "maximum": 1000}
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["synthetic_cases", "profile_snapshots", "turn_summaries", "overlap_summary"],
+      "properties": {
+        "synthetic_cases": {"type": "array", "minItems": 12, "items": {"$ref": "#/$defs/synthetic_case"}},
+        "profile_snapshots": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/profile_snapshot"}},
+        "turn_summaries": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/turn_summary"}},
+        "overlap_summary": {"$ref": "#/$defs/overlap_summary"}
+      }
+    },
+    "operator_review": {"$ref": "#/$defs/operator_review"},
+    "senior_review": {"$ref": "#/$defs/senior_review"}
+  },
+  "$defs": {
+    "case_id": {"type": "string", "pattern": "^[a-z0-9_]{1,64}$"},
+    "provider": {"enum": ["claude", "gemini", "openai"]},
+    "model": {"enum": ["claude-sonnet-4-5-20250929", "claude-sonnet-5", "gemini-2.5-flash", "gemini-3.7-flash", "gpt-4o"]},
+    "stt_locale": {"enum": ["en-US", "si-LK"]},
+    "tts_route": {"enum": ["elevenlabs", "gemini"]},
+    "outcome": {"enum": ["completed", "true_empty", "incomplete_tool_block", "malformed_tool_json", "stream_aborted", "timeout", "closed_failure"]},
+    "recovery_reason": {"enum": ["none", "quota", "server", "client", "empty", "malformed", "cancelled", "deadline", "tool_executed"]},
+    "reviewer_token": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+    "latency": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["latency_ms"],
+          "properties": {"latency_ms": {"type": "integer", "minimum": 0, "maximum": 600000}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["latency_upper_bound_ms", "upper_bound_is_conservative"],
+          "properties": {"latency_upper_bound_ms": {"type": "integer", "minimum": 0, "maximum": 600000}, "upper_bound_is_conservative": {"const": true}}
+        }
+      ]
+    },
+    "synthetic_case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "result", "initial_provider", "final_provider", "recovery_reason", "llm_request_count", "tool_call_count", "history_committed", "cleanup_owner_matched", "latency"],
+      "properties": {
+        "case_id": {"$ref": "#/$defs/case_id"},
+        "result": {"enum": ["pass", "fail"]},
+        "initial_provider": {"$ref": "#/$defs/provider"},
+        "final_provider": {"$ref": "#/$defs/provider"},
+        "recovery_reason": {"$ref": "#/$defs/recovery_reason"},
+        "llm_request_count": {"type": "integer", "minimum": 0, "maximum": 100},
+        "tool_call_count": {"type": "integer", "minimum": 0, "maximum": 100},
+        "history_committed": {"type": "boolean"},
+        "cleanup_owner_matched": {"type": "boolean"},
+        "latency": {"$ref": "#/$defs/latency"}
+      }
+    },
+    "profile_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "press", "language", "provider", "model", "stt_locale", "tts_route"],
+      "properties": {
+        "case_id": {"$ref": "#/$defs/case_id"},
+        "press": {"enum": [1, 2]},
+        "language": {"enum": ["en", "si"]},
+        "provider": {"$ref": "#/$defs/provider"},
+        "model": {"$ref": "#/$defs/model"},
+        "stt_locale": {"$ref": "#/$defs/stt_locale"},
+        "tts_route": {"$ref": "#/$defs/tts_route"}
+      }
+    },
+    "turn_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "llm_request_count", "tool_call_count", "history_committed", "cleanup_owner_matched", "outcome", "latency"],
+      "properties": {
+        "case_id": {"$ref": "#/$defs/case_id"},
+        "llm_request_count": {"type": "integer", "minimum": 0, "maximum": 100},
+        "tool_call_count": {"type": "integer", "minimum": 0, "maximum": 100},
+        "history_committed": {"type": "boolean"},
+        "cleanup_owner_matched": {"type": "boolean"},
+        "outcome": {"$ref": "#/$defs/outcome"},
+        "latency": {"$ref": "#/$defs/latency"}
+      }
+    },
+    "overlap_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["press1_profile_ok", "press2_profile_ok", "distinct_call_local_profiles", "cross_call_ownership_ok", "cross_call_tool_state_ok", "cross_call_cleanup_ok"],
+      "properties": {
+        "press1_profile_ok": {"const": true},
+        "press2_profile_ok": {"const": true},
+        "distinct_call_local_profiles": {"const": true},
+        "cross_call_ownership_ok": {"const": true},
+        "cross_call_tool_state_ok": {"const": true},
+        "cross_call_cleanup_ok": {"const": true}
+      }
+    },
+    "operator_review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fluent_and_intelligible", "thresholds_ok", "decision", "reviewer_token"],
+      "properties": {
+        "fluent_and_intelligible": {"type": "boolean"},
+        "thresholds_ok": {"type": "boolean"},
+        "decision": {"enum": ["approve", "rollback", "escalate"]},
+        "reviewer_token": {"$ref": "#/$defs/reviewer_token"}
+      }
+    },
+    "senior_review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["independent", "decision", "reviewer_token"],
+      "properties": {
+        "independent": {"const": true},
+        "decision": {"enum": ["approve", "rollback", "escalate"]},
+        "reviewer_token": {"$ref": "#/$defs/reviewer_token"}
+      }
+    }
+  }
+}
