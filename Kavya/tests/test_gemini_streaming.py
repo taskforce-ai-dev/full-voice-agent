@@ -1562,6 +1562,191 @@ def test_gemini_tool_shape_conversion_passes_anthropic_tools_through():
     assert server._claude_tools_from_gemini(None) == []
 
 
+def test_gemini_to_claude_conversion_deep_copies_mixed_tool_shapes(monkeypatch):
+    original_tools = [
+        {"function_declarations": [{
+            "name": "check_availability",
+            "description": "check rooms",
+            "parameters": {"type": "object", "properties": {"date": {"type": "string"}}},
+        }]},
+        {
+            "name": "capture_spoken_number",
+            "description": "parse digits",
+            "input_schema": {"type": "object", "properties": {"spoken": {"type": "string"}}},
+        },
+    ]
+    before = copy.deepcopy(original_tools)
+    converted = server._claude_tools_from_gemini(original_tools)
+    for tool in converted:
+        tool["input_schema"]["properties"]["temporary"] = {"type": "boolean"}
+    assert original_tools == before
+
+    session, _spoken = _session([], lang="si", smartpbx=True)
+    session.tools = original_tools
+    original_model = session.model
+    monkeypatch.setattr(
+        server,
+        "_claude_tools_from_gemini",
+        lambda _tools: (_ for _ in ()).throw(ValueError("local conversion invariant")),
+    )
+    with pytest.raises(ValueError, match="local conversion invariant"):
+        asyncio.run(session._run_claude_failover_turn())
+    assert session.llm_provider == "gemini"
+    assert session.model == original_model
+    assert session.tools is original_tools
+
+
+def test_direct_sinhala_gemini_failure_uses_claude_then_restores_full_profile(monkeypatch, caplog):
+    session, spoken = _session([], lang="si", smartpbx=True, model="gemini-3.7-flash")
+    session.gemini_client = FakeFlakyGemini([_QuotaError()])
+    session.anthropic_client = object()
+    original_tools = [{"function_declarations": [{
+        "name": "check_availability",
+        "description": "check rooms",
+        "parameters": {"type": "object", "properties": {"date": {"type": "string"}}},
+    }]}]
+    session.tools = original_tools
+    session.history = [{"role": "user", "content": "hello"}]
+    snapshot = (
+        session.lang, session.system_prompt, session.llm_provider, session.model,
+        session.tools, copy.deepcopy(session.tools), session.gemini_client,
+        session.anthropic_client, session._gemini_thinking_level,
+        session._smartpbx_gemini_max_tokens, session._speak_generation,
+        copy.deepcopy(session.history), copy.deepcopy(session.full_transcript),
+        session._tts_elevenlabs, session._tts_openai, session._tts_gemini_sinhala,
+    )
+    seen = {}
+
+    async def run_claude():
+        seen["profile"] = (session.llm_provider, session.model, session.lang)
+        seen["prompt"] = session._active_system_prompt()
+        seen["tools"] = session.tools
+        assert all("function_declarations" not in tool for tool in session.tools)
+        assert [tool["name"] for tool in session.tools] == ["check_availability"]
+        session.tools[0]["input_schema"]["properties"]["temporary"] = {"type": "string"}
+        await session._speak("සිංහල පිළිතුරක්.")
+        return "සිංහල පිළිතුරක්."
+
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(session, "_run_llm_claude", run_claude)
+    with caplog.at_level("WARNING", logger="server"):
+        assert asyncio.run(session._run_llm_gemini()) == "සිංහල පිළිතුරක්."
+    assert seen["profile"] == ("claude", server.CLAUDE_MODEL, "si")
+    assert "The caller selected Sinhala" in seen["prompt"]
+    assert spoken == ["සිංහල පිළිතුරක්."]
+    assert (session.lang, session.system_prompt, session.llm_provider, session.model,
+            session.tools, copy.deepcopy(session.tools), session.gemini_client,
+            session.anthropic_client, session._gemini_thinking_level,
+            session._smartpbx_gemini_max_tokens, session._speak_generation,
+            session.history, session.full_transcript, session._tts_elevenlabs,
+            session._tts_openai, session._tts_gemini_sinhala) == snapshot
+    assert session.tools[0]["function_declarations"][0]["parameters"] is not seen["tools"][0]["input_schema"]
+    failover_logs = [
+        record.getMessage() for record in caplog.records
+        if "event=llm_provider_failover" in record.getMessage()
+    ]
+    assert failover_logs == [
+        "smartpbx_media event=llm_provider_failover from=gemini to=claude reason=quota"
+    ]
+    assert all("hello" not in message and "check_availability" not in message for message in failover_logs)
+
+
+def test_direct_sinhala_sticky_fallback_uses_injected_client_without_global_key(monkeypatch):
+    session, _spoken = _session([], lang="si", smartpbx=True)
+    original_tools = copy.deepcopy(GEMINI_SHAPED_TOOLS)
+    session.tools = original_tools
+    session.anthropic_client = object()
+    session._gemini_failover_state["degraded"] = True
+    seen = []
+
+    async def run_claude():
+        seen.append((session.llm_provider, session.model, session.tools))
+        return "සිංහල පිළිතුරක්."
+
+    monkeypatch.setattr(server, "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(session, "_run_llm_claude", run_claude)
+    assert asyncio.run(session._run_llm_gemini()) == "සිංහල පිළිතුරක්."
+    assert session.gemini_client.requests == 0
+    assert seen[0][0:2] == ("claude", server.CLAUDE_MODEL)
+    assert all("function_declarations" not in tool for tool in seen[0][2])
+    assert session.tools is original_tools
+    assert session.llm_provider == "gemini"
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("claude failure"), asyncio.CancelledError()])
+def test_sinhala_fallback_restores_profile_when_claude_fails(monkeypatch, failure):
+    session, _spoken = _session([], lang="si", smartpbx=True)
+    original_tools = copy.deepcopy(GEMINI_SHAPED_TOOLS)
+    session.tools = original_tools
+    original_profile = (session.llm_provider, session.model, session.tools)
+
+    async def failing_claude():
+        session.tools[0]["input_schema"]["properties"]["temporary"] = {"type": "boolean"}
+        raise failure
+
+    monkeypatch.setattr(session, "_run_llm_claude", failing_claude)
+    with pytest.raises(type(failure)):
+        asyncio.run(session._run_claude_failover_turn())
+    assert (session.llm_provider, session.model, session.tools) == original_profile
+    assert session.tools is original_tools
+    assert "temporary" not in original_tools[0]["function_declarations"][0]["parameters"]["properties"]
+
+
+@pytest.mark.parametrize("local_error", [
+    ValueError("local parser sentinel"), OSError("local I/O sentinel"), asyncio.TimeoutError(),
+])
+def test_direct_sinhala_local_error_recovers_without_claude_replay(monkeypatch, local_error):
+    session, spoken = _session([], lang="si", smartpbx=True)
+    session.gemini_client = FakeFlakyGemini([local_error])
+    session.anthropic_client = object()
+    claude_calls = 0
+
+    async def run_claude():
+        nonlocal claude_calls
+        claude_calls += 1
+        return "must not run"
+
+    monkeypatch.setattr(session, "_run_llm_claude", run_claude)
+    result = asyncio.run(session._run_llm_gemini())
+    assert claude_calls == 0
+    assert result == spoken[-1]
+    assert "sentinel" not in result
+
+
+def test_direct_sinhala_delivered_partial_audio_never_replays_through_claude(monkeypatch):
+    session, spoken = _session(
+        [[_text_chunk("පළමු වාක්‍යය. "), _QuotaError()]], lang="si", smartpbx=True,
+    )
+    session._start_assistant_turn_delivery_tracking()
+    claude_calls = 0
+
+    async def delivered_tts(_text, *, sentence=None, turn_generation=None, **_kwargs):
+        session._record_delivered_sentence(sentence, turn_generation)
+        spoken.append(sentence)
+
+    async def run_claude():
+        nonlocal claude_calls
+        claude_calls += 1
+        return "must not run"
+
+    session._tts_gemini_sinhala = delivered_tts
+    session.anthropic_client = object()
+    monkeypatch.setattr(session, "_run_llm_claude", run_claude)
+    result = asyncio.run(session._run_llm_gemini())
+
+    assert claude_calls == 0
+    assert spoken[0] == "පළමු වාක්‍යය."
+    assert "පළමු වාක්‍යය." not in spoken[1:]
+    assert result.startswith("පළමු වාක්‍යය.")
+    assert session.history[0]["content"] == "පළමු වාක්‍යය."
+
+
+def test_gemini_provider_origin_rejects_boolean_status_codes():
+    assert server._gemini_provider_origin_reason(SimpleNamespace(status=True)) is None
+    assert server._gemini_provider_origin_reason(SimpleNamespace(status=False)) is None
+    assert server._gemini_provider_origin_reason(_QuotaError(status=429)) == "quota"
+
+
 @pytest.mark.asyncio
 async def test_media_stream_sticky_failover_sends_claude_shaped_tools(monkeypatch):
     session, spoken = _session([])

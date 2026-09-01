@@ -37,6 +37,7 @@ except ImportError:  # Python 3.13+ may require audioop-lts instead.
     audioop = None
 import base64
 import binascii
+import copy
 import contextlib
 import enum
 import json
@@ -2423,7 +2424,8 @@ def _build_system_prompt(lang: str = "en") -> str:
     """Build the system prompt for Claude, tailored to the caller's language.
 
     The language is determined by the IVR DTMF selection, so Claude does not
-    need to auto-detect — it responds exclusively in the chosen language.
+    need to auto-detect. Sinhala remains the main language but permits the
+    narrowly defined code-switching needed for hotel terms.
     """
     today = date.today().isoformat()
 
@@ -2431,15 +2433,19 @@ def _build_system_prompt(lang: str = "en") -> str:
     if lang == "si":
         language_rules = (
             "LANGUAGE RULES:\n"
-            "- The caller selected Sinhala. You MUST respond entirely in "
-            "Sinhala using native Unicode script "
-            "(e.g. '\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
-            "\u0D94\u0DB6\u0DA7 \u0D9A\u0DDC\u0DC4\u0DDD\u0DB8\u0DAF "
-            "\u0D8B\u0DAF\u0DC0\u0DCA \u0D9A\u0DBB\u0DB1\u0DCA\u0DB1\u0DDA?').\n"
-            "- NEVER use romanized Latin script for Sinhala words.\n"
-            "- NEVER respond in English unless the guest explicitly switches "
-            "to English.\n"
-            "- Use proper Sinhala grammar and a natural conversational tone.\n\n"
+            "- The caller selected Sinhala. Use Sinhala as the main language, in native "
+            "Unicode script. Speak in contemporary conversational Sri Lankan Sinhala, "
+            "not formal written or ceremonial Sinhala.\n"
+            "- Keep a routine reply to one short sentence and ask at most one question. "
+            "Use a second short sentence only when it carries necessary booking information.\n"
+            "- Natural English code-switching is allowed for official room names, Hatton "
+            "Hills, WhatsApp, and familiar hotel terms. Never romanize Sinhala words.\n"
+            "- Never switch the whole response to English unless the guest explicitly "
+            "switches to English.\n"
+            "- Preserve dates, prices, room names, guest counts, phone digits, and tool "
+            "results exactly while phrasing the surrounding response naturally.\n"
+            "- Never expose English-only internal recovery, keypad, validation, or tool "
+            "wording to the caller.\n\n"
         )
     elif lang == "ta":
         language_rules = (
@@ -3550,7 +3556,8 @@ async def _open_gemini_stream(
         else:
             unsupported_models.add(model)
         logger.warning(
-            "gemini_diagnostic event=thinking_config_rejected model=%s",
+            "gemini_diagnostic event=thinking_config_rejected model=%s "
+            "reason=unsupported_thinking_config",
             model,
         )
         degraded = {k: v for k, v in config.items() if k != "thinking_config"}
@@ -3658,6 +3665,10 @@ def _extract_gemini_exception_code(exc: Any) -> Any:
         if candidate is None:
             continue
 
+        # ``bool`` is an ``int`` subclass, but never an HTTP/provider code.
+        if isinstance(candidate, bool):
+            continue
+
         if isinstance(candidate, int):
             return candidate
 
@@ -3666,10 +3677,9 @@ def _extract_gemini_exception_code(exc: Any) -> Any:
             if stripped:
                 return stripped
 
-        if isinstance(candidate, bool):
-            continue
-
         candidate_value = getattr(candidate, "value", None)
+        if isinstance(candidate_value, bool):
+            continue
         if isinstance(candidate_value, int):
             return candidate_value
         if isinstance(candidate_value, str) and candidate_value.strip():
@@ -3705,6 +3715,44 @@ def _classify_gemini_exception(exc: Exception) -> str:
     if code.startswith("5") and len(code) == 3 and code.isdigit():
         return "server"
     return "client_error"
+
+
+class _GeminiProviderOriginError(Exception):
+    """Private direct-Sinhala marker for a recognized Gemini SDK failure."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _gemini_provider_origin_reason(exc: BaseException) -> str | None:
+    """Return a closed reason for a recognized Gemini provider failure only.
+
+    This intentionally does not examine exception text or Python exception
+    types: a local parser, invariant, recovery, or test-harness error must not
+    become eligible for a Claude replay merely because it looks transport-like.
+    """
+    raw_code = _extract_gemini_exception_code(exc)
+    if isinstance(raw_code, bool):
+        return None
+    if isinstance(raw_code, int):
+        if raw_code == 429:
+            return "quota"
+        if 500 <= raw_code <= 599:
+            return "server"
+        return None
+    if isinstance(raw_code, str):
+        code = raw_code.strip().upper()
+        if code in {"429", "RESOURCE_EXHAUSTED"}:
+            return "quota"
+        if len(code) == 3 and code.isdigit() and code.startswith("5"):
+            return "server"
+    return None
+
+
+def _is_gemini_provider_technical_error(exc: BaseException) -> bool:
+    """Whether Task 4's direct-Sinhala fallback may replay this failure."""
+    return isinstance(exc, (_GeminiEmptyTurnError, _GeminiProviderOriginError))
 
 
 class _GeminiEmptyTurnError(Exception):
@@ -3744,16 +3792,17 @@ def _claude_tools_from_gemini(tools: Any) -> list[dict[str, Any]]:
         declarations = entry.get("function_declarations")
         if declarations is None:
             if entry.get("name"):
-                converted.append(entry)
+                converted.append(copy.deepcopy(entry))
             continue
         for declaration in declarations:
             if not isinstance(declaration, dict) or not declaration.get("name"):
                 continue
             converted.append({
                 "name": declaration["name"],
-                "description": declaration.get("description", ""),
-                "input_schema": declaration.get("parameters")
-                or {"type": "object", "properties": {}},
+                "description": copy.deepcopy(declaration.get("description", "")),
+                "input_schema": copy.deepcopy(
+                    declaration.get("parameters") or {"type": "object", "properties": {}}
+                ),
             })
     return converted
 
@@ -5365,6 +5414,10 @@ class MediaStreamSession:
     def _is_direct_smartpbx_non_capture(self) -> bool:
         """Shared direct-call timeout/retry policy, excluding dictation flows."""
         return self._is_direct_smartpbx() and not self._is_capture_mode_active()
+
+    def _is_direct_smartpbx_sinhala(self) -> bool:
+        """Task 4 boundary; never broadens English or Twilio failure behavior."""
+        return self._is_direct_smartpbx() and self.lang == "si"
 
     def _reserve_smartpbx_initial_filler(self) -> _CallFillerLease:
         return self._smartpbx_filler_rotation.reserve(
@@ -8550,16 +8603,30 @@ class MediaStreamSession:
         previous_model = self.model
         previous_tools = self.tools
         previous_provider = self.llm_provider
-        self.model = CLAUDE_MODEL
-        if previous_provider == "gemini":
-            self.tools = _claude_tools_from_gemini(previous_tools)
-        self.llm_provider = "claude"
         try:
+            # Conversion itself can fail. Keep all temporary assignments inside
+            # this try so the original call profile is restored in every case.
+            self.model = CLAUDE_MODEL
+            if previous_provider == "gemini":
+                self.tools = _claude_tools_from_gemini(previous_tools)
+            self.llm_provider = "claude"
             return await self._run_llm_claude()
         finally:
             self.model = previous_model
             self.tools = previous_tools
             self.llm_provider = previous_provider
+
+    async def _fence_direct_sinhala_gemini_round(
+        self, *, tts_tasks: list[asyncio.Task], gen: int,
+    ) -> int:
+        """Retire only this failed Sinhala Gemini round before its next action."""
+        await self._smartpbx_cancel_stalled_filler(gen)
+        fenced_gen = await self._smartpbx_fence_stalled_generation(
+            tts_tasks=tts_tasks, gen=gen,
+        )
+        for task in tts_tasks:
+            self._discard_smartpbx_deferred_tts_task(task)
+        return fenced_gen
 
     async def _run_llm_gemini(self) -> str:
         """Gemini-native streaming version of _run_llm for Media Streams.
@@ -8572,6 +8639,7 @@ class MediaStreamSession:
         """
         if not self._current_smartpbx_runner_owns_shared_state():
             return ""
+        direct_sinhala = self._is_direct_smartpbx_sinhala()
         if self._gemini_failover_state.get("degraded") and self._gemini_failover_ready():
             logger.info(
                 "smartpbx_media event=llm_provider_failover from=gemini to=claude reason=sticky"
@@ -8588,9 +8656,22 @@ class MediaStreamSession:
         turn_tool_executed = False
         turn_full_text = ""
         turn_gen = self._speak_generation
+        turn_tts_tasks: list[asyncio.Task] = []
+        delivered_before_turn = len(self._delivered_sentences)
+
+        def _direct_sinhala_delivered_text() -> str:
+            """Commit only confirmed same-turn speech after a terminal fence."""
+            delivered = self._delivered_sentences[delivered_before_turn:]
+            delivered_text = " ".join(delivered)
+            if delivered_text:
+                self._append_assistant_history({
+                    "role": "assistant",
+                    "content": delivered_text,
+                })
+            return delivered_text
 
         async def _run_gemini_turn() -> str:
-            nonlocal turn_tool_executed, turn_full_text, turn_gen
+            nonlocal turn_tool_executed, turn_full_text, turn_gen, turn_tts_tasks
             full_text = ""
             fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
             smartpbx_filler_sent = False
@@ -8610,6 +8691,7 @@ class MediaStreamSession:
                 function_calls: list[dict] = []
                 sentence_buffer = ""
                 tts_tasks: list[asyncio.Task] = []
+                turn_tts_tasks = tts_tasks
                 has_tool_use = False
                 finish_reason = None
                 saw_terminal_metadata = False
@@ -8633,24 +8715,30 @@ class MediaStreamSession:
                     reported_output_tokens = None
 
                     async def _acquire_gemini_stream():
-                        return await _open_gemini_stream(
-                            self.gemini_client,
-                            model=self.model,
-                            contents=_history_to_gemini(
-                                self.history,
-                                include_function_call_ids=self._is_direct_smartpbx(),
-                            ),
-                            config=_build_gemini_config(
-                                system=self._active_system_prompt(),
-                                tools=self.tools,
+                        try:
+                            return await _open_gemini_stream(
+                                self.gemini_client,
                                 model=self.model,
-                                nudge=nudge,
-                                max_output_tokens=self._provider_max_tokens("gemini"),
-                                thinking_level=self._gemini_thinking_level,
+                                contents=_history_to_gemini(
+                                    self.history,
+                                    include_function_call_ids=self._is_direct_smartpbx(),
+                                ),
+                                config=_build_gemini_config(
+                                    system=self._active_system_prompt(),
+                                    tools=self.tools,
+                                    model=self.model,
+                                    nudge=nudge,
+                                    max_output_tokens=self._provider_max_tokens("gemini"),
+                                    thinking_level=self._gemini_thinking_level,
+                                    unsupported_models=self._gemini_thinking_unsupported_models,
+                                ),
                                 unsupported_models=self._gemini_thinking_unsupported_models,
-                            ),
-                            unsupported_models=self._gemini_thinking_unsupported_models,
-                        )
+                            )
+                        except Exception as exc:
+                            reason = _gemini_provider_origin_reason(exc)
+                            if direct_sinhala and reason is not None:
+                                raise _GeminiProviderOriginError(reason) from None
+                            raise
 
                     # Capture flows keep their pre-Phase-B logic (spec §5) —
                     # no stream-timeout guard while dictating a name/number.
@@ -8734,7 +8822,12 @@ class MediaStreamSession:
                             tts_tasks=tts_tasks,
                         )
 
-                    except Exception:
+                    except Exception as exc:
+                        if direct_sinhala:
+                            reason = _gemini_provider_origin_reason(exc)
+                            if reason is not None:
+                                raise _GeminiProviderOriginError(reason) from None
+                            raise
                         # A provider disconnect after a visible delta is an
                         # incomplete direct round, never a reason to commit
                         # or replay the partial work.  The outcome below
@@ -9094,9 +9187,66 @@ class MediaStreamSession:
                 return ""
             _note_gemini_success(self._gemini_failover_state)
             return response_text
+        except asyncio.CancelledError:
+            raise
+        except _GeminiProviderOriginError as exc:
+            # This marker is created only by the direct Sinhala Gemini SDK
+            # boundary. Fence its round before either provider can speak.
+            if not direct_sinhala:
+                raise
+            turn_gen = await self._fence_direct_sinhala_gemini_round(
+                tts_tasks=turn_tts_tasks, gen=turn_gen,
+            )
+            delivered_text = _direct_sinhala_delivered_text()
+            if delivered_text or turn_tool_executed:
+                return await self._smartpbx_speak_recovery_and_finish(
+                    tool_executed=turn_tool_executed, gen=turn_gen,
+                    full_text=delivered_text,
+                )
+            if not self._gemini_failover_ready():
+                return await self._smartpbx_speak_recovery_and_finish(
+                    tool_executed=False, gen=turn_gen, full_text="",
+                )
+            if len(self.history) > gemini_history_len:
+                self.history = self.history[:gemini_history_len]
+            logger.warning(
+                "smartpbx_media event=llm_provider_failover "
+                "from=gemini to=claude reason=%s",
+                exc.reason,
+            )
+            _note_gemini_failover(self._gemini_failover_state)
+            return await self._run_claude_failover_turn()
         except Exception as exc:
             if not self._current_smartpbx_runner_owns_shared_state():
                 return ""
+
+            if direct_sinhala:
+                turn_gen = await self._fence_direct_sinhala_gemini_round(
+                    tts_tasks=turn_tts_tasks, gen=turn_gen,
+                )
+                delivered_text = _direct_sinhala_delivered_text()
+                # Empty turns are an explicit provider condition. Local parser,
+                # invariant, recovery, and harness errors are not eligible to
+                # replay through Claude, even when their Python type resembles
+                # an SDK transport exception.
+                if (
+                    isinstance(exc, _GeminiEmptyTurnError)
+                    and not delivered_text
+                    and not turn_tool_executed
+                    and self._gemini_failover_ready()
+                ):
+                    if len(self.history) > gemini_history_len:
+                        self.history = self.history[:gemini_history_len]
+                    logger.warning(
+                        "smartpbx_media event=llm_provider_failover "
+                        "from=gemini to=claude reason=empty_response"
+                    )
+                    _note_gemini_failover(self._gemini_failover_state)
+                    return await self._run_claude_failover_turn()
+                return await self._smartpbx_speak_recovery_and_finish(
+                    tool_executed=turn_tool_executed, gen=turn_gen,
+                    full_text=delivered_text,
+                )
 
             reason = (
                 "empty_response" if isinstance(exc, _GeminiEmptyTurnError)

@@ -485,3 +485,42 @@ def test_prompt_promotes_obvious_next_step_proactively():
     """When the next action is obvious, Kavya should take it rather than wait."""
     assert "When the obvious next step after a repeated failure is available" in PROMPT
     assert "do the obvious next step instead of waiting to be asked again." in PROMPT.lower()
+
+
+def test_sinhala_prompt_requires_conversational_sri_lankan_speech_and_safe_code_switching():
+    """The active direct-SmartPBX prompt must retain the approved Sinhala policy."""
+    prompt = server._build_system_prompt("si")
+    for rule in (
+        "contemporary conversational Sri Lankan Sinhala",
+        "one short sentence and ask at most one question",
+        "official room names, Hatton Hills, WhatsApp, and familiar hotel terms",
+        "Preserve dates, prices, room names, guest counts, phone digits, and tool results exactly",
+        "Never switch the whole response to English unless the guest explicitly switches",
+        "Never expose English-only internal recovery, keypad, validation, or tool wording",
+    ):
+        assert rule in prompt
+    assert "MUST respond entirely in Sinhala" not in prompt
+    assert "NEVER respond in English unless the guest explicitly switches" not in prompt
+    assert "romanize Sinhala" in prompt
+
+    session = server.MediaStreamSession(
+        websocket=None, lang="si", media_transport=object(), llm_provider="gemini",
+    )
+    session._smartpbx_transfer_context = object()
+    active_prompt = session._active_system_prompt()
+    assert "SMARTPBX CALLER RHYTHM" in active_prompt
+    assert "Answer first in one or two concise sentences." in active_prompt
+    assert "Ask no more than one necessary next question." in active_prompt
+    assert "MUST respond entirely in Sinhala" not in active_prompt
+
+
+def test_english_prompt_contract_remains_english_only():
+    english_prompt = server._build_system_prompt("en")
+    assert "The caller selected English. Respond only in English." in english_prompt
+    for sinhala_rule in (
+        "contemporary conversational Sri Lankan Sinhala",
+        "Natural English code-switching is allowed",
+        "Never switch the whole response to English unless the guest explicitly switches",
+        "Never expose English-only internal recovery, keypad, validation, or tool wording",
+    ):
+        assert sinhala_rule not in english_prompt
