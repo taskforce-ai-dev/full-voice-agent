@@ -3563,7 +3563,8 @@ async def _iter_gemini_stream(stream) -> AsyncIterator[tuple[str, Any]]:
     """Normalise a native Gemini stream into ``(kind, payload)`` deltas.
 
     Kinds: ``"text"`` (str), ``"tool"`` (dict with name/args/thought_signature),
-    ``"finish"`` (finish reason or block reason).
+    ``"finish"`` (finish reason or block reason), and ``"usage"`` (the
+    reported candidate-token scalar or ``None``).
 
     Thought parts are DROPPED. On 3.x models the model's private reasoning
     arrives as ordinary text parts flagged ``thought=True``; speaking that to a
@@ -3572,6 +3573,10 @@ async def _iter_gemini_stream(stream) -> AsyncIterator[tuple[str, Any]]:
     lightweight fakes the tests stream through it.
     """
     async for chunk in stream:
+        usage_metadata = getattr(chunk, "usage_metadata", None)
+        if usage_metadata is not None:
+            yield "usage", getattr(usage_metadata, "candidates_token_count", None)
+
         candidates = getattr(chunk, "candidates", None)
         if not candidates:
             feedback = getattr(chunk, "prompt_feedback", None)
@@ -8597,6 +8602,7 @@ class MediaStreamSession:
                     has_tool_use = False
                     finish_reason = None
                     saw_terminal_metadata = False
+                    reported_output_tokens = None
 
                     async def _acquire_gemini_stream():
                         return await _open_gemini_stream(
@@ -8642,6 +8648,9 @@ class MediaStreamSession:
 
                         stream_opened = True
                         async for kind, payload in _iter_gemini_stream(response_iter):
+                            if kind == "usage":
+                                reported_output_tokens = payload
+                                continue
                             if kind == "finish":
                                 finish_reason = payload
                                 saw_terminal_metadata = True
@@ -8654,6 +8663,8 @@ class MediaStreamSession:
                                 self._mark_smartpbx_turn_once("llm_first_token")
                                 has_tool_use = True
                                 function_calls.append(payload)
+                                continue
+                            if kind != "text":
                                 continue
 
                             if initial_filler is not None:
@@ -8719,7 +8730,7 @@ class MediaStreamSession:
                             "outcome=%s stop_reason=%s output_tokens=%s attempt=%d",
                             outcome.value,
                             _normalized_gemini_stop_reason(finish_reason),
-                            _bounded_claude_output_tokens(None),
+                            _bounded_claude_output_tokens(reported_output_tokens),
                             _bounded_claude_attempt(attempt + 1),
                         )
                         if outcome is not SmartPBXGeminiRoundOutcome.COMPLETED:
@@ -10561,12 +10572,16 @@ async def _run_llm_streaming_gemini(
                     )
 
                     async for kind, payload in _iter_gemini_stream(response):
+                        if kind == "usage":
+                            continue
                         if kind == "finish":
                             finish_reason = payload
                             continue
                         if kind == "tool":
                             _cancel_slow()
                             function_calls.append(payload)
+                            continue
+                        if kind != "text":
                             continue
                         _cancel_slow()
                         text_content += payload
