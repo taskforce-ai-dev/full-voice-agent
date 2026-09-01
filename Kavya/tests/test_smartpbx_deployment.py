@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import re
 import json
@@ -3138,50 +3139,108 @@ def test_kavya_generic_rejection_and_reviewed_image_gates_remain_intact():
     assert "org.opencontainers.image.revision" in publisher
 
 
+SINHALA_LLM_DEFAULTS = {
+    "SMARTPBX_SINHALA_LLM_PROVIDER": "gemini",
+    "SMARTPBX_SINHALA_GEMINI_LLM_MODEL": "gemini-3.7-flash",
+    "SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL": "low",
+    "SMARTPBX_SINHALA_GEMINI_MAX_TOKENS": "600",
+}
+
+SINHALA_GEMINI_TTS_DEFAULTS = {
+    "SMARTPBX_SINHALA_GEMINI_TTS_MODEL": "gemini-3.1-flash-tts-preview",
+    "SMARTPBX_SINHALA_GEMINI_TTS_VOICE": "Vindemiatrix",
+    "SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS": "15.0",
+}
+
+
+def parse_redacted_active_env_assignments(text: str) -> dict[str, object]:
+    """Return assignment metadata without retaining dotenv values."""
+    counts: dict[str, int] = {}
+    classifications: dict[str, list[str]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        counts[name] = counts.get(name, 0) + 1
+        classifications.setdefault(name, []).append(
+            "blank" if value == "" else "whitespace" if not value.strip() else "nonblank"
+        )
+    return {"counts": counts, "classifications": classifications}
+
+
+def smartpbx_protected_template(runbook: str) -> str:
+    """Extract the dotenv fence under the isolated SmartPBX heading only."""
+    heading = "## Create the isolated server-side environment"
+    scoped = runbook.split(heading, 1)[1]
+    match = re.search(r"(?ms)^```dotenv\n(?P<body>.*?)^```\s*$", scoped)
+    assert match is not None
+    return match.group("body")
+
+
+def smartpbx_sinhala_rollback_transaction(runbook: str) -> str:
+    marker = "```sh\n# SmartPBX Sinhala LLM rollback transaction"
+    scoped = runbook.split(marker, 1)[1]
+    return "# SmartPBX Sinhala LLM rollback transaction" + scoped.split("```", 1)[0]
+
+
 def test_sinhala_smartpbx_settings_are_explicit_and_secret_safe():
     compose = yaml.safe_load(read_text("docker-compose.yml"))
-    environment = compose["services"]["kavya-smartpbx"]["environment"]
+    smartpbx = compose["services"]["kavya-smartpbx"]["environment"]
+    legacy = compose["services"]["kavya"]
 
-    assert environment["SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS"] == (
+    assert smartpbx["SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS"] == (
         "${SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS:-8.0}"
     )
-    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_MODEL"] == (
-        "${SMARTPBX_SINHALA_GEMINI_TTS_MODEL:-gemini-3.1-flash-tts-preview}"
-    )
-    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_VOICE"] == (
-        "${SMARTPBX_SINHALA_GEMINI_TTS_VOICE:-Vindemiatrix}"
-    )
-    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS"] == (
-        "${SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS:-15.0}"
-    )
-    assert environment["GEMINI_API_KEY"] == "${GEMINI_API_KEY:-}"
+    assert {name: smartpbx.get(name) for name in SINHALA_LLM_DEFAULTS} == {
+        name: f"${{{name}:-{value}}}" for name, value in SINHALA_LLM_DEFAULTS.items()
+    }
+    assert {name: smartpbx.get(name) for name in SINHALA_GEMINI_TTS_DEFAULTS} == {
+        name: f"${{{name}:-{value}}}" for name, value in SINHALA_GEMINI_TTS_DEFAULTS.items()
+    }
+    assert smartpbx["GEMINI_API_KEY"] == "${GEMINI_API_KEY:-}"
+    assert legacy["env_file"] == [".env"]
+    assert not set(SINHALA_LLM_DEFAULTS).intersection(legacy["environment"])
+    for name in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "HUMAN_AGENT_PHONE"):
+        assert name not in smartpbx
 
     example = read_text(".env.example")
-    for name, default in (
-        ("SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS", "8.0"),
-        ("SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
-        ("SMARTPBX_SINHALA_GEMINI_TTS_VOICE", "Vindemiatrix"),
-        ("SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS", "15.0"),
-    ):
+    for name, default in {
+        **SINHALA_LLM_DEFAULTS,
+        **SINHALA_GEMINI_TTS_DEFAULTS,
+        "SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS": "8.0",
+    }.items():
         assert re.search(rf"^{name}={re.escape(default)}$", example, re.MULTILINE)
     assert_exactly_one_blank_env_assignment(example, "GEMINI_API_KEY")
 
 
-def test_gemini_key_assignment_contract_rejects_later_or_duplicate_nonblank_values():
-    # Comments are documentation, not dotenv assignments. Any later active
-    # value, including a duplicate, must violate the same helper used above.
+def test_gemini_key_assignment_contract_rejects_duplicate_whitespace_or_later_active_values():
+    # Comments are documentation, not dotenv assignments. The protected
+    # template permits exactly one active *blank* key assignment, while the
+    # runtime gate separately requires exactly one stripped nonblank value.
+    def runtime_ready(text: str) -> bool:
+        parsed = parse_redacted_active_env_assignments(text)
+        return (
+            parsed["counts"].get("GEMINI_API_KEY") == 1
+            and parsed["classifications"].get("GEMINI_API_KEY") == ["nonblank"]
+        )
+
     commented_blank = "# GEMINI_API_KEY=ignored-comment\nGEMINI_API_KEY=\n"
     assert_exactly_one_blank_env_assignment(commented_blank, "GEMINI_API_KEY")
+    assert not runtime_ready(commented_blank)
+    assert runtime_ready("GEMINI_API_KEY=usable-secret\n")
 
     for invalid in (
-        "GEMINI_API_KEY=nonblank-value\n",
-        "GEMINI_API_KEY=\nGEMINI_API_KEY=later-nonblank-value\n",
+        "GEMINI_API_KEY= \n",
+        "GEMINI_API_KEY=\nGEMINI_API_KEY=\n",
+        "GEMINI_API_KEY=\nGEMINI_API_KEY=later-active\n",
     ):
-        with pytest.raises(AssertionError, match="exactly once as an active blank"):
-            assert_exactly_one_blank_env_assignment(invalid, "GEMINI_API_KEY")
+        parsed = parse_redacted_active_env_assignments(invalid)
+        assert not runtime_ready(invalid)
+        assert parsed["counts"]["GEMINI_API_KEY"] >= 1
 
 
-def test_sinhala_smartpbx_runbook_documents_the_closed_gemini_tts_contract():
+def test_sinhala_smartpbx_runbook_documents_the_llm_tts_and_transaction_contract():
     runbook = read_text("SMARTPBX_RUNBOOK.md")
     section = runbook.split("## SmartPBX Sinhala menu and Gemini TTS", 1)[1].split(
         "\n## ", 1
@@ -3194,28 +3253,384 @@ def test_sinhala_smartpbx_runbook_documents_the_closed_gemini_tts_contract():
         "timeout defaults to English",
         "invalid selection replays once then defaults to English",
         "Twilio behavior is unchanged",
-        "existing Claude LLM",
-        "existing STT selection",
-        "Only its TTS uses Gemini",
+        "Press 1",
+        "ElevenLabs",
+        "Press 2",
+        "Azure `si-LK`",
+        "gemini-3.7-flash",
+        "low",
+        "600",
+        "GEMINI_FAILOVER_TO_CLAUDE",
+        "usable Anthropic readiness",
         "gemini-3.1-flash-tts-preview",
         "Vindemiatrix",
-        "There is deliberately no OpenAI, ElevenLabs, or Azure fallback for SmartPBX Sinhala TTS.",
-        "failure is closed/diagnostic",
-        "Gemini API key presence check",
-        "GEMINI_API_KEY` only when Sinhala is enabled",
-        "does not print the key",
+        "no-output",
+        "stripped",
+        "before exposing the bilingual menu",
+        "offline-only",
+        "Gemini Transcribe",
+        "Chirp 2",
+        "StreamingRecognize",
+        "update_smartpbx_sinhala_provider.sh apply /opt/kavya/.env.smartpbx claude",
+        "update_smartpbx_sinhala_provider.sh restore /opt/kavya/.env.smartpbx",
+        "update_smartpbx_sinhala_provider.sh cleanup /opt/kavya/.env.smartpbx",
+        "config validation failure",
+        "post-recreate failure",
+        "same reviewed identity",
         "health/status checks",
         "two-language canary call checklist",
-        "restore the prior image/config",
     ):
         assert required.casefold() in folded_normalized
     assert "authenticated `/smartpbx/status`".casefold() in folded_normalized
     assert "bounded provider/event/outcome diagnostics".casefold() in folded_normalized
-    assert "grep -Eq '^GEMINI_API_KEY=.+$' /opt/kavya/.env.smartpbx" in section
+    for stale in ("Only its TTS uses Gemini", "Sinhala retains the existing Claude LLM"):
+        assert stale.casefold() not in folded_normalized
+    transaction = smartpbx_sinhala_rollback_transaction(runbook)
+    assert re.search(r"(?m)^.*docker compose.*\bup\b", transaction) is None
+    assert re.search(r"(?m)^.*docker compose.*\brestart\b", transaction) is None
 
-    fallback_sentences = re.findall(r"[^.]*\bfallback\b[^.]*\.", normalized, re.IGNORECASE)
-    assert fallback_sentences
-    assert all(
-        re.search(r"\b(?:no|do not)\b", sentence, re.IGNORECASE)
-        for sentence in fallback_sentences
-    ), "the Sinhala section must not describe an enabled fallback"
+
+def test_smartpbx_sinhala_llm_rendered_compose_and_protected_template_contract(tmp_path):
+    # Use an isolated project directory. Never let Compose discover the real
+    # repository .env, .env.smartpbx, Docker configuration, or any secret.
+    project = tmp_path / "compose-project"
+    project.mkdir()
+    compose_file = project / "docker-compose.yml"
+    shutil.copyfile(PROJECT_ROOT / "docker-compose.yml", compose_file)
+    names = sorted(
+        set(re.findall(r"\$\{([A-Z0-9_]+)(?::-[^}]*)?\}", read_text("docker-compose.yml")))
+    )
+    safe_env = project / ".env"
+    safe_smartpbx_env = project / ".env.smartpbx"
+    safe_values = {name: "" for name in names}
+    safe_values["SMARTPBX_IMAGE_TAG"] = "reviewed-image"
+    # The legacy service deliberately receives its ordinary `.env`, while the
+    # SmartPBX profile receives the protected `.env.smartpbx` allowlist.  Keep
+    # SmartPBX-only LLM controls out of the former in this isolated render.
+    legacy_values = {
+        name: value for name, value in safe_values.items()
+        if name not in SINHALA_LLM_DEFAULTS
+    }
+    safe_env.write_text(
+        "\n".join(f"{name}={value}" for name, value in legacy_values.items()) + "\n",
+        encoding="utf-8",
+    )
+    safe_smartpbx_env.write_text(
+        "\n".join(f"{name}={value}" for name, value in safe_values.items()) + "\n",
+        encoding="utf-8",
+    )
+
+    def render(overrides: dict[str, str]) -> dict:
+        values = {**safe_values, **overrides}
+        safe_smartpbx_env.write_text(
+            "\n".join(f"{name}={value}" for name, value in values.items()) + "\n",
+            encoding="utf-8",
+        )
+        rendered = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "--env-file",
+                str(safe_smartpbx_env),
+                "--profile",
+                "smartpbx",
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=project,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(project / "empty-home"),
+                "DOCKER_CONFIG": str(project / "empty-docker-config"),
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert rendered.returncode == 0, rendered.stderr
+        return json.loads(rendered.stdout)
+
+    defaults = render({})["services"]
+    assert set(defaults) == {"kavya", "kavya-smartpbx"}
+    assert {
+        name: defaults["kavya-smartpbx"]["environment"][name]
+        for name in SINHALA_LLM_DEFAULTS
+    } == SINHALA_LLM_DEFAULTS
+    assert not set(SINHALA_LLM_DEFAULTS).intersection(defaults["kavya"]["environment"])
+
+    overrides = {
+        "SMARTPBX_SINHALA_LLM_PROVIDER": "claude",
+        "SMARTPBX_SINHALA_GEMINI_LLM_MODEL": "gemini-3.7-flash-canary",
+        "SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL": "high",
+        "SMARTPBX_SINHALA_GEMINI_MAX_TOKENS": "777",
+    }
+    rendered_overrides = render(overrides)["services"]
+    assert {
+        name: rendered_overrides["kavya-smartpbx"]["environment"][name]
+        for name in overrides
+    } == overrides
+    assert not set(overrides).intersection(rendered_overrides["kavya"]["environment"])
+
+    parsed = parse_redacted_active_env_assignments(
+        smartpbx_protected_template(read_text("SMARTPBX_RUNBOOK.md"))
+    )
+    for name in {**SINHALA_LLM_DEFAULTS, **SINHALA_GEMINI_TTS_DEFAULTS}:
+        assert parsed["counts"].get(name) == 1
+        assert parsed["classifications"].get(name) == ["nonblank"]
+    assert parsed["counts"].get("GEMINI_API_KEY") == 1
+    assert parsed["classifications"].get("GEMINI_API_KEY") == ["blank"]
+
+
+def test_sinhala_provider_updater_is_a_closed_redacted_root_transaction():
+    updater = PROJECT_ROOT / "scripts" / "update_smartpbx_sinhala_provider.sh"
+    assert updater.is_file()
+    assert os.access(updater, os.X_OK)
+    script = updater.read_text(encoding="utf-8")
+    for required in (
+        "PROTECTED_FILE=/opt/kavya/.env.smartpbx",
+        "TRANSACTION_DIR=/opt/kavya/.smartpbx-sinhala-rollback",
+        "[[ $EUID -eq 0 ]]",
+        'apply) [[ $# -eq 3 && $2 == "$PROTECTED_FILE" && $3 == "$PROVIDER_VALUE" ]]',
+        'restore|cleanup) [[ $# -eq 2 && $2 == "$PROTECTED_FILE" ]]',
+        "flock -n 9",
+        "cmp -s",
+        "SMARTPBX_SINHALA_PROVIDER_APPLIED",
+        "SMARTPBX_SINHALA_PROVIDER_RESTORED",
+        "SMARTPBX_SINHALA_PROVIDER_CLEANED",
+        "SMARTPBX_SINHALA_PROVIDER_UPDATE_FAILED",
+    ):
+        assert required in script
+    for forbidden in ("cat \"$PROTECTED_FILE\"", "diff ", "set -x"):
+        assert forbidden not in script
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    for required in (
+        "The guarded image deployer does not install host-side scripts.",
+        "sudo test -x /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh",
+        "sudo chown root:root /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh",
+        "sudo chmod 0755 /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh",
+        "sudo install -d -o root -g root -m 0700 /opt/kavya/.smartpbx-sinhala-rollback",
+    ):
+        assert required in runbook
+
+
+def test_sinhala_provider_updater_transaction_uses_only_its_private_backup(tmp_path):
+    """Exercise a path-rewritten copy: never /opt/kavya or a real credential.
+
+    The production script deliberately accepts one fixed root path. Rewriting
+    just the literal path and root predicate gives the same shell transaction a
+    non-root, fake-command harness while preserving the closed original
+    interface asserted above.
+    """
+    protected = tmp_path / "protected.env"
+    transaction = tmp_path / "rollback"
+    protected.write_text(
+        "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=gemini\nSMARTPBX_WS_TOKEN=fake\n",
+        encoding="utf-8",
+    )
+    transaction.mkdir(mode=0o700)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name, body in {
+        "stat": """#!/usr/bin/env bash
+if [[ $1 == -c ]]; then
+  [[ ${!#} == */rollback ]] && printf '0:0:700\\n' || printf '0:0:600\\n'
+fi
+""",
+        "chown": "#!/usr/bin/env bash\nexit 0\n",
+        "chmod": "#!/usr/bin/env bash\nexit 0\n",
+        "install": "#!/usr/bin/env bash\nexit 0\n",
+        "curl": "#!/usr/bin/env bash\nprintf '%s\\n' '{\"status\":\"ok\",\"service_mode\":\"smartpbx\",\"active_sessions\":0,\"transfer_enabled\":false}'\n",
+        "jq": "#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n",
+    }.items():
+        path = fake_bin / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+
+    updater = (PROJECT_ROOT / "scripts" / "update_smartpbx_sinhala_provider.sh").read_text(
+        encoding="utf-8"
+    )
+    updater = updater.replace("/opt/kavya/.env.smartpbx", str(protected))
+    updater = updater.replace("/opt/kavya/.smartpbx-sinhala-rollback", str(transaction))
+    updater = updater.replace("[[ $EUID -eq 0 ]]", "true")
+    runner = tmp_path / "update.sh"
+    runner.write_text(updater, encoding="utf-8")
+    runner.chmod(0o755)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(runner), *args], text=True, capture_output=True, env=env, check=False
+        )
+
+    initial = protected.read_text(encoding="utf-8")
+    rejected = run("apply", str(tmp_path / "other.env"), "claude")
+    assert rejected.returncode != 0
+    assert protected.read_text(encoding="utf-8") == initial
+    assert not list(transaction.iterdir())
+
+    applied = run("apply", str(protected), "claude")
+    assert applied.returncode == 0
+    assert applied.stdout == "SMARTPBX_SINHALA_PROVIDER_APPLIED\n"
+    assert protected.read_text(encoding="utf-8") == (
+        "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=claude\nSMARTPBX_WS_TOKEN=fake\n"
+    )
+    assert {entry.name for entry in transaction.iterdir()} == {"backup.env", "metadata", "pending"}
+
+    restored = run("restore", str(protected))
+    assert restored.returncode == 0
+    assert restored.stdout == "SMARTPBX_SINHALA_PROVIDER_RESTORED\n"
+    assert protected.read_text(encoding="utf-8") == initial
+    assert {entry.name for entry in transaction.iterdir()} == {"backup.env", "metadata", "pending"}
+    cleaned = run("cleanup", str(protected))
+    assert cleaned.returncode == 0
+    assert cleaned.stdout == "SMARTPBX_SINHALA_PROVIDER_CLEANED\n"
+    assert not list(transaction.iterdir())
+
+
+def test_documented_sinhala_rollback_transaction_orders_failures_and_cleanup(tmp_path):
+    """Run the literal runbook transaction with fake host commands only."""
+    runbook_script = smartpbx_sinhala_rollback_transaction(
+        read_text("SMARTPBX_RUNBOOK.md")
+    )
+
+    def scenario(name: str, **switches: str) -> tuple[subprocess.CompletedProcess[str], list[str], Path, Path]:
+        root = tmp_path / name
+        app = root / "app"
+        scripts = app / "scripts"
+        tx = app / ".smartpbx-sinhala-rollback"
+        fake_bin = root / "bin"
+        scripts.mkdir(parents=True)
+        tx.mkdir(mode=0o700)
+        fake_bin.mkdir()
+        protected = app / ".env.smartpbx"
+        protected.write_text(
+            "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=gemini\nSMARTPBX_WS_TOKEN=fake\n",
+            encoding="utf-8",
+        )
+        (app / ".env").write_text("SAFE=1\n", encoding="utf-8")
+        log = root / "operations.log"
+        marker = root / "deploy-once"
+
+        def fake(name: str, body: str) -> None:
+            path = fake_bin / name
+            path.write_text("#!/usr/bin/env bash\nset -Eeuo pipefail\n" + body, encoding="utf-8")
+            path.chmod(0o755)
+
+        fake("sudo", 'printf "sudo %s\\n" "$*" >> "$FAKE_LOG"\nexec "$@"\n')
+        fake(
+            "docker",
+            'printf "docker %s\\n" "$*" >> "$FAKE_LOG"\n'
+            '[[ "$*" == *" config"* ]] || exit 1\n'
+            'if [[ ${FAKE_CONFIG_FAIL:-0} == 1 ]]; then exit 1; fi\n'
+            'exit 0\n',
+        )
+        fake(
+            "curl",
+            'printf "curl %s\\n" "$*" >> "$FAKE_LOG"\n'
+            "printf '%s\\n' '{\"status\":\"ok\",\"service_mode\":\"smartpbx\",\"active_sessions\":0,\"transfer_enabled\":false}'\n",
+        )
+        fake("jq", 'printf "jq %s\\n" "$*" >> "$FAKE_LOG"\ncat >/dev/null\n')
+        for command in ("stat", "install", "mktemp", "cp", "mv", "cmp"):
+            real = shutil.which(command)
+            assert real is not None
+            fake(
+                command,
+                f'printf "{command} %s\\n" "$*" >> "$FAKE_LOG"\nexec {real} "$@"\n',
+            )
+        fake(
+            "update_smartpbx_sinhala_provider.sh",
+            'printf "updater %s\\n" "$*" >> "$FAKE_LOG"\n'
+            'command=$1; protected=$2\n'
+            'if [[ $command == apply ]]; then\n'
+            '  [[ ${FAKE_APPLY_FAIL:-0} == 1 ]] && exit 1\n'
+            '  stat -c %a "$protected" >/dev/null\n'
+            '  install -m 600 /dev/null "$TX/backup.env"\n'
+            '  cp "$protected" "$TX/backup.env"\n'
+            '  tmp=$(mktemp "$TX/.candidate.XXXXXX")\n'
+            '  sed "s/^SMARTPBX_SINHALA_LLM_PROVIDER=.*/SMARTPBX_SINHALA_LLM_PROVIDER=claude/" "$protected" > "$tmp"\n'
+            '  cmp -s "$protected" "$protected"\n'
+            '  mv "$tmp" "$protected"\n'
+            '  : > "$TX/pending"\n'
+            'elif [[ $command == restore ]]; then\n'
+            '  cp "$TX/backup.env" "$protected"\n'
+            'elif [[ $command == cleanup ]]; then\n'
+            '  [[ -f $TX/backup.env ]] || exit 1\n'
+            '  printf "cleanup_backup_present\\n" >> "$FAKE_LOG"\n'
+            '  curl --fail http://127.0.0.1:8006/health | jq -e . >/dev/null\n'
+            '  curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e . >/dev/null\n'
+            '  rm -f "$TX"/*\n'
+            'else exit 1\nfi\n',
+        )
+        fake(
+            "deploy_smartpbx_image.sh",
+            'printf "deploy %s\\n" "$*" >> "$FAKE_LOG"\n'
+            'if [[ ${FAKE_DEPLOY_FAIL_ONCE:-0} == 1 && ! -e $DEPLOY_MARKER ]]; then touch "$DEPLOY_MARKER"; exit 1; fi\n',
+        )
+        # The runbook invokes fixed /opt/kavya script paths. Point those paths
+        # at this scenario's fake commands without changing its command order.
+        for command in ("update_smartpbx_sinhala_provider.sh", "deploy_smartpbx_image.sh"):
+            target = scripts / command
+            target.write_text((fake_bin / command).read_text(encoding="utf-8"), encoding="utf-8")
+            target.chmod(0o755)
+        driver = root / "runbook-transaction.sh"
+        driver.write_text(
+            "#!/usr/bin/env bash\n"
+            "REVIEWED_CI_SHORT_SHA=abcdef0\n"
+            "REVIEWED_FULL_COMMIT_SHA=abcdef0123456789abcdef0123456789abcdef01\n"
+            "REVIEWED_IMAGE_DIGEST=sha256:" + "0" * 64 + "\n"
+            + runbook_script.replace("/opt/kavya", str(app)),
+            encoding="utf-8",
+        )
+        driver.chmod(0o755)
+        env = {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FAKE_LOG": str(log),
+            "TX": str(tx),
+            "DEPLOY_MARKER": str(marker),
+            **switches,
+        }
+        result = subprocess.run([str(driver)], text=True, capture_output=True, env=env, check=False)
+        operations = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        return result, operations, protected, tx
+
+    apply_failed, operations, protected, tx = scenario("apply-failure", FAKE_APPLY_FAIL="1")
+    assert apply_failed.returncode != 0
+    assert operations == [f"sudo {protected.parent / 'scripts' / 'update_smartpbx_sinhala_provider.sh'} apply {protected} claude", f"updater apply {protected} claude"]
+    assert "SMARTPBX_SINHALA_LLM_PROVIDER=gemini" in protected.read_text(encoding="utf-8")
+    assert not list(tx.iterdir())
+
+    config_failed, operations, protected, tx = scenario("config-failure", FAKE_CONFIG_FAIL="1")
+    assert config_failed.returncode != 0
+    assert any(line.startswith("updater apply ") for line in operations)
+    restore_index = next(i for i, line in enumerate(operations) if line.startswith("updater restore "))
+    cleanup_index = next(i for i, line in enumerate(operations) if line.startswith("updater cleanup "))
+    assert restore_index < cleanup_index
+    assert not any(line.startswith("deploy ") for line in operations)
+    assert len([line for line in operations if line.startswith("updater cleanup ")]) == 1
+    assert "SMARTPBX_SINHALA_LLM_PROVIDER=gemini" in protected.read_text(encoding="utf-8")
+    assert not list(tx.iterdir())
+
+    retried, operations, protected, tx = scenario("post-recreate-failure", FAKE_DEPLOY_FAIL_ONCE="1")
+    assert retried.returncode == 0
+    deploys = [line for line in operations if line.startswith("deploy ")]
+    assert len(deploys) == 2 and deploys[0] == deploys[1]
+    restore_index = next(i for i, line in enumerate(operations) if line.startswith("updater restore "))
+    second_deploy_index = [
+        i for i, line in enumerate(operations) if line.startswith("deploy ")
+    ][1]
+    assert restore_index < second_deploy_index
+    assert operations.index("cleanup_backup_present") < next(
+        i for i, line in enumerate(operations) if line.startswith("curl ")
+    )
+    assert len([line for line in operations if line.startswith("updater cleanup ")]) == 1
+    assert not list(tx.iterdir())
+
+    successful, operations, _protected, tx = scenario("success")
+    assert successful.returncode == 0
+    assert len([line for line in operations if line.startswith("deploy ")]) == 1
+    assert len([line for line in operations if line.startswith("updater cleanup ")]) == 1
+    assert not list(tx.iterdir())

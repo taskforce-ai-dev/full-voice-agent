@@ -81,8 +81,16 @@ def _gemini_text(text: str):
     return _gemini_chunk(_gemini_part(text=text))
 
 
-def _gemini_tool(name: str, args: dict | None = None):
-    return _gemini_chunk(_gemini_part(function_call=SimpleNamespace(name=name, args=args or {})))
+def _gemini_terminal(finish_reason: str = "STOP"):
+    return _gemini_chunk(finish_reason=finish_reason)
+
+
+def _gemini_tool(name: str, args: dict | None = None, *, id: str = "review-tool-1"):
+    return _gemini_chunk(
+        _gemini_part(
+            function_call=SimpleNamespace(id=id, name=name, args=args or {})
+        )
+    )
 
 
 def _gemini_empty(finish_reason: str = "MAX_TOKENS"):
@@ -136,6 +144,20 @@ def _media_stream_session(*, gemini_turns, capture_mode: bool = False):
         model="gemini-2.5-flash", media_transport=FakeTransport(),
     )
     session.tools = []
+    # This helper represents only direct SmartPBX rounds. Every healthy round
+    # is production-shaped and explicitly terminal; intentionally incomplete
+    # EOF fixtures belong in the dedicated classifier tests instead.
+    gemini_turns = [
+        list(turn) + [_gemini_terminal()]
+        if isinstance(turn, list)
+        and not any(
+            getattr(chunk.candidates[0], "finish_reason", None)
+            for chunk in turn
+            if getattr(chunk, "candidates", None)
+        )
+        else turn
+        for turn in gemini_turns
+    ]
     session.gemini_client = FakeFlakyGemini(gemini_turns)
     session._smartpbx_transfer_context = object()
     session._capture_mode_active = capture_mode
@@ -147,6 +169,7 @@ def _media_stream_session(*, gemini_turns, capture_mode: bool = False):
 
     session._tts_elevenlabs = tts
     session._tts_openai = tts
+    session._tts_gemini_sinhala = tts
     return session, spoken
 
 

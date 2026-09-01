@@ -76,6 +76,10 @@ OPENAI_MODEL=gpt-4o
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash
 SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS=8.0
+SMARTPBX_SINHALA_LLM_PROVIDER=gemini
+SMARTPBX_SINHALA_GEMINI_LLM_MODEL=gemini-3.7-flash
+SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL=low
+SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=600
 SMARTPBX_SINHALA_GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 SMARTPBX_SINHALA_GEMINI_TTS_VOICE=Vindemiatrix
 SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS=15.0
@@ -146,44 +150,98 @@ The SmartPBX call menu is **1 English, 2 Sinhala**. The timeout defaults to
 English; an invalid selection replays once then defaults to English. This is a
 direct SmartPBX-only choice: Twilio behavior is unchanged.
 
-Sinhala retains the existing Claude LLM and existing STT selection. Only its
-TTS uses Gemini, with `gemini-3.1-flash-tts-preview` and voice
-`Vindemiatrix`.
+Press 1 keeps the English Azure STT -> Claude -> ElevenLabs pipeline. Press
+2 uses Azure `si-LK` -> Gemini `gemini-3.7-flash` at thinking level `low`
+with a separate `600`-token ceiling -> Gemini
+`gemini-3.1-flash-tts-preview` / `Vindemiatrix`. The Sinhala menu segment is
+also Gemini TTS and remains part of the bilingual menu before selection.
 
-There is deliberately no OpenAI, ElevenLabs, or Azure fallback for SmartPBX Sinhala TTS.
-A Gemini TTS failure is closed/diagnostic: retain the caller-facing failure
-behavior, inspect only the bounded provider/event/outcome diagnostics, and do
-not route speech to another provider.
+The Gemini credential check is no-output and stripped: exactly one active,
+nonblank `GEMINI_API_KEY` is required before exposing the bilingual menu,
+including to a caller who will press `1`. Blank, whitespace-only, duplicate,
+or later-active assignments fail closed before either menu segment or STT can
+start, with only the existing generic unavailable outcome. Never print or
+inspect the protected file outside the reviewed root-only procedures.
 
-Before enabling Sinhala, perform this Gemini API key presence check. It requires
-`GEMINI_API_KEY` only when Sinhala is enabled and does not print the key:
+Gemini-to-Claude fallback is call-local and conditional on both
+`GEMINI_FAILOVER_TO_CLAUDE` and usable Anthropic readiness. If either is
+unavailable, the bounded Gemini failure outcome remains. TTS remains selected
+by language and has no OpenAI, ElevenLabs, or Azure-TTS fallback. Diagnostics
+and canaries use bounded metadata only: never a key, transcript, response, or
+exception detail.
+
+Azure remains the live Sinhala STT provider. Gemini Transcribe, Chirp 2, and
+StreamingRecognize are offline-only evaluations; do not change the live STT
+route while operating this canary.
+
+### SmartPBX-only one-setting Sinhala LLM rollback
+
+This transaction changes only `SMARTPBX_SINHALA_LLM_PROVIDER=claude`; it does
+not change global `LLM_PROVIDER`, English, Twilio, STT, TTS, or any secret.
+First drain to authenticated `active_sessions=0`. The root-owned updater owns
+the locked `/opt/kavya/.smartpbx-sinhala-rollback` directory (already
+`root:root`, mode `0700`), its private mode-`0600` backup, all temporary files,
+and recorded original metadata. Operators do not create, name, inspect, or
+pass a backup path.
+
+The guarded image deployer does not install host-side scripts. Before this
+procedure, the reviewed `/opt/kavya` checkout must contain this utility and it
+must be root-owned mode `0755`; otherwise stop as a deployment blocker rather
+than assuming an image build installed it:
 
 ```sh
-set -euo pipefail
-cd /opt/kavya
-if ! grep -Eq '^GEMINI_API_KEY=.+$' /opt/kavya/.env.smartpbx; then
-  echo "GEMINI_API_KEY is required before enabling SmartPBX Sinhala" >&2
-  exit 1
-fi
-SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
+sudo test -x /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh
+sudo chown root:root /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh
+sudo chmod 0755 /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh
+sudo install -d -o root -g root -m 0700 /opt/kavya/.smartpbx-sinhala-rollback
 ```
 
-After the established guarded pinned-image recreate, run the normal authenticated
-health/status checks and this two-language canary call checklist:
+```sh
+# SmartPBX Sinhala LLM rollback transaction (covered by deployment-contract tests)
+rollback_smartpbx_sinhala_llm() {
+set -euo pipefail
+cd /opt/kavya
+if ! sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh apply /opt/kavya/.env.smartpbx claude; then
+  return 1
+fi
+[[ "$REVIEWED_CI_SHORT_SHA" =~ ^[0-9a-f]{7}$ ]]
+[[ "$REVIEWED_FULL_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+[[ "$REVIEWED_CI_SHORT_SHA" == "${REVIEWED_FULL_COMMIT_SHA:0:7}" ]]
+[[ "$REVIEWED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+if ! SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null; then
+  sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh restore /opt/kavya/.env.smartpbx
+  sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh cleanup /opt/kavya/.env.smartpbx
+  return 1
+fi
+if ! sudo /opt/kavya/scripts/deploy_smartpbx_image.sh "$REVIEWED_CI_SHORT_SHA" "$REVIEWED_FULL_COMMIT_SHA" "$REVIEWED_IMAGE_DIGEST"; then
+  sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh restore /opt/kavya/.env.smartpbx
+  sudo /opt/kavya/scripts/deploy_smartpbx_image.sh "$REVIEWED_CI_SHORT_SHA" "$REVIEWED_FULL_COMMIT_SHA" "$REVIEWED_IMAGE_DIGEST"
+fi
+sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh cleanup /opt/kavya/.env.smartpbx
+}
+rollback_smartpbx_sinhala_llm
+```
 
-1. Call the SmartPBX endpoint, select `1`, and confirm the existing English
-   Claude/STT/TTS path responds.
-2. Call again, select `2`, and confirm Sinhala retains Claude and STT while the
-   caller hears Gemini `Vindemiatrix` TTS from
-   `gemini-3.1-flash-tts-preview`.
-3. Confirm `/health` and authenticated `/smartpbx/status` are healthy, then
-   inspect only bounded Sinhala Gemini failure diagnostics if the second call
-   fails.
+The updater accepts only the fixed protected path and `claude`; it verifies one
+active provider assignment, normalized byte equality everywhere else, and the
+recorded owner/group/mode before atomic replacement. It prints fixed redacted
+status tokens only. A restore retains the private backup through the retry;
+`cleanup` is the terminal action and first performs authenticated health/status
+checks. Thus config validation failure restores then cleans up without any
+guarded deploy; post-recreate failure restores then retries with the same
+reviewed identity; successful authenticated health/status checks invoke cleanup
+exactly once.
 
-If either canary fails, restore the prior image/config, recreate only
-`kavya-smartpbx` through the established guarded deployment path, and repeat
-the authenticated health/status checks. Do not substitute a fallback TTS
-provider during rollback or diagnosis.
+Never run `docker compose up`, `recreate`, or `restart` directly for this
+rollback.
+
+After the guarded deployment, run this **two-language canary call checklist**:
+
+1. Call the SmartPBX endpoint, press `1`, and confirm the English pipeline.
+2. Call again, press `2`, and confirm Azure `si-LK`, Gemini LLM, and Gemini
+   `Vindemiatrix` TTS respond.
+3. Confirm `/health` and authenticated `/smartpbx/status`; inspect only
+   bounded provider/event/outcome diagnostics if the second call fails.
 
 ## Controlled startup pre-roll canary
 
@@ -264,8 +322,8 @@ headers carry only the dedicated WSS token; they never carry MCP credentials.
 ## Direct SmartPBX English reliability timing (Phase B)
 
 The shared timeout knobs govern direct SmartPBX English provider rounds and
-direct SmartPBX Sinhala Claude rounds. OpenAI/Gemini keep their existing
-English-only scope, and the initial filler remains an English-only policy.
+direct SmartPBX Sinhala Claude/Gemini rounds. The initial filler remains an
+English-only policy.
 Twilio Media Streams (Arabic/Sinhala/Tamil) and the Twilio ConversationRelay
 path are unaffected — none of this timing applies outside a direct SmartPBX
 call.
@@ -304,12 +362,15 @@ retry/recovery policy.
 ## Claude direct SmartPBX output budget (600-token canary)
 
 `SMARTPBX_MAX_TOKENS` (default `120`, clamp `[40, 200]`) is the shared direct
-SmartPBX English output budget and still governs the OpenAI and Gemini rounds
-unchanged. Claude is the one exception:
+SmartPBX English output budget and continues to govern OpenAI and English
+Gemini. Claude and profile-configured Sinhala Gemini are exceptions:
 
 - `SMARTPBX_CLAUDE_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) — the
   Claude-only direct SmartPBX English/Sinhala output budget. Leave it blank to
   take the default.
+- `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) —
+  the direct Sinhala Gemini ceiling. Gemini 3.x may consume thinking tokens;
+  this does not alter English Gemini's preserved shared-budget contract.
 
 For direct Sinhala SmartPBX only, `SMARTPBX_SINHALA_CLAUDE_EFFORT` accepts
 `medium` (default) or `high`. Thinking remains enabled in both modes; set
@@ -345,8 +406,9 @@ not a model fault.
 Nothing else moves: the global ConversationRelay/Twilio `MAX_TOKENS` (300),
 every Twilio-path budget, and the OpenAI/Gemini SmartPBX budgets are untouched.
 
-Each Claude round logs exactly one privacy-safe outcome line —
-`smartpbx_media event=llm_round_outcome provider=claude outcome=<enum>
+Each terminal-classified Claude or direct Gemini round logs exactly one
+privacy-safe outcome line —
+`smartpbx_media event=llm_round_outcome provider=<claude|gemini> outcome=<enum>
 stop_reason=<enum> output_tokens=<bounded n|unknown> attempt=<1-9>` — carrying
 no text, no tool arguments and no caller identifiers. See the cutover-gate
 allowlist below for the exact, closed field set. `outcome` is one of
@@ -355,8 +417,8 @@ allowlist below for the exact, closed field set. `outcome` is one of
 logs at WARNING.
 
 `true_empty` and `stream_aborted` are deliberately separate. `true_empty` means
-the model reported ending its turn (a `message_delta` or `message_stop`
-arrived) having produced nothing — a model-behaviour signal. `stream_aborted`
+the model reported terminal metadata having produced nothing — a
+model-behaviour signal. `stream_aborted`
 means the stream simply stopped arriving with no terminal metadata at all — a
 transport/connection signal. Treat a rising `stream_aborted` rate as a network
 or upstream-proxy investigation, never as a prompt problem.
@@ -470,7 +532,7 @@ sentinel as documented below.
 
 | Field | Type | Permitted values |
 | --- | --- | --- |
-| `provider` | bounded enum | `claude` only (this event is Claude-specific) |
+| `provider` | bounded enum | `claude`, `gemini` |
 | `outcome` | bounded enum | `completed`, `max_tokens_truncated`, `true_empty`, `incomplete_tool_block`, `malformed_tool_json`, `stream_aborted` |
 | `stop_reason` | bounded enum | `end_turn`, `max_tokens`, `tool_use`, `stop_sequence`, `refusal`, `none` (absent), `unknown` (anything else) |
 | `output_tokens` | bounded integer | `0`–`1000000`, clamped; or `unknown` when the stream reported no usage |

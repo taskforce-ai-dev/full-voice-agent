@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from smartpbx_protocol import CallContext, MediaFormat
+from smartpbx_session import KavyaSmartPBXSession
 
 
 class FakeTransport:
@@ -147,6 +149,155 @@ def install_smartpbx_sink(pipeline):
     return records
 
 
+class ActivatedSelectionStt:
+    def __init__(self):
+        self.starts = 0
+        self.stops = 0
+
+    def start(self):
+        self.starts += 1
+
+    def stop(self):
+        self.stops += 1
+
+    def feed(self, _payload):
+        return None
+
+
+def _selection_context():
+    return CallContext(
+        call_id="media-leg", other_leg_call_id="dialog-call",
+        caller_id_number="+94000000000", callee_id_number="+94110000000",
+        account_id="dialog-account", media_format=MediaFormat(encoding="g711_ulaw", sample_rate=8000),
+    )
+
+
+def _real_selection_session(server):
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport,
+        anthropic_client=object(), llm_provider="claude", model="test-model",
+    )
+    stt = ActivatedSelectionStt()
+    session = KavyaSmartPBXSession(
+        _selection_context(), transport, pipeline=pipeline,
+        stt_factory=lambda **_kwargs: stt,
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0), welcome_text="",
+        llm_provider="claude", model="test-model",
+    )
+    return session, pipeline, stt
+
+
+@pytest.mark.asyncio
+async def test_real_selected_profiles_keep_tts_routing_owned_by_lang(monkeypatch):
+    import server
+
+    english_session, english, english_stt = _real_selection_session(server)
+    sinhala_session, sinhala, sinhala_stt = _real_selection_session(server)
+    routes: list[tuple[str, str]] = []
+    canonical = SimpleNamespace(voice_id="canonical", model_id="canonical-model", request_voice_settings={})
+
+    async def quiet_tts(_text, **_kwargs):
+        return None
+
+    async def elevenlabs(text, **_kwargs):
+        assert server.load_kavya_english_voice_profile() is canonical
+        routes.append(("elevenlabs", text))
+
+    async def gemini(text, **_kwargs):
+        routes.append(("gemini", text))
+
+    monkeypatch.setattr(english, "_tts_elevenlabs", quiet_tts)
+    monkeypatch.setattr(english, "_tts_gemini_sinhala", quiet_tts)
+    monkeypatch.setattr(sinhala, "_tts_elevenlabs", quiet_tts)
+    monkeypatch.setattr(sinhala, "_tts_gemini_sinhala", quiet_tts)
+    monkeypatch.setattr(
+        server, "load_kavya_english_voice_profile",
+        lambda: (_ for _ in ()).throw(AssertionError("selection must not load TTS secrets")),
+    )
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(server, "get_tools_gemini", lambda: [])
+    sinhala.gemini_client = object()
+
+    await asyncio.gather(english_session.start(), sinhala_session.start())
+    await asyncio.gather(english_session.feed_dtmf("1"), sinhala_session.feed_dtmf("2"))
+    assert (english_stt.starts, sinhala_stt.starts) == (1, 1)
+
+    monkeypatch.setattr(server, "load_kavya_english_voice_profile", lambda: canonical)
+    monkeypatch.setattr(english, "_tts_elevenlabs", elevenlabs)
+    monkeypatch.setattr(english, "_tts_gemini_sinhala", gemini)
+    monkeypatch.setattr(sinhala, "_tts_elevenlabs", elevenlabs)
+    monkeypatch.setattr(sinhala, "_tts_gemini_sinhala", gemini)
+
+    await english._speak("English route")
+    await sinhala._speak("සිංහල Gemini route")
+    # A Gemini LLM rollback changes model execution, not the selected Sinhala TTS router.
+    sinhala.llm_provider = "claude"
+    await sinhala._speak("සිංහල Claude fallback route")
+
+    assert routes == [
+        ("elevenlabs", "English route"),
+        ("gemini", "සිංහල Gemini route"),
+        ("gemini", "සිංහල Claude fallback route"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_real_preselection_menu_retains_bilingual_lang_owned_tts(monkeypatch):
+    import server
+
+    session, pipeline, _stt = _real_selection_session(server)
+    routes: list[tuple[str, str]] = []
+
+    async def elevenlabs(text, **_kwargs):
+        routes.append(("elevenlabs", text))
+
+    async def gemini(text, **_kwargs):
+        routes.append(("gemini", text))
+
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", elevenlabs)
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", gemini)
+    await session.start()
+    await asyncio.sleep(0)
+
+    assert routes == [
+        ("elevenlabs", "For English, press 1."),
+        ("gemini", "සිංහල සඳහා, 2 ඔබන්න."),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_selected_language_keeps_tts_routing_owned_by_lang(monkeypatch):
+    """LLM fallback must not redirect selected Sinhala speech to ElevenLabs."""
+    import server
+
+    english = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=FakeTransport(), llm_provider="claude",
+    )
+    english._smartpbx_transfer_context = object()
+    sinhala = server.MediaStreamSession(
+        websocket=None, lang="si", media_transport=FakeTransport(), llm_provider="claude",
+    )
+    sinhala._smartpbx_transfer_context = object()
+    calls: list[tuple[str, str]] = []
+
+    async def elevenlabs(text, **_kwargs):
+        calls.append(("elevenlabs", text))
+
+    async def gemini(text, **_kwargs):
+        calls.append(("gemini", text))
+
+    monkeypatch.setattr(english, "_tts_elevenlabs", elevenlabs)
+    monkeypatch.setattr(english, "_tts_gemini_sinhala", gemini)
+    monkeypatch.setattr(sinhala, "_tts_elevenlabs", elevenlabs)
+    monkeypatch.setattr(sinhala, "_tts_gemini_sinhala", gemini)
+
+    await english._speak("English route")
+    await sinhala._speak("සිංහල")
+
+    assert calls == [("elevenlabs", "English route"), ("gemini", "සිංහල")]
+
+
 @pytest.mark.asyncio
 async def test_smartpbx_sinhala_gemini_pcm_is_downsampled_and_completed_once(monkeypatch):
     import server
@@ -217,11 +368,14 @@ async def test_smartpbx_sinhala_gemini_failure_never_calls_other_tts(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_smartpbx_sinhala_missing_gemini_key_fails_closed_without_client(monkeypatch, caplog):
+@pytest.mark.parametrize("credential", ["", " \t\n "])
+async def test_smartpbx_sinhala_missing_gemini_key_fails_closed_without_client(
+    monkeypatch, caplog, credential,
+):
     import server
 
     pipeline, transport = make_sinhala_smartpbx_pipeline(server)
-    monkeypatch.setattr(server, "GEMINI_API_KEY", "")
+    monkeypatch.setattr(server, "GEMINI_API_KEY", credential)
     monkeypatch.setattr(
         server,
         "_get_gemini_tts_client",

@@ -945,6 +945,91 @@ def test_smartpbx_stt_streams_can_disable_raw_sdk_transcript_logging(caplog):
     assert "raw azure stt transcript" not in caplog.text
 
 
+def test_azure_cancellation_signals_fatal_once_and_normal_stop_suppresses_it():
+    import server
+
+    canceled = server.AzureSTTStream(lambda _text: None, lang="si", privacy_safe=True)
+    canceled._running = True
+    fatal_calls: list[str] = []
+    canceled.on_fatal = lambda: fatal_calls.append("fatal")
+    event = SimpleNamespace(reason="canceled", error_details="private provider payload")
+
+    canceled._on_canceled(event)
+    canceled._on_canceled(event)
+
+    assert fatal_calls == ["fatal"]
+    assert canceled._running is False
+
+    stopped = server.AzureSTTStream(lambda _text: None, lang="si", privacy_safe=True)
+    stopped._running = True
+    stopped.on_fatal = lambda: fatal_calls.append("normal-stop")
+    stopped.stop()
+    stopped._on_canceled(event)
+
+    assert fatal_calls == ["fatal"]
+
+
+def test_explicit_sinhala_azure_is_fail_closed_when_sdk_is_unavailable(monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", False)
+    with pytest.raises(RuntimeError, match="requested STT provider unavailable"):
+        server._make_stt(
+            lambda _text: None,
+            lambda _text: None,
+            "si",
+            provider="azure",
+            fail_closed=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    (("AZURE_STT_AVAILABLE", False), ("audioop", None), ("AZURE_SPEECH_KEY", "  ")),
+)
+def test_explicit_sinhala_azure_is_fail_closed_when_a_required_dependency_is_missing(
+    monkeypatch, attribute, value,
+):
+    import server
+
+    monkeypatch.setattr(server, attribute, value)
+    with pytest.raises(RuntimeError, match="requested STT provider unavailable"):
+        server._make_stt(
+            lambda _text: None,
+            lambda _text: None,
+            "si",
+            provider="azure",
+            fail_closed=True,
+        )
+
+
+def test_configured_english_azure_keeps_existing_google_fallback(monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", False)
+    stream = server._make_stt(
+        lambda _text: None,
+        lambda _text: None,
+        "en",
+        provider="azure",
+        fail_closed=False,
+    )
+    assert isinstance(stream, server.GoogleSTTStream)
+
+
+def test_explicit_unknown_stt_provider_is_rejected():
+    import server
+
+    with pytest.raises(RuntimeError, match="requested STT provider unavailable"):
+        server._make_stt(
+            lambda _text: None,
+            lambda _text: None,
+            "si",
+            provider="unsupported",
+            fail_closed=True,
+        )
+
+
 def test_google_smartpbx_english_stt_constructs_en_us_without_duplicate_alternative(monkeypatch):
     import server
 
@@ -1740,6 +1825,13 @@ class _DirectToolStreamPause:
         self.release = asyncio.Event()
 
 
+class _DirectToolStreamRaise:
+    """A transport failure after prior native-Gemini chunks were consumed."""
+
+    def __init__(self, exc: BaseException):
+        self.exc = exc
+
+
 async def _direct_tool_event_stream(events):
     for event in events:
         if event is YIELD_TO_EVENT_LOOP:
@@ -1749,6 +1841,8 @@ async def _direct_tool_event_stream(events):
             event.entered.set()
             await event.release.wait()
             continue
+        if isinstance(event, _DirectToolStreamRaise):
+            raise event.exc
         yield event
 
 
@@ -1846,11 +1940,18 @@ def direct_tool_round(provider, arguments, preamble=None, tool_name="create_book
             parts.append(SimpleNamespace(text=preamble, function_call=None))
         parts.append(SimpleNamespace(
             text=None,
-            function_call=SimpleNamespace(name=tool_name, args=arguments),
+            function_call=SimpleNamespace(
+                id="gemini-tool-1", name=tool_name, args=arguments,
+            ),
         ))
-        return [SimpleNamespace(candidates=[SimpleNamespace(
-            finish_reason=None, content=SimpleNamespace(parts=parts),
-        )])]
+        return [
+            SimpleNamespace(candidates=[SimpleNamespace(
+                finish_reason=None, content=SimpleNamespace(parts=parts),
+            )]),
+            SimpleNamespace(candidates=[SimpleNamespace(
+                finish_reason="STOP", content=SimpleNamespace(parts=[]),
+            )]),
+        ]
     events = []
     if preamble is not None:
         events.append(SimpleNamespace(
@@ -1892,13 +1993,20 @@ def direct_tool_batch_round(provider, calls, *, preamble=None, yield_before=Fals
         parts.extend(
             SimpleNamespace(
                 text=None,
-                function_call=SimpleNamespace(name=name, args=arguments),
+                function_call=SimpleNamespace(
+                    id=f"gemini-tool-{index + 1}", name=name, args=arguments,
+                ),
             )
-            for name, arguments in calls
+            for index, (name, arguments) in enumerate(calls)
         )
-        return prefix + [SimpleNamespace(candidates=[SimpleNamespace(
-            finish_reason=None, content=SimpleNamespace(parts=parts),
-        )])]
+        return prefix + [
+            SimpleNamespace(candidates=[SimpleNamespace(
+                finish_reason=None, content=SimpleNamespace(parts=parts),
+            )]),
+            SimpleNamespace(candidates=[SimpleNamespace(
+                finish_reason="STOP", content=SimpleNamespace(parts=[]),
+            )]),
+        ]
     events = list(prefix)
     if preamble is not None:
         events.append(SimpleNamespace(
@@ -1930,10 +2038,15 @@ def direct_text_round(provider, text):
             delta=SimpleNamespace(content=text, tool_calls=None),
         )])]
     if provider == "gemini":
-        return [SimpleNamespace(candidates=[SimpleNamespace(
-            finish_reason=None,
-            content=SimpleNamespace(parts=[SimpleNamespace(text=text, function_call=None)]),
-        )])]
+        return [
+            SimpleNamespace(candidates=[SimpleNamespace(
+                finish_reason=None,
+                content=SimpleNamespace(parts=[SimpleNamespace(text=text, function_call=None)]),
+            )]),
+            SimpleNamespace(candidates=[SimpleNamespace(
+                finish_reason="STOP", content=SimpleNamespace(parts=[]),
+            )]),
+        ]
     return [
         SimpleNamespace(
             type="content_block_delta",
@@ -2400,8 +2513,8 @@ async def test_barged_in_slow_tool_cannot_leave_orphaned_provider_history(
     assert request_names == ["create_booking"]
     assert result_ids == request_ids
     assert direct_single_tool_pairs(provider, pipeline.history) == [
-        (new_arguments, "tool-1" if provider != "gemini" else "gemini_tc_0_0",
-         "tool-1" if provider != "gemini" else "gemini_tc_0_0"),
+        (new_arguments, "tool-1" if provider != "gemini" else "gemini-tool-1",
+         "tool-1" if provider != "gemini" else "gemini-tool-1"),
     ]
     history_after_current = list(pipeline.history)
     transcript_after_current = list(pipeline.full_transcript)
@@ -2418,8 +2531,8 @@ async def test_barged_in_slow_tool_cannot_leave_orphaned_provider_history(
     await asyncio.wait_for(old_task, timeout=1)
 
     assert direct_single_tool_pairs(provider, pipeline.history) == [
-        (new_arguments, "tool-1" if provider != "gemini" else "gemini_tc_0_0",
-         "tool-1" if provider != "gemini" else "gemini_tc_0_0"),
+        (new_arguments, "tool-1" if provider != "gemini" else "gemini-tool-1",
+         "tool-1" if provider != "gemini" else "gemini-tool-1"),
     ]
     assert direct_tool_request_inputs(provider, pipeline.history) == [new_arguments]
     request_ids, request_names, result_ids = direct_tool_history_records(
@@ -3336,24 +3449,659 @@ async def test_direct_smartpbx_provider_requests_use_the_concise_output_budget(
 
     request = client.requests[0]
     if provider == "gemini":
-        assert request["config"]["max_output_tokens"] == 120
+        assert request["config"]["max_output_tokens"] == server.SMARTPBX_MAX_TOKENS
     elif provider == "claude":
-        assert request["max_tokens"] == 600
         assert request["max_tokens"] == server.SMARTPBX_CLAUDE_MAX_TOKENS
     else:
-        assert request["max_tokens"] == 120
+        assert request["max_tokens"] == server.SMARTPBX_MAX_TOKENS
 
 
-def test_claude_smartpbx_budget_is_600_and_scoped_away_from_the_other_providers():
-    """The canary raises Claude alone. The shared SmartPBX budget, its
-    resolver and the global ConversationRelay budget must not move."""
+def test_smartpbx_budget_resolvers_are_pure_and_request_shape_uses_resolved_constants():
+    """Import-time deployment values are not test defaults."""
     import server
 
-    assert server.SMARTPBX_CLAUDE_MAX_TOKENS == 600
-    assert server.SMARTPBX_MAX_TOKENS == 120
-    assert server.MAX_TOKENS == 300
     assert server._resolve_smartpbx_max_tokens(None) == 120
     assert server._resolve_smartpbx_max_tokens("201") == 200
+    assert server._resolve_smartpbx_max_tokens("not-a-number") == 120
+    assert server._resolve_smartpbx_claude_max_tokens("199") == 200
+    assert server._resolve_smartpbx_claude_max_tokens("4096") == 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["acquire", "initial", "mid_stream"])
+async def test_direct_sinhala_gemini_deadline_is_bound_to_the_telemetry_owned_turn(
+    monkeypatch, phase,
+):
+    """Each Sinhala deadline fails through the owning turn boundary exactly once.
+
+    The spies prove the wrapper is actually installed.  The completed turn is
+    observed through ``SmartPBXTurnTelemetry.turns_summarized``, never by
+    counting a log record.
+    """
+    import server
+
+    # The mid-stream branch sees visible but incomplete text.  It deliberately
+    # lacks a sentence boundary, so only the seeded old-generation TTS task can
+    # hold the recovery lock; a partial answer must never be delivered.
+    client = direct_tool_client("gemini", [direct_text_round("gemini", "Late reply")])
+    pipeline = direct_tool_pipeline(server, "gemini", client, lang="si")
+    pipeline.model = "gemini-3.7-flash"
+    bind_direct_smartpbx_turn(server, pipeline)
+    wrapper_calls: list[str] = []
+    spoken: list[str] = []
+    held_tts_started = asyncio.Event()
+    held_tts_cancelled = asyncio.Event()
+    held_tts_release = asyncio.Event()
+    held_tts_text = "held stale Sinhala TTS"
+
+    async def sinhala_tts(text, **_kwargs):
+        if text == held_tts_text:
+            held_tts_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                held_tts_cancelled.set()
+                await held_tts_release.wait()
+                raise
+        else:
+            spoken.append(text)
+
+    async def acquire(callback, *, timeout):
+        wrapper_calls.append("acquire")
+        if phase == "acquire":
+            raise server._SmartPBXStreamTimeout(
+                phase=server._SmartPBXStreamTimeout.PHASE_INITIAL,
+            )
+        return await callback()
+
+    async def guarded(source, **_kwargs):
+        wrapper_calls.append("guard")
+        if phase == "initial":
+            raise server._SmartPBXStreamTimeout(
+                phase=server._SmartPBXStreamTimeout.PHASE_INITIAL,
+            )
+        seen = False
+        async for item in source:
+            yield item
+            seen = True
+            if phase == "mid_stream" and seen:
+                raise server._SmartPBXStreamTimeout(
+                    phase=server._SmartPBXStreamTimeout.PHASE_STALL,
+                )
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", sinhala_tts)
+    monkeypatch.setattr(server, "_smartpbx_acquire_stream_within_deadline", acquire)
+    monkeypatch.setattr(server, "_smartpbx_timeout_guarded_stream", guarded)
+
+    held_task = pipeline._start_smartpbx_round_tts(
+        held_tts_text,
+        generation=pipeline._speak_generation,
+        sentence=held_tts_text,
+    )
+    assert held_task is not None
+    await asyncio.wait_for(held_tts_started.wait(), timeout=1)
+    controller, filler_cancelled, filler_release = await _held_sinhala_initial_filler(
+        server, pipeline,
+    )
+    turn_task = asyncio.create_task(
+        pipeline._process_utterance_bound("safe Sinhala guest turn")
+    )
+    try:
+        await asyncio.wait_for(filler_cancelled.wait(), timeout=1)
+        assert not turn_task.done()
+        assert not held_task.done()
+        assert controller._task is not None and not controller._task.done()
+        filler_release.set()
+
+        # `_smartpbx_handle_stream_timeout` must await its initial filler
+        # before it reaches the old-generation sentence-task fence. Releasing
+        # TTS first would hide that ordering and let a deadlocked recovery
+        # appear to pass.
+        await asyncio.wait_for(held_tts_cancelled.wait(), timeout=1)
+        assert not turn_task.done()
+        assert controller._task is not None and controller._task.done()
+        held_tts_release.set()
+        await asyncio.wait_for(turn_task, timeout=1)
+
+        assert wrapper_calls == (
+            ["acquire"] if phase == "acquire" else ["acquire", "guard"]
+        )
+        assert spoken == [
+            "සමාවෙන්න, මට දැන් පිළිතුරු දෙන්න අපහසුයි. "
+            "කරුණාකර නැවත කියන්න පුළුවන්ද?"
+        ]
+        assert "Late reply" not in spoken
+        assert held_task.done()
+        assert controller._task is not None and controller._task.done()
+        assert pipeline._turn_telemetry is not None
+        assert pipeline._turn_telemetry.turns_summarized == 1
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert not pipeline._smartpbx_tool_filler_tasks
+        assert pipeline._smartpbx_initial_filler is None
+        assert pipeline._media_transport.audio == []
+    finally:
+        filler_release.set()
+        held_tts_release.set()
+        if not turn_task.done():
+            turn_task.cancel()
+        if not held_task.done():
+            held_task.cancel()
+        await asyncio.gather(turn_task, held_task, return_exceptions=True)
+        if controller._task is not None and not controller._task.done():
+            controller._task.cancel()
+            await asyncio.gather(controller._task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stale_failed_turn_cancels_only_its_same_turn_generation_deferred_tts(
+    monkeypatch,
+):
+    """A stale timeout must not retire a newer turn sharing its generation."""
+    import server
+
+    pipeline = direct_tool_pipeline(server, "claude", direct_tool_client("claude", []))
+    generation = pipeline._speak_generation
+    old_runner = server._SmartPBXRunnerContext(
+        turn_id="old-turn",
+        dropped_frame_baseline=0,
+        speak_generation=generation,
+        raw_utterance="",
+    )
+    new_runner = server._SmartPBXRunnerContext(
+        turn_id="new-turn",
+        dropped_frame_baseline=0,
+        speak_generation=generation,
+        raw_utterance="",
+    )
+    pipeline._active_smartpbx_turn_id = old_runner.turn_id
+    pipeline._assistant_turn_generation = generation
+    started = {text: asyncio.Event() for text in ("old sentence", "new sentence")}
+    cancelled = {text: asyncio.Event() for text in started}
+    tts_release = {text: asyncio.Event() for text in started}
+    owner_release = {text: asyncio.Event() for text in started}
+    tasks: dict[str, asyncio.Task] = {}
+
+    async def blocked_speak(text, *, generation, sentence):
+        started[text].set()
+        try:
+            await tts_release[text].wait()
+        except asyncio.CancelledError:
+            cancelled[text].set()
+            raise
+
+    async def start_owned_tts(runner, text):
+        token = server._smartpbx_runner_context.set(runner)
+        try:
+            task = pipeline._start_smartpbx_round_tts(
+                text, generation=generation, sentence=text,
+            )
+            assert task is not None
+            tasks[text] = task
+            await owner_release[text].wait()
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+    monkeypatch.setattr(pipeline, "_invoke_speak", blocked_speak)
+    old_owner = asyncio.create_task(start_owned_tts(old_runner, "old sentence"))
+    try:
+        await asyncio.wait_for(started["old sentence"].wait(), timeout=1)
+        pipeline._active_smartpbx_turn_id = new_runner.turn_id
+        new_owner = asyncio.create_task(start_owned_tts(new_runner, "new sentence"))
+        await asyncio.wait_for(started["new sentence"].wait(), timeout=1)
+
+        token = server._smartpbx_runner_context.set(old_runner)
+        try:
+            fenced_generation = await pipeline._smartpbx_fence_stalled_generation(
+                tts_tasks=[], gen=generation,
+            )
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+        assert fenced_generation == generation
+        assert cancelled["old sentence"].is_set()
+        assert not cancelled["new sentence"].is_set()
+        assert tasks["old sentence"].done()
+        assert not tasks["new sentence"].done()
+        assert tasks["new sentence"] in pipeline._smartpbx_deferred_tts_tasks
+        assert pipeline._smartpbx_deferred_tts_owners[tasks["new sentence"]] == (
+            new_runner.turn_id,
+            generation,
+        )
+    finally:
+        for release in tts_release.values():
+            release.set()
+        for release in owner_release.values():
+            release.set()
+        if not old_owner.done():
+            old_owner.cancel()
+        if "new_owner" in locals() and not new_owner.done():
+            new_owner.cancel()
+        await asyncio.gather(
+            old_owner,
+            *( [new_owner] if "new_owner" in locals() else [] ),
+            *tasks.values(),
+            return_exceptions=True,
+        )
+        await asyncio.sleep(0)
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert not pipeline._smartpbx_deferred_tts_owners
+
+
+@pytest.mark.asyncio
+async def test_terminal_deferred_tts_cancellation_keeps_task_tracked_until_done(
+    monkeypatch,
+):
+    """Teardown requests cancellation but leaves lifecycle tracking to callbacks."""
+    import server
+
+    pipeline = direct_tool_pipeline(server, "claude", direct_tool_client("claude", []))
+    pipeline._active_smartpbx_turn_id = "terminal-turn"
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_speak(_text, *, generation, sentence):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+            raise
+
+    monkeypatch.setattr(pipeline, "_invoke_speak", blocked_speak)
+    task = pipeline._start_smartpbx_round_tts(
+        "terminal sentence", generation=pipeline._speak_generation,
+        sentence="terminal sentence",
+    )
+    assert task is not None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        pipeline._cancel_smartpbx_deferred_tts_now()
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+
+        assert task in pipeline._smartpbx_deferred_tts_tasks
+        assert pipeline._smartpbx_deferred_tts_owners[task] == (
+            "terminal-turn",
+            pipeline._speak_generation,
+        )
+
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert not pipeline._smartpbx_deferred_tts_owners
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_direct_sinhala_gemini_capture_mode_does_not_install_deadline_wrappers(monkeypatch):
+    import server
+
+    client = direct_tool_client("gemini", [direct_text_round("gemini", "හරි.")])
+    pipeline = direct_tool_pipeline(server, "gemini", client, lang="si")
+    pipeline.model = "gemini-3.7-flash"
+    pipeline._capture_mode_active = True
+    bind_direct_smartpbx_turn(server, pipeline)
+    spoken: list[str] = []
+
+    async def must_not_wrap(*_args, **_kwargs):
+        raise AssertionError("capture mode must not install Gemini timeout wrappers")
+
+    async def sinhala_tts(text, **_kwargs):
+        spoken.append(text)
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", sinhala_tts)
+    monkeypatch.setattr(server, "_smartpbx_acquire_stream_within_deadline", must_not_wrap)
+    monkeypatch.setattr(server, "_smartpbx_timeout_guarded_stream", must_not_wrap)
+
+    await pipeline._process_utterance_bound("safe Sinhala capture")
+
+    assert spoken == ["හරි."]
+
+
+def _direct_gemini_partial_tool_round(*, finish_reason=None, raised=None):
+    """A direct native round with visible work that is not yet trustworthy."""
+    events = [SimpleNamespace(candidates=[SimpleNamespace(
+        finish_reason=None,
+        content=SimpleNamespace(parts=[
+            SimpleNamespace(text="Partial native Gemini sentence. ", function_call=None),
+            SimpleNamespace(
+                text=None,
+                function_call=SimpleNamespace(
+                    id="discarded-provider-tool",
+                    name="check_availability",
+                    args={"nights": 2},
+                ),
+            ),
+        ]),
+    )])]
+    if finish_reason is not None:
+        events.append(SimpleNamespace(candidates=[SimpleNamespace(
+            finish_reason=finish_reason,
+            content=SimpleNamespace(parts=[]),
+        )]))
+    if raised is not None:
+        events.append(_DirectToolStreamRaise(raised))
+    return events
+
+
+async def _held_sinhala_initial_filler(server, pipeline):
+    """Install a real controller whose cancellation must be awaited by recovery."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def speak(_text, *, generation):
+        assert generation == pipeline._speak_generation
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+            raise
+
+    async def clear_audio():
+        await pipeline._clear_media_audio()
+
+    controller = server.SmartPBXInitialFillerController(
+        speak=speak,
+        generation=pipeline._speak_generation,
+        delay_seconds=0,
+        clear_audio=clear_audio,
+        text="held test filler",
+    )
+    controller.start()
+    await asyncio.wait_for(started.wait(), timeout=1)
+    pipeline._smartpbx_initial_filler = controller
+    return controller, cancelled, release
+
+
+@pytest.mark.asyncio
+async def test_direct_sinhala_terminal_true_empty_retries_then_recovers_once_through_gemini_tts(
+    monkeypatch,
+):
+    """Two sound STOP rounds are true-empty, not EOF or generic fallback.
+
+    This intentionally runs through the telemetry-owning bound turn and the
+    real Sinhala TTS dispatch path.  It does not replace the recovery helper,
+    so a generic English fallback or a direct-runner-only assertion cannot
+    satisfy the contract.
+    """
+    import server
+
+    empty_stop = lambda: [SimpleNamespace(candidates=[SimpleNamespace(
+        finish_reason="STOP", content=SimpleNamespace(parts=[]),
+    )])]
+    client = direct_tool_client("gemini", [empty_stop(), empty_stop()])
+    pipeline = direct_tool_pipeline(server, "gemini", client, lang="si")
+    pipeline.model = "gemini-3.7-flash"
+    bind_direct_smartpbx_turn(server, pipeline)
+    spoken: list[str] = []
+
+    async def claude_must_not_run():
+        raise AssertionError("true-empty recovery must not enter the Claude path")
+
+    async def sinhala_tts(text, *, sentence=None, turn_generation=None):
+        spoken.append(text)
+        pipeline._is_speaking = True
+        await pipeline._send_tts_done(
+            sentence=sentence,
+            turn_generation=turn_generation,
+        )
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "GEMINI_FAILOVER_TO_CLAUDE", False)
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", sinhala_tts)
+    monkeypatch.setattr(pipeline, "_run_claude_failover_turn", claude_must_not_run)
+
+    await asyncio.wait_for(
+        pipeline._process_utterance_bound("terminal Sinhala empty turn"), timeout=1,
+    )
+
+    recovery = (
+        "සමාවෙන්න, මට දැන් පිළිතුරු දෙන්න අපහසුයි. "
+        "කරුණාකර නැවත කියන්න පුළුවන්ද?"
+    )
+    assert len(client.requests) == 2
+    assert spoken == [recovery]
+    assistant_messages = [
+        message for message in pipeline.history if message.get("role") == "assistant"
+    ]
+    assert assistant_messages == [{"role": "assistant", "content": recovery}]
+    assert not [
+        message for message in pipeline.history
+        if message.get("role") == "tool" or message.get("tool_calls")
+    ]
+    assert pipeline._turn_telemetry is not None
+    assert pipeline._turn_telemetry.turns_summarized == 1
+    assert not pipeline._smartpbx_deferred_tts_tasks
+    assert not pipeline._smartpbx_tool_filler_tasks
+    assert pipeline._media_transport.audio == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["max_tokens", "eof", "raised"])
+async def test_direct_sinhala_incomplete_gemini_rounds_are_fenced_by_the_bound_turn(
+    monkeypatch, caplog, failure,
+):
+    """Only a telemetry-owned turn may retire incomplete native Gemini work.
+
+    This uses the endpoint runner context, actual per-sentence TTS task
+    registry, and a real initial-filler controller.  The two attempts model the
+    production retry boundary; neither partial text nor the complete-looking
+    tool may cross it.
+    """
+    import server
+
+    terminal = "MAX_TOKENS" if failure == "max_tokens" else None
+    raised = RuntimeError("private native stream failure") if failure == "raised" else None
+    rounds = [
+        _direct_gemini_partial_tool_round(finish_reason=terminal, raised=raised),
+        _direct_gemini_partial_tool_round(finish_reason=terminal, raised=raised),
+    ]
+    client = direct_tool_client("gemini", rounds)
+    pipeline = direct_tool_pipeline(server, "gemini", client, lang="si")
+    pipeline.model = "gemini-3.7-flash"
+    bind_direct_smartpbx_turn(server, pipeline)
+    caplog.set_level(logging.WARNING, logger="server")
+    controller, filler_cancelled, filler_release = await _held_sinhala_initial_filler(
+        server, pipeline,
+    )
+    partial_started = [asyncio.Event(), asyncio.Event()]
+    partial_cancelled = [asyncio.Event(), asyncio.Event()]
+    partial_release = [asyncio.Event(), asyncio.Event()]
+    partial_tts_calls = 0
+    spoken: list[str] = []
+    executed: list[tuple[str, dict]] = []
+
+    async def sinhala_tts(text, **_kwargs):
+        nonlocal partial_tts_calls
+        if text == "Partial native Gemini sentence.":
+            index = partial_tts_calls
+            partial_tts_calls += 1
+            partial_started[index].set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                partial_cancelled[index].set()
+                await partial_release[index].wait()
+                raise
+        else:
+            spoken.append(text)
+
+    async def tool_spy(name, arguments):
+        executed.append((name, dict(arguments)))
+        return json.dumps({"unexpected": "tool side effect"})
+
+    async def claude_must_not_run():
+        raise AssertionError("discarded Gemini work must not enter the Claude path")
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", tool_spy)
+    monkeypatch.setattr(server, "GEMINI_FAILOVER_TO_CLAUDE", False)
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", sinhala_tts)
+    monkeypatch.setattr(pipeline, "_run_claude_failover_turn", claude_must_not_run)
+
+    turn_task = asyncio.create_task(
+        pipeline._process_utterance_bound("bounded Sinhala guest turn")
+    )
+    try:
+        await asyncio.wait_for(partial_started[0].wait(), timeout=1)
+        await asyncio.wait_for(filler_cancelled.wait(), timeout=1)
+        assert not turn_task.done()
+        assert executed == []
+        filler_release.set()
+
+        await asyncio.wait_for(partial_cancelled[0].wait(), timeout=1)
+        assert not turn_task.done()
+        partial_release[0].set()
+
+        await asyncio.wait_for(partial_started[1].wait(), timeout=1)
+        await asyncio.wait_for(partial_cancelled[1].wait(), timeout=1)
+        assert not turn_task.done()
+        partial_release[1].set()
+        await asyncio.wait_for(turn_task, timeout=1)
+
+        assert len(client.requests) == 2
+        assert executed == []
+        assert spoken == [
+            "සමාවෙන්න, මට දැන් පිළිතුරු දෙන්න අපහසුයි. "
+            "කරුණාකර නැවත කියන්න පුළුවන්ද?"
+        ]
+        assert "Partial native Gemini sentence." not in repr(pipeline.history)
+        assert not [
+            message for message in pipeline.history
+            if message.get("role") == "tool" or message.get("tool_calls")
+        ]
+        assert controller._task is not None and controller._task.done()
+        assert pipeline._smartpbx_initial_filler is None
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert not pipeline._smartpbx_tool_filler_tasks
+        assert pipeline._media_transport.audio == []
+        assert pipeline._turn_telemetry is not None
+        assert pipeline._turn_telemetry.turns_summarized == 1
+        assert "private native stream failure" not in caplog.text
+    finally:
+        filler_release.set()
+        for release in partial_release:
+            release.set()
+        if not turn_task.done():
+            turn_task.cancel()
+        await asyncio.gather(turn_task, return_exceptions=True)
+        if controller._task is not None and not controller._task.done():
+            controller._task.cancel()
+            await asyncio.gather(controller._task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_direct_sinhala_gemini_post_tool_failure_fences_tts_and_does_not_replay(
+    monkeypatch, caplog,
+):
+    """A completed side effect makes provider failure recovery non-replayable."""
+    import server
+
+    first_round = direct_tool_round(
+        "gemini", {"nights": 1}, tool_name="check_availability",
+    )
+    failing_followup = [
+        SimpleNamespace(candidates=[SimpleNamespace(
+            finish_reason=None,
+            content=SimpleNamespace(parts=[SimpleNamespace(
+                text="Partial post-tool sentence. ", function_call=None,
+            )]),
+        )]),
+        _DirectToolStreamRaise(RuntimeError("private post-tool stream failure")),
+    ]
+    client = direct_tool_client("gemini", [first_round, failing_followup])
+    pipeline = direct_tool_pipeline(server, "gemini", client, lang="si")
+    pipeline.model = "gemini-3.7-flash"
+    bind_direct_smartpbx_turn(server, pipeline)
+    caplog.set_level(logging.WARNING, logger="server")
+    controller, filler_cancelled, filler_release = await _held_sinhala_initial_filler(
+        server, pipeline,
+    )
+    partial_started = asyncio.Event()
+    partial_cancelled = asyncio.Event()
+    partial_release = asyncio.Event()
+    spoken: list[str] = []
+    executed: list[tuple[str, dict]] = []
+
+    async def sinhala_tts(text, **_kwargs):
+        if text == "Partial post-tool sentence.":
+            partial_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                partial_cancelled.set()
+                await partial_release.wait()
+                raise
+        else:
+            spoken.append(text)
+
+    async def tool_spy(name, arguments):
+        executed.append((name, dict(arguments)))
+        return json.dumps({"available": True})
+
+    async def claude_must_not_run():
+        raise AssertionError("post-tool failure must recover without Claude replay")
+
+    monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
+    monkeypatch.setattr(server, "execute_tool", tool_spy)
+    monkeypatch.setattr(server, "GEMINI_FAILOVER_TO_CLAUDE", False)
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", sinhala_tts)
+    monkeypatch.setattr(pipeline, "_run_claude_failover_turn", claude_must_not_run)
+
+    turn_task = asyncio.create_task(
+        pipeline._process_utterance_bound("post-tool Sinhala guest turn")
+    )
+    try:
+        await asyncio.wait_for(partial_started.wait(), timeout=1)
+        await asyncio.wait_for(filler_cancelled.wait(), timeout=1)
+        assert not turn_task.done()
+        filler_release.set()
+        await asyncio.wait_for(partial_cancelled.wait(), timeout=1)
+        assert not turn_task.done()
+        partial_release.set()
+        await asyncio.wait_for(turn_task, timeout=1)
+
+        assert len(client.requests) == 2
+        assert executed == [("check_availability", {"nights": 1})]
+        assert spoken == [
+            server.MEDIA_STREAM_FILLERS["si"]["check_availability"],
+            "සමාවෙන්න, මට පැහැදිලි යාවත්කාලීනයක් දෙන්න බැරි වුණා. "
+            "මට දිගටම උදව් කරන්නද?"
+        ]
+        assert "Partial post-tool sentence." not in spoken
+        assert "Partial post-tool sentence." not in repr(pipeline.history)
+        assert [message for message in pipeline.history if message.get("role") == "tool"]
+        assert len([
+            message for message in pipeline.history if message.get("role") == "tool"
+        ]) == 1
+        assert controller._task is not None and controller._task.done()
+        assert pipeline._smartpbx_initial_filler is None
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert not pipeline._smartpbx_tool_filler_tasks
+        assert pipeline._media_transport.audio == []
+        assert pipeline._turn_telemetry is not None
+        assert pipeline._turn_telemetry.turns_summarized == 1
+        assert "private post-tool stream failure" not in caplog.text
+    finally:
+        filler_release.set()
+        partial_release.set()
+        if not turn_task.done():
+            turn_task.cancel()
+        await asyncio.gather(turn_task, return_exceptions=True)
+        if controller._task is not None and not controller._task.done():
+            controller._task.cancel()
+            await asyncio.gather(controller._task, return_exceptions=True)
 
 
 @pytest.mark.parametrize(

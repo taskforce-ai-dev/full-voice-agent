@@ -68,11 +68,15 @@ def _gemini_chunk(*, text: str | None = None, tools: list[dict[str, object]] | N
     parts = []
     if text is not None:
         parts.append(SimpleNamespace(text=text, function_call=None))
-    for tool in tools or []:
+    for index, tool in enumerate(tools or []):
         parts.append(
             SimpleNamespace(
                 text=None,
-                function_call=SimpleNamespace(name=tool["name"], args=tool["arguments"]),
+                function_call=SimpleNamespace(
+                    id=f"handover-gemini-tool-{index + 1}",
+                    name=tool["name"],
+                    args=tool["arguments"],
+                ),
             )
         )
     return SimpleNamespace(
@@ -200,7 +204,13 @@ def _provider_round(provider: str, *, tools=None, text=None) -> list[object]:
     if provider == "openai":
         return [_openai_chunk(tools=tools)] if tools is not None else [_openai_chunk(text=text)]
     if provider == "gemini":
-        return [_gemini_chunk(tools=tools)] if tools is not None else [_gemini_chunk(text=text)]
+        chunk = _gemini_chunk(tools=tools) if tools is not None else _gemini_chunk(text=text)
+        return [
+            chunk,
+            SimpleNamespace(candidates=[SimpleNamespace(
+                finish_reason="STOP", content=SimpleNamespace(parts=[]),
+            )]),
+        ]
     return _claude_tool_events(tools) if tools is not None else _claude_text_events(text)
 
 
