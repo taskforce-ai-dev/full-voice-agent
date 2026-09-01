@@ -1826,18 +1826,28 @@ def test_direct_sinhala_local_tts_transport_error_does_not_replay_claude(monkeyp
     session.anthropic_client = object()
     claude_calls = 0
 
-    async def bad_tts(*_args, **_kwargs):
-        raise httpx.ConnectError("local tts transport error")
+    response_text = "සිංහල වාක්‍යය."
+
+    async def selectively_bad_tts(text, **_kwargs):
+        # Model the actual boundary: the response TTS fails, but the
+        # independent recovery invocation can still be delivered.  Replacing
+        # every TTS call would make recovery impossible and proves nothing
+        # about whether this local error replayed via Claude.
+        if text == response_text:
+            raise httpx.ConnectError("local tts transport error")
+        spoken.append(text)
 
     async def run_claude():
         nonlocal claude_calls
         claude_calls += 1
         return "must not run"
 
-    session._tts_gemini_sinhala = bad_tts
+    session._tts_gemini_sinhala = selectively_bad_tts
     monkeypatch.setattr(session, "_run_llm_claude", run_claude)
     result = asyncio.run(session._run_llm_gemini())
     assert claude_calls == 0
+    assert response_text not in spoken
+    assert spoken
     assert result == spoken[-1]
 
 

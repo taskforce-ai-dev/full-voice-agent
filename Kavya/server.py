@@ -3645,6 +3645,12 @@ async def _iter_gemini_provider_deltas(
             reason = _gemini_provider_origin_reason(exc)
             if mark_provider_errors and reason is not None:
                 raise _GeminiProviderOriginError(reason) from None
+            if mark_provider_errors:
+                # The stream itself ended without a provider error we can
+                # prove.  Keep this distinct from an exception raised by the
+                # caller while handling an already-yielded delta (for example
+                # local TTS): only this adapter owns ``anext(iterator)``.
+                raise _GeminiStreamAbortedError() from None
             raise
 
 
@@ -3750,6 +3756,10 @@ class _GeminiProviderOriginError(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class _GeminiStreamAbortedError(Exception):
+    """Private marker for an unclassified post-open Gemini stream failure."""
 
 
 _GEMINI_PROVIDER_FAILURE_REASONS = frozenset({
@@ -8873,19 +8883,37 @@ class MediaStreamSession:
                         )
 
                     except Exception as exc:
-                        if direct_sinhala:
-                            # The only direct-Sinhala marker source is the
-                            # acquisition await or iterator adapter above.
-                            # Local processing exceptions must stay unmarked.
+                        if direct_sinhala and isinstance(exc, _GeminiProviderOriginError):
+                            # The adapter/acquisition seam has proven a
+                            # provider-origin failure eligible for the
+                            # direct-Sinhala Claude fallback below.
                             raise
-                        # A provider disconnect after a visible delta is an
-                        # incomplete direct round, never a reason to commit
-                        # or replay the partial work.  The outcome below
-                        # performs the same fence/retry/recovery transition
-                        # without exposing provider exception text.
-                        if not self._is_direct_smartpbx() or not stream_opened:
+                        if (
+                            direct_sinhala
+                            and isinstance(exc, _GeminiStreamAbortedError)
+                        ):
+                            # A post-open stream failure without a provable
+                            # provider classification is still an incomplete
+                            # Gemini round.  Let the shared direct-round
+                            # outcome fence/retry/recovery it; never replay
+                            # it through Claude.  Local response/TTS/history
+                            # errors cannot carry this adapter-only marker.
+                            saw_terminal_metadata = False
+                        elif direct_sinhala:
+                            # Local processing exceptions must remain local:
+                            # fence and recover in the outer handler without
+                            # being misclassified as a provider stream error.
                             raise
-                        saw_terminal_metadata = False
+                        else:
+                            # A provider disconnect after a visible delta is
+                            # an incomplete direct round, never a reason to
+                            # commit or replay the partial work.  The outcome
+                            # below performs the same fence/retry/recovery
+                            # transition without exposing provider exception
+                            # text.
+                            if not self._is_direct_smartpbx() or not stream_opened:
+                                raise
+                            saw_terminal_metadata = False
 
                     if self._is_direct_smartpbx_non_capture():
                         outcome = _classify_gemini_round_outcome(
