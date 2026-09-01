@@ -104,6 +104,31 @@ def make_session():
     return session, pipeline, stt
 
 
+def test_sinhala_llm_provider_defaults_to_gemini_and_invalid_values_fail_to_claude():
+    assert server._resolve_smartpbx_sinhala_llm_provider(None) == "gemini"
+    assert server._resolve_smartpbx_sinhala_llm_provider("") == "gemini"
+    assert server._resolve_smartpbx_sinhala_llm_provider(" GEMINI ") == "gemini"
+    assert server._resolve_smartpbx_sinhala_llm_provider("claude") == "claude"
+    assert server._resolve_smartpbx_sinhala_llm_provider("openai") == "claude"
+
+
+def test_sinhala_gemini_thinking_level_is_closed_and_latency_safe():
+    assert server._resolve_smartpbx_sinhala_gemini_thinking_level(None) == "low"
+    assert server._resolve_smartpbx_sinhala_gemini_thinking_level("") == "low"
+    assert server._resolve_smartpbx_sinhala_gemini_thinking_level("medium") == "medium"
+    assert server._resolve_smartpbx_sinhala_gemini_thinking_level("HIGH") == "high"
+    assert server._resolve_smartpbx_sinhala_gemini_thinking_level("minimal") == "low"
+
+
+def test_sinhala_gemini_output_budget_defaults_and_clamps():
+    assert server._resolve_smartpbx_sinhala_gemini_max_tokens(None) == 600
+    assert server._resolve_smartpbx_sinhala_gemini_max_tokens("") == 600
+    assert server._resolve_smartpbx_sinhala_gemini_max_tokens("invalid") == 600
+    assert server._resolve_smartpbx_sinhala_gemini_max_tokens("199") == 200
+    assert server._resolve_smartpbx_sinhala_gemini_max_tokens("600") == 600
+    assert server._resolve_smartpbx_sinhala_gemini_max_tokens("1025") == 1024
+
+
 @pytest.mark.asyncio
 async def test_digit_two_starts_sinhala_stt_once_and_consumes_only_the_menu_digit():
     session, pipeline, stt = make_session()
