@@ -12,10 +12,12 @@ Kavya is an AI voice agent for **Hatton Hills** — a luxury boutique eco retrea
 
 **Single property.** Hatton Hills has exactly five room types, all distinct: Forest Escape Suite, Eco Harmony Suite, Sunrise Vista Premium Suite (each up to 2 guests), Mount Luxe Chalet, Mount Monarch Chalet (each up to 5 guests). Kavya must NEVER ask which property or location the caller means. The two-property disambiguation machinery from the Mosvold era is retained but inert — see v0.20.
 
-The agent persona is **Kavya** — a reservations agent. **As of 2026-07-28 the line is English only**: Sinhala and Arabic were removed from the IVR — `DIGIT_TO_LANG = {"1": "en"}`, the Arabic/Sinhala `<Say>` prompts are gone from `/voice/incoming`, and `/ws/media-stream/{lang}` now accepts only `ta` (so `si`/`ar` connections are refused). The Sinhala/Arabic/Tamil TTS, STT, prompt and filler code below all remain in place and dormant; re-enable by restoring the digit, the `<Say>`, and the guard entry. Sinhala TTS now uses **OpenAI `gpt-4o-mini-tts`** (voice `nova`) as of v0.16 (was Azure `si-LK-SameeraNeural`). Tamil is fully implemented in code (Media Streams path below) but is still **NOT surfaced in the menu** — add `"4": "ta"` (and a `<Say>` prompt) to expose it.
+The agent persona is **Kavya** — a reservations agent. **Twilio service historical note (2026-07-28):** that service's line was English only: Sinhala and Arabic were removed from its IVR — `DIGIT_TO_LANG = {"1": "en"}`, the Arabic/Sinhala `<Say>` prompts are gone from `/voice/incoming`, and `/ws/media-stream/{lang}` now accepts only `ta` (so `si`/`ar` connections are refused). The dormant Twilio Sinhala path uses **OpenAI `gpt-4o-mini-tts`** (voice `nova`) as of v0.16 (was Azure `si-LK-SameeraNeural`). Tamil remains implemented in the Twilio Media Streams code but is not surfaced in that menu. This history does not describe, enable, or alter Direct SmartPBX.
+
+**Direct SmartPBX language boundary:** the Dialog SmartPBX menu presents `1` for English and `2` for Sinhala. A selection timeout, invalid selection, or replayed invalid selection resolves to English. This is a direct SmartPBX-only choice: Twilio ConversationRelay and Twilio Media Streams behavior remain unchanged.
 
 **Two server modes:**
-- `server.py` — **Unified production server** (IVR DTMF menu: English→ConversationRelay+ElevenLabs, Arabic→Media Streams+ElevenLabs multilingual, Sinhala→Media Streams+OpenAI `gpt-4o-mini-tts`; Tamil→Media Streams+ElevenLabs is implemented but unlisted in the menu)
+- `server.py` — **Unified production server**: the Twilio service retains its historical ConversationRelay/Media Streams routes; the opt-in Direct SmartPBX service has its own `1` English / `2` Sinhala call-local profiles.
 - `media_stream_server.py` — **Standalone Media Streams** (Anthropic Claude, ElevenLabs multilingual TTS, Google Cloud STT, barge-in — kept as reference/alternative)
 
 This "two server modes" split is orthogonal to a second, more recent gate: `server.py` itself now builds one of **two mutually exclusive service-mode apps** (Twilio vs Dialog SmartPBX) via `KAVYA_SERVICE_MODE` — see **Service Modes** below.
@@ -96,11 +98,43 @@ Copy `.env.example` to `.env`. Key groups:
 - `OPENAI_API_KEY`, `OPENAI_MODEL` — OpenAI (default model: `gpt-4o`)
 - `GEMINI_API_KEY`, `GEMINI_MODEL` — Gemini via native google-genai SDK (default model: `gemini-2.5-flash`)
 
+### Direct SmartPBX Sinhala profile
+
+Direct SmartPBX settings belong only in protected, root-owned
+`/opt/kavya/.env.smartpbx`. Its `kavya-smartpbx` Compose service uses an
+explicit environment allowlist and must not receive Twilio credentials or
+`HUMAN_AGENT_PHONE`.
+
+- Press `1` retains the existing English profile exactly: its configured
+  provider/model, English prompt, tools, timing, capture, handover behavior,
+  configured English STT, and canonical ElevenLabs route. Populating Sinhala
+  settings does not build a Gemini client or mutate that English call profile.
+- Press `2` is call-local: Azure STT at `si-LK`, Gemini 3.7 Flash LLM with
+  `low` thinking and a bounded 600-token output ceiling, and Gemini 3.1 Flash
+  TTS (`gemini-3.1-flash-tts-preview`, `Vindemiatrix`).
+- The Compose-rendered defaults are
+  `SMARTPBX_SINHALA_LLM_PROVIDER=gemini`,
+  `SMARTPBX_SINHALA_GEMINI_LLM_MODEL=gemini-3.7-flash`,
+  `SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL=low`, and
+  `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=600`. At runtime, a blank provider
+  resolves to `gemini`; an invalid nonblank provider resolves to `claude`;
+  thinking accepts `low`, `medium`, or `high` and otherwise resolves to `low`;
+  and the token ceiling defaults to 600 and clamps to `[200, 1024]`.
+- The only operator rollback is
+  `SMARTPBX_SINHALA_LLM_PROVIDER=claude`. It changes the Sinhala LLM only; it
+  does not alter global `LLM_PROVIDER`, the Twilio service, or an English
+  SmartPBX call. Azure `si-LK` STT and Gemini TTS remain selected.
+- A nonblank `GEMINI_API_KEY` is a protected SmartPBX Sinhala provisioning
+  concern for the default Gemini LLM and Gemini TTS. The bilingual menu is
+  deliberately withheld when that key is missing or whitespace-only, including
+  from a caller who would have selected Press `1`. Never put it in tracked files
+  or print it. Chirp and Gemini Transcribe are not part of this rollout.
+
 **TTS/STT:**
 - `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` — ElevenLabs TTS (English ConversationRelay + Tamil Media Streams)
-- `OPENAI_API_KEY` — OpenAI key; used for `gpt-4o-mini-tts` (Sinhala voice) and, if `LLM_PROVIDER=openai`, the LLM
-- `OPENAI_TTS_MODEL` / `OPENAI_TTS_VOICE` / `OPENAI_TTS_INSTRUCTIONS` — Sinhala TTS config (defaults: `gpt-4o-mini-tts`, `nova`, a warm Kavya/Treehouse Sinhala-tone instruction)
-- `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION` — Azure TTS (legacy Sinhala path `_tts_azure`, no longer live) + Azure STT backend. Region: `southeastasia`
+- `OPENAI_API_KEY` — OpenAI key; used by the historical Twilio Sinhala `gpt-4o-mini-tts` path and, if `LLM_PROVIDER=openai`, the LLM
+- `OPENAI_TTS_MODEL` / `OPENAI_TTS_VOICE` / `OPENAI_TTS_INSTRUCTIONS` — historical Twilio Sinhala TTS config (defaults: `gpt-4o-mini-tts`, `nova`, a warm Kavya/Treehouse Sinhala-tone instruction)
+- `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION` — Azure STT backend and legacy Twilio Sinhala Azure TTS path (`_tts_azure`, no longer live). Region: `southeastasia`
 - `GOOGLE_APPLICATION_CREDENTIALS` — GCP service-account JSON for Google Cloud STT. File: `full-voice-agent-a8a245fb37cb.json`, mounted as `/app/gcp-credentials.json` in Docker
 
 **Telephony & integrations:**
@@ -204,7 +238,7 @@ Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8
 - `smartpbx_protocol.py` — strict, transport-independent parser for the Dialog wire events (`connected`/`start`/`media`/`dtmf`/`hangup`/`stop`, else `Unsupported`) into a closed dataclass union; fail-closed on anything malformed.
 - `smartpbx_gateway.py` — `SmartPBXSettings` (env validation), `SmartPBXSessionRegistry` (the 4-call admission counter), and `SmartPBXGateway` (auth → admit → start session → event loop → cleanup-once, emitting the `smartpbx_protocol_diagnostic` log line).
 - `smartpbx_transport.py` — `SmartPBXMediaTransport`, the bounded outbound audio queue serializing `media` frames back to Dialog. Frames are **paced at realtime** so barge-in has queued audio left to cancel (Dialog defines no `clear` wire event); on overflow it **refuses the newest frame**, cutting the tail of a reply rather than decimating it; generation-fenced so barge-in can't leak stale audio; and a dead sender raises a failure signal so the gateway ends the call instead of leaving the guest in silence.
-- `smartpbx_session.py` — `KavyaSmartPBXSession`, the adapter wiring one Dialog call into Kavya's existing `MediaStreamSession` pipeline (STT → KB/PMS tools → LLM → TTS), forcing `lang="en"` and binding transfer/handover context.
+- `smartpbx_session.py` — `KavyaSmartPBXSession`, the adapter that first resolves a call-local English or Sinhala language profile, then wires it into one Dialog call's `MediaStreamSession` pipeline (STT → KB/PMS tools → LLM → TTS) and binds transfer/handover context. It does not mutate process-global provider or model state.
 - `smartpbx_mcp.py` — fail-closed Dialog MCP call control: `DialogMCPSettings.from_env()` and `DialogMCPCallControl.transfer_call()`, restricted to operator-configured `tel:`/`sip:` destinations.
 - `smartpbx_handover.py` — `SmartPBXHandoverCoordinator`, the call-local state machine that attempts the MCP transfer and, on failure, falls back to the existing WhatsApp handover notification.
 - `smartpbx_diagnostics.py` — the enum vocabulary (`DiagnosticStage`/`DiagnosticOutcome`/`DiagnosticFailureClass`) for the seven-field diagnostic log line.
@@ -213,6 +247,16 @@ Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8
 
 **Deployment shape.** SmartPBX runs as a separate Compose profile (`docker-compose.yml`, profile `smartpbx`, service `kavya-smartpbx`) alongside — not instead of — the existing `kavya` Twilio service: its own container, its own loopback port `127.0.0.1:8006`, its own Chroma volume (`./chroma_db_smartpbx`, never shared with the Twilio service's writable store), and an explicit environment allowlist (no `env_file: .env` — Twilio credentials and `HUMAN_AGENT_PHONE` must never reach this container). The image tag is pinned via `SMARTPBX_IMAGE_TAG` (default `disabled`, which cannot pull anything); secrets live in root-only `/opt/kavya/.env.smartpbx` (`chmod 600`), never `.env`. Public TLS terminates at a dedicated Nginx vhost, `smartpbx-kavya.taskforceai.tech`, in front of the loopback port. Image provenance is enforced in CI: `.github/workflows/build-kavya-image.yml` (publisher) and `probe-kavya-image.yml` (read-only probe) gate which image tag/digest is trustworthy to deploy — the runbook's guarded deploy script cross-checks the reviewed short SHA against the image's OCI revision label before recreating the container.
 
+**Direct SmartPBX Sinhala LLM recovery.** Gemini-to-Claude fallback is
+technical recovery only and remains call-local while preserving provider and
+tool state. A round that has delivered audio or produced a tool side effect is
+fenced and is not replayed; recovery never authorizes repeat booking
+operations. The technical failure classification is deliberately narrow, not
+an assertion that every Gemini exception falls back. Diagnostics and
+acceptance evidence are privacy-safe metadata only: they do not retain caller
+transcript text, prompts, tool arguments/results, audio, API keys, headers, or
+raw provider exceptions.
+
 **Full cutover/rollback procedure:** `SMARTPBX_RUNBOOK.md` — preconditions and immutable image identity, `.env.smartpbx` provisioning, TLS bootstrap, the five cutover gates (bad/missing auth rejected, bidirectional audio + LLM turn, KB/PMS answer + post-call record, 4-accepted/5th-rejected capacity, endpoint-down fallback), optional transfer drill with compulsory revoke, and drain-before-stop withdrawal/rollback.
 
 ## Key Design Decisions
@@ -220,7 +264,7 @@ Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8
 - **Pluggable LLM**: `LLM_PROVIDER` env var switches between Claude (default), OpenAI, and Gemini. Each has its own client singleton, streaming functions, and tool format. History is stored in provider-native format; Gemini uses a converter `_history_to_gemini()` since it stores in OpenAI format internally.
 - **Claude as default**: Anthropic Claude (`claude-sonnet-4-5-20250929`) is the default and primary tested provider. Uses native `AsyncAnthropic` SDK with `messages.stream()`, content block events (`content_block_start`, `content_block_delta`, `content_block_stop`), and Anthropic tool format (`input_schema`).
 - **Two servers, one codebase**: `server.py` (unified production) and `media_stream_server.py` (standalone, Anthropic-only, kept as reference). Both share `booking_api.py`, `tools.py`, `knowledge_base.py`.
-- **DTMF language menu**: live menu (v0.16) is Press 1 → ConversationRelay (English + ElevenLabs); Press 2 → Media Streams (Arabic + ElevenLabs multilingual); Press 3 → Media Streams (Sinhala + OpenAI `gpt-4o-mini-tts`). `DIGIT_TO_LANG = {"1": "en", "2": "ar", "3": "si"}`; no input → English. Tamil (Media Streams + ElevenLabs) remains fully coded but is not mapped to any menu digit — add `"4": "ta"` plus a matching `<Say>` prompt to re-expose it.
+- **Twilio historical DTMF language menu**: the v0.16 menu was Press 1 → ConversationRelay (English + ElevenLabs); Press 2 → Media Streams (Arabic + ElevenLabs multilingual); Press 3 → Media Streams (Sinhala + OpenAI `gpt-4o-mini-tts`). `DIGIT_TO_LANG = {"1": "en", "2": "ar", "3": "si"}`; no input → English. Tamil (Media Streams + ElevenLabs) remains fully coded but is not mapped to any menu digit. This does not govern Direct SmartPBX, whose menu/profile boundary is documented above.
 - **Interim-based STT endpointing**: Google Cloud STT rarely fires `is_final=True` for conversational speech. Each interim result overwrites `_pending_transcript` (not appends) and resets a `STT_ENDPOINTING_SILENCE_SECONDS` timer. `STT_ENDPOINTING_SILENCE_SECONDS` defaults to `1.0` and clamps to `[0.2, 5.0]`. `STT_FINAL_GRACE_SECONDS` defaults to `0.5` and clamps to `[0.05, 5.0]`.
 - **Tool gating via system prompt**: General info (rooms, rates, policies, activities) answered from KB context — no tool call. Tools only for date-specific booking operations.
 - **Filler speech**: Spoken before tool execution to avoid silence during API calls (language-specific fillers for Sinhala/Tamil).
@@ -228,7 +272,7 @@ Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8
 - **History trimming**: Max `MAX_HISTORY_MESSAGES` messages (`60`). `_trim_history()` is format-aware — detects and skips orphaned tool result messages at the start of trimmed history for both Anthropic format (user messages containing `tool_result` content blocks) and OpenAI format (`role: "tool"` messages). Also skips orphaned assistant `tool_use`/`tool_calls` messages.
 - **Native script**: LLM responds in native Sinhala/Tamil Unicode script. TTS handles native script directly.
 - **Kavya persona**: Collects booking info in order: name → location (local vs foreign rates) → pax → dates → room. Mentions complimentary activities (2+ nights), April/December advance payment, honeymoon packages.
-- **Hybrid TTS**: English → ElevenLabs turbo (cloned voice via ConversationRelay), Sinhala → OpenAI `gpt-4o-mini-tts` (voice `nova`, 24 kHz PCM → 8 kHz μ-law via `audioop`), Tamil → ElevenLabs `eleven_multilingual_v2` (cloned voice, `ulaw_8000` output). Legacy Azure `si-LK-SameeraNeural` Sinhala path (`_tts_azure`) is wired but no longer the live route.
+- **Twilio historical hybrid TTS**: English → ElevenLabs turbo (cloned voice via ConversationRelay), Sinhala → OpenAI `gpt-4o-mini-tts` (voice `nova`, 24 kHz PCM → 8 kHz μ-law via `audioop`), Tamil → ElevenLabs `eleven_multilingual_v2` (cloned voice, `ulaw_8000` output). Legacy Azure `si-LK-SameeraNeural` Sinhala path (`_tts_azure`) is wired but no longer that live Twilio route. Direct SmartPBX Sinhala instead uses its call-local Gemini TTS route.
 - **Barge-in**: Media Streams only. When STT detects speech during TTS, sends `clear` event to Twilio, sets `_is_speaking = False`, increments `_speak_generation` to cancel queued TTS tasks. Thresholds are driven by `BARGEIN_MIN_CHARS` (default `12`, clamp `[0, 200]`) and `BARGEIN_DEBOUNCE_SECONDS` (default `0.6`, clamp `[0.0, 5.0]`).
 
 ## Server Endpoints
