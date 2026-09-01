@@ -17,6 +17,7 @@ caller can actually hear:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from types import SimpleNamespace
 
@@ -51,10 +52,21 @@ def _text_chunk(text: str):
     return _chunk(_part(text=text))
 
 
-def _tool_chunk(name: str, args: dict | None = None, *, thought_signature=None):
+def _terminal_chunk(finish_reason="STOP"):
+    """The terminal metadata emitted by a completed native Gemini round."""
+    return _chunk(finish_reason=finish_reason)
+
+
+def _tool_chunk(
+    name: str,
+    args: dict | None = None,
+    *,
+    id: str | None = None,
+    thought_signature=None,
+):
     return _chunk(
         _part(
-            function_call=SimpleNamespace(name=name, args=args or {}),
+            function_call=SimpleNamespace(name=name, args=args or {}, id=id),
             thought_signature=thought_signature,
         )
     )
@@ -71,13 +83,17 @@ class FakeGeminiModels:
 
     async def generate_content_stream(self, **kwargs):
         self.owner.requests += 1
-        self.owner.configs.append(kwargs.get("config"))
-        self.owner.contents.append(kwargs.get("contents"))
+        snapshot = copy.deepcopy(kwargs)
+        self.owner.configs.append(snapshot.get("config"))
+        self.owner.contents.append(snapshot.get("contents"))
+        self.owner.request_payloads.append(snapshot)
         chunks = self.owner.rounds.pop(0)
 
         async def stream():
             for index, chunk in enumerate(chunks):
                 self.owner.timeline.append(("chunk", index))
+                if isinstance(chunk, BaseException):
+                    raise chunk
                 yield chunk
 
         return stream()
@@ -89,6 +105,7 @@ class FakeGemini:
         self.requests = 0
         self.configs: list[dict] = []
         self.contents: list[list] = []
+        self.request_payloads: list[dict] = []
         self.timeline: list[tuple] = timeline if timeline is not None else []
         self.aio = SimpleNamespace(models=FakeGeminiModels(self))
 
@@ -101,13 +118,16 @@ class FakeFlakyGemini:
         self.requests = 0
         self.configs: list[dict] = []
         self.contents: list[list] = []
+        self.request_payloads: list[dict] = []
         self.timeline: list[tuple] = []
         self.aio = SimpleNamespace(models=self)
 
     async def generate_content_stream(self, **kwargs):
         self.requests += 1
-        self.configs.append(kwargs.get("config"))
-        self.contents.append(kwargs.get("contents"))
+        snapshot = copy.deepcopy(kwargs)
+        self.configs.append(snapshot.get("config"))
+        self.contents.append(snapshot.get("contents"))
+        self.request_payloads.append(snapshot)
 
         behavior = self._turns.pop(0)
         if isinstance(behavior, BaseException):
@@ -119,6 +139,8 @@ class FakeFlakyGemini:
         async def stream():
             for index, chunk in enumerate(turn.chunks):
                 self.timeline.append(("chunk", turn_index, index))
+                if isinstance(chunk, BaseException):
+                    raise chunk
                 yield chunk
 
         return stream()
@@ -148,7 +170,15 @@ class FakeTransport:
         self.marks.append(name)
 
 
-def _session(rounds, *, lang="en", smartpbx=False, timeline=None, model="gemini-2.5-flash"):
+def _session(
+    rounds,
+    *,
+    lang="en",
+    smartpbx=False,
+    timeline=None,
+    model="gemini-2.5-flash",
+    terminalize_direct_rounds=True,
+):
     """A Gemini MediaStreamSession with TTS captured instead of synthesised."""
     session = server.MediaStreamSession(
         websocket=None,
@@ -158,6 +188,21 @@ def _session(rounds, *, lang="en", smartpbx=False, timeline=None, model="gemini-
         media_transport=FakeTransport() if smartpbx else None,
     )
     session.tools = []
+    # Only direct SmartPBX fixtures acquire the terminal-aware contract. The
+    # regular Media Streams / ConversationRelay fixtures intentionally retain
+    # their existing terminal-free behavior.
+    if smartpbx and terminalize_direct_rounds:
+        rounds = [
+            list(round_) + [_terminal_chunk()]
+            if isinstance(round_, list)
+            and not any(
+                getattr(chunk.candidates[0], "finish_reason", None)
+                for chunk in round_
+                if getattr(chunk, "candidates", None)
+            )
+            else round_
+            for round_ in rounds
+        ]
     session.gemini_client = FakeGemini(rounds, timeline=timeline)
     if smartpbx:
         session._smartpbx_transfer_context = object()
@@ -170,6 +215,7 @@ def _session(rounds, *, lang="en", smartpbx=False, timeline=None, model="gemini-
 
     session._tts_elevenlabs = tts
     session._tts_openai = tts
+    session._tts_gemini_sinhala = tts
     return session, spoken
 
 
@@ -463,7 +509,280 @@ def test_a_model_that_rejects_thinking_controls_degrades_instead_of_failing(monk
     assert len(attempts) == 2
     assert "thinking_config" not in attempts[1]
     assert spoken == ["Hi there."]
+    assert session._gemini_thinking_unsupported_models == {session.model}
+    assert server._gemini_thinking_unsupported is False
+
+
+def test_direct_sinhala_gemini_uses_its_session_owned_thinking_and_budget():
+    session, _spoken = _session(
+        [[_text_chunk("හරි.")]],
+        lang="si",
+        smartpbx=True,
+        model="gemini-3.7-flash",
+    )
+    session._gemini_thinking_level = "low"
+    session._smartpbx_gemini_max_tokens = 600
+
+    asyncio.run(session._run_llm_gemini())
+
+    config = session.gemini_client.configs[0]
+    assert config["thinking_config"] == {"thinking_level": "low"}
+    assert config["max_output_tokens"] == 600
+
+
+def test_direct_english_gemini_keeps_shared_controls_and_incremental_tts():
+    session, spoken = _session(
+        [[_text_chunk("All right.")]],
+        lang="en",
+        smartpbx=True,
+        model="gemini-3.7-flash",
+    )
+    session._gemini_thinking_level = server.GEMINI_THINKING_LEVEL
+    session._smartpbx_gemini_max_tokens = 600
+
+    asyncio.run(session._run_llm_gemini())
+
+    config = session.gemini_client.configs[0]
+    assert config["thinking_config"] == {
+        "thinking_level": server.GEMINI_THINKING_LEVEL
+    }
+    assert config["max_output_tokens"] == server.SMARTPBX_MAX_TOKENS
+    assert spoken == ["All right."]
+    assert session._is_direct_smartpbx_english_non_capture() is True
+
+
+def test_gemini_session_constructor_owns_default_generation_controls():
+    session, _spoken = _session([[_text_chunk("Hi.")]], smartpbx=True)
+
+    assert session._gemini_thinking_level == server.GEMINI_THINKING_LEVEL
+    assert session._smartpbx_gemini_max_tokens == server.SMARTPBX_MAX_TOKENS
+    assert session._gemini_thinking_unsupported_models == set()
+
+
+def test_non_smartpbx_sinhala_keeps_global_max_tokens_and_legacy_eof_shape():
+    rounds = [[_text_chunk("හරි.")]]
+    session, _spoken = _session(rounds, lang="si", model="gemini-3.7-flash")
+
+    assert session._provider_max_tokens("gemini") == server.MAX_TOKENS
+    assert getattr(rounds[0][-1].candidates[0], "finish_reason", None) is None
+
+
+def test_gemini_37_multi_tool_followup_preserves_each_provider_call_id(monkeypatch):
+    session, _spoken = _session(
+        [[
+            _tool_chunk(
+                "check_availability", {"room": "A"}, id="call-17",
+                thought_signature=b"sig-17",
+            ),
+            _tool_chunk(
+                "check_availability", {"room": "B"}, id="call-18",
+                thought_signature=b"sig-18",
+            ),
+        ], [_text_chunk("Both rooms are available.")]],
+        smartpbx=True,
+        model="gemini-3.7-flash",
+    )
+    executed: list[dict] = []
+
+    async def execute(name, arguments):
+        executed.append({"name": name, "arguments": dict(arguments)})
+        return json.dumps({"room": arguments["room"], "available": True})
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+    asyncio.run(session._run_llm_gemini())
+
+    assert executed == [
+        {"name": "check_availability", "arguments": {"room": "A"}},
+        {"name": "check_availability", "arguments": {"room": "B"}},
+    ]
+    followup = session.gemini_client.request_payloads[1]
+    assert followup["model"] == "gemini-3.7-flash"
+    model_calls = [
+        part["function_call"]
+        for content in followup["contents"]
+        if content["role"] == "model"
+        for part in content["parts"]
+        if "function_call" in part
+    ]
+    responses = [
+        part["function_response"]
+        for content in followup["contents"]
+        if content["role"] == "user"
+        for part in content["parts"]
+        if "function_response" in part
+    ]
+    assert [(call["id"], call["name"]) for call in model_calls] == [
+        ("call-17", "check_availability"), ("call-18", "check_availability"),
+    ]
+    assert [part.get("thought_signature") for content in followup["contents"]
+            if content["role"] == "model" for part in content["parts"]
+            if "function_call" in part] == [b"sig-17", b"sig-18"]
+    assert [(response["id"], response["name"], response["response"])
+            for response in responses] == [
+        ("call-17", "check_availability", {"room": "A", "available": True}),
+        ("call-18", "check_availability", {"room": "B", "available": True}),
+    ]
+    assert "gemini_tc_" not in repr(session.history)
+
+
+def test_conversation_relay_history_conversion_keeps_function_call_ids_opted_out():
+    history = [
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "provider-id", "type": "function",
+            "function": {"name": "check_availability", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "provider-id", "content": "{}"},
+    ]
+
+    contents = server._history_to_gemini(history)
+    parts = [part for content in contents for part in content["parts"]]
+    assert "id" not in parts[0]["function_call"]
+    assert "id" not in parts[1]["function_response"]
+
+
+@pytest.mark.parametrize(
+    ("id", "name", "args"),
+    [
+        (None, "check_availability", {"nights": 1}),
+        ("call-19", None, {"nights": 1}),
+        ("call-20", "check_availability", ["private-malformed-sentinel"]),
+    ],
+)
+def test_gemini_malformed_provider_tool_payload_is_closed_and_privacy_safe(
+    monkeypatch, caplog, id, name, args,
+):
+    session, spoken = _session(
+        [[_chunk(_part(function_call=SimpleNamespace(id=id, name=name, args=args)))],
+         [_chunk(_part(function_call=SimpleNamespace(id=id, name=name, args=args)))]],
+        smartpbx=True,
+        terminalize_direct_rounds=True,
+    )
+    executed: list[tuple] = []
+
+    async def execute(*arguments):
+        executed.append(arguments)
+        return "{}"
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+    with caplog.at_level("INFO", logger="server"):
+        asyncio.run(session._run_llm_gemini())
+
+    assert executed == []
+    assert not [m for m in session.history if m.get("tool_calls") or m.get("role") == "tool"]
+    assert spoken == [server.SMARTPBX_LLM_EMPTY_RETRY_RECOVERY_TEXT]
+    assert "private-malformed-sentinel" not in caplog.text
+
+
+def test_gemini_round_outcome_classifier_distinguishes_terminal_failures():
+    cases = [
+        ("MAX_TOKENS", True, [], "max_tokens_truncated"),
+        ("STOP", True, [{"malformed": True}], "malformed_tool_json"),
+        (None, False, [], "stream_aborted"),
+        ("STOP", True, [], "true_empty"),
+        ("STOP", True, [{"id": "call", "name": "tool", "args": {}}], "completed"),
+    ]
+    for finish_reason, terminal, calls, expected in cases:
+        assert server._classify_gemini_round_outcome(
+            text_content="", function_calls=calls, finish_reason=finish_reason,
+            saw_terminal_metadata=terminal,
+        ).value == expected
+
+
+def test_thinking_rejection_is_call_local_model_local_and_ordered(monkeypatch, caplog):
+    monkeypatch.setattr(server, "_gemini_thinking_unsupported", False)
+    a, _ = _session([[_text_chunk("A.")]], smartpbx=True, model="gemini-3.7-flash")
+    b, _ = _session([[_text_chunk("B.")]], smartpbx=True, model="gemini-3.7-flash")
+    a._gemini_thinking_level = "low"
+    b._gemini_thinking_level = "high"
+    a_requested = asyncio.Event()
+    release_rejection = asyncio.Event()
+    a_retried = asyncio.Event()
+    calls: list[dict] = []
+    inner = a.gemini_client.aio.models.generate_content_stream
+
+    async def reject_a_once(**kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        if "thinking_config" in kwargs["config"]:
+            a_requested.set()
+            await release_rejection.wait()
+            raise ValueError("thinking_config private rejection text")
+        a_retried.set()
+        return await inner(**kwargs)
+
+    a.gemini_client.aio.models.generate_content_stream = reject_a_once
+
+    async def scenario():
+        a_task = asyncio.create_task(a._run_llm_gemini())
+        await asyncio.wait_for(a_requested.wait(), timeout=1)
+        release_rejection.set()
+        await asyncio.wait_for(a_retried.wait(), timeout=1)
+        await b._run_llm_gemini()
+        await a_task
+
+    with caplog.at_level("WARNING", logger="server"):
+        asyncio.run(scenario())
+
+    assert len(calls) == 2
+    assert "thinking_config" not in calls[1]["config"]
+    assert len(b.gemini_client.request_payloads) == 1
+    assert b.gemini_client.configs[0]["thinking_config"] == {"thinking_level": "high"}
+    assert a._gemini_thinking_unsupported_models == {"gemini-3.7-flash"}
+    assert b._gemini_thinking_unsupported_models == set()
+    assert server._gemini_thinking_unsupported is False
+    assert "private rejection text" not in caplog.text
+
+
+def test_legacy_non_media_gemini_thinking_latch_remains_process_owned(monkeypatch):
+    """ConversationRelay callers retain the legacy one-process compatibility latch."""
+    monkeypatch.setattr(server, "_gemini_thinking_unsupported", False)
+    attempts: list[dict] = []
+
+    class LegacyModels:
+        async def generate_content_stream(self, **kwargs):
+            attempts.append(copy.deepcopy(kwargs))
+            if "thinking_config" in kwargs["config"]:
+                raise ValueError("thinking_config is not supported")
+            return iter(())
+
+    legacy_client = SimpleNamespace(aio=SimpleNamespace(models=LegacyModels()))
+
+    async def scenario():
+        await server._open_gemini_stream(
+            legacy_client,
+            model="gemini-3.7-flash",
+            contents=[],
+            config={"thinking_config": {"thinking_level": "low"}},
+        )
+
+    asyncio.run(scenario())
+
+    assert len(attempts) == 2
+    assert "thinking_config" not in attempts[1]["config"]
     assert server._gemini_thinking_unsupported is True
+    assert server._gemini_thinking_config("gemini-3.7-flash") is None
+
+
+def test_non_thinking_exception_is_not_retried_or_logged_as_config_rejection(monkeypatch, caplog):
+    monkeypatch.setattr(server, "_gemini_thinking_unsupported", False)
+    monkeypatch.setattr(server, "GEMINI_FAILOVER_TO_CLAUDE", False)
+    session, _spoken = _session([[_text_chunk("unreachable")]], smartpbx=True)
+    attempts: list[dict] = []
+    private_error = "private provider outage while thinking about a retry"
+
+    async def provider_failure(**kwargs):
+        attempts.append(copy.deepcopy(kwargs))
+        raise RuntimeError(private_error)
+
+    session.gemini_client.aio.models.generate_content_stream = provider_failure
+
+    with caplog.at_level("WARNING", logger="server"):
+        with pytest.raises(RuntimeError, match="private provider outage"):
+            asyncio.run(session._run_llm_gemini())
+
+    assert len(attempts) == 1
+    assert session._gemini_thinking_unsupported_models == set()
+    assert server._gemini_thinking_unsupported is False
+    assert private_error not in caplog.text
 
 
 # --- ConversationRelay runner --------------------------------------------
