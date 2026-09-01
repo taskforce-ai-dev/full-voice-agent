@@ -5306,6 +5306,12 @@ class MediaStreamSession:
         # batch whose later tool transfers. They need equivalent terminal and
         # barge ownership rather than remaining only in a runner-local list.
         self._smartpbx_deferred_tts_tasks: set[asyncio.Task] = set()
+        # Deferred TTS is session-owned, but a stalled runner may only retire
+        # work from its own turn and generation.  Generations are intentionally
+        # not unique per utterance, so both ownership values are required.
+        self._smartpbx_deferred_tts_owners: dict[
+            asyncio.Task, tuple[str | None, int]
+        ] = {}
         # Set only by the transfer prelude after it has fenced old audio. The
         # acknowledged transfer consumes it to avoid clearing a second time.
         self._smartpbx_transfer_audio_fenced = False
@@ -5520,12 +5526,21 @@ class MediaStreamSession:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            self._discard_smartpbx_deferred_tts_task(task)
 
     def _cancel_smartpbx_deferred_tts_now(self) -> None:
         """Synchronously request terminal cancellation of deferred model speech."""
         for task in tuple(self._smartpbx_deferred_tts_tasks):
             if not task.done():
                 task.cancel()
+        self._smartpbx_deferred_tts_tasks.clear()
+        self._smartpbx_deferred_tts_owners.clear()
+
+    def _discard_smartpbx_deferred_tts_task(self, task: asyncio.Task) -> None:
+        """Forget one finished or terminally-cancelled deferred TTS task."""
+        self._smartpbx_deferred_tts_tasks.discard(task)
+        self._smartpbx_deferred_tts_owners.pop(task, None)
 
     def _start_smartpbx_round_tts(
         self, text: str, *, generation: int, sentence: str,
@@ -5542,7 +5557,12 @@ class MediaStreamSession:
         if not self._is_direct_smartpbx():
             return task
         self._smartpbx_deferred_tts_tasks.add(task)
-        task.add_done_callback(self._smartpbx_deferred_tts_tasks.discard)
+        runner = _smartpbx_runner_context.get()
+        owner_turn_id = (
+            runner.turn_id if runner is not None else self._active_smartpbx_turn_id
+        )
+        self._smartpbx_deferred_tts_owners[task] = (owner_turn_id, generation)
+        task.add_done_callback(self._discard_smartpbx_deferred_tts_task)
         owner = asyncio.current_task()
         if owner is not None:
             owner.add_done_callback(
@@ -5976,10 +5996,10 @@ class MediaStreamSession:
         Two things must both finish before the recovery line is spoken, or a
         late-arriving TTS task from the dead generation can deliver audio
         after (or on top of) the recovery line:
-        1. Cancel-and-await any of THIS round's per-sentence TTS tasks that
-           are still pending (queued sentences from partial content spoken
-           before the stall). The stalled generation's initial filler is
-           NOT among these — it is cancelled separately and earlier, by
+        1. Cancel-and-await any of THIS round's per-sentence TTS tasks and
+           every session-owned deferred task registered to the SAME turn and
+           generation. The stalled generation's initial filler is NOT among
+           these — it is cancelled separately and earlier, by
            ``_smartpbx_cancel_stalled_filler``, before this method ever runs.
         2. Fence the transport against undelivered old-generation audio the
            same way genuine barge-in does: bump ``_speak_generation`` and
@@ -6004,13 +6024,23 @@ class MediaStreamSession:
 
         Returns the generation the recovery line should speak on.
         """
-        pending = [task for task in tts_tasks if not task.done()]
+        runner = _smartpbx_runner_context.get()
+        runner_turn_id = runner.turn_id if runner is not None else None
+        failed_turn_id = (
+            runner_turn_id if runner is not None else self._active_smartpbx_turn_id
+        )
+        pending = {
+            task for task in tts_tasks if not task.done()
+        }
+        pending.update(
+            task
+            for task, owner in self._smartpbx_deferred_tts_owners.items()
+            if not task.done() and owner == (failed_turn_id, gen)
+        )
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        runner = _smartpbx_runner_context.get()
-        runner_turn_id = runner.turn_id if runner is not None else None
         active_turn_id = self._active_smartpbx_turn_id
         barge_ins = self._smartpbx_barge_ins
         transfer_pending = self.transfer_pending
@@ -8667,7 +8697,10 @@ class MediaStreamSession:
                             if kind != "text":
                                 continue
 
-                            if initial_filler is not None:
+                            if (
+                                initial_filler is not None
+                                and self._is_direct_smartpbx_english()
+                            ):
                                 await initial_filler.on_content_delta()
                                 if initial_filler._cleared_after_spoke:
                                     gen = self._speak_generation
@@ -8713,7 +8746,7 @@ class MediaStreamSession:
                             raise
                         saw_terminal_metadata = False
 
-                    if self._is_direct_smartpbx():
+                    if self._is_direct_smartpbx_non_capture():
                         outcome = _classify_gemini_round_outcome(
                             text_content=text_content,
                             function_calls=function_calls,

@@ -3594,6 +3594,101 @@ async def test_direct_sinhala_gemini_deadline_is_bound_to_the_telemetry_owned_tu
 
 
 @pytest.mark.asyncio
+async def test_stale_failed_turn_cancels_only_its_same_turn_generation_deferred_tts(
+    monkeypatch,
+):
+    """A stale timeout must not retire a newer turn sharing its generation."""
+    import server
+
+    pipeline = direct_tool_pipeline(server, "claude", direct_tool_client("claude", []))
+    generation = pipeline._speak_generation
+    old_runner = server._SmartPBXRunnerContext(
+        turn_id="old-turn",
+        dropped_frame_baseline=0,
+        speak_generation=generation,
+        raw_utterance="",
+    )
+    new_runner = server._SmartPBXRunnerContext(
+        turn_id="new-turn",
+        dropped_frame_baseline=0,
+        speak_generation=generation,
+        raw_utterance="",
+    )
+    pipeline._active_smartpbx_turn_id = old_runner.turn_id
+    pipeline._assistant_turn_generation = generation
+    started = {text: asyncio.Event() for text in ("old sentence", "new sentence")}
+    cancelled = {text: asyncio.Event() for text in started}
+    tts_release = {text: asyncio.Event() for text in started}
+    owner_release = {text: asyncio.Event() for text in started}
+    tasks: dict[str, asyncio.Task] = {}
+
+    async def blocked_speak(text, *, generation, sentence):
+        started[text].set()
+        try:
+            await tts_release[text].wait()
+        except asyncio.CancelledError:
+            cancelled[text].set()
+            raise
+
+    async def start_owned_tts(runner, text):
+        token = server._smartpbx_runner_context.set(runner)
+        try:
+            task = pipeline._start_smartpbx_round_tts(
+                text, generation=generation, sentence=text,
+            )
+            assert task is not None
+            tasks[text] = task
+            await owner_release[text].wait()
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+    monkeypatch.setattr(pipeline, "_invoke_speak", blocked_speak)
+    old_owner = asyncio.create_task(start_owned_tts(old_runner, "old sentence"))
+    try:
+        await asyncio.wait_for(started["old sentence"].wait(), timeout=1)
+        pipeline._active_smartpbx_turn_id = new_runner.turn_id
+        new_owner = asyncio.create_task(start_owned_tts(new_runner, "new sentence"))
+        await asyncio.wait_for(started["new sentence"].wait(), timeout=1)
+
+        token = server._smartpbx_runner_context.set(old_runner)
+        try:
+            fenced_generation = await pipeline._smartpbx_fence_stalled_generation(
+                tts_tasks=[], gen=generation,
+            )
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+        assert fenced_generation == generation
+        assert cancelled["old sentence"].is_set()
+        assert not cancelled["new sentence"].is_set()
+        assert tasks["old sentence"].done()
+        assert not tasks["new sentence"].done()
+        assert tasks["new sentence"] in pipeline._smartpbx_deferred_tts_tasks
+        assert pipeline._smartpbx_deferred_tts_owners[tasks["new sentence"]] == (
+            new_runner.turn_id,
+            generation,
+        )
+    finally:
+        for release in tts_release.values():
+            release.set()
+        for release in owner_release.values():
+            release.set()
+        if not old_owner.done():
+            old_owner.cancel()
+        if "new_owner" in locals() and not new_owner.done():
+            new_owner.cancel()
+        await asyncio.gather(
+            old_owner,
+            *( [new_owner] if "new_owner" in locals() else [] ),
+            *tasks.values(),
+            return_exceptions=True,
+        )
+        await asyncio.sleep(0)
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert not pipeline._smartpbx_deferred_tts_owners
+
+
+@pytest.mark.asyncio
 async def test_direct_sinhala_gemini_capture_mode_does_not_install_deadline_wrappers(monkeypatch):
     import server
 
@@ -3625,7 +3720,7 @@ def _direct_gemini_partial_tool_round(*, finish_reason=None, raised=None):
     events = [SimpleNamespace(candidates=[SimpleNamespace(
         finish_reason=None,
         content=SimpleNamespace(parts=[
-            SimpleNamespace(text="Partial native Gemini sentence.", function_call=None),
+            SimpleNamespace(text="Partial native Gemini sentence. ", function_call=None),
             SimpleNamespace(
                 text=None,
                 function_call=SimpleNamespace(
@@ -3703,8 +3798,13 @@ async def test_direct_sinhala_terminal_true_empty_retries_then_recovers_once_thr
     async def claude_must_not_run():
         raise AssertionError("true-empty recovery must not enter the Claude path")
 
-    async def sinhala_tts(text, **_kwargs):
+    async def sinhala_tts(text, *, sentence=None, turn_generation=None):
         spoken.append(text)
+        pipeline._is_speaking = True
+        await pipeline._send_tts_done(
+            sentence=sentence,
+            turn_generation=turn_generation,
+        )
 
     monkeypatch.setattr(server, "retrieve_context", lambda _text: "")
     monkeypatch.setattr(server, "GEMINI_FAILOVER_TO_CLAUDE", False)
@@ -3864,7 +3964,7 @@ async def test_direct_sinhala_gemini_post_tool_failure_fences_tts_and_does_not_r
         SimpleNamespace(candidates=[SimpleNamespace(
             finish_reason=None,
             content=SimpleNamespace(parts=[SimpleNamespace(
-                text="Partial post-tool sentence.", function_call=None,
+                text="Partial post-tool sentence. ", function_call=None,
             )]),
         )]),
         _DirectToolStreamRaise(RuntimeError("private post-tool stream failure")),

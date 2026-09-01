@@ -66,6 +66,14 @@ def _terminal_chunk_with_output_usage(output_tokens: int):
     return chunk
 
 
+def _usage_only_chunk(output_tokens: int):
+    """A native Gemini usage update that carries no candidate payload."""
+    return SimpleNamespace(
+        candidates=[],
+        usage_metadata=SimpleNamespace(candidates_token_count=output_tokens),
+    )
+
+
 def _tool_chunk(
     name: str,
     args: dict | None = None,
@@ -278,7 +286,7 @@ def test_thought_parts_are_never_spoken():
 def test_tool_round_loops_and_the_filler_covers_the_tool_latency(monkeypatch):
     session, spoken = _session(
         [
-            [_tool_chunk("check_availability", {"nights": 2})],
+            [_tool_chunk("check_availability", {"nights": 2}, id="tool-latency-1")],
             [_text_chunk("Two suites are free.")],
         ],
         smartpbx=True,
@@ -323,7 +331,10 @@ def test_the_twilio_media_streams_path_still_gets_its_language_filler(monkeypatc
 
 def test_tool_rounds_are_bounded_by_max_tool_rounds(monkeypatch):
     session, _spoken = _session(
-        [[_tool_chunk("check_availability")] for _ in range(server.MAX_TOOL_ROUNDS)],
+        [
+            [_tool_chunk("check_availability", id=f"bounded-{index}")]
+            for index in range(server.MAX_TOOL_ROUNDS)
+        ],
         smartpbx=True,
     )
 
@@ -341,10 +352,18 @@ def test_streamed_thought_signature_is_echoed_back_to_gemini(monkeypatch):
     """Gemini 3.x rejects the follow-up round if the signature is not returned."""
     session, _spoken = _session(
         [
-            [_tool_chunk("check_availability", {}, thought_signature=b"sig-123")],
+            [
+                _tool_chunk(
+                    "check_availability",
+                    {},
+                    id="thought-1",
+                    thought_signature=b"sig-123",
+                )
+            ],
             [_text_chunk("All set.")],
         ],
         smartpbx=True,
+        model="gemini-3.7-flash",
     )
 
     async def execute(_name, _arguments):
@@ -604,6 +623,57 @@ def test_direct_smartpbx_gemini_logs_unknown_only_without_usage_metadata(caplog)
     assert outcomes == [
         "smartpbx_media event=llm_round_outcome provider=gemini "
         "outcome=completed stop_reason=end_turn output_tokens=unknown attempt=1"
+    ]
+
+
+def test_direct_smartpbx_gemini_consumes_usage_only_chunk_without_capping(caplog):
+    session, _spoken = _session(
+        [[
+            _usage_only_chunk(42),
+            _text_chunk("Ready."),
+            _terminal_chunk(),
+        ]],
+        smartpbx=True,
+        terminalize_direct_rounds=False,
+    )
+
+    with caplog.at_level("INFO", logger="server"):
+        asyncio.run(session._run_llm_gemini())
+
+    outcomes = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=llm_round_outcome provider=gemini" in record.getMessage()
+    ]
+    assert outcomes == [
+        "smartpbx_media event=llm_round_outcome provider=gemini "
+        "outcome=completed stop_reason=end_turn output_tokens=42 attempt=1"
+    ]
+
+
+def test_direct_smartpbx_gemini_retry_does_not_reuse_prior_attempt_usage(caplog):
+    session, _spoken = _session(
+        [[_terminal_chunk_with_output_usage(42)], [
+            _text_chunk("Ready."),
+            _terminal_chunk(),
+        ]],
+        smartpbx=True,
+        terminalize_direct_rounds=False,
+    )
+
+    with caplog.at_level("INFO", logger="server"):
+        asyncio.run(session._run_llm_gemini())
+
+    outcomes = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=llm_round_outcome provider=gemini" in record.getMessage()
+    ]
+    assert outcomes == [
+        "smartpbx_media event=llm_round_outcome provider=gemini "
+        "outcome=true_empty stop_reason=end_turn output_tokens=42 attempt=1",
+        "smartpbx_media event=llm_round_outcome provider=gemini "
+        "outcome=completed stop_reason=end_turn output_tokens=unknown attempt=2",
     ]
 
 
