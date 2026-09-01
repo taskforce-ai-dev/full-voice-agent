@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import threading
 
 import pytest
 
@@ -676,3 +677,158 @@ async def test_sinhala_azure_preflight_failure_is_azure_not_llm_unavailable(
     assert events == [
         "smartpbx_media event=language_profile_unavailable lang=si provider=azure"
     ]
+
+
+@pytest.mark.asyncio
+async def test_preflight_cleanup_stops_sync_stt_off_loop_and_finishes_once(monkeypatch):
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "claude")
+
+    class ThreadRecordingStt(RecordingStt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_threads: list[int] = []
+
+        def stop(self) -> None:
+            self.stop_threads.append(threading.get_ident())
+            super().stop()
+
+    stt = ThreadRecordingStt()
+    session, pipeline, _stt, _transport = _controlled_session(stt=stt)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = session._preflight_language_profile
+
+    async def gated(candidate_pipeline, profile):
+        entered.set()
+        await release.wait()
+        return await original(candidate_pipeline, profile)
+
+    monkeypatch.setattr(session, "_preflight_language_profile", gated)
+    await session.start()
+    activation = asyncio.create_task(session.feed_dtmf("2"))
+    await entered.wait()
+    finish = asyncio.create_task(session.finish())
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.wait_for(asyncio.gather(activation, finish), timeout=1)
+
+    assert stt.starts == 0
+    assert stt.stops == 1
+    assert stt.stop_threads != [threading.get_ident()]
+    assert pipeline._stt is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_sinhala_provider_is_closed_before_openai_or_state_mutation(monkeypatch):
+    events = _capture_profile_events(monkeypatch)
+    session, pipeline, stt, transport = _controlled_session()
+    original_tools = copy.deepcopy(pipeline.tools)
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "openai")
+    monkeypatch.setattr(
+        server, "_get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("invalid Sinhala provider reached OpenAI")),
+    )
+
+    await session.start()
+    await asyncio.sleep(0)
+    await session.feed_dtmf("2")
+
+    assert stt.starts == 0
+    assert session._selected_language is None
+    assert session.terminal_future.done()
+    assert pipeline.tools == original_tools
+    assert pipeline._stt is None
+    assert transport.clears == 0
+    assert events == [
+        "smartpbx_media event=language_profile_unavailable lang=si provider=invalid"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fallback_claude_client_exhaustion_is_the_only_provider_none_case(monkeypatch):
+    events = _capture_profile_events(monkeypatch)
+    session, pipeline, stt, _transport = _controlled_session()
+    pipeline.anthropic_client = None
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(server, "_get_gemini_client", _raise_runtime_error)
+    monkeypatch.setattr(server, "_get_anthropic_client", _raise_runtime_error)
+
+    await session.start()
+    await session.feed_dtmf("2")
+
+    assert stt.starts == 0
+    assert events == [
+        "smartpbx_media event=language_profile_unavailable lang=si provider=none"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fallback_claude_tool_setup_failure_is_not_client_exhaustion(monkeypatch):
+    events = _capture_profile_events(monkeypatch)
+    session, pipeline, stt, _transport = _controlled_session()
+    pipeline.llm_provider = "gemini"
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(server, "_get_gemini_client", _raise_runtime_error)
+    monkeypatch.setattr(server, "get_tools", _raise_runtime_error)
+
+    await session.start()
+    await session.feed_dtmf("2")
+
+    assert stt.starts == 0
+    assert events == [
+        "smartpbx_media event=language_profile_unavailable lang=si provider=claude"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gemini_tool_setup_failure_falls_back_without_client_unavailable_reason(monkeypatch):
+    events = _capture_profile_events(monkeypatch)
+    session, pipeline, stt, _transport = _controlled_session()
+    pipeline.gemini_client = object()
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(server, "get_tools_gemini", _raise_runtime_error)
+
+    await session.start()
+    await session.feed_dtmf("2")
+
+    assert stt.starts == 1
+    assert pipeline.llm_provider == "claude"
+    assert events == [
+        "smartpbx_media event=language_profile_fallback lang=si "
+        "from=gemini to=claude reason=provider_setup_unavailable"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_timeout_english_profile_preserves_provider_clients_and_tool_copy(monkeypatch):
+    session, pipeline, stt = make_session()
+    original_tools = pipeline.tools
+    expected_tools = copy.deepcopy(original_tools)
+    expected = (pipeline.llm_provider, pipeline.model, pipeline.anthropic_client, pipeline.gemini_client)
+    monkeypatch.setattr(server, "SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS", 0)
+
+    await session.start()
+    await asyncio.wait_for(_wait_for_stt_start(stt), timeout=1)
+
+    assert (pipeline.llm_provider, pipeline.model, pipeline.anthropic_client, pipeline.gemini_client) == expected
+    assert pipeline.tools == expected_tools
+    assert pipeline.tools is not original_tools
+    assert pipeline.tools[0] is not original_tools[0]
+
+
+@pytest.mark.asyncio
+async def test_second_invalid_english_profile_preserves_provider_clients_and_tool_copy():
+    session, pipeline, stt = make_session()
+    original_tools = pipeline.tools
+    expected_tools = copy.deepcopy(original_tools)
+    expected = (pipeline.llm_provider, pipeline.model, pipeline.anthropic_client, pipeline.gemini_client)
+
+    await session.start()
+    await session.feed_dtmf("#")
+    await session.feed_dtmf("*")
+
+    assert stt.starts == 1
+    assert (pipeline.llm_provider, pipeline.model, pipeline.anthropic_client, pipeline.gemini_client) == expected
+    assert pipeline.tools == expected_tools
+    assert pipeline.tools is not original_tools
+    assert pipeline.tools[0] is not original_tools[0]
