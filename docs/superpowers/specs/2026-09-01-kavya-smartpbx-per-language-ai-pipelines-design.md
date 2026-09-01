@@ -45,9 +45,18 @@ already-shipped SmartPBX IVR and Gemini Sinhala TTS design.
   latency controls.
 - Pressing `2` must select a Sinhala session profile before STT starts and
   before conversation history exists.
+- The existing bilingual pre-selection IVR menu remains intact. It temporarily
+  uses `lang="si"` to speak the Sinhala menu line through Gemini TTS before a
+  profile is selected; this is menu delivery, not a selected Sinhala LLM
+  profile, and this LLM-only change must not alter it.
 - The Sinhala profile names Azure explicitly and fails closed if Azure is not
-  constructible. It must never inherit the global factory's Azure-to-Google
-  fallback; English retains that existing configured fallback behavior.
+  constructible because its SDK, `audioop`, or a whitespace-only
+  `AZURE_SPEECH_KEY` is absent. It
+  must never inherit the global factory's Azure-to-Google fallback; English
+  retains that existing configured fallback behavior. An Azure stream that
+  later cancels is also fatal to the selected Sinhala session: it must invoke
+  the session-owned fatal callback once, not on normal shutdown and not merely
+  log and leave the caller silent.
 - Provider/model/tool selection and requested generation controls are
   session-owned. Lazy module-level SDK client singletons may remain shared, but
   no call may mutate process-wide provider/model/tool/thinking compatibility
@@ -118,11 +127,11 @@ Sinhala production service.
 
 1. The SmartPBX session starts in the existing pre-STT IVR state.
 2. `1`, `2`, timeout, or invalid-selection fallback resolves a language code.
-3. A small profile resolver returns the provider/model/tool/STT/TTS choices for
-   that language. It returns values; it does not mutate globals. The existing
-   immutable language code remains the execution key for the current STT
-   factory and TTS router; the profile records those choices explicitly rather
-   than adding a provider registry.
+3. A small profile resolver returns only executable per-session provider,
+   model, tool, STT-backend, and generation-control values. It returns values;
+   it does not mutate globals. `lang` remains the existing execution key for
+   both the STT factory and the TTS router: the profile must not duplicate
+   descriptive TTS provider/model/voice fields or introduce a provider registry.
 4. `_activate_language()` applies that profile exactly once before constructing
    and starting STT:
    - set `lang` and rebuild the language system prompt;
@@ -248,8 +257,10 @@ it.
 - A Gemini TTS failure remains a TTS failure. It must not invoke OpenAI,
   ElevenLabs, Azure, or another speech provider.
 - An STT provider failure must fail closed through the existing session fatal
-  signal or an explicitly tested Sinhala-only rollback mechanism. It must not
-  silently change English or mix transcripts from two recognizers.
+  signal. Azure construction must reject missing SDK, `audioop`, and key before
+  the welcome starts; `AzureSTTStream` must expose and call `on_fatal` from its
+  cancellation callback. It must not silently change English or mix transcripts
+  from two recognizers.
 
 ## Verification design
 
@@ -262,6 +273,9 @@ it.
 - Simultaneous English and Sinhala calls retain independent provider/model/tool
   state through normal turns, capture turns, tool rounds, barge-in, and
   teardown.
+- The English IVR selection neither eagerly reads/validates an ElevenLabs voice
+  secret nor changes the canonical `lang="en"` ElevenLabs `_speak` route; the
+  Sinhala selection still routes `lang="si"` speech exclusively to Gemini TTS.
 
 ### LLM and tools
 
@@ -271,6 +285,10 @@ it.
 - Empty, blocked, truncated, timed-out, malformed-tool, quota, server-error,
   and post-tool failure paths have the required retry/failover/recovery
   outcome.
+- Sinhala uses the language-appropriate direct-SmartPBX recovery predicate in
+  both the exhausted-empty and tool-executed-exception branches, so it receives
+  the same bounded provider-safe recovery as English rather than a generic
+  fallback path.
 - Direct SmartPBX Sinhala Gemini turns use the same non-capture initial/stall
   deadline and atomic timeout recovery contract as direct SmartPBX Claude
   turns. Capture flows keep their existing timeout carve-out.
