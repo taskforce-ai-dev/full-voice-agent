@@ -4075,9 +4075,11 @@ async def test_direct_sinhala_gemini_post_tool_failure_fences_tts_and_does_not_r
         assert len(client.requests) == 2
         assert executed == [("check_availability", {"nights": 1})]
         assert spoken == [
+            server.MEDIA_STREAM_FILLERS["si"]["check_availability"],
             "සමාවෙන්න, මට පැහැදිලි යාවත්කාලීනයක් දෙන්න බැරි වුණා. "
             "මට දිගටම උදව් කරන්නද?"
         ]
+        assert "Partial post-tool sentence." not in spoken
         assert "Partial post-tool sentence." not in repr(pipeline.history)
         assert [message for message in pipeline.history if message.get("role") == "tool"]
         assert len([
