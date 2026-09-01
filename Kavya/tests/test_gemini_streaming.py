@@ -1801,6 +1801,46 @@ def test_direct_sinhala_rejects_an_unapproved_provider_marker(monkeypatch):
     assert result == spoken[-1]
 
 
+def test_direct_sinhala_local_config_transport_error_does_not_replay_claude(monkeypatch):
+    session, spoken = _session([], lang="si", smartpbx=True)
+    session.anthropic_client = object()
+    claude_calls = 0
+
+    def bad_config(**_kwargs):
+        raise httpx.ConnectError("local config transport error")
+
+    async def run_claude():
+        nonlocal claude_calls
+        claude_calls += 1
+        return "must not run"
+
+    monkeypatch.setattr(server, "_build_gemini_config", bad_config)
+    monkeypatch.setattr(session, "_run_llm_claude", run_claude)
+    result = asyncio.run(session._run_llm_gemini())
+    assert claude_calls == 0
+    assert result == spoken[-1]
+
+
+def test_direct_sinhala_local_tts_transport_error_does_not_replay_claude(monkeypatch):
+    session, spoken = _session([[_text_chunk("සිංහල වාක්‍යය.")]], lang="si", smartpbx=True)
+    session.anthropic_client = object()
+    claude_calls = 0
+
+    async def bad_tts(*_args, **_kwargs):
+        raise httpx.ConnectError("local tts transport error")
+
+    async def run_claude():
+        nonlocal claude_calls
+        claude_calls += 1
+        return "must not run"
+
+    session._tts_gemini_sinhala = bad_tts
+    monkeypatch.setattr(session, "_run_llm_claude", run_claude)
+    result = asyncio.run(session._run_llm_gemini())
+    assert claude_calls == 0
+    assert result == spoken[-1]
+
+
 def test_direct_sinhala_partial_tts_is_cancelled_before_claude_fallback(monkeypatch):
     session, _spoken = _session([], lang="si", smartpbx=True)
     session.gemini_client = FakeFlakyGemini([[

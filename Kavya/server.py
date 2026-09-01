@@ -3621,6 +3621,28 @@ async def _iter_gemini_stream(stream) -> AsyncIterator[tuple[str, Any]]:
             yield "finish", finish_reason
 
 
+async def _iter_gemini_provider_deltas(
+    stream, *, mark_provider_errors: bool = False,
+) -> AsyncIterator[tuple[str, Any]]:
+    """Advance the normalized Gemini iterator behind the narrow marker seam.
+
+    The caller's response/filler/TTS/history work runs outside this adapter, so
+    an ``httpx`` exception from local processing cannot be mistaken for an LLM
+    transport failure and replayed through Claude.
+    """
+    iterator = _iter_gemini_stream(stream)
+    while True:
+        try:
+            yield await anext(iterator)
+        except StopAsyncIteration:
+            return
+        except Exception as exc:
+            reason = _gemini_provider_origin_reason(exc)
+            if mark_provider_errors and reason is not None:
+                raise _GeminiProviderOriginError(reason) from None
+            raise
+
+
 def _log_gemini_empty(
     *, path: str, attempt: int, finish_reason: Any, retrying: bool, call_sid: str = ""
 ) -> None:
@@ -8734,23 +8756,25 @@ class MediaStreamSession:
                     reported_output_tokens = None
 
                     async def _acquire_gemini_stream():
+                        contents = _history_to_gemini(
+                            self.history,
+                            include_function_call_ids=self._is_direct_smartpbx(),
+                        )
+                        config = _build_gemini_config(
+                            system=self._active_system_prompt(),
+                            tools=self.tools,
+                            model=self.model,
+                            nudge=nudge,
+                            max_output_tokens=self._provider_max_tokens("gemini"),
+                            thinking_level=self._gemini_thinking_level,
+                            unsupported_models=self._gemini_thinking_unsupported_models,
+                        )
                         try:
                             return await _open_gemini_stream(
                                 self.gemini_client,
                                 model=self.model,
-                                contents=_history_to_gemini(
-                                    self.history,
-                                    include_function_call_ids=self._is_direct_smartpbx(),
-                                ),
-                                config=_build_gemini_config(
-                                    system=self._active_system_prompt(),
-                                    tools=self.tools,
-                                    model=self.model,
-                                    nudge=nudge,
-                                    max_output_tokens=self._provider_max_tokens("gemini"),
-                                    thinking_level=self._gemini_thinking_level,
-                                    unsupported_models=self._gemini_thinking_unsupported_models,
-                                ),
+                                contents=contents,
+                                config=config,
                                 unsupported_models=self._gemini_thinking_unsupported_models,
                             )
                         except Exception as exc:
@@ -8782,7 +8806,9 @@ class MediaStreamSession:
                             response_iter = await _acquire_gemini_stream()
 
                         stream_opened = True
-                        async for kind, payload in _iter_gemini_stream(response_iter):
+                        async for kind, payload in _iter_gemini_provider_deltas(
+                            response_iter, mark_provider_errors=direct_sinhala,
+                        ):
                             if kind == "usage":
                                 reported_output_tokens = payload
                                 continue
@@ -8843,9 +8869,9 @@ class MediaStreamSession:
 
                     except Exception as exc:
                         if direct_sinhala:
-                            reason = _gemini_provider_origin_reason(exc)
-                            if reason is not None:
-                                raise _GeminiProviderOriginError(reason) from None
+                            # The only direct-Sinhala marker source is the
+                            # acquisition await or iterator adapter above.
+                            # Local processing exceptions must stay unmarked.
                             raise
                         # A provider disconnect after a visible delta is an
                         # incomplete direct round, never a reason to commit
