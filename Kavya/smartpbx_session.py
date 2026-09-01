@@ -244,7 +244,11 @@ class KavyaSmartPBXSession:
         """Prepare provider/STT first, then make exactly one committed selection."""
         del source  # The source is audit context; selection semantics are identical.
         async with self._language_activation_lock:
-            if self._selected_language is not None or self._finish_task is not None:
+            if (
+                self._selected_language is not None
+                or self._finish_task is not None
+                or self._terminal_future.done()
+            ):
                 return
             pipeline = self._require_pipeline()
             requested_profile = self._resolve_language_profile(lang)
@@ -545,6 +549,10 @@ class KavyaSmartPBXSession:
 
     def _end_call_without_language_profile(self, _profile: SmartPBXLanguageProfile) -> None:
         """Terminal profile failure is not a false generic STT-unavailable event."""
+        timeout_handle = self._language_timeout_handle
+        self._language_timeout_handle = None
+        if timeout_handle is not None:
+            timeout_handle.cancel()
         if not self._terminal_future.done():
             self._terminal_future.set_result(None)
 
