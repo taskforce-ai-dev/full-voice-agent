@@ -32,7 +32,7 @@
 - Modify `Kavya/tests/test_gemini_streaming.py`: Gemini 3.7 function-call IDs, truncation/deadline behavior, session isolation, Sinhala-specific request shape, and Claude fallback preservation.
 - Modify `Kavya/tests/test_smartpbx_gemini_tts.py`: option-1 ElevenLabs, option-2 Gemini, and Gemini-TTS preservation during Claude LLM fallback.
 - Modify `Kavya/tests/test_prompt_policy.py`: conversational Sinhala prompt contract without weakening English policy.
-- Modify `Kavya/tests/test_smartpbx_deployment.py`: Compose, dotenv, runbook setting, extracted-template parser, and exact diagnostics contracts.
+- Modify `Kavya/tests/test_smartpbx_deployment.py:23-39,564-598,3141-3167,3184-3213`: Compose, dotenv, runbook setting, active-assignment parser, and exact diagnostics contracts.
 - Modify `Kavya/docker-compose.yml`: explicit SmartPBX-only environment allowlist entries.
 - Modify `Kavya/.env.example`: non-secret Sinhala LLM defaults and rollback comments.
 - Modify `Kavya/SMARTPBX_RUNBOOK.md`: runtime behavior, canary checks, and one-line rollback.
@@ -317,17 +317,22 @@ async def test_concurrent_english_and_sinhala_profiles_never_cross_mutate(monkey
     )
 ```
 
-Add a separate behavioral routing test, using a no-welcome test session so
-selection is isolated from greeting synthesis. Patch
-`load_kavya_english_voice_profile` to raise during `feed_dtmf("1")` and assert
-selection still starts English STT. Then replace the pipeline's
-`_tts_elevenlabs` and `_tts_gemini_sinhala` with distinct async recorders,
-restore a canonical English voice-profile stub for the actual speak, and await
-`pipeline._speak("English route")`: assert only `_tts_elevenlabs` received the
-call and that it used the canonical-profile path. In the paired Sinhala session
-await `_speak("සිංහල")` and assert only `_tts_gemini_sinhala` received the call.
-The test must assert the concrete `_speak` dispatches, not merely profile field
-values, because `lang` is the actual TTS execution key.
+Keep `RecordingPipeline` limited to activation-state and STT-start snapshots;
+it must never patch or call production `_tts_*` methods or `_speak`. Add the
+separate behavioral routing test with an executable real `MediaStreamSession`,
+a `KavyaSmartPBXSession` stub, and transport/STT stubs that satisfy the real
+session constructor and lifecycle. Use a no-welcome session so selection is
+isolated from greeting synthesis. Patch `load_kavya_english_voice_profile` to
+raise during `feed_dtmf("1")` and assert selection still starts English STT.
+For the production-routing seam, wrap the real session's ElevenLabs and Sinhala
+Gemini TTS internals with distinct async recorders, restore a canonical English
+voice-profile stub for the actual English speak, and invoke the real session
+`_speak("English route")`; assert only the ElevenLabs route runs and that it
+uses the canonical-profile path. In the paired real Sinhala session invoke
+`_speak("සිංහල")` and assert only the Gemini-TTS route runs. A separate
+canonical-ElevenLabs-internals test is acceptable if it is needed to keep the
+real-routing test focused. These assertions must exercise concrete dispatch,
+not merely profile fields, because `lang` is the execution key.
 
 Also extend `Kavya/tests/test_smartpbx_gemini_tts.py`: prove option 1 speaks
 with ElevenLabs, option 2 speaks with Gemini, and a Sinhala Gemini-to-Claude
@@ -488,6 +493,17 @@ def test_configured_english_azure_keeps_existing_google_fallback(monkeypatch):
     assert isinstance(stream, server.GoogleSTTStream)
 
 
+def test_explicit_unknown_stt_provider_is_rejected():
+    with pytest.raises(RuntimeError, match="requested STT provider unavailable"):
+        server._make_stt(
+            lambda _text: None,
+            lambda _text: None,
+            "si",
+            provider="unsupported",
+            fail_closed=True,
+        )
+
+
 @pytest.mark.asyncio
 async def test_invalid_global_stt_provider_preserves_english_google_behavior(monkeypatch):
     monkeypatch.setattr(server, "STT_PROVIDER", "unexpected")
@@ -499,6 +515,11 @@ async def test_invalid_global_stt_provider_preserves_english_google_behavior(mon
     assert stt.starts == 1
     assert session._resolve_language_profile("en").stt_provider == "google"
 ```
+
+The explicit-unknown-provider case must remain separate from both the invalid
+global configuration test and the configured-English Azure-to-Google fallback:
+it proves `_make_stt(..., provider=<unknown>)` rejects instead of silently
+selecting a recognizer.
 
 Add an IVR-level variant whose STT factory raises for the concrete Azure
 profile. Assert no STT start, no welcome, resolved terminal future, and the
@@ -710,7 +731,7 @@ Expected GitHub Actions result: provider-isolation tests pass; all existing Smar
 ### Task 3: Make the Gemini 3.7 SmartPBX runner provider-correct and session-owned
 
 **Files:**
-- Modify: `Kavya/server.py:3274-3473,4946-4983,5180-5194,8291-8444`
+- Modify: `Kavya/server.py:3274-3473,4946-4983,5180-5194,8291-8860`
 - Test: `Kavya/tests/test_gemini_streaming.py:425-466,665-960`
 - Test: `Kavya/tests/test_smartpbx_server.py:3318-3356`
 
@@ -1142,8 +1163,8 @@ Expected GitHub Actions result: prompt and fallback tests pass; existing English
 **Files:**
 - Modify: `Kavya/docker-compose.yml:99-168`
 - Modify: `Kavya/.env.example:22-32,265-285`
-- Modify: `Kavya/SMARTPBX_RUNBOOK.md:70-141,143-185,203-208,264-268,304-308,469-485,518-522`
-- Modify: `Kavya/tests/test_smartpbx_deployment.py:564-598,3141-3167,3184-3213`
+- Modify: `Kavya/SMARTPBX_RUNBOOK.md:70-141,143-185,264-268,304-308,345-346,469-485,518-522`
+- Modify: `Kavya/tests/test_smartpbx_deployment.py:23-39,564-598,3141-3167,3184-3213`
 
 **Interfaces:**
 - Consumes: the four environment variable names from Task 1.
@@ -1252,7 +1273,9 @@ SMARTPBX_SINHALA_GEMINI_TTS_VOICE=Vindemiatrix
 SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS=15.0
 ```
 
-Keep `GEMINI_API_KEY=` blank and unique.
+Keep `GEMINI_API_KEY=` blank and unique in the example/template. For runtime
+activation, define a nonblank key as `bool(value.strip())`; a whitespace-only
+assignment is not usable and is never printed.
 
 Extend the existing dotenv deployment helper into an active-assignment parser
 for the extracted protected runbook template (the `dotenv` block at lines
@@ -1261,8 +1284,25 @@ require exactly one active assignment each for
 `SMARTPBX_SINHALA_LLM_PROVIDER`, `SMARTPBX_SINHALA_GEMINI_LLM_MODEL`,
 `SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL`, and
 `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS`, and exactly one active blank
-`GEMINI_API_KEY=`. Reject duplicates, a later active value, or a nonblank
-Gemini key. Test each failure shape. Do not merely search for a matching line.
+`GEMINI_API_KEY=`. Reject duplicates, whitespace-only values, a later active
+value, or a nonblank Gemini key in that protected blank-key template. Test the
+accepted blank assignment, rejected whitespace-only assignment, and rejected
+later-nonblank assignment without rendering any key value. Do not merely search
+for a matching line.
+
+Replace the current grep-based runtime key-presence contract
+(`grep -Eq '^GEMINI_API_KEY=.+$' ...`), which accepts whitespace-only values,
+with a no-output active-assignment check that requires exactly one assignment
+and a stripped non-empty value, for example:
+
+```bash
+awk -F= '$1 == "GEMINI_API_KEY" { count++; if ($2 ~ /[^[:space:]]/) nonblank++ } END { exit !(count == 1 && nonblank == 1) }' /opt/kavya/.env.smartpbx
+```
+
+The runtime-contract tests must prove that blank and whitespace-only values
+fail, while one nonblank value succeeds, without echoing the key. Keep the
+later-nonblank case as a separate protected-template failure test; it must not
+weaken the example/template's exact blank-assignment contract.
 
 In the preceding `SMARTPBX_CLAUDE_MAX_TOKENS` comment block, replace the stale
 `OpenAI and Gemini stay on SMARTPBX_MAX_TOKENS` sentence. State that Gemini 3.7
@@ -1277,9 +1317,12 @@ Replace the existing `## SmartPBX Sinhala menu and Gemini TTS` section in place
 (not a new heading elsewhere) with concise text containing all of these
 operational facts. Preserve that exact heading because the deployment test
 extracts it. Replace the stale Press-2/Claude claims at current lines 149-151
-and 176-178, the English-only timing-provider claim at 203-208, the stale
-provider timing claims at 264-268, the shared-120-budget claim at 304-308, and
-the Claude-only retry claim at 518-522. The replacements must say that
+and 176-178, the stale provider timing claims at 264-268, the shared-120-budget
+claim at 304-308, the 345-346 statement that OpenAI/Gemini budgets are
+untouched, and the Claude-only retry claim at 518-522. Preserve the unrelated
+startup pre-roll canary at 203-208. The 345-346 replacement must distinguish
+English Gemini's preserved `SMARTPBX_MAX_TOKENS` request contract from Sinhala
+Gemini's session-owned `600` ceiling. The replacements must say that
 direct-SmartPBX Sinhala Gemini uses the non-capture deadline/recovery branches,
 while capture remains excluded; fillers and other English-only policy are not
 broadened.
@@ -1304,11 +1347,17 @@ fallback is permitted. Preserve the bilingual pre-selection menu: its Sinhala
 line still uses Gemini TTS before a language profile is selected.
 
 Before enabling Sinhala, use an active-assignment parser over the protected
-template and a key-presence check that requires a nonblank `GEMINI_API_KEY`
-only for Sinhala, never prints the key, and leaves the service unchanged on
-failure. Diagnostics and the canary inspect only bounded provider/event/outcome
-fields; they never expose response content, transcript text, exception detail,
-or any secret.
+template and the no-output check below. It requires exactly one
+`GEMINI_API_KEY` assignment with `bool(value.strip())`, only for Sinhala,
+never prints the key, and leaves the service unchanged on failure:
+
+```bash
+awk -F= '$1 == "GEMINI_API_KEY" { count++; if ($2 ~ /[^[:space:]]/) nonblank++ } END { exit !(count == 1 && nonblank == 1) }' /opt/kavya/.env.smartpbx
+```
+
+Diagnostics and the canary inspect only bounded provider/event/outcome fields;
+they never expose response content, transcript text, exception detail, or any
+secret.
 
 Rollback only the Sinhala LLM by setting:
 

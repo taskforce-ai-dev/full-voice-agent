@@ -400,15 +400,21 @@ Keep the existing runbook heading `## SmartPBX Sinhala menu and Gemini TTS`,
 because the deployment test extracts it. Its protected `.env.smartpbx` template
 contains exactly one active assignment for each of the four Sinhala LLM settings
 and exactly one blank active `GEMINI_API_KEY=`; the parser ignores comments and
-rejects duplicate, later, or nonblank key assignments. The section preserves
+rejects duplicate, later, or nonblank key assignments. For activation, a
+nonblank Gemini key means `bool(value.strip())`; whitespace-only is not a key.
+The tests cover a blank value, a whitespace-only value, and a later nonblank
+assignment without printing any value. The section preserves
 menu/timeout/invalid-selection behavior, key-presence/no-secret-printing,
 bounded diagnostics, two-language canary, and rollback.
 
 Update the stale timing, token-budget, and Claude-only-retry prose in the
-current runbook regions 203-208, 264-268, 304-308, and 518-522, together with
-the diagnostics schema around 469-485. Deployment coverage includes those
-diagnostics tests (564-598), protected-template tests (3141-3167), and section
-tests (3184-3213). Compose rendering always uses `--profile smartpbx`.
+current runbook regions 264-268, 304-308, 345-346, and 518-522, together with
+the diagnostics schema around 469-485. Preserve the startup pre-roll canary at
+203-208. The 345-346 replacement distinguishes preserved English Gemini
+budgeting from the Sinhala session-owned `600` ceiling. Deployment coverage
+includes the dotenv helper tests (23-39), diagnostics tests (564-598),
+protected-template tests (3141-3167), and section tests (3184-3213). Compose
+rendering always uses `--profile smartpbx`.
 
 ## Explicit non-goals
 
