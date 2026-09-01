@@ -1997,7 +1997,7 @@ def direct_tool_batch_round(provider, calls, *, preamble=None, yield_before=Fals
                     id=f"gemini-tool-{index + 1}", name=name, args=arguments,
                 ),
             )
-            for name, arguments in calls
+            for index, (name, arguments) in enumerate(calls)
         )
         return prefix + [
             SimpleNamespace(candidates=[SimpleNamespace(
