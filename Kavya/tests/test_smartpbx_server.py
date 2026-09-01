@@ -945,6 +945,30 @@ def test_smartpbx_stt_streams_can_disable_raw_sdk_transcript_logging(caplog):
     assert "raw azure stt transcript" not in caplog.text
 
 
+def test_azure_cancellation_signals_fatal_once_and_normal_stop_suppresses_it():
+    import server
+
+    canceled = server.AzureSTTStream(lambda _text: None, lang="si", privacy_safe=True)
+    canceled._running = True
+    fatal_calls: list[str] = []
+    canceled.on_fatal = lambda: fatal_calls.append("fatal")
+    event = SimpleNamespace(reason="canceled", error_details="private provider payload")
+
+    canceled._on_canceled(event)
+    canceled._on_canceled(event)
+
+    assert fatal_calls == ["fatal"]
+    assert canceled._running is False
+
+    stopped = server.AzureSTTStream(lambda _text: None, lang="si", privacy_safe=True)
+    stopped._running = True
+    stopped.on_fatal = lambda: fatal_calls.append("normal-stop")
+    stopped.stop()
+    stopped._on_canceled(event)
+
+    assert fatal_calls == ["fatal"]
+
+
 def test_explicit_sinhala_azure_is_fail_closed_when_sdk_is_unavailable(monkeypatch):
     import server
 

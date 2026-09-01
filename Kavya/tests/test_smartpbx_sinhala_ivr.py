@@ -462,3 +462,217 @@ async def test_sinhala_activation_fails_closed_when_no_llm_client_is_usable(monk
     assert events == [
         "smartpbx_media event=language_profile_unavailable lang=si provider=none"
     ]
+
+
+class _BlockingClearTransport(RecordingTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def clear_audio(self) -> None:
+        self.clears += 1
+        self.entered.set()
+        await self.release.wait()
+
+
+def _controlled_session(transport=None, stt=None):
+    pipeline = RecordingPipeline()
+    transport = transport or RecordingTransport()
+    stt = stt or RecordingStt()
+    session = KavyaSmartPBXSession(
+        _context(), transport, pipeline=pipeline,
+        stt_factory=lambda **_kwargs: stt,
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0),
+        welcome_text="", llm_provider="claude", model="test-model",
+    )
+    return session, pipeline, stt, transport
+
+
+@pytest.mark.asyncio
+async def test_digit_and_timeout_serialize_one_preflight_and_one_commit(monkeypatch):
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "claude")
+    session, _pipeline, stt, transport = _controlled_session()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+    original = session._preflight_language_profile
+
+    async def gated(pipeline, profile):
+        calls.append(profile.lang)
+        entered.set()
+        await release.wait()
+        return await original(pipeline, profile)
+
+    monkeypatch.setattr(session, "_preflight_language_profile", gated)
+    await session.start()
+    digit = asyncio.create_task(session.feed_dtmf("2"))
+    await entered.wait()
+    timeout = asyncio.create_task(session._activate_language("en", "timeout"))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(digit, timeout)
+
+    assert calls == ["si"]
+    assert stt.starts == 1
+    assert transport.clears == 1
+    assert session._selected_language == "si"
+
+
+@pytest.mark.asyncio
+async def test_finish_during_preflight_cleans_unstarted_candidate_without_orphan(monkeypatch):
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "claude")
+    session, pipeline, stt, transport = _controlled_session()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = session._preflight_language_profile
+
+    async def gated(candidate_pipeline, profile):
+        entered.set()
+        await release.wait()
+        return await original(candidate_pipeline, profile)
+
+    monkeypatch.setattr(session, "_preflight_language_profile", gated)
+    await session.start()
+    activation = asyncio.create_task(session.feed_dtmf("2"))
+    await entered.wait()
+    finish = asyncio.create_task(session.finish())
+    await asyncio.sleep(0)
+    assert session._finish_task is not None
+    assert not finish.done()
+    release.set()
+    await asyncio.gather(activation, finish)
+
+    assert stt.starts == 0
+    assert stt.stops == 1
+    assert pipeline._stt is None
+    assert session._welcome_task is None
+    assert transport.clears == 0
+
+
+@pytest.mark.asyncio
+async def test_finish_during_blocked_clear_cleans_candidate_and_releases_finish_lock(monkeypatch):
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "claude")
+    transport = _BlockingClearTransport()
+    session, pipeline, stt, _ = _controlled_session(transport=transport)
+    await session.start()
+    activation = asyncio.create_task(session.feed_dtmf("2"))
+    await transport.entered.wait()
+    finish = asyncio.create_task(session.finish())
+    await asyncio.sleep(0)
+    assert session._finish_task is not None
+    transport.release.set()
+    await asyncio.wait_for(asyncio.gather(activation, finish), timeout=1)
+
+    assert stt.starts == 0
+    assert stt.stops == 1
+    assert pipeline._stt is None
+    assert session._welcome_task is None
+
+
+@pytest.mark.asyncio
+async def test_finish_during_cancelled_menu_wait_cleans_candidate_without_late_start(monkeypatch):
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "claude")
+    session, pipeline, stt, transport = _controlled_session()
+    menu_cancelled = asyncio.Event()
+    menu_release = asyncio.Event()
+
+    async def stubborn_menu(_text):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            menu_cancelled.set()
+            await menu_release.wait()
+
+    pipeline._speak = stubborn_menu
+    await session.start()
+    await asyncio.sleep(0)
+    activation = asyncio.create_task(session.feed_dtmf("2"))
+    await menu_cancelled.wait()
+    finish = asyncio.create_task(session.finish())
+    await asyncio.sleep(0)
+    assert session._finish_task is not None
+    menu_release.set()
+    await asyncio.wait_for(asyncio.gather(activation, finish), timeout=1)
+
+    assert stt.starts == 0
+    assert stt.stops == 1
+    assert pipeline._stt is None
+    assert session._welcome_task is None
+    assert transport.clears == 1
+
+
+@pytest.mark.asyncio
+async def test_selected_pipeline_stt_owns_audio_and_teardown(monkeypatch):
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "claude")
+    session, pipeline, stt, _transport = _controlled_session()
+    await session.start()
+    await session.feed_dtmf("2")
+
+    await session.feed_audio(b"owned-audio")
+    await session.finish()
+
+    assert pipeline._stt is stt
+    assert stt.audio == [b"owned-audio"]
+    assert stt.stops == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_stt_start_failure_detaches_candidate_and_terminates(monkeypatch):
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "claude")
+
+    class FailingStt(RecordingStt):
+        def start(self) -> None:
+            self.starts += 1
+            raise RuntimeError("synthetic start failure")
+
+    stt = FailingStt()
+    session, pipeline, _stt, transport = _controlled_session(stt=stt)
+    await session.start()
+    await session.feed_dtmf("2")
+
+    assert stt.starts == 1
+    assert stt.stops == 1
+    assert pipeline._stt is None
+    assert session.terminal_future.done()
+    assert session._welcome_task is None
+    assert transport.clears == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    (("AZURE_STT_AVAILABLE", False), ("audioop", None), ("AZURE_SPEECH_KEY", "  ")),
+)
+async def test_sinhala_azure_preflight_failure_is_azure_not_llm_unavailable(
+    monkeypatch, attribute, value,
+):
+    events = _capture_profile_events(monkeypatch)
+    pipeline = RecordingPipeline()
+    pipeline.gemini_client = object()
+    transport = RecordingTransport()
+    session = KavyaSmartPBXSession(
+        _context(), transport, pipeline=pipeline, stt_factory=server._make_stt,
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0), welcome_text="",
+        llm_provider="claude", model="test-model",
+    )
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(server, "get_tools_gemini", lambda: [])
+    monkeypatch.setattr(server, attribute, value)
+    before_tools = copy.deepcopy(pipeline.tools)
+    await session.start()
+    await asyncio.sleep(0)
+    menu_task = session._language_menu_task
+
+    await session.feed_dtmf("2")
+
+    assert session._selected_language is None
+    assert pipeline._stt is None
+    assert pipeline.tools == before_tools
+    assert transport.clears == 0
+    assert session._welcome_task is None
+    assert menu_task is session._language_menu_task
+    assert session.terminal_future.done()
+    assert events == [
+        "smartpbx_media event=language_profile_unavailable lang=si provider=azure"
+    ]
