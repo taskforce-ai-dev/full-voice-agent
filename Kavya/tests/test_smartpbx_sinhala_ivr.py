@@ -660,23 +660,86 @@ async def test_sinhala_azure_preflight_failure_is_azure_not_llm_unavailable(
     monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "gemini")
     monkeypatch.setattr(server, "get_tools_gemini", lambda: [])
     monkeypatch.setattr(server, attribute, value)
-    before_tools = copy.deepcopy(pipeline.tools)
+    # The bilingual menu has completed: its temporary Sinhala routing cannot be
+    # mistaken for a preflight mutation below.
     await session.start()
     await asyncio.sleep(0)
+    timeout_handle = session._language_timeout_handle
     menu_task = session._language_menu_task
+    before = {
+        "selected": session._selected_language,
+        "menu": menu_task,
+        "menu_done": menu_task.done() if menu_task is not None else None,
+        "speaking": pipeline._is_speaking,
+        "generation": pipeline._speak_generation,
+        "prompt": pipeline.system_prompt,
+        "lang": pipeline.lang,
+        "provider": pipeline.llm_provider,
+        "model": pipeline.model,
+        "anthropic": pipeline.anthropic_client,
+        "gemini": pipeline.gemini_client,
+        "stt": pipeline._stt,
+        "welcome": session._welcome_task,
+        "welcome_pending": pipeline._smartpbx_welcome_audio_pending,
+    }
+    before_tools = copy.deepcopy(pipeline.tools)
 
     await session.feed_dtmf("2")
 
-    assert session._selected_language is None
-    assert pipeline._stt is None
+    assert session._selected_language == before["selected"]
+    assert session._language_timeout_handle is None
+    assert timeout_handle is not None and timeout_handle.cancelled()
+    assert session._language_menu_task is before["menu"]
+    assert (menu_task.done() if menu_task is not None else None) == before["menu_done"]
+    assert pipeline._is_speaking == before["speaking"]
+    assert pipeline._speak_generation == before["generation"]
+    assert pipeline.system_prompt == before["prompt"]
+    assert pipeline.lang == before["lang"]
+    assert pipeline.llm_provider == before["provider"]
+    assert pipeline.model == before["model"]
+    assert pipeline.anthropic_client is before["anthropic"]
+    assert pipeline.gemini_client is before["gemini"]
+    assert pipeline._stt is before["stt"]
     assert pipeline.tools == before_tools
     assert transport.clears == 0
-    assert session._welcome_task is None
-    assert menu_task is session._language_menu_task
+    assert session._welcome_task is before["welcome"]
+    assert pipeline._smartpbx_welcome_audio_pending == before["welcome_pending"]
     assert session.terminal_future.done()
     assert events == [
         "smartpbx_media event=language_profile_unavailable lang=si provider=azure"
     ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_language_profile_failure_cancels_timeout_and_rejects_late_activation(monkeypatch):
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "claude")
+    english_stt = RecordingStt()
+
+    def profile_factory(**kwargs):
+        if kwargs["lang"] == "si":
+            raise RuntimeError("synthetic Sinhala STT prerequisite failure")
+        return english_stt
+
+    pipeline = RecordingPipeline()
+    transport = RecordingTransport()
+    session = KavyaSmartPBXSession(
+        _context(), transport, pipeline=pipeline, stt_factory=profile_factory,
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0), welcome_text="",
+        llm_provider="claude", model="test-model",
+    )
+    await session.start()
+    timeout_handle = session._language_timeout_handle
+
+    await session.feed_dtmf("2")
+    await session._activate_language("en", "timeout")
+
+    assert session.terminal_future.done()
+    assert session._language_timeout_handle is None
+    assert timeout_handle is not None and timeout_handle.cancelled()
+    assert session._selected_language is None
+    assert english_stt.starts == 0
+    assert pipeline._stt is None
+    assert transport.clears == 0
 
 
 @pytest.mark.asyncio
