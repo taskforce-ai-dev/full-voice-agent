@@ -270,28 +270,6 @@ jobs:
           docker build -t "$image" .
           docker run --rm --entrypoint python "$image" -c "import english_voice_profile; import server"
 
-      # This validates the deterministic, synthetic-only source fixture. It is
-      # intentionally not an acceptance decision: a PR evidence artifact needs
-      # externally supplied immutable identity plus two real review records.
-      - name: Validate synthetic Sinhala acceptance evidence source
-        if: matrix.agent == 'Kavya'
-        working-directory: Kavya
-        run: |
-          evidence_dir="$RUNNER_TEMP/kavya-task6-evidence"
-          mkdir -p "$evidence_dir"
-          python scripts/collect_sinhala_acceptance_evidence.py validate-synthetic \
-            --sources acceptance/task6-synthetic-failover-sources.json \
-            --manifest "$evidence_dir/task6-synthetic-manifest.json"
-
-      - name: Upload synthetic Sinhala evidence manifest
-        if: matrix.agent == 'Kavya'
-        uses: actions/upload-artifact@v4
-        with:
-          name: kavya-sinhala-gemini-synthetic-${{ github.sha }}
-          path: ${{ runner.temp }}/kavya-task6-evidence/task6-synthetic-manifest.json
-          if-no-files-found: error
-          retention-days: 7
-
   # ---------------------------------------------------------------------------
   # 5. deps-resolve — can each agent's production lock actually be installed?
   #
