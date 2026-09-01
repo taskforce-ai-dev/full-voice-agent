@@ -505,6 +505,11 @@ CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+
+def _has_gemini_api_key() -> bool:
+    """Return whether the configured Gemini credential has usable content."""
+    return bool(GEMINI_API_KEY.strip())
+
 # ---------------------------------------------------------------------------
 # Optional: Google Gemini native SDK
 # ---------------------------------------------------------------------------
@@ -3344,9 +3349,9 @@ def _get_gemini_client():
     if _gemini_client is None:
         if not GOOGLE_GENAI_AVAILABLE:
             raise RuntimeError("google-genai package not installed")
-        if not GEMINI_API_KEY:
+        if not _has_gemini_api_key():
             raise RuntimeError("GEMINI_API_KEY is not set")
-        _gemini_client = google_genai.Client(api_key=GEMINI_API_KEY)
+        _gemini_client = google_genai.Client(api_key=GEMINI_API_KEY.strip())
         logger.info("Initialized native Gemini client with model %s", MODEL)
     return _gemini_client
 
@@ -3357,9 +3362,9 @@ def _get_gemini_tts_client():
     if _gemini_tts_client is None:
         if not GOOGLE_GENAI_AVAILABLE:
             raise RuntimeError("google-genai package not installed")
-        if not GEMINI_API_KEY:
+        if not _has_gemini_api_key():
             raise RuntimeError("GEMINI_API_KEY is not set")
-        _gemini_tts_client = google_genai.Client(api_key=GEMINI_API_KEY)
+        _gemini_tts_client = google_genai.Client(api_key=GEMINI_API_KEY.strip())
         logger.info("Initialized native Gemini client for SmartPBX Sinhala TTS")
     return _gemini_tts_client
 
@@ -10007,7 +10012,7 @@ class MediaStreamSession:
         text = text.strip()
         if not text:
             return
-        if not GEMINI_API_KEY:
+        if not _has_gemini_api_key():
             self._log_tts_failure("gemini", "missing_api_key")
             self._emit_smartpbx_tts_diagnostic(
                 DiagnosticFailureClass.TTS_MISSING_API_KEY

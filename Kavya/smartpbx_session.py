@@ -184,6 +184,12 @@ class KavyaSmartPBXSession:
     async def _start_once(self) -> None:
         import server
 
+        # The bilingual menu itself uses Sinhala Gemini TTS, even for callers
+        # who will press 1. Fail before creating its task so no partial prompt
+        # or provider/STT activation can escape when the key is blank.
+        if not server._has_gemini_api_key():
+            self._end_call_without_language_profile()
+            return
         self._ensure_session_trace_id()
         self._load_runtime_defaults()
         pipeline = self._require_pipeline()
@@ -547,7 +553,9 @@ class KavyaSmartPBXSession:
             profile.lang, provider or profile.stt_provider,
         )
 
-    def _end_call_without_language_profile(self, _profile: SmartPBXLanguageProfile) -> None:
+    def _end_call_without_language_profile(
+        self, _profile: SmartPBXLanguageProfile | None = None,
+    ) -> None:
         """Terminal profile failure is not a false generic STT-unavailable event."""
         timeout_handle = self._language_timeout_handle
         self._language_timeout_handle = None

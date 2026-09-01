@@ -122,6 +122,84 @@ def make_session():
     return session, pipeline, stt
 
 
+@pytest.fixture(autouse=True)
+def _valid_gemini_credential_for_bilingual_menu(monkeypatch):
+    """Keep unrelated IVR coverage on the valid production menu path."""
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-gemini-key")
+
+
+@pytest.mark.parametrize("credential", ["", " \t\n "])
+def test_native_gemini_client_rejects_blank_credential_before_sdk_init(
+    monkeypatch, credential,
+):
+    sdk_calls: list[str] = []
+
+    class _SDK:
+        @staticmethod
+        def Client(*, api_key):
+            sdk_calls.append(api_key)
+            return object()
+
+    monkeypatch.setattr(server, "GEMINI_API_KEY", credential)
+    monkeypatch.setattr(server, "GOOGLE_GENAI_AVAILABLE", True)
+    monkeypatch.setattr(server, "google_genai", _SDK)
+    monkeypatch.setattr(server, "_gemini_client", None)
+
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY is not set"):
+        server._get_gemini_client()
+
+    assert sdk_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential", ["", " \t\n "])
+async def test_blank_gemini_credential_ends_before_bilingual_menu_or_activation(
+    monkeypatch, credential,
+):
+    """The preselection menu is unavailable unless its Sinhala TTS key is usable."""
+    client_calls: list[str] = []
+    session, pipeline, stt = make_session()
+    pipeline.anthropic_client = None
+    monkeypatch.setattr(server, "GEMINI_API_KEY", credential)
+    monkeypatch.setattr(
+        server,
+        "_get_gemini_client",
+        lambda: client_calls.append("gemini") or object(),
+    )
+    monkeypatch.setattr(
+        server,
+        "_get_anthropic_client",
+        lambda: client_calls.append("claude") or object(),
+    )
+
+    await session.start()
+    await asyncio.sleep(0)
+    await session.feed_dtmf("2")
+
+    assert pipeline.spoken == []
+    assert session._language_menu_task is None
+    assert session._language_timeout_handle is None
+    assert stt.starts == 0
+    assert pipeline._stt is None
+    assert client_calls == []
+    assert session.terminal_future.done()
+
+
+@pytest.mark.asyncio
+async def test_valid_gemini_credential_keeps_bilingual_menu_and_english_activation(
+    monkeypatch,
+):
+    session, pipeline, stt = make_session()
+    monkeypatch.setattr(server, "GEMINI_API_KEY", " valid-gemini-key ")
+
+    await session.start()
+    await asyncio.sleep(0)
+
+    assert [lang for lang, _text in pipeline.spoken] == ["en", "si"]
+    assert await session.feed_dtmf("1") is True
+    assert (pipeline.lang, stt.starts) == ("en", 1)
+
+
 def test_sinhala_llm_provider_defaults_to_gemini_and_invalid_values_fail_to_claude():
     assert server._resolve_smartpbx_sinhala_llm_provider(None) == "gemini"
     assert server._resolve_smartpbx_sinhala_llm_provider("") == "gemini"

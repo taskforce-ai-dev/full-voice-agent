@@ -368,11 +368,14 @@ async def test_smartpbx_sinhala_gemini_failure_never_calls_other_tts(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_smartpbx_sinhala_missing_gemini_key_fails_closed_without_client(monkeypatch, caplog):
+@pytest.mark.parametrize("credential", ["", " \t\n "])
+async def test_smartpbx_sinhala_missing_gemini_key_fails_closed_without_client(
+    monkeypatch, caplog, credential,
+):
     import server
 
     pipeline, transport = make_sinhala_smartpbx_pipeline(server)
-    monkeypatch.setattr(server, "GEMINI_API_KEY", "")
+    monkeypatch.setattr(server, "GEMINI_API_KEY", credential)
     monkeypatch.setattr(
         server,
         "_get_gemini_tts_client",
