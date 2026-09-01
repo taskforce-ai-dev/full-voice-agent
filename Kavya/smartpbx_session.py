@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import logging
 import os
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Literal
 
@@ -19,6 +21,38 @@ from smartpbx_transport import SmartPBXMediaTransport
 PostCallProcessor = Callable[..., Awaitable[None]]
 logger = logging.getLogger(__name__)
 _SESSION_MAX_MS = 600_000
+
+
+@dataclass(frozen=True)
+class SmartPBXLanguageProfile:
+    """The immutable provider/STT choices for one selected IVR language."""
+
+    lang: Literal["en", "si"]
+    stt_provider: Literal["google", "azure"]
+    stt_language: Literal["en", "si"]
+    stt_fail_closed: bool
+    llm_provider: Literal["claude", "gemini", "openai"]
+    model: str
+    gemini_thinking_level: str | None = None
+    gemini_max_tokens: int | None = None
+
+
+def _without_transfer_tool(
+    tools: list[dict[str, Any]], provider: str,
+) -> list[dict[str, Any]]:
+    """Remove Dialog-owned transfer without corrupting provider-native schemas."""
+    if provider != "gemini":
+        return [tool for tool in tools if tool.get("name") != "transfer_to_human"]
+    filtered: list[dict[str, Any]] = []
+    for tool in tools:
+        declarations = [
+            declaration
+            for declaration in tool.get("function_declarations", [])
+            if declaration.get("name") != "transfer_to_human"
+        ]
+        if declarations:
+            filtered.append({**tool, "function_declarations": declarations})
+    return filtered
 
 
 def _emit_smartpbx_session_summary(**fields: object) -> None:
@@ -66,6 +100,7 @@ class KavyaSmartPBXSession:
         self._terminal_future: asyncio.Future[None] = loop.create_future()
         self._start_lock = asyncio.Lock()
         self._finish_lock = asyncio.Lock()
+        self._language_activation_lock = asyncio.Lock()
         self._start_task: asyncio.Task[None] | None = None
         self._finish_task: asyncio.Task[None] | None = None
         self._welcome_task: asyncio.Task[None] | None = None
@@ -79,6 +114,7 @@ class KavyaSmartPBXSession:
         self._session_trace_id: str | None = None
         self._session_started_ns = time.monotonic_ns()
         self._session_summary_emitted = False
+        self._prepared_stt_cleanup_ids: set[int] = set()
 
     @property
     def terminal_future(self) -> asyncio.Future[None]:
@@ -193,52 +229,261 @@ class KavyaSmartPBXSession:
         lang: Literal["en", "si"],
         source: Literal["digit", "timeout", "invalid"],
     ) -> None:
-        """Commit one language selection and start the caller's STT pipeline."""
-        if self._selected_language is not None or self._finish_task is not None:
-            return
-        self._selected_language = lang
-        timeout_handle = self._language_timeout_handle
-        self._language_timeout_handle = None
-        if timeout_handle is not None:
-            timeout_handle.cancel()
+        """Prepare provider/STT first, then make exactly one committed selection."""
+        del source  # The source is audit context; selection semantics are identical.
+        async with self._language_activation_lock:
+            if self._selected_language is not None or self._finish_task is not None:
+                return
+            pipeline = self._require_pipeline()
+            requested_profile = self._resolve_language_profile(lang)
+            prepared = await self._preflight_language_profile(pipeline, requested_profile)
+            if prepared is None:
+                return
+            profile, prepared_client, prepared_tools, prepared_stt = prepared
+            if self._selected_language is not None or self._finish_task is not None:
+                await self._cleanup_unstarted_prepared_stt(prepared_stt)
+                return
 
-        pipeline = self._require_pipeline()
-        pipeline._is_speaking = False
-        pipeline._speak_generation = getattr(pipeline, "_speak_generation", 0) + 1
-        menu_task = self._language_menu_task
-        if menu_task is not None and not menu_task.done():
-            menu_task.cancel()
-        await self._transport.clear_audio()
-        if menu_task is not None:
-            await asyncio.gather(menu_task, return_exceptions=True)
+            # The first mutation claims this call's language. Everything before
+            # it is local preflight, so a failed candidate cannot cross-mutate a
+            # concurrent call or leave a half-selected menu behind.
+            self._selected_language = profile.lang
+            timeout_handle = self._language_timeout_handle
+            self._language_timeout_handle = None
+            if timeout_handle is not None:
+                timeout_handle.cancel()
+            menu_task = self._language_menu_task
+            if menu_task is not None and not menu_task.done():
+                menu_task.cancel()
+            await self._transport.clear_audio()
+            if self._finish_task is not None:
+                await self._cleanup_unstarted_prepared_stt(prepared_stt)
+                return
+            if menu_task is not None:
+                await asyncio.gather(menu_task, return_exceptions=True)
+            if self._finish_task is not None:
+                await self._cleanup_unstarted_prepared_stt(prepared_stt)
+                return
 
-        pipeline.lang = lang
+            pipeline._is_speaking = False
+            pipeline._speak_generation = getattr(pipeline, "_speak_generation", 0) + 1
+            profile = self._apply_prepared_language_profile(
+                pipeline, profile, prepared_client, prepared_tools,
+            )
+            import server
+            pipeline.lang = profile.lang
+            pipeline.system_prompt = server._build_system_prompt(profile.lang)
+            if self._finish_task is not None:
+                await self._cleanup_unstarted_prepared_stt(prepared_stt)
+                return
+            pipeline._stt = prepared_stt
+            self._wire_stt_fatal_signal(prepared_stt)
+            if self._finish_task is not None:
+                await self._cleanup_unstarted_prepared_stt(prepared_stt)
+                if pipeline._stt is prepared_stt:
+                    pipeline._stt = None
+                return
+            try:
+                prepared_stt.start()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await self._cleanup_started_prepared_stt(prepared_stt)
+                if pipeline._stt is prepared_stt:
+                    pipeline._stt = None
+                self._emit_language_profile_unavailable(profile)
+                self._end_call_without_language_profile(profile)
+                return
+            if self._finish_task is not None:
+                await self._cleanup_started_prepared_stt(prepared_stt)
+                if pipeline._stt is prepared_stt:
+                    pipeline._stt = None
+                return
+            welcome_text = (
+                server.LANGUAGE_CONFIGS[profile.lang]["welcome_greeting"]
+                if self._welcome_uses_language_default
+                else self._welcome_text
+            )
+            if welcome_text:
+                pipeline._smartpbx_welcome_audio_pending = welcome_text
+                self._welcome_task = asyncio.create_task(pipeline._speak(welcome_text))
+
+    def _resolve_language_profile(
+        self, lang: Literal["en", "si"],
+    ) -> SmartPBXLanguageProfile:
         import server
-        pipeline.system_prompt = server._build_system_prompt(lang)
-        if lang != "en":
-            pipeline.tools = [
-                tool for tool in getattr(pipeline, "tools", [])
-                if tool.get("name") != "transfer_to_human"
-            ]
-        pipeline._stt = self._stt_factory(
+
+        if lang == "en":
+            return SmartPBXLanguageProfile(
+                lang="en",
+                stt_provider="azure" if server.STT_PROVIDER == "azure" else "google",
+                stt_language="en",
+                stt_fail_closed=False,
+                llm_provider=self._llm_provider or server.LLM_PROVIDER,
+                model=self._model or server.MODEL,
+            )
+        provider = server.SMARTPBX_SINHALA_LLM_PROVIDER
+        return SmartPBXLanguageProfile(
+            lang="si",
+            stt_provider="azure",
+            stt_language="si",
+            stt_fail_closed=True,
+            llm_provider=provider,
+            model=(server.SMARTPBX_SINHALA_GEMINI_LLM_MODEL
+                   if provider == "gemini" else server.CLAUDE_MODEL),
+            gemini_thinking_level=server.SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL,
+            gemini_max_tokens=server.SMARTPBX_SINHALA_GEMINI_MAX_TOKENS,
+        )
+
+    async def _preflight_language_profile(
+        self, pipeline: Any, requested: SmartPBXLanguageProfile,
+    ) -> tuple[SmartPBXLanguageProfile, Any, list[dict[str, Any]], Any] | None:
+        """Acquire one complete profile and recognizer without mutating a call."""
+        try:
+            return self._prepare_language_profile(pipeline, requested)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if requested.lang != "si" or requested.llm_provider != "gemini":
+                self._emit_language_profile_unavailable(requested)
+                self._end_call_without_language_profile(requested)
+                return None
+        # A Gemini client/setup failure has one bounded Sinhala Claude rollback.
+        import server
+        fallback = SmartPBXLanguageProfile(
+            lang="si", stt_provider="azure", stt_language="si", stt_fail_closed=True,
+            llm_provider="claude", model=server.CLAUDE_MODEL,
+        )
+        try:
+            prepared = self._prepare_language_profile(pipeline, fallback)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._emit_language_profile_unavailable(fallback, provider="none")
+            self._end_call_without_language_profile(fallback)
+            return None
+        logger.warning(
+            "smartpbx_media event=language_profile_fallback lang=si "
+            "from=gemini to=claude reason=client_unavailable"
+        )
+        return prepared
+
+    def _prepare_language_profile(
+        self, pipeline: Any, profile: SmartPBXLanguageProfile,
+    ) -> tuple[SmartPBXLanguageProfile, Any, list[dict[str, Any]], Any]:
+        """Synchronous technical half of preflight; deliberately no assignments."""
+        import server
+
+        if profile.lang == "en":
+            # The English adapter is already fully resolved by
+            # _load_runtime_defaults; IVR selection must not rebuild tools or
+            # touch unrelated TTS/LLM configuration.
+            client = None
+            tools = getattr(pipeline, "tools", [])
+        elif profile.llm_provider == "gemini":
+            client = getattr(pipeline, "gemini_client", None) or server._get_gemini_client()
+            tools = _without_transfer_tool(server.get_tools_gemini(), "gemini")
+        elif profile.llm_provider == "claude":
+            client = getattr(pipeline, "anthropic_client", None) or server._get_anthropic_client()
+            tools = _without_transfer_tool(server.get_tools(), "claude")
+        elif profile.llm_provider == "openai":
+            client = getattr(pipeline, "client", None) or server._get_client()
+            tools = _without_transfer_tool(server.get_tools_openai(), "openai")
+        else:
+            raise RuntimeError("unsupported language profile provider")
+        stt = self._stt_factory(
             on_final_result=pipeline._on_stt_result,
             on_interim_result=pipeline._on_stt_interim,
-            lang=lang,
+            lang=profile.stt_language,
             privacy_safe=True,
+            provider=profile.stt_provider,
+            fail_closed=profile.stt_fail_closed,
         )
-        self._wire_stt_fatal_signal(pipeline._stt)
-        pipeline._stt.start()
-        welcome_text = (
-            server.LANGUAGE_CONFIGS[lang]["welcome_greeting"]
-            if self._welcome_uses_language_default
-            else self._welcome_text
-        )
-        if welcome_text:
-            pipeline._smartpbx_welcome_audio_pending = welcome_text
-            self._welcome_task = asyncio.create_task(pipeline._speak(welcome_text))
+        return profile, client, copy.deepcopy(tools), stt
 
+    def _apply_language_profile(
+        self, pipeline: Any, profile: SmartPBXLanguageProfile,
+    ) -> SmartPBXLanguageProfile | None:
+        """Compatibility seam for callers that already hold a validated profile."""
+        try:
+            import server
+            if profile.lang == "en":
+                client = None
+                tools = copy.deepcopy(getattr(pipeline, "tools", []))
+            elif profile.llm_provider == "gemini":
+                client = getattr(pipeline, "gemini_client", None) or server._get_gemini_client()
+                tools = _without_transfer_tool(server.get_tools_gemini(), "gemini")
+            elif profile.llm_provider == "claude":
+                client = getattr(pipeline, "anthropic_client", None) or server._get_anthropic_client()
+                tools = _without_transfer_tool(server.get_tools(), "claude")
+            else:
+                client = getattr(pipeline, "client", None) or server._get_client()
+                tools = _without_transfer_tool(server.get_tools_openai(), "openai")
+        except Exception:
+            return None
+        return self._apply_prepared_language_profile(pipeline, profile, client, tools)
+
+    def _apply_prepared_language_profile(
+        self, pipeline: Any, profile: SmartPBXLanguageProfile,
+        prepared_client: Any, prepared_tools: list[dict[str, Any]],
+    ) -> SmartPBXLanguageProfile:
+        # English keeps the adapter's already-resolved provider/model/client,
+        # while still breaking every shared mutable tools reference.
+        pipeline.tools = copy.deepcopy(prepared_tools)
+        if profile.lang == "en":
+            return profile
+        if profile.llm_provider == "gemini":
+            pipeline.gemini_client = prepared_client
+        elif profile.llm_provider == "claude":
+            pipeline.anthropic_client = prepared_client
+        else:
+            pipeline.client = prepared_client
+        pipeline.llm_provider = profile.llm_provider
+        pipeline.model = profile.model
+        self._llm_provider = profile.llm_provider
+        self._model = profile.model
+        pipeline._gemini_thinking_level = profile.gemini_thinking_level
+        pipeline._smartpbx_gemini_max_tokens = profile.gemini_max_tokens
+        return profile
+
+    async def _cleanup_unstarted_prepared_stt(self, stt: Any) -> None:
+        await self._cleanup_prepared_stt(stt)
+
+    async def _cleanup_started_prepared_stt(self, stt: Any) -> None:
+        await self._cleanup_prepared_stt(stt)
+
+    async def _cleanup_prepared_stt(self, stt: Any) -> None:
+        if stt is None or id(stt) in self._prepared_stt_cleanup_ids:
+            return
+        self._prepared_stt_cleanup_ids.add(id(stt))
+        stop = getattr(stt, "stop", None)
+        if callable(stop):
+            result = stop()
+            if inspect.isawaitable(result):
+                await result
+
+    def _emit_language_profile_unavailable(
+        self, profile: SmartPBXLanguageProfile, *, provider: str | None = None,
+    ) -> None:
+        logger.warning(
+            "smartpbx_media event=language_profile_unavailable lang=%s provider=%s",
+            profile.lang, provider or profile.stt_provider,
+        )
+
+    def _end_call_without_language_profile(self, _profile: SmartPBXLanguageProfile) -> None:
+        """Terminal profile failure is not a false generic STT-unavailable event."""
+        if not self._terminal_future.done():
+            self._terminal_future.set_result(None)
 
     async def _finish_once(self, schedule_post_call: bool) -> None:
+        """Publish finish before acquiring the activation/teardown handoff lock."""
+        await self._language_activation_lock.acquire()
+        try:
+            await self._finish_once_locked(schedule_post_call)
+        finally:
+            self._language_activation_lock.release()
+
+    async def _finish_once_locked(self, schedule_post_call: bool) -> None:
         try:
             pipeline = self._pipeline
             if pipeline is None:

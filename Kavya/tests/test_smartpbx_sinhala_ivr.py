@@ -229,6 +229,7 @@ async def test_audio_before_selection_never_reaches_stt_feed():
 async def test_selected_sinhala_uses_sinhala_welcome_and_post_call_language():
     post_calls: list[dict[str, object]] = []
     pipeline = RecordingPipeline()
+    pipeline.gemini_client = object()
     stt = RecordingStt()
 
     async def post_call(**metadata):

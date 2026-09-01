@@ -31,7 +31,10 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
-import audioop
+try:
+    import audioop
+except ImportError:  # Python 3.13+ may require audioop-lts instead.
+    audioop = None
 import base64
 import binascii
 import contextlib
@@ -4803,6 +4806,10 @@ class AzureSTTStream:
         self._running = False
         self._push_stream = None
         self._recognizer = None
+        self._state_lock = threading.Lock()
+        self._stop_requested = False
+        self._fatal_notified = False
+        self.on_fatal: Any = None
 
     def start(self):
         if not AZURE_STT_AVAILABLE:
@@ -4811,7 +4818,7 @@ class AzureSTTStream:
         if audioop is None:
             logger.error("Cannot start Azure STT — audioop unavailable (install audioop-lts on 3.13+)")
             return
-        if not AZURE_SPEECH_KEY:
+        if not isinstance(AZURE_SPEECH_KEY, str) or not AZURE_SPEECH_KEY.strip():
             logger.error("Cannot start Azure STT — AZURE_SPEECH_KEY not set")
             return
 
@@ -4853,12 +4860,17 @@ class AzureSTTStream:
             except Exception:
                 logger.warning("Azure STT phrase list not applied", exc_info=True)
 
-        self._running = True
+        with self._state_lock:
+            self._stop_requested = False
+            self._fatal_notified = False
+            self._running = True
         self._recognizer.start_continuous_recognition_async()
         logger.info("Azure STT stream started (lang=%s, primary=%s)", self._lang, primary)
 
     def stop(self):
-        self._running = False
+        with self._state_lock:
+            self._stop_requested = True
+            self._running = False
         if self._push_stream is not None:
             try:
                 self._push_stream.close()
@@ -4914,10 +4926,24 @@ class AzureSTTStream:
             self._on_final(text)
 
     def _on_canceled(self, evt):
-        logger.warning(
-            "Azure STT canceled (lang=%s): reason=%s detail=%s",
-            self._lang, evt.reason, getattr(evt, "error_details", ""),
-        )
+        # Azure invokes this on an SDK thread.  Claim the one terminal
+        # notification while synchronized, then call out after releasing the
+        # lock so user callbacks cannot deadlock stop()/teardown.
+        with self._state_lock:
+            self._running = False
+            on_fatal = None
+            if not self._stop_requested and not self._fatal_notified:
+                self._fatal_notified = True
+                on_fatal = self.on_fatal
+        if self._privacy_safe:
+            logger.warning("smartpbx_media event=stt_provider_canceled")
+        else:
+            logger.warning("Azure STT canceled (lang=%s)", self._lang)
+        if on_fatal is not None:
+            try:
+                on_fatal()
+            except Exception:
+                logger.warning("Azure STT fatal signal failed")
 
 
 def _make_stt(
@@ -4925,15 +4951,31 @@ def _make_stt(
     on_interim_result: Any,
     lang: str,
     privacy_safe: bool = False,
+    *,
+    provider: str | None = None,
+    fail_closed: bool = False,
 ):
     """Build the configured STT backend. STT_PROVIDER: 'google' (default) | 'azure'.
 
     Falls back to Google if Azure is selected but its SDK/audioop is missing.
     """
-    if STT_PROVIDER == "azure":
-        if AZURE_STT_AVAILABLE and audioop is not None:
+    selected_provider = STT_PROVIDER if provider is None else provider
+    if selected_provider == "azure":
+        azure_ready = (
+            AZURE_STT_AVAILABLE
+            and audioop is not None
+            and isinstance(AZURE_SPEECH_KEY, str)
+            and bool(AZURE_SPEECH_KEY.strip())
+        )
+        if azure_ready:
             return AzureSTTStream(on_final_result, on_interim_result, lang, privacy_safe)
+        if fail_closed:
+            raise RuntimeError("requested STT provider unavailable")
         logger.error("STT_PROVIDER=azure but Azure STT unavailable — falling back to Google")
+    elif selected_provider != "google":
+        if provider is not None:
+            raise RuntimeError("requested STT provider unavailable")
+        logger.error("STT_PROVIDER=%s is unsupported — falling back to Google", selected_provider)
     return GoogleSTTStream(on_final_result, on_interim_result, lang, privacy_safe)
 
 
