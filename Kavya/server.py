@@ -588,6 +588,30 @@ def _resolve_smartpbx_claude_max_tokens(raw: object) -> int:
     return min(max(value, 200), 1024)
 
 
+_SMARTPBX_SINHALA_LLM_PROVIDERS = frozenset({"gemini", "claude"})
+_SMARTPBX_SINHALA_GEMINI_THINKING_LEVELS = frozenset({"low", "medium", "high"})
+
+
+def _resolve_smartpbx_sinhala_llm_provider(raw: object) -> str:
+    value = "" if raw is None else str(raw).strip().lower()
+    if not value:
+        return "gemini"
+    return value if value in _SMARTPBX_SINHALA_LLM_PROVIDERS else "claude"
+
+
+def _resolve_smartpbx_sinhala_gemini_thinking_level(raw: object) -> str:
+    value = "" if raw is None else str(raw).strip().lower()
+    return value if value in _SMARTPBX_SINHALA_GEMINI_THINKING_LEVELS else "low"
+
+
+def _resolve_smartpbx_sinhala_gemini_max_tokens(raw: object) -> int:
+    try:
+        value = int(raw) if raw not in (None, "") else 600
+    except (TypeError, ValueError):
+        value = 600
+    return min(max(value, 200), 1024)
+
+
 def _resolve_smartpbx_initial_filler_delay(raw: object) -> float:
     try:
         value = float(raw) if raw not in (None, "") else 1.5
@@ -642,6 +666,21 @@ SMARTPBX_MAX_TOKENS: int = _resolve_smartpbx_max_tokens(
 )
 SMARTPBX_CLAUDE_MAX_TOKENS: int = _resolve_smartpbx_claude_max_tokens(
     os.getenv("SMARTPBX_CLAUDE_MAX_TOKENS")
+)
+SMARTPBX_SINHALA_LLM_PROVIDER = _resolve_smartpbx_sinhala_llm_provider(
+    os.getenv("SMARTPBX_SINHALA_LLM_PROVIDER")
+)
+SMARTPBX_SINHALA_GEMINI_LLM_MODEL = (
+    os.getenv("SMARTPBX_SINHALA_GEMINI_LLM_MODEL", "gemini-3.7-flash").strip()
+    or "gemini-3.7-flash"
+)
+SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL = (
+    _resolve_smartpbx_sinhala_gemini_thinking_level(
+        os.getenv("SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL")
+    )
+)
+SMARTPBX_SINHALA_GEMINI_MAX_TOKENS = _resolve_smartpbx_sinhala_gemini_max_tokens(
+    os.getenv("SMARTPBX_SINHALA_GEMINI_MAX_TOKENS")
 )
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS: float = _resolve_smartpbx_initial_filler_delay(
     os.getenv("SMARTPBX_INITIAL_FILLER_DELAY_SECONDS")
