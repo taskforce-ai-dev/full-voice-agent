@@ -19,7 +19,7 @@
 - Do not add deprecated Gemini 3.x sampling parameters (`temperature`, `top_p`, `top_k`) or migrate the existing Generate Content runner to the Interactions API in this change.
 - New diagnostics use fixed event/enumerated fields only; never log prompts, transcripts, caller data, tool arguments/results, response bodies, exception bodies, audio, API keys, or credentials.
 - The top-level `audioop` import is currently unconditional before its guarded fallback. Move it into that guarded import (or remove the unconditional import) so `audioop = None` is observable and the Azure fail-closed test can exercise it.
-- Option-2 activation performs every fallible preflight before mutating any `pipeline`, prompt, adapter, or session-owned LLM state: validate the closed provider, acquire the LLM client, prepare/filter/deep-copy provider-native tools, and construct/validate the requested Azure STT candidate (including SDK, `audioop`, and stripped-key checks). Only after that complete preflight succeeds may it atomically apply the profile, attach/start STT, and schedule the welcome. Catch `Exception` only at the bounded technical preflight; let `asyncio.CancelledError` and every other `BaseException` propagate. The diagnostic is fixed-field only and never includes exception text.
+- Construct `_language_activation_lock = asyncio.Lock()` with the other session locks, before any calls; this lock itself is not a selection mutation. Every `_activate_language()` source holds it, rechecks `_selected_language`/`_finish_task`, and performs every fallible preflight while *all* per-selection fields remain unchanged: selected language, timeout cancellation, speaking/generation, menu cancellation, `clear_audio`, prompt/profile/client/tools, `pipeline._stt`, and welcome state. Preflight validates the closed provider, acquires the LLM client, prepares/filter/deep-copies provider-native tools, and constructs/validates the requested Azure STT candidate (including SDK, `audioop`, and stripped-key checks). Recheck selection/finish before commit. The sole lock holder then claims selected language, cancels timeout, cancels menu, clears audio, awaits the cancelled menu, resets speaking/generation, applies profile/prompt, assigns/wires/starts `pipeline._stt`, and schedules welcome in that order; no second activation can interleave, although the recheck may observe `finish()` set during preflight. If so, safely clean up the unstarted candidate and await that cleanup when it is awaitable. Catch `Exception` only at the bounded technical preflight; let `asyncio.CancelledError` and every other `BaseException` propagate. The diagnostic is fixed-field only and never includes exception text.
 - Do not run pytest on the development or production host. Use `python3 -m py_compile` locally for syntax only and the existing GitHub Actions Kavya test job for behavioral RED/GREEN evidence.
 - Preserve existing dirty Graphify artifacts and `docs/superpowers/plans/2026-08-31-kavya-smartpbx-sinhala-gemini-tts.md`; do not stage or modify them.
 
@@ -521,16 +521,19 @@ global configuration test and the configured-English Azure-to-Google fallback:
 it proves `_make_stt(..., provider=<unknown>)` rejects instead of silently
 selecting a recognizer.
 
-Add a production-shaped IVR activation test that snapshots every mutable
-pipeline/session activation field (at minimum `lang`, prompt, adapter
-`_llm_provider`/`_model`, pipeline provider/model/client/tool values, thinking
-controls, and STT attachment) before `feed_dtmf("2")`. Make the requested
-Azure candidate fail because each prerequisite is absent in turn
-(`AZURE_STT_AVAILABLE=False`, `audioop=None`, and a blank/whitespace-only
-`AZURE_SPEECH_KEY`). Each variant must prove the snapshot is byte-for-byte
-unchanged, no welcome task is created or started, no STT starts or attaches,
-the terminal future resolves, and exactly one fixed-field
-`provider=azure` unavailable event is emitted. This is a production-shaped
+Add a production-shaped IVR activation test that snapshots complete relevant
+session/pipeline state before `feed_dtmf("2")`: `_selected_language`; timeout
+handle identity/cancelled state; menu-task identity/state; `_is_speaking` and
+`_speak_generation`; transport `clear_audio` call count; prompt/lang/provider/
+model/client/tools; `pipeline._stt`; and welcome-task identity/pending text.
+Make the requested Azure candidate fail because each prerequisite is absent in
+turn (`AZURE_STT_AVAILABLE=False`, `audioop=None`, and a blank/whitespace-only
+`AZURE_SPEECH_KEY`). Each variant must prove those activation/pipeline/menu/
+transport fields remain unchanged, no welcome task is created or started, no
+STT starts or attaches, and no audio clears. The bounded terminal unavailable
+path may resolve `terminal_future` and emit exactly one fixed-field
+`provider=azure` unavailable event; make this explicit rather than claiming
+literally no session state can ever change. This is a production-shaped
 pre-mutation invariant, not merely an `_make_stt()` unit test. The configured
 English fallback remains unchanged. Add an `AzureSTTStream` unit test that first
 establishes a running stream, sets `stream.on_fatal` to a recorder, fires genuine
@@ -685,10 +688,16 @@ resolves `terminal_future` and does not report the existing false
 `STT_UNAVAILABLE` diagnostic. `_activate_language()` must use the returned
 profile, not the original requested profile.
 
-In `_activate_language()`, after the menu task is canceled/awaited, use an
-explicit prepare-then-commit sequence. Do not set `pipeline.lang`, rebuild the
-prompt, alter adapter fields, attach STT, create the welcome task, or start STT
-until both LLM/tools and the requested STT object have preflighted:
+In `__init__`, create `self._language_activation_lock = asyncio.Lock()` beside
+the existing session locks. In `_activate_language()`, acquire it before every
+selection check and do **not** cancel/await the menu first. First recheck
+`_selected_language` and `_finish_task`; then use an explicit
+prepare-then-commit sequence while timeout/menu/transport/pipeline state stays
+intact. Do not set `_selected_language`, cancel the timeout, change speaking or
+generation, cancel the menu, call `clear_audio`, set `pipeline.lang`, rebuild
+the prompt, alter adapter fields, attach STT, create the welcome task, or start
+STT until both LLM/tools and the requested STT object have preflighted. Recheck
+selection/finish after preflight and before the first commit mutation:
 
 ```python
 requested_profile = self._resolve_language_profile(lang)
@@ -696,23 +705,54 @@ prepared = self._preflight_language_profile(pipeline, requested_profile)
 if prepared is None:
     return
 profile, prepared_client, prepared_tools, prepared_stt = prepared
-# The first mutation: apply the complete prepared profile atomically.
+# Still inside _language_activation_lock: no other activation can interleave.
+# finish() may have set _finish_task while awaited preflight was in progress.
+if self._selected_language is not None or self._finish_task is not None:
+    cleanup = self._cleanup_unstarted_prepared_stt(prepared_stt)
+    if inspect.isawaitable(cleanup):
+        await cleanup
+    return
+# First commit mutation: claim the selection.
+self._selected_language = profile.lang
+timeout_handle = self._language_timeout_handle
+self._language_timeout_handle = None
+if timeout_handle is not None:
+    timeout_handle.cancel()
+menu_task = self._language_menu_task
+if menu_task is not None and not menu_task.done():
+    menu_task.cancel()
+await self._transport.clear_audio()
+if menu_task is not None:
+    await asyncio.gather(menu_task, return_exceptions=True)
+pipeline._is_speaking = False
+pipeline._speak_generation = getattr(pipeline, "_speak_generation", 0) + 1
+# Then atomically apply the complete prepared profile/client/tools and prompt.
 profile = self._apply_prepared_language_profile(
     pipeline, profile, prepared_client, prepared_tools
 )
 pipeline.lang = profile.lang
-# Rebuild the prompt and bind the already-validated STT only after commit.
-self._stt = prepared_stt
-prepared_stt.start()
+pipeline.system_prompt = server._build_system_prompt(profile.lang)
+# Bind the already-validated pipeline-owned STT only after profile/prompt commit.
+pipeline._stt = prepared_stt
+self._wire_stt_fatal_signal(pipeline._stt)
+pipeline._stt.start()
 # Only now may the selected-language welcome be scheduled.
 ...
 ```
 
-The concrete helper names may differ, but this ordering is mandatory. A
-preflight failure must leave the snapshot from the production-shaped test
-unchanged and must not create a welcome task or start/attach STT. The fallback
-path follows the same prepare-then-commit rule; it is not permission to mutate
-the requested Gemini profile before trying Claude.
+The concrete helper names may differ, but this ordering is mandatory. The
+holder claims `_selected_language`, cancels the timeout, cancels the menu,
+clears audio, awaits the cancelled menu under existing semantics, resets speaking/increments
+generation, then applies profile/prompt and the pipeline-owned STT as one commit
+sequence. No second activation can interleave because it cannot acquire the
+lock; `finish()` may already be detected at the post-preflight recheck. A preflight failure must leave the
+protected activation/pipeline/menu/transport snapshot unchanged and must not
+create a welcome task or start/attach STT; required terminal/unavailable
+handling may resolve terminal state and emit its bounded event only. The
+fallback path follows the same prepare-then-commit rule; it is not permission
+to mutate the requested Gemini profile before trying Claude. A post-preflight
+finish recheck awaits cleanup when needed and stops the unstarted prepared
+candidate without attaching it, so it cannot become an orphan.
 
 Do not use this abbreviated old ordering:
 
@@ -753,6 +793,22 @@ after profile activation and proves the other session and future `get_tools*()`
 output are unchanged.
 
 Do not rebuild the `MediaStreamSession`, STT callbacks, transport, history, or tool context.
+
+Add a digit-versus-timeout serialization test that holds the first preflight at
+a barrier, concurrently delivers a digit and timeout activation, then releases
+it. Assert exactly one caller preflights/commits; the second acquires the lock
+later, sees `_selected_language`, and returns before preflight, so no losing
+candidate exists and no duplicate welcome/menu/timeout/transport mutation
+occurs. Add a separate finish-during-preflight test: hold preflight, call
+`finish()` so `_finish_task` is set, then release preflight. Assert the
+post-preflight recheck awaits cleanup of the unstarted candidate exactly once;
+it is never assigned to `pipeline._stt` or started and leaves no orphan,
+welcome, or transport mutation. Add an executable ownership test after activation:
+`await session.feed_audio(payload)` must call
+`prepared_stt.feed(bytes(payload))` through `pipeline._stt`, and `finish()`
+must stop that exact instance once. The test must fail if any implementation
+assigns STT to the session instead of the pipeline, because
+`KavyaSmartPBXSession` has no such STT contract.
 
 - [ ] **Step 5: Syntax-check, push GREEN, and verify the exact changed boundary**
 

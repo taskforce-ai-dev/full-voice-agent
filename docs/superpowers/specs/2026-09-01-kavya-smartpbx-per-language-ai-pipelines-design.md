@@ -43,13 +43,24 @@ already-shipped SmartPBX IVR and Gemini Sinhala TTS design.
   the reviewed English behavior: English prompt, English STT, Claude, current
   tools, ElevenLabs, capture behavior, handover, telemetry, timeouts, and
   latency controls.
-- Pressing `2` must select a Sinhala session profile before STT starts and
-  before conversation history exists. It must first preflight the selected
-  provider/client/tools **and** construct/validate the requested Azure STT
-  candidate (SDK, `audioop`, and stripped-key prerequisites) while pipeline,
-  prompt, adapter, STT attachment, and welcome state remain unchanged. Only a
-  fully prepared profile may then atomically mutate those fields, attach/start
-  STT, and schedule the welcome.
+- Every selection source (`1`, `2`, timeout, and invalid fallback) must pass
+  through one constructor-owned `_language_activation_lock = asyncio.Lock()`.
+  The lock is initialized with the other session synchronization primitives;
+  creating it is not a selection mutation. While holding it,
+  `_activate_language()` first rechecks `_selected_language` and `_finish_task`,
+  then preflights the selected provider/client/tools **and** constructs/validates
+  the requested Azure STT candidate (SDK, `audioop`, and stripped-key
+  prerequisites). Until that preflight completes, *all* per-selection state is
+  unchanged: `_selected_language`, timeout handle/cancellation, speaking flag,
+  generation, menu task, transport audio, prompt/profile/client/tools,
+  `pipeline._stt`, and welcome state. It rechecks selection/finish after
+  preflight and before commit. Only the winning activation may set the selected
+  language first, then cancel the timeout, cancel the menu, clear audio, await
+  the cancelled menu under the existing semantics, reset speaking/increment generation,
+  apply the profile/prompt, attach/start STT, and schedule the welcome. No
+  second activation can interleave with that commit while the lock is held;
+  `finish()` may nevertheless already have set `_finish_task`, which the
+  post-preflight recheck detects.
 - The existing bilingual pre-selection IVR menu remains intact. It temporarily
   uses `lang="si"` to speak the Sinhala menu line through Gemini TTS before a
   profile is selected; this is menu delivery, not a selected Sinhala LLM
@@ -141,15 +152,30 @@ Sinhala production service.
    it does not mutate globals. `lang` remains the existing execution key for
    both the STT factory and the TTS router: the profile must not duplicate
    descriptive TTS provider/model/voice fields or introduce a provider registry.
-4. `_activate_language()` uses prepare-then-commit exactly once:
-   - validate the profile, acquire its LLM client, prepare/filter/deep-copy its
-     provider-native tools, and construct/validate its requested STT candidate;
-   - if any preflight fails, leave all pipeline/prompt/adapter/STT/welcome
-     state unchanged and take only the bounded fallback or terminal path;
-   - only after all preflight succeeds, atomically install `lang`, the rebuilt
-     system prompt, LLM provider/model/client/tools, and STT attachment;
-   - retain the existing language-specific TTS routing, then start the already
-     validated STT and schedule the selected-language greeting.
+4. `_activate_language()` uses a lock-fenced prepare-then-commit exactly once:
+   - under the constructor-owned `_language_activation_lock`, recheck
+     `_selected_language`/`_finish_task`, then validate the profile, acquire its
+     LLM client, prepare/filter/deep-copy provider-native tools, and
+     construct/validate the requested STT candidate without cancelling the
+     timeout/menu or changing session/pipeline/transport state;
+   - if preflight fails, retain that activation snapshot and take only the
+     bounded fallback or terminal path. A terminal unavailable path may resolve
+     terminal state and emit its required bounded diagnostic, but it must not
+     mutate any listed activation, pipeline, menu, or transport field;
+   - after preflight, recheck `_selected_language`/`_finish_task` before any
+     commit. A later digit/timeout activation cannot have progressed past the
+     lock and therefore returns before preflight; if `finish()` was set during
+     an awaited preflight, await safe cleanup of the unstarted prepared STT and
+     return without committing;
+   - the one lock holder commits in this exact order: first claim
+     `_selected_language`; cancel the timeout; cancel the menu, clear transport
+     audio, then await the cancelled menu under existing semantics; reset speaking/increment
+     generation; atomically install `lang`, rebuilt prompt, and LLM
+     provider/model/client/tools; then attach the prepared instance as
+     `pipeline._stt`. No other activation can interleave while the lock remains
+     held, although the preceding recheck may have detected `finish()`;
+   - wire the fatal signal to `pipeline._stt`, start that same instance, and
+     schedule the selected-language greeting.
 5. All later turns dispatch through the existing provider switch in
    `_process_utterance_bound()` and therefore use `_run_llm_claude()` for
    English or `_run_llm_gemini()` for Sinhala.
@@ -205,14 +231,20 @@ pipeline mutation, greeting, or STT start.
 
 Option-2 activation validates the closed Sinhala provider set (`gemini` or
 `claude`) and completes all fallible LLM/client/tool **and requested-STT**
-preflight before changing the pipeline, prompt, adapter, STT attachment, or
-welcome state. Azure preflight includes its SDK, `audioop`, and a
-whitespace-stripped `AZURE_SPEECH_KEY`. Only after a complete preflight may it
-atomically apply the profile, attach/start STT, and schedule the greeting. It
-catches `Exception` only around that bounded technical preflight;
-`asyncio.CancelledError` and other `BaseException` values must propagate. An
-invalid configured provider follows the same bounded unavailable/fallback path
-and can never fall into OpenAI dispatch.
+preflight under the activation lock before changing `_selected_language`, the
+timeout/menu, speaking/generation, transport, pipeline, prompt, adapter, STT
+attachment, or welcome state. Azure preflight includes its SDK, `audioop`, and
+a whitespace-stripped `AZURE_SPEECH_KEY`. It then rechecks selection/finish
+while still locked. A digit/timeout competitor cannot have preflighted because
+it is serialized behind this lock; if `finish()` was set during preflight, the
+unstarted prepared stream is awaited through safe cleanup and is never attached.
+The holder otherwise commits in the fixed order: claim selected language,
+cancel timeout, cancel menu, clear audio, await the cancelled menu, reset speaking/generation,
+apply profile/prompt, then assign `pipeline._stt`, wire its fatal signal, start
+it, and schedule the greeting. It catches `Exception` only around that bounded
+technical preflight; `asyncio.CancelledError` and other `BaseException` values
+must propagate. An invalid configured provider follows the same bounded
+unavailable/fallback path and can never fall into OpenAI dispatch.
 
 `AzureSTTStream` owns synchronized `_stop_requested` and `_fatal_notified`
 flags. A genuine cancellation while running marks it non-running under the
@@ -301,7 +333,10 @@ it.
   the transfer-free Claude Sinhala profile and continue. If neither LLM client
   is usable, emit one bounded fixed-field diagnostic, do not start STT, and
   terminate the session through the existing fatal-session path rather than
-  leaving a selected but silent call.
+  leaving a selected but silent call. That terminal handling may resolve the
+  terminal future and emit its required bounded unavailable diagnostic, but it
+  must not be described as literal zero session-state change: it must leave the
+  activation/pipeline/menu/transport fields protected by preflight unchanged.
 - Claude fallback text remains Sinhala because the selected language prompt is
   retained; all resulting speech still uses Gemini Sinhala TTS.
 - A Gemini TTS failure remains a TTS failure. It must not invoke OpenAI,
@@ -324,15 +359,33 @@ it.
   model, tools, STT language, greeting, and TTS route as before.
 - Press `2` constructs Gemini 3.7 Flash tools/model/client, Sinhala prompt,
   selected Sinhala STT, and Gemini TTS.
-- A production-shaped Press-2 activation test snapshots all mutable
-  pipeline/session activation state before selection (language, prompt,
-  adapter provider/model, pipeline provider/model/client/tools/thinking
-  controls, STT attachment, and welcome state). With each Azure prerequisite
-  absent in turn (SDK, `audioop`, and a blank/whitespace-only key), it proves
-  the snapshot is unchanged, no welcome is created or started, no STT attaches
-  or starts, the terminal future resolves, and exactly one bounded
-  `provider=azure` unavailable diagnostic is emitted. This invariant applies
-  before either the requested or Claude-fallback profile may mutate state.
+- A production-shaped Press-2 activation test snapshots complete relevant
+  session/pipeline state before selection: selected language; timeout-handle
+  identity and cancellation state; menu-task identity/state; speaking flag and
+  generation; transport `clear_audio` calls; prompt/lang/provider/model/client/
+  tools; `pipeline._stt`; welcome-task identity and pending text. With each
+  Azure prerequisite absent in turn (SDK, `audioop`, and a blank/whitespace-only
+  key), it proves those activation/pipeline/menu/transport fields remain
+  unchanged, no welcome is created or started, no STT attaches or starts, and
+  no audio is cleared. The bounded terminal/unavailable handling may resolve
+  terminal state and emit exactly one `provider=azure` unavailable diagnostic;
+  it is explicitly outside that unchanged-field snapshot rather than a claim
+  that no session state whatsoever can change.
+- A concurrent digit-versus-timeout test blocks the first preflight, releases
+  both contenders, and proves exactly one caller preflights/commits. The second
+  acquires `_language_activation_lock` only after the first has claimed
+  `_selected_language`, sees it, and returns before preflight; it therefore has
+  no candidate to clean up and causes no duplicate welcome, timeout/menu
+  mutation, or `clear_audio` call.
+- A separate finish-during-preflight test holds preflight, calls `finish()` so
+  `_finish_task` is set, then releases preflight. The activation recheck awaits
+  cleanup of its unstarted prepared STT exactly once; it never assigns or starts
+  it and leaves no orphan, welcome, or transport mutation.
+- After activation, an executable adapter test calls
+  `await session.feed_audio(payload)` and proves
+  `prepared_stt.feed(bytes(payload))` runs through `pipeline._stt`; teardown
+  stops that same prepared instance exactly once. This rules out a nonexistent
+  session-owned STT contract.
 - Simultaneous English and Sinhala calls retain independent provider/model/tool
   state through normal turns, capture turns, tool rounds, barge-in, and
   teardown.
