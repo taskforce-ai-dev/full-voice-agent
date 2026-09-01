@@ -5534,8 +5534,6 @@ class MediaStreamSession:
         for task in tuple(self._smartpbx_deferred_tts_tasks):
             if not task.done():
                 task.cancel()
-        self._smartpbx_deferred_tts_tasks.clear()
-        self._smartpbx_deferred_tts_owners.clear()
 
     def _discard_smartpbx_deferred_tts_task(self, task: asyncio.Task) -> None:
         """Forget one finished or terminally-cancelled deferred TTS task."""

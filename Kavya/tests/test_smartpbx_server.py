@@ -3689,6 +3689,57 @@ async def test_stale_failed_turn_cancels_only_its_same_turn_generation_deferred_
 
 
 @pytest.mark.asyncio
+async def test_terminal_deferred_tts_cancellation_keeps_task_tracked_until_done(
+    monkeypatch,
+):
+    """Teardown requests cancellation but leaves lifecycle tracking to callbacks."""
+    import server
+
+    pipeline = direct_tool_pipeline(server, "claude", direct_tool_client("claude", []))
+    pipeline._active_smartpbx_turn_id = "terminal-turn"
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_speak(_text, *, generation, sentence):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+            raise
+
+    monkeypatch.setattr(pipeline, "_invoke_speak", blocked_speak)
+    task = pipeline._start_smartpbx_round_tts(
+        "terminal sentence", generation=pipeline._speak_generation,
+        sentence="terminal sentence",
+    )
+    assert task is not None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        pipeline._cancel_smartpbx_deferred_tts_now()
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+
+        assert task in pipeline._smartpbx_deferred_tts_tasks
+        assert pipeline._smartpbx_deferred_tts_owners[task] == (
+            "terminal-turn",
+            pipeline._speak_generation,
+        )
+
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert not pipeline._smartpbx_deferred_tts_tasks
+        assert not pipeline._smartpbx_deferred_tts_owners
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_direct_sinhala_gemini_capture_mode_does_not_install_deadline_wrappers(monkeypatch):
     import server
 
