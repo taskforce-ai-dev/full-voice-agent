@@ -270,16 +270,27 @@ async def test_first_invalid_digit_replays_menu_and_second_defaults_to_english()
 
 
 @pytest.mark.asyncio
-async def test_sinhala_removes_only_human_transfer_while_english_keeps_every_tool():
+async def test_sinhala_removes_only_human_transfer_while_english_keeps_every_tool(
+    monkeypatch,
+):
     sinhala_session, sinhala_pipeline, _sinhala_stt = make_session()
-    original_sinhala_tools = list(sinhala_pipeline.tools)
+    # This direct session uses the configured Gemini profile, so provide the
+    # native Gemini tool schema rather than relying on unrelated n8n env setup.
+    sinhala_pipeline.gemini_client = object()
+    monkeypatch.setattr(
+        server,
+        "get_tools_gemini",
+        lambda: [{"function_declarations": [
+            {"name": "transfer_to_human"},
+            {"name": "check_availability"},
+        ]}],
+    )
     await sinhala_session.start()
     await sinhala_session.feed_dtmf("2")
 
-    assert sinhala_pipeline.tools == [
-        tool for tool in original_sinhala_tools
-        if tool["name"] != "transfer_to_human"
-    ]
+    assert sinhala_pipeline.tools == [{"function_declarations": [
+        {"name": "check_availability"},
+    ]}]
 
     english_session, english_pipeline, _english_stt = make_session()
     original_english_tools = list(english_pipeline.tools)

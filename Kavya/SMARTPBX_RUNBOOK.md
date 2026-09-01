@@ -150,8 +150,8 @@ The SmartPBX call menu is **1 English, 2 Sinhala**. The timeout defaults to
 English; an invalid selection replays once then defaults to English. This is a
 direct SmartPBX-only choice: Twilio behavior is unchanged.
 
-Press `1` keeps the English Azure STT -> Claude -> ElevenLabs pipeline. Press
-`2` uses Azure `si-LK` -> Gemini `gemini-3.7-flash` at thinking level `low`
+Press 1 keeps the English Azure STT -> Claude -> ElevenLabs pipeline. Press
+2 uses Azure `si-LK` -> Gemini `gemini-3.7-flash` at thinking level `low`
 with a separate `600`-token ceiling -> Gemini
 `gemini-3.1-flash-tts-preview` / `Vindemiatrix`. The Sinhala menu segment is
 also Gemini TTS and remains part of the bilingual menu before selection.

@@ -3304,11 +3304,21 @@ def test_smartpbx_sinhala_llm_rendered_compose_and_protected_template_contract(t
     safe_smartpbx_env = project / ".env.smartpbx"
     safe_values = {name: "" for name in names}
     safe_values["SMARTPBX_IMAGE_TAG"] = "reviewed-image"
-    for path in (safe_env, safe_smartpbx_env):
-        path.write_text(
-            "\n".join(f"{name}={value}" for name, value in safe_values.items()) + "\n",
-            encoding="utf-8",
-        )
+    # The legacy service deliberately receives its ordinary `.env`, while the
+    # SmartPBX profile receives the protected `.env.smartpbx` allowlist.  Keep
+    # SmartPBX-only LLM controls out of the former in this isolated render.
+    legacy_values = {
+        name: value for name, value in safe_values.items()
+        if name not in SINHALA_LLM_DEFAULTS
+    }
+    safe_env.write_text(
+        "\n".join(f"{name}={value}" for name, value in legacy_values.items()) + "\n",
+        encoding="utf-8",
+    )
+    safe_smartpbx_env.write_text(
+        "\n".join(f"{name}={value}" for name, value in safe_values.items()) + "\n",
+        encoding="utf-8",
+    )
 
     def render(overrides: dict[str, str]) -> dict:
         values = {**safe_values, **overrides}
@@ -3427,7 +3437,7 @@ def test_sinhala_provider_updater_transaction_uses_only_its_private_backup(tmp_p
     for name, body in {
         "stat": """#!/usr/bin/env bash
 if [[ $1 == -c ]]; then
-  [[ ${!#} == *rollback ]] && printf '0:0:700\\n' || printf '0:0:600\\n'
+  [[ ${!#} == */rollback ]] && printf '0:0:700\\n' || printf '0:0:600\\n'
 fi
 """,
         "chown": "#!/usr/bin/env bash\nexit 0\n",
@@ -3569,7 +3579,7 @@ def test_documented_sinhala_rollback_transaction_orders_failures_and_cleanup(tmp
         driver.write_text(
             "#!/usr/bin/env bash\n"
             "REVIEWED_CI_SHORT_SHA=abcdef0\n"
-            "REVIEWED_FULL_COMMIT_SHA=abcdef0123456789abcdef0123456789abcdef0123\n"
+            "REVIEWED_FULL_COMMIT_SHA=abcdef0123456789abcdef0123456789abcdef01\n"
             "REVIEWED_IMAGE_DIGEST=sha256:" + "0" * 64 + "\n"
             + runbook_script.replace("/opt/kavya", str(app)),
             encoding="utf-8",
