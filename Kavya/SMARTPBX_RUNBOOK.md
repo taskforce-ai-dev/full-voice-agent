@@ -264,8 +264,8 @@ headers carry only the dedicated WSS token; they never carry MCP credentials.
 ## Direct SmartPBX English reliability timing (Phase B)
 
 The shared timeout knobs govern direct SmartPBX English provider rounds and
-direct SmartPBX Sinhala Claude rounds. OpenAI/Gemini keep their existing
-English-only scope, and the initial filler remains an English-only policy.
+direct SmartPBX Sinhala Claude/Gemini rounds. The initial filler remains an
+English-only policy.
 Twilio Media Streams (Arabic/Sinhala/Tamil) and the Twilio ConversationRelay
 path are unaffected — none of this timing applies outside a direct SmartPBX
 call.
@@ -304,12 +304,15 @@ retry/recovery policy.
 ## Claude direct SmartPBX output budget (600-token canary)
 
 `SMARTPBX_MAX_TOKENS` (default `120`, clamp `[40, 200]`) is the shared direct
-SmartPBX English output budget and still governs the OpenAI and Gemini rounds
-unchanged. Claude is the one exception:
+SmartPBX English output budget and continues to govern OpenAI and English
+Gemini. Claude and profile-configured Sinhala Gemini are exceptions:
 
 - `SMARTPBX_CLAUDE_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) — the
   Claude-only direct SmartPBX English/Sinhala output budget. Leave it blank to
   take the default.
+- `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) —
+  the direct Sinhala Gemini ceiling. Gemini 3.x may consume thinking tokens;
+  this does not alter English Gemini's preserved shared-budget contract.
 
 For direct Sinhala SmartPBX only, `SMARTPBX_SINHALA_CLAUDE_EFFORT` accepts
 `medium` (default) or `high`. Thinking remains enabled in both modes; set
@@ -345,8 +348,9 @@ not a model fault.
 Nothing else moves: the global ConversationRelay/Twilio `MAX_TOKENS` (300),
 every Twilio-path budget, and the OpenAI/Gemini SmartPBX budgets are untouched.
 
-Each Claude round logs exactly one privacy-safe outcome line —
-`smartpbx_media event=llm_round_outcome provider=claude outcome=<enum>
+Each terminal-classified Claude or direct Gemini round logs exactly one
+privacy-safe outcome line —
+`smartpbx_media event=llm_round_outcome provider=<claude|gemini> outcome=<enum>
 stop_reason=<enum> output_tokens=<bounded n|unknown> attempt=<1-9>` — carrying
 no text, no tool arguments and no caller identifiers. See the cutover-gate
 allowlist below for the exact, closed field set. `outcome` is one of
@@ -355,8 +359,8 @@ allowlist below for the exact, closed field set. `outcome` is one of
 logs at WARNING.
 
 `true_empty` and `stream_aborted` are deliberately separate. `true_empty` means
-the model reported ending its turn (a `message_delta` or `message_stop`
-arrived) having produced nothing — a model-behaviour signal. `stream_aborted`
+the model reported terminal metadata having produced nothing — a
+model-behaviour signal. `stream_aborted`
 means the stream simply stopped arriving with no terminal metadata at all — a
 transport/connection signal. Treat a rising `stream_aborted` rate as a network
 or upstream-proxy investigation, never as a prompt problem.
@@ -470,7 +474,7 @@ sentinel as documented below.
 
 | Field | Type | Permitted values |
 | --- | --- | --- |
-| `provider` | bounded enum | `claude` only (this event is Claude-specific) |
+| `provider` | bounded enum | `claude`, `gemini` |
 | `outcome` | bounded enum | `completed`, `max_tokens_truncated`, `true_empty`, `incomplete_tool_block`, `malformed_tool_json`, `stream_aborted` |
 | `stop_reason` | bounded enum | `end_turn`, `max_tokens`, `tool_use`, `stop_sequence`, `refusal`, `none` (absent), `unknown` (anything else) |
 | `output_tokens` | bounded integer | `0`–`1000000`, clamped; or `unknown` when the stream reported no usage |
