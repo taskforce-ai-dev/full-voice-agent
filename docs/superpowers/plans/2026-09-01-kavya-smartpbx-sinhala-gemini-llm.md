@@ -19,20 +19,20 @@
 - Do not add deprecated Gemini 3.x sampling parameters (`temperature`, `top_p`, `top_k`) or migrate the existing Generate Content runner to the Interactions API in this change.
 - New diagnostics use fixed event/enumerated fields only; never log prompts, transcripts, caller data, tool arguments/results, response bodies, exception bodies, audio, API keys, or credentials.
 - The top-level `audioop` import is currently unconditional before its guarded fallback. Move it into that guarded import (or remove the unconditional import) so `audioop = None` is observable and the Azure fail-closed test can exercise it.
-- Gemini activation performs every fallible preflight (provider validation, client acquisition, and provider-native tool preparation/copy) before mutating `pipeline` or adapter state. Catch `Exception` only at that bounded technical boundary; let `asyncio.CancelledError` and every other `BaseException` propagate. The diagnostic is fixed-field only and never includes exception text.
+- Option-2 activation performs every fallible preflight before mutating any `pipeline`, prompt, adapter, or session-owned LLM state: validate the closed provider, acquire the LLM client, prepare/filter/deep-copy provider-native tools, and construct/validate the requested Azure STT candidate (including SDK, `audioop`, and stripped-key checks). Only after that complete preflight succeeds may it atomically apply the profile, attach/start STT, and schedule the welcome. Catch `Exception` only at the bounded technical preflight; let `asyncio.CancelledError` and every other `BaseException` propagate. The diagnostic is fixed-field only and never includes exception text.
 - Do not run pytest on the development or production host. Use `python3 -m py_compile` locally for syntax only and the existing GitHub Actions Kavya test job for behavioral RED/GREEN evidence.
 - Preserve existing dirty Graphify artifacts and `docs/superpowers/plans/2026-08-31-kavya-smartpbx-sinhala-gemini-tts.md`; do not stage or modify them.
 
 ## File Map
 
-- Modify `Kavya/server.py`: closed Sinhala LLM settings, Gemini 3.7 call-ID/history compliance, direct-SmartPBX deadlines and incomplete-round fencing, session-owned Gemini thinking/token controls, sticky fallback readiness, request wiring, and conversational Sinhala prompt rules.
+- Modify `Kavya/server.py:34,556-676,3274-3473,4737-4898,4946-4983,5180-5194,8291-8860`: guarded top-level `audioop` import, closed Sinhala LLM settings, Gemini 3.7 call-ID/history compliance, direct-SmartPBX deadlines and incomplete-round fencing, session-owned Gemini thinking/token controls, sticky fallback readiness, requested-STT construction, request wiring, and conversational Sinhala prompt rules.
 - Modify `Kavya/smartpbx_session.py`: immutable language profile resolution and call-local profile activation before STT starts.
 - Modify `Kavya/tests/test_smartpbx_sinhala_ivr.py`: provider/model/client/tool isolation and concurrent English/Sinhala session contracts.
 - Modify `Kavya/tests/test_smartpbx_server.py`: explicit Azure fail-closed versus preserved English/configured STT fallback behavior.
 - Modify `Kavya/tests/test_gemini_streaming.py`: Gemini 3.7 function-call IDs, truncation/deadline behavior, session isolation, Sinhala-specific request shape, and Claude fallback preservation.
 - Modify `Kavya/tests/test_smartpbx_gemini_tts.py`: option-1 ElevenLabs, option-2 Gemini, and Gemini-TTS preservation during Claude LLM fallback.
 - Modify `Kavya/tests/test_prompt_policy.py`: conversational Sinhala prompt contract without weakening English policy.
-- Modify `Kavya/tests/test_smartpbx_deployment.py:23-39,564-598,3141-3167,3184-3213`: Compose, dotenv, runbook setting, active-assignment parser, and exact diagnostics contracts.
+- Modify `Kavya/tests/test_smartpbx_deployment.py:23-39,564-598,3141-3167,3170-3181,3184-3213`: Compose, dotenv, runbook setting, active-assignment parser, operational rollback, and exact diagnostics contracts.
 - Modify `Kavya/docker-compose.yml`: explicit SmartPBX-only environment allowlist entries.
 - Modify `Kavya/.env.example`: non-secret Sinhala LLM defaults and rollback comments.
 - Modify `Kavya/SMARTPBX_RUNBOOK.md`: runtime behavior, canary checks, and one-line rollback.
@@ -155,7 +155,7 @@ Expected GitHub Actions result: the new resolver tests pass and every pre-existi
 
 **Files:**
 - Modify: `Kavya/smartpbx_session.py:1-235,432-477`
-- Modify: `Kavya/server.py:4737-4898` (`AzureSTTStream._on_canceled()` and `_make_stt()`)
+- Modify: `Kavya/server.py:34,4737-4898` (the guarded top-level `audioop` import, `AzureSTTStream._on_canceled()`, and `_make_stt()`)
 - Test: `Kavya/tests/test_smartpbx_sinhala_ivr.py`
 - Test: `Kavya/tests/test_smartpbx_server.py`
 
@@ -521,11 +521,17 @@ global configuration test and the configured-English Azure-to-Google fallback:
 it proves `_make_stt(..., provider=<unknown>)` rejects instead of silently
 selecting a recognizer.
 
-Add an IVR-level variant whose STT factory raises for the concrete Azure
-profile. Assert no STT start, no welcome, resolved terminal future, and the
-single `provider=azure` unavailable event. Add parallel variants for
-`AZURE_STT_AVAILABLE=False`, `audioop=None`, and a blank `AZURE_SPEECH_KEY`;
-all three must reject Sinhala before welcome or STT start while the configured
+Add a production-shaped IVR activation test that snapshots every mutable
+pipeline/session activation field (at minimum `lang`, prompt, adapter
+`_llm_provider`/`_model`, pipeline provider/model/client/tool values, thinking
+controls, and STT attachment) before `feed_dtmf("2")`. Make the requested
+Azure candidate fail because each prerequisite is absent in turn
+(`AZURE_STT_AVAILABLE=False`, `audioop=None`, and a blank/whitespace-only
+`AZURE_SPEECH_KEY`). Each variant must prove the snapshot is byte-for-byte
+unchanged, no welcome task is created or started, no STT starts or attaches,
+the terminal future resolves, and exactly one fixed-field
+`provider=azure` unavailable event is emitted. This is a production-shaped
+pre-mutation invariant, not merely an `_make_stt()` unit test. The configured
 English fallback remains unchanged. Add an `AzureSTTStream` unit test that first
 establishes a running stream, sets `stream.on_fatal` to a recorder, fires genuine
 `_on_canceled()` callbacks twice, and asserts one fatal callback; then call
@@ -662,21 +668,55 @@ def _apply_language_profile(
 The concrete code must not blindly call the client getters as the abbreviated
 snippet above suggests. Validate `gemini|claude`, acquire the client, prepare
 the provider-native tools, filter transfer ownership, and deep-copy that tool
-set before changing any pipeline field. Catch `Exception` only around this
-preflight; re-raise `asyncio.CancelledError` and every other `BaseException`.
+set before changing any pipeline field. Then construct and validate the
+requested STT candidate while the pre-selection pipeline/session state is
+still intact. For Sinhala Azure this preflight includes the SDK, `audioop`, and
+`AZURE_SPEECH_KEY.strip()` checks; a missing prerequisite must fail before a
+prompt, adapter, `pipeline.lang`, client/tool field, STT attachment, welcome,
+or STT start is mutated. Catch `Exception` only around this complete LLM-plus-
+STT preflight; re-raise `asyncio.CancelledError` and every other `BaseException`.
 On a bounded technical preflight failure, resolve a Claude copy of the same
-Sinhala STT/TTS profile, initialize or reuse Anthropic, emit the bounded
-fallback event, and apply that profile atomically. If Anthropic is also unavailable, emit the
-bounded unavailable event, call a new LLM/profile-specific
+Sinhala STT/TTS profile, preflight its Anthropic client/tools **and the same
+requested Azure candidate** without mutation, emit the bounded fallback event,
+and atomically apply only the fully prepared fallback. If Anthropic or Azure is
+also unavailable, emit the bounded unavailable event, call a new LLM/profile-specific
 `_end_call_without_language_profile()` helper, and return `None`. That helper
 resolves `terminal_future` and does not report the existing false
 `STT_UNAVAILABLE` diagnostic. `_activate_language()` must use the returned
 profile, not the original requested profile.
 
-In `_activate_language()`, after the menu task is canceled/awaited and before `pipeline.lang = lang`, add:
+In `_activate_language()`, after the menu task is canceled/awaited, use an
+explicit prepare-then-commit sequence. Do not set `pipeline.lang`, rebuild the
+prompt, alter adapter fields, attach STT, create the welcome task, or start STT
+until both LLM/tools and the requested STT object have preflighted:
 
 ```python
 requested_profile = self._resolve_language_profile(lang)
+prepared = self._preflight_language_profile(pipeline, requested_profile)
+if prepared is None:
+    return
+profile, prepared_client, prepared_tools, prepared_stt = prepared
+# The first mutation: apply the complete prepared profile atomically.
+profile = self._apply_prepared_language_profile(
+    pipeline, profile, prepared_client, prepared_tools
+)
+pipeline.lang = profile.lang
+# Rebuild the prompt and bind the already-validated STT only after commit.
+self._stt = prepared_stt
+prepared_stt.start()
+# Only now may the selected-language welcome be scheduled.
+...
+```
+
+The concrete helper names may differ, but this ordering is mandatory. A
+preflight failure must leave the snapshot from the production-shaped test
+unchanged and must not create a welcome task or start/attach STT. The fallback
+path follows the same prepare-then-commit rule; it is not permission to mutate
+the requested Gemini profile before trying Claude.
+
+Do not use this abbreviated old ordering:
+
+```python
 profile = self._apply_language_profile(pipeline, requested_profile)
 if profile is None:
     return
@@ -1164,7 +1204,7 @@ Expected GitHub Actions result: prompt and fallback tests pass; existing English
 - Modify: `Kavya/docker-compose.yml:99-168`
 - Modify: `Kavya/.env.example:22-32,265-285`
 - Modify: `Kavya/SMARTPBX_RUNBOOK.md:70-141,143-185,264-268,304-308,345-346,469-485,518-522`
-- Modify: `Kavya/tests/test_smartpbx_deployment.py:23-39,564-598,3141-3167,3184-3213`
+- Modify: `Kavya/tests/test_smartpbx_deployment.py:23-39,564-598,3141-3167,3170-3181,3184-3213`
 
 **Interfaces:**
 - Consumes: the four environment variable names from Task 1.
@@ -1359,25 +1399,93 @@ Diagnostics and the canary inspect only bounded provider/event/outcome fields;
 they never expose response content, transcript text, exception detail, or any
 secret.
 
-Rollback only the Sinhala LLM by setting:
+The one-setting SmartPBX-only rollback is transactionally exact:
+
+1. Drain new SmartPBX work and confirm the authenticated SmartPBX status shows
+   `active_sessions=0` before changing anything. Capture the original file
+   metadata and create a root-only, mode-`0600` temporary backup without
+   printing either file's contents:
+
+```bash
+ENV_FILE=/opt/kavya/.env.smartpbx
+ENV_UID="$(sudo stat -c '%u' "$ENV_FILE")"
+ENV_GID="$(sudo stat -c '%g' "$ENV_FILE")"
+ENV_MODE="$(sudo stat -c '%a' "$ENV_FILE")"
+ENV_BACKUP="$(sudo mktemp /opt/kavya/.env.smartpbx.rollback.XXXXXX)"
+sudo install -o root -g root -m 600 "$ENV_FILE" "$ENV_BACKUP"
+```
+
+2. Use `sudoedit "$ENV_FILE"` and change **only** this active assignment;
+   restore the captured owner, group, and mode after the edit. Do not print the
+   file or any secret:
 
 ```dotenv
 SMARTPBX_SINHALA_LLM_PROVIDER=claude
 ```
 
-Then recreate only `kavya-smartpbx` through the guarded image deployment
-procedure. Do not edit `LLM_PROVIDER`; it is the English/global baseline.
+```bash
+sudo chown "$ENV_UID:$ENV_GID" "$ENV_FILE"
+sudo chmod "$ENV_MODE" "$ENV_FILE"
+```
+
+3. Before any recreation, validate the SmartPBX profile using the same reviewed
+   immutable image tag and the edited environment. The command is intentionally
+   config-only and leaves the running container unchanged:
+
+```bash
+sudo env SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --project-directory /opt/kavya --env-file "$ENV_FILE" -f /opt/kavya/docker-compose.yml --profile smartpbx config >/dev/null
+```
+
+If validation fails, restore the root-owned backup, preserve the original
+metadata, remove the backup, and stop; do not invoke the helper:
+
+```bash
+sudo install -o "$ENV_UID" -g "$ENV_GID" -m "$ENV_MODE" "$ENV_BACKUP" "$ENV_FILE"
+sudo rm -- "$ENV_BACKUP"
+```
+
+4. Only after validation succeeds, run the existing guarded helper with the
+   same reviewed immutable image identity. The quoted placeholders are shell
+   variables containing the already-reviewed CI short SHA, expected revision
+   SHA, and expected digest:
+
+```bash
+sudo /opt/kavya/scripts/deploy_smartpbx_image.sh "$REVIEWED_CI_SHORT_SHA" "$EXPECTED_SHA" "$EXPECTED_DIGEST"
+```
+
+The helper renders the SmartPBX profile, recreates only `kavya-smartpbx`, and
+protects the image/recreation path with its existing image rollback, health,
+and service-isolation checks. It continues to use the current
+`.env.smartpbx`; it does **not** restore that file. If the helper fails after
+recreation begins, the operator must restore the environment backup and rerun
+the same guarded helper with the same reviewed immutable identity:
+
+```bash
+sudo install -o "$ENV_UID" -g "$ENV_GID" -m "$ENV_MODE" "$ENV_BACKUP" "$ENV_FILE"
+sudo /opt/kavya/scripts/deploy_smartpbx_image.sh "$REVIEWED_CI_SHORT_SHA" "$EXPECTED_SHA" "$EXPECTED_DIGEST"
+```
+
+After either successful deployment or restored configuration, verify
+authenticated SmartPBX status for healthy isolation and `active_sessions=0`,
+then check `/health`; only then remove the root-only backup with
+`sudo rm -- "$ENV_BACKUP"`. Do not invoke an unguarded `docker compose up` or
+direct compose recreate. Do not edit `LLM_PROVIDER`; it is the English/global
+baseline.
 
 Azure `si-LK` remains the live Sinhala STT. Chirp 2's general V2 table lists
 Sinhala, but its method-specific `StreamingRecognize` list excludes Sinhala;
 Gemini Transcribe Live also omits Sinhala. Both are offline-only evaluations.
 
-Canary both languages: prove option 1 still produces canonical ElevenLabs
-speech; prove option 2 uses Azure `si-LK`, Gemini 3.7 Flash, and Gemini TTS;
-then force a replay-safe Gemini LLM failure and prove its Sinhala Claude
-fallback still uses Gemini TTS. Check `/health` and authenticated
-`/smartpbx/status`; on failure restore the prior image/config and repeat those
-checks. Twilio behavior is unchanged.
+Canary normal traffic only: prove option 1 still produces canonical ElevenLabs
+speech and prove option 2 uses Azure `si-LK`, Gemini 3.7 Flash, and Gemini
+TTS. Do **not** force a live Gemini/provider/configuration failure or inject
+any other production fault. Gemini-to-Claude failover is proven by the CI
+regression suite and bounded synthetic harness evidence only, never by
+deliberately breaking live production/provider configuration. Keep any rollback
+drill separate, read-only where possible, or otherwise explicitly controlled.
+Check `/health` and authenticated `/smartpbx/status`; on failure follow the
+transactional environment-backup restore and guarded-helper rerun above, then
+repeat those checks. Twilio behavior is unchanged.
 ````
 
 - [ ] **Step 6: Syntax/config check, push GREEN, and inspect the rendered Compose service**
@@ -1476,8 +1584,8 @@ This section is an operations handoff, not authorization to deploy during implem
 5. Place one Press-1 preservation call: greeting, general KB question, rate question, phone capture, and hangup. Compare first-media latency and errors with the pre-deploy stable baseline.
 6. Place one Press-2 fluent-speaker call: general question, rate, availability tool, name, repeated-digit phone number, booking, barge-in, and hangup. Confirm natural Sinhala, correct slots, no English recovery leakage, no duplicate tool side effects, and Gemini TTS throughout.
 7. Place simultaneous Press-1 and Press-2 calls. Confirm telemetry shows independent sessions and no provider/model/tool crossing.
-8. Force a replay-safe Gemini failure in a controlled canary. Confirm one call falls back to Claude in Sinhala, Gemini TTS remains active, and the other call stays on its selected provider.
-9. If Sinhala quality or reliability regresses, set `SMARTPBX_SINHALA_LLM_PROVIDER=claude` and recreate only `kavya-smartpbx`. If the service itself is unhealthy, use the existing immutable-image rollback.
+8. Do not inject a Gemini/provider/configuration failure into the live canary. Prove Gemini-to-Claude failover with CI regression tests and bounded synthetic-harness evidence; the live calls remain normal option-1 and option-2 checks.
+9. If Sinhala quality or reliability regresses, follow the transactionally guarded one-setting rollback above: drain, back up and edit only `SMARTPBX_SINHALA_LLM_PROVIDER`, validate Compose, then use the guarded helper. If recreation begins and fails, restore the environment backup before rerunning that helper with the same reviewed immutable identity.
 
 ## Official Implementation Sources
 

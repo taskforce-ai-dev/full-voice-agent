@@ -44,7 +44,12 @@ already-shipped SmartPBX IVR and Gemini Sinhala TTS design.
   tools, ElevenLabs, capture behavior, handover, telemetry, timeouts, and
   latency controls.
 - Pressing `2` must select a Sinhala session profile before STT starts and
-  before conversation history exists.
+  before conversation history exists. It must first preflight the selected
+  provider/client/tools **and** construct/validate the requested Azure STT
+  candidate (SDK, `audioop`, and stripped-key prerequisites) while pipeline,
+  prompt, adapter, STT attachment, and welcome state remain unchanged. Only a
+  fully prepared profile may then atomically mutate those fields, attach/start
+  STT, and schedule the welcome.
 - The existing bilingual pre-selection IVR menu remains intact. It temporarily
   uses `lang="si"` to speak the Sinhala menu line through Gemini TTS before a
   profile is selected; this is menu delivery, not a selected Sinhala LLM
@@ -136,14 +141,15 @@ Sinhala production service.
    it does not mutate globals. `lang` remains the existing execution key for
    both the STT factory and the TTS router: the profile must not duplicate
    descriptive TTS provider/model/voice fields or introduce a provider registry.
-4. `_activate_language()` applies that profile exactly once before constructing
-   and starting STT:
-   - set `lang` and rebuild the language system prompt;
-   - install the session's LLM provider, model, client, and matching tool
-     declarations;
-   - select the session's STT backend and language configuration;
-   - retain the existing language-specific TTS routing;
-   - start STT and speak the selected-language greeting.
+4. `_activate_language()` uses prepare-then-commit exactly once:
+   - validate the profile, acquire its LLM client, prepare/filter/deep-copy its
+     provider-native tools, and construct/validate its requested STT candidate;
+   - if any preflight fails, leave all pipeline/prompt/adapter/STT/welcome
+     state unchanged and take only the bounded fallback or terminal path;
+   - only after all preflight succeeds, atomically install `lang`, the rebuilt
+     system prompt, LLM provider/model/client/tools, and STT attachment;
+   - retain the existing language-specific TTS routing, then start the already
+     validated STT and schedule the selected-language greeting.
 5. All later turns dispatch through the existing provider switch in
    `_process_utterance_bound()` and therefore use `_run_llm_claude()` for
    English or `_run_llm_gemini()` for Sinhala.
@@ -198,8 +204,12 @@ without `audioop` exposes `audioop is None`; option 2 then rejects before any
 pipeline mutation, greeting, or STT start.
 
 Option-2 activation validates the closed Sinhala provider set (`gemini` or
-`claude`) and does all fallible client/tool preflight before changing the
-pipeline. It catches `Exception` only around that bounded technical preflight;
+`claude`) and completes all fallible LLM/client/tool **and requested-STT**
+preflight before changing the pipeline, prompt, adapter, STT attachment, or
+welcome state. Azure preflight includes its SDK, `audioop`, and a
+whitespace-stripped `AZURE_SPEECH_KEY`. Only after a complete preflight may it
+atomically apply the profile, attach/start STT, and schedule the greeting. It
+catches `Exception` only around that bounded technical preflight;
 `asyncio.CancelledError` and other `BaseException` values must propagate. An
 invalid configured provider follows the same bounded unavailable/fallback path
 and can never fall into OpenAI dispatch.
@@ -314,6 +324,15 @@ it.
   model, tools, STT language, greeting, and TTS route as before.
 - Press `2` constructs Gemini 3.7 Flash tools/model/client, Sinhala prompt,
   selected Sinhala STT, and Gemini TTS.
+- A production-shaped Press-2 activation test snapshots all mutable
+  pipeline/session activation state before selection (language, prompt,
+  adapter provider/model, pipeline provider/model/client/tools/thinking
+  controls, STT attachment, and welcome state). With each Azure prerequisite
+  absent in turn (SDK, `audioop`, and a blank/whitespace-only key), it proves
+  the snapshot is unchanged, no welcome is created or started, no STT attaches
+  or starts, the terminal future resolves, and exactly one bounded
+  `provider=azure` unavailable diagnostic is emitted. This invariant applies
+  before either the requested or Claude-fallback profile may mutate state.
 - Simultaneous English and Sinhala calls retain independent provider/model/tool
   state through normal turns, capture turns, tool rounds, barge-in, and
   teardown.
@@ -383,9 +402,69 @@ column only.
 1. Land provider-isolation and Gemini-LLM behavior behind Sinhala-only settings.
 2. Deploy with Sinhala STT still set to Azure.
 3. Run controlled Press-1 English preservation calls and Press-2 Sinhala calls.
-4. Accept or roll back the Sinhala LLM independently by switching
-   `SMARTPBX_SINHALA_LLM_PROVIDER` to `claude` and recreating only
-   `kavya-smartpbx`.
+4. For the one-setting Sinhala-only rollback, first drain and confirm the
+   authenticated SmartPBX status reports `active_sessions=0`. Capture the
+   original metadata and create a root-only, mode-`0600` temporary backup
+   without printing the environment file or any secret:
+
+   ```bash
+   ENV_FILE=/opt/kavya/.env.smartpbx
+   ENV_UID="$(sudo stat -c '%u' "$ENV_FILE")"
+   ENV_GID="$(sudo stat -c '%g' "$ENV_FILE")"
+   ENV_MODE="$(sudo stat -c '%a' "$ENV_FILE")"
+   ENV_BACKUP="$(sudo mktemp /opt/kavya/.env.smartpbx.rollback.XXXXXX)"
+   sudo install -o root -g root -m 600 "$ENV_FILE" "$ENV_BACKUP"
+   ```
+
+   Use `sudoedit "$ENV_FILE"` to change only
+   `SMARTPBX_SINHALA_LLM_PROVIDER=claude`, then preserve the original owner,
+   group, and mode:
+
+   ```bash
+   sudo chown "$ENV_UID:$ENV_GID" "$ENV_FILE"
+   sudo chmod "$ENV_MODE" "$ENV_FILE"
+   ```
+
+   Before any recreation, validate Compose with the same reviewed immutable
+   image tag and SmartPBX profile; this config-only command leaves the running
+   container unchanged:
+
+   ```bash
+   sudo env SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --project-directory /opt/kavya --env-file "$ENV_FILE" -f /opt/kavya/docker-compose.yml --profile smartpbx config >/dev/null
+   ```
+
+   If validation fails, restore the backup with its original metadata, remove
+   the root-only backup, and stop without invoking the helper:
+
+   ```bash
+   sudo install -o "$ENV_UID" -g "$ENV_GID" -m "$ENV_MODE" "$ENV_BACKUP" "$ENV_FILE"
+   sudo rm -- "$ENV_BACKUP"
+   ```
+
+   Only after validation succeeds, run the existing guarded helper against the
+   same reviewed immutable image identity:
+
+   ```bash
+   sudo /opt/kavya/scripts/deploy_smartpbx_image.sh "$REVIEWED_CI_SHORT_SHA" "$EXPECTED_SHA" "$EXPECTED_DIGEST"
+   ```
+
+   The quoted variables are the reviewed CI short SHA, expected revision SHA,
+   and expected digest. The helper renders the SmartPBX profile, recreates only
+   `kavya-smartpbx`, and protects image/recreation with its image rollback,
+   health, and isolation checks. It continues using the current
+   `.env.smartpbx`; environment restoration is explicitly operator-owned. If
+   the helper fails after recreation begins, restore the backup and rerun the
+   same helper with the same reviewed immutable identity:
+
+   ```bash
+   sudo install -o "$ENV_UID" -g "$ENV_GID" -m "$ENV_MODE" "$ENV_BACKUP" "$ENV_FILE"
+   sudo /opt/kavya/scripts/deploy_smartpbx_image.sh "$REVIEWED_CI_SHORT_SHA" "$EXPECTED_SHA" "$EXPECTED_DIGEST"
+   ```
+
+   After either success or restored configuration, verify authenticated
+   SmartPBX status for healthy isolation and `active_sessions=0`, then check
+   `/health`; remove the root-only backup only after those checks with
+   `sudo rm -- "$ENV_BACKUP"`. Do not run an unguarded compose recreate.
 5. After the LLM/TTS path is accepted, benchmark Chirp 2 offline using
    controlled, consented recordings only.
 6. Do not canary Chirp 2 on live calls unless Google's method-specific
@@ -405,7 +484,13 @@ nonblank Gemini key means `bool(value.strip())`; whitespace-only is not a key.
 The tests cover a blank value, a whitespace-only value, and a later nonblank
 assignment without printing any value. The section preserves
 menu/timeout/invalid-selection behavior, key-presence/no-secret-printing,
-bounded diagnostics, two-language canary, and rollback.
+bounded diagnostics, normal two-language canary, and rollback. The live canary
+exercises normal option 1 and option 2 only: live fault injection (including
+deliberately breaking Gemini/provider configuration) is prohibited.
+Gemini-to-Claude failover is proven by CI regression tests and bounded
+synthetic harness evidence, never by inducing a production failure. A rollback
+drill is separate and read-only where possible or otherwise explicitly
+controlled.
 
 Update the stale timing, token-budget, and Claude-only-retry prose in the
 current runbook regions 264-268, 304-308, 345-346, and 518-522, together with
@@ -413,7 +498,8 @@ the diagnostics schema around 469-485. Preserve the startup pre-roll canary at
 203-208. The 345-346 replacement distinguishes preserved English Gemini
 budgeting from the Sinhala session-owned `600` ceiling. Deployment coverage
 includes the dotenv helper tests (23-39), diagnostics tests (564-598),
-protected-template tests (3141-3167), and section tests (3184-3213). Compose
+protected-template tests (3141-3167), rollback tests (3170-3181), and section
+tests (3184-3213). Compose
 rendering always uses `--profile smartpbx`.
 
 ## Explicit non-goals
