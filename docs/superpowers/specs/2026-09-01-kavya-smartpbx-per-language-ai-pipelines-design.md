@@ -8,7 +8,7 @@ SmartPBX IVR selection:
 | IVR selection | STT | LLM | TTS |
 | --- | --- | --- | --- |
 | `1` English | Existing production English STT configuration | Existing Claude configuration | Existing ElevenLabs configuration |
-| `2` Sinhala | Azure `si-LK` initially; Google Cloud STT V2 `chirp_2` as the supported challenger | Gemini `gemini-3.7-flash` | Existing Gemini `gemini-3.1-flash-tts-preview`, voice `Vindemiatrix` |
+| `2` Sinhala | Existing Azure `si-LK`; unsupported challengers remain offline-only | Gemini `gemini-3.7-flash` | Existing Gemini `gemini-3.1-flash-tts-preview`, voice `Vindemiatrix` |
 
 Claude remains available to Sinhala only as an automatic technical-failure
 fallback. It is not used for ordinary Sinhala turns. A Gemini failure can make
@@ -16,11 +16,20 @@ the current call sticky-degrade to Claude through the existing per-session
 failover state, but it must never change another call or the English profile.
 
 Gemini 3.5 Transcribe Live is not a production Sinhala candidate at this time.
-It accepts live mu-law audio and offers interim/final events plus custom
-vocabulary, but Google's published supported-language table does not include
-Sinhala or `si-LK`. It may be evaluated offline against controlled pilot audio;
-it must not receive live caller traffic until Google documents Sinhala support
-or a separately approved exception defines sufficient empirical evidence.
+It accepts raw mono 16-bit PCM at 16 kHz and offers interim/final events plus
+custom vocabulary, but Google's published supported-language table does not
+include Sinhala or `si-LK`. A SmartPBX mu-law harness would therefore need an
+explicit decode/resample boundary. It may be evaluated offline against
+controlled pilot audio; it must not receive live caller traffic until Google
+documents Sinhala support or a separately approved exception defines sufficient
+empirical evidence.
+
+Google Cloud's general Speech-to-Text V2 language table lists Sinhala `si-LK`
+for `chirp_2`, but the method-specific Chirp 2 documentation limits
+`StreamingRecognize` to a language list that excludes Sinhala. The general
+table therefore supports an offline `Recognize`/`BatchRecognize` evaluation,
+not a live-call integration. Azure remains the only supported live Sinhala STT
+in this design until the method-specific streaming list changes.
 
 This design supersedes only the earlier design's decision to keep one LLM and
 one STT provider selection for both SmartPBX languages. It preserves the
@@ -36,8 +45,13 @@ already-shipped SmartPBX IVR and Gemini Sinhala TTS design.
   latency controls.
 - Pressing `2` must select a Sinhala session profile before STT starts and
   before conversation history exists.
-- Provider/model/tool selection is session-owned. No call may mutate a module
-  global that another concurrent call reads.
+- The Sinhala profile names Azure explicitly and fails closed if Azure is not
+  constructible. It must never inherit the global factory's Azure-to-Google
+  fallback; English retains that existing configured fallback behavior.
+- Provider/model/tool selection and requested generation controls are
+  session-owned. Lazy module-level SDK client singletons may remain shared, but
+  no call may mutate process-wide provider/model/tool/thinking compatibility
+  state that changes another concurrent call's request behavior.
 - Sinhala Gemini TTS remains provider-exclusive. LLM failover to Claude must
   not imply a TTS fallback; all Sinhala text continues through Gemini TTS.
 - Existing generation ownership, barge-in, filler, capture, transport, tool
@@ -104,8 +118,11 @@ Sinhala production service.
 
 1. The SmartPBX session starts in the existing pre-STT IVR state.
 2. `1`, `2`, timeout, or invalid-selection fallback resolves a language code.
-3. A small profile resolver returns the provider/model/tool/STT choices for
-   that language. It returns values; it does not mutate globals.
+3. A small profile resolver returns the provider/model/tool/STT/TTS choices for
+   that language. It returns values; it does not mutate globals. The existing
+   immutable language code remains the execution key for the current STT
+   factory and TTS router; the profile records those choices explicitly rather
+   than adding a provider registry.
 4. `_activate_language()` applies that profile exactly once before constructing
    and starting STT:
    - set `lang` and rebuild the language system prompt;
@@ -148,6 +165,12 @@ low/medium/high thinking. The current Gemini helper already selects the 3.x
 The implementation must not add deprecated sampling parameters or migrate the
 LLM runner to another API in the same change.
 
+The Generate Content function-calling contract is a prerequisite, not a canary
+detail. Gemini 3.7 returns an ID with each function call and requires the
+matching ID and name on each `FunctionResponse`. The SmartPBX history adapter
+must preserve that provider ID alongside the existing thought signature across
+the tool-result follow-up; locally synthesized IDs are not sufficient.
+
 The existing non-Claude direct-SmartPBX ceiling is at most 200 tokens. That
 ceiling must not be assumed adequate for Gemini 3.7 tool turns: thinking tokens
 count against output and a truncated function call cannot execute safely. The
@@ -184,14 +207,16 @@ Keep Azure with the existing `si-LK` language setting for the first Gemini-LLM
 canary. This changes one provider boundary at a time and gives an immediate
 rollback point.
 
-### Supported challenger
+### Offline Chirp 2 challenger
 
-Add a Sinhala-only STT selector with `azure` and `google_chirp2` values. Google
-Cloud Speech-to-Text V2 documents Sinhala `si-LK` support for `chirp_2` in
-`asia-southeast1`, including automatic punctuation, model adaptation, and
-word-level confidence. It does not list `chirp_telephony` for Sinhala, so the
-evaluation must use `chirp_2` and must measure its behavior on the actual 8 kHz
-telephone audio rather than infer telephony quality from language support.
+Do not add a production STT selector for Chirp 2. Google Cloud Speech-to-Text
+V2 documents Sinhala `si-LK` for `chirp_2` in `asia-southeast1`, including
+automatic punctuation, model adaptation, and word-level confidence, but its
+method-specific Chirp 2 documentation excludes Sinhala from
+`StreamingRecognize`. Evaluate `Recognize` or `BatchRecognize` only against
+controlled 8 kHz telephone recordings. Do not infer live streaming support
+from the broader model/language table, and do not add `google_chirp2` to the
+live session factory unless Google adds `si-LK` to the streaming list.
 
 The English STT provider and its phrase-list/digit behavior stay unchanged.
 
@@ -199,9 +224,10 @@ The English STT provider and its phrase-list/digit behavior stay unchanged.
 
 Gemini `gemini-3.5-transcribe-live` may be connected to a controlled offline
 or explicit pilot harness, not the production Press-2 selector. The harness
-may use mu-law input and a narrow custom vocabulary for property and room
-names, but it must label the result unsupported for Sinhala and must not make
-the production plan depend on it.
+must decode SmartPBX mu-law to raw mono 16-bit PCM at 16 kHz and may use a
+narrow custom vocabulary for property and room names, but it must label the
+result unsupported for Sinhala and must not make the production plan depend on
+it.
 
 ## Failure handling
 
@@ -211,6 +237,12 @@ the production plan depend on it.
   existing non-replayable recovery behavior.
 - Repeated Gemini technical failures sticky-degrade only that Sinhala session
   to Claude and emit the existing bounded provider-failover/degraded events.
+- A Gemini client-initialization failure during option-2 activation must be
+  caught before STT starts. If a prepared Anthropic client is available, apply
+  the transfer-free Claude Sinhala profile and continue. If neither LLM client
+  is usable, emit one bounded fixed-field diagnostic, do not start STT, and
+  terminate the session through the existing fatal-session path rather than
+  leaving a selected but silent call.
 - Claude fallback text remains Sinhala because the selected language prompt is
   retained; all resulting speech still uses Gemini Sinhala TTS.
 - A Gemini TTS failure remains a TTS failure. It must not invoke OpenAI,
@@ -239,14 +271,20 @@ the production plan depend on it.
 - Empty, blocked, truncated, timed-out, malformed-tool, quota, server-error,
   and post-tool failure paths have the required retry/failover/recovery
   outcome.
+- Direct SmartPBX Sinhala Gemini turns use the same non-capture initial/stall
+  deadline and atomic timeout recovery contract as direct SmartPBX Claude
+  turns. Capture flows keep their existing timeout carve-out.
+- A Gemini 3.7 tool round preserves each provider function-call ID into the
+  matching function response; truncated or malformed tool rounds execute no
+  tool and commit no partial assistant/tool history.
 - No English recovery or keypad sentence reaches Sinhala TTS.
 
 ### STT benchmark
 
 Use controlled, consented call audio covering conversational Sinhala,
 Sinhala-English code-switching, room names, Sri Lankan names, dates, guest
-counts, short confirmations, phone numbers, and repeated digits. Compare Azure
-`si-LK` and Chirp 2 on:
+counts, short confirmations, phone numbers, and repeated digits. Compare the
+live Azure `si-LK` transcript with offline Chirp 2 results on:
 
 - exact booking-slot accuracy;
 - semantic utterance accuracy;
@@ -279,11 +317,11 @@ column only.
 4. Accept or roll back the Sinhala LLM independently by switching
    `SMARTPBX_SINHALA_LLM_PROVIDER` to `claude` and recreating only
    `kavya-smartpbx`.
-5. After the LLM/TTS path is accepted, canary Chirp 2 separately on controlled
-   Sinhala calls.
-6. Promote Chirp 2 only if it beats Azure on booking-slot accuracy without an
-   unacceptable finalization-latency or barge-in regression. Otherwise retain
-   Azure.
+5. After the LLM/TTS path is accepted, benchmark Chirp 2 offline using
+   controlled, consented recordings only.
+6. Do not canary Chirp 2 on live calls unless Google's method-specific
+   documentation adds Sinhala to `StreamingRecognize` and a new design is
+   approved.
 7. Keep immutable-image rollback available throughout the guarded Kavya
    probe/build/deploy process.
 
@@ -301,9 +339,11 @@ column only.
 ## Official sources
 
 - Google AI for Developers, [Gemini 3.7 Flash](https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash)
+- Google AI for Developers, [Gemini 3.7 migration checklist](https://ai.google.dev/gemini-api/docs/generate-content/latest-model)
 - Google AI for Developers, [Streaming text generation](https://ai.google.dev/gemini-api/docs/generate-content/text-generation#streaming-responses)
 - Google AI for Developers, [Function calling](https://ai.google.dev/gemini-api/docs/function-calling)
 - Google AI for Developers, [Gemini audio transcription](https://ai.google.dev/gemini-api/docs/transcribe)
 - Google AI for Developers, [Live transcription](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)
 - Google Cloud, [Speech-to-Text V2 supported languages](https://docs.cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages)
+- Google Cloud, [Chirp 2 method-specific language availability](https://docs.cloud.google.com/speech-to-text/docs/models/chirp-2#language-availability)
 - Microsoft Learn, [Azure Speech language and voice support](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support)
