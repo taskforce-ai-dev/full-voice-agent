@@ -1748,6 +1748,26 @@ def test_gemini_provider_origin_rejects_boolean_status_codes():
     assert server._gemini_provider_origin_reason(_QuotaError(status=429)) == "quota"
 
 
+def test_direct_sinhala_stream_adapter_preserves_smartpbx_timeout():
+    """A direct-Sinhala stream timeout must reach its dedicated runner path."""
+
+    async def timed_out_stream():
+        raise server._SmartPBXStreamTimeout(
+            phase=server._SmartPBXStreamTimeout.PHASE_STALL,
+        )
+        yield  # pragma: no cover - keeps this an async generator
+
+    async def consume():
+        async for _item in server._iter_gemini_provider_deltas(
+            timed_out_stream(), mark_provider_errors=True,
+        ):
+            pass
+
+    with pytest.raises(server._SmartPBXStreamTimeout) as raised:
+        asyncio.run(consume())
+    assert raised.value.phase == server._SmartPBXStreamTimeout.PHASE_STALL
+
+
 @pytest.mark.parametrize(
     ("turn", "reason", "private_detail"),
     [

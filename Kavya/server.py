@@ -3641,6 +3641,12 @@ async def _iter_gemini_provider_deltas(
             yield await anext(iterator)
         except StopAsyncIteration:
             return
+        except _SmartPBXStreamTimeout:
+            # The direct SmartPBX runner owns timeout telemetry and its
+            # atomic cancellation/recovery transition.  This adapter must
+            # never turn that operational timeout into a generic incomplete
+            # Gemini stream result.
+            raise
         except Exception as exc:
             reason = _gemini_provider_origin_reason(exc)
             if mark_provider_errors and reason is not None:
