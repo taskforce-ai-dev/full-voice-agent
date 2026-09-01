@@ -122,6 +122,7 @@ copy_with_original_metadata() {
 create_backup() {
   local tmp
   tmp=$(mktemp "$TRANSACTION_DIR/.backup.XXXXXX" 2>/dev/null) || return 1
+  silent install -m 600 /dev/null "$tmp" || return 1
   silent cp -- "$PROTECTED_FILE" "$tmp" || return 1
   silent chown 0:0 "$tmp" || return 1
   silent chmod 600 "$tmp" || return 1
@@ -167,8 +168,12 @@ restore() {
   transaction_pending || return 1
   read_metadata || return 1
   copy_with_original_metadata "$BACKUP_FILE" || return 1
-  remove_transaction_artifacts || return 1
-  transaction_empty
+  # Keep the private backup locked through the guarded-image retry. Cleanup is
+  # the single terminal operation and refuses to run before health/status pass.
+  printf 'restored\n' >"$PENDING_FILE" 2>/dev/null || return 1
+  silent chown 0:0 "$PENDING_FILE" || return 1
+  silent chmod 600 "$PENDING_FILE" || return 1
+  transaction_pending
 }
 
 authenticated_post_deploy_checks() {

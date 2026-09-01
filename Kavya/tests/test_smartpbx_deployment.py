@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import re
 import json
@@ -3177,6 +3178,12 @@ def smartpbx_protected_template(runbook: str) -> str:
     return match.group("body")
 
 
+def smartpbx_sinhala_rollback_transaction(runbook: str) -> str:
+    marker = "```sh\n# SmartPBX Sinhala LLM rollback transaction"
+    scoped = runbook.split(marker, 1)[1]
+    return "# SmartPBX Sinhala LLM rollback transaction" + scoped.split("```", 1)[0]
+
+
 def test_sinhala_smartpbx_settings_are_explicit_and_secret_safe():
     compose = yaml.safe_load(read_text("docker-compose.yml"))
     smartpbx = compose["services"]["kavya-smartpbx"]["environment"]
@@ -3267,7 +3274,7 @@ def test_sinhala_smartpbx_runbook_documents_the_llm_tts_and_transaction_contract
         "update_smartpbx_sinhala_provider.sh apply /opt/kavya/.env.smartpbx claude",
         "update_smartpbx_sinhala_provider.sh restore /opt/kavya/.env.smartpbx",
         "update_smartpbx_sinhala_provider.sh cleanup /opt/kavya/.env.smartpbx",
-        "config validation fails",
+        "config validation failure",
         "post-recreate failure",
         "same reviewed identity",
         "health/status checks",
@@ -3283,33 +3290,78 @@ def test_sinhala_smartpbx_runbook_documents_the_llm_tts_and_transaction_contract
 
 
 def test_smartpbx_sinhala_llm_rendered_compose_and_protected_template_contract(tmp_path):
+    # Use an isolated project directory. Never let Compose discover the real
+    # repository .env, .env.smartpbx, Docker configuration, or any secret.
+    project = tmp_path / "compose-project"
+    project.mkdir()
+    compose_file = project / "docker-compose.yml"
+    shutil.copyfile(PROJECT_ROOT / "docker-compose.yml", compose_file)
     names = sorted(
         set(re.findall(r"\$\{([A-Z0-9_]+)(?::-[^}]*)?\}", read_text("docker-compose.yml")))
     )
-    fixture = tmp_path / "smartpbx-rendered.env"
-    fixture.write_text(
-        "\n".join(f"{name}=" for name in names)
-        + "\nSMARTPBX_IMAGE_TAG=reviewed-image"
-        + "\n".join(f"\n{name}={value}" for name, value in SINHALA_LLM_DEFAULTS.items())
-        + "\n",
-        encoding="utf-8",
-    )
-    rendered = subprocess.run(
-        ["docker", "compose", "--env-file", str(fixture), "--profile", "smartpbx", "config"],
-        cwd=PROJECT_ROOT,
-        env={"PATH": os.environ.get("PATH", "")},
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert rendered.returncode == 0, rendered.stderr
-    services = yaml.safe_load(rendered.stdout)["services"]
-    assert "kavya-smartpbx" in services
+    safe_env = project / ".env"
+    safe_smartpbx_env = project / ".env.smartpbx"
+    safe_values = {name: "" for name in names}
+    safe_values["SMARTPBX_IMAGE_TAG"] = "reviewed-image"
+    for path in (safe_env, safe_smartpbx_env):
+        path.write_text(
+            "\n".join(f"{name}={value}" for name, value in safe_values.items()) + "\n",
+            encoding="utf-8",
+        )
+
+    def render(overrides: dict[str, str]) -> dict:
+        values = {**safe_values, **overrides}
+        safe_smartpbx_env.write_text(
+            "\n".join(f"{name}={value}" for name, value in values.items()) + "\n",
+            encoding="utf-8",
+        )
+        rendered = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "--env-file",
+                str(safe_smartpbx_env),
+                "--profile",
+                "smartpbx",
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=project,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(project / "empty-home"),
+                "DOCKER_CONFIG": str(project / "empty-docker-config"),
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert rendered.returncode == 0, rendered.stderr
+        return json.loads(rendered.stdout)
+
+    defaults = render({})["services"]
+    assert set(defaults) == {"kavya", "kavya-smartpbx"}
     assert {
-        name: services["kavya-smartpbx"]["environment"][name]
+        name: defaults["kavya-smartpbx"]["environment"][name]
         for name in SINHALA_LLM_DEFAULTS
     } == SINHALA_LLM_DEFAULTS
-    assert not set(SINHALA_LLM_DEFAULTS).intersection(services["kavya"]["environment"])
+    assert not set(SINHALA_LLM_DEFAULTS).intersection(defaults["kavya"]["environment"])
+
+    overrides = {
+        "SMARTPBX_SINHALA_LLM_PROVIDER": "claude",
+        "SMARTPBX_SINHALA_GEMINI_LLM_MODEL": "gemini-3.7-flash-canary",
+        "SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL": "high",
+        "SMARTPBX_SINHALA_GEMINI_MAX_TOKENS": "777",
+    }
+    rendered_overrides = render(overrides)["services"]
+    assert {
+        name: rendered_overrides["kavya-smartpbx"]["environment"][name]
+        for name in overrides
+    } == overrides
+    assert not set(overrides).intersection(rendered_overrides["kavya"]["environment"])
 
     parsed = parse_redacted_active_env_assignments(
         smartpbx_protected_template(read_text("SMARTPBX_RUNBOOK.md"))
@@ -3342,6 +3394,15 @@ def test_sinhala_provider_updater_is_a_closed_redacted_root_transaction():
         assert required in script
     for forbidden in ("cat \"$PROTECTED_FILE\"", "diff ", "set -x"):
         assert forbidden not in script
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    for required in (
+        "The guarded image deployer does not install host-side scripts.",
+        "sudo test -x /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh",
+        "sudo chown root:root /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh",
+        "sudo chmod 0755 /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh",
+        "sudo install -d -o root -g root -m 0700 /opt/kavya/.smartpbx-sinhala-rollback",
+    ):
+        assert required in runbook
 
 
 def test_sinhala_provider_updater_transaction_uses_only_its_private_backup(tmp_path):
@@ -3370,6 +3431,7 @@ fi
 """,
         "chown": "#!/usr/bin/env bash\nexit 0\n",
         "chmod": "#!/usr/bin/env bash\nexit 0\n",
+        "install": "#!/usr/bin/env bash\nexit 0\n",
         "curl": "#!/usr/bin/env bash\nprintf '%s\\n' '{\"status\":\"ok\",\"service_mode\":\"smartpbx\",\"active_sessions\":0,\"transfer_enabled\":false}'\n",
         "jq": "#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n",
     }.items():
@@ -3411,10 +3473,149 @@ fi
     assert restored.returncode == 0
     assert restored.stdout == "SMARTPBX_SINHALA_PROVIDER_RESTORED\n"
     assert protected.read_text(encoding="utf-8") == initial
-    assert not list(transaction.iterdir())
-
-    assert run("apply", str(protected), "claude").returncode == 0
+    assert {entry.name for entry in transaction.iterdir()} == {"backup.env", "metadata", "pending"}
     cleaned = run("cleanup", str(protected))
     assert cleaned.returncode == 0
     assert cleaned.stdout == "SMARTPBX_SINHALA_PROVIDER_CLEANED\n"
     assert not list(transaction.iterdir())
+
+
+def test_documented_sinhala_rollback_transaction_orders_failures_and_cleanup(tmp_path):
+    """Run the literal runbook transaction with fake host commands only."""
+    runbook_script = smartpbx_sinhala_rollback_transaction(
+        read_text("SMARTPBX_RUNBOOK.md")
+    )
+
+    def scenario(name: str, **switches: str) -> tuple[subprocess.CompletedProcess[str], list[str], Path, Path]:
+        root = tmp_path / name
+        app = root / "app"
+        scripts = app / "scripts"
+        tx = app / ".smartpbx-sinhala-rollback"
+        fake_bin = root / "bin"
+        scripts.mkdir(parents=True)
+        tx.mkdir(mode=0o700)
+        fake_bin.mkdir()
+        protected = app / ".env.smartpbx"
+        protected.write_text(
+            "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=gemini\nSMARTPBX_WS_TOKEN=fake\n",
+            encoding="utf-8",
+        )
+        (app / ".env").write_text("SAFE=1\n", encoding="utf-8")
+        log = root / "operations.log"
+        marker = root / "deploy-once"
+
+        def fake(name: str, body: str) -> None:
+            path = fake_bin / name
+            path.write_text("#!/usr/bin/env bash\nset -Eeuo pipefail\n" + body, encoding="utf-8")
+            path.chmod(0o755)
+
+        fake("sudo", 'printf "sudo %s\\n" "$*" >> "$FAKE_LOG"\nexec "$@"\n')
+        fake(
+            "docker",
+            'printf "docker %s\\n" "$*" >> "$FAKE_LOG"\n'
+            '[[ "$*" == *" config"* ]] || exit 1\n'
+            '[[ ${FAKE_CONFIG_FAIL:-0} == 1 ]] && exit 1\n',
+        )
+        fake(
+            "curl",
+            'printf "curl %s\\n" "$*" >> "$FAKE_LOG"\n'
+            "printf '%s\\n' '{\"status\":\"ok\",\"service_mode\":\"smartpbx\",\"active_sessions\":0,\"transfer_enabled\":false}'\n",
+        )
+        fake("jq", 'printf "jq %s\\n" "$*" >> "$FAKE_LOG"\ncat >/dev/null\n')
+        for command in ("stat", "install", "mktemp", "cp", "mv", "cmp"):
+            real = shutil.which(command)
+            assert real is not None
+            fake(
+                command,
+                f'printf "{command} %s\\n" "$*" >> "$FAKE_LOG"\nexec {real} "$@"\n',
+            )
+        fake(
+            "update_smartpbx_sinhala_provider.sh",
+            'printf "updater %s\\n" "$*" >> "$FAKE_LOG"\n'
+            'command=$1; protected=$2\n'
+            'if [[ $command == apply ]]; then\n'
+            '  [[ ${FAKE_APPLY_FAIL:-0} == 1 ]] && exit 1\n'
+            '  stat -c %a "$protected" >/dev/null\n'
+            '  install -m 600 /dev/null "$TX/backup.env"\n'
+            '  cp "$protected" "$TX/backup.env"\n'
+            '  tmp=$(mktemp "$TX/.candidate.XXXXXX")\n'
+            '  sed "s/^SMARTPBX_SINHALA_LLM_PROVIDER=.*/SMARTPBX_SINHALA_LLM_PROVIDER=claude/" "$protected" > "$tmp"\n'
+            '  cmp -s "$protected" "$protected"\n'
+            '  mv "$tmp" "$protected"\n'
+            '  : > "$TX/pending"\n'
+            'elif [[ $command == restore ]]; then\n'
+            '  cp "$TX/backup.env" "$protected"\n'
+            'elif [[ $command == cleanup ]]; then\n'
+            '  [[ -f $TX/backup.env ]] || exit 1\n'
+            '  printf "cleanup_backup_present\\n" >> "$FAKE_LOG"\n'
+            '  curl --fail http://127.0.0.1:8006/health | jq -e . >/dev/null\n'
+            '  curl --fail http://127.0.0.1:8006/smartpbx/status | jq -e . >/dev/null\n'
+            '  rm -f "$TX"/*\n'
+            'else exit 1\nfi\n',
+        )
+        fake(
+            "deploy_smartpbx_image.sh",
+            'printf "deploy %s\\n" "$*" >> "$FAKE_LOG"\n'
+            'if [[ ${FAKE_DEPLOY_FAIL_ONCE:-0} == 1 && ! -e $DEPLOY_MARKER ]]; then touch "$DEPLOY_MARKER"; exit 1; fi\n',
+        )
+        # The runbook invokes fixed /opt/kavya script paths. Point those paths
+        # at this scenario's fake commands without changing its command order.
+        for command in ("update_smartpbx_sinhala_provider.sh", "deploy_smartpbx_image.sh"):
+            target = scripts / command
+            target.write_text((fake_bin / command).read_text(encoding="utf-8"), encoding="utf-8")
+            target.chmod(0o755)
+        driver = root / "runbook-transaction.sh"
+        driver.write_text(
+            "#!/usr/bin/env bash\n"
+            "REVIEWED_CI_SHORT_SHA=abcdef0\n"
+            "REVIEWED_FULL_COMMIT_SHA=abcdef0123456789abcdef0123456789abcdef0123\n"
+            "REVIEWED_IMAGE_DIGEST=sha256:" + "0" * 64 + "\n"
+            + runbook_script.replace("/opt/kavya", str(app)),
+            encoding="utf-8",
+        )
+        driver.chmod(0o755)
+        env = {
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FAKE_LOG": str(log),
+            "TX": str(tx),
+            "DEPLOY_MARKER": str(marker),
+            **switches,
+        }
+        result = subprocess.run([str(driver)], text=True, capture_output=True, env=env, check=False)
+        operations = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        return result, operations, protected, tx
+
+    apply_failed, operations, protected, tx = scenario("apply-failure", FAKE_APPLY_FAIL="1")
+    assert apply_failed.returncode != 0
+    assert operations == [f"sudo {protected.parent / 'scripts' / 'update_smartpbx_sinhala_provider.sh'} apply {protected} claude", f"updater apply {protected} claude"]
+    assert "SMARTPBX_SINHALA_LLM_PROVIDER=gemini" in protected.read_text(encoding="utf-8")
+    assert not list(tx.iterdir())
+
+    config_failed, operations, protected, tx = scenario("config-failure", FAKE_CONFIG_FAIL="1")
+    assert config_failed.returncode != 0
+    assert any(line.startswith("updater apply ") for line in operations)
+    restore_index = next(i for i, line in enumerate(operations) if line.startswith("updater restore "))
+    cleanup_index = next(i for i, line in enumerate(operations) if line.startswith("updater cleanup "))
+    assert restore_index < cleanup_index
+    assert not any(line.startswith("deploy ") for line in operations)
+    assert len([line for line in operations if line.startswith("updater cleanup ")]) == 1
+    assert "SMARTPBX_SINHALA_LLM_PROVIDER=gemini" in protected.read_text(encoding="utf-8")
+    assert not list(tx.iterdir())
+
+    retried, operations, protected, tx = scenario("post-recreate-failure", FAKE_DEPLOY_FAIL_ONCE="1")
+    assert retried.returncode == 0
+    deploys = [line for line in operations if line.startswith("deploy ")]
+    assert len(deploys) == 2 and deploys[0] == deploys[1]
+    restore_index = next(i for i, line in enumerate(operations) if line.startswith("updater restore "))
+    assert restore_index < operations.index(deploys[1])
+    assert operations.index("cleanup_backup_present") < next(
+        i for i, line in enumerate(operations) if line.startswith("curl ")
+    )
+    assert len([line for line in operations if line.startswith("updater cleanup ")]) == 1
+    assert not list(tx.iterdir())
+
+    successful, operations, _protected, tx = scenario("success")
+    assert successful.returncode == 0
+    assert len([line for line in operations if line.startswith("deploy ")]) == 1
+    assert len([line for line in operations if line.startswith("updater cleanup ")]) == 1
+    assert not list(tx.iterdir())

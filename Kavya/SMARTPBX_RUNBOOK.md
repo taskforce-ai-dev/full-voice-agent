@@ -184,46 +184,56 @@ the locked `/opt/kavya/.smartpbx-sinhala-rollback` directory (already
 and recorded original metadata. Operators do not create, name, inspect, or
 pass a backup path.
 
+The guarded image deployer does not install host-side scripts. Before this
+procedure, the reviewed `/opt/kavya` checkout must contain this utility and it
+must be root-owned mode `0755`; otherwise stop as a deployment blocker rather
+than assuming an image build installed it:
+
 ```sh
+sudo test -x /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh
+sudo chown root:root /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh
+sudo chmod 0755 /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh
+sudo install -d -o root -g root -m 0700 /opt/kavya/.smartpbx-sinhala-rollback
+```
+
+```sh
+# SmartPBX Sinhala LLM rollback transaction (covered by deployment-contract tests)
+rollback_smartpbx_sinhala_llm() {
 set -euo pipefail
 cd /opt/kavya
-sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh apply /opt/kavya/.env.smartpbx claude
+if ! sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh apply /opt/kavya/.env.smartpbx claude; then
+  return 1
+fi
 [[ "$REVIEWED_CI_SHORT_SHA" =~ ^[0-9a-f]{7}$ ]]
 [[ "$REVIEWED_FULL_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
 [[ "$REVIEWED_CI_SHORT_SHA" == "${REVIEWED_FULL_COMMIT_SHA:0:7}" ]]
 [[ "$REVIEWED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
+if ! SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null; then
+  sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh restore /opt/kavya/.env.smartpbx
+  sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh cleanup /opt/kavya/.env.smartpbx
+  return 1
+fi
+if ! sudo /opt/kavya/scripts/deploy_smartpbx_image.sh "$REVIEWED_CI_SHORT_SHA" "$REVIEWED_FULL_COMMIT_SHA" "$REVIEWED_IMAGE_DIGEST"; then
+  sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh restore /opt/kavya/.env.smartpbx
+  sudo /opt/kavya/scripts/deploy_smartpbx_image.sh "$REVIEWED_CI_SHORT_SHA" "$REVIEWED_FULL_COMMIT_SHA" "$REVIEWED_IMAGE_DIGEST"
+fi
+sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh cleanup /opt/kavya/.env.smartpbx
+}
+rollback_smartpbx_sinhala_llm
 ```
 
 The updater accepts only the fixed protected path and `claude`; it verifies one
 active provider assignment, normalized byte equality everywhere else, and the
 recorded owner/group/mode before atomic replacement. It prints fixed redacted
-status tokens only. If apply or config validation fails, restore and stop; do
-not invoke the guarded helper:
-
-```sh
-sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh restore /opt/kavya/.env.smartpbx
-```
-
-For a successful config validation, use only the guarded immutable-image helper
-with the reviewed identity in this exact order:
-
-```sh
-sudo /opt/kavya/scripts/deploy_smartpbx_image.sh "$REVIEWED_CI_SHORT_SHA" "$REVIEWED_FULL_COMMIT_SHA" "$REVIEWED_IMAGE_DIGEST"
-```
-
-On post-recreate failure, restore with the exact command above and rerun that
-same guarded helper with the same reviewed identity. Retain the backup until
-authenticated status and health checks pass, then finish the transaction:
-
-```sh
-sudo /opt/kavya/scripts/update_smartpbx_sinhala_provider.sh cleanup /opt/kavya/.env.smartpbx
-```
+status tokens only. A restore retains the private backup through the retry;
+`cleanup` is the terminal action and first performs authenticated health/status
+checks. Thus config validation failure restores then cleans up without any
+guarded deploy; post-recreate failure restores then retries with the same
+reviewed identity; successful authenticated health/status checks invoke cleanup
+exactly once.
 
 Never run `docker compose up`, `recreate`, or `restart` directly for this
-rollback. A config validation failure restores before any guarded deploy; a
-post-recreate failure restores then retries with the same reviewed identity;
-successful authenticated health/status checks invoke cleanup exactly once.
+rollback.
 
 After the guarded deployment, run this two-language canary checklist:
 
