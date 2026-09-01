@@ -122,12 +122,6 @@ def make_session():
     return session, pipeline, stt
 
 
-@pytest.fixture(autouse=True)
-def _valid_gemini_credential_for_bilingual_menu(monkeypatch):
-    """Keep unrelated IVR coverage on the valid production menu path."""
-    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-gemini-key")
-
-
 @pytest.mark.parametrize("credential", ["", " \t\n "])
 def test_native_gemini_client_rejects_blank_credential_before_sdk_init(
     monkeypatch, credential,
