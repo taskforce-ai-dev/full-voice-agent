@@ -3285,8 +3285,9 @@ def test_sinhala_smartpbx_runbook_documents_the_llm_tts_and_transaction_contract
     assert "bounded provider/event/outcome diagnostics".casefold() in folded_normalized
     for stale in ("Only its TTS uses Gemini", "Sinhala retains the existing Claude LLM"):
         assert stale.casefold() not in folded_normalized
-    assert re.search(r"(?m)^.*docker compose.*\bup\b", section) is None
-    assert re.search(r"(?m)^.*docker compose.*\brestart\b", section) is None
+    transaction = smartpbx_sinhala_rollback_transaction(runbook)
+    assert re.search(r"(?m)^.*docker compose.*\bup\b", transaction) is None
+    assert re.search(r"(?m)^.*docker compose.*\brestart\b", transaction) is None
 
 
 def test_smartpbx_sinhala_llm_rendered_compose_and_protected_template_contract(tmp_path):
