@@ -57,6 +57,15 @@ def _terminal_chunk(finish_reason="STOP"):
     return _chunk(finish_reason=finish_reason)
 
 
+def _terminal_chunk_with_output_usage(output_tokens: int):
+    """A native Gemini terminal chunk with its SDK output-usage field."""
+    chunk = _terminal_chunk()
+    chunk.usage_metadata = SimpleNamespace(
+        candidates_token_count=output_tokens,
+    )
+    return chunk
+
+
 def _tool_chunk(
     name: str,
     args: dict | None = None,
@@ -549,6 +558,53 @@ def test_direct_english_gemini_keeps_shared_controls_and_incremental_tts():
     assert config["max_output_tokens"] == server.SMARTPBX_MAX_TOKENS
     assert spoken == ["All right."]
     assert session._is_direct_smartpbx_english_non_capture() is True
+
+
+def test_direct_smartpbx_gemini_logs_bounded_reported_output_tokens(caplog):
+    session, _spoken = _session(
+        [[
+            _text_chunk("Ready."),
+            _terminal_chunk_with_output_usage(
+                server.SMARTPBX_CLAUDE_MAX_LOGGED_OUTPUT_TOKENS + 1,
+            ),
+        ]],
+        smartpbx=True,
+        terminalize_direct_rounds=False,
+    )
+
+    with caplog.at_level("INFO", logger="server"):
+        asyncio.run(session._run_llm_gemini())
+
+    outcomes = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=llm_round_outcome provider=gemini" in record.getMessage()
+    ]
+    assert outcomes == [
+        "smartpbx_media event=llm_round_outcome provider=gemini "
+        "outcome=completed stop_reason=end_turn output_tokens=1000000 attempt=1"
+    ]
+
+
+def test_direct_smartpbx_gemini_logs_unknown_only_without_usage_metadata(caplog):
+    session, _spoken = _session(
+        [[_text_chunk("Ready."), _terminal_chunk()]],
+        smartpbx=True,
+        terminalize_direct_rounds=False,
+    )
+
+    with caplog.at_level("INFO", logger="server"):
+        asyncio.run(session._run_llm_gemini())
+
+    outcomes = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=llm_round_outcome provider=gemini" in record.getMessage()
+    ]
+    assert outcomes == [
+        "smartpbx_media event=llm_round_outcome provider=gemini "
+        "outcome=completed stop_reason=end_turn output_tokens=unknown attempt=1"
+    ]
 
 
 def test_gemini_session_constructor_owns_default_generation_controls():
