@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 
 import pytest
 
 import server
+import smartpbx_session
 from smartpbx_protocol import CallContext, MediaFormat
-from smartpbx_session import KavyaSmartPBXSession
+from smartpbx_session import KavyaSmartPBXSession, _without_transfer_tool
 
 
 class RecordingTransport:
@@ -20,13 +22,17 @@ class RecordingTransport:
 
 
 class RecordingStt:
-    def __init__(self) -> None:
+    def __init__(self, snapshot_factory=None) -> None:
         self.starts = 0
         self.stops = 0
         self.audio: list[bytes] = []
+        self.snapshot_factory = snapshot_factory
+        self.profile_at_start = None
 
     def start(self) -> None:
         self.starts += 1
+        if self.snapshot_factory is not None:
+            self.profile_at_start = self.snapshot_factory()
 
     def stop(self) -> None:
         self.stops += 1
@@ -50,7 +56,11 @@ class RecordingPipeline:
         self._dtmf_collector = None
         self.transfer_pending = False
         self.full_transcript = [{"role": "user", "text": "test"}]
-        self.anthropic_client = None
+        self.llm_provider = "claude"
+        self.model = "test-model"
+        self._gemini_thinking_level = "global-low"
+        self._smartpbx_gemini_max_tokens = 120
+        self.anthropic_client = object()
         self.client = None
         self.gemini_client = None
         self.spoken: list[tuple[str, str]] = []
@@ -90,7 +100,14 @@ def _context() -> CallContext:
 
 def make_session():
     pipeline = RecordingPipeline()
-    stt = RecordingStt()
+    stt = RecordingStt(lambda: {
+        "lang": pipeline.lang,
+        "llm_provider": pipeline.llm_provider,
+        "model": pipeline.model,
+        "tools": copy.deepcopy(pipeline.tools),
+        "thinking_level": pipeline._gemini_thinking_level,
+        "max_tokens": pipeline._smartpbx_gemini_max_tokens,
+    })
     session = KavyaSmartPBXSession(
         _context(),
         RecordingTransport(),
@@ -230,6 +247,8 @@ async def test_selected_sinhala_uses_sinhala_welcome_and_post_call_language():
 
     assert ("si", server.LANGUAGE_CONFIGS["si"]["welcome_greeting"]) in pipeline.spoken
     assert post_calls[0]["lang"] == "si"
+    assert post_calls[0]["llm_provider"] == "gemini"
+    assert post_calls[0]["model"] == "gemini-3.7-flash"
 
 
 @pytest.mark.asyncio
@@ -241,3 +260,203 @@ async def test_post_selection_dtmf_reaches_the_active_collector_unchanged():
 
     assert await session.feed_dtmf("7") is True
     assert pipeline.dtmf == ["7"]
+
+
+@pytest.mark.asyncio
+async def test_digit_two_applies_gemini_profile_before_sinhala_stt(monkeypatch):
+    gemini_tools = [{
+        "function_declarations": [
+            {"name": "transfer_to_human"},
+            {"name": "check_availability"},
+            {"name": "create_booking"},
+        ]
+    }]
+    gemini_client = object()
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_LLM_MODEL", "gemini-3.7-flash")
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL", "low")
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_MAX_TOKENS", 600)
+    monkeypatch.setattr(server, "get_tools_gemini", lambda: gemini_tools)
+    monkeypatch.setattr(server, "_get_gemini_client", lambda: gemini_client)
+
+    session, pipeline, stt = make_session()
+    await session.start()
+    await session.feed_dtmf("2")
+
+    assert stt.starts == 1
+    assert pipeline.llm_provider == "gemini"
+    assert pipeline.gemini_client is gemini_client
+    assert pipeline.model == "gemini-3.7-flash"
+    assert pipeline._gemini_thinking_level == "low"
+    assert pipeline._smartpbx_gemini_max_tokens == 600
+    assert pipeline.tools == [{
+        "function_declarations": [
+            {"name": "check_availability"},
+            {"name": "create_booking"},
+        ]
+    }]
+    assert stt.profile_at_start == {
+        "lang": "si",
+        "llm_provider": "gemini",
+        "model": "gemini-3.7-flash",
+        "tools": pipeline.tools,
+        "thinking_level": "low",
+        "max_tokens": 600,
+    }
+
+
+@pytest.mark.asyncio
+async def test_english_selection_keeps_existing_provider_model_tools_and_clients(monkeypatch):
+    session, pipeline, _stt = make_session()
+    monkeypatch.setattr(
+        server,
+        "load_kavya_english_voice_profile",
+        lambda: (_ for _ in ()).throw(AssertionError("IVR must not load TTS secrets")),
+    )
+    original_tools = pipeline.tools
+    expected_tools = copy.deepcopy(original_tools)
+    expected = (
+        pipeline.llm_provider,
+        pipeline.model,
+        pipeline.anthropic_client,
+        pipeline.gemini_client,
+    )
+    monkeypatch.setattr(
+        server,
+        "get_tools_gemini",
+        lambda: (_ for _ in ()).throw(AssertionError("English must not rebuild Gemini tools")),
+    )
+
+    await session.start()
+    await session.feed_dtmf("1")
+
+    assert (
+        pipeline.llm_provider,
+        pipeline.model,
+        pipeline.anthropic_client,
+        pipeline.gemini_client,
+    ) == expected
+    assert pipeline.tools == expected_tools
+    assert pipeline.tools is not original_tools
+    assert pipeline.tools[0] is not original_tools[0]
+    assert session._resolve_language_profile("en").lang == "en"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_english_and_sinhala_profiles_never_cross_mutate(monkeypatch):
+    gemini_client = object()
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_LLM_MODEL", "gemini-3.7-flash")
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL", "low")
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_MAX_TOKENS", 600)
+    monkeypatch.setattr(
+        server,
+        "get_tools_gemini",
+        lambda: [{"function_declarations": [{"name": "check_availability"}]}],
+    )
+    monkeypatch.setattr(server, "_get_gemini_client", lambda: gemini_client)
+    english, english_pipeline, english_stt = make_session()
+    sinhala, sinhala_pipeline, sinhala_stt = make_session()
+
+    await asyncio.gather(english.start(), sinhala.start())
+    await asyncio.gather(english.feed_dtmf("1"), sinhala.feed_dtmf("2"))
+
+    assert (english_pipeline.lang, english_pipeline.llm_provider, english_pipeline.model) == (
+        "en", "claude", "test-model"
+    )
+    assert (sinhala_pipeline.lang, sinhala_pipeline.llm_provider, sinhala_pipeline.model) == (
+        "si", "gemini", "gemini-3.7-flash"
+    )
+    assert english_stt.profile_at_start["llm_provider"] == "claude"
+    assert sinhala_stt.profile_at_start["llm_provider"] == "gemini"
+    assert english_pipeline.tools is not sinhala_pipeline.tools
+    sinhala_pipeline.tools[0]["function_declarations"][0]["name"] = "changed"
+    assert english_pipeline.tools == [{"name": "transfer_to_human"}, {"name": "check_availability"}]
+
+
+@pytest.mark.asyncio
+async def test_sinhala_claude_rollback_profile_stays_transfer_free(monkeypatch):
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_LLM_PROVIDER", "claude")
+    claude_client = object()
+    monkeypatch.setattr(server, "_get_anthropic_client", lambda: claude_client)
+    session, pipeline, stt = make_session()
+    pipeline.anthropic_client = None
+
+    await session.start()
+    await session.feed_dtmf("2")
+
+    assert stt.starts == 1
+    assert pipeline.llm_provider == "claude"
+    assert pipeline.model == server.CLAUDE_MODEL
+    assert pipeline.anthropic_client is claude_client
+    assert all("function_declarations" not in tool for tool in pipeline.tools)
+    assert "transfer_to_human" not in {tool["name"] for tool in pipeline.tools}
+
+
+def test_without_transfer_tool_keeps_provider_native_tool_shapes():
+    assert _without_transfer_tool(
+        [{"function_declarations": [{"name": "transfer_to_human"}]}], "gemini"
+    ) == []
+    assert _without_transfer_tool([{
+        "function_declarations": [
+            {"name": "transfer_to_human"}, {"name": "check_availability"},
+        ]
+    }], "gemini") == [{
+        "function_declarations": [{"name": "check_availability"}],
+    }]
+
+
+def _raise_runtime_error():
+    raise RuntimeError("synthetic client failure")
+
+
+def _capture_profile_events(monkeypatch):
+    events: list[str] = []
+
+    def capture(message, *args, **_kwargs):
+        rendered = message % args if args else message
+        if "event=language_profile_" in rendered:
+            events.append(rendered)
+
+    monkeypatch.setattr(smartpbx_session.logger, "warning", capture)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_sinhala_gemini_client_init_failure_falls_back_before_stt(monkeypatch):
+    events = _capture_profile_events(monkeypatch)
+    session, pipeline, stt = make_session()
+    claude_client = pipeline.anthropic_client
+    monkeypatch.setattr(server, "_get_gemini_client", _raise_runtime_error)
+
+    await session.start()
+    await session.feed_dtmf("2")
+
+    assert stt.starts == 1
+    assert pipeline.anthropic_client is claude_client
+    assert stt.profile_at_start["llm_provider"] == "claude"
+    assert stt.profile_at_start["model"] == server.CLAUDE_MODEL
+    assert all("function_declarations" not in tool for tool in stt.profile_at_start["tools"])
+    assert "transfer_to_human" not in {tool["name"] for tool in stt.profile_at_start["tools"]}
+    assert events == [
+        "smartpbx_media event=language_profile_fallback lang=si from=gemini to=claude reason=client_unavailable"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sinhala_activation_fails_closed_when_no_llm_client_is_usable(monkeypatch):
+    events = _capture_profile_events(monkeypatch)
+    session, pipeline, stt = make_session()
+    pipeline.anthropic_client = None
+    monkeypatch.setattr(server, "_get_gemini_client", _raise_runtime_error)
+    monkeypatch.setattr(server, "_get_anthropic_client", _raise_runtime_error)
+
+    await session.start()
+    await session.feed_dtmf("2")
+
+    assert stt.starts == 0
+    assert session.terminal_future.done()
+    assert session._welcome_task is None
+    assert events == [
+        "smartpbx_media event=language_profile_unavailable lang=si provider=none"
+    ]

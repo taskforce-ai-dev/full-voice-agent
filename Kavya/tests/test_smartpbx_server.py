@@ -945,6 +945,67 @@ def test_smartpbx_stt_streams_can_disable_raw_sdk_transcript_logging(caplog):
     assert "raw azure stt transcript" not in caplog.text
 
 
+def test_explicit_sinhala_azure_is_fail_closed_when_sdk_is_unavailable(monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", False)
+    with pytest.raises(RuntimeError, match="requested STT provider unavailable"):
+        server._make_stt(
+            lambda _text: None,
+            lambda _text: None,
+            "si",
+            provider="azure",
+            fail_closed=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    (("AZURE_STT_AVAILABLE", False), ("audioop", None), ("AZURE_SPEECH_KEY", "  ")),
+)
+def test_explicit_sinhala_azure_is_fail_closed_when_a_required_dependency_is_missing(
+    monkeypatch, attribute, value,
+):
+    import server
+
+    monkeypatch.setattr(server, attribute, value)
+    with pytest.raises(RuntimeError, match="requested STT provider unavailable"):
+        server._make_stt(
+            lambda _text: None,
+            lambda _text: None,
+            "si",
+            provider="azure",
+            fail_closed=True,
+        )
+
+
+def test_configured_english_azure_keeps_existing_google_fallback(monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", False)
+    stream = server._make_stt(
+        lambda _text: None,
+        lambda _text: None,
+        "en",
+        provider="azure",
+        fail_closed=False,
+    )
+    assert isinstance(stream, server.GoogleSTTStream)
+
+
+def test_explicit_unknown_stt_provider_is_rejected():
+    import server
+
+    with pytest.raises(RuntimeError, match="requested STT provider unavailable"):
+        server._make_stt(
+            lambda _text: None,
+            lambda _text: None,
+            "si",
+            provider="unsupported",
+            fail_closed=True,
+        )
+
+
 def test_google_smartpbx_english_stt_constructs_en_us_without_duplicate_alternative(monkeypatch):
     import server
 

@@ -148,6 +148,38 @@ def install_smartpbx_sink(pipeline):
 
 
 @pytest.mark.asyncio
+async def test_selected_language_keeps_tts_routing_owned_by_lang(monkeypatch):
+    """LLM fallback must not redirect selected Sinhala speech to ElevenLabs."""
+    import server
+
+    english = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=FakeTransport(), llm_provider="claude",
+    )
+    english._smartpbx_transfer_context = object()
+    sinhala = server.MediaStreamSession(
+        websocket=None, lang="si", media_transport=FakeTransport(), llm_provider="claude",
+    )
+    sinhala._smartpbx_transfer_context = object()
+    calls: list[tuple[str, str]] = []
+
+    async def elevenlabs(text, **_kwargs):
+        calls.append(("elevenlabs", text))
+
+    async def gemini(text, **_kwargs):
+        calls.append(("gemini", text))
+
+    monkeypatch.setattr(english, "_tts_elevenlabs", elevenlabs)
+    monkeypatch.setattr(english, "_tts_gemini_sinhala", gemini)
+    monkeypatch.setattr(sinhala, "_tts_elevenlabs", elevenlabs)
+    monkeypatch.setattr(sinhala, "_tts_gemini_sinhala", gemini)
+
+    await english._speak("English route")
+    await sinhala._speak("සිංහල")
+
+    assert calls == [("elevenlabs", "English route"), ("gemini", "සිංහල")]
+
+
+@pytest.mark.asyncio
 async def test_smartpbx_sinhala_gemini_pcm_is_downsampled_and_completed_once(monkeypatch):
     import server
 
