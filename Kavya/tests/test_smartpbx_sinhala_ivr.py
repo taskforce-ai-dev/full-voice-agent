@@ -10,7 +10,7 @@ import pytest
 import server
 import smartpbx_session
 from smartpbx_protocol import CallContext, MediaFormat
-from smartpbx_session import KavyaSmartPBXSession, _without_transfer_tool
+from smartpbx_session import KavyaSmartPBXSession
 
 
 class RecordingTransport:
@@ -394,10 +394,11 @@ async def test_sinhala_claude_rollback_profile_stays_transfer_free(monkeypatch):
 
 
 def test_without_transfer_tool_keeps_provider_native_tool_shapes():
-    assert _without_transfer_tool(
+    filter_tools = getattr(smartpbx_session, "_without_transfer_tool")
+    assert filter_tools(
         [{"function_declarations": [{"name": "transfer_to_human"}]}], "gemini"
     ) == []
-    assert _without_transfer_tool([{
+    assert filter_tools([{
         "function_declarations": [
             {"name": "transfer_to_human"}, {"name": "check_availability"},
         ]
