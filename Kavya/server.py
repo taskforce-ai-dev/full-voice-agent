@@ -3725,6 +3725,11 @@ class _GeminiProviderOriginError(Exception):
         super().__init__(reason)
 
 
+_GEMINI_PROVIDER_FAILURE_REASONS = frozenset({
+    "quota", "server", "transport_closed", "transport_timeout",
+})
+
+
 def _gemini_provider_origin_reason(exc: BaseException) -> str | None:
     """Return a closed reason for a recognized Gemini provider failure only.
 
@@ -3732,6 +3737,14 @@ def _gemini_provider_origin_reason(exc: BaseException) -> str | None:
     types: a local parser, invariant, recovery, or test-harness error must not
     become eligible for a Claude replay merely because it looks transport-like.
     """
+    # Only the native HTTP client's concrete errors prove a transport origin.
+    # Deliberately do not accept bare asyncio/OSError/ConnectionError classes:
+    # local code and test harnesses can raise those too.
+    if isinstance(exc, httpx.TimeoutException):
+        return "transport_timeout"
+    if isinstance(exc, httpx.TransportError):
+        return "transport_closed"
+
     raw_code = _extract_gemini_exception_code(exc)
     if isinstance(raw_code, bool):
         return None
@@ -3752,7 +3765,13 @@ def _gemini_provider_origin_reason(exc: BaseException) -> str | None:
 
 def _is_gemini_provider_technical_error(exc: BaseException) -> bool:
     """Whether Task 4's direct-Sinhala fallback may replay this failure."""
-    return isinstance(exc, (_GeminiEmptyTurnError, _GeminiProviderOriginError))
+    return (
+        isinstance(exc, _GeminiEmptyTurnError)
+        or (
+            isinstance(exc, _GeminiProviderOriginError)
+            and exc.reason in _GEMINI_PROVIDER_FAILURE_REASONS
+        )
+    )
 
 
 class _GeminiEmptyTurnError(Exception):
@@ -9198,7 +9217,11 @@ class MediaStreamSession:
                 tts_tasks=turn_tts_tasks, gen=turn_gen,
             )
             delivered_text = _direct_sinhala_delivered_text()
-            if delivered_text or turn_tool_executed:
+            if (
+                not _is_gemini_provider_technical_error(exc)
+                or delivered_text
+                or turn_tool_executed
+            ):
                 return await self._smartpbx_speak_recovery_and_finish(
                     tool_executed=turn_tool_executed, gen=turn_gen,
                     full_text=delivered_text,
