@@ -3138,50 +3138,102 @@ def test_kavya_generic_rejection_and_reviewed_image_gates_remain_intact():
     assert "org.opencontainers.image.revision" in publisher
 
 
+SINHALA_LLM_DEFAULTS = {
+    "SMARTPBX_SINHALA_LLM_PROVIDER": "gemini",
+    "SMARTPBX_SINHALA_GEMINI_LLM_MODEL": "gemini-3.7-flash",
+    "SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL": "low",
+    "SMARTPBX_SINHALA_GEMINI_MAX_TOKENS": "600",
+}
+
+SINHALA_GEMINI_TTS_DEFAULTS = {
+    "SMARTPBX_SINHALA_GEMINI_TTS_MODEL": "gemini-3.1-flash-tts-preview",
+    "SMARTPBX_SINHALA_GEMINI_TTS_VOICE": "Vindemiatrix",
+    "SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS": "15.0",
+}
+
+
+def parse_redacted_active_env_assignments(text: str) -> dict[str, object]:
+    """Return assignment metadata without retaining dotenv values."""
+    counts: dict[str, int] = {}
+    classifications: dict[str, list[str]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        counts[name] = counts.get(name, 0) + 1
+        classifications.setdefault(name, []).append(
+            "blank" if value == "" else "whitespace" if not value.strip() else "nonblank"
+        )
+    return {"counts": counts, "classifications": classifications}
+
+
+def smartpbx_protected_template(runbook: str) -> str:
+    """Extract the dotenv fence under the isolated SmartPBX heading only."""
+    heading = "## Create the isolated server-side environment"
+    scoped = runbook.split(heading, 1)[1]
+    match = re.search(r"(?ms)^```dotenv\n(?P<body>.*?)^```\s*$", scoped)
+    assert match is not None
+    return match.group("body")
+
+
 def test_sinhala_smartpbx_settings_are_explicit_and_secret_safe():
     compose = yaml.safe_load(read_text("docker-compose.yml"))
-    environment = compose["services"]["kavya-smartpbx"]["environment"]
+    smartpbx = compose["services"]["kavya-smartpbx"]["environment"]
+    legacy = compose["services"]["kavya"]
 
-    assert environment["SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS"] == (
+    assert smartpbx["SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS"] == (
         "${SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS:-8.0}"
     )
-    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_MODEL"] == (
-        "${SMARTPBX_SINHALA_GEMINI_TTS_MODEL:-gemini-3.1-flash-tts-preview}"
-    )
-    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_VOICE"] == (
-        "${SMARTPBX_SINHALA_GEMINI_TTS_VOICE:-Vindemiatrix}"
-    )
-    assert environment["SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS"] == (
-        "${SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS:-15.0}"
-    )
-    assert environment["GEMINI_API_KEY"] == "${GEMINI_API_KEY:-}"
+    assert {name: smartpbx.get(name) for name in SINHALA_LLM_DEFAULTS} == {
+        name: f"${{{name}:-{value}}}" for name, value in SINHALA_LLM_DEFAULTS.items()
+    }
+    assert {name: smartpbx.get(name) for name in SINHALA_GEMINI_TTS_DEFAULTS} == {
+        name: f"${{{name}:-{value}}}" for name, value in SINHALA_GEMINI_TTS_DEFAULTS.items()
+    }
+    assert smartpbx["GEMINI_API_KEY"] == "${GEMINI_API_KEY:-}"
+    assert legacy["env_file"] == [".env"]
+    assert not set(SINHALA_LLM_DEFAULTS).intersection(legacy["environment"])
+    for name in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "HUMAN_AGENT_PHONE"):
+        assert name not in smartpbx
 
     example = read_text(".env.example")
-    for name, default in (
-        ("SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS", "8.0"),
-        ("SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
-        ("SMARTPBX_SINHALA_GEMINI_TTS_VOICE", "Vindemiatrix"),
-        ("SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS", "15.0"),
-    ):
+    for name, default in {
+        **SINHALA_LLM_DEFAULTS,
+        **SINHALA_GEMINI_TTS_DEFAULTS,
+        "SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS": "8.0",
+    }.items():
         assert re.search(rf"^{name}={re.escape(default)}$", example, re.MULTILINE)
     assert_exactly_one_blank_env_assignment(example, "GEMINI_API_KEY")
 
 
-def test_gemini_key_assignment_contract_rejects_later_or_duplicate_nonblank_values():
-    # Comments are documentation, not dotenv assignments. Any later active
-    # value, including a duplicate, must violate the same helper used above.
+def test_gemini_key_assignment_contract_rejects_duplicate_whitespace_or_later_active_values():
+    # Comments are documentation, not dotenv assignments. The protected
+    # template permits exactly one active *blank* key assignment, while the
+    # runtime gate separately requires exactly one stripped nonblank value.
+    def runtime_ready(text: str) -> bool:
+        parsed = parse_redacted_active_env_assignments(text)
+        return (
+            parsed["counts"].get("GEMINI_API_KEY") == 1
+            and parsed["classifications"].get("GEMINI_API_KEY") == ["nonblank"]
+        )
+
     commented_blank = "# GEMINI_API_KEY=ignored-comment\nGEMINI_API_KEY=\n"
     assert_exactly_one_blank_env_assignment(commented_blank, "GEMINI_API_KEY")
+    assert not runtime_ready(commented_blank)
+    assert runtime_ready("GEMINI_API_KEY=usable-secret\n")
 
     for invalid in (
-        "GEMINI_API_KEY=nonblank-value\n",
-        "GEMINI_API_KEY=\nGEMINI_API_KEY=later-nonblank-value\n",
+        "GEMINI_API_KEY= \n",
+        "GEMINI_API_KEY=\nGEMINI_API_KEY=\n",
+        "GEMINI_API_KEY=\nGEMINI_API_KEY=later-active\n",
     ):
-        with pytest.raises(AssertionError, match="exactly once as an active blank"):
-            assert_exactly_one_blank_env_assignment(invalid, "GEMINI_API_KEY")
+        parsed = parse_redacted_active_env_assignments(invalid)
+        assert not runtime_ready(invalid)
+        assert parsed["counts"]["GEMINI_API_KEY"] >= 1
 
 
-def test_sinhala_smartpbx_runbook_documents_the_closed_gemini_tts_contract():
+def test_sinhala_smartpbx_runbook_documents_the_llm_tts_and_transaction_contract():
     runbook = read_text("SMARTPBX_RUNBOOK.md")
     section = runbook.split("## SmartPBX Sinhala menu and Gemini TTS", 1)[1].split(
         "\n## ", 1
@@ -3194,28 +3246,175 @@ def test_sinhala_smartpbx_runbook_documents_the_closed_gemini_tts_contract():
         "timeout defaults to English",
         "invalid selection replays once then defaults to English",
         "Twilio behavior is unchanged",
-        "existing Claude LLM",
-        "existing STT selection",
-        "Only its TTS uses Gemini",
+        "Press 1",
+        "ElevenLabs",
+        "Press 2",
+        "Azure `si-LK`",
+        "gemini-3.7-flash",
+        "low",
+        "600",
+        "GEMINI_FAILOVER_TO_CLAUDE",
+        "usable Anthropic readiness",
         "gemini-3.1-flash-tts-preview",
         "Vindemiatrix",
-        "There is deliberately no OpenAI, ElevenLabs, or Azure fallback for SmartPBX Sinhala TTS.",
-        "failure is closed/diagnostic",
-        "Gemini API key presence check",
-        "GEMINI_API_KEY` only when Sinhala is enabled",
-        "does not print the key",
+        "no-output",
+        "stripped",
+        "before exposing the bilingual menu",
+        "offline-only",
+        "Gemini Transcribe",
+        "Chirp 2",
+        "StreamingRecognize",
+        "update_smartpbx_sinhala_provider.sh apply /opt/kavya/.env.smartpbx claude",
+        "update_smartpbx_sinhala_provider.sh restore /opt/kavya/.env.smartpbx",
+        "update_smartpbx_sinhala_provider.sh cleanup /opt/kavya/.env.smartpbx",
+        "config validation fails",
+        "post-recreate failure",
+        "same reviewed identity",
         "health/status checks",
         "two-language canary call checklist",
-        "restore the prior image/config",
     ):
         assert required.casefold() in folded_normalized
     assert "authenticated `/smartpbx/status`".casefold() in folded_normalized
     assert "bounded provider/event/outcome diagnostics".casefold() in folded_normalized
-    assert "grep -Eq '^GEMINI_API_KEY=.+$' /opt/kavya/.env.smartpbx" in section
+    for stale in ("Only its TTS uses Gemini", "Sinhala retains the existing Claude LLM"):
+        assert stale.casefold() not in folded_normalized
+    assert re.search(r"(?m)^.*docker compose.*\bup\b", section) is None
+    assert re.search(r"(?m)^.*docker compose.*\brestart\b", section) is None
 
-    fallback_sentences = re.findall(r"[^.]*\bfallback\b[^.]*\.", normalized, re.IGNORECASE)
-    assert fallback_sentences
-    assert all(
-        re.search(r"\b(?:no|do not)\b", sentence, re.IGNORECASE)
-        for sentence in fallback_sentences
-    ), "the Sinhala section must not describe an enabled fallback"
+
+def test_smartpbx_sinhala_llm_rendered_compose_and_protected_template_contract(tmp_path):
+    names = sorted(
+        set(re.findall(r"\$\{([A-Z0-9_]+)(?::-[^}]*)?\}", read_text("docker-compose.yml")))
+    )
+    fixture = tmp_path / "smartpbx-rendered.env"
+    fixture.write_text(
+        "\n".join(f"{name}=" for name in names)
+        + "\nSMARTPBX_IMAGE_TAG=reviewed-image"
+        + "\n".join(f"\n{name}={value}" for name, value in SINHALA_LLM_DEFAULTS.items())
+        + "\n",
+        encoding="utf-8",
+    )
+    rendered = subprocess.run(
+        ["docker", "compose", "--env-file", str(fixture), "--profile", "smartpbx", "config"],
+        cwd=PROJECT_ROOT,
+        env={"PATH": os.environ.get("PATH", "")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    services = yaml.safe_load(rendered.stdout)["services"]
+    assert "kavya-smartpbx" in services
+    assert {
+        name: services["kavya-smartpbx"]["environment"][name]
+        for name in SINHALA_LLM_DEFAULTS
+    } == SINHALA_LLM_DEFAULTS
+    assert not set(SINHALA_LLM_DEFAULTS).intersection(services["kavya"]["environment"])
+
+    parsed = parse_redacted_active_env_assignments(
+        smartpbx_protected_template(read_text("SMARTPBX_RUNBOOK.md"))
+    )
+    for name in {**SINHALA_LLM_DEFAULTS, **SINHALA_GEMINI_TTS_DEFAULTS}:
+        assert parsed["counts"].get(name) == 1
+        assert parsed["classifications"].get(name) == ["nonblank"]
+    assert parsed["counts"].get("GEMINI_API_KEY") == 1
+    assert parsed["classifications"].get("GEMINI_API_KEY") == ["blank"]
+
+
+def test_sinhala_provider_updater_is_a_closed_redacted_root_transaction():
+    updater = PROJECT_ROOT / "scripts" / "update_smartpbx_sinhala_provider.sh"
+    assert updater.is_file()
+    assert os.access(updater, os.X_OK)
+    script = updater.read_text(encoding="utf-8")
+    for required in (
+        "PROTECTED_FILE=/opt/kavya/.env.smartpbx",
+        "TRANSACTION_DIR=/opt/kavya/.smartpbx-sinhala-rollback",
+        "[[ $EUID -eq 0 ]]",
+        'apply) [[ $# -eq 3 && $2 == "$PROTECTED_FILE" && $3 == "$PROVIDER_VALUE" ]]',
+        'restore|cleanup) [[ $# -eq 2 && $2 == "$PROTECTED_FILE" ]]',
+        "flock -n 9",
+        "cmp -s",
+        "SMARTPBX_SINHALA_PROVIDER_APPLIED",
+        "SMARTPBX_SINHALA_PROVIDER_RESTORED",
+        "SMARTPBX_SINHALA_PROVIDER_CLEANED",
+        "SMARTPBX_SINHALA_PROVIDER_UPDATE_FAILED",
+    ):
+        assert required in script
+    for forbidden in ("cat \"$PROTECTED_FILE\"", "diff ", "set -x"):
+        assert forbidden not in script
+
+
+def test_sinhala_provider_updater_transaction_uses_only_its_private_backup(tmp_path):
+    """Exercise a path-rewritten copy: never /opt/kavya or a real credential.
+
+    The production script deliberately accepts one fixed root path. Rewriting
+    just the literal path and root predicate gives the same shell transaction a
+    non-root, fake-command harness while preserving the closed original
+    interface asserted above.
+    """
+    protected = tmp_path / "protected.env"
+    transaction = tmp_path / "rollback"
+    protected.write_text(
+        "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=gemini\n",
+        encoding="utf-8",
+    )
+    transaction.mkdir(mode=0o700)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name, body in {
+        "stat": """#!/usr/bin/env bash
+if [[ $1 == -c ]]; then
+  [[ ${!#} == *rollback ]] && printf '0:0:700\\n' || printf '0:0:600\\n'
+fi
+""",
+        "chown": "#!/usr/bin/env bash\nexit 0\n",
+        "chmod": "#!/usr/bin/env bash\nexit 0\n",
+        "curl": "#!/usr/bin/env bash\nprintf '%s\\n' '{\"status\":\"ok\",\"service_mode\":\"smartpbx\",\"active_sessions\":0,\"transfer_enabled\":false}'\n",
+        "jq": "#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n",
+    }.items():
+        path = fake_bin / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+
+    updater = (PROJECT_ROOT / "scripts" / "update_smartpbx_sinhala_provider.sh").read_text(
+        encoding="utf-8"
+    )
+    updater = updater.replace("/opt/kavya/.env.smartpbx", str(protected))
+    updater = updater.replace("/opt/kavya/.smartpbx-sinhala-rollback", str(transaction))
+    updater = updater.replace("[[ $EUID -eq 0 ]]", "true")
+    runner = tmp_path / "update.sh"
+    runner.write_text(updater, encoding="utf-8")
+    runner.chmod(0o755)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(runner), *args], text=True, capture_output=True, env=env, check=False
+        )
+
+    initial = protected.read_text(encoding="utf-8")
+    rejected = run("apply", str(tmp_path / "other.env"), "claude")
+    assert rejected.returncode != 0
+    assert protected.read_text(encoding="utf-8") == initial
+    assert not list(transaction.iterdir())
+
+    applied = run("apply", str(protected), "claude")
+    assert applied.returncode == 0
+    assert applied.stdout == "SMARTPBX_SINHALA_PROVIDER_APPLIED\n"
+    assert protected.read_text(encoding="utf-8") == (
+        "UNCHANGED_LINE=ok\nSMARTPBX_SINHALA_LLM_PROVIDER=claude\n"
+    )
+    assert {entry.name for entry in transaction.iterdir()} == {"backup.env", "metadata", "pending"}
+
+    restored = run("restore", str(protected))
+    assert restored.returncode == 0
+    assert restored.stdout == "SMARTPBX_SINHALA_PROVIDER_RESTORED\n"
+    assert protected.read_text(encoding="utf-8") == initial
+    assert not list(transaction.iterdir())
+
+    assert run("apply", str(protected), "claude").returncode == 0
+    cleaned = run("cleanup", str(protected))
+    assert cleaned.returncode == 0
+    assert cleaned.stdout == "SMARTPBX_SINHALA_PROVIDER_CLEANED\n"
+    assert not list(transaction.iterdir())
