@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 _SESSION_MAX_MS = 600_000
 
 
+class _LanguageProfileSTTUnavailable(Exception):
+    """A selected profile's recognizer could not be constructed pre-commit."""
+
+
 @dataclass(frozen=True)
 class SmartPBXLanguageProfile:
     """The immutable provider/STT choices for one selected IVR language."""
@@ -343,6 +347,10 @@ class KavyaSmartPBXSession:
             return self._prepare_language_profile(pipeline, requested)
         except asyncio.CancelledError:
             raise
+        except _LanguageProfileSTTUnavailable:
+            self._emit_language_profile_unavailable(requested)
+            self._end_call_without_language_profile(requested)
+            return None
         except Exception:
             if requested.lang != "si" or requested.llm_provider != "gemini":
                 self._emit_language_profile_unavailable(requested)
@@ -358,6 +366,10 @@ class KavyaSmartPBXSession:
             prepared = self._prepare_language_profile(pipeline, fallback)
         except asyncio.CancelledError:
             raise
+        except _LanguageProfileSTTUnavailable:
+            self._emit_language_profile_unavailable(fallback)
+            self._end_call_without_language_profile(fallback)
+            return None
         except Exception:
             self._emit_language_profile_unavailable(fallback, provider="none")
             self._end_call_without_language_profile(fallback)
@@ -399,14 +411,19 @@ class KavyaSmartPBXSession:
             tools = _without_transfer_tool(server.get_tools_openai(), "openai")
         else:
             raise RuntimeError("unsupported language profile provider")
-        stt = self._stt_factory(
-            on_final_result=pipeline._on_stt_result,
-            on_interim_result=pipeline._on_stt_interim,
-            lang=profile.stt_language,
-            privacy_safe=True,
-            provider=profile.stt_provider,
-            fail_closed=profile.stt_fail_closed,
-        )
+        try:
+            stt = self._stt_factory(
+                on_final_result=pipeline._on_stt_result,
+                on_interim_result=pipeline._on_stt_interim,
+                lang=profile.stt_language,
+                privacy_safe=True,
+                provider=profile.stt_provider,
+                fail_closed=profile.stt_fail_closed,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise _LanguageProfileSTTUnavailable from exc
         return profile, client, copy.deepcopy(tools), stt
 
     def _apply_language_profile(
