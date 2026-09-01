@@ -61,6 +61,10 @@ already-shipped SmartPBX IVR and Gemini Sinhala TTS design.
   session-owned. Lazy module-level SDK client singletons may remain shared, but
   no call may mutate process-wide provider/model/tool/thinking compatibility
   state that changes another concurrent call's request behavior.
+- Every profile assignment receives a `copy.deepcopy()` of its provider-native
+  tools, including English preservation. Equal values are required, but neither
+  the outer list nor nested declarations may share identity with the original,
+  another session, or future `get_tools*()` output.
 - Sinhala Gemini TTS remains provider-exclusive. LLM failover to Claude must
   not imply a TTS fallback; all Sinhala text continues through Gemini TTS.
 - Existing generation ownership, barge-in, filler, capture, transport, tool
@@ -186,6 +190,42 @@ count against output and a truncated function call cannot execute safely. The
 Sinhala Gemini ceiling therefore needs its own resolver and production-shaped
 truncation tests.
 
+## Exact implementation boundaries
+
+The module currently imports `audioop` unconditionally before the guarded
+fallback. That first import must be guarded or removed so a Python/runtime
+without `audioop` exposes `audioop is None`; option 2 then rejects before any
+pipeline mutation, greeting, or STT start.
+
+Option-2 activation validates the closed Sinhala provider set (`gemini` or
+`claude`) and does all fallible client/tool preflight before changing the
+pipeline. It catches `Exception` only around that bounded technical preflight;
+`asyncio.CancelledError` and other `BaseException` values must propagate. An
+invalid configured provider follows the same bounded unavailable/fallback path
+and can never fall into OpenAI dispatch.
+
+`AzureSTTStream` owns synchronized `_stop_requested` and `_fatal_notified`
+flags. A genuine cancellation while running marks it non-running under the
+lock, selects its session callback once, and invokes that callback outside the
+lock. Normal `stop()` sets `_stop_requested` and suppresses the fatal callback.
+The cancellation record contains only a bounded reason/outcome; it must never
+log `evt.error_details` or provider error text.
+
+The shared `_history_to_gemini()` converter needs an explicit, default-false
+SmartPBX flag for provider function-call IDs. Direct SmartPBX Gemini uses that
+flag to round-trip the real ID in both `function_call` and
+`function_response`; ConversationRelay retains its present converted shape and
+has a regression test proving no ID was added to its history.
+
+`llm_round_outcome` is one provider-unified exact bounded schema, not separate
+Claude and Gemini schemas. It emits exactly `provider`, `outcome`,
+`stop_reason`, `output_tokens`, and `attempt`. Provider is `claude|gemini`;
+outcome is `completed|max_tokens_truncated|true_empty|incomplete_tool_block|malformed_tool_json|stream_aborted`; stop reason is normalized to
+`end_turn|max_tokens|tool_use|stop_sequence|refusal|unknown` (or `none` only
+when absent); output tokens are clamped to `0..1000000` or `unknown`; attempt
+is clamped to `1..9`. No content, tool data, raw provider string, exception, or
+identifier beyond the established bounded event fields is emitted.
+
 ## Conversational Sinhala policy
 
 Changing models alone does not prove natural conversation. The Sinhala prompt
@@ -261,6 +301,10 @@ it.
   the welcome starts; `AzureSTTStream` must expose and call `on_fatal` from its
   cancellation callback. It must not silently change English or mix transcripts
   from two recognizers.
+- The direct-SmartPBX non-capture predicate is widened only in the exact Sinhala
+  Gemini deadline, exhausted-empty, and tool-executed-exception recovery
+  branches. Capture behavior remains excluded, and production filler, transfer,
+  and other English-only predicates remain unchanged.
 
 ## Verification design
 
@@ -276,6 +320,13 @@ it.
 - The English IVR selection neither eagerly reads/validates an ElevenLabs voice
   secret nor changes the canonical `lang="en"` ElevenLabs `_speak` route; the
   Sinhala selection still routes `lang="si"` speech exclusively to Gemini TTS.
+- TTS dispatch tests use a real `MediaStreamSession` with a
+  `KavyaSmartPBXSession`/transport stub, not `RecordingPipeline` (whose
+  `_speak` override cannot prove production routing). They separately prove
+  option-1 ElevenLabs routing by wrapping the real ElevenLabs method with a
+  fake response and nonblank test key (or by a separate canonical-profile test),
+  option-2 Gemini routing, unchanged bilingual pre-selection menu delivery,
+  and Gemini TTS retention after Gemini-to-Claude LLM fallback.
 
 ### LLM and tools
 
@@ -342,6 +393,22 @@ column only.
    approved.
 7. Keep immutable-image rollback available throughout the guarded Kavya
    probe/build/deploy process.
+
+## Documentation and deployment-contract acceptance
+
+Keep the existing runbook heading `## SmartPBX Sinhala menu and Gemini TTS`,
+because the deployment test extracts it. Its protected `.env.smartpbx` template
+contains exactly one active assignment for each of the four Sinhala LLM settings
+and exactly one blank active `GEMINI_API_KEY=`; the parser ignores comments and
+rejects duplicate, later, or nonblank key assignments. The section preserves
+menu/timeout/invalid-selection behavior, key-presence/no-secret-printing,
+bounded diagnostics, two-language canary, and rollback.
+
+Update the stale timing, token-budget, and Claude-only-retry prose in the
+current runbook regions 203-208, 264-268, 304-308, and 518-522, together with
+the diagnostics schema around 469-485. Deployment coverage includes those
+diagnostics tests (564-598), protected-template tests (3141-3167), and section
+tests (3184-3213). Compose rendering always uses `--profile smartpbx`.
 
 ## Explicit non-goals
 

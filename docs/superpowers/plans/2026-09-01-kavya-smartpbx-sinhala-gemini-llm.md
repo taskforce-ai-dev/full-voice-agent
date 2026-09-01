@@ -18,6 +18,8 @@
 - Keep Azure `si-LK` as live Sinhala STT and fail option 2 closed if its SDK, `audioop`, or a blank/whitespace-only `AZURE_SPEECH_KEY` is unavailable; never silently route Sinhala to Google. `AzureSTTStream` cancellation must call its session-wired `on_fatal` callback exactly once, never for normal `stop()`. Do not add `google_chirp2` or Gemini Transcribe to `_make_stt()` in this change.
 - Do not add deprecated Gemini 3.x sampling parameters (`temperature`, `top_p`, `top_k`) or migrate the existing Generate Content runner to the Interactions API in this change.
 - New diagnostics use fixed event/enumerated fields only; never log prompts, transcripts, caller data, tool arguments/results, response bodies, exception bodies, audio, API keys, or credentials.
+- The top-level `audioop` import is currently unconditional before its guarded fallback. Move it into that guarded import (or remove the unconditional import) so `audioop = None` is observable and the Azure fail-closed test can exercise it.
+- Gemini activation performs every fallible preflight (provider validation, client acquisition, and provider-native tool preparation/copy) before mutating `pipeline` or adapter state. Catch `Exception` only at that bounded technical boundary; let `asyncio.CancelledError` and every other `BaseException` propagate. The diagnostic is fixed-field only and never includes exception text.
 - Do not run pytest on the development or production host. Use `python3 -m py_compile` locally for syntax only and the existing GitHub Actions Kavya test job for behavioral RED/GREEN evidence.
 - Preserve existing dirty Graphify artifacts and `docs/superpowers/plans/2026-08-31-kavya-smartpbx-sinhala-gemini-tts.md`; do not stage or modify them.
 
@@ -30,7 +32,7 @@
 - Modify `Kavya/tests/test_gemini_streaming.py`: Gemini 3.7 function-call IDs, truncation/deadline behavior, session isolation, Sinhala-specific request shape, and Claude fallback preservation.
 - Modify `Kavya/tests/test_smartpbx_gemini_tts.py`: option-1 ElevenLabs, option-2 Gemini, and Gemini-TTS preservation during Claude LLM fallback.
 - Modify `Kavya/tests/test_prompt_policy.py`: conversational Sinhala prompt contract without weakening English policy.
-- Modify `Kavya/tests/test_smartpbx_deployment.py`: Compose, dotenv, and runbook setting contracts.
+- Modify `Kavya/tests/test_smartpbx_deployment.py`: Compose, dotenv, runbook setting, extracted-template parser, and exact diagnostics contracts.
 - Modify `Kavya/docker-compose.yml`: explicit SmartPBX-only environment allowlist entries.
 - Modify `Kavya/.env.example`: non-secret Sinhala LLM defaults and rollback comments.
 - Modify `Kavya/SMARTPBX_RUNBOOK.md`: runtime behavior, canary checks, and one-line rollback.
@@ -283,7 +285,8 @@ async def test_english_selection_keeps_existing_provider_model_tools_and_clients
         pipeline.gemini_client,
     ) == expected
     assert pipeline.tools == expected_tools
-    assert pipeline.tools is original_tools
+    assert pipeline.tools is not original_tools
+    assert pipeline.tools[0] is not original_tools[0]
     # The profile contains no descriptive TTS fields. `lang` remains the
     # executable router key, so selecting English cannot load TTS secrets.
     assert session._resolve_language_profile("en").lang == "en"
@@ -502,12 +505,16 @@ profile. Assert no STT start, no welcome, resolved terminal future, and the
 single `provider=azure` unavailable event. Add parallel variants for
 `AZURE_STT_AVAILABLE=False`, `audioop=None`, and a blank `AZURE_SPEECH_KEY`;
 all three must reject Sinhala before welcome or STT start while the configured
-English fallback remains unchanged. Add an `AzureSTTStream` unit test that
-sets `stream.on_fatal` to a recorder, fires `_on_canceled()` twice, and asserts
-one fatal callback; then call normal `stop()` and assert it does not signal a
-fatal condition. Implementation must add `on_fatal` and an idempotence fence to
-Azure's instance state, invoke it only for runtime cancellation, and never
-falsely treat Google-only fatal signaling as Azure behavior.
+English fallback remains unchanged. Add an `AzureSTTStream` unit test that first
+establishes a running stream, sets `stream.on_fatal` to a recorder, fires genuine
+`_on_canceled()` callbacks twice, and asserts one fatal callback; then call
+normal `stop()` and assert it does not signal a fatal condition. Implementation
+must add synchronized `_stop_requested` and `_fatal_notified` state:
+cancellation marks the stream non-running under the lock, selects the callback
+exactly once, then calls `on_fatal` outside the lock. Normal stop sets
+`_stop_requested` and suppresses the callback. Log a bounded cancellation
+reason/outcome only; never log `evt.error_details`, exception text, or provider
+payloads.
 
 The first diagnostic contract is
 `smartpbx_media event=language_profile_fallback lang=si from=gemini to=claude reason=client_unavailable`.
@@ -519,7 +526,7 @@ bodies in either line.
 - [ ] **Step 3: Push RED and capture the provider-isolation failure**
 
 ```bash
-git add Kavya/tests/test_smartpbx_sinhala_ivr.py
+git add Kavya/tests/test_smartpbx_sinhala_ivr.py Kavya/tests/test_smartpbx_server.py Kavya/tests/test_smartpbx_gemini_tts.py
 git commit -m "test(kavya): specify per-language SmartPBX LLM isolation"
 git push origin Rakesh
 ```
@@ -605,6 +612,9 @@ def _apply_language_profile(
     self, pipeline: Any, profile: SmartPBXLanguageProfile,
 ) -> SmartPBXLanguageProfile | None:
     if profile.lang == "en":
+        # Preserve the already-loaded English provider/client/model, but do not
+        # retain a mutable reference to the pre-selection tool definition.
+        pipeline.tools = copy.deepcopy(pipeline.tools)
         return profile
     import server
 
@@ -629,10 +639,13 @@ def _apply_language_profile(
 ```
 
 The concrete code must not blindly call the client getters as the abbreviated
-snippet above suggests. Wrap Gemini initialization before changing any pipeline
-field. On `RuntimeError`, resolve a Claude copy of the same Sinhala STT/TTS
-profile, initialize or reuse Anthropic, emit the bounded fallback event, and
-apply that profile atomically. If Anthropic is also unavailable, emit the
+snippet above suggests. Validate `gemini|claude`, acquire the client, prepare
+the provider-native tools, filter transfer ownership, and deep-copy that tool
+set before changing any pipeline field. Catch `Exception` only around this
+preflight; re-raise `asyncio.CancelledError` and every other `BaseException`.
+On a bounded technical preflight failure, resolve a Claude copy of the same
+Sinhala STT/TTS profile, initialize or reuse Anthropic, emit the bounded
+fallback event, and apply that profile atomically. If Anthropic is also unavailable, emit the
 bounded unavailable event, call a new LLM/profile-specific
 `_end_call_without_language_profile()` helper, and return `None`. That helper
 resolves `terminal_future` and does not report the existing false
@@ -671,11 +684,12 @@ a new provider registry, profile TTS fields, or change the current `lang`-based
 TTS path.
 
 Import `copy` in `smartpbx_session.py`. `get_tools()` and `get_tools_gemini()`
-may return shared nested definitions, so every assigned session tool set must
-be deep-copied. Add a two-session test that asserts distinct list and nested
-declaration identities, mutates one session's tool declaration after profile
-activation, and proves the other session and future `get_tools*()` output are
-unchanged.
+may return shared nested definitions, so **every** assigned session tool set,
+including the English preservation profile, must be deep-copied. The English
+test asserts equal value but `is not original_tools`, plus distinct nested
+identity. Add a two-session test that mutates one session's nested declaration
+after profile activation and proves the other session and future `get_tools*()`
+output are unchanged.
 
 Do not rebuild the `MediaStreamSession`, STT callbacks, transport, history, or tool context.
 
@@ -784,7 +798,7 @@ tool arguments/results, exception bodies, caller data, or response bodies.
 - [ ] **Step 2: Push RED and prove each pre-existing contract gap**
 
 ```bash
-git add Kavya/tests/test_gemini_streaming.py
+git add Kavya/tests/test_gemini_streaming.py Kavya/tests/test_smartpbx_server.py
 git commit -m "test(kavya): expose Sinhala Gemini request isolation"
 git push origin Rakesh
 ```
@@ -803,12 +817,14 @@ In `_iter_gemini_stream()`, defensively extract the provider's
 non-mapping arguments value by recording malformed payload state rather than
 raising before the round classifier runs. Carry a valid ID as `payload["id"]`
 alongside name, arguments, and thought signature. In the direct SmartPBX Gemini
-path, store that ID in the internal
-assistant tool-call entry instead of synthesizing `gemini_tc_*`. Extend the
-SmartPBX call to `_history_to_gemini()` so the model function-call part contains
-that ID and the matching SDK `FunctionResponse` dict contains `id`, `name`, and
-`response`. Keep ConversationRelay on its current behavior in this SmartPBX-only
-change.
+path, store that ID in the internal assistant tool-call entry instead of
+synthesizing `gemini_tc_*`. Extend `_history_to_gemini()` with an explicit
+`include_function_call_ids: bool = False` flag. Only the direct SmartPBX Gemini
+call passes `True`, so its model function-call part and matching SDK
+`FunctionResponse` contain `id`, `name`, and `response`; ConversationRelay keeps
+its exact current conversion when the flag is omitted. Add a ConversationRelay
+regression proving its converted history has no newly introduced function-call
+IDs.
 
 Add a closed `SmartPBXGeminiRoundOutcome` classifier. Normalize finish reasons
 to a fixed vocabulary and apply precedence in this order:
@@ -824,12 +840,17 @@ Add a malformed-provider-payload test with missing name/ID and non-mapping
 arguments. It must reach the `malformed tool` outcome, execute no tool, commit
 no partial history, and never leak a parser exception from `_iter_gemini_stream()`.
 
-Emit only fixed outcome metadata for every classified direct-SmartPBX Gemini
-round: `smartpbx_media event=llm_round_outcome provider=gemini
-outcome=<completed|truncated|malformed_tool|stream_aborted|empty>`. Add this
-five-value allowlist to the deployment/runbook diagnostics test and document it
-as bounded metadata only; never append text, arguments, exception details, or
-provider response content.
+Use the existing exact `llm_round_outcome` schema for Gemini too; do not create
+a parallel five-value event vocabulary. Emit exactly `provider`, `outcome`,
+`stop_reason`, `output_tokens`, and `attempt`, with no other fields. `provider`
+is the closed enum `claude|gemini`; `outcome` is the existing closed enum
+`completed|max_tokens_truncated|true_empty|incomplete_tool_block|malformed_tool_json|stream_aborted`; `stop_reason` is normalized to
+`end_turn|max_tokens|tool_use|stop_sequence|refusal|unknown` (or `none` only
+when no terminal reason exists); `output_tokens` is `0..1000000` clamped or
+`unknown`; and `attempt` is `1..9` clamped. Update the deployment test around
+lines 564-598 and the runbook diagnostics table around lines 469-485 to assert
+this provider-unified exact schema. It carries no text, arguments, exception
+details, or provider response content.
 
 Preserve the existing incremental-speech latency contract: completed sentences
 may still enter the generation-fenced TTS pipeline before terminal metadata.
@@ -970,9 +991,9 @@ SMARTPBX_MAX_TOKENS” without that preservation rationale.
 - [ ] **Step 6: Verify syntax and GREEN CI**
 
 ```bash
-python3 -m py_compile Kavya/server.py Kavya/tests/test_gemini_streaming.py
-git diff --check -- Kavya/server.py Kavya/tests/test_gemini_streaming.py
-git add Kavya/server.py Kavya/tests/test_gemini_streaming.py
+python3 -m py_compile Kavya/server.py Kavya/tests/test_gemini_streaming.py Kavya/tests/test_smartpbx_server.py
+git diff --check -- Kavya/server.py Kavya/tests/test_gemini_streaming.py Kavya/tests/test_smartpbx_server.py
+git add Kavya/server.py Kavya/tests/test_gemini_streaming.py Kavya/tests/test_smartpbx_server.py
 git commit -m "fix(kavya): harden Sinhala Gemini provider rounds"
 git push origin Rakesh
 ```
@@ -1120,9 +1141,9 @@ Expected GitHub Actions result: prompt and fallback tests pass; existing English
 
 **Files:**
 - Modify: `Kavya/docker-compose.yml:99-168`
-- Modify: `Kavya/.env.example:265-285`
-- Modify: `Kavya/SMARTPBX_RUNBOOK.md:143-185,304-335`
-- Modify: `Kavya/tests/test_smartpbx_deployment.py:3184-3213`
+- Modify: `Kavya/.env.example:22-32,265-285`
+- Modify: `Kavya/SMARTPBX_RUNBOOK.md:70-141,143-185,203-208,264-268,304-308,469-485,518-522`
+- Modify: `Kavya/tests/test_smartpbx_deployment.py:564-598,3141-3167,3184-3213`
 
 **Interfaces:**
 - Consumes: the four environment variable names from Task 1.
@@ -1233,10 +1254,15 @@ SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS=15.0
 
 Keep `GEMINI_API_KEY=` blank and unique.
 
-Extend the existing dotenv deployment helper tests to require exactly one active
-assignment for each of the four `SMARTPBX_SINHALA_LLM_*` names as well as the
-single blank `GEMINI_API_KEY`; a duplicate or later nonblank active assignment
-must fail. Do not merely search for a matching line.
+Extend the existing dotenv deployment helper into an active-assignment parser
+for the extracted protected runbook template (the `dotenv` block at lines
+70-141), not a regex that happens to find text elsewhere. Ignore comments;
+require exactly one active assignment each for
+`SMARTPBX_SINHALA_LLM_PROVIDER`, `SMARTPBX_SINHALA_GEMINI_LLM_MODEL`,
+`SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL`, and
+`SMARTPBX_SINHALA_GEMINI_MAX_TOKENS`, and exactly one active blank
+`GEMINI_API_KEY=`. Reject duplicates, a later active value, or a nonblank
+Gemini key. Test each failure shape. Do not merely search for a matching line.
 
 In the preceding `SMARTPBX_CLAUDE_MAX_TOKENS` comment block, replace the stale
 `OpenAI and Gemini stay on SMARTPBX_MAX_TOKENS` sentence. State that Gemini 3.7
@@ -1247,11 +1273,16 @@ replacement from Task 3.
 
 - [ ] **Step 5: Document behavior, evidence, and one-setting rollback**
 
-Replace the existing `## SmartPBX Sinhala menu and Gemini TTS` section (not a
-new section elsewhere) with concise text containing all of these operational
-facts. Replace both stale claims at current lines 149-151 and 176-178: Press 2
-must no longer be described as Claude plus Gemini TTS, and its canary must no
-longer verify that obsolete path.
+Replace the existing `## SmartPBX Sinhala menu and Gemini TTS` section in place
+(not a new heading elsewhere) with concise text containing all of these
+operational facts. Preserve that exact heading because the deployment test
+extracts it. Replace the stale Press-2/Claude claims at current lines 149-151
+and 176-178, the English-only timing-provider claim at 203-208, the stale
+provider timing claims at 264-268, the shared-120-budget claim at 304-308, and
+the Claude-only retry claim at 518-522. The replacements must say that
+direct-SmartPBX Sinhala Gemini uses the non-capture deadline/recovery branches,
+while capture remains excluded; fillers and other English-only policy are not
+broadened.
 
 In the protected `.env.smartpbx` template already in this runbook, add the four
 non-secret LLM settings with their documented defaults alongside the existing
@@ -1260,13 +1291,24 @@ template names occur once; this is separate from, and must retain, the blank
 secret `GEMINI_API_KEY` assignment contract.
 
 ````markdown
-## Sinhala per-language pipeline
+## SmartPBX Sinhala menu and Gemini TTS
 
-Press 1 keeps the existing English STT -> Claude -> ElevenLabs path. Press 2
-uses Azure `si-LK` STT -> Gemini `gemini-3.7-flash` at thinking level `low`
-with output ceiling `600` -> Gemini `gemini-3.1-flash-tts-preview` voice
-`Vindemiatrix`. Gemini technical failures reuse the existing call-local Claude
-fallback; TTS remains Gemini and no other active call changes provider.
+The menu is **1 English, 2 Sinhala**. Timeout defaults to English; an invalid
+selection replays once then defaults to English. Press 1 keeps the existing
+English STT -> Claude -> ElevenLabs path. Press 2 uses Azure `si-LK` STT ->
+Gemini `gemini-3.7-flash` at thinking level `low` with output ceiling `600` ->
+Gemini `gemini-3.1-flash-tts-preview` voice `Vindemiatrix`. Gemini technical
+failures reuse the existing call-local Claude fallback; TTS remains Gemini, no
+other active call changes provider, and no OpenAI, ElevenLabs, or Azure TTS
+fallback is permitted. Preserve the bilingual pre-selection menu: its Sinhala
+line still uses Gemini TTS before a language profile is selected.
+
+Before enabling Sinhala, use an active-assignment parser over the protected
+template and a key-presence check that requires a nonblank `GEMINI_API_KEY`
+only for Sinhala, never prints the key, and leaves the service unchanged on
+failure. Diagnostics and the canary inspect only bounded provider/event/outcome
+fields; they never expose response content, transcript text, exception detail,
+or any secret.
 
 Rollback only the Sinhala LLM by setting:
 
@@ -1280,13 +1322,20 @@ procedure. Do not edit `LLM_PROVIDER`; it is the English/global baseline.
 Azure `si-LK` remains the live Sinhala STT. Chirp 2's general V2 table lists
 Sinhala, but its method-specific `StreamingRecognize` list excludes Sinhala;
 Gemini Transcribe Live also omits Sinhala. Both are offline-only evaluations.
+
+Canary both languages: prove option 1 still produces canonical ElevenLabs
+speech; prove option 2 uses Azure `si-LK`, Gemini 3.7 Flash, and Gemini TTS;
+then force a replay-safe Gemini LLM failure and prove its Sinhala Claude
+fallback still uses Gemini TTS. Check `/health` and authenticated
+`/smartpbx/status`; on failure restore the prior image/config and repeat those
+checks. Twilio behavior is unchanged.
 ````
 
 - [ ] **Step 6: Syntax/config check, push GREEN, and inspect the rendered Compose service**
 
 ```bash
 python3 -m py_compile Kavya/tests/test_smartpbx_deployment.py
-docker compose -f Kavya/docker-compose.yml config --services
+docker compose -f Kavya/docker-compose.yml --profile smartpbx config --services
 git diff --check -- Kavya/docker-compose.yml Kavya/.env.example Kavya/SMARTPBX_RUNBOOK.md Kavya/tests/test_smartpbx_deployment.py
 git add Kavya/docker-compose.yml Kavya/.env.example Kavya/SMARTPBX_RUNBOOK.md Kavya/tests/test_smartpbx_deployment.py
 git commit -m "docs(kavya): expose Sinhala Gemini LLM canary controls"
@@ -1336,7 +1385,7 @@ Expected: `cmp` exits `0`.
 - [ ] **Step 3: Run all permitted local verification**
 
 ```bash
-python3 -m py_compile Kavya/server.py Kavya/smartpbx_session.py Kavya/tests/test_smartpbx_sinhala_ivr.py Kavya/tests/test_smartpbx_server.py Kavya/tests/test_gemini_streaming.py Kavya/tests/test_prompt_policy.py Kavya/tests/test_smartpbx_deployment.py
+python3 -m py_compile Kavya/server.py Kavya/smartpbx_session.py Kavya/tests/test_smartpbx_sinhala_ivr.py Kavya/tests/test_smartpbx_server.py Kavya/tests/test_smartpbx_gemini_tts.py Kavya/tests/test_gemini_streaming.py Kavya/tests/test_prompt_policy.py Kavya/tests/test_smartpbx_deployment.py
 git diff --check
 git status --short
 ```
