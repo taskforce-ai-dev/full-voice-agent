@@ -672,18 +672,18 @@ async def test_finish_during_cancelled_menu_wait_cleans_candidate_without_late_s
     menu_cancelled = asyncio.Event()
     menu_release = asyncio.Event()
 
-    async def stubborn_menu(_text):
+    async def stubborn_menu(_audio):
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             menu_cancelled.set()
             await menu_release.wait()
 
-    pipeline._speak = stubborn_menu
+    monkeypatch.setattr(transport, "send_audio", stubborn_menu)
     await session.start()
     await asyncio.sleep(0)
     activation = asyncio.create_task(session.feed_dtmf("2"))
-    await menu_cancelled.wait()
+    await asyncio.wait_for(menu_cancelled.wait(), timeout=1)
     finish = asyncio.create_task(session.finish())
     await asyncio.sleep(0)
     assert session._finish_task is not None
