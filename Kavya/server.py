@@ -8693,11 +8693,13 @@ class MediaStreamSession:
     async def _run_llm_gemini(self) -> str:
         """Gemini-native streaming version of _run_llm for Media Streams.
 
-        Sentence-level: every completed sentence is handed to TTS as it arrives,
-        through the same ``_extract_sentences``  ``_invoke_speak`` pipeline (and
-        therefore the same generation fence and delivered-sentence tracking) the
-        Claude path uses. Lang-agnostic the Sinhala/Tamil/Arabic Media Streams
-        calls and the direct SmartPBX English calls all run through here.
+        Completed sentences normally reach TTS as they arrive through the same
+        ``_extract_sentences`` / ``_invoke_speak`` pipeline (and therefore the
+        same generation fence and delivered-sentence tracking) the Claude path
+        uses. Direct SmartPBX Sinhala non-capture text-only rounds are the
+        narrow exception: a completed no-tool reply is synthesized once,
+        preventing a second Gemini TTS request from creating dead air inside
+        one caller-facing answer.
         """
         if not self._current_smartpbx_runner_owns_shared_state():
             return ""
@@ -8752,6 +8754,10 @@ class MediaStreamSession:
                 text_content = ""
                 function_calls: list[dict] = []
                 sentence_buffer = ""
+                batch_direct_sinhala = (
+                    direct_sinhala and not self._is_capture_mode_active()
+                )
+                deferred_sinhala_sentences: list[str] = []
                 tts_tasks: list[asyncio.Task] = []
                 turn_tts_tasks = tts_tasks
                 has_tool_use = False
@@ -8771,10 +8777,26 @@ class MediaStreamSession:
                     text_content = ""
                     function_calls = []
                     sentence_buffer = ""
+                    deferred_sinhala_sentences = []
                     has_tool_use = False
                     finish_reason = None
                     saw_terminal_metadata = False
                     reported_output_tokens = None
+
+                    async def _restore_deferred_sinhala_sentences() -> None:
+                        """Return a no-longer-text-only round to sentence streaming."""
+                        nonlocal deferred_sinhala_sentences
+                        if not batch_direct_sinhala or not deferred_sinhala_sentences:
+                            return
+                        for sentence in deferred_sinhala_sentences:
+                            task = self._start_smartpbx_round_tts(
+                                sentence, generation=gen, sentence=sentence,
+                            )
+                            if task is not None:
+                                tts_tasks.append(task)
+                        deferred_sinhala_sentences = []
+                        if tts_tasks:
+                            await asyncio.sleep(0)
 
                     async def _acquire_gemini_stream():
                         contents = _history_to_gemini(
@@ -8842,6 +8864,11 @@ class MediaStreamSession:
                                     await initial_filler.on_tool_delta()
                                     if initial_filler._cleared_after_spoke:
                                         gen = self._speak_generation
+                                # A late tool means this is not a batchable
+                                # text-only round. Restore every completed
+                                # preamble sentence to the established
+                                # per-sentence lifecycle before tool handling.
+                                await _restore_deferred_sinhala_sentences()
                                 self._mark_smartpbx_turn_once("llm_first_token")
                                 has_tool_use = True
                                 function_calls.append(payload)
@@ -8868,6 +8895,13 @@ class MediaStreamSession:
                             sentences, sentence_buffer = _extract_sentences(sentence_buffer)
                             if not sentences:
                                 continue
+                            # Gemini TTS is request/response rather than text-streamed.
+                            # Keep direct-SmartPBX Sinhala no-tool responses whole, but
+                            # retain the completed sentences so a later tool delta can
+                            # restore the preamble to the normal sentence-level path.
+                            if batch_direct_sinhala:
+                                deferred_sinhala_sentences.extend(sentences)
+                                continue
                             for s in sentences:
                                 task = self._start_smartpbx_round_tts(
                                     s, generation=gen, sentence=s,
@@ -8893,6 +8927,10 @@ class MediaStreamSession:
                             # The adapter/acquisition seam has proven a
                             # provider-origin failure eligible for the
                             # direct-Sinhala Claude fallback below.
+                            # It is not a terminal completed text-only round,
+                            # so retain the existing partial-delivery and
+                            # generation-fencing behavior before failover.
+                            await _restore_deferred_sinhala_sentences()
                             raise
                         if (
                             direct_sinhala
@@ -9240,6 +9278,15 @@ class MediaStreamSession:
                     continue
 
                 remaining = sentence_buffer.strip()
+                if batch_direct_sinhala:
+                    remaining = " ".join(
+                        [*deferred_sinhala_sentences, remaining]
+                    ).strip()
+                    if self._speak_generation != gen:
+                        # Do not create a stale whole-reply task after a
+                        # barge-in; the normal per-sentence path is already
+                        # generation-fenced at this same boundary.
+                        remaining = ""
                 if remaining:
                     task = self._start_smartpbx_round_tts(
                         remaining, generation=gen, sentence=remaining,
