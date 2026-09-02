@@ -268,6 +268,105 @@ def test_each_sentence_reaches_tts_while_the_stream_is_still_arriving():
     )
 
 
+def test_direct_smartpbx_sinhala_batches_a_no_tool_reply_into_one_tts_request():
+    """Avoid a second Gemini synthesis gap inside one caller-facing reply."""
+    timeline: list[tuple] = []
+    session, spoken = _session(
+        [[
+            _text_chunk("පළමු වාක්‍යය. "),
+            _text_chunk("දෙවන වාක්‍යය."),
+        ]],
+        lang="si",
+        smartpbx=True,
+        timeline=timeline,
+    )
+
+    result = asyncio.run(session._run_llm_gemini())
+
+    assert spoken == ["පළමු වාක්‍යය. දෙවන වාක්‍යය."]
+    assert result == "පළමු වාක්‍යය. දෙවන වාක්‍යය."
+    assert next(i for i, entry in enumerate(timeline) if entry[0] == "tts") > max(
+        i for i, entry in enumerate(timeline) if entry[0] == "chunk"
+    )
+
+
+def test_direct_smartpbx_english_keeps_incremental_sentence_tts():
+    """The Sinhala batching boundary must not alter the established English path."""
+    session, spoken = _session(
+        [[
+            _text_chunk("First sentence. "),
+            _text_chunk("Second sentence."),
+        ]],
+        lang="en",
+        smartpbx=True,
+    )
+
+    asyncio.run(session._run_llm_gemini())
+
+    assert spoken == ["First sentence.", "Second sentence."]
+
+
+def test_twilio_sinhala_keeps_incremental_sentence_tts():
+    """Only the direct SmartPBX Sinhala route trades streaming for continuity."""
+    session, spoken = _session(
+        [[
+            _text_chunk("පළමු වාක්‍යය. "),
+            _text_chunk("දෙවන වාක්‍යය."),
+        ]],
+        lang="si",
+    )
+
+    asyncio.run(session._run_llm_gemini())
+
+    assert spoken == ["පළමු වාක්‍යය.", "දෙවන වාක්‍යය."]
+
+
+def test_direct_smartpbx_sinhala_capture_keeps_incremental_sentence_tts():
+    """Capture flows retain their specialised streaming turn behavior."""
+    session, spoken = _session(
+        [[
+            _text_chunk("පළමු වාක්‍යය. "),
+            _text_chunk("දෙවන වාක්‍යය."),
+        ]],
+        lang="si",
+        smartpbx=True,
+    )
+    session._capture_mode_active = True
+
+    asyncio.run(session._run_llm_gemini())
+
+    assert spoken == ["පළමු වාක්‍යය.", "දෙවන වාක්‍යය."]
+
+
+def test_direct_smartpbx_sinhala_keeps_a_tool_preamble_audible(monkeypatch):
+    """Batching a no-tool reply must not discard text that precedes a tool."""
+    session, spoken = _session(
+        [
+            [
+                _text_chunk("මම ඒක පරීක්ෂා කරමි. "),
+                _text_chunk("කරුණාකර මොහොතක් ඉන්න. "),
+                _tool_chunk("check_availability", {"nights": 2}),
+            ],
+            [_text_chunk("කාමර තිබේ.")],
+        ],
+        lang="si",
+        smartpbx=True,
+    )
+
+    async def execute(_name, _arguments):
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    asyncio.run(session._run_llm_gemini())
+
+    assert spoken[:2] == [
+        "මම ඒක පරීක්ෂා කරමි.",
+        "කරුණාකර මොහොතක් ඉන්න.",
+    ]
+    assert spoken[-1] == "කාමර තිබේ."
+
+
 def test_thought_parts_are_never_spoken():
     session, spoken = _session(
         [[

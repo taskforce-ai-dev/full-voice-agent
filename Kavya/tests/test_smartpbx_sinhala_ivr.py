@@ -17,6 +17,14 @@ from smartpbx_session import KavyaSmartPBXSession
 class RecordingTransport:
     def __init__(self) -> None:
         self.clears = 0
+        self.audio: list[bytes] = []
+        self.marks: list[str] = []
+
+    async def send_audio(self, audio: bytes) -> None:
+        self.audio.append(audio)
+
+    async def send_mark(self, name: str) -> None:
+        self.marks.append(name)
 
     async def clear_audio(self) -> None:
         self.clears += 1
@@ -189,7 +197,9 @@ async def test_valid_gemini_credential_keeps_bilingual_menu_and_english_activati
     await session.start()
     await asyncio.sleep(0)
 
-    assert [lang for lang, _text in pipeline.spoken] == ["en", "si"]
+    assert pipeline.spoken == []
+    assert len(session._transport.audio) == 1
+    assert session._transport.marks == ["language-menu"]
     assert await session.feed_dtmf("1") is True
     assert (pipeline.lang, stt.starts) == ("en", 1)
 
@@ -256,13 +266,14 @@ async def test_first_invalid_digit_replays_menu_and_second_defaults_to_english()
     session, pipeline, stt = make_session()
     await session.start()
     await asyncio.sleep(0)
-    first_menu = list(pipeline.spoken)
-    assert [lang for lang, _text in first_menu] == ["en", "si"]
+    assert pipeline.spoken == []
+    assert len(session._transport.audio) == 1
 
     assert await session.feed_dtmf("#") is True
     await asyncio.sleep(0)
-    replayed_menu = pipeline.spoken[len(first_menu):]
-    assert [lang for lang, _text in replayed_menu] == ["en", "si"]
+    assert session._transport.clears == 1
+    assert len(session._transport.audio) == 2
+    assert session._transport.audio[0] == session._transport.audio[1]
     assert stt.starts == 0
 
     assert await session.feed_dtmf("*") is True
@@ -661,18 +672,18 @@ async def test_finish_during_cancelled_menu_wait_cleans_candidate_without_late_s
     menu_cancelled = asyncio.Event()
     menu_release = asyncio.Event()
 
-    async def stubborn_menu(_text):
+    async def stubborn_menu(_audio):
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             menu_cancelled.set()
             await menu_release.wait()
 
-    pipeline._speak = stubborn_menu
+    monkeypatch.setattr(transport, "send_audio", stubborn_menu)
     await session.start()
     await asyncio.sleep(0)
     activation = asyncio.create_task(session.feed_dtmf("2"))
-    await menu_cancelled.wait()
+    await asyncio.wait_for(menu_cancelled.wait(), timeout=1)
     finish = asyncio.create_task(session.finish())
     await asyncio.sleep(0)
     assert session._finish_task is not None

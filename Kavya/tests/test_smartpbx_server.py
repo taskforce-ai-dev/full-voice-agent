@@ -3,12 +3,14 @@
 import asyncio
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from smartpbx_protocol import CallContext, MediaFormat
 from smartpbx_session import KavyaSmartPBXSession
+import smartpbx_session
 
 
 class FakeTransport:
@@ -563,9 +565,10 @@ async def test_default_smartpbx_welcome_reuses_kavya_english_greeting():
         pass
 
     pipeline = FakePipeline()
+    transport = FakeTransport()
     session = KavyaSmartPBXSession(
         context(),
-        FakeTransport(),
+        transport,
         pipeline=pipeline,
         stt_factory=lambda **_kwargs: FakeSTT(),
         post_call_processor=process_post_call,
@@ -576,15 +579,82 @@ async def test_default_smartpbx_welcome_reuses_kavya_english_greeting():
 
     await session.start()
     await asyncio.sleep(0)
-    menu_segments = list(pipeline.spoken)
-    assert menu_segments == ["For English, press 1.", "සිංහල සඳහා, 2 ඔබන්න."]
+    assert pipeline.spoken == []
+    assert len(transport.audio) == 1
+    assert transport.marks == ["language-menu"]
     await session.feed_dtmf("1")
     await asyncio.sleep(0)
     await session.finish(False)
 
-    assert pipeline.spoken == menu_segments + [
-        server.LANGUAGE_CONFIGS["en"]["welcome_greeting"]
-    ]
+    assert pipeline.spoken == [server.LANGUAGE_CONFIGS["en"]["welcome_greeting"]]
+
+
+@pytest.mark.asyncio
+async def test_language_menu_sends_pre_generated_audio_without_live_tts(monkeypatch):
+    asset = b"\xff" * 2400 + b"\x7f" * 160
+    monkeypatch.setattr(
+        smartpbx_session,
+        "_load_smartpbx_language_menu_audio",
+        lambda: asset,
+        raising=False,
+    )
+    pipeline = FakePipeline()
+    transport = FakeTransport()
+    session = KavyaSmartPBXSession(
+        context(),
+        transport,
+        pipeline=pipeline,
+        stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0),
+        welcome_text=None,
+        llm_provider="claude",
+        model="test-model",
+    )
+
+    await session.start()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    try:
+        assert transport.audio == [asset]
+        assert transport.marks == ["language-menu"]
+        assert pipeline.spoken == []
+    finally:
+        await session.finish(False)
+
+
+def test_language_menu_asset_has_exact_300ms_lead_and_wire_frame_alignment():
+    asset_path = Path(smartpbx_session.__file__).with_name(
+        "smartpbx_language_menu.ulaw"
+    )
+
+    assert asset_path.exists()
+    asset = asset_path.read_bytes()
+    assert len(asset) > 2400
+    assert len(asset) % 160 == 0
+    assert asset[:2400] == b"\xff" * 2400
+    assert asset[2400:2560] != b"\xff" * 160
+
+
+@pytest.mark.parametrize(
+    "asset",
+    [
+        b"",
+        b"\xff" * 2400 + b"\x7f",
+        b"\x00" * 2400 + b"\x7f" * 160,
+        b"\xff" * 2560,
+        b"\xff" * 2400 + b"\x7f" * (513 * 160 - 2400),
+    ],
+)
+def test_language_menu_loader_rejects_invalid_wire_assets(monkeypatch, tmp_path, asset):
+    asset_path = tmp_path / "menu.ulaw"
+    asset_path.write_bytes(asset)
+    monkeypatch.setattr(smartpbx_session, "_LANGUAGE_MENU_AUDIO_PATH", asset_path)
+    smartpbx_session._load_smartpbx_language_menu_audio.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="language menu asset is invalid"):
+            smartpbx_session._load_smartpbx_language_menu_audio()
+    finally:
+        smartpbx_session._load_smartpbx_language_menu_audio.cache_clear()
 
 
 @pytest.mark.asyncio
@@ -1384,17 +1454,13 @@ async def test_smartpbx_session_installs_default_noop_sink_on_pipeline_before_we
     session, pipeline, _, _ = make_session(post_call_processor=process_post_call)
     await session.start()
     await asyncio.sleep(0)
-    assert pipeline.spoken == ["For English, press 1.", "සිංහල සඳහා, 2 ඔබන්න."]
+    assert pipeline.spoken == []
     await session.feed_dtmf("1")
     await asyncio.sleep(0)
     try:
         sink = getattr(pipeline, "_smartpbx_diagnostic_sink", None)
         assert callable(sink)
-        assert pipeline.spoken == [
-            "For English, press 1.",
-            "සිංහල සඳහා, 2 ඔබන්න.",
-            "Welcome to Hatton Hills.",
-        ]
+        assert pipeline.spoken == ["Welcome to Hatton Hills."]
     finally:
         await session.finish(False)
 
@@ -1419,15 +1485,11 @@ async def test_default_diagnostic_sink_is_callable_before_welcome_speak():
     await session.feed_dtmf("1")
     await asyncio.sleep(0)
     try:
-        assert pipeline.spoken == [
-            "For English, press 1.",
-            "සිංහල සඳහා, 2 ඔබන්න.",
-            "Welcome to Hatton Hills.",
-        ]
-        assert len(pipeline.sinks_seen_at_speak) == 3
+        assert pipeline.spoken == ["Welcome to Hatton Hills."]
+        assert len(pipeline.sinks_seen_at_speak) == 1
         sink = getattr(pipeline, "_smartpbx_diagnostic_sink", None)
         assert callable(sink)
-        assert pipeline.sinks_seen_at_speak == [sink] * 3
+        assert pipeline.sinks_seen_at_speak == [sink]
     finally:
         await session.finish(False)
 
@@ -1451,7 +1513,7 @@ async def test_explicit_diagnostic_sink_reaches_pipeline_before_welcome_by_ident
     await session.feed_dtmf("1")
     await asyncio.sleep(0)
     try:
-        assert pipeline.sinks_seen_at_speak == [explicit_sink] * 3
+        assert pipeline.sinks_seen_at_speak == [explicit_sink]
     finally:
         await session.finish(False)
 
@@ -1485,7 +1547,7 @@ async def test_explicit_falsey_diagnostic_sink_is_preserved_and_used_before_welc
     await session.feed_dtmf("1")
     await asyncio.sleep(0)
     try:
-        assert pipeline.sinks_seen_at_speak == [explicit_sink] * 3
+        assert pipeline.sinks_seen_at_speak == [explicit_sink]
         pipeline._smartpbx_diagnostic_sink(
             DiagnosticStage.SESSION_START,
             DiagnosticOutcome.COMPLETED,

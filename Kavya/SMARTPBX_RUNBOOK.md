@@ -153,8 +153,9 @@ direct SmartPBX-only choice: Twilio behavior is unchanged.
 Press 1 keeps the English Azure STT -> Claude -> ElevenLabs pipeline. Press
 2 uses Azure `si-LK` -> Gemini `gemini-3.7-flash` at thinking level `low`
 with a separate `600`-token ceiling -> Gemini
-`gemini-3.1-flash-tts-preview` / `Vindemiatrix`. The Sinhala menu segment is
-also Gemini TTS and remains part of the bilingual menu before selection.
+`gemini-3.1-flash-tts-preview` / `Vindemiatrix`. The bilingual prompt before
+selection is the reviewed static μ-law asset documented below; neither menu
+segment makes a live TTS request.
 
 The Gemini credential check is no-output and stripped: exactly one active,
 nonblank `GEMINI_API_KEY` is required before exposing the bilingual menu,
@@ -242,6 +243,28 @@ After the guarded deployment, run this **two-language canary call checklist**:
    `Vindemiatrix` TTS respond.
 3. Confirm `/health` and authenticated `/smartpbx/status`; inspect only
    bounded provider/event/outcome diagnostics if the second call fails.
+
+## Static SmartPBX language menu
+
+The pre-selection prompt is the committed `smartpbx_language_menu.ulaw` asset,
+not a live ElevenLabs or Gemini request. It is 8 kHz G.711 μ-law aligned to
+160-byte/20 ms frames. Its first 2,400 bytes are exactly fifteen frames (300
+ms) of digital μ-law silence, followed by the approved canonical English
+voice saying “For English, press 1.” and the approved Gemini `Vindemiatrix`
+voice saying “සිංහල සඳහා, 2 ඔබන්න.”
+
+The runtime validates and caches the entire asset before starting menu
+playback. Missing, empty, oversized, misaligned, incorrectly prefixed, or
+all-silent assets fail admission before partial audio reaches the caller.
+Changing the wording or either voice requires regenerating the asset once with
+protected provider credentials, verifying the same wire contract, reviewing
+the resulting audio, and shipping it in a new image. Never generate this menu
+per call and never store provider credentials in the repository.
+
+When this static menu is deployed, keep the separate transport experiment at
+`SMARTPBX_STARTUP_PREROLL_MS=0`; the asset's own 300 ms prefix is the complete
+intentional startup lead. Roll back the image and restore the prior protected
+environment value together if the opening prompt regresses.
 
 ## Controlled startup pre-roll canary
 

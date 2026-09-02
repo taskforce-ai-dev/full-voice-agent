@@ -243,7 +243,7 @@ async def test_real_selected_profiles_keep_tts_routing_owned_by_lang(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_real_preselection_menu_retains_bilingual_lang_owned_tts(monkeypatch):
+async def test_real_preselection_menu_bypasses_live_tts(monkeypatch):
     import server
 
     session, pipeline, _stt = _real_selection_session(server)
@@ -260,10 +260,9 @@ async def test_real_preselection_menu_retains_bilingual_lang_owned_tts(monkeypat
     await session.start()
     await asyncio.sleep(0)
 
-    assert routes == [
-        ("elevenlabs", "For English, press 1."),
-        ("gemini", "සිංහල සඳහා, 2 ඔබන්න."),
-    ]
+    assert routes == []
+    assert len(session._transport.audio) == 1
+    assert session._transport.marks == ["language-menu"]
 
 
 @pytest.mark.asyncio

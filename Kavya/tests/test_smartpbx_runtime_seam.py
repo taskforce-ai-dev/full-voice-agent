@@ -24,6 +24,12 @@ CONTEXT = CallContext(
 
 
 class Transport:
+    async def send_audio(self, _audio: bytes) -> None:
+        pass
+
+    async def send_mark(self, _name: str) -> None:
+        pass
+
     async def clear_audio(self) -> None:
         pass
 
