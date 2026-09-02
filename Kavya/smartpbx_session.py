@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import inspect
 import logging
 import os
@@ -11,6 +12,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
 from smartpbx_diagnostics import SmartPBXDiagnosticSink
@@ -21,6 +23,30 @@ from smartpbx_transport import SmartPBXMediaTransport
 PostCallProcessor = Callable[..., Awaitable[None]]
 logger = logging.getLogger(__name__)
 _SESSION_MAX_MS = 600_000
+_LANGUAGE_MENU_AUDIO_PATH = Path(__file__).with_name("smartpbx_language_menu.ulaw")
+_ULAW_FRAME_BYTES = 160
+_LANGUAGE_MENU_PREROLL_BYTES = 2_400
+_MAX_LANGUAGE_MENU_FRAMES = 512
+
+
+@functools.lru_cache(maxsize=1)
+def _load_smartpbx_language_menu_audio() -> bytes:
+    """Load the immutable SmartPBX menu after validating its wire contract."""
+    audio = _LANGUAGE_MENU_AUDIO_PATH.read_bytes()
+    first_material_frame = audio[
+        _LANGUAGE_MENU_PREROLL_BYTES:
+        _LANGUAGE_MENU_PREROLL_BYTES + _ULAW_FRAME_BYTES
+    ]
+    if (
+        len(audio) <= _LANGUAGE_MENU_PREROLL_BYTES
+        or len(audio) % _ULAW_FRAME_BYTES
+        or len(audio) > _MAX_LANGUAGE_MENU_FRAMES * _ULAW_FRAME_BYTES
+        or audio[:_LANGUAGE_MENU_PREROLL_BYTES]
+        != b"\xff" * _LANGUAGE_MENU_PREROLL_BYTES
+        or first_material_frame == b"\xff" * _ULAW_FRAME_BYTES
+    ):
+        raise RuntimeError("SmartPBX language menu asset is invalid")
+    return audio
 
 
 class _LanguageProfileSTTUnavailable(Exception):
@@ -117,6 +143,7 @@ class KavyaSmartPBXSession:
         self._finish_task: asyncio.Task[None] | None = None
         self._welcome_task: asyncio.Task[None] | None = None
         self._selected_language: str | None = None
+        self._language_menu_audio: bytes | None = None
         self._language_menu_task: asyncio.Task[None] | None = None
         self._language_timeout_handle: asyncio.TimerHandle | None = None
         self._invalid_language_selections = 0
@@ -184,10 +211,16 @@ class KavyaSmartPBXSession:
     async def _start_once(self) -> None:
         import server
 
-        # The bilingual menu itself uses Sinhala Gemini TTS, even for callers
-        # who will press 1. Fail before creating its task so no partial prompt
-        # or provider/STT activation can escape when the key is blank.
+        # Sinhala responses still require Gemini TTS after selection. Fail
+        # before the static bilingual menu so callers cannot enter a profile
+        # that cannot speak back to them.
         if not server._has_gemini_api_key():
+            self._end_call_without_language_profile()
+            return
+        try:
+            self._language_menu_audio = _load_smartpbx_language_menu_audio()
+        except (OSError, RuntimeError):
+            logger.error("smartpbx_media event=language_menu_asset_unavailable")
             self._end_call_without_language_profile()
             return
         self._ensure_session_trace_id()
@@ -219,28 +252,28 @@ class KavyaSmartPBXSession:
         )
 
     async def _restart_language_menu(self) -> None:
-        """Replay the menu once without turning an invalid key into barge-in."""
+        """Fence any unheard remainder, then replay the same local menu once."""
         menu_task = self._language_menu_task
         if menu_task is not None and not menu_task.done():
             menu_task.cancel()
             await asyncio.gather(menu_task, return_exceptions=True)
         if self._selected_language is None:
+            await self._transport.clear_audio()
+        if self._selected_language is None:
             self._language_menu_task = asyncio.create_task(self._speak_language_menu())
 
     async def _speak_language_menu(self) -> None:
-        """Speak the pre-STT menu only while this session still awaits selection."""
-        pipeline = self._require_pipeline()
-        segments = (
-            ("en", "For English, press 1."),
-            ("si", "සිංහල සඳහා, 2 ඔබන්න."),
-        )
-        for lang, text in segments:
-            if self._selected_language is not None:
-                return
-            pipeline.lang = lang
-            await pipeline._speak(text)
-            if self._selected_language is not None:
-                return
+        """Stream the local pre-STT menu while this session awaits selection."""
+        if self._selected_language is not None:
+            return
+        audio = self._language_menu_audio
+        if audio is None:
+            audio = _load_smartpbx_language_menu_audio()
+        logger.info("smartpbx_media event=language_menu_audio_started")
+        await self._transport.send_audio(audio)
+        if self._selected_language is not None:
+            return
+        await self._transport.send_mark("language-menu")
 
     async def _activate_language(
         self,
