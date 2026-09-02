@@ -153,8 +153,9 @@ direct SmartPBX-only choice: Twilio behavior is unchanged.
 Press 1 keeps the English Azure STT -> Claude -> ElevenLabs pipeline. Press
 2 uses Azure `si-LK` -> Gemini `gemini-3.7-flash` at thinking level `low`
 with a separate `600`-token ceiling -> Gemini
-`gemini-3.1-flash-tts-preview` / `Vindemiatrix`. The Sinhala menu segment is
-also Gemini TTS and remains part of the bilingual menu before selection.
+`gemini-3.1-flash-tts-preview` / `Vindemiatrix`. The bilingual prompt before
+selection is the reviewed static μ-law asset documented below; neither menu
+segment makes a live TTS request.
 
 The Gemini credential check is no-output and stripped: exactly one active,
 nonblank `GEMINI_API_KEY` is required before exposing the bilingual menu,
