@@ -104,6 +104,12 @@ def test_dockerfile_copies_the_neutral_diagnostics_module_for_runtime_imports():
     assert "smartpbx_diagnostics.py" in copy_line
 
 
+def test_dockerfile_packages_the_static_smartpbx_language_menu_audio():
+    dockerfile = read_text("Dockerfile")
+
+    assert "COPY smartpbx_language_menu.ulaw ./" in dockerfile
+
+
 def test_nginx_exposes_only_the_bounded_smartpbx_surface_with_tls():
     nginx = read_text("nginx-smartpbx.conf")
 

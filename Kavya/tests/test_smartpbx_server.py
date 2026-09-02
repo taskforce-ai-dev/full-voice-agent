@@ -3,12 +3,14 @@
 import asyncio
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from smartpbx_protocol import CallContext, MediaFormat
 from smartpbx_session import KavyaSmartPBXSession
+import smartpbx_session
 
 
 class FakeTransport:
@@ -585,6 +587,52 @@ async def test_default_smartpbx_welcome_reuses_kavya_english_greeting():
     assert pipeline.spoken == menu_segments + [
         server.LANGUAGE_CONFIGS["en"]["welcome_greeting"]
     ]
+
+
+@pytest.mark.asyncio
+async def test_language_menu_sends_pre_generated_audio_without_live_tts(monkeypatch):
+    asset = b"\xff" * 2400 + b"\x7f" * 160
+    monkeypatch.setattr(
+        smartpbx_session,
+        "_load_smartpbx_language_menu_audio",
+        lambda: asset,
+        raising=False,
+    )
+    pipeline = FakePipeline()
+    transport = FakeTransport()
+    session = KavyaSmartPBXSession(
+        context(),
+        transport,
+        pipeline=pipeline,
+        stt_factory=lambda **_kwargs: FakeSTT(),
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0),
+        welcome_text=None,
+        llm_provider="claude",
+        model="test-model",
+    )
+
+    await session.start()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    try:
+        assert transport.audio == [asset]
+        assert transport.marks == ["language-menu"]
+        assert pipeline.spoken == []
+    finally:
+        await session.finish(False)
+
+
+def test_language_menu_asset_has_exact_300ms_lead_and_wire_frame_alignment():
+    asset_path = Path(smartpbx_session.__file__).with_name(
+        "smartpbx_language_menu.ulaw"
+    )
+
+    assert asset_path.exists()
+    asset = asset_path.read_bytes()
+    assert len(asset) > 2400
+    assert len(asset) % 160 == 0
+    assert asset[:2400] == b"\xff" * 2400
+    assert asset[2400:2560] != b"\xff" * 160
 
 
 @pytest.mark.asyncio
