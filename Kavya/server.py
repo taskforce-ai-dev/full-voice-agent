@@ -8942,6 +8942,7 @@ class MediaStreamSession:
                             # outcome fence/retry/recovery it; never replay
                             # it through Claude.  Local response/TTS/history
                             # errors cannot carry this adapter-only marker.
+                            await _restore_deferred_sinhala_sentences()
                             saw_terminal_metadata = False
                         elif direct_sinhala:
                             # Local processing exceptions must remain local:
