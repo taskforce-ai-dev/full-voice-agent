@@ -3451,6 +3451,11 @@ def test_smartpbx_status_requires_the_shared_token():
         {"X-Kavya-SmartPBX-Token": "wrong-token12"},
         {"X-Kavya-SmartPBX-Token": "status-toke"},
         {"X-Kavya-SmartPBX-Token": "status-tokenn"},
+        # Starlette decodes header bytes as latin-1, so a header byte >= 0x80
+        # arrives here as a non-ASCII str. secrets.compare_digest raises
+        # TypeError on non-ASCII str operands — this must still be an
+        # ordinary 401, not an unhandled exception.
+        {"X-Kavya-SmartPBX-Token": "caf\xe9-status-token"},
     ):
         with pytest.raises(HTTPException) as raised:
             status(_fake_request(headers))

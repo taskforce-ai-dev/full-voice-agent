@@ -88,7 +88,17 @@ class SmartPBXSettings:
         return bool(self.token and self.account_id)
 
     def token_matches(self, candidate: str) -> bool:
-        return isinstance(candidate, str) and bool(self.token) and secrets.compare_digest(self.token, candidate)
+        # Starlette decodes header bytes as latin-1, so a header byte >= 0x80
+        # arrives here as a non-ASCII str. secrets.compare_digest raises
+        # TypeError on non-ASCII str operands; reject before calling it so a
+        # crafted header is an ordinary 401/AUTHENTICATION rejection, not an
+        # unhandled exception (500 / INTERNAL_ERROR diagnostic).
+        return (
+            isinstance(candidate, str)
+            and candidate.isascii()
+            and bool(self.token)
+            and secrets.compare_digest(self.token, candidate)
+        )
 
 
 class SessionLease:

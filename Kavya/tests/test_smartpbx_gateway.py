@@ -114,6 +114,18 @@ def test_settings_default_to_the_kavya_token_header_and_documented_bounds():
     assert "test-token" not in repr(configuration)
 
 
+def test_token_matches_rejects_non_ascii_candidate_without_raising():
+    # secrets.compare_digest raises TypeError on a non-ASCII str operand.
+    # Starlette decodes header bytes as latin-1, so a header byte >= 0x80
+    # arrives here as a non-ASCII str — token_matches must reject it as an
+    # ordinary mismatch, not let the TypeError escape as an internal fault.
+    configuration = settings()
+
+    assert configuration.token_matches("caf\xe9-not-ascii") is False
+    assert configuration.token_matches("test-token") is True
+    assert configuration.token_matches("wrong-token") is False
+
+
 def test_startup_preroll_setting_defaults_to_zero_accepts_two_seconds_and_rejects_unsafe_values():
     assert settings().startup_preroll_ms == 0
     assert SmartPBXSettings.from_env({"ENABLE_SMARTPBX_WSS": "false"}).startup_preroll_ms == 0
@@ -430,7 +442,17 @@ def fixed_diagnostics(caplog):
         ([], SmartPBXSettings.from_env({"ENABLE_SMARTPBX_WSS": "false"}), "test-token",
          ("schema_admission", "rejected", "disabled")),
         ([], None, "wrong-token", ("schema_admission", "rejected", "authentication")),
+        # Non-ASCII candidate: secrets.compare_digest raises TypeError on a
+        # non-ASCII str operand; token_matches must reject before calling it
+        # so this is an ordinary AUTHENTICATION rejection, not INTERNAL_ERROR.
+        ([], None, "caf\xe9-not-ascii", ("schema_admission", "rejected", "authentication")),
         (['{'], None, "test-token", ("schema_admission", "rejected", "invalid_message")),
+        # RecursionError from the JSON decoder on deeply nested input, and
+        # UnicodeEncodeError from a lone surrogate, must both be reported as
+        # an ordinary invalid_message, not surface via the gateway's generic
+        # exception handler as INTERNAL_ERROR/1011.
+        (["[" * 10000 + "0" + "]" * 10000], None, "test-token", ("schema_admission", "rejected", "invalid_message")),
+        (["\ud800"], None, "test-token", ("schema_admission", "rejected", "invalid_message")),
         ([START, {"event": "stop"}], None, "test-token",
          [("session_start", "completed", "none"), ("terminal_cleanup", "completed", "none")]),
         ([START, {"event": "dtmf", "dtmf": {"callId": "call-1", "otherLegCallId": "other-1", "digit": "5"}}, {"event": "stop"}],
