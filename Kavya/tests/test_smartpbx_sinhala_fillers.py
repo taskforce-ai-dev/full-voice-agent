@@ -347,3 +347,57 @@ def test_a_spoken_initial_filler_suppresses_the_sinhala_tool_filler():
         "check_availability",
         text_content="", filler_sent=True, initial_filler=None,
     )
+
+
+# --- A1 x A7: the new Sinhala filler must not survive a discarded round -----
+
+def test_a_cached_sinhala_filler_is_retired_by_a_max_tokens_discard(monkeypatch):
+    """The Sinhala path now arms a filler, so the discard fence must retire it.
+
+    A filler left running across a `max_tokens_truncated` discard would speak
+    over the retry's answer with nothing left able to cancel it.
+    """
+    from tests.test_gemini_streaming import (
+        _empty_chunk, _session, _terminal_chunk, _text_chunk,
+    )
+    from tests.test_smartpbx_server import bind_direct_smartpbx_turn
+
+    server._store_cached_smartpbx_sinhala_phrase_audio(
+        server.SMARTPBX_SINHALA_INITIAL_FILLER_TEXT, b"\xff" * 640,
+    )
+    monkeypatch.setattr(server, "SMARTPBX_INITIAL_FILLER_DELAY_SECONDS", 0.0)
+
+    answer = "සම්පූර්ණ පිළිතුර."
+    session, spoken = _session(
+        [
+            [_text_chunk("පළමු වාක්‍යය. "), _empty_chunk("MAX_TOKENS")],
+            [_text_chunk(answer), _terminal_chunk()],
+        ],
+        lang="si",
+        smartpbx=True,
+        terminalize_direct_rounds=False,
+    )
+
+    controllers = []
+    real_start = session._start_initial_smartpbx_filler
+
+    def spy(**kwargs):
+        controller = real_start(**kwargs)
+        if controller is not None:
+            controllers.append(controller)
+        return controller
+
+    session._start_initial_smartpbx_filler = spy
+
+    async def scenario():
+        bind_direct_smartpbx_turn(server, session)
+        return await session._run_llm_gemini()
+
+    result = asyncio.run(scenario())
+
+    assert controllers, "a prewarmed process must arm the Sinhala initial filler"
+    assert controllers[0]._task.done()
+    assert session._smartpbx_initial_filler is None
+    assert result == answer
+    assert spoken[-1] == answer
+    assert not any("සමාවෙන්න" in text for text in spoken)
