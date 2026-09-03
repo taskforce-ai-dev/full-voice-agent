@@ -52,6 +52,45 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 # --- Error tracking (Sentry): no-op unless SENTRY_DSN is set ---
+# `_sentry_before_send`/`_SENTRY_LOGGABLE_DIGITS` are defined unconditionally
+# (not inside the `if`) so they stay importable/testable even when SENTRY_DSN
+# is unset, and so `sentry_sdk.init(before_send=...)` below can reference them
+# without a forward-reference problem.
+import re
+
+# A digit run this long or longer is a phone number or booking reference;
+# never let it reach Sentry via a breadcrumb message. Same threshold as
+# smartpbx_mcp._LOGGABLE_DIGITS (kept independent here: this module's Sentry
+# setup runs before the rest of this file's imports and must not import
+# smartpbx_mcp, which pulls in httpx, this early).
+_SENTRY_LOGGABLE_DIGITS = re.compile(r"[0-9]{5,}")
+
+
+def _sentry_before_send(event: dict, _hint: dict) -> dict:
+    """Privacy scrubber: drop extra/contexts wholesale, drop digit-bearing breadcrumbs.
+
+    Frame local variables are already disabled via `include_local_variables=False`
+    on init; this covers the two remaining ad hoc channels an exception handler
+    or an instrumented library can use to smuggle transcript text, tool
+    arguments, or a caller's phone number into a Sentry event.
+    """
+    event.pop("extra", None)
+    event.pop("contexts", None)
+    breadcrumbs = event.get("breadcrumbs")
+    values = breadcrumbs.get("values") if isinstance(breadcrumbs, dict) else None
+    if isinstance(values, list):
+        breadcrumbs["values"] = [
+            crumb
+            for crumb in values
+            if not (
+                isinstance(crumb, dict)
+                and isinstance(crumb.get("message"), str)
+                and _SENTRY_LOGGABLE_DIGITS.search(crumb["message"])
+            )
+        ]
+    return event
+
+
 if os.getenv("SENTRY_DSN"):
     import sentry_sdk
 
@@ -61,11 +100,13 @@ if os.getenv("SENTRY_DSN"):
         environment=os.getenv("SENTRY_ENV", "production"),
         send_default_pii=os.getenv("SENTRY_SEND_PII", "false").lower() == "true",
         enable_logs=os.getenv("SENTRY_ENABLE_LOGS", "true").lower() == "true",
+        include_local_variables=False,
+        max_request_body_size="never",
+        before_send=_sentry_before_send,
     )
     sentry_sdk.set_tag("agent", "kavya")
 
 import queue
-import re
 import threading
 import time
 import wave
