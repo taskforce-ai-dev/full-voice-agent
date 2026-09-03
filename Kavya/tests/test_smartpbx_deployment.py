@@ -46,6 +46,10 @@ def test_kavya_smartpbx_is_loopback_only_and_uses_its_own_port():
 
     assert service["profiles"] == ["smartpbx"]
     assert service["image"] == "ghcr.io/taskforce-ai-dev/kavya:${SMARTPBX_IMAGE_TAG:-disabled}"
+    # Membership alone (`in`) is satisfied by a second, additional binding
+    # such as `0.0.0.0:8006:8000` -- pin there is exactly one published
+    # port so a public bind can never sneak in alongside the loopback one.
+    assert len(service["ports"]) == 1
     assert "127.0.0.1:8006:8000" in service["ports"]
     assert service["environment"]["KAVYA_SERVICE_MODE"] == "smartpbx"
     assert service["environment"]["ENABLE_SMARTPBX_WSS"] == "true"
@@ -2352,6 +2356,10 @@ def test_smartpbx_runbook_uses_the_guarded_smartpbx_image_deploy_helper():
 
 
 
+@pytest.mark.skipif(
+    not Path("/usr/bin/jq").exists(),
+    reason="the fake jq wrapper shells out to a hardcoded /usr/bin/jq",
+)
 def test_smartpbx_image_deploy_functions_fail_closed_under_fake_path(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -2391,6 +2399,16 @@ class FakeDeployHost:
     candidate = "sha256:" + "c" * 64
 
     def __init__(self, tmp_path, **state):
+        # Every consumer of this fake host shells out through real `sudo -n`
+        # (passwordless sudo required) and a `jq` wrapper that hard-codes
+        # /usr/bin/jq -- both host dependencies, unguarded before, that are
+        # present on CI's ubuntu runner but not necessarily on a laptop
+        # (audit-tests.md sec 4.2). Skip at this single choke point instead
+        # of decorating every one of this fixture's callers individually.
+        if shutil.which("sudo") is None:
+            pytest.skip("passwordless sudo is required by the fake deploy host")
+        if not Path("/usr/bin/jq").exists():
+            pytest.skip("/usr/bin/jq is required by the fake deploy host")
         self.root, self.bin, self.app = tmp_path, tmp_path / "bin", tmp_path / "app"
         self.bin.mkdir(); self.app.mkdir()
         (self.app / ".env").write_text("SENTINEL_LOCAL_SECRET\n", encoding="utf-8")
@@ -2666,8 +2684,13 @@ def test_deploy_signals_after_mutation_roll_back_once(tmp_path, signal_name):
     assert process.returncode != 0 and host.compose_count() == 2
 
 
-@pytest.mark.parametrize("attempt", range(10))
+@pytest.mark.parametrize("attempt", range(2))
 def test_traps_precede_arming_and_second_signal_cannot_interrupt_rollback(tmp_path, attempt):
+    # `attempt` is otherwise unused; it exists only to repeat this real
+    # sudo+SIGTERM+SIGINT process race a few times to catch flakiness in
+    # trap-arming ordering. 10 reps cost ~3.3-5.6s each (audit-tests.md
+    # sec 4.1, ~45s of the whole `-k smartpbx` subset for no added
+    # confidence beyond a couple of reps) -- trimmed to 2.
     script = read_smartpbx_image_deploy_script()
     arm = script.split("arm_rollback()", 1)[1].split("disarm_rollback()", 1)[0]
     assert arm.find("trap 'on_error") < arm.find("ROLLBACK_ARMED=1")
@@ -3296,6 +3319,10 @@ def test_sinhala_smartpbx_runbook_documents_the_llm_tts_and_transaction_contract
     assert re.search(r"(?m)^.*docker compose.*\brestart\b", transaction) is None
 
 
+@pytest.mark.skipif(
+    shutil.which("docker") is None,
+    reason="this test renders the real docker-compose.yml through a real `docker compose config`",
+)
 def test_smartpbx_sinhala_llm_rendered_compose_and_protected_template_contract(tmp_path):
     # Use an isolated project directory. Never let Compose discover the real
     # repository .env, .env.smartpbx, Docker configuration, or any secret.

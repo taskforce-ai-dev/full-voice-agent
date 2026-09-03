@@ -915,11 +915,18 @@ async def test_smartpbx_disabled_transfer_never_reports_legacy_transferring(capl
 
     token = smartpbx_transfer_context.set(SmartPBXTransferContext(call_control=None))
     try:
-        result = await execute_tool("transfer_to_human", {"reason": "sensitive reason"})
+        with caplog.at_level(logging.INFO, logger="tools"):
+            result = await execute_tool("transfer_to_human", {"reason": "sensitive reason"})
     finally:
         smartpbx_transfer_context.reset(token)
 
     assert result == '{"status": "unavailable"}'
+    # Prove the negative assertion below actually means something: without
+    # `caplog.at_level` above, INFO records (tools.py logs execute_tool's
+    # entry at INFO) are never captured at all and `caplog.text` is simply
+    # empty -- "sensitive reason" not in caplog.text would then pass
+    # vacuously whether or not the tool ever logs a caller-supplied reason.
+    assert "smartpbx_tool event=execute tool=transfer_to_human" in caplog.text
     assert "sensitive reason" not in caplog.text
 
 

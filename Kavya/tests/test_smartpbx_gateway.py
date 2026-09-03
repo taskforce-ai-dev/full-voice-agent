@@ -475,6 +475,14 @@ async def test_gateway_four_calls_have_unique_opaque_correlations(caplog):
     assert all(__import__("re").fullmatch(r"spx-[0-9a-f]{32}", value) for value in correlations)
 
 
+# Module-scope placeholder so constructing any of the _Fault* classes below
+# before either test that sets a real value (via `global _FAULT_STATE`) never
+# raises a bare NameError -- unsafe under `-p xdist`/`--random-order`, or
+# simply from any future test in this file that instantiates one of them
+# during collection or in a different order (audit-tests.md sec 4.6).
+_FAULT_STATE: dict = {}
+
+
 class _FaultTransport:
     def __init__(self, _websocket, _context, *, max_queue_frames, on_frame_dropped=None):
         self.close_calls = 0
@@ -647,11 +655,31 @@ async def test_gateway_completed_call_is_not_degraded_when_the_peer_already_clos
 async def test_gateway_close_fault_on_an_uncompleted_call_is_still_degraded(caplog):
     # A close that fails on a call that did NOT complete cleanly is a genuine
     # degradation and must still be flagged.
+    #
+    # This used to feed a socket that goes silent forever after the
+    # unsupported event, forcing the gateway to sit out the real
+    # SMARTPBX_IDLE_TIMEOUT_SECONDS default (90s) before it could observe
+    # the idle-timeout exit path -- 90.09s measured, ~35% of the whole
+    # `-k smartpbx` subset's wall time (audit-tests.md sec 4.1). Two
+    # independent speedups, either of which alone would already avoid the
+    # 90s wait: the configured idle timeout is dropped to the settings
+    # floor (10s, see SMARTPBX_IDLE_TIMEOUT_SECONDS's clamp), and the
+    # socket raises the timeout explicitly on its next receive instead of
+    # blocking on a never-resolving Future -- so `_receive_or_terminal`'s
+    # `asyncio.wait(..., timeout=idle_timeout_seconds)` finds the receive
+    # task already done and returns immediately (FIRST_COMPLETED) rather
+    # than actually waiting out the timeout window. This reaches the exact
+    # same `except asyncio.TimeoutError` / IDLE_TIMEOUT diagnostic path a
+    # real idle timeout would, in effectively zero wall-clock time.
     registry = SmartPBXSessionRegistry(4)
-    socket = _CloseFaultWebSocket([START, {"event": "future-event"}])
+    socket = _CloseFaultWebSocket(
+        [START, {"event": "future-event"}, asyncio.TimeoutError()]
+    )
     factory = Factory()
     with caplog.at_level("INFO"):
-        await SmartPBXGateway(settings(), registry).handle(socket, factory)
+        await SmartPBXGateway(settings(SMARTPBX_IDLE_TIMEOUT_SECONDS="10"), registry).handle(
+            socket, factory
+        )
     assert socket.close_attempts == 1
     tuples = [(r["stage"], r["outcome"], r["failure_class"]) for r in fixed_diagnostics(caplog)]
     assert ("terminal_cleanup", "degraded", "websocket_close") in tuples
