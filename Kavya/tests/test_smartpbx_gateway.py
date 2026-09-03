@@ -136,6 +136,29 @@ def test_startup_preroll_setting_defaults_to_zero_accepts_two_seconds_and_reject
             settings(SMARTPBX_STARTUP_PREROLL_MS=value)
 
 
+def test_blank_bounded_integer_settings_fall_back_to_the_code_default_like_absent():
+    """P1-4: a key present but blank (an unset compose ``${VAR:-default}``
+    passthrough) must resolve exactly like a missing key, not crash-loop."""
+    defaults = settings()
+    blank = settings(
+        SMARTPBX_MAX_MESSAGE_CHARS="",
+        SMARTPBX_MAX_AUDIO_BYTES="",
+        SMARTPBX_MAX_OUTBOUND_FRAMES="",
+        SMARTPBX_START_TIMEOUT_SECONDS="",
+        SMARTPBX_IDLE_TIMEOUT_SECONDS="",
+        SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS="",
+    )
+    assert blank.max_message_chars == defaults.max_message_chars == 65536
+    assert blank.max_audio_bytes == defaults.max_audio_bytes == 32768
+    assert blank.max_outbound_frames == defaults.max_outbound_frames == 512
+    assert blank.start_timeout_seconds == defaults.start_timeout_seconds == 10
+    assert blank.idle_timeout_seconds == defaults.idle_timeout_seconds == 90
+    assert blank.transfer_pending_timeout_seconds == defaults.transfer_pending_timeout_seconds == 300
+    # An actually-invalid nonblank value must still fail closed.
+    with pytest.raises(ValueError):
+        settings(SMARTPBX_START_TIMEOUT_SECONDS="not-a-number")
+
+
 @pytest.mark.asyncio
 async def test_gateway_checks_token_before_accepting():
     _, registry, socket, factory = await run([], token="wrong-token")

@@ -150,6 +150,28 @@ def test_endpoint_alone_cannot_enable_transfer():
     assert configuration.transfer_destinations == {}
 
 
+def test_blank_bounded_limits_fall_back_to_the_code_default_like_absent():
+    """P1-4: a key present but blank (an unset compose ``${VAR:-default}``
+    passthrough) must resolve exactly like a missing key -- otherwise
+    ``invalid_limits`` silently disables transfer even with a valid
+    URL/key/destinations configured."""
+    configuration = settings(
+        SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS="",
+        SMARTPBX_MCP_READ_TIMEOUT_SECONDS="",
+        SMARTPBX_MCP_MAX_RESPONSE_BYTES="",
+        SMARTPBX_MCP_RETRIES="",
+    )
+
+    assert configuration.failure is None
+    assert configuration.enabled is True
+    assert configuration.connect_timeout_seconds == 5
+    assert configuration.read_timeout_seconds == 15
+    assert configuration.max_response_bytes == 1048576
+    assert configuration.retries == 1
+    # An actually-invalid nonblank value must still fail closed.
+    assert settings(SMARTPBX_MCP_RETRIES="not-a-number").failure == "invalid_limits"
+
+
 def test_secret_and_destinations_do_not_appear_in_settings_repr():
     rendered = repr(settings())
 

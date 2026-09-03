@@ -71,7 +71,11 @@ class SmartPBXSettings:
             return cls(False, "", "", **_default_integer_settings(), auth_header_name=header)
         token, account_id = environ.get("SMARTPBX_WS_TOKEN", ""), environ.get("SMARTPBX_ACCOUNT_ID", "")
         values = {
-            attribute: _parse_bounded_integer(environ.get(name, str(default)), minimum, maximum)
+            # A key present but blank (e.g. an unset compose passthrough with a
+            # ``:-`` default of "") must resolve to the default exactly like a
+            # missing key -- otherwise a single omitted .env line crash-loops
+            # the container instead of falling back.
+            attribute: _parse_bounded_integer(environ.get(name) or str(default), minimum, maximum)
             for name, (attribute, default, minimum, maximum) in _INTEGER_SETTINGS.items()
         }
         if not isinstance(token, str) or not isinstance(account_id, str):

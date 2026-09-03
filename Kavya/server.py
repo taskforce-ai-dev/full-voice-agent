@@ -96,7 +96,11 @@ if os.getenv("SENTRY_DSN"):
 
     sentry_sdk.init(
         dsn=os.getenv("SENTRY_DSN"),
-        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+        # A key present but blank (e.g. an unset compose
+        # ``${SENTRY_TRACES_SAMPLE_RATE:-0.0}`` passthrough) must resolve to the
+        # default exactly like a missing key -- float("") would otherwise raise
+        # at import and crash-loop the container whenever SENTRY_DSN is set.
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE") or "0.0"),
         environment=os.getenv("SENTRY_ENV", "production"),
         send_default_pii=os.getenv("SENTRY_SEND_PII", "false").lower() == "true",
         enable_logs=os.getenv("SENTRY_ENABLE_LOGS", "true").lower() == "true",
@@ -526,7 +530,9 @@ AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "southeastasia")
 
 # Media Streams STT backend: "google" (default) or "azure".
 # Azure reuses AZURE_SPEECH_KEY / AZURE_SPEECH_REGION (already set for Sinhala TTS).
-STT_PROVIDER: str = os.getenv("STT_PROVIDER", "google").lower()
+# A key present but blank (e.g. an unset compose ``${STT_PROVIDER:-...}``
+# passthrough) must resolve to the default exactly like a missing key.
+STT_PROVIDER: str = (os.getenv("STT_PROVIDER") or "google").lower()
 
 # Debug: dump live call audio to an 8 kHz PCM16 wav for offline STT benchmarking.
 STT_DEBUG_DUMP: bool = os.getenv("STT_DEBUG_DUMP", "0") == "1"
@@ -541,7 +547,10 @@ SMARTPBX_PILOT_TRANSCRIPT_LOGGING: bool = (
 )
 
 # LLM provider selection: "claude" (default), "openai", or "gemini"
-LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "claude")
+# A key present but blank (e.g. an unset compose ``${LLM_PROVIDER:-claude}``
+# passthrough) must resolve to the default exactly like a missing key --
+# otherwise the OpenAI branch is silently selected with MODEL="".
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER") or "claude"
 CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
