@@ -2323,6 +2323,43 @@ def test_generic_deploy_workflows_pin_every_action_to_a_full_commit_sha(workflow
         assert f"uses: {reference} # {expected_version}\n" in text, reference
 
 
+def test_dep_audit_workflow_audits_kavyas_lock_file_and_blocks_only_kavya():
+    workflow = (PROJECT_ROOT.parent / ".github/workflows/dep-audit.yml").read_text(encoding="utf-8")
+    document = yaml.load(workflow, Loader=yaml.BaseLoader)
+
+    # Kavya's advisory-vs-enforced split: every other agent stays advisory
+    # (continue-on-error), Kavya is blocking. The matrix carries all 8 agent
+    # names; continue-on-error is now a per-entry expression, not a bare bool.
+    audit_job = document["jobs"]["audit"]
+    assert audit_job["continue-on-error"] == "${{ matrix.dir != 'Kavya' }}"
+    assert set(audit_job["strategy"]["matrix"]["dir"]) == {
+        "BSL Agent", "Flico Agent", "HattonHills", "Kavya",
+        "Kitchened", "SLIC Agent", "Sofia Agent", "WorldOfRefrigerators",
+    }
+
+    step = next(
+        step for step in audit_job["steps"] if step.get("name") == "Audit pinned dependencies"
+    )
+    run = step["run"]
+    # Kavya is audited from the exact lock file its Dockerfile installs, not
+    # the loose requirements-prod.txt ranges pip-audit would otherwise
+    # silently re-resolve to the latest matching versions.
+    assert 'req="$dir/requirements-prod.lock.txt"' in run
+    assert 'pip-audit -r "$req" --no-deps' in run
+    assert 'if [ "$dir" = "Kavya" ]; then' in run
+    # Every other agent keeps the existing prod/base fallback, unaffected.
+    assert 'prod="$dir/requirements-prod.txt"' in run
+    assert 'base="$dir/requirements.txt"' in run
+
+    # A pull_request trigger exists, scoped to Kavya's own requirements files
+    # only -- it must not reintroduce the per-PR cost for the other 7 agents.
+    on = document["on"]
+    assert "pull_request" in on
+    assert on["pull_request"]["paths"] == ["Kavya/requirements*"]
+    assert "workflow_dispatch" in on
+    assert "schedule" in on
+
+
 SMARTPBX_IMAGE_DEPLOY_SCRIPT = PROJECT_ROOT / "scripts" / "deploy_smartpbx_image.sh"
 
 

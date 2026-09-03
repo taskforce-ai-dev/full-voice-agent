@@ -39,11 +39,15 @@ except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 try:
-    import PyPDF2
-    PYPDF2_AVAILABLE = True
+    # PyPDF2 3.0.1 (PYSEC-2026-1835, no fixed PyPDF2 release exists --
+    # 3.0.1 was PyPDF2's final version) was migrated to its actively
+    # maintained successor, pypdf, which keeps the same PdfReader /
+    # .pages / .extract_text() surface used below.
+    import pypdf
+    PYPDF_AVAILABLE = True
 except ImportError:
-    PyPDF2 = None  # type: ignore[assignment]
-    PYPDF2_AVAILABLE = False
+    pypdf = None  # type: ignore[assignment]
+    PYPDF_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -311,7 +315,7 @@ def _read_file(path: str) -> Optional[str]:
 
     Supports:
       * .txt / .md  â€” read as UTF-8 text (with latin-1 fallback).
-      * .pdf        â€” extract text via PyPDF2 (if installed).
+      * .pdf        â€” extract text via pypdf (if installed).
 
     Returns ``None`` when the file cannot be read.
     """
@@ -331,12 +335,12 @@ def _read_file(path: str) -> Optional[str]:
         return None
 
     if ext == ".pdf":
-        if not PYPDF2_AVAILABLE:
-            logger.warning("PyPDF2 not installed â€” cannot read %s", path)
+        if not PYPDF_AVAILABLE:
+            logger.warning("pypdf not installed â€” cannot read %s", path)
             return None
         try:
             with open(path, "rb") as fh:
-                reader = PyPDF2.PdfReader(fh)
+                reader = pypdf.PdfReader(fh)
                 pages = [page.extract_text() or "" for page in reader.pages]
                 return "\n".join(pages)
         except Exception as exc:
