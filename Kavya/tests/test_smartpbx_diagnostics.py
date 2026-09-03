@@ -47,7 +47,7 @@ def test_close_reason_is_an_exact_str_enum_with_stable_values():
     expected = (
         "HANGUP", "STOP", "PEER_DISCONNECT", "IDLE_TIMEOUT", "START_TIMEOUT",
         "TRANSFER_PENDING_TIMEOUT", "MAX_CALL_DURATION", "TRANSPORT_FAILURE",
-        "STT_FATAL", "PROTOCOL_VIOLATION", "PROFILE_UNAVAILABLE", "INTERNAL_ERROR",
+        "STT_FATAL", "PROTOCOL_VIOLATION", "PROFILE_UNAVAILABLE", "SHUTDOWN", "INTERNAL_ERROR",
     )
     enum_type = diagnostics.SmartPBXCloseReason
     assert issubclass(enum_type, (str, Enum))
