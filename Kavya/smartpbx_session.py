@@ -289,9 +289,38 @@ class KavyaSmartPBXSession:
         pipeline.call_start_time = self._call_start_time
         pipeline._event_loop = asyncio.get_running_loop()
         pipeline._smartpbx_diagnostic_sink = self._diagnostic_sink
+        # The selection window is opened by the menu task itself, once its last
+        # frame has actually reached the wire -- see
+        # _arm_language_selection_timeout.
         self._language_menu_task = asyncio.create_task(self._speak_language_menu())
-        loop = asyncio.get_running_loop()
-        self._language_timeout_handle = loop.call_later(
+
+    def _arm_language_selection_timeout(self) -> None:
+        """Open the selection window at the END of the menu, not at its start.
+
+        The static menu is roughly 4.4 s of paced audio inside an 8 s window.
+        Arming when playback was merely *scheduled* spent most of that window on
+        the prompt itself and cut the Sinhala half off mid-sentence -- for a
+        caller who had not yet been told which key to press. ``send_mark``
+        returns only once the last frame has reached the wire, so that is the
+        moment the caller actually has the whole window.
+
+        Idempotent and self-fencing: a replayed menu retires the previous handle
+        and opens a fresh window from its own end, and a selection or teardown
+        that has already claimed the call arms nothing.
+        """
+        import server
+
+        if (
+            self._selected_language is not None
+            or self._finish_task is not None
+            or self._terminal_future.done()
+        ):
+            return
+        handle = self._language_timeout_handle
+        self._language_timeout_handle = None
+        if handle is not None:
+            handle.cancel()
+        self._language_timeout_handle = asyncio.get_running_loop().call_later(
             server.SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS,
             lambda: asyncio.create_task(self._activate_language("en", "timeout")),
         )
@@ -315,10 +344,19 @@ class KavyaSmartPBXSession:
         if audio is None:
             audio = _load_smartpbx_language_menu_audio()
         logger.info("smartpbx_media event=language_menu_audio_started")
-        await self._transport.send_audio(audio)
-        if self._selected_language is not None:
-            return
-        await self._transport.send_mark("language-menu")
+        try:
+            await self._transport.send_audio(audio)
+            if self._selected_language is not None:
+                return
+            await self._transport.send_mark("language-menu")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A caller who never heard the menu must still have a way out of the
+            # pre-selection state: a transport fault cannot leave the call
+            # parked until the session ceiling with no timer to default it.
+            logger.warning("smartpbx_media event=language_menu_playback_failed")
+        self._arm_language_selection_timeout()
 
     async def _activate_language(
         self,

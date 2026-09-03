@@ -262,6 +262,15 @@ voice saying “සිංහල සඳහා, 2 ඔබන්න.”
 The runtime validates and caches the entire asset before starting menu
 playback. Missing, empty, oversized, misaligned, incorrectly prefixed, or
 all-silent assets fail admission before partial audio reaches the caller.
+
+`SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS` is armed from the END of menu
+playback -- after the completion mark returns, i.e. once the last frame has
+reached the wire -- not when playback is scheduled. The asset is roughly 4.4 s
+long, so arming at the start left a caller only the remainder of the window and
+cut the Sinhala half off mid-sentence. Budget the value as time the caller has
+AFTER hearing the whole menu. A replayed menu (one invalid key) opens a fresh
+window from its own end, and a menu whose playback fails still opens one, so a
+transport fault cannot park the call in the pre-selection state.
 Changing the wording or either voice requires regenerating the asset once with
 protected provider credentials, verifying the same wire contract, reviewing
 the resulting audio, and shipping it in a new image. Never generate this menu

@@ -989,3 +989,112 @@ async def test_second_invalid_english_profile_preserves_provider_clients_and_too
     assert pipeline.tools == expected_tools
     assert pipeline.tools is not original_tools
     assert pipeline.tools[0] is not original_tools[0]
+
+
+class GatedMenuTransport(RecordingTransport):
+    """A transport whose completion mark can be held mid-playback."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mark_entered = asyncio.Event()
+        self.mark_release = asyncio.Event()
+
+    async def send_mark(self, name: str) -> None:
+        self.mark_entered.set()
+        await self.mark_release.wait()
+        await super().send_mark(name)
+
+
+def make_gated_menu_session():
+    pipeline = RecordingPipeline()
+    transport = GatedMenuTransport()
+    session = KavyaSmartPBXSession(
+        _context(),
+        transport,
+        pipeline=pipeline,
+        stt_factory=lambda **_kwargs: RecordingStt(),
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0),
+        welcome_text="",
+        llm_provider="claude",
+        model="test-model",
+    )
+    return session, transport
+
+
+@pytest.mark.asyncio
+async def test_language_timeout_is_armed_only_once_the_menu_has_finished_playing():
+    """The static menu is ~4.4 s of paced audio inside an 8 s window.
+
+    Arming when playback is merely scheduled spent most of the window on the
+    prompt itself and cut the Sinhala half off mid-sentence -- for a caller who
+    had not yet been told which key to press. ``send_mark`` returns only once
+    the last frame is on the wire, so that is when the caller actually has the
+    window.
+    """
+    session, transport = make_gated_menu_session()
+
+    await session.start()
+    await asyncio.wait_for(transport.mark_entered.wait(), timeout=1)
+
+    assert session._language_timeout_handle is None, (
+        "the selection window must not open while the menu is still playing"
+    )
+
+    transport.mark_release.set()
+    await asyncio.wait_for(
+        asyncio.shield(session._language_menu_task), timeout=1,
+    )
+
+    handle = session._language_timeout_handle
+    assert handle is not None
+    handle.cancel()
+    session._language_timeout_handle = None
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_menu_reopens_the_selection_window_from_its_own_end():
+    session, _pipeline, _stt = make_session()
+
+    await session.start()
+    await asyncio.sleep(0)
+    first = session._language_timeout_handle
+    assert first is not None
+
+    assert await session.feed_dtmf("#") is True
+    await asyncio.sleep(0)
+
+    second = session._language_timeout_handle
+    assert second is not None and second is not first
+    assert first.cancelled()
+    second.cancel()
+    session._language_timeout_handle = None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_menu_playback_still_opens_the_selection_window():
+    """A caller who never heard the menu must still leave the pre-selection
+    state; a transport fault cannot hang the call to the session ceiling."""
+
+    class FailingTransport(RecordingTransport):
+        async def send_audio(self, audio: bytes) -> None:
+            raise RuntimeError("synthetic transport failure")
+
+    pipeline = RecordingPipeline()
+    session = KavyaSmartPBXSession(
+        _context(),
+        FailingTransport(),
+        pipeline=pipeline,
+        stt_factory=lambda **_kwargs: RecordingStt(),
+        post_call_processor=lambda **_kwargs: asyncio.sleep(0),
+        welcome_text="",
+        llm_provider="claude",
+        model="test-model",
+    )
+
+    await session.start()
+    await asyncio.sleep(0)
+
+    handle = session._language_timeout_handle
+    assert handle is not None
+    handle.cancel()
+    session._language_timeout_handle = None
