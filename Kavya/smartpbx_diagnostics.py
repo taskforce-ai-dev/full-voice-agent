@@ -49,6 +49,8 @@ class DiagnosticFailureClass(StrEnum):
     SESSION_START = "session_start"
     AUDIO_INGESTION = "audio_ingestion"
     STT_UNAVAILABLE = "stt_unavailable"
+    GEMINI_API_KEY_MISSING = "gemini_api_key_missing"
+    PROFILE_UNAVAILABLE = "profile_unavailable"
     TTS_MISSING_API_KEY = "tts_missing_api_key"
     TTS_PROFILE_FAILURE = "tts_profile_failure"
     TTS_HTTP_STATUS = "tts_http_status"

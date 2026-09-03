@@ -831,6 +831,9 @@ class _LifecycleSession:
         self.terminal_future = asyncio.get_running_loop().create_future()
         self.finishes = []
         self.close_reasons = []
+        # A session-internal terminal failure (audit #10) records this before
+        # resolving terminal_future; None means the ordinary completed path.
+        self.close_reason = None
     async def start(self):
         if self.start_error:
             raise self.start_error
@@ -1136,3 +1139,74 @@ async def test_start_timeout_never_creates_a_session_to_carry_a_close_reason():
     )
     assert factory.sessions == []
     assert socket.close_calls == [(POLICY_VIOLATION, "start timeout")]
+
+
+# ---------------------------------------------------------------------------
+# C3 -- profile/credential failures must close 1011, not look like hangups
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_session_internal_profile_failure_closes_1011_not_completed(caplog):
+    """audit #10: the session resolves terminal_future itself (no socket
+    message) after a profile preflight failure. The gateway must read the
+    session's own recorded close_reason and close 1011, not treat it as an
+    ordinary completed hangup."""
+    caplog.set_level(logging.INFO)
+    factory = _LifecycleFactory()
+    registry = SmartPBXSessionRegistry(4)
+    socket = FakeWebSocket([START])
+    task = asyncio.create_task(SmartPBXGateway(settings(), registry).handle(socket, factory))
+    try:
+        await asyncio.wait_for(factory.session_ready.wait(), timeout=.2)
+        factory.session.close_reason = "profile_unavailable"
+        factory.session.terminal_future.set_result(None)
+        await asyncio.wait_for(task, timeout=.2)
+        assert socket.close_calls == [(1011, "internal error")]
+        assert factory.session.finishes == [True]
+        # finish()'s own close_reason argument is left None here -- it falls
+        # back to whatever the session already recorded on itself.
+        assert factory.session.close_reasons == [(None, None)]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_session_internal_stt_fatal_closes_1011_not_completed():
+    factory = _LifecycleFactory()
+    registry = SmartPBXSessionRegistry(4)
+    socket = FakeWebSocket([START])
+    task = asyncio.create_task(SmartPBXGateway(settings(), registry).handle(socket, factory))
+    try:
+        await asyncio.wait_for(factory.session_ready.wait(), timeout=.2)
+        factory.session.close_reason = "stt_fatal"
+        factory.session.terminal_future.set_result(None)
+        await asyncio.wait_for(task, timeout=.2)
+        assert socket.close_calls == [(1011, "internal error")]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_terminal_future_completion_without_a_recorded_reason_still_closes_1000():
+    """A plain terminal_future completion with no session-recorded failure
+    (e.g. a test double, or any future non-failure terminal path) must keep
+    the pre-existing completed/1000 behavior -- this is the regression guard
+    for the C3 change itself."""
+    factory = _LifecycleFactory()
+    registry = SmartPBXSessionRegistry(4)
+    socket = FakeWebSocket([START])
+    task = asyncio.create_task(SmartPBXGateway(settings(), registry).handle(socket, factory))
+    try:
+        await asyncio.wait_for(factory.session_ready.wait(), timeout=.2)
+        assert factory.session.close_reason is None
+        factory.session.terminal_future.set_result(None)
+        await asyncio.wait_for(task, timeout=.2)
+        assert socket.close_calls == [(1000, "call ended")]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

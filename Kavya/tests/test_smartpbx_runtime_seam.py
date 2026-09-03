@@ -66,13 +66,14 @@ class BlockingSTT:
         time.sleep(self._block_seconds)
 
 
-def _session(pipeline) -> KavyaSmartPBXSession:
+def _session(pipeline, *, diagnostic_sink=None) -> KavyaSmartPBXSession:
     async def post(**_):
         raise AssertionError("empty transcript must not post")
 
     return KavyaSmartPBXSession(
         CONTEXT, Transport(), pipeline=pipeline, post_call_processor=post,
         welcome_text="", llm_provider="openai", model="m",
+        diagnostic_sink=diagnostic_sink,
     )
 
 
@@ -1630,3 +1631,75 @@ async def test_flush_snapshots_and_resets_per_turn_stt_event_counts(monkeypatch)
     second = next(r for r in emitted if r["event"] == "turn_summary")
     assert second["stt_interim_events"] == 1
     assert second["stt_final_events"] == 0
+
+
+# ---------------------------------------------------------------------------
+# C3 -- profile/credential failures must emit SESSION_START/FAILED/<class>
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_end_call_without_language_profile_emits_session_start_failed_diagnostic():
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    calls = []
+
+    def sink(stage, outcome, failure_class):
+        calls.append((stage, outcome, failure_class))
+
+    session = _session(Pipeline(), diagnostic_sink=sink)
+
+    session._end_call_without_language_profile()
+
+    assert calls == [
+        (DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.PROFILE_UNAVAILABLE)
+    ]
+    assert session.close_reason == "profile_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_end_call_without_language_profile_accepts_an_explicit_failure_class():
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    calls = []
+    session = _session(Pipeline(), diagnostic_sink=lambda *args: calls.append(args))
+
+    session._end_call_without_language_profile(
+        failure_class=DiagnosticFailureClass.GEMINI_API_KEY_MISSING,
+    )
+
+    assert calls == [
+        (DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.GEMINI_API_KEY_MISSING)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_end_call_without_language_profile_diagnostic_failure_never_blocks_teardown():
+    """A raising sink must not prevent the terminal future from resolving --
+    the diagnostic is best-effort observability, not load-bearing."""
+    def raising_sink(*_args):
+        raise RuntimeError("sink boom")
+
+    session = _session(Pipeline(), diagnostic_sink=raising_sink)
+
+    session._end_call_without_language_profile()
+
+    assert session.terminal_future.done()
+    assert session.close_reason == "profile_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_missing_gemini_api_key_emits_gemini_api_key_missing_diagnostic(monkeypatch):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    monkeypatch.setattr(server, "_has_gemini_api_key", lambda: False)
+    calls = []
+    session = _session(Pipeline(), diagnostic_sink=lambda *args: calls.append(args))
+
+    await session.start()
+
+    assert session.terminal_future.done()
+    assert session.close_reason == "profile_unavailable"
+    assert calls == [
+        (DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.GEMINI_API_KEY_MISSING)
+    ]

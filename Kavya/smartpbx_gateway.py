@@ -13,7 +13,8 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol
 from starlette.websockets import WebSocketDisconnect
 
 from smartpbx_diagnostics import (
-    DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage, SmartPBXDiagnosticSink,
+    DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage, SmartPBXCloseReason,
+    SmartPBXDiagnosticSink,
 )
 from smartpbx_protocol import (
     ConnectedEvent, DtmfEvent, HangupEvent, MediaEvent, POLICY_VIOLATION,
@@ -27,6 +28,13 @@ logger = logging.getLogger(__name__)
 
 SMARTPBX_PROTOCOL_VERSION = "smartpbx-ai-provider-v06"
 _MAX_COUNTER = (1 << 63) - 1
+# Session-internal terminal failures (audit #10) -- when the "raw is None"
+# branch below reads one of these back off the session, the call closes
+# 1011 instead of looking like a completed hangup.
+_SESSION_INTERNAL_FAILURE_REASONS = frozenset({
+    SmartPBXCloseReason.PROFILE_UNAVAILABLE.value,
+    SmartPBXCloseReason.STT_FATAL.value,
+})
 _INTEGER_SETTINGS = {
     "SMARTPBX_MAX_CALLS": ("max_calls", 4, 1, 4),
     "SMARTPBX_MAX_MESSAGE_CHARS": ("max_message_chars", 65536, 1024, 65536),
@@ -327,11 +335,20 @@ class SmartPBXGateway:
                 if raw is None:
                     # The session's own terminal future resolved, not the
                     # socket -- the only way that happens today is a
-                    # session-internal fatal path (profile/STT). Leave
-                    # close_reason unset so finish() falls back to whatever
-                    # the session already recorded on itself.
-                    close_outcome = (1000, "call ended")
-                    completed_normally = True
+                    # session-internal fatal path (profile/STT). Audit #10:
+                    # this used to close 1000/completed_normally regardless,
+                    # so a missing GEMINI_API_KEY or a failed preflight ended
+                    # the call looking exactly like an ordinary hangup. Read
+                    # back whatever the session already recorded on itself
+                    # (it already emitted its own SESSION_START/FAILED
+                    # diagnostic before resolving the terminal future) and
+                    # close 1011 for a real failure instead.
+                    session_reason = getattr(session, "close_reason", None)
+                    if session_reason in _SESSION_INTERNAL_FAILURE_REASONS:
+                        close_outcome = (1011, "internal error")
+                    else:
+                        close_outcome = (1000, "call ended")
+                        completed_normally = True
                     break
                 event = parse_smartpbx_event(
                     raw,

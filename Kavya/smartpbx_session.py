@@ -252,7 +252,10 @@ class KavyaSmartPBXSession:
         # before the static bilingual menu so callers cannot enter a profile
         # that cannot speak back to them.
         if not server._has_gemini_api_key():
-            self._end_call_without_language_profile()
+            from smartpbx_diagnostics import DiagnosticFailureClass
+            self._end_call_without_language_profile(
+                failure_class=DiagnosticFailureClass.GEMINI_API_KEY_MISSING,
+            )
             return
         try:
             self._language_menu_audio = _load_smartpbx_language_menu_audio()
@@ -624,13 +627,33 @@ class KavyaSmartPBXSession:
         )
 
     def _end_call_without_language_profile(
-        self, _profile: SmartPBXLanguageProfile | None = None,
+        self,
+        _profile: SmartPBXLanguageProfile | None = None,
+        *,
+        failure_class: "DiagnosticFailureClass | None" = None,
     ) -> None:
-        """Terminal profile failure is not a false generic STT-unavailable event."""
+        """Terminal profile failure is not a false generic STT-unavailable event.
+
+        Audit #10: without an explicit diagnostic here, a missing GEMINI_API_KEY
+        or a preflight failure ended the call exactly like an ordinary hangup --
+        completed_normally in the gateway, no diagnostic, no warning that
+        anything was ever wrong. Emitting SESSION_START/FAILED/<class> here
+        makes the failure observable before the terminal future resolves.
+        """
+        from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
         timeout_handle = self._language_timeout_handle
         self._language_timeout_handle = None
         if timeout_handle is not None:
             timeout_handle.cancel()
+        try:
+            self._diagnostic_sink(
+                DiagnosticStage.SESSION_START,
+                DiagnosticOutcome.FAILED,
+                failure_class if failure_class is not None else DiagnosticFailureClass.PROFILE_UNAVAILABLE,
+            )
+        except Exception:
+            pass
         if self._pending_close_reason is None:
             self._pending_close_reason = SmartPBXCloseReason.PROFILE_UNAVAILABLE.value
         if not self._terminal_future.done():
