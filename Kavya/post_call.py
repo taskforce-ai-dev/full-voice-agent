@@ -527,6 +527,10 @@ async def process_post_call_data(
     gemini_client: Any | None = None,
     model: str = "",
     privacy_safe: bool = False,
+    close_reason: str | None = None,
+    close_code: int | None = None,
+    duration_ms: int | None = None,
+    barge_ins: int | None = None,
 ) -> None:
     """Orchestrate post-call processing: extract details, POST to n8n.
 
@@ -534,6 +538,12 @@ async def process_post_call_data(
     are caught and logged -- never propagated. `privacy_safe` redacts this
     function's operational logs only; it does not change transcript retention
     or downstream payload semantics.
+
+    `close_reason`/`close_code`/`duration_ms`/`barge_ins` are optional,
+    privacy-safe (enum/count-only) fields carried from the gateway's close
+    outcome -- currently only the SmartPBX path supplies them. `guest_turns`/
+    `agent_turns` are always derived here from `full_transcript`, for every
+    caller, since they need no extra plumbing.
     """
     try:
         if privacy_safe:
@@ -569,15 +579,32 @@ async def process_post_call_data(
 
         # Build the payload
         lang_names = {"en": "English", "si": "Sinhala", "ta": "Tamil", "ar": "Arabic"}
+        guest_turns = sum(1 for entry in full_transcript if entry.get("role") == "user")
+        agent_turns = sum(1 for entry in full_transcript if entry.get("role") == "assistant")
         payload: dict[str, Any] = {
             "timestamp": call_start_time,
             "call_end_time": call_end_time,
             "call_sid": call_sid,
             "language": lang_names.get(lang, lang),
+            "language_code": lang,
             "caller_phone": caller_phone.lstrip("+") if caller_phone else caller_phone,
             "transcript": transcript_text,
+            "guest_turns": guest_turns,
+            "agent_turns": agent_turns,
             **extracted,
         }
+        # SmartPBX-only, privacy-safe (enum/count-only) close diagnostics.
+        # Extra keys are additive -- the n8n workflow reads named fields off
+        # $json.body.* and the dashboard client puts these under `metadata`,
+        # so neither breaks on unrecognized keys.
+        if close_reason is not None:
+            payload["close_reason"] = close_reason
+        if close_code is not None:
+            payload["close_code"] = close_code
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        if barge_ins is not None:
+            payload["barge_ins"] = barge_ins
 
         # POST to n8n
         await _post_to_n8n(payload, privacy_safe=privacy_safe)
@@ -609,6 +636,11 @@ async def process_post_call_data(
                     full_transcript=full_transcript,
                     extracted=extracted,
                     privacy_safe=privacy_safe,
+                    close_reason=close_reason,
+                    close_code=close_code,
+                    guest_turns=guest_turns,
+                    agent_turns=agent_turns,
+                    barge_ins=barge_ins,
                 )
             except Exception as exc:
                 if privacy_safe:

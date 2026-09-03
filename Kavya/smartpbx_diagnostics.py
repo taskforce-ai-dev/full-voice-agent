@@ -71,3 +71,24 @@ class SmartPBXDiagnosticSink(Protocol):
         outcome: DiagnosticOutcome,
         failure_class: DiagnosticFailureClass,
     ) -> None: ...
+
+
+class SmartPBXCloseReason(StrEnum):
+    """Closed vocabulary for why a SmartPBX call ended.
+
+    Carried into the session summary (`outcome`) and the post-call payload
+    (`close_reason`/`close_code`) so a call is never recorded as a plain
+    "completed" call when it actually failed closed.
+    """
+
+    HANGUP = "hangup"
+    STOP = "stop"
+    PEER_DISCONNECT = "peer_disconnect"
+    IDLE_TIMEOUT = "idle_timeout"
+    START_TIMEOUT = "start_timeout"
+    TRANSFER_PENDING_TIMEOUT = "transfer_pending_timeout"
+    TRANSPORT_FAILURE = "transport_failure"
+    STT_FATAL = "stt_fatal"
+    PROTOCOL_VIOLATION = "protocol_violation"
+    PROFILE_UNAVAILABLE = "profile_unavailable"
+    INTERNAL_ERROR = "internal_error"

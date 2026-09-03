@@ -15,6 +15,7 @@ from dataclasses import replace
 import pytest
 
 from smartpbx_gateway import SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings
+from smartpbx_protocol import POLICY_VIOLATION
 
 
 START = {"event": "start", "start": {
@@ -77,8 +78,10 @@ class Session:
     async def feed_audio(self, _audio):
         pass
 
-    async def finish(self, schedule_post_call=False):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
         self.finishes += int(schedule_post_call)
+        self.last_close_reason = close_reason
+        self.last_close_code = close_code
 
 
 def _factory(session):
@@ -147,6 +150,9 @@ async def test_transfer_pending_without_a_terminal_event_releases_the_slot(caplo
         f"the ceiling needs its own diagnostic, not idle_timeout: {failures}"
     )
     assert "idle_timeout" not in failures
+    assert (session.last_close_reason, session.last_close_code) == (
+        "transfer_pending_timeout", POLICY_VIOLATION,
+    )
 
 
 @pytest.mark.asyncio

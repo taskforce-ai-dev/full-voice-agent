@@ -60,6 +60,7 @@ class FakeSession:
         self.starts = 0
         self.audio = []
         self.finishes = []
+        self.close_reasons = []
         self.terminal_future = asyncio.get_running_loop().create_future()
 
     async def start(self):
@@ -68,8 +69,9 @@ class FakeSession:
     async def feed_audio(self, audio):
         self.audio.append(audio)
 
-    async def finish(self, schedule_post_call=False):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
         self.finishes.append(schedule_post_call)
+        self.close_reasons.append((close_reason, close_code))
 
 
 class Factory:
@@ -548,8 +550,9 @@ class _FaultSession(FakeSession):
     def __init__(self, context, transport):
         super().__init__(context, transport)
         self.finish_started = asyncio.Event()
-    async def finish(self, schedule_post_call=False):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
         self.finishes.append(schedule_post_call)
+        self.close_reasons.append((close_reason, close_code))
         self.finish_started.set()
         _FAULT_STATE["order"].append("session")
         if _FAULT_STATE["block_finish"]:
@@ -827,14 +830,16 @@ class _LifecycleSession:
         self.feed_error = feed_error
         self.terminal_future = asyncio.get_running_loop().create_future()
         self.finishes = []
+        self.close_reasons = []
     async def start(self):
         if self.start_error:
             raise self.start_error
     async def feed_audio(self, _audio):
         if self.feed_error:
             raise self.feed_error
-    async def finish(self, schedule_post_call=False):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
         self.finishes.append(schedule_post_call)
+        self.close_reasons.append((close_reason, close_code))
 class _LifecycleFactory:
     def __init__(self, *, factory_error=None, start_error=None, feed_error=None):
         self.factory_error, self.start_error, self.feed_error = factory_error, start_error, feed_error
@@ -1067,3 +1072,67 @@ async def test_gateway_dtmf_without_a_collector_hook_still_observes(caplog):
 
     tuples = [(r["stage"], r["outcome"], r["failure_class"]) for r in fixed_diagnostics(caplog)]
     assert ("context_validation", "observed", "none") in tuples
+
+
+# ---------------------------------------------------------------------------
+# C1 -- close_reason/close_code threaded from the gateway into session.finish()
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory,messages,expected",
+    [
+        (_LifecycleFactory(), [START, {"event": "stop"}], [(True, "stop", 1000)]),
+        (
+            _LifecycleFactory(),
+            [START, {"event": "hangup", "hangup": {
+                "callId": "call-1", "otherLegCallId": "other-1",
+                "accountId": "account-1", "reason": "normal",
+            }}],
+            [(True, "hangup", 1000)],
+        ),
+        (_LifecycleFactory(start_error=RuntimeError("start")), [START], [(True, "internal_error", 1011)]),
+        (
+            _LifecycleFactory(feed_error=RuntimeError("feed")),
+            [START, {"event": "media", "media": {"payload": "YQ=="}}],
+            [(True, "internal_error", 1011)],
+        ),
+        (_LifecycleFactory(), [START, WebSocketDisconnect()], [(True, "peer_disconnect", 1000)]),
+    ],
+)
+async def test_gateway_threads_close_reason_and_code_into_session_finish(factory, messages, expected):
+    _registry, _socket, factory = await _run_lifecycle(messages, factory)
+    assert factory.session is not None
+    got = [
+        (schedule, reason, code)
+        for schedule, (reason, code) in zip(factory.session.finishes, factory.session.close_reasons)
+    ]
+    assert got == expected
+
+
+@pytest.mark.asyncio
+async def test_gateway_factory_failure_never_calls_session_finish():
+    # No session was ever constructed, so there is nothing to carry a close
+    # reason into -- this must not raise.
+    registry, socket, factory = await _run_lifecycle(
+        [START], _LifecycleFactory(factory_error=RuntimeError("factory")),
+    )
+    assert factory.session is None
+    assert socket.close_calls == [(1011, "internal error")]
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_closes_with_idle_timeout_close_reason():
+    _gateway, _registry, _socket, factory = await run(
+        [START], configuration=replace(settings(), idle_timeout_seconds=0.01),
+    )
+    assert factory.sessions[0].close_reasons == [("idle_timeout", POLICY_VIOLATION)]
+
+
+@pytest.mark.asyncio
+async def test_start_timeout_never_creates_a_session_to_carry_a_close_reason():
+    _gateway, _registry, socket, factory = await run(
+        [], configuration=replace(settings(), start_timeout_seconds=0.01),
+    )
+    assert factory.sessions == []
+    assert socket.close_calls == [(POLICY_VIOLATION, "start timeout")]

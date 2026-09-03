@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
-from smartpbx_diagnostics import SmartPBXDiagnosticSink
+from smartpbx_diagnostics import SmartPBXCloseReason, SmartPBXDiagnosticSink
 from smartpbx_protocol import CallContext
 from smartpbx_transport import SmartPBXMediaTransport
 
@@ -27,6 +27,14 @@ _LANGUAGE_MENU_AUDIO_PATH = Path(__file__).with_name("smartpbx_language_menu.ula
 _ULAW_FRAME_BYTES = 160
 _LANGUAGE_MENU_PREROLL_BYTES = 2_400
 _MAX_LANGUAGE_MENU_FRAMES = 512
+_CLOSE_REASONS = frozenset(reason.value for reason in SmartPBXCloseReason)
+
+
+def _resolve_close_reason(reason: str | None) -> str:
+    """Clamp to the closed vocabulary; an unrecognized/missing value is internal_error."""
+    if isinstance(reason, str) and reason in _CLOSE_REASONS:
+        return reason
+    return SmartPBXCloseReason.INTERNAL_ERROR.value
 
 
 @functools.lru_cache(maxsize=1)
@@ -154,6 +162,14 @@ class KavyaSmartPBXSession:
         self._session_started_ns = time.monotonic_ns()
         self._session_summary_emitted = False
         self._prepared_stt_cleanup_ids: set[int] = set()
+        # Set internally by a session-local terminal failure (missing profile,
+        # fatal STT) before the gateway even knows the call is over; the
+        # gateway supplies its own reason for every other close path via
+        # finish()'s explicit arguments, which take priority when given.
+        self._pending_close_reason: str | None = None
+        self._pending_close_code: int | None = None
+        self._resolved_close_reason: str | None = None
+        self._resolved_close_code: int | None = None
 
     @property
     def terminal_future(self) -> asyncio.Future[None]:
@@ -163,6 +179,15 @@ class KavyaSmartPBXSession:
     def transfer_pending(self) -> bool:
         """Expose the inner pipeline state to the provider-neutral gateway."""
         return bool(getattr(self._pipeline, "transfer_pending", False))
+
+    @property
+    def close_reason(self) -> str | None:
+        """The session-detected close reason, if one has been recorded yet."""
+        return self._pending_close_reason
+
+    @property
+    def close_code(self) -> int | None:
+        return self._pending_close_code
 
     async def start(self) -> None:
         async with self._start_lock:
@@ -199,7 +224,19 @@ class KavyaSmartPBXSession:
             return True
         return await self._require_pipeline().feed_dtmf(digit)
 
-    async def finish(self, schedule_post_call: bool = False) -> None:
+    async def finish(
+        self,
+        schedule_post_call: bool = False,
+        close_reason: str | None = None,
+        close_code: int | None = None,
+    ) -> None:
+        # The gateway's explicit reason always wins; a still-None reason here
+        # (its "raw is None" branch, which never reads from the socket) leaves
+        # whatever a session-internal terminal failure already recorded.
+        if close_reason is not None:
+            self._pending_close_reason = close_reason
+        if close_code is not None:
+            self._pending_close_code = close_code
         async with self._finish_lock:
             if self._finish_task is None:
                 self._finish_task = asyncio.create_task(
@@ -594,6 +631,8 @@ class KavyaSmartPBXSession:
         self._language_timeout_handle = None
         if timeout_handle is not None:
             timeout_handle.cancel()
+        if self._pending_close_reason is None:
+            self._pending_close_reason = SmartPBXCloseReason.PROFILE_UNAVAILABLE.value
         if not self._terminal_future.done():
             self._terminal_future.set_result(None)
 
@@ -610,6 +649,13 @@ class KavyaSmartPBXSession:
             pipeline = self._pipeline
             if pipeline is None:
                 return
+            # Resolve once, up front: both the post-call payload below and the
+            # session summary in the finally block must agree on why this call
+            # ended, and neither may see it change mid-teardown.
+            self._resolved_close_reason = _resolve_close_reason(self._pending_close_reason)
+            self._resolved_close_code = (
+                self._pending_close_code if isinstance(self._pending_close_code, int) else 0
+            )
             timeout_handle = self._language_timeout_handle
             self._language_timeout_handle = None
             if timeout_handle is not None:
@@ -707,6 +753,10 @@ class KavyaSmartPBXSession:
                         gemini_client=getattr(pipeline, "gemini_client", None),
                         model=self._model,
                         privacy_safe=True,
+                        close_reason=self._resolved_close_reason,
+                        close_code=self._resolved_close_code,
+                        duration_ms=self._clamped_duration_ms(),
+                        barge_ins=self._clamped_barge_ins(pipeline),
                     )
                 )
         finally:
@@ -751,17 +801,24 @@ class KavyaSmartPBXSession:
         self._session_summary_emitted = True
         pipeline = self._pipeline
         telemetry = getattr(pipeline, "_turn_telemetry", None)
-        duration_ms = min(max((time.monotonic_ns() - self._session_started_ns) // 1_000_000, 0), _SESSION_MAX_MS)
+        outcome = self._resolved_close_reason or _resolve_close_reason(self._pending_close_reason)
         _emit_smartpbx_session_summary(
             event="session_summary",
             session_trace_id=self._ensure_session_trace_id(),
-            outcome="finished",
+            outcome=outcome,
             turns_started=min(max(int(getattr(telemetry, "turns_started", 0)), 0), 100_000),
             turns_summarized=min(max(int(getattr(telemetry, "turns_summarized", 0)), 0), 100_000),
-            duration_ms=duration_ms,
+            duration_ms=self._clamped_duration_ms(),
             frames_dropped_total=min(max(int(getattr(self._transport, "frames_dropped_total", 0)), 0), 100_000),
-            barge_ins=min(max(int(getattr(pipeline, "_smartpbx_barge_ins", 0)), 0), 100_000),
+            barge_ins=self._clamped_barge_ins(pipeline),
         )
+
+    def _clamped_duration_ms(self) -> int:
+        return min(max((time.monotonic_ns() - self._session_started_ns) // 1_000_000, 0), _SESSION_MAX_MS)
+
+    @staticmethod
+    def _clamped_barge_ins(pipeline: Any) -> int:
+        return min(max(int(getattr(pipeline, "_smartpbx_barge_ins", 0)), 0), 100_000)
 
     def _wire_stt_fatal_signal(self, stt: Any) -> None:
         """Let a terminally failed STT stream end the call in seconds.
@@ -793,6 +850,8 @@ class KavyaSmartPBXSession:
             )
         except Exception:
             pass
+        if self._pending_close_reason is None:
+            self._pending_close_reason = SmartPBXCloseReason.STT_FATAL.value
         if not self._terminal_future.done():
             self._terminal_future.set_result(None)
 

@@ -188,7 +188,7 @@ async def test_gateway_ends_the_call_when_the_outbound_sender_dies():
         async def feed_audio(self, _audio) -> None:
             pass
 
-        async def finish(self, schedule_post_call: bool = False) -> None:
+        async def finish(self, schedule_post_call: bool = False, close_reason=None, close_code=None) -> None:
             self.finishes += int(schedule_post_call)
 
     async def factory(_context, transport, _sink=None):
@@ -479,7 +479,7 @@ async def test_gateway_reports_dropped_frames_through_status(monkeypatch):
         async def feed_audio(self, _audio):
             pass
 
-        async def finish(self, schedule_post_call=False):
+        async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
             pass
 
     async def factory(_context, _transport, _sink=None):
@@ -527,7 +527,7 @@ async def test_gateway_tracks_echo_rejections_through_status():
         async def feed_audio(self, _audio):
             pass
 
-        async def finish(self, schedule_post_call=False):
+        async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
             pass
 
     async def factory(_context, _transport, _sink=None):
@@ -980,14 +980,14 @@ async def test_session_finish_emits_one_opaque_aggregate_summary_after_cleanup(m
     pipeline._turn_telemetry = types.SimpleNamespace(turns_started=3, turns_summarized=3)
     pipeline._smartpbx_barge_ins = 2
     session = _session(pipeline)
-    await session.finish(False)
-    await session.finish(False)
+    await session.finish(False, close_reason="hangup", close_code=1000)
+    await session.finish(False, close_reason="hangup", close_code=1000)
 
     assert records == [
         {
             "event": "session_summary",
             "session_trace_id": records[0]["session_trace_id"],
-            "outcome": "finished",
+            "outcome": "hangup",
             "turns_started": 3,
             "turns_summarized": 3,
             "duration_ms": records[0]["duration_ms"],
@@ -998,6 +998,65 @@ async def test_session_finish_emits_one_opaque_aggregate_summary_after_cleanup(m
     assert isinstance(records[0]["session_trace_id"], str)
     assert 0 <= records[0]["duration_ms"] <= 600_000
     assert not ({"call_id", "caller", "phone", "transcript", "text"} & set(records[0]))
+
+
+@pytest.mark.asyncio
+async def test_finish_falls_back_to_default_outcome_when_nothing_recorded_a_reason(monkeypatch):
+    """No hangup/stop/timeout ever fired and no internal failure set one either.
+
+    finish() is only ever called by the gateway with an explicit reason in
+    practice; this exercises the closed-vocabulary fallback directly so it is
+    provably safe rather than merely untested.
+    """
+    import smartpbx_session
+
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        smartpbx_session, "_emit_smartpbx_session_summary", lambda **fields: records.append(fields),
+    )
+    session = _session(Pipeline())
+    await session.finish(False)
+
+    assert records[0]["outcome"] == "internal_error"
+
+
+@pytest.mark.asyncio
+async def test_end_call_without_language_profile_records_profile_unavailable_close_reason():
+    session = _session(Pipeline())
+
+    session._end_call_without_language_profile()
+
+    assert session.close_reason == "profile_unavailable"
+    assert session.terminal_future.done()
+
+
+@pytest.mark.asyncio
+async def test_end_call_without_stt_records_stt_fatal_close_reason():
+    session = _session(Pipeline())
+
+    session._end_call_without_stt()
+
+    assert session.close_reason == "stt_fatal"
+    assert session.terminal_future.done()
+
+
+@pytest.mark.asyncio
+async def test_finish_gateway_reason_none_falls_back_to_session_recorded_reason(monkeypatch):
+    """Mirrors the gateway's raw-is-None branch: it passes close_reason=None,
+    and finish() must use whatever the session already recorded on itself
+    rather than resolving to the generic internal_error default."""
+    import smartpbx_session
+
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        smartpbx_session, "_emit_smartpbx_session_summary", lambda **fields: records.append(fields),
+    )
+    session = _session(Pipeline())
+    session._end_call_without_stt()
+
+    await session.finish(False, close_reason=None, close_code=None)
+
+    assert records[0]["outcome"] == "stt_fatal"
 
 
 @pytest.mark.asyncio

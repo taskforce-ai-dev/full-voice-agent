@@ -185,7 +185,12 @@ class _GatewaySession(Protocol):
 
     async def start(self) -> None: ...
     async def feed_audio(self, audio: bytes) -> None: ...
-    async def finish(self, schedule_post_call: bool = False) -> None: ...
+    async def finish(
+        self,
+        schedule_post_call: bool = False,
+        close_reason: str | None = None,
+        close_code: int | None = None,
+    ) -> None: ...
 
 
 SessionFactory = Callable[[Any, SmartPBXMediaTransport, SmartPBXDiagnosticSink], Awaitable[_GatewaySession]]
@@ -222,6 +227,13 @@ class SmartPBXGateway:
         cancellation: asyncio.CancelledError | None = None
         close_outcome: tuple[int, str] | None = None
         completed_normally = False
+        # Privacy-safe closed-vocabulary reason carried into the session
+        # summary and post-call payload (smartpbx_diagnostics.SmartPBXCloseReason).
+        # A branch that leaves this None (the "raw is None" completion below)
+        # defers to whatever a session-internal terminal failure already
+        # recorded on the session itself.
+        close_reason: str | None = None
+        close_code: int | None = None
 
         token = websocket.headers.get(self._settings.auth_header_name, "")
         if not self._settings.enabled or not self._settings.configured:
@@ -265,6 +277,7 @@ class SmartPBXGateway:
             except Exception:
                 sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.SESSION_FACTORY)
                 close_outcome = (1011, "internal error")
+                close_reason, close_code = "internal_error", 1011
                 return
             try:
                 session._record_echo_rejection = self._registry.record_echo_rejection
@@ -275,12 +288,18 @@ class SmartPBXGateway:
             except Exception:
                 sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.SESSION_START)
                 close_outcome = (1011, "internal error")
+                close_reason, close_code = "internal_error", 1011
                 return
             sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
 
             while True:
                 raw = await self._receive_or_terminal(websocket, session, transport)
                 if raw is None:
+                    # The session's own terminal future resolved, not the
+                    # socket -- the only way that happens today is a
+                    # session-internal fatal path (profile/STT). Leave
+                    # close_reason unset so finish() falls back to whatever
+                    # the session already recorded on itself.
                     close_outcome = (1000, "call ended")
                     completed_normally = True
                     break
@@ -298,6 +317,7 @@ class SmartPBXGateway:
                     except Exception:
                         sink(DiagnosticStage.AUDIO_INGESTION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.AUDIO_INGESTION)
                         close_outcome = (1011, "internal error")
+                        close_reason, close_code = "internal_error", 1011
                         return
                 elif isinstance(event, DtmfEvent):
                     try:
@@ -334,10 +354,12 @@ class SmartPBXGateway:
                 elif isinstance(event, HangupEvent):
                     validate_event_context(event, context)
                     close_outcome = (1000, "call ended")
+                    close_reason, close_code = "hangup", 1000
                     completed_normally = True
                     break
                 elif isinstance(event, StopEvent):
                     close_outcome = (1000, "call ended")
+                    close_reason, close_code = "stop", 1000
                     completed_normally = True
                     break
                 elif isinstance(event, UnsupportedEvent):
@@ -356,18 +378,24 @@ class SmartPBXGateway:
             if session is None:
                 sink(DiagnosticStage.SCHEMA_ADMISSION, DiagnosticOutcome.REJECTED, DiagnosticFailureClass.START_TIMEOUT)
                 close_outcome = (POLICY_VIOLATION, "start timeout")
+                close_reason, close_code = "start_timeout", POLICY_VIOLATION
             else:
                 sink(DiagnosticStage.AUDIO_INGESTION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.IDLE_TIMEOUT)
                 close_outcome = (POLICY_VIOLATION, "idle timeout")
+                close_reason, close_code = "idle_timeout", POLICY_VIOLATION
         except _TransferPendingTimeout:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSFER_PENDING_TIMEOUT)
             close_outcome = (POLICY_VIOLATION, "transfer timeout")
+            close_reason, close_code = "transfer_pending_timeout", POLICY_VIOLATION
         except _TransportSendFailure:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSPORT_SEND)
             close_outcome = (1011, "internal error")
-        except WebSocketDisconnect:
+            close_reason, close_code = "transport_failure", 1011
+        except WebSocketDisconnect as error:
             disconnected = True
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DISCONNECTED, DiagnosticFailureClass.TRANSPORT_DISCONNECT)
+            close_reason = "peer_disconnect"
+            close_code = error.code if isinstance(error.code, int) else None
         except asyncio.CancelledError as error:
             cancellation = error
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.CANCELLED, DiagnosticFailureClass.CANCELLED)
@@ -375,12 +403,16 @@ class SmartPBXGateway:
             stage, outcome, failure = _protocol_diagnostic(error.failure_class)
             sink(stage, outcome, failure)
             close_outcome = (error.close_code, error.public_reason)
+            close_reason, close_code = "protocol_violation", error.close_code
         except Exception:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.INTERNAL_ERROR)
             close_outcome = (1011, "internal error")
+            close_reason, close_code = "internal_error", 1011
         finally:
             try:
-                cleanup_task = asyncio.create_task(self._cleanup(session, transport, lease, sink))
+                cleanup_task = asyncio.create_task(
+                    self._cleanup(session, transport, lease, sink, close_reason, close_code)
+                )
                 while not cleanup_task.done():
                     try:
                         await asyncio.shield(cleanup_task)
@@ -501,6 +533,8 @@ class SmartPBXGateway:
         transport: SmartPBXMediaTransport | None,
         lease: SessionLease | None,
         sink: SmartPBXDiagnosticSink,
+        close_reason: str | None = None,
+        close_code: int | None = None,
     ) -> bool:
         degraded = False
         failures = {
@@ -514,7 +548,12 @@ class SmartPBXGateway:
             # Close first so that aggregate observes terminal transport cleanup,
             # while the fault-isolated/shielded loop below still releases the
             # lease if either operation fails or is cancelled.
-            ("session", None if session is None else session.finish(schedule_post_call=True)),
+            (
+                "session",
+                None if session is None else session.finish(
+                    schedule_post_call=True, close_reason=close_reason, close_code=close_code,
+                ),
+            ),
             ("lease", None if lease is None else lease.release()),
         ):
             if operation is None:

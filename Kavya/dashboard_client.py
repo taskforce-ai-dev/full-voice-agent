@@ -167,6 +167,11 @@ async def send_call_completed(
     full_transcript: list[dict[str, str]],
     extracted: dict[str, Any],
     privacy_safe: bool = False,
+    close_reason: str | None = None,
+    close_code: int | None = None,
+    guest_turns: int | None = None,
+    agent_turns: int | None = None,
+    barge_ins: int | None = None,
 ) -> None:
     """Emit a call.completed event with full transcript + extracted summary."""
     _announce_once(privacy_safe=privacy_safe)
@@ -176,6 +181,29 @@ async def send_call_completed(
     follow_up = extracted.get("follow_up_needed") == "Yes"
     outcome = extracted.get("call_outcome")
     summary = extracted.get("summary")
+
+    metadata = {
+        "language": lang,
+        "guest_name": extracted.get("guest_name"),
+        "num_guests": extracted.get("num_guests"),
+        "check_in": extracted.get("check_in"),
+        "check_out": extracted.get("check_out"),
+        "room_preference": extracted.get("room_preference"),
+        "availability_result": extracted.get("availability_result"),
+    }
+    # SmartPBX-only, privacy-safe (enum/count-only) close diagnostics. Omitted
+    # entirely for callers (e.g. the Twilio path) that don't supply them, so
+    # the existing metadata shape is unchanged there.
+    if close_reason is not None:
+        metadata["close_reason"] = close_reason
+    if close_code is not None:
+        metadata["close_code"] = close_code
+    if guest_turns is not None:
+        metadata["guest_turns"] = guest_turns
+    if agent_turns is not None:
+        metadata["agent_turns"] = agent_turns
+    if barge_ins is not None:
+        metadata["barge_ins"] = barge_ins
 
     payload = {
         "eventType": "call.completed",
@@ -192,15 +220,7 @@ async def send_call_completed(
             "endedAt": ended_at_iso,
             "durationSec": duration_sec,
             "followUpRequired": follow_up,
-            "metadata": {
-                "language": lang,
-                "guest_name": extracted.get("guest_name"),
-                "num_guests": extracted.get("num_guests"),
-                "check_in": extracted.get("check_in"),
-                "check_out": extracted.get("check_out"),
-                "room_preference": extracted.get("room_preference"),
-                "availability_result": extracted.get("availability_result"),
-            },
+            "metadata": metadata,
         },
     }
     await _post(payload, privacy_safe=privacy_safe)
