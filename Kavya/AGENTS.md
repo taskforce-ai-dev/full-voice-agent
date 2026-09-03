@@ -259,6 +259,25 @@ acceptance evidence are privacy-safe metadata only: they do not retain caller
 transcript text, prompts, tool arguments/results, audio, API keys, headers, or
 raw provider exceptions.
 
+**History is rendered per provider at the request boundary.** `self.history` is
+written in whichever provider's shape ran the round, so after one Gemini tool
+round it holds OpenAI-shaped `assistant.tool_calls` / `role: "tool"` entries —
+which Anthropic 400s on, and (before this) turned one transient Gemini error
+into a dead call, because the sticky counter then routed every later turn to the
+provider that was rejecting our payload. `_claude_messages_from_history()`
+renders any mixed history into valid Anthropic Messages input at both Claude
+request sites (`_run_llm_claude`, `_run_llm_streaming_claude`); it is an
+identity pass for an already-Anthropic history, preserves tool_use/tool_result
+pairing and ids, drops an unanswered tool call rather than **ever** fabricating a
+result, and never carries a Gemini thought signature across providers.
+`_history_to_gemini()` reads Anthropic content-block entries for the reverse
+direction, so the turn after a Claude failover tool round still runs on Gemini.
+A failover turn that fails for our own reason speaks the shared localized
+recovery line (post-tool variant when that turn already committed a tool round,
+so recovery never invites a repeat booking) and **rolls back the recorded
+failover** (`_rollback_gemini_failover`) — our own errors must never latch
+`degraded` and pin the call to the provider that just failed.
+
 **Full cutover/rollback procedure:** `SMARTPBX_RUNBOOK.md` — preconditions and immutable image identity, `.env.smartpbx` provisioning, TLS bootstrap, the five cutover gates (bad/missing auth rejected, bidirectional audio + LLM turn, KB/PMS answer + post-call record, 4-accepted/5th-rejected capacity, endpoint-down fallback), optional transfer drill with compulsory revoke, and drain-before-stop withdrawal/rollback.
 
 ## Key Design Decisions

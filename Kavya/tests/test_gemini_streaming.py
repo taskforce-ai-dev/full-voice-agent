@@ -1681,7 +1681,7 @@ def test_gemini_to_claude_conversion_deep_copies_mixed_tool_shapes(monkeypatch):
         tool["input_schema"]["properties"]["temporary"] = {"type": "boolean"}
     assert original_tools == before
 
-    session, _spoken = _session([], lang="si", smartpbx=True)
+    session, spoken = _session([], lang="si", smartpbx=True)
     session.tools = original_tools
     original_model = session.model
     monkeypatch.setattr(
@@ -1689,8 +1689,12 @@ def test_gemini_to_claude_conversion_deep_copies_mixed_tool_shapes(monkeypatch):
         "_claude_tools_from_gemini",
         lambda _tools: (_ for _ in ()).throw(ValueError("local conversion invariant")),
     )
-    with pytest.raises(ValueError, match="local conversion invariant"):
-        asyncio.run(session._run_claude_failover_turn())
+    # A local invariant failure inside the swap is OURS, not the provider's: the
+    # caller gets the localized recovery line rather than the error filler, and
+    # the call profile is restored exactly as before.
+    recovery = asyncio.run(session._run_claude_failover_turn())
+    assert recovery and spoken == [recovery]
+    assert "සමාවෙන්න" in recovery
     assert session.llm_provider == "gemini"
     assert session.model == original_model
     assert session.tools is original_tools
@@ -1773,20 +1777,46 @@ def test_direct_sinhala_sticky_fallback_uses_injected_client_without_global_key(
     assert session.llm_provider == "gemini"
 
 
-@pytest.mark.parametrize("failure", [RuntimeError("claude failure"), asyncio.CancelledError()])
-def test_sinhala_fallback_restores_profile_when_claude_fails(monkeypatch, failure):
-    session, _spoken = _session([], lang="si", smartpbx=True)
+def test_sinhala_fallback_restores_profile_when_claude_fails(monkeypatch):
+    """A failed Claude turn restores the profile AND still answers the caller.
+
+    Re-raising here reached `_process_utterance`'s generic handler, which speaks
+    the "please wait" filler and then nothing — dead air. The direct SmartPBX
+    non-capture path now speaks the shared localized recovery line instead.
+    """
+    session, spoken = _session([], lang="si", smartpbx=True)
     original_tools = copy.deepcopy(GEMINI_SHAPED_TOOLS)
     session.tools = original_tools
     original_profile = (session.llm_provider, session.model, session.tools)
 
     async def failing_claude():
         session.tools[0]["input_schema"]["properties"]["temporary"] = {"type": "boolean"}
-        raise failure
+        raise RuntimeError("claude failure")
 
     monkeypatch.setattr(session, "_run_llm_claude", failing_claude)
-    with pytest.raises(type(failure)):
+    recovery = asyncio.run(session._run_claude_failover_turn())
+    assert recovery and spoken == [recovery]
+    assert "සමාවෙන්න" in recovery
+    assert (session.llm_provider, session.model, session.tools) == original_profile
+    assert session.tools is original_tools
+    assert "temporary" not in original_tools[0]["function_declarations"][0]["parameters"]["properties"]
+
+
+def test_sinhala_fallback_restores_profile_when_claude_is_cancelled(monkeypatch):
+    """Cancellation is a lifecycle signal, never a turn outcome: it propagates."""
+    session, spoken = _session([], lang="si", smartpbx=True)
+    original_tools = copy.deepcopy(GEMINI_SHAPED_TOOLS)
+    session.tools = original_tools
+    original_profile = (session.llm_provider, session.model, session.tools)
+
+    async def cancelled_claude():
+        session.tools[0]["input_schema"]["properties"]["temporary"] = {"type": "boolean"}
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(session, "_run_llm_claude", cancelled_claude)
+    with pytest.raises(asyncio.CancelledError):
         asyncio.run(session._run_claude_failover_turn())
+    assert spoken == []
     assert (session.llm_provider, session.model, session.tools) == original_profile
     assert session.tools is original_tools
     assert "temporary" not in original_tools[0]["function_declarations"][0]["parameters"]["properties"]

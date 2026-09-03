@@ -3432,27 +3432,126 @@ async def _iter_gemini_tts_audio_deltas(stream: Any) -> AsyncIterator[tuple[str,
             yield data, delta
 
 
+def _anthropic_block_text(block_content: Any) -> str:
+    """Flatten an Anthropic content payload back into the string we stored.
+
+    A ``tool_result`` block carries either the raw JSON string this codebase
+    writes or the API's own list-of-blocks form; both must survive a provider
+    swap, because the string IS the tool's result and inventing a different one
+    would tell the next provider something the tool never returned.
+    """
+    if isinstance(block_content, str):
+        return block_content
+    if isinstance(block_content, list):
+        return "".join(
+            part.get("text", "")
+            for part in block_content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _gemini_parts_from_anthropic_assistant_blocks(
+    blocks: list, *, include_function_call_ids: bool,
+) -> list[dict]:
+    """Render one Anthropic assistant content list as Gemini model parts.
+
+    Reached whenever a Claude failover turn wrote history that the NEXT turn
+    hands back to Gemini. No thought signature is ever produced here: that
+    field is a Gemini-issued, call-local value, and a Claude tool id is not one.
+    """
+    parts: list[dict] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if text:
+                parts.append({"text": text})
+        elif block_type == "tool_use":
+            args = block.get("input")
+            fc_part: dict[str, Any] = {
+                "function_call": {
+                    "name": block.get("name", "unknown"),
+                    "args": args if isinstance(args, dict) else {},
+                }
+            }
+            if include_function_call_ids and block.get("id"):
+                fc_part["function_call"]["id"] = block["id"]
+            parts.append(fc_part)
+    return parts
+
+
+def _gemini_parts_from_anthropic_user_blocks(
+    blocks: list, *, tool_names: dict[str, str], include_function_call_ids: bool,
+) -> list[dict]:
+    """Render one Anthropic user content list as Gemini user parts."""
+    parts: list[dict] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if text:
+                parts.append({"text": text})
+        elif block_type == "tool_result":
+            tool_use_id = block.get("tool_use_id", "")
+            raw = _anthropic_block_text(block.get("content"))
+            try:
+                response_data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                response_data = {"result": raw}
+            fr_part: dict[str, Any] = {
+                "function_response": {
+                    "name": tool_names.get(tool_use_id, "unknown"),
+                    "response": response_data,
+                }
+            }
+            if include_function_call_ids and tool_use_id:
+                fr_part["function_response"]["id"] = tool_use_id
+            parts.append(fr_part)
+    return parts
+
+
 def _history_to_gemini(
     history: list[dict], *, include_function_call_ids: bool = False,
 ) -> list[dict]:
-    """Convert OpenAI-format history to Gemini-native contents.
+    """Convert internal history to Gemini-native contents.
 
     OpenAI format:
       - {"role": "user",      "content": "..."}
       - {"role": "assistant", "content": "...", "tool_calls": [...]}
       - {"role": "tool",      "tool_call_id": "...", "content": "..."}
 
+    Anthropic format (left behind by a Claude failover turn):
+      - {"role": "assistant", "content": [{"type": "tool_use", ...}]}
+      - {"role": "user",      "content": [{"type": "tool_result", ...}]}
+
     Gemini format:
       - {"role": "user",  "parts": [{"text": "..."}]}
       - {"role": "model", "parts": [{"text": "..."}, {"function_call": {...}}]}
       - {"role": "user",  "parts": [{"function_response": {...}}]}
     """
-    # Build tool_call_id â†’ tool_name map from assistant messages
+    # Build tool_call_id â†’ tool_name map from assistant messages, in BOTH
+    # shapes: after a provider swap one conversation holds both.
     tc_id_to_name: dict[str, str] = {}
     for msg in history:
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+        if msg.get("role") != "assistant":
+            continue
+        if msg.get("tool_calls"):
             for tc in msg["tool_calls"]:
                 tc_id_to_name[tc["id"]] = tc["function"]["name"]
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("id")
+                ):
+                    tc_id_to_name[block["id"]] = block.get("name", "unknown")
 
     contents: list[dict] = []
     i = 0
@@ -3461,13 +3560,28 @@ def _history_to_gemini(
         role = msg.get("role")
 
         if role == "user":
-            contents.append({"role": "user", "parts": [{"text": msg["content"]}]})
+            content = msg.get("content")
+            if isinstance(content, list):
+                user_parts = _gemini_parts_from_anthropic_user_blocks(
+                    content,
+                    tool_names=tc_id_to_name,
+                    include_function_call_ids=include_function_call_ids,
+                )
+                if user_parts:
+                    contents.append({"role": "user", "parts": user_parts})
+            else:
+                contents.append({"role": "user", "parts": [{"text": content}]})
             i += 1
 
         elif role == "assistant":
             parts: list[dict] = []
-            if msg.get("content"):
-                parts.append({"text": msg["content"]})
+            content = msg.get("content")
+            if isinstance(content, list):
+                parts.extend(_gemini_parts_from_anthropic_assistant_blocks(
+                    content, include_function_call_ids=include_function_call_ids,
+                ))
+            elif content:
+                parts.append({"text": content})
             if msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     try:
@@ -3521,6 +3635,235 @@ def _history_to_gemini(
             i += 1  # skip unknown roles
 
     return contents
+
+
+def _claude_tool_result_ids(history: list[dict]) -> set[str]:
+    """Every tool call id this history actually carries a result for."""
+    answered: set[str] = set()
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                answered.add(tool_call_id)
+            continue
+        if role != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and block.get("tool_use_id")
+            ):
+                answered.add(block["tool_use_id"])
+    return answered
+
+
+def _claude_messages_from_history(history: list[dict]) -> list[dict]:
+    """Render any internal history shape into valid Anthropic Messages input.
+
+    ``self.history`` is written in whichever provider's shape ran the round, so
+    after a Gemini tool round it holds OpenAI-shaped
+    ``{"role": "assistant", "content": None, "tool_calls": [...]}`` /
+    ``{"role": "tool", ...}`` entries. Handing those to Anthropic is a 400 —
+    which, on the Sinhala failover path, is a dead call rather than a recovered
+    turn. This renders one canonical Anthropic payload per request; the session's
+    own history is never mutated, so the next Gemini turn still sees its native
+    shape (``_history_to_gemini`` reads both).
+
+    Rules, in the order they matter:
+      * Already-Anthropic entries are passed through by identity, so a history
+        that needs no conversion returns the SAME list object and the English
+        path's request is byte-for-byte what it was.
+      * tool_use/tool_result pairing and ids are preserved exactly; consecutive
+        OpenAI ``tool`` entries collapse into the single user message the API
+        requires.
+      * A tool call whose result is missing has its ``tool_use`` block dropped
+        (the API rejects an unanswered one) — never a fabricated result. A
+        tool result with no matching call is dropped for the same reason.
+      * Nothing else is dropped: assistant text keeps its tool call, and a
+        non-conversational marker entry (e.g. the booking-confirmation marker)
+        is carried as a user turn rather than lost.
+    """
+    answered_ids = _claude_tool_result_ids(history)
+    rendered: list[dict[str, Any]] = []
+    emitted_tool_use_ids: set[str] = set()
+    dropped = 0
+    index = 0
+    total = len(history)
+
+    while index < total:
+        msg = history[index]
+        if not isinstance(msg, dict):
+            dropped += 1
+            index += 1
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if role == "assistant":
+            index += 1
+            blocks: list[dict[str, Any]] = []
+            if msg.get("tool_calls"):
+                if isinstance(content, str) and content.strip():
+                    blocks.append({"type": "text", "text": content})
+                for tool_call in msg["tool_calls"]:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    call_id = tool_call.get("id")
+                    function = tool_call.get("function") or {}
+                    if not call_id or not function.get("name"):
+                        dropped += 1
+                        continue
+                    if call_id not in answered_ids:
+                        # No result exists for this call. Anthropic rejects a
+                        # dangling tool_use, and inventing a result would tell
+                        # the model a side effect happened that never did.
+                        dropped += 1
+                        continue
+                    raw_arguments = function.get("arguments") or "{}"
+                    try:
+                        parsed = json.loads(raw_arguments) if raw_arguments else {}
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = {}
+                    if not isinstance(parsed, dict):
+                        parsed = {}
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": function["name"],
+                        "input": parsed,
+                    })
+                    emitted_tool_use_ids.add(call_id)
+                if blocks:
+                    rendered.append({"role": "assistant", "content": blocks})
+                else:
+                    dropped += 1
+                continue
+            if isinstance(content, list):
+                kept: list[dict[str, Any]] = []
+                changed = False
+                for block in content:
+                    if not isinstance(block, dict):
+                        changed = True
+                        dropped += 1
+                        continue
+                    if block.get("type") == "tool_use":
+                        block_id = block.get("id")
+                        if not block_id or block_id not in answered_ids:
+                            changed = True
+                            dropped += 1
+                            continue
+                        emitted_tool_use_ids.add(block_id)
+                    elif block.get("type") == "text" and not str(
+                        block.get("text", "")
+                    ).strip():
+                        changed = True
+                        dropped += 1
+                        continue
+                    kept.append(block)
+                if not kept:
+                    dropped += 1
+                    continue
+                rendered.append(msg if not changed else {
+                    "role": "assistant", "content": kept,
+                })
+                continue
+            if isinstance(content, str) and content.strip():
+                rendered.append(msg)
+            else:
+                # `content: None` (the Gemini tool-call shape with every call
+                # dropped) and empty text are both API errors, and neither
+                # carries anything the model could read.
+                dropped += 1
+            continue
+
+        if role == "tool":
+            # Consecutive OpenAI tool results answer ONE assistant turn and
+            # must arrive as one user message.
+            tool_blocks: list[dict[str, Any]] = []
+            while index < total:
+                entry = history[index]
+                if not isinstance(entry, dict) or entry.get("role") != "tool":
+                    break
+                index += 1
+                tool_call_id = entry.get("tool_call_id")
+                if not tool_call_id or tool_call_id not in emitted_tool_use_ids:
+                    dropped += 1
+                    continue
+                tool_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": _anthropic_block_text(entry.get("content")),
+                })
+            if tool_blocks:
+                rendered.append({"role": "user", "content": tool_blocks})
+            continue
+
+        if role == "user":
+            index += 1
+            if isinstance(content, list):
+                kept_user: list[dict[str, Any]] = []
+                changed = False
+                for block in content:
+                    if not isinstance(block, dict):
+                        changed = True
+                        dropped += 1
+                        continue
+                    if block.get("type") == "tool_result":
+                        block_id = block.get("tool_use_id")
+                        if not block_id or block_id not in emitted_tool_use_ids:
+                            changed = True
+                            dropped += 1
+                            continue
+                    elif block.get("type") == "text" and not str(
+                        block.get("text", "")
+                    ).strip():
+                        changed = True
+                        dropped += 1
+                        continue
+                    kept_user.append(block)
+                if not kept_user:
+                    dropped += 1
+                    continue
+                rendered.append(msg if not changed else {
+                    "role": "user", "content": kept_user,
+                })
+                continue
+            if isinstance(content, str) and content.strip():
+                rendered.append(msg)
+            else:
+                dropped += 1
+            continue
+
+        # Any other role (a marker/system note): Anthropic accepts only user
+        # and assistant, so carry the text as a user turn rather than lose it.
+        index += 1
+        note = content if isinstance(content, str) else msg.get("text")
+        if isinstance(note, str) and note.strip():
+            rendered.append({"role": "user", "content": note})
+        else:
+            dropped += 1
+
+    while rendered and rendered[0].get("role") != "user":
+        # The API requires the first message to be a user turn; history trimmed
+        # mid-conversation can leave an assistant one in front.
+        rendered.pop(0)
+        dropped += 1
+
+    if dropped:
+        # Counts only — never an entry, a role, a tool name or any text.
+        logger.info("llm_history_render target=claude dropped_entries=%d", dropped)
+    if len(rendered) == len(history) and all(
+        a is b for a, b in zip(rendered, history)
+    ):
+        return history
+    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -3960,6 +4303,53 @@ def _note_gemini_failover(state: dict[str, Any]) -> str:
 
 def _note_gemini_success(state: dict[str, Any]) -> None:
     state["consecutive_failovers"] = 0
+
+
+def _rollback_gemini_failover(
+    state: dict[str, Any], snapshot: dict[str, Any], *, noted: bool
+) -> None:
+    """Undo one recorded failover after the Claude turn itself failed.
+
+    The counter answers exactly one question — "is Gemini failing repeatedly?" —
+    and a failure on the OTHER side of the swap is not evidence about Gemini. If
+    our own error were allowed to latch ``degraded``, every later turn of the
+    call would be routed to the provider that just failed, with no way back:
+    one bad turn would become a dead call. ``degraded`` is cleared for the same
+    reason, so a failing sticky turn releases the call to retry Gemini.
+    ``degraded_logged`` is deliberately left alone: the closed telemetry event
+    stays one-per-call.
+
+    ``noted`` says whether the caller recorded a failover for THIS turn before
+    running it (every per-exception route does; the sticky route does not), so
+    the counter lands back on its pre-failover value either way.
+    """
+    previous = snapshot.get("consecutive_failovers", 0)
+    state["consecutive_failovers"] = max(previous - 1, 0) if noted else previous
+    state["degraded"] = False
+
+
+def _classify_failover_turn_failure(exc: BaseException) -> str:
+    """Closed reason enum for a failed failover turn — never any message text."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    if isinstance(status, bool) or not isinstance(status, int):
+        return "local"
+    if status == 429:
+        return "quota"
+    if 500 <= status <= 599:
+        return "server"
+    return "invalid_request"
+
+
+def _history_recorded_tool_round(history: list[dict], since: int) -> bool:
+    """True when the entries appended after ``since`` include a tool round."""
+    for msg in history[since:]:
+        if not isinstance(msg, dict):
+            continue
+        if _is_tool_call_msg(msg) or _is_tool_result_msg(msg):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -8794,7 +9184,7 @@ class MediaStreamSession:
             return False
         return self.anthropic_client is not None
 
-    async def _run_claude_failover_turn(self) -> str:
+    async def _run_claude_failover_turn(self, *, noted_failover: bool = False) -> str:
         """Run this turn on Claude with Claude-shaped model AND tools, then restore.
 
         Every Gemini→Claude failover lands here — sticky and per-exception alike.
@@ -8819,18 +9209,51 @@ class MediaStreamSession:
         previous_model = self.model
         previous_tools = self.tools
         previous_provider = self.llm_provider
+        # Taken BEFORE the turn: if the swap itself fails, the recorded failover
+        # is rolled back so our own error cannot pin the call to Claude.
+        failover_state_snapshot = dict(self._gemini_failover_state)
+        history_len_before = len(self.history)
         try:
-            # Conversion itself can fail. Keep all temporary assignments inside
-            # this try so the original call profile is restored in every case.
-            self.model = CLAUDE_MODEL
-            if previous_provider == "gemini":
-                self.tools = _claude_tools_from_gemini(previous_tools)
-            self.llm_provider = "claude"
-            return await self._run_llm_claude()
-        finally:
-            self.model = previous_model
-            self.tools = previous_tools
-            self.llm_provider = previous_provider
+            try:
+                # Conversion itself can fail. Keep all temporary assignments
+                # inside this try so the original call profile is restored in
+                # every case.
+                self.model = CLAUDE_MODEL
+                if previous_provider == "gemini":
+                    self.tools = _claude_tools_from_gemini(previous_tools)
+                self.llm_provider = "claude"
+                return await self._run_llm_claude()
+            finally:
+                self.model = previous_model
+                self.tools = previous_tools
+                self.llm_provider = previous_provider
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _rollback_gemini_failover(
+                self._gemini_failover_state, failover_state_snapshot,
+                noted=noted_failover,
+            )
+            if not self._is_direct_smartpbx_non_capture():
+                # Twilio Media Streams, ConversationRelay and the dictation
+                # flows keep their existing failure handling untouched.
+                raise
+            logger.error(
+                "smartpbx_media event=llm_failover_turn_failed reason=%s",
+                _classify_failover_turn_failure(exc),
+            )
+            if not self._current_smartpbx_runner_owns_shared_state():
+                return ""
+            # Never a replay: if the failed Claude turn already committed a tool
+            # round, the caller hears the post-tool line, which asks nothing that
+            # could repeat a booking operation.
+            return await self._smartpbx_speak_recovery_and_finish(
+                tool_executed=_history_recorded_tool_round(
+                    self.history, history_len_before,
+                ),
+                gen=self._speak_generation,
+                full_text="",
+            )
 
     async def _fence_direct_sinhala_gemini_round(
         self, *, tts_tasks: list[asyncio.Task], gen: int,
@@ -9520,7 +9943,7 @@ class MediaStreamSession:
                 exc.reason,
             )
             _note_gemini_failover(self._gemini_failover_state)
-            return await self._run_claude_failover_turn()
+            return await self._run_claude_failover_turn(noted_failover=True)
         except Exception as exc:
             if not self._current_smartpbx_runner_owns_shared_state():
                 return ""
@@ -9547,7 +9970,7 @@ class MediaStreamSession:
                         "from=gemini to=claude reason=empty_response"
                     )
                     _note_gemini_failover(self._gemini_failover_state)
-                    return await self._run_claude_failover_turn()
+                    return await self._run_claude_failover_turn(noted_failover=True)
                 return await self._smartpbx_speak_recovery_and_finish(
                     tool_executed=turn_tool_executed, gen=turn_gen,
                     full_text=delivered_text,
@@ -9607,7 +10030,7 @@ class MediaStreamSession:
             )
 
             _note_gemini_failover(self._gemini_failover_state)
-            return await self._run_claude_failover_turn()
+            return await self._run_claude_failover_turn(noted_failover=True)
 
 
     # â”€â”€ Claude native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
@@ -9684,7 +10107,10 @@ class MediaStreamSession:
                     "model": self.model,
                     "max_tokens": self._provider_max_tokens("claude"),
                     "system": system_blocks,
-                    "messages": self.history,
+                    # A failover (or sticky) turn inherits a history written in
+                    # Gemini's shape; rendering is a no-op identity pass for a
+                    # history that is already Anthropic-shaped.
+                    "messages": _claude_messages_from_history(self.history),
                     "tools": self.tools if self.tools else NOT_GIVEN,
                 }
                 # Do not disable adaptive thinking.  Medium effort is a
@@ -11467,7 +11893,10 @@ async def _run_llm_streaming_claude(
             model=model,
             max_tokens=MAX_TOKENS,
             system=_split_claude_system_blocks(system),
-            messages=conversation_history,
+            # Same reason as the Media Streams runner: a ConversationRelay
+            # Gemini→Claude failover inherits an OpenAI-shaped tool history.
+            # Identity pass when the history is already Anthropic-shaped.
+            messages=_claude_messages_from_history(conversation_history),
             tools=tools if tools else NOT_GIVEN,
         ) as stream:
             async for event in stream:
