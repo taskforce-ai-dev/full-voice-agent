@@ -64,6 +64,7 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # ADVISORY BY POLICY (CONTRIBUTING.md §1): this codebase predates ruff, so a
     # full-tree `ruff check .` reports ~1,000 pre-existing violations across
     # every agent folder. They cannot be mass-fixed safely — reformatting agent
@@ -125,6 +126,7 @@ jobs:
   docs-drift:
     name: docs-drift
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -141,6 +143,7 @@ jobs:
   dockerfile-lint:
     name: dockerfile-lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Advisory: surfaces Dockerfile issues but must not block merges.
     continue-on-error: true
     steps:
@@ -185,6 +188,12 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    # Explicit ceiling per the header note on docs-drift/lint/hang risk: this
+    # job used to have no timeout at all, so a hung async test (or a script
+    # like the retired live_conversation_test.py that opened a real socket
+    # at import time and blocked pytest --collect-only for 120s+) could burn
+    # the GitHub-hosted 360-minute default before the run went red.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -235,7 +244,14 @@ jobs:
           # don't get skipped, they FAIL ("async def functions are not
           # natively supported"), which is silent today only because this
           # job used to swallow every test failure regardless of cause.
-          pip install "pytest>=9.1.1" "pytest-asyncio>=1.4.0"
+          #
+          # pytest-timeout backs the per-test --timeout=300 applied to the
+          # Kavya run below (audit-tests.md sec 7: no pytest-timeout was
+          # installed anywhere, so a single lost wakeup in a test that waits
+          # on a real asyncio timer/idle-timeout could otherwise ride the
+          # whole 45-minute job timeout instead of failing fast and pointing
+          # at the actual hung test).
+          pip install "pytest>=9.1.1" "pytest-asyncio>=1.4.0" "pytest-timeout>=2.3.1"
 
       - name: Run pytest in "${{ matrix.agent }}"
         if: steps.detect.outputs.has_tests == 'true'
@@ -260,7 +276,21 @@ jobs:
           # gone red. Bare `pytest` was only ever "working" here because
           # continue-on-error and the `|| echo` fallback below swallowed a
           # hang exactly as readily as a real test failure.
-          pytest tests
+          #
+          # Kavya specifically also gets pytest-timeout's per-test wall-clock
+          # cap: its suite carries real asyncio timers (idle-timeout waits,
+          # stall-recovery deadlines) that a lost wakeup or a future
+          # regression could turn into an indefinite hang rather than a
+          # failure. --timeout=300 is well above every legitimate test's
+          # measured runtime (audit-tests.md sec 1: slowest single test was
+          # 90s, now cut further by the F2 timing-hygiene fixes) but short
+          # enough to fail fast and name the offending test instead of
+          # riding out this job's 45-minute ceiling.
+          if [ "${{ matrix.agent }}" = "Kavya" ]; then
+            pytest tests --timeout=300
+          else
+            pytest tests
+          fi
 
       - name: Build and import Kavya image
         if: matrix.agent == 'Kavya'
@@ -303,6 +333,7 @@ jobs:
   deps-resolve:
     name: deps-resolve
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
