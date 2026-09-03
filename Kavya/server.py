@@ -664,10 +664,18 @@ def _resolve_smartpbx_sinhala_gemini_thinking_level(raw: object) -> str:
 
 
 def _resolve_smartpbx_sinhala_gemini_max_tokens(raw: object) -> int:
+    """Direct-Sinhala output ceiling, defaulting to the top of the clamp.
+
+    Gemini 3.x charges thinking tokens against this budget, so a 600-token
+    ceiling truncated real answers: production saw a first turn finish
+    `max_tokens` at `output_tokens=24` and spend a whole extra round recovering
+    from it. 1024 leaves the visible reply room after thinking; the clamp and
+    the operator override are unchanged.
+    """
     try:
-        value = int(raw) if raw not in (None, "") else 600
+        value = int(raw) if raw not in (None, "") else 1024
     except (TypeError, ValueError):
-        value = 600
+        value = 1024
     return min(max(value, 200), 1024)
 
 

@@ -112,16 +112,16 @@ explicit environment allowlist and must not receive Twilio credentials or
   configured English STT, and canonical ElevenLabs route. Populating Sinhala
   settings does not build a Gemini client or mutate that English call profile.
 - Press `2` is call-local: Azure STT at `si-LK`, Gemini 3.7 Flash LLM with
-  `low` thinking and a bounded 600-token output ceiling, and Gemini 3.1 Flash
+  `low` thinking and a bounded 1024-token output ceiling, and Gemini 3.1 Flash
   TTS (`gemini-3.1-flash-tts-preview`, `Vindemiatrix`).
 - The Compose-rendered defaults are
   `SMARTPBX_SINHALA_LLM_PROVIDER=gemini`,
   `SMARTPBX_SINHALA_GEMINI_LLM_MODEL=gemini-3.7-flash`,
   `SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL=low`, and
-  `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=600`. At runtime, a blank provider
+  `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=1024`. At runtime, a blank provider
   resolves to `gemini`; an invalid nonblank provider resolves to `claude`;
   thinking accepts `low`, `medium`, or `high` and otherwise resolves to `low`;
-  and the token ceiling defaults to 600 and clamps to `[200, 1024]`.
+  and the token ceiling defaults to 1024 and clamps to `[200, 1024]`.
 - The only operator rollback is
   `SMARTPBX_SINHALA_LLM_PROVIDER=claude`. It changes the Sinhala LLM only; it
   does not alter global `LLM_PROVIDER`, the Twilio service, or an English

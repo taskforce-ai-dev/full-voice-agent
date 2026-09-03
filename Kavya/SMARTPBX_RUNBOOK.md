@@ -84,7 +84,7 @@ SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS=8.0
 SMARTPBX_SINHALA_LLM_PROVIDER=gemini
 SMARTPBX_SINHALA_GEMINI_LLM_MODEL=gemini-3.7-flash
 SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL=low
-SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=600
+SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=1024
 SMARTPBX_SINHALA_GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 SMARTPBX_SINHALA_GEMINI_TTS_VOICE=Vindemiatrix
 SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS=15.0
@@ -398,7 +398,7 @@ Gemini. Claude and profile-configured Sinhala Gemini are exceptions:
 - `SMARTPBX_CLAUDE_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) — the
   Claude-only direct SmartPBX English/Sinhala output budget. Leave it blank to
   take the default.
-- `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) —
+- `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS` (default `1024`, clamp `[200, 1024]`) —
   the direct Sinhala Gemini ceiling. Gemini 3.x may consume thinking tokens;
   this does not alter English Gemini's preserved shared-budget contract.
 

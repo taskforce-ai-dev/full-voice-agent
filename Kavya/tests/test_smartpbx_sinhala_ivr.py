@@ -221,9 +221,9 @@ def test_sinhala_gemini_thinking_level_is_closed_and_latency_safe():
 
 
 def test_sinhala_gemini_output_budget_defaults_and_clamps():
-    assert server._resolve_smartpbx_sinhala_gemini_max_tokens(None) == 600
-    assert server._resolve_smartpbx_sinhala_gemini_max_tokens("") == 600
-    assert server._resolve_smartpbx_sinhala_gemini_max_tokens("invalid") == 600
+    assert server._resolve_smartpbx_sinhala_gemini_max_tokens(None) == 1024
+    assert server._resolve_smartpbx_sinhala_gemini_max_tokens("") == 1024
+    assert server._resolve_smartpbx_sinhala_gemini_max_tokens("invalid") == 1024
     assert server._resolve_smartpbx_sinhala_gemini_max_tokens("199") == 200
     assert server._resolve_smartpbx_sinhala_gemini_max_tokens("600") == 600
     assert server._resolve_smartpbx_sinhala_gemini_max_tokens("1025") == 1024
