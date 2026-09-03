@@ -2485,10 +2485,34 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
 #
 # PRIVACY: this cache is an allowlist, never a general memo table. Caller
 # transcript, model output and tool text must never be admitted to it.
+# The keypad prompt is reached exactly when spoken capture has already
+# failed twice, so it lands on a caller who is already struggling -- the
+# worst possible moment to switch her into English. The label is model
+# output, so it is never interpolated into the Sinhala sentence: that would
+# both speak English mid-Sinhala and make the phrase unrenderable in
+# advance. Two fixed phrases cover every label the tool is offered for.
+SMARTPBX_SINHALA_KEYPAD_PROMPTS: dict[str, str] = {
+    "whatsapp": (
+        "කරුණාකර ඔබේ WhatsApp අංකය දුරකථනයේ අංක බොත්තම් වලින් ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
+    ),
+    "default": (
+        "කරුණාකර ඔබේ අංකය දුරකථනයේ අංක බොත්තම් වලින් ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
+    ),
+}
+
+
+def _smartpbx_sinhala_keypad_instruction(label: str) -> str:
+    """Select the fixed Sinhala keypad prompt for a model-supplied label."""
+    return SMARTPBX_SINHALA_KEYPAD_PROMPTS[
+        "whatsapp" if "whatsapp" in label.lower() else "default"
+    ]
+
+
 SMARTPBX_SINHALA_CACHED_PHRASES: tuple[str, ...] = tuple(
     dict.fromkeys(
         (
             SMARTPBX_SINHALA_INITIAL_FILLER_TEXT,
+            *SMARTPBX_SINHALA_KEYPAD_PROMPTS.values(),
             *(
                 phrase
                 for phrase in MEDIA_STREAM_FILLERS.get("si", {}).values()
@@ -7162,10 +7186,17 @@ class MediaStreamSession:
             label = str(tool_input.get("label") or "").strip()
         spoken_label = label or "your number"
 
-        instruction = (
-            f"Please key in {spoken_label} on your phone's keypad now, "
-            "then press the hash key when you're done."
-        )
+        # A Sinhala caller must not be handed an English instruction, and this
+        # prompt is on the critical path: the entry window only arms once it has
+        # been spoken, so it takes a pre-rendered fixed phrase rather than a
+        # live synthesis round trip.
+        if self.lang == "si":
+            instruction = _smartpbx_sinhala_keypad_instruction(label)
+        else:
+            instruction = (
+                f"Please key in {spoken_label} on your phone's keypad now, "
+                "then press the hash key when you're done."
+            )
         collector = DtmfCollector(
             loop=self._event_loop,
             interdigit_timeout=DTMF_INTERDIGIT_TIMEOUT_SECONDS,

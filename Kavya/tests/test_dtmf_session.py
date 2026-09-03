@@ -482,3 +482,75 @@ async def test_a_pause_during_the_prompt_does_not_finalize_a_partial_entry(monke
     result = json.loads(await asyncio.wait_for(task, timeout=1))
     assert result["digits"] == "0762560705"
     assert loop.live() == []
+
+
+def make_sinhala_smartpbx_session(monkeypatch):
+    session = server.MediaStreamSession(
+        websocket=None, lang="si", media_transport=None,
+    )
+    session._event_loop = asyncio.get_running_loop()
+    session._smartpbx_transfer_context = object()
+    spoken: list[str] = []
+
+    async def fake_speak(text, generation=-1):
+        spoken.append(text)
+
+    monkeypatch.setattr(session, "_speak", fake_speak)
+    return session, spoken
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,expected_key",
+    [
+        ("WhatsApp number for your confirmation", "whatsapp"),
+        ("callback number", "default"),
+        ("", "default"),
+    ],
+)
+async def test_sinhala_keypad_prompt_is_spoken_in_sinhala(
+    monkeypatch, label, expected_key,
+):
+    """A Sinhala caller who has already failed spoken capture twice must not be
+    handed an English instruction at the moment she is struggling most."""
+    session, spoken = make_sinhala_smartpbx_session(monkeypatch)
+
+    task = asyncio.create_task(session._collect_number_via_keypad({"label": label}))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert spoken == [server.SMARTPBX_SINHALA_KEYPAD_PROMPTS[expected_key]]
+    assert "Please key in" not in spoken[0]
+    # The model-supplied label is never interpolated into the Sinhala sentence.
+    if label:
+        assert label not in spoken[0]
+
+    session._dtmf_collector.cancel()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_english_keypad_prompt_is_unchanged(monkeypatch):
+    session, spoken = make_smartpbx_session(monkeypatch)
+
+    task = asyncio.create_task(
+        session._collect_number_via_keypad({"label": "WhatsApp number"})
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert spoken == [
+        "Please key in WhatsApp number on your phone's keypad now, "
+        "then press the hash key when you're done."
+    ]
+
+    session._dtmf_collector.cancel()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+def test_both_sinhala_keypad_prompts_are_pre_rendered_fixed_phrases():
+    """The entry window arms only after this prompt, so it cannot pay for TTS."""
+    for prompt in server.SMARTPBX_SINHALA_KEYPAD_PROMPTS.values():
+        assert prompt in server.SMARTPBX_SINHALA_CACHED_PHRASES
