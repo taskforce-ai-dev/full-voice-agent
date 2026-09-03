@@ -43,7 +43,7 @@ class _FakeAsgiSession:
     async def feed_audio(self, audio):
         pass
 
-    async def finish(self, schedule_post_call=False):
+    async def finish(self, schedule_post_call=False, **close_kwargs):
         pass
 
 

@@ -188,7 +188,12 @@ async def test_max_call_seconds_setting_defaults_bounds_and_env_tunable():
     assert settings(max_call_seconds=300).max_call_seconds == 300
     assert settings(max_call_seconds=7200).max_call_seconds == 7200
 
-    for rejected in ("0", "299", "7201", "-1", "", "abc", "3600.5"):
+    # A blank compose passthrough means "absent" and resolves to the default.
+    assert SmartPBXSettings.from_env({
+        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+        "SMARTPBX_ACCOUNT_ID": "account-1", "SMARTPBX_MAX_CALL_SECONDS": "",
+    }).max_call_seconds == 3600
+    for rejected in ("0", "299", "7201", "-1", "abc", "3600.5"):
         with pytest.raises(ValueError):
             SmartPBXSettings.from_env({
                 "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",

@@ -169,7 +169,12 @@ async def test_transfer_pending_ceiling_is_bounded_and_env_tunable():
     })
     assert tuned.transfer_pending_timeout_seconds == 120
 
-    for rejected in ("0", "29", "1801", "-1", "", "abc", "300.5"):
+    # A blank compose passthrough means "absent" and resolves to the default.
+    assert SmartPBXSettings.from_env({
+        "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",
+        "SMARTPBX_ACCOUNT_ID": "account-1", "SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS": "",
+    }).transfer_pending_timeout_seconds == 300
+    for rejected in ("0", "29", "1801", "-1", "abc", "300.5"):
         with pytest.raises(ValueError):
             SmartPBXSettings.from_env({
                 "ENABLE_SMARTPBX_WSS": "true", "SMARTPBX_WS_TOKEN": "token",

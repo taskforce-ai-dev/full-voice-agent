@@ -454,7 +454,10 @@ def test_canonical_voice_configuration_covers_both_kavya_services_and_stays_disa
         "transfer-disabled",
     ):
         assert required in runbook
-    assert "sha" + "256sum" not in runbook
+    # The canonical-voice procedure validates env contents, never checksums;
+    # the separate opt-in host-file integrity check may use sha256sum.
+    voice_section = runbook.split("## Canonical English voice provisioning", 1)[1].split("\n## ", 1)[0]
+    assert "sha" + "256sum" not in voice_section
 
 
 def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_operations():
