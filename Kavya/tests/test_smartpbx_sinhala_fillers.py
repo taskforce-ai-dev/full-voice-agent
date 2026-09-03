@@ -229,3 +229,121 @@ def test_twilio_sinhala_media_streams_never_arm_a_smartpbx_initial_filler():
         )
 
     assert asyncio.run(scenario()) is None
+
+
+# --- A2: the tool filler runs beside the tool -------------------------------
+
+def _sinhala_tool_pipeline(provider, rounds):
+    from tests.test_smartpbx_server import direct_tool_client, direct_tool_pipeline
+
+    client = direct_tool_client(provider, rounds)
+    pipeline = direct_tool_pipeline(server, provider, client, lang="si")
+    pipeline.history = [{"role": "user", "content": "guest asks about rooms"}]
+    return pipeline
+
+
+def _run_sinhala_tool_turn(monkeypatch, provider, *, tool_name):
+    """Drive one Sinhala tool round with a filler that will not finish itself.
+
+    The filler's TTS blocks until the tool has actually started. Serialising the
+    filler in front of ``execute_tool`` therefore deadlocks the turn, which is
+    exactly the production behaviour this change removes.
+    """
+    from tests.test_smartpbx_server import (
+        bind_direct_smartpbx_turn, direct_text_round, direct_tool_round,
+    )
+
+    pipeline = _sinhala_tool_pipeline(provider, [
+        direct_tool_round(provider, {"nights": 2}, tool_name=tool_name),
+        direct_text_round(provider, "පිළිතුර."),
+    ])
+    events: list[str] = []
+    tool_started = asyncio.Event()
+
+    async def fake_tts(text, **_kwargs):
+        events.append("tts_start:" + text)
+        if text in server.MEDIA_STREAM_FILLERS["si"].values():
+            await asyncio.wait_for(tool_started.wait(), timeout=2.0)
+        events.append("tts_done:" + text)
+
+    async def fake_execute_tool(name, _arguments):
+        events.append("tool:" + name)
+        tool_started.set()
+        return '{"status": "ok"}'
+
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", fake_tts)
+    monkeypatch.setattr(server, "execute_tool", fake_execute_tool)
+
+    async def scenario():
+        bind_direct_smartpbx_turn(server, pipeline)
+        runner = (
+            pipeline._run_llm_gemini if provider == "gemini"
+            else pipeline._run_llm_claude
+        )
+        await asyncio.wait_for(runner(), timeout=5.0)
+
+    asyncio.run(scenario())
+    return events
+
+
+@pytest.mark.parametrize("provider", ["gemini", "claude"])
+def test_direct_sinhala_tool_filler_runs_concurrently_with_the_tool(
+    monkeypatch, provider,
+):
+    events = _run_sinhala_tool_turn(
+        monkeypatch, provider, tool_name="check_availability",
+    )
+    filler = server.MEDIA_STREAM_FILLERS["si"]["check_availability"]
+
+    assert "tts_start:" + filler in events
+    # The load-bearing assertion: the PMS call started while the filler was
+    # still being delivered, not after it had drained.
+    assert events.index("tool:check_availability") < events.index("tts_done:" + filler)
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["transfer_to_human", "capture_spoken_number"],
+)
+def test_excluded_sinhala_tools_keep_their_serialised_filler(tool_name):
+    """Transfer owns its own announcement; capture keeps its specialised flow."""
+    pipeline, _transport = _sinhala_pipeline()
+
+    assert not pipeline._is_direct_smartpbx_sinhala_tool_filler_round(
+        tool_name, text_content="", filler_sent=False, initial_filler=None,
+    )
+
+
+def test_twilio_sinhala_media_streams_keep_their_serialised_filler():
+    """Only the direct Dialog path gains the concurrent filler."""
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="si", media_transport=None, llm_provider="gemini",
+    )
+
+    assert not pipeline._is_direct_smartpbx_sinhala_tool_filler_round(
+        "check_availability",
+        text_content="", filler_sent=False, initial_filler=None,
+    )
+
+
+def test_a_spoken_initial_filler_suppresses_the_sinhala_tool_filler():
+    """One filler per turn, exactly as on the English path."""
+    pipeline, _transport = _sinhala_pipeline()
+    spoke = SimpleNamespace(suppress_specialized_tool_filler=True)
+    pending = SimpleNamespace(suppress_specialized_tool_filler=False)
+
+    assert not pipeline._is_direct_smartpbx_sinhala_tool_filler_round(
+        "check_availability",
+        text_content="", filler_sent=False, initial_filler=spoke,
+    )
+    assert pipeline._is_direct_smartpbx_sinhala_tool_filler_round(
+        "check_availability",
+        text_content="", filler_sent=False, initial_filler=pending,
+    )
+    assert not pipeline._is_direct_smartpbx_sinhala_tool_filler_round(
+        "check_availability",
+        text_content="මම බලනවා.", filler_sent=False, initial_filler=None,
+    )
+    assert not pipeline._is_direct_smartpbx_sinhala_tool_filler_round(
+        "check_availability",
+        text_content="", filler_sent=True, initial_filler=None,
+    )

@@ -6143,6 +6143,38 @@ class MediaStreamSession:
         """Task 4 boundary; never broadens English or Twilio failure behavior."""
         return self._is_direct_smartpbx() and self.lang == "si"
 
+    def _is_direct_smartpbx_sinhala_tool_filler_round(
+        self,
+        first_tool: str,
+        *,
+        text_content: str,
+        filler_sent: bool,
+        initial_filler: "SmartPBXInitialFillerController | None",
+    ) -> bool:
+        """Whether this Sinhala tool batch may run its filler beside the tool.
+
+        The Sinhala branch used to ``await`` its filler before ``execute_tool``,
+        so the PMS call did not even start until Gemini TTS had synthesised and
+        paced the whole phrase. English has run the two concurrently since
+        Phase B; this is the same admission rule, so the exclusions match
+        exactly: the transfer tool owns its own canonical announcement and
+        delivery barrier, capture flows keep their specialised prompts, one
+        filler per turn, and a model preamble or an already-spoken initial
+        filler makes a second one redundant. Everything excluded here keeps the
+        pre-existing serialised behavior untouched.
+        """
+        return (
+            self._is_direct_smartpbx_sinhala()
+            and first_tool != "transfer_to_human"
+            and first_tool not in _SMARTPBX_CAPTURE_TOOLS
+            and not filler_sent
+            and not text_content.strip()
+            and not (
+                initial_filler is not None
+                and initial_filler.suppress_specialized_tool_filler
+            )
+        )
+
     def _reserve_smartpbx_initial_filler(self) -> _CallFillerLease:
         return self._smartpbx_filler_rotation.reserve(
             "initial", SMARTPBX_INITIAL_FILLER_BANK
@@ -9924,6 +9956,19 @@ class MediaStreamSession:
                             )
                             await asyncio.sleep(0)
                             smartpbx_filler_sent = True
+                    elif self._is_direct_smartpbx_sinhala_tool_filler_round(
+                        first_tool,
+                        text_content=text_content,
+                        filler_sent=smartpbx_filler_sent,
+                        initial_filler=initial_filler,
+                    ):
+                        filler = fillers.get(first_tool, fillers.get("_default", ""))
+                        if filler:
+                            tool_filler_task = self._start_smartpbx_tool_filler(
+                                filler, generation=gen,
+                            )
+                            await asyncio.sleep(0)
+                            smartpbx_filler_sent = True
                     else:
                         filler = fillers.get(first_tool, fillers.get("_default", ""))
                         if filler:
@@ -10644,6 +10689,19 @@ class MediaStreamSession:
                         filler_lease = self._reserve_smartpbx_tool_filler(first_tool)
                         tool_filler_task = self._start_smartpbx_tool_filler(
                             filler_lease.text, generation=gen, lease=filler_lease,
+                        )
+                        await asyncio.sleep(0)
+                        smartpbx_filler_sent = True
+                elif self._is_direct_smartpbx_sinhala_tool_filler_round(
+                    first_tool,
+                    text_content=text_content,
+                    filler_sent=smartpbx_filler_sent,
+                    initial_filler=initial_filler,
+                ):
+                    filler = fillers.get(first_tool, fillers.get("_default", ""))
+                    if filler:
+                        tool_filler_task = self._start_smartpbx_tool_filler(
+                            filler, generation=gen,
                         )
                         await asyncio.sleep(0)
                         smartpbx_filler_sent = True
