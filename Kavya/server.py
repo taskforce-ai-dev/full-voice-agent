@@ -5366,6 +5366,13 @@ class MediaStreamSession:
         # being treated as an audible-response barge-in.
         self._tts_synthesis_in_flight = False
         self._tts_synthesis_generation: int | None = None
+        # audit #9: the English/ElevenLabs equivalent of the above. Unlike
+        # Gemini, ElevenLabs sets _is_speaking True immediately (so a genuine
+        # barge-in still fires during TTFB); this instead tracks "request
+        # started, no frame on the wire yet" so a sub-threshold/debounced STT
+        # result in that window is buffered rather than dropped.
+        self._smartpbx_en_pre_audio_active = False
+        self._smartpbx_en_pre_audio_generation: int | None = None
         self._pre_audio_stt_generation: int | None = None
         self._pre_audio_stt_first_at = 0.0
         self._pre_audio_stt_events = 0
@@ -5378,6 +5385,21 @@ class MediaStreamSession:
         self._assistant_turn_generated_sentences: list[str] = []
         self._delivered_sentences: list[str] = []
         self._track_assistant_turn_delivery: bool = False
+        # audit #5: lets a waiter (tools._await_turn_delivery) block on
+        # progress instead of busy-spinning `await asyncio.sleep(0)` every
+        # loop tick. Set by _send_tts_done on every completed sentence and by
+        # _handle_bargein on every generation bump, so a waiter wakes on
+        # either delivery progress or the delivery becoming moot.
+        self._smartpbx_delivery_event: asyncio.Event = asyncio.Event()
+        # audit #8: _handle_bargein idempotency. Two STT callbacks (an interim
+        # and a final, or two interims) can both be submitted while
+        # _is_speaking is still True and the loop is busy -- both then run
+        # _handle_bargein for what is really one interruption. The generation
+        # value claimed by the most recent run; a call for that same
+        # generation (still in progress, or already finished and bumped past
+        # it) is a duplicate and returns immediately instead of redoing the
+        # cancel/bump/retain cycle.
+        self._smartpbx_bargein_claimed_generation: int | None = None
         self._assistant_turn_speech_end_at: float = 0.0
         # Gemini failover state is per MediaStreamSession.
         self._gemini_failover_state: dict[str, Any] = _init_gemini_failover_state()
@@ -6956,12 +6978,32 @@ class MediaStreamSession:
     # â”€â”€ STT callback (called from background thread) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _pre_audio_synthesis_active(self) -> bool:
-        return (
-            self._is_direct_smartpbx()
-            and self._tts_synthesis_in_flight
-            and not self._is_speaking
-            and self._tts_synthesis_generation == self._speak_generation
-        )
+        """True in the window between a TTS request starting and its first
+        audio frame reaching the transport -- for either TTS path.
+
+        Gemini/Sinhala (`_tts_synthesis_in_flight`) never sets `_is_speaking`
+        until that first frame, so `not self._is_speaking` alone identifies
+        the window there. English/ElevenLabs (audit #9) sets `_is_speaking`
+        True immediately instead -- a genuine >=BARGEIN_MIN_CHARS
+        interruption must still be able to barge in during TTFB -- so it is
+        tracked separately via `_smartpbx_en_pre_audio_active`.
+        """
+        if not self._is_direct_smartpbx():
+            return False
+        if self._tts_synthesis_in_flight and not self._is_speaking:
+            return self._tts_synthesis_generation == self._speak_generation
+        if self._smartpbx_en_pre_audio_active:
+            return self._smartpbx_en_pre_audio_generation == self._speak_generation
+        return False
+
+    def _smartpbx_end_en_pre_audio_window(self, generation: int) -> None:
+        """End the English pre-audio window at the exact moment the first
+        frame reaches the transport -- not when the whole TTS call finishes.
+        Left active for the full utterance would route every later STT result
+        through pre-audio buffering instead of the normal barge-in path for
+        as long as speech plays."""
+        if self._smartpbx_en_pre_audio_generation == generation:
+            self._smartpbx_en_pre_audio_active = False
 
     def _clear_pre_audio_stt(self) -> str:
         text = self._pre_audio_stt_latest_interim or self._pre_audio_stt_committed
@@ -7161,6 +7203,16 @@ class MediaStreamSession:
         return True
 
     async def _handle_bargein(self):
+        # Idempotent per speak generation (audit #8): a duplicate STT callback
+        # for the same interruption (two interims/a final racing in while the
+        # loop is busy) must not redo the cancel/bump/retain cycle -- that
+        # would supersede the caller's own new utterance a second time and
+        # can drop it entirely. Captured up front, synchronously, before any
+        # await -- nothing else can run between this check and the claim.
+        generation = self._speak_generation
+        if self._smartpbx_bargein_claimed_generation == generation:
+            return
+        self._smartpbx_bargein_claimed_generation = generation
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=barge_in")
         else:
@@ -7183,6 +7235,10 @@ class MediaStreamSession:
         self._assistant_turn_speech_end_at = time.monotonic()
         self._cancel_reprompt()
         self._speak_generation += 1
+        # Wake any _await_turn_delivery waiter (audit #5): the generation it
+        # was waiting on is now stale, so its own condition check will exit
+        # rather than blocking out the remainder of its timeout.
+        self._smartpbx_delivery_event.set()
         # Barge-in ownership: SUPERSEDED for dispatch, RETAINED for the record.
         # The guest is speaking NEW content right now, and that utterance — not
         # an older buffer — is what the next turn must answer; prepending stale
@@ -7364,6 +7420,10 @@ class MediaStreamSession:
                 self._record_delivered_sentence(sentence, turn_generation or generation)
                 self._schedule_reprompt()
             self._assistant_turn_speech_end_at = time.monotonic()
+            # Wake any _await_turn_delivery waiter (audit #5) -- whether or
+            # not this sentence counted as delivered, the waiter's own
+            # condition needs a re-check.
+            self._smartpbx_delivery_event.set()
             return delivered
         async with self._ws_lock:
             await self.ws.send_text(json.dumps({
@@ -10430,110 +10490,142 @@ class MediaStreamSession:
         self._is_speaking = True
         self._mark_smartpbx_turn_once("tts_request")
         self._speaking_since = time.monotonic()
+        # audit #9: unlike Gemini/Sinhala TTS, ElevenLabs sets _is_speaking
+        # True immediately (before TTFB), so a genuine >=BARGEIN_MIN_CHARS
+        # interruption can still barge in during that window. But a
+        # sub-threshold/debounced STT result arriving in that same window was
+        # previously just dropped -- not buffered -- because
+        # _pre_audio_synthesis_active() only recognized Gemini's "in flight,
+        # not yet speaking" shape. This tracks ElevenLabs' own pre-audio
+        # window (request started, no frame on the wire yet) so
+        # _on_stt_result/_on_stt_interim route it through the same
+        # _handle_pre_audio_stt buffering Sinhala already has.
+        expected_generation = self._speak_generation
+        smartpbx_pre_audio = self._is_direct_smartpbx()
+        audio_emitted = False
+        if smartpbx_pre_audio:
+            self._smartpbx_en_pre_audio_active = True
+            self._smartpbx_en_pre_audio_generation = expected_generation
         url = _elevenlabs_stream_url(voice_id)
         headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
         payload: dict[str, Any] = {"text": text, "model_id": model_id, "voice_settings": voice_settings}
 
-        if self._consume_smartpbx_welcome_audio_marker(text):
-            cache_key = _smartpbx_welcome_audio_cache_key(
-                text, url, model_id, voice_settings,
-            )
+        try:
+            if self._consume_smartpbx_welcome_audio_marker(text):
+                cache_key = _smartpbx_welcome_audio_cache_key(
+                    text, url, model_id, voice_settings,
+                )
 
-            async def fetch_welcome_audio() -> bytes:
+                async def fetch_welcome_audio() -> bytes:
+                    async with httpx.AsyncClient() as http:
+                        async with http.stream(
+                            "POST", url, json=payload, headers=headers, timeout=15.0,
+                        ) as resp:
+                            if resp.status_code != 200:
+                                await resp.aread()
+                                self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
+                                self._emit_smartpbx_tts_diagnostic(
+                                    DiagnosticFailureClass.TTS_HTTP_STATUS
+                                )
+                                raise _ElevenLabsWelcomeHTTPStatus()
+                            chunks: list[bytes] = []
+                            async for chunk in resp.aiter_bytes(chunk_size=640):
+                                if chunk:
+                                    chunks.append(chunk)
+                            return b"".join(chunks)
+
+                try:
+                    audio = await _get_cached_smartpbx_welcome_audio(cache_key, fetch_welcome_audio)
+                    if not self._is_speaking:
+                        logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                        return
+                    self._mark_smartpbx_turn_once("tts_first_chunk")
+                    audio_emitted = True
+                    if smartpbx_pre_audio:
+                        self._smartpbx_end_en_pre_audio_window(expected_generation)
+                    await self._send_media_audio(audio)
+                    if self._is_speaking:
+                        await self._send_tts_done(
+                            sentence=sentence,
+                            turn_generation=turn_generation,
+                        )
+                    else:
+                        logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                except _ElevenLabsWelcomeHTTPStatus:
+                    self._is_speaking = False
+                except _ElevenLabsWelcomeEmptyAudio:
+                    self._log_tts_failure("elevenlabs", "empty_audio")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
+                    self._is_speaking = False
+                except httpx.TimeoutException:
+                    self._log_tts_failure("elevenlabs", "timeout")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_TIMEOUT)
+                    self._is_speaking = False
+                except Exception:
+                    self._log_tts_failure("elevenlabs", "exception")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
+                    self._is_speaking = False
+                return
+
+            try:
                 async with httpx.AsyncClient() as http:
                     async with http.stream(
                         "POST", url, json=payload, headers=headers, timeout=15.0,
                     ) as resp:
                         if resp.status_code != 200:
-                            await resp.aread()
-                            self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
-                            self._emit_smartpbx_tts_diagnostic(
-                                DiagnosticFailureClass.TTS_HTTP_STATUS
-                            )
-                            raise _ElevenLabsWelcomeHTTPStatus()
-                        chunks: list[bytes] = []
-                        async for chunk in resp.aiter_bytes(chunk_size=640):
-                            if chunk:
-                                chunks.append(chunk)
-                        return b"".join(chunks)
+                            body = await resp.aread()
+                            if self._is_smartpbx_session():
+                                self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
+                                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_HTTP_STATUS)
+                            else:
+                                logger.error("ElevenLabs %d: %s", resp.status_code, body[:200])
+                            self._is_speaking = False
+                            return
 
-            try:
-                audio = await _get_cached_smartpbx_welcome_audio(cache_key, fetch_welcome_audio)
-                if not self._is_speaking:
-                    logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
-                    return
-                self._mark_smartpbx_turn_once("tts_first_chunk")
-                await self._send_media_audio(audio)
+                        async for chunk in resp.aiter_bytes(chunk_size=640):
+                            if not self._is_speaking:
+                                break
+                            if chunk:
+                                self._mark_smartpbx_turn_once("tts_first_chunk")
+                                audio_emitted = True
+                                if smartpbx_pre_audio:
+                                    self._smartpbx_end_en_pre_audio_window(expected_generation)
+                            await self._send_media_audio(chunk)
+
                 if self._is_speaking:
                     await self._send_tts_done(
                         sentence=sentence,
                         turn_generation=turn_generation,
                     )
                 else:
-                    logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
-            except _ElevenLabsWelcomeHTTPStatus:
-                self._is_speaking = False
-            except _ElevenLabsWelcomeEmptyAudio:
-                self._log_tts_failure("elevenlabs", "empty_audio")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
-                self._is_speaking = False
+                    if self._is_smartpbx_session():
+                        logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                    else:
+                        logger.info("ElevenLabs TTS interrupted by barge-in [%s]", self.call_sid)
+
             except httpx.TimeoutException:
-                self._log_tts_failure("elevenlabs", "timeout")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_TIMEOUT)
+                if self._is_smartpbx_session():
+                    self._log_tts_failure("elevenlabs", "timeout")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_TIMEOUT)
+                else:
+                    logger.error("ElevenLabs timeout for: %s", text[:80])
                 self._is_speaking = False
             except Exception:
-                self._log_tts_failure("elevenlabs", "exception")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
-                self._is_speaking = False
-            return
-
-        try:
-            async with httpx.AsyncClient() as http:
-                async with http.stream(
-                    "POST", url, json=payload, headers=headers, timeout=15.0,
-                ) as resp:
-                    if resp.status_code != 200:
-                        body = await resp.aread()
-                        if self._is_smartpbx_session():
-                            self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
-                            self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_HTTP_STATUS)
-                        else:
-                            logger.error("ElevenLabs %d: %s", resp.status_code, body[:200])
-                        self._is_speaking = False
-                        return
-
-                    async for chunk in resp.aiter_bytes(chunk_size=640):
-                        if not self._is_speaking:
-                            break
-                        if chunk:
-                            self._mark_smartpbx_turn_once("tts_first_chunk")
-                        await self._send_media_audio(chunk)
-
-            if self._is_speaking:
-                await self._send_tts_done(
-                    sentence=sentence,
-                    turn_generation=turn_generation,
-                )
-            else:
                 if self._is_smartpbx_session():
-                    logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                    self._log_tts_failure("elevenlabs", "exception")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
                 else:
-                    logger.info("ElevenLabs TTS interrupted by barge-in [%s]", self.call_sid)
-
-        except httpx.TimeoutException:
-            if self._is_smartpbx_session():
-                self._log_tts_failure("elevenlabs", "timeout")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_TIMEOUT)
-            else:
-                logger.error("ElevenLabs timeout for: %s", text[:80])
-            self._is_speaking = False
-        except Exception:
-            if self._is_smartpbx_session():
-                self._log_tts_failure("elevenlabs", "exception")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
-            else:
-                logger.exception("ElevenLabs TTS failed for: %s", text[:80])
-            self._is_speaking = False
+                    logger.exception("ElevenLabs TTS failed for: %s", text[:80])
+                self._is_speaking = False
+        finally:
+            if (
+                smartpbx_pre_audio
+                and self._smartpbx_en_pre_audio_generation == expected_generation
+            ):
+                self._smartpbx_en_pre_audio_active = False
+                self._smartpbx_en_pre_audio_generation = None
+                if not audio_emitted:
+                    await self._flush_pre_audio_stt()
 
     # â”€â”€ Azure TTS (Sinhala) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 

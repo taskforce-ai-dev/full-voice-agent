@@ -979,17 +979,38 @@ async def _await_turn_delivery(
     The accounting is driven by _send_tts_done, which already uses the shared
     Dialog barrier (send_mark -> queue.join). Keep this wait bounded so blocked
     TTS cannot keep transfer hanging indefinitely.
+
+    Audit #5: this used to busy-spin `await asyncio.sleep(0)` once per event
+    loop tick for the full paced delivery of the announcement (~3-5s), which
+    under load contends with every other concurrent call's paced senders and
+    STT feeds. `_send_tts_done` (and `_handle_bargein`, when it makes this
+    wait moot) now sets `pipeline._smartpbx_delivery_event`, so this blocks
+    between real progress events instead.
     """
     if expected <= 0 or timeout <= 0:
         return
 
+    def _pending() -> bool:
+        return (
+            int(getattr(pipeline, "_assistant_turn_generation", -1)) == generation
+            and len(getattr(pipeline, "_delivered_sentences", [])) < expected
+        )
+
+    event = getattr(pipeline, "_smartpbx_delivery_event", None)
     try:
         async with asyncio.timeout(timeout):
-            while (
-                int(getattr(pipeline, "_assistant_turn_generation", -1)) == generation
-                and len(getattr(pipeline, "_delivered_sentences", [])) < expected
-            ):
-                await asyncio.sleep(0)
+            if event is None:
+                # Defensive fallback for a pipeline stand-in without the
+                # event (e.g. an older/lighter test double) -- still bounded
+                # by the outer timeout, just without the wake signal.
+                while _pending():
+                    await asyncio.sleep(0)
+                return
+            while _pending():
+                event.clear()
+                if not _pending():
+                    break
+                await event.wait()
     except TimeoutError:
         logger.warning(
             "smartpbx_tool event=transfer_delivery_timeout timeout=%.2f", timeout,
