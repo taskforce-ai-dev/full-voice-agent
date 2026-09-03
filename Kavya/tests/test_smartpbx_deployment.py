@@ -128,6 +128,14 @@ def test_nginx_exposes_only_the_bounded_smartpbx_surface_with_tls():
     media = nginx.split("location = /ws/v1/smartpbx/media", 1)[1].split("location =", 1)[0]
     assert "limit_req zone=kavya_smartpbx_req burst=10 nodelay;" in media
     assert "limit_req_status 429;" in nginx
+    # /smartpbx/status and /health share the media socket's single uvicorn
+    # worker; without their own rate limit an unauthenticated client can
+    # hammer them freely (no auth is required to reach /health at all).
+    assert "limit_req_zone $binary_remote_addr zone=kavya_smartpbx_http:10m rate=60r/m;" in nginx
+    health = nginx.split("location = /health", 1)[1].split("location =", 1)[0]
+    status_block = nginx.split("location = /smartpbx/status", 1)[1].split("location /", 1)[0]
+    assert "limit_req zone=kavya_smartpbx_http burst=20 nodelay;" in health
+    assert "limit_req zone=kavya_smartpbx_http burst=20 nodelay;" in status_block
     assert nginx.count("location = /ws/v1/smartpbx/media") == 1
     assert nginx.count("location = /health") == 1
     assert nginx.count("location = /smartpbx/status") == 1
