@@ -43,10 +43,18 @@ jobs:
             "Flico|https://flico.taskforceai.tech/health"
             "HattonHills|https://hattonhills.taskforceai.tech/health"
             "Kavya|https://treehouse.taskforceai.tech/health"
+            "Kavya SmartPBX|https://smartpbx-kavya.taskforceai.tech/health"
             "Kitchened|https://kitchened.taskforceai.tech/health"
             "SLIC|https://abans.taskforceai.tech/health"
             "Sofia|https://abans.taskforceai.tech/health"
             "WorldOfRefrigerators|https://worldofrefrigerators.taskforceai.tech/health"
+          )
+
+          # Endpoints whose /health body must contain a fixed substring, beyond
+          # a 2xx/3xx status -- catches a stray/misconfigured app answering on
+          # the right host with the wrong service.
+          declare -A BODY_CONTAINS=(
+            ["Kavya SmartPBX"]='"service_mode":"smartpbx"'
           )
 
           if [ "${#URLS[@]}" -eq 0 ]; then
@@ -61,16 +69,30 @@ jobs:
           for entry in "${URLS[@]}"; do
             agent="${entry%%|*}"
             url="${entry#*|}"
+            body_file="$(mktemp)"
 
-            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$url")
+            code=$(curl -s -o "$body_file" -w "%{http_code}" --max-time 15 "$url")
 
-            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+            healthy=1
+            reason=""
+            if [ "$code" -lt 200 ] || [ "$code" -ge 400 ]; then
+              # code is "000" when curl could not reach/resolve the host.
+              healthy=0
+            fi
+
+            expected_substring="${BODY_CONTAINS[$agent]:-}"
+            if [ "$healthy" -eq 1 ] && [ -n "$expected_substring" ] && ! grep -qF -- "$expected_substring" "$body_file"; then
+              healthy=0
+              reason=" (body missing expected substring)"
+            fi
+
+            if [ "$healthy" -eq 1 ]; then
               echo "OK    [$code] $agent -> $url"
             else
-              # code is "000" when curl could not reach/resolve the host.
-              echo "FAIL  [$code] $agent -> $url"
-              failures+=("$agent ($code) $url")
+              echo "FAIL  [$code] $agent -> $url$reason"
+              failures+=("$agent ($code) $url$reason")
             fi
+            rm -f "$body_file"
           done
 
           echo "--------------------------------------------------"
@@ -85,3 +107,26 @@ jobs:
           fi
 
           echo "All ${#URLS[@]} endpoint(s) healthy."
+
+      - name: Check smartpbx-kavya.taskforceai.tech certificate expiry (fail under 14 days)
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          host="smartpbx-kavya.taskforceai.tech"
+          checkend_seconds=$((14 * 24 * 60 * 60))
+
+          cert=$(echo | openssl s_client -servername "$host" -connect "$host:443" -timeout 15 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null)
+          if [ -z "$cert" ]; then
+            echo "FAIL  could not retrieve a certificate for $host"
+            exit 1
+          fi
+          echo "$host: $cert"
+
+          if echo | openssl s_client -servername "$host" -connect "$host:443" -timeout 15 2>/dev/null \
+              | openssl x509 -noout -checkend "$checkend_seconds" >/dev/null 2>&1; then
+            echo "OK    $host certificate valid for at least 14 more days"
+          else
+            echo "FAIL  $host certificate expires within 14 days (or could not be checked)"
+            exit 1
+          fi
