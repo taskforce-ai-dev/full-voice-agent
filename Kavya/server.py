@@ -7487,6 +7487,11 @@ class MediaStreamSession:
             "\n\nSMARTPBX CALLER RHYTHM:\n"
             "- Answer first in one or two concise sentences.\n"
             "- Ask no more than one necessary next question.\n"
+            "- Confirm a detail the guest has just given by repeating it back "
+            "in a few words, then carry on.\n"
+            "- Do not open a reply by describing yourself (\"As an AI...\"). "
+            "Answer the question; say plainly that you are an AI agent for "
+            "Hatton Hills only when the caller asks.\n"
             if self._is_direct_smartpbx()
             else ""
         )
