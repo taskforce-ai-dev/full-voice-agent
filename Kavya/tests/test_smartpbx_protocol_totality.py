@@ -162,15 +162,6 @@ def _generate_cases() -> list[tuple[str, str]]:
     return cases
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "fixed in stream E: deep JSON nesting and lone-surrogate text both "
-        "escape parse_smartpbx_event's narrow `except (TypeError, "
-        "json.JSONDecodeError)` (smartpbx_protocol.py:117-124) as a bare "
-        "RecursionError / UnicodeEncodeError instead of ProtocolViolation."
-    ),
-)
 def test_parse_smartpbx_event_returns_union_member_or_protocol_violation_over_2000_cases():
     """For any `str`, `parse_smartpbx_event` must return a union member or
     raise `ProtocolViolation` -- and nothing else. 2000 fixed-seed
