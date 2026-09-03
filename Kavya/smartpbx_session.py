@@ -28,6 +28,11 @@ _ULAW_FRAME_BYTES = 160
 _LANGUAGE_MENU_PREROLL_BYTES = 2_400
 _MAX_LANGUAGE_MENU_FRAMES = 512
 _CLOSE_REASONS = frozenset(reason.value for reason in SmartPBXCloseReason)
+# audit #3: how long teardown waits for an in-flight side-effecting tool call
+# (e.g. create_booking) to settle before snapshotting the post-call transcript.
+# A module-level name (not an inline literal) so tests can shrink it instead
+# of waiting out a real 10s.
+LATE_TOOL_RESULT_WAIT_SECONDS = 10.0
 
 
 def _resolve_close_reason(reason: str | None) -> str:
@@ -760,7 +765,30 @@ class KavyaSmartPBXSession:
             if self._smartpbx_transfer_context is not None and self._smartpbx_transfer_context.coordinator is not None:
                 await self._smartpbx_transfer_context.coordinator.finalize_notification_retry()
 
+            # Late tool completion (audit #3): a runner mid-`execute_tool`
+            # (e.g. `create_booking`, 2-5s of PMS latency) when the caller
+            # hangs up is deliberately NOT cancelled -- a half-committed side
+            # effect on the wire is worse than letting it finish -- but it
+            # loses ownership the moment teardown clears the active turn, so
+            # its result would otherwise never reach the post-call record.
+            # Wait, bounded, for it to settle and record its own late result
+            # (via `_record_smartpbx_late_tool_completion`) before snapshotting
+            # the transcript below. Already done (the common case -- most
+            # turns finish in well under this) returns immediately; shielded
+            # so the wait timing out here never cancels the runner itself.
+            runner_task = getattr(pipeline, "_smartpbx_active_runner_task", None)
+            if runner_task is not None and not runner_task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(runner_task), timeout=LATE_TOOL_RESULT_WAIT_SECONDS,
+                    )
+                except Exception:
+                    pass
+
             transcript = list(getattr(pipeline, "full_transcript", []))
+            late_tool_results = getattr(pipeline, "_smartpbx_late_tool_results", None)
+            if late_tool_results:
+                transcript.extend(late_tool_results)
             if schedule_post_call and transcript:
                 self._post_call_task = asyncio.create_task(
                     self._post_call_processor(

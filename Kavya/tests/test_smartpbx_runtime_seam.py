@@ -1703,3 +1703,106 @@ async def test_missing_gemini_api_key_emits_gemini_api_key_missing_diagnostic(mo
     assert calls == [
         (DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.GEMINI_API_KEY_MISSING)
     ]
+
+
+# ---------------------------------------------------------------------------
+# C4 -- late tool completion after hangup: wait for the in-flight runner
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_finish_waits_for_in_flight_runner_and_merges_late_tool_results(monkeypatch):
+    """audit #3: teardown must not snapshot the post-call transcript before an
+    in-flight side-effecting tool call (e.g. create_booking) has a chance to
+    record its late result."""
+    import smartpbx_session
+
+    monkeypatch.setattr(smartpbx_session, "LATE_TOOL_RESULT_WAIT_SECONDS", 2.0)
+
+    pipeline = Pipeline()
+    pipeline.full_transcript = [{"role": "user", "text": "book it"}]
+    pipeline._smartpbx_late_tool_results = []
+    release = asyncio.Event()
+
+    async def runner():
+        await release.wait()
+        pipeline._smartpbx_late_tool_results.append({
+            "role": "system",
+            "text": "BOOKING CONFIRMED via create_booking: guest_name=Test Guest",
+        })
+
+    pipeline._smartpbx_active_runner_task = asyncio.ensure_future(runner())
+
+    posted: dict = {}
+
+    async def post(**kwargs):
+        posted.update(kwargs)
+
+    session = _session(pipeline)
+    session._post_call_processor = post
+
+    finish_task = asyncio.create_task(session.finish(True, close_reason="hangup", close_code=1000))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not finish_task.done(), "finish() must be blocked on the in-flight runner"
+
+    release.set()
+    await asyncio.wait_for(finish_task, timeout=1)
+
+    assert posted, "schedule_post_call=True with a non-empty transcript must post"
+    texts = [entry["text"] for entry in posted["full_transcript"]]
+    assert "book it" in texts
+    assert any("BOOKING CONFIRMED" in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_finish_does_not_wait_when_no_runner_is_in_flight():
+    """The common case (no tool ever executed, or it already finished) must
+    not pay any wait -- finish() completes as soon as its other teardown
+    steps do."""
+    pipeline = Pipeline()
+    pipeline.full_transcript = [{"role": "user", "text": "hello"}]
+    posted: dict = {}
+
+    async def post(**kwargs):
+        posted.update(kwargs)
+
+    session = _session(pipeline)
+    session._post_call_processor = post
+
+    await asyncio.wait_for(session.finish(True, close_reason="hangup", close_code=1000), timeout=1)
+
+    assert posted["full_transcript"] == [{"role": "user", "text": "hello"}]
+
+
+@pytest.mark.asyncio
+async def test_finish_bounded_wait_gives_up_and_still_completes(monkeypatch):
+    """A runner that never settles within the bound must not hang teardown
+    forever -- finish() proceeds without its (never-recorded) late result."""
+    import smartpbx_session
+
+    monkeypatch.setattr(smartpbx_session, "LATE_TOOL_RESULT_WAIT_SECONDS", 0.05)
+
+    pipeline = Pipeline()
+    pipeline.full_transcript = [{"role": "user", "text": "hello"}]
+    never_release = asyncio.Event()
+
+    async def runner():
+        await never_release.wait()
+
+    pipeline._smartpbx_active_runner_task = asyncio.ensure_future(runner())
+    posted: dict = {}
+
+    async def post(**kwargs):
+        posted.update(kwargs)
+
+    session = _session(pipeline)
+    session._post_call_processor = post
+
+    try:
+        await asyncio.wait_for(
+            session.finish(True, close_reason="hangup", close_code=1000), timeout=1,
+        )
+        assert posted["full_transcript"] == [{"role": "user", "text": "hello"}]
+    finally:
+        never_release.set()
+        await asyncio.gather(pipeline._smartpbx_active_runner_task, return_exceptions=True)

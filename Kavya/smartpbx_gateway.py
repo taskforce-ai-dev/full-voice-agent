@@ -637,6 +637,13 @@ class SmartPBXGateway:
             "transport": DiagnosticFailureClass.TRANSPORT_CLEANUP,
             "lease": DiagnosticFailureClass.LEASE_CLEANUP,
         }
+        # "session" gets a longer ceiling than its siblings: session.finish()
+        # already budgets up to 5s just to join the STT worker thread, and
+        # (audit #3) may now also wait up to 10s more for a late-completing
+        # side-effecting tool (e.g. create_booking) to settle so its booking
+        # marker reaches the post-call record. Both are shielded internally,
+        # so a session that still exceeds this is a genuine cleanup fault.
+        cleanup_timeouts = {"transport": 5, "session": 20, "lease": 5}
         for name, operation in (
             ("transport", None if transport is None else transport.close()),
             # finish() emits the session aggregate and schedules post-call work.
@@ -655,7 +662,7 @@ class SmartPBXGateway:
                 continue
             task = asyncio.create_task(operation)
             try:
-                await asyncio.wait_for(task, timeout=5)
+                await asyncio.wait_for(task, timeout=cleanup_timeouts[name])
             except (Exception, asyncio.CancelledError):
                 degraded = True
                 if not task.done():

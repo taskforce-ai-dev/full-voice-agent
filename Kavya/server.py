@@ -5484,6 +5484,13 @@ class MediaStreamSession:
         # Stays False for non-SmartPBX (Twilio) sessions, which never call
         # _finalize_smartpbx_turns().
         self._smartpbx_torn_down = False
+        # audit #3/#11: the currently in-flight endpointing->LLM->tool round,
+        # tracked so teardown can wait (bounded) for it to settle instead of
+        # discarding a tool that already had its side effect. Session-owned,
+        # separate from full_transcript so a late booking marker never lands
+        # in the live conversation history it can no longer be spoken from.
+        self._smartpbx_active_runner_task: "asyncio.Task[None] | None" = None
+        self._smartpbx_late_tool_results: list[dict[str, str]] = []
 
     def _is_smartpbx_session(self) -> bool:
         return self._smartpbx_transfer_context is not None
@@ -5993,6 +6000,22 @@ class MediaStreamSession:
     def _current_smartpbx_runner_can_execute_tools(self) -> bool:
         """Keep a barged-out task from crossing the tool side-effect boundary."""
         return self._current_smartpbx_runner_owns_shared_state()
+
+    def _record_smartpbx_late_tool_completion(
+        self, tool_name: str, tool_input: dict[str, Any], tool_result: str,
+    ) -> None:
+        """A tool executed after this runner lost ownership (audit #3).
+
+        Teardown already emitted the bounded ``late_tool_completion`` turn_stage
+        telemetry via ``_current_smartpbx_runner_owns_shared_state``; this is
+        the data half -- a booking that already happened must still reach the
+        post-call record even though the turn/history it would normally land
+        in is gone. Reuses ``_append_booking_confirmation_marker``'s own
+        success/shape filtering, so this is a safe no-op for every other tool
+        and for a failed or non-``create_booking`` result.
+        """
+        late = self._smartpbx_late_tool_results
+        _append_booking_confirmation_marker(late, tool_name, tool_input, tool_result)
 
     def _smartpbx_runner_raw_utterance(self) -> str:
         """Return raw capture input owned by this task, never a newer turn's."""
@@ -8020,8 +8043,14 @@ class MediaStreamSession:
             self._endpointing_handle.cancel()
         self._endpointing_handle = self._event_loop.call_later(
             delay,
-            lambda: asyncio.ensure_future(self._flush_transcript()),
+            self._dispatch_smartpbx_flush_transcript,
         )
+
+    def _dispatch_smartpbx_flush_transcript(self) -> None:
+        # Tracked, not just fire-and-forget (audit #11): SmartPBX teardown
+        # (audit #3) waits on this to let an in-flight tool call settle
+        # before the post-call transcript is snapshotted.
+        self._smartpbx_active_runner_task = asyncio.ensure_future(self._flush_transcript())
 
     async def _flush_transcript(self):
         if self._teardown_dispatch_closed or self._stt_closing or self._smartpbx_torn_down:
@@ -8592,6 +8621,17 @@ class MediaStreamSession:
                     if not self._current_smartpbx_runner_owns_shared_state(
                         tool_executed=tool_executed
                     ):
+                        # audit #3: this tool (and any earlier one this round)
+                        # already had its side effect; a booking must still
+                        # reach the post-call record even though the turn it
+                        # would normally be written into is gone.
+                        for _, _tc, _parsed_input, _result_str, _ in staged_results:
+                            self._record_smartpbx_late_tool_completion(
+                                _tc["name"], _parsed_input, _result_str,
+                            )
+                        self._record_smartpbx_late_tool_completion(
+                            tc["name"], parsed_input, result_str,
+                        )
                         await self._cancel_smartpbx_round_tts(tts_tasks)
                         await self._finish_smartpbx_tool_filler(
                             tool_filler_task, cancel=True
@@ -8616,6 +8656,10 @@ class MediaStreamSession:
                 if not self._current_smartpbx_runner_owns_shared_state(
                     tool_executed=tool_executed
                 ):
+                    for _tool_index, tc, parsed_input, result_str, _tool_error in staged_results:
+                        self._record_smartpbx_late_tool_completion(
+                            tc["name"], parsed_input, result_str,
+                        )
                     return ""
                 if len(staged_results) != len(tool_list):
                     assistant_msg["tool_calls"] = assistant_msg["tool_calls"][:len(staged_results)]
@@ -9267,6 +9311,17 @@ class MediaStreamSession:
                         if not self._current_smartpbx_runner_owns_shared_state(
                             tool_executed=tool_executed
                         ):
+                            # audit #3: this tool (and any earlier one this
+                            # round) already had its side effect; a booking
+                            # must still reach the post-call record even
+                            # though the turn it would normally land in is gone.
+                            for _tc, _parsed_input, _result_str, _ in staged_results:
+                                self._record_smartpbx_late_tool_completion(
+                                    _tc["function"]["name"], _parsed_input, _result_str,
+                                )
+                            self._record_smartpbx_late_tool_completion(
+                                tc["function"]["name"], parsed_input, result_str,
+                            )
                             await self._cancel_smartpbx_round_tts(tts_tasks)
                             await self._finish_smartpbx_tool_filler(
                                 tool_filler_task, cancel=True
@@ -9291,6 +9346,10 @@ class MediaStreamSession:
                     if not self._current_smartpbx_runner_owns_shared_state(
                         tool_executed=tool_executed
                     ):
+                        for tc, parsed_input, result_str, _tool_error in staged_results:
+                            self._record_smartpbx_late_tool_completion(
+                                tc["function"]["name"], parsed_input, result_str,
+                            )
                         await self._finish_smartpbx_tool_filler(
                             tool_filler_task, cancel=True
                         )
@@ -9968,6 +10027,17 @@ class MediaStreamSession:
                     if not self._current_smartpbx_runner_owns_shared_state(
                         tool_executed=tool_executed
                     ):
+                        # audit #3: this tool (and any earlier one this round)
+                        # already had its side effect; a booking must still
+                        # reach the post-call record even though the turn it
+                        # would normally be written into is gone.
+                        for _, _tb, _tb_input, _result_str, _ in staged_results:
+                            self._record_smartpbx_late_tool_completion(
+                                _tb["name"], _tb_input, _result_str,
+                            )
+                        self._record_smartpbx_late_tool_completion(
+                            tb["name"], tb["input"], result_str,
+                        )
                         await self._cancel_smartpbx_round_tts(tts_tasks)
                         await self._finish_smartpbx_tool_filler(
                             tool_filler_task, cancel=True
@@ -9992,6 +10062,10 @@ class MediaStreamSession:
                 if not self._current_smartpbx_runner_owns_shared_state(
                     tool_executed=tool_executed
                 ):
+                    for _tool_index, tb, tb_input, result_str, _tool_error in staged_results:
+                        self._record_smartpbx_late_tool_completion(
+                            tb["name"], tb_input, result_str,
+                        )
                     return ""
                 if len(staged_results) != len(tool_use_blocks):
                     assistant_content = assistant_content[:len(staged_results) + (1 if text_content else 0)]
