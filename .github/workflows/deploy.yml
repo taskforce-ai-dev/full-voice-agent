@@ -75,11 +75,11 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Reject Kavya image publishing
+      - name: Reject Kavya generic deployment
         run: |
           set -euo pipefail
-          if [[ "$AGENT" == "kavya" && "$MODE" == "image" ]]; then
-            echo "Kavya image mode is disabled; use the build-only Kavya image publisher." >&2
+          if [[ "$AGENT" == "kavya" ]]; then
+            echo "Kavya is excluded from generic deploy.yml for every mode (image, fast, build); use the build-only Kavya image publisher and the guarded runbook script (scripts/deploy_smartpbx_image.sh)." >&2
             exit 1
           fi
 
@@ -173,12 +173,26 @@ jobs:
           SRC: ${{ steps.map.outputs.src }}
           OPT: ${{ steps.map.outputs.opt }}
         run: |
+          # Kavya is rejected above for every mode, so this branch never runs
+          # for it today. These extra excludes are defence in depth only: if
+          # the reject step above is ever loosened or removed by mistake, a
+          # kavya rsync still cannot overwrite the host-side control plane
+          # (compose env allowlist, nginx vhosts, the guarded deploy scripts,
+          # the runbook). Other agents are unaffected.
+          extra_excludes=()
+          if [[ "$AGENT" == "kavya" ]]; then
+            extra_excludes=(
+              --exclude='scripts/' --exclude='docker-compose.yml'
+              --exclude='nginx-smartpbx*.conf' --exclude='SMARTPBX_RUNBOOK.md'
+            )
+          fi
           rsync -az \
             --exclude='.env' --exclude='.env.*' \
             --exclude='.git/' --exclude='.github/' \
             --exclude='venv/' --exclude='.venv/' --exclude='__pycache__/' \
             --exclude='chroma_db/' --exclude='node_modules/' \
             --exclude='*.log' --exclude='active_sessions.json' --exclude='*.bak' \
+            "${extra_excludes[@]}" \
             -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no" \
             "$SRC/" "$VPS_USER@$VPS_HOST:$OPT/"
 

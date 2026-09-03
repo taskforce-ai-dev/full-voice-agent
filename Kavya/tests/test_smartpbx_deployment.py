@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import hashlib
 import shutil
 import subprocess
 import re
@@ -2225,15 +2226,19 @@ def test_build_kavya_image_publisher_uses_only_trusted_tooling_and_honest_writer
     assert "consumers use the verified digest" in text
 
 
-def test_deploy_workflow_rejects_kavya_image_mode_before_any_publisher_or_host_step():
+def test_deploy_workflow_rejects_kavya_for_every_mode_before_any_publisher_or_host_step():
     text = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
     document = yaml.load(text, Loader=yaml.BaseLoader)
     steps = document["jobs"]["deploy"]["steps"]
 
-    guard = workflow_step(steps, "Reject Kavya image publishing")
+    guard = workflow_step(steps, "Reject Kavya generic deployment")
     guard_run = guard["run"]
-    assert '[[ "$AGENT" == "kavya" && "$MODE" == "image" ]]' in guard_run
-    assert "Kavya image mode is disabled; use the build-only Kavya image publisher." in guard_run
+    # The condition must reject every mode, not just `image` — it must not
+    # reference $MODE at all.
+    assert '[[ "$AGENT" == "kavya" ]]' in guard_run
+    assert "$MODE" not in guard_run
+    assert "Kavya is excluded from generic deploy.yml for every mode" in guard_run
+    assert "deploy_smartpbx_image.sh" in guard_run
     assert "exit 1" in guard_run
     for later_name in (
         "Set up Buildx",
@@ -2243,6 +2248,27 @@ def test_deploy_workflow_rejects_kavya_image_mode_before_any_publisher_or_host_s
         "Sync agent files to the VPS (preserves .env + runtime state)",
     ):
         assert steps.index(guard) < steps.index(workflow_step(steps, later_name))
+
+
+def test_deploy_workflow_rsync_excludes_smartpbx_host_control_plane_for_kavya():
+    text = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    document = yaml.load(text, Loader=yaml.BaseLoader)
+    steps = document["jobs"]["deploy"]["steps"]
+
+    sync = workflow_step(steps, "Sync agent files to the VPS (preserves .env + runtime state)")
+    sync_run = sync["run"]
+    # Defence in depth: even if the reject-Kavya guard above is ever loosened,
+    # rsync must never overwrite the SmartPBX host-side control plane files.
+    for excluded in (
+        "--exclude='scripts/'",
+        "--exclude='docker-compose.yml'",
+        "--exclude='nginx-smartpbx*.conf'",
+        "--exclude='SMARTPBX_RUNBOOK.md'",
+    ):
+        assert excluded in sync_run
+    # These extra excludes must be conditional on AGENT == kavya so a build-mode
+    # deploy of any other agent still ships its own docker-compose.yml / scripts.
+    assert 'if [[ "$AGENT" == "kavya" ]]' in sync_run
 
 
 SMARTPBX_IMAGE_DEPLOY_SCRIPT = PROJECT_ROOT / "scripts" / "deploy_smartpbx_image.sh"
@@ -2319,7 +2345,13 @@ def test_smartpbx_image_deploy_helper_recreates_only_smartpbx_and_checks_json_re
         "docker system prune",
         "docker image prune",
         "docker compose down",
-        "nginx",
+        # The optional host-file integrity check reads nginx config filenames
+        # (nginx-smartpbx*.conf) to verify their checksums — that is not
+        # managing nginx. What must never appear is the helper actually
+        # controlling the nginx process/service.
+        "nginx -s",
+        "reload nginx",
+        "restart nginx",
         "systemctl",
         "rsync",
         "ssh ",
@@ -2353,6 +2385,130 @@ def test_smartpbx_runbook_uses_the_guarded_smartpbx_image_deploy_helper():
     assert "deploy_smartpbx_image.sh" in runbook
     assert "NEW_TAG EXPECTED_SHA EXPECTED_DIGEST" in runbook
     assert "authenticated integration probe" in runbook
+
+
+def test_smartpbx_runbook_documents_the_host_files_manifest_procedure():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+
+    assert "SMARTPBX_HOST_FILES_SHA256" in runbook
+    assert "git -C" in runbook
+    assert "sha256sum" in runbook
+    for name in (
+        "docker-compose.yml",
+        "nginx-smartpbx.conf",
+        "nginx-smartpbx-acme.conf",
+    ):
+        assert name in runbook
+
+
+def test_smartpbx_image_deploy_helper_verifies_host_files_before_recreate_when_manifest_set():
+    script = read_smartpbx_image_deploy_script()
+
+    assert "SMARTPBX_HOST_FILES_SHA256" in script
+    assert "check_host_files_integrity" in script
+    assert "sha256sum -c" in script
+    for required in (
+        "docker-compose.yml",
+        "nginx-smartpbx.conf",
+        "nginx-smartpbx-acme.conf",
+        "scripts/*.sh",
+    ):
+        assert required in script
+    main_block = script.split("main() {", 1)[1].split("\nif [[", 1)[0]
+    assert (
+        main_block.find("check_env_files")
+        < main_block.find("check_host_files_integrity")
+        < main_block.find("verify_candidate_image")
+        < main_block.find("arm_rollback")
+        < main_block.find("recreate_smartpbx")
+    )
+
+
+def test_check_host_files_integrity_is_optional_and_skips_when_unset(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    result = subprocess.run(
+        ["bash", "-c", f"cd {app}; source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; check_host_files_integrity"],
+        env=os.environ | {"SMARTPBX_HOST_FILES_SHA256": ""},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+
+
+def _write_host_files_fixture(app):
+    (app / "docker-compose.yml").write_text("compose\n", encoding="utf-8")
+    (app / "nginx-smartpbx.conf").write_text("nginx\n", encoding="utf-8")
+    (app / "nginx-smartpbx-acme.conf").write_text("acme\n", encoding="utf-8")
+    scripts = app / "scripts"
+    scripts.mkdir()
+    (scripts / "deploy_smartpbx_image.sh").write_text("script\n", encoding="utf-8")
+    return ("docker-compose.yml", "nginx-smartpbx.conf", "nginx-smartpbx-acme.conf", "scripts/deploy_smartpbx_image.sh")
+
+
+def _sha256_manifest(app, relative_paths):
+    lines = []
+    for rel in relative_paths:
+        digest = hashlib.sha256((app / rel).read_bytes()).hexdigest()
+        lines.append(f"{digest}  {rel}")
+    return "\n".join(lines) + "\n"
+
+
+def _run_host_files_check(app, manifest_path):
+    return subprocess.run(
+        ["bash", "-c", f"cd {app}; source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; check_host_files_integrity"],
+        env=os.environ | {"SMARTPBX_HOST_FILES_SHA256": str(manifest_path)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_check_host_files_integrity_passes_with_a_correct_manifest(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    relative_paths = _write_host_files_fixture(app)
+    manifest = tmp_path / "good.sha256"
+    manifest.write_text(_sha256_manifest(app, relative_paths), encoding="utf-8")
+
+    result = _run_host_files_check(app, manifest)
+    assert result.returncode == 0
+
+
+def test_check_host_files_integrity_fails_closed_on_missing_manifest(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    _write_host_files_fixture(app)
+
+    result = _run_host_files_check(app, tmp_path / "absent.sha256")
+    assert result.returncode != 0
+
+
+def test_check_host_files_integrity_fails_closed_when_manifest_omits_a_required_file(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    relative_paths = _write_host_files_fixture(app)
+    manifest = tmp_path / "incomplete.sha256"
+    # Omit the last required file — the check must not silently pass files it
+    # never looked for.
+    manifest.write_text(_sha256_manifest(app, relative_paths[:-1]), encoding="utf-8")
+
+    result = _run_host_files_check(app, manifest)
+    assert result.returncode != 0
+
+
+def test_check_host_files_integrity_fails_closed_on_a_tampered_file(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    relative_paths = _write_host_files_fixture(app)
+    manifest = tmp_path / "good.sha256"
+    manifest.write_text(_sha256_manifest(app, relative_paths), encoding="utf-8")
+
+    (app / "docker-compose.yml").write_text("tampered\n", encoding="utf-8")
+
+    result = _run_host_files_check(app, manifest)
+    assert result.returncode != 0
 
 
 
@@ -2614,6 +2770,43 @@ def test_deploy_rechecks_rollback_alias_before_forward_mutation(tmp_path):
 ])
 def test_deploy_preflight_failures_never_mutate(tmp_path, environment):
     host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+def test_deploy_missing_host_files_manifest_blocks_before_mutation(tmp_path):
+    host = FakeDeployHost(tmp_path)
+    result = host.deploy(SMARTPBX_HOST_FILES_SHA256=str(host.app / "missing-manifest.sha256"))
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+def test_deploy_correct_host_files_manifest_permits_recreate(tmp_path):
+    host = FakeDeployHost(tmp_path)
+    relative_paths = ("docker-compose.yml", "nginx-smartpbx.conf", "nginx-smartpbx-acme.conf")
+    for name in relative_paths:
+        (host.app / name).write_text(f"{name}\n", encoding="utf-8")
+    validator = host.app / "scripts" / "validate_english_voice_env.sh"
+    all_paths = relative_paths + ("scripts/validate_english_voice_env.sh",)
+    lines = [f"{hashlib.sha256((host.app / p).read_bytes()).hexdigest()}  {p}" for p in all_paths]
+    manifest = host.app / "host-files.sha256"
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = host.deploy(SMARTPBX_HOST_FILES_SHA256=str(manifest))
+    assert result.returncode == 0 and host.compose_count() == 1
+
+
+def test_deploy_tampered_host_file_after_manifest_blocks_before_mutation(tmp_path):
+    host = FakeDeployHost(tmp_path)
+    relative_paths = ("docker-compose.yml", "nginx-smartpbx.conf", "nginx-smartpbx-acme.conf")
+    for name in relative_paths:
+        (host.app / name).write_text(f"{name}\n", encoding="utf-8")
+    all_paths = relative_paths + ("scripts/validate_english_voice_env.sh",)
+    lines = [f"{hashlib.sha256((host.app / p).read_bytes()).hexdigest()}  {p}" for p in all_paths]
+    manifest = host.app / "host-files.sha256"
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Tamper docker-compose.yml after the manifest was produced.
+    (host.app / "docker-compose.yml").write_text("tampered\n", encoding="utf-8")
+
+    result = host.deploy(SMARTPBX_HOST_FILES_SHA256=str(manifest))
     assert result.returncode != 0 and host.compose_count() == 0
 
 
@@ -3156,8 +3349,8 @@ def test_kavya_generic_rejection_and_reviewed_image_gates_remain_intact():
     probe = (workflows / "probe-kavya-image.yml").read_text(encoding="utf-8")
     publisher = (workflows / "build-kavya-image.yml").read_text(encoding="utf-8")
 
-    assert '"$AGENT" == "kavya" && "$MODE" == "image"' in generic_deploy
-    assert "Kavya image mode is disabled" in generic_deploy
+    assert '"$AGENT" == "kavya"' in generic_deploy
+    assert "Kavya is excluded from generic deploy.yml for every mode" in generic_deploy
 
     assert "repository_dispatch:" in probe
     assert "kavya_image_read_only_probe" in probe

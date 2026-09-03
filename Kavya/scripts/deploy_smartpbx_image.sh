@@ -52,6 +52,31 @@ check_env_files() {
   [[ $(stat -c '%U:%G:%a' .env.smartpbx) == root:root:600 ]] || return 1
 }
 
+# Optional defence in depth: if SMARTPBX_HOST_FILES_SHA256 names a manifest,
+# every host-side control-plane file (the compose file, both nginx vhosts, and
+# every scripts/*.sh helper) must have a matching sha256sum entry in it, and
+# every entry must verify. Unset/blank -> no-op (opt-in only). A manifest that
+# omits one of these files, or does not verify, fails closed.
+required_host_files() {
+  local file
+  printf '%s\n' docker-compose.yml nginx-smartpbx.conf nginx-smartpbx-acme.conf
+  for file in scripts/*.sh; do
+    [[ -f $file ]] && printf '%s\n' "$file"
+  done
+}
+
+check_host_files_integrity() {
+  local manifest=${SMARTPBX_HOST_FILES_SHA256:-}
+  [[ -n $manifest ]] || return 0
+  [[ -f $manifest ]] || return 1
+  local file
+  while IFS= read -r file; do
+    [[ -f $file ]] || return 1
+    grep -qF " $file" "$manifest" || return 1
+  done < <(required_host_files)
+  sha256sum -c "$manifest" --strict --quiet
+}
+
 smartpbx_status_token() {
   # Read-only and never echoed. Passed to curl on standard input rather than as
   # an argument so it cannot appear in the process list.
@@ -190,6 +215,7 @@ main() {
   capture_baseline || { fail; return 1; }
   check_loopback_preflight || { fail; return 1; }
   check_env_files || { fail; return 1; }
+  check_host_files_integrity || { fail; return 1; }
   voice_validation=$("$APP_DIR/scripts/validate_english_voice_env.sh" .env .env.smartpbx) || { fail; return 1; }
   [[ $voice_validation == canonical_voice_match=ok ]] || { fail; return 1; }
   docker compose --env-file .env.smartpbx --profile smartpbx config >/dev/null || { fail; return 1; }

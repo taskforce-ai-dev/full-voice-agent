@@ -896,3 +896,48 @@ containers. `SIGKILL`, kernel panic, power loss, and host loss cannot run a
 shell trap; an operator must inspect and recover those cases from the recorded
 baseline/rollback alias. The helper never manages Nginx, prunes images, or
 mutates another service.
+
+### Optional host-file integrity check (`SMARTPBX_HOST_FILES_SHA256`)
+
+The generic `deploy.yml` rejects `agent=kavya` for every mode (image, fast,
+build), so `/opt/kavya`'s host-side control plane — `docker-compose.yml`, the
+two nginx vhosts, and every `scripts/*.sh` helper — is normally only ever
+changed by an operator applying a reviewed diff by hand. As defence in depth
+against that guard ever being loosened by mistake, the guarded deploy helper
+supports an opt-in pre-recreate integrity check: if the env var
+`SMARTPBX_HOST_FILES_SHA256` names a checksum manifest file, the helper
+verifies `docker-compose.yml`, `nginx-smartpbx.conf`, `nginx-smartpbx-acme.conf`,
+and every `scripts/*.sh` file under `/opt/kavya` against it with `sha256sum -c`
+before recreating the container. A manifest that is missing, that omits any of
+those files, or that fails a checksum, aborts the deployment before anything is
+mutated. Leaving the variable unset (the default) skips the check entirely —
+it is opt-in, not required.
+
+Produce the manifest **from the reviewed checkout**, not from `/opt/kavya`
+itself (checksumming files already on the host proves nothing about tampering
+of those same files):
+
+```sh
+# Run on a trusted machine against the exact reviewed commit ($REVIEWED_FULL_COMMIT_SHA).
+checkout=/path/to/a/clean/full-voice-agent/checkout
+sha=$REVIEWED_FULL_COMMIT_SHA
+manifest=/opt/kavya/host-files.sha256   # root-owned, mode 0600, outside the repo tree
+
+: > "$manifest"
+for f in docker-compose.yml nginx-smartpbx.conf nginx-smartpbx-acme.conf \
+         scripts/deploy_smartpbx_image.sh scripts/update_smartpbx_sinhala_provider.sh \
+         scripts/validate_english_voice_env.sh; do
+  hash=$(git -C "$checkout" show "$sha:Kavya/$f" | sha256sum | cut -d' ' -f1)
+  printf '%s  %s\n' "$hash" "$f" >> "$manifest"
+done
+
+sudo install -o root -g root -m 0600 "$manifest" /opt/kavya/host-files.sha256
+```
+
+List every `scripts/*.sh` file that exists in the reviewed checkout under
+`Kavya/scripts/` — the check fails closed if any current `scripts/*.sh` file on
+the host has no manifest entry, so an incomplete list blocks the next deploy
+rather than silently skipping coverage. Then set
+`SMARTPBX_HOST_FILES_SHA256=/opt/kavya/host-files.sha256` in the deploy
+operator's shell (or export it inline before invoking the helper) before
+running `deploy_smartpbx_image.sh`.
