@@ -2455,14 +2455,27 @@ def test_dep_audit_workflow_audits_kavyas_lock_file_and_blocks_only_kavya():
     document = yaml.load(workflow, Loader=yaml.BaseLoader)
 
     # Kavya's advisory-vs-enforced split: every other agent stays advisory
-    # (continue-on-error), Kavya is blocking. The matrix carries all 8 agent
-    # names; continue-on-error is now a per-entry expression, not a bare bool.
+    # (continue-on-error), Kavya is blocking. The matrix is an expression:
+    # Kavya alone on pull_request (the only blocking row, on a trigger scoped
+    # to Kavya's requirements files), all 8 agents on the weekly/manual runs.
     audit_job = document["jobs"]["audit"]
     assert audit_job["continue-on-error"] == "${{ matrix.dir != 'Kavya' }}"
-    assert set(audit_job["strategy"]["matrix"]["dir"]) == {
+    matrix_dir = audit_job["strategy"]["matrix"]["dir"]
+    assert isinstance(matrix_dir, str) and matrix_dir.startswith("${{") and matrix_dir.endswith("}}")
+    assert "github.event_name == 'pull_request' && fromJSON('[\"Kavya\"]')" in matrix_dir
+    for agent in (
         "BSL Agent", "Flico Agent", "HattonHills", "Kavya",
         "Kitchened", "SLIC Agent", "Sofia Agent", "WorldOfRefrigerators",
-    }
+    ):
+        assert f'"{agent}"' in matrix_dir
+    # chromadb's four deferred advisories are the only ignores, each named
+    # explicitly so a new advisory still fails the build.
+    run_text = next(
+        step for step in audit_job["steps"] if step.get("name") == "Audit pinned dependencies"
+    )["run"]
+    assert run_text.count("--ignore-vuln") == 4
+    for ignored in ("PYSEC-2026-311", "CVE-2026-45830", "CVE-2026-45831", "CVE-2026-45833"):
+        assert f"--ignore-vuln {ignored}" in run_text
 
     step = next(
         step for step in audit_job["steps"] if step.get("name") == "Audit pinned dependencies"

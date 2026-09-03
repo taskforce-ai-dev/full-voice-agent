@@ -71,15 +71,10 @@ jobs:
       fail-fast: false
       matrix:
         # Folder names with spaces are passed as quoted JSON strings.
-        dir:
-          - "BSL Agent"
-          - "Flico Agent"
-          - "HattonHills"
-          - "Kavya"
-          - "Kitchened"
-          - "SLIC Agent"
-          - "Sofia Agent"
-          - "WorldOfRefrigerators"
+        # On pull_request only Kavya runs (its trigger is scoped to Kavya's
+        # requirements files and it is the only blocking row); the weekly and
+        # manual runs audit every agent.
+        dir: ${{ github.event_name == 'pull_request' && fromJSON('["Kavya"]') || fromJSON('["BSL Agent","Flico Agent","HattonHills","Kavya","Kitchened","SLIC Agent","Sofia Agent","WorldOfRefrigerators"]') }}
 
     steps:
       - name: Checkout
@@ -116,7 +111,15 @@ jobs:
               exit 1
             fi
             echo "Auditing (locked, no-deps): $req"
-            pip-audit -r "$req" --no-deps
+            # chromadb 1.5.9 advisories are acknowledged and deferred: Kavya
+            # runs Chroma embedded (no HTTP server surface) and the persisted
+            # store's on-disk format must be migrated deliberately, not by a
+            # CI bump. Remove these ignores when chromadb is upgraded.
+            pip-audit -r "$req" --no-deps \
+              --ignore-vuln PYSEC-2026-311 \
+              --ignore-vuln CVE-2026-45830 \
+              --ignore-vuln CVE-2026-45831 \
+              --ignore-vuln CVE-2026-45833
             exit $?
           fi
 
