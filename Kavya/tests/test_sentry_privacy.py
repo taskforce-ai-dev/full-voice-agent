@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import json
 import pytest
 
 pytest.importorskip("sentry_sdk")
@@ -200,3 +201,49 @@ def test_server_sentry_init_call_disables_locals_and_request_bodies_and_wires_sc
     assert "include_local_variables=False" in init_call
     assert 'max_request_body_size="never"' in init_call
     assert "before_send=_sentry_before_send" in init_call
+
+
+def test_sentry_before_send_masks_digits_in_exception_values_logentry_message_and_tags():
+    event = {
+        "exception": {"values": [{"type": "RuntimeError", "value": "kb lookup failed for 0771234567"}]},
+        "logentry": {"message": "guest %s", "params": ["reference 887711"], "formatted": "guest reference 887711"},
+        "message": "post-call for caller 94771234567",
+        "tags": {"call_sid": "spx-1234567890", "agent": "kavya"},
+        "user": {"id": "0771234567"},
+        "request": {"url": "https://example/?to=0771234567"},
+        "breadcrumbs": {"values": [{"message": "clean", "data": {"to": "0771234567", "n": 3}}]},
+    }
+
+    result = server._sentry_before_send(event, {})
+
+    assert result["exception"]["values"][0]["value"] == "kb lookup failed for <digits>"
+    assert result["logentry"]["formatted"] == "guest reference <digits>"
+    assert result["logentry"]["params"] == ["reference <digits>"]
+    assert result["message"] == "post-call for caller <digits>"
+    assert result["tags"] == {"call_sid": "spx-<digits>", "agent": "kavya"}
+    assert "user" not in result and "request" not in result
+    crumb = result["breadcrumbs"]["values"][0]
+    assert crumb["data"] == {"to": "<digits>", "n": 3}
+    assert not server._SENTRY_LOGGABLE_DIGITS.search(json.dumps(result))
+
+
+def test_sentry_before_send_survives_malformed_shapes_without_raising():
+    event = {
+        "exception": "not-a-dict",
+        "logentry": 42,
+        "tags": ["not", "a", "dict"],
+        "breadcrumbs": {"values": "nope"},
+    }
+    result = server._sentry_before_send(event, {})
+    assert result is event
+
+
+def test_sentry_before_send_fails_closed_when_scrubbing_raises(monkeypatch):
+    def _boom(value, depth=0):
+        raise RuntimeError("scrubber bug")
+
+    monkeypatch.setattr(server, "_sentry_scrub_value", _boom)
+    event = {"exception": {"values": [{"value": "phone 0771234567"}]}, "message": "phone 0771234567", "tags": {}}
+    result = server._sentry_before_send(event, {})
+    assert result is event
+    assert "message" not in result and "tags" not in result

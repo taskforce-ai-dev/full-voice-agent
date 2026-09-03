@@ -401,3 +401,70 @@ def test_a_cached_sinhala_filler_is_retired_by_a_max_tokens_discard(monkeypatch)
     assert result == answer
     assert spoken[-1] == answer
     assert not any("සමාවෙන්න" in text for text in spoken)
+
+
+# --- audible-state claim on the first frame (real paced transport) ----------
+def test_a_cached_phrase_claims_speaking_state_on_its_first_frame_not_after_playback():
+    """Regression: the cached clip used to go out as one un-framed blob, so the
+    paced sender drained the whole phrase before ``_mark_tts_audible`` ran.
+    ``_is_speaking`` stayed False for the entire audible filler, every STT
+    result was routed through the pre-audio path, and two short back-channel
+    interims (below BARGEIN_MIN_CHARS) barged in on the filler itself, bumping
+    the speak generation and orphaning the real answer.  Uses the real
+    ``SmartPBXMediaTransport`` because a fake instantaneous ``send_audio`` is
+    exactly what hid this."""
+    from smartpbx_protocol import CallContext, MediaFormat
+    from smartpbx_transport import SmartPBXMediaTransport
+
+    class _WS:
+        def __init__(self) -> None:
+            self.sent = 0
+
+        async def send_text(self, _text: str) -> None:
+            self.sent += 1
+
+    async def scenario() -> tuple[int, int, int, bool, int]:
+        ws = _WS()
+        context = CallContext("c", "o", "1", "2", "a", MediaFormat("PCMU", 8000))
+        transport = SmartPBXMediaTransport(ws, context)
+        transport.start()
+        await asyncio.sleep(0)
+        pipeline = server.MediaStreamSession(
+            websocket=None, lang="si", media_transport=transport, llm_provider="gemini",
+        )
+        pipeline._smartpbx_transfer_context = object()
+        pipeline._event_loop = asyncio.get_running_loop()
+        text = server.SMARTPBX_SINHALA_INITIAL_FILLER_TEXT
+        server._store_cached_smartpbx_sinhala_phrase_audio(text, b"\xff" * 8000)  # 1.0 s
+        gen0 = pipeline._speak_generation
+        speaking_seen = False
+
+        async def back_channel() -> None:
+            nonlocal speaking_seen
+            await asyncio.sleep(0.25)
+            for interim in ("\u0dc4\u0dcf", "\u0dc4\u0dcf \u0dc4\u0dbb\u0dd2"):
+                speaking_seen = speaking_seen or pipeline._is_speaking
+                # Exactly the STT-thread routing in _on_stt_interim.
+                if pipeline._pre_audio_synthesis_active():
+                    await pipeline._handle_pre_audio_stt("interim", interim)
+                elif pipeline._is_speaking:
+                    if not pipeline._is_echo(interim) and pipeline._should_barge_in(interim):
+                        await pipeline._handle_bargein()
+                else:
+                    await pipeline._set_transcript_interim(interim)
+                await asyncio.sleep(0.2)
+
+        noise = asyncio.create_task(back_channel())
+        try:
+            await pipeline._speak(text, sentence=text)
+        finally:
+            await noise
+            await transport.close()
+        return gen0, pipeline._speak_generation, pipeline._smartpbx_barge_ins, speaking_seen, ws.sent
+
+    gen0, gen1, barge_ins, speaking_seen, sent = asyncio.run(scenario())
+
+    assert speaking_seen, "audible speaking state must be claimed while the cached clip plays"
+    assert gen1 == gen0, "a sub-threshold back-channel must not barge in on the filler"
+    assert barge_ins == 0
+    assert sent >= 8000 // 160, "every paced frame of the clip reached the wire"

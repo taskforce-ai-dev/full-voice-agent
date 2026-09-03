@@ -116,14 +116,14 @@ jobs:
           host="smartpbx-kavya.taskforceai.tech"
           checkend_seconds=$((14 * 24 * 60 * 60))
 
-          cert=$(echo | openssl s_client -servername "$host" -connect "$host:443" -timeout 15 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null)
+          cert=$(echo | timeout 15 openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null)
           if [ -z "$cert" ]; then
             echo "FAIL  could not retrieve a certificate for $host"
             exit 1
           fi
           echo "$host: $cert"
 
-          if echo | openssl s_client -servername "$host" -connect "$host:443" -timeout 15 2>/dev/null \
+          if echo | timeout 15 openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null \
               | openssl x509 -noout -checkend "$checkend_seconds" >/dev/null 2>&1; then
             echo "OK    $host certificate valid for at least 14 more days"
           else

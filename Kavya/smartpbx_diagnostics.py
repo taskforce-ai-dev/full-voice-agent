@@ -95,4 +95,5 @@ class SmartPBXCloseReason(StrEnum):
     STT_FATAL = "stt_fatal"
     PROTOCOL_VIOLATION = "protocol_violation"
     PROFILE_UNAVAILABLE = "profile_unavailable"
+    SHUTDOWN = "shutdown"
     INTERNAL_ERROR = "internal_error"

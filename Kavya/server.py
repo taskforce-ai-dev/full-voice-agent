@@ -66,28 +66,67 @@ import re
 _SENTRY_LOGGABLE_DIGITS = re.compile(r"[0-9]{5,}")
 
 
-def _sentry_before_send(event: dict, _hint: dict) -> dict:
-    """Privacy scrubber: drop extra/contexts wholesale, drop digit-bearing breadcrumbs.
+_SENTRY_DIGITS_PLACEHOLDER = "<digits>"
+_SENTRY_SCRUB_MAX_DEPTH = 8
 
-    Frame local variables are already disabled via `include_local_variables=False`
-    on init; this covers the two remaining ad hoc channels an exception handler
-    or an instrumented library can use to smuggle transcript text, tool
-    arguments, or a caller's phone number into a Sentry event.
+
+def _sentry_scrub_value(value, depth: int = 0):
+    """Mask 5+ digit runs in any string reachable from ``value`` (bounded depth)."""
+    if isinstance(value, str):
+        return _SENTRY_LOGGABLE_DIGITS.sub(_SENTRY_DIGITS_PLACEHOLDER, value)
+    if depth >= _SENTRY_SCRUB_MAX_DEPTH:
+        return None
+    if isinstance(value, list):
+        return [_sentry_scrub_value(item, depth + 1) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sentry_scrub_value(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        return {key: _sentry_scrub_value(item, depth + 1) for key, item in value.items()}
+    return value
+
+
+def _sentry_before_send(event: dict, _hint: dict) -> dict:
+    """Privacy scrubber for every free-text channel of a Sentry event.
+
+    Frame local variables are already disabled via ``include_local_variables=False``
+    on init. This drops ``extra``/``contexts``/``user``/``request`` wholesale,
+    drops digit-bearing breadcrumbs, and masks 5+ digit runs (phone numbers,
+    booking references) in exception values, log entries, messages, tags and
+    breadcrumb data, so a transcript fragment or caller number that an
+    exception handler folds into a message never leaves the box unmasked.
+    Never raises and never drops the event itself: a scrubber failure must
+    not hide the exception it was scrubbing.
     """
-    event.pop("extra", None)
-    event.pop("contexts", None)
-    breadcrumbs = event.get("breadcrumbs")
-    values = breadcrumbs.get("values") if isinstance(breadcrumbs, dict) else None
-    if isinstance(values, list):
-        breadcrumbs["values"] = [
-            crumb
-            for crumb in values
-            if not (
-                isinstance(crumb, dict)
-                and isinstance(crumb.get("message"), str)
-                and _SENTRY_LOGGABLE_DIGITS.search(crumb["message"])
-            )
-        ]
+    try:
+        for key in ("extra", "contexts", "user", "request"):
+            event.pop(key, None)
+        breadcrumbs = event.get("breadcrumbs")
+        values = breadcrumbs.get("values") if isinstance(breadcrumbs, dict) else None
+        if isinstance(values, list):
+            kept = []
+            for crumb in values:
+                if not isinstance(crumb, dict):
+                    continue
+                message = crumb.get("message")
+                if isinstance(message, str) and _SENTRY_LOGGABLE_DIGITS.search(message):
+                    continue
+                if "data" in crumb:
+                    crumb["data"] = _sentry_scrub_value(crumb.get("data"))
+                kept.append(crumb)
+            breadcrumbs["values"] = kept
+        exception = event.get("exception")
+        exc_values = exception.get("values") if isinstance(exception, dict) else None
+        if isinstance(exc_values, list):
+            for entry in exc_values:
+                if isinstance(entry, dict) and isinstance(entry.get("value"), str):
+                    entry["value"] = _sentry_scrub_value(entry["value"])
+        for key in ("logentry", "message", "tags"):
+            if key in event:
+                event[key] = _sentry_scrub_value(event[key])
+    except Exception:
+        # Fail closed on the free-text channels rather than on the event.
+        for key in ("extra", "contexts", "user", "request", "breadcrumbs", "logentry", "message", "tags"):
+            event.pop(key, None)
     return event
 
 
@@ -8009,10 +8048,16 @@ class MediaStreamSession:
                 "generation",
                 getattr(self._media_transport, "_generation", cleared_generation),
             )
-            if isinstance(transport_generation, int) and not isinstance(
-                transport_generation, bool,
+            if (
+                isinstance(transport_generation, int)
+                and not isinstance(transport_generation, bool)
+                and transport_generation >= self._speak_generation
             ):
-                self._speak_generation = max(transport_generation, 0)
+                # Re-sync to the transport's fence, but never move the speak
+                # generation backwards: a closed/dead transport reports a
+                # stale generation, and clamping to it would let the
+                # per-generation barge-in claim match forever.
+                self._speak_generation = transport_generation
             return
             async with self._ws_lock:
                 await self.ws.send_text(json.dumps({
@@ -11055,6 +11100,27 @@ class MediaStreamSession:
                     "smartpbx_media event=tts_phrase_cache_hit provider=gemini"
                 )
                 mulaw_buf = cached_phrase_audio
+                # Emit the cached clip in the same 640-byte frames as the
+                # streamed path so audible speaking state is claimed on the
+                # FIRST frame, not after the paced sender has drained the
+                # whole clip.  A single un-framed send blocked for the entire
+                # phrase with ``_is_speaking`` still False, which routed the
+                # caller's (and the agent's own echoed) audio through the
+                # pre-audio STT path and made the filler barge in on itself.
+                while len(mulaw_buf) >= 640:
+                    if not self._owns_sinhala_tts_stream(
+                        expected_generation, audio_emitted=audio_emitted
+                    ):
+                        cancelled = True
+                        break
+                    frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
+                    if await self._send_media_audio(frame):
+                        await self._flush_pre_audio_stt()
+                        self._mark_smartpbx_turn_once("tts_first_chunk")
+                        audio_emitted = self._mark_tts_audible(expected_generation)
+                        if not audio_emitted:
+                            cancelled = True
+                            break
             else:
                 client = self._gemini_tts_client
                 if client is None:

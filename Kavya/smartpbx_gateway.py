@@ -452,6 +452,9 @@ class SmartPBXGateway:
         except asyncio.CancelledError as error:
             cancellation = error
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.CANCELLED, DiagnosticFailureClass.CANCELLED)
+            # Task cancellation is the container stopping (deploy/rollback),
+            # not a fault: record it as such instead of "internal_error".
+            close_reason, close_code = "shutdown", 1001
         except ProtocolViolation as error:
             stage, outcome, failure = _protocol_diagnostic(error.failure_class)
             sink(stage, outcome, failure)

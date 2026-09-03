@@ -311,6 +311,9 @@ main() {
   voice_validation=$("$APP_DIR/scripts/validate_english_voice_env.sh" .env .env.smartpbx) || { fail; return 1; }
   [[ $voice_validation == canonical_voice_match=ok ]] || { fail; return 1; }
   docker compose --env-file .env.smartpbx --profile smartpbx config >/dev/null || { fail; return 1; }
+  # Free space BEFORE pulling the candidate (the image is ~2.5 GB and grows with
+  # the baked embedding model); the same keep-set as the post-deploy prune.
+  prune_stale_kavya_images
   verify_candidate_image || { fail; return 1; }
   [[ $(image_id "$IMAGE:$ROLLBACK_TAG") == "$ROLLBACK_IMAGE_ID" ]] || { fail; return 1; }
   arm_rollback

@@ -130,8 +130,27 @@ def test_dockerfile_locks_dependencies_and_copies_every_smartpbx_runtime_module(
         "smartpbx_protocol.py",
         "smartpbx_session.py",
         "smartpbx_transport.py",
+        "smartpbx_dtmf.py",
+        "smartpbx_diagnostics.py",
+        "handover.py",
+        "post_call.py",
+        "dashboard_client.py",
+        "english_voice_profile.py",
     ):
         assert module in dockerfile
+    # Every first-party module server.py imports at top level must ship, or
+    # the container dies at import (2026-07-31: ModuleNotFoundError 'handover').
+    import ast as _ast
+    tree = _ast.parse(read_text("server.py"))
+    local_modules = {
+        (node.module if isinstance(node, _ast.ImportFrom) else alias.name)
+        for node in tree.body
+        if isinstance(node, (_ast.Import, _ast.ImportFrom))
+        for alias in (node.names if isinstance(node, _ast.Import) else [None])
+        if (PROJECT_ROOT / f"{(node.module if isinstance(node, _ast.ImportFrom) else alias.name)}.py").exists()
+    }
+    for module in sorted(local_modules):
+        assert f"{module}.py" in dockerfile, f"{module}.py is imported by server.py but not copied into the image"
 
 
 def test_embedding_model_is_baked_into_the_image_and_offline_at_runtime():
@@ -2643,7 +2662,13 @@ def test_smartpbx_image_deploy_helper_prunes_stale_images_only_after_disarm():
     assert "docker image prune -f" in script
     assert "docker builder prune -af" in script
     main_block = script.split("main() {", 1)[1].split("\nif [[", 1)[0]
-    assert main_block.find("disarm_rollback") < main_block.find("prune_stale_kavya_images")
+    # Prune runs twice: once BEFORE the candidate pull (free space on a full
+    # host; the keep-set protects the armed rollback alias and both running
+    # images) and once after disarm.  Never between arm and disarm.
+    assert main_block.find("prune_stale_kavya_images") < main_block.find("verify_candidate_image")
+    armed_window = main_block.split("arm_rollback", 1)[1].split("disarm_rollback", 1)[0]
+    assert "prune_stale_kavya_images" not in armed_window
+    assert main_block.rfind("prune_stale_kavya_images") > main_block.find("disarm_rollback")
     assert "prune_stale_kavya_images" not in script.split("rollback_once() {", 1)[1].split("\n}", 1)[0]
     prune_body = script.split("prune_stale_kavya_images() {", 1)[1].split("\nmain() {", 1)[0]
     assert "ROLLBACK_TAG" in prune_body
@@ -4304,3 +4329,20 @@ def test_documented_sinhala_rollback_transaction_orders_failures_and_cleanup(tmp
     assert len([line for line in operations if line.startswith("deploy ")]) == 1
     assert len([line for line in operations if line.startswith("updater cleanup ")]) == 1
     assert not list(tx.iterdir())
+
+
+def test_kavya_smartpbx_compose_runtime_hardening_is_pinned():
+    """stop_grace_period, bounded logging, a healthcheck, PII off and loopback
+    binding are load-bearing; none of them had an assertion before."""
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    service = compose["services"]["kavya-smartpbx"]
+    assert service["stop_grace_period"] == "30s"
+    assert service["logging"]["driver"] == "json-file"
+    assert service["logging"]["options"]["max-size"] == "10m"
+    assert service["logging"]["options"]["max-file"] == "3"
+    assert "healthcheck" in service and service["healthcheck"]["test"]
+    assert service["environment"]["SENTRY_SEND_PII"] == "false"
+    assert service["environment"]["SENTRY_ENABLE_LOGS"] == "false"
+    assert service["ports"] == ["127.0.0.1:8006:8000"]
+    legacy = compose["services"]["kavya"]
+    assert all(str(port).startswith("127.0.0.1:") for port in legacy["ports"])

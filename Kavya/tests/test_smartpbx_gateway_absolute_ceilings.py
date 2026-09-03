@@ -12,6 +12,7 @@ absolute nature is provable without a real multi-minute wait.
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 from dataclasses import replace
 
@@ -215,3 +216,30 @@ async def test_ordinary_short_calls_are_unaffected_by_the_new_ceiling():
 
     assert session.finishes == 1
     assert (session.last_close_reason, session.last_close_code) == ("stop", 1000)
+
+
+def test_gateway_default_clock_is_the_real_monotonic_clock():
+    """Production constructs the gateway with no clock; if the default ever
+    became a fake, SMARTPBX_MAX_CALL_SECONDS, the idle timeout and the
+    transfer-pending ceiling would all silently stop firing."""
+    gateway = SmartPBXGateway(settings(), SmartPBXSessionRegistry(4))
+    assert gateway._clock is time.monotonic
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_a_call_is_recorded_as_shutdown_not_internal_error():
+    """Container stop (deploy/rollback) cancels the handler task; the post-call
+    record and session summary must say "shutdown", not blame the code."""
+    socket = Socket()
+    session = Session()
+    for _ in range(50):
+        socket.messages.put_nowait(json.dumps(MEDIA))
+    gateway = SmartPBXGateway(settings(), SmartPBXSessionRegistry(4))
+    task = asyncio.create_task(gateway.handle(socket, _factory(session)))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert session.finishes == 1
+    assert (session.last_close_reason, session.last_close_code) == ("shutdown", 1001)
