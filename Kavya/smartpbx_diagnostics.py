@@ -44,6 +44,7 @@ class DiagnosticFailureClass(StrEnum):
     START_TIMEOUT = "start_timeout"
     IDLE_TIMEOUT = "idle_timeout"
     TRANSFER_PENDING_TIMEOUT = "transfer_pending_timeout"
+    MAX_CALL_DURATION = "max_call_duration"
     SESSION_FACTORY = "session_factory"
     SESSION_START = "session_start"
     AUDIO_INGESTION = "audio_ingestion"
@@ -76,7 +77,7 @@ class SmartPBXDiagnosticSink(Protocol):
 class SmartPBXCloseReason(StrEnum):
     """Closed vocabulary for why a SmartPBX call ended.
 
-    Carried into the session summary (`outcome`) and the post-call payload
+    Carried into the session summary (`outcome`) and the post-call record
     (`close_reason`/`close_code`) so a call is never recorded as a plain
     "completed" call when it actually failed closed.
     """
@@ -87,6 +88,7 @@ class SmartPBXCloseReason(StrEnum):
     IDLE_TIMEOUT = "idle_timeout"
     START_TIMEOUT = "start_timeout"
     TRANSFER_PENDING_TIMEOUT = "transfer_pending_timeout"
+    MAX_CALL_DURATION = "max_call_duration"
     TRANSPORT_FAILURE = "transport_failure"
     STT_FATAL = "stt_fatal"
     PROTOCOL_VIOLATION = "protocol_violation"

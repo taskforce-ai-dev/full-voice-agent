@@ -43,6 +43,10 @@ _INTEGER_SETTINGS = {
     # An acknowledged transfer legitimately outlives ordinary idleness, but a
     # carrier terminal event that never arrives must not pin the slot forever.
     "SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS": ("transfer_pending_timeout_seconds", 300, 30, 1800),
+    # A hard ceiling independent of activity: unlike idle/transfer-pending,
+    # this one does not reset on inbound media -- a call that never goes idle
+    # and never enters transfer-pending must still end eventually.
+    "SMARTPBX_MAX_CALL_SECONDS": ("max_call_seconds", 3600, 300, 7200),
 }
 
 
@@ -59,6 +63,7 @@ class SmartPBXSettings:
     start_timeout_seconds: int
     idle_timeout_seconds: int
     transfer_pending_timeout_seconds: int
+    max_call_seconds: int
     auth_header_name: str = "X-Kavya-SmartPBX-Token"
 
     @classmethod
@@ -175,6 +180,10 @@ class _TransferPendingTimeout(Exception):
     """An acknowledged transfer produced no terminal event within the ceiling."""
 
 
+class _MaxCallDurationExceeded(Exception):
+    """The hard per-call ceiling elapsed, independent of activity."""
+
+
 class _TransportSendFailure(Exception):
     """The outbound sender died; the guest can no longer hear anything."""
 
@@ -199,16 +208,28 @@ SessionFactory = Callable[[Any, SmartPBXMediaTransport, SmartPBXDiagnosticSink],
 class SmartPBXGateway:
     """Authenticate and drive a single bounded Kavya SmartPBX media session."""
 
-    def __init__(self, settings: SmartPBXSettings, registry: SmartPBXSessionRegistry) -> None:
+    def __init__(
+        self,
+        settings: SmartPBXSettings,
+        registry: SmartPBXSessionRegistry,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._settings = settings
         self._registry = registry
+        # Injected so absolute-ceiling behavior (audit #2) is provable with a
+        # controlled clock rather than a real multi-minute wait -- this is
+        # deliberately NOT the process-global `time.monotonic`, so a fake
+        # clock here can never perturb real-time audio pacing elsewhere
+        # (e.g. SmartPBXMediaTransport's send cadence).
+        self._clock = clock
 
     def snapshot(self) -> dict[str, bool | int | str]:
         return smartpbx_status(self._settings, self._registry)
 
     async def handle(self, websocket: Any, session_factory: SessionFactory) -> None:
         correlation_id = f"spx-{secrets.token_hex(16)}"
-        started_at = time.monotonic()
+        started_at = self._clock()
         sink_enabled = True
 
         def sink(
@@ -292,8 +313,17 @@ class SmartPBXGateway:
                 return
             sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
 
+            # A one-element box so _receive_or_terminal can remember, across
+            # calls, the single moment transfer_pending first became true --
+            # transfer_pending is never reset, so once recorded this never
+            # needs to change again for the life of the call.
+            transfer_pending_since: list[float | None] = [None]
             while True:
-                raw = await self._receive_or_terminal(websocket, session, transport)
+                raw = await self._receive_or_terminal(
+                    websocket, session, transport,
+                    call_started_at=started_at,
+                    transfer_pending_since=transfer_pending_since,
+                )
                 if raw is None:
                     # The session's own terminal future resolved, not the
                     # socket -- the only way that happens today is a
@@ -387,6 +417,12 @@ class SmartPBXGateway:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSFER_PENDING_TIMEOUT)
             close_outcome = (POLICY_VIOLATION, "transfer timeout")
             close_reason, close_code = "transfer_pending_timeout", POLICY_VIOLATION
+        except _MaxCallDurationExceeded:
+            # Not a failure -- an expected, hard operational ceiling -- so this
+            # closes politely (1000) rather than as a policy violation.
+            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.OBSERVED, DiagnosticFailureClass.MAX_CALL_DURATION)
+            close_outcome = (1000, "call ended")
+            close_reason, close_code = "max_call_duration", 1000
         except _TransportSendFailure:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSPORT_SEND)
             close_outcome = (1011, "internal error")
@@ -464,17 +500,50 @@ class SmartPBXGateway:
                 continue
             raise ProtocolViolation(POLICY_VIOLATION, "start required", "start_required")
 
+    def _max_call_remaining(self, call_started_at: float, now: float) -> float:
+        return self._settings.max_call_seconds - (now - call_started_at)
+
     async def _receive_or_terminal(
         self,
         websocket: Any,
         session: _GatewaySession,
         transport: SmartPBXMediaTransport | None = None,
+        *,
+        call_started_at: float,
+        transfer_pending_since: list[float | None],
     ) -> str | None:
+        now = self._clock()
+        max_call_remaining = self._max_call_remaining(call_started_at, now)
+        if max_call_remaining <= 0:
+            raise _MaxCallDurationExceeded
         pending = bool(getattr(session, "transfer_pending", False))
-        timeout = self._settings.transfer_pending_timeout_seconds if pending else self._settings.idle_timeout_seconds
+        if pending and transfer_pending_since[0] is None:
+            # transfer_pending is documented never to reset once true, so this
+            # is recorded at most once per call.
+            transfer_pending_since[0] = now
+        if pending:
+            # An absolute ceiling from the moment the transfer was acknowledged
+            # -- unlike idle, this must NOT restart just because Dialog keeps
+            # streaming media on the pending leg (audit #2). Checked and raised
+            # BEFORE attempting to receive again: a message that is already
+            # queued must not let the caller re-enter and silently extend the
+            # ceiling by another full window.
+            ceiling_remaining = self._settings.transfer_pending_timeout_seconds - (now - transfer_pending_since[0])
+            if ceiling_remaining <= 0:
+                raise _TransferPendingTimeout
+        else:
+            # Idle genuinely does restart on every inbound message; that is
+            # its correct definition, not the bug.
+            ceiling_remaining = self._settings.idle_timeout_seconds
+        timeout = max(0.0, min(ceiling_remaining, max_call_remaining))
         terminal = getattr(session, "terminal_future", None)
         if terminal is None:
-            return await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
+            try:
+                return await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
+            except asyncio.TimeoutError:
+                if self._max_call_remaining(call_started_at, self._clock()) <= 0:
+                    raise _MaxCallDurationExceeded
+                raise
         receive_task = asyncio.create_task(websocket.receive_text())
         # A dead outbound sender leaves the guest in silence; wait on it too so
         # the call ends now instead of at the idle timeout.
@@ -499,15 +568,24 @@ class SmartPBXGateway:
         # idle deadline expires. That is bounded and acceptable; it is not 300s.
         if not done and not pending and getattr(session, "transfer_pending", False):
             # The transfer was acknowledged while we were waiting: re-wait on the
-            # transfer ceiling rather than closing on the ordinary idle deadline.
+            # transfer ceiling (also bounded by the max-call ceiling) rather than
+            # closing on the ordinary idle deadline.
             pending = True
+            now2 = self._clock()
+            transfer_pending_since[0] = now2
+            max_call_remaining2 = self._max_call_remaining(call_started_at, now2)
+            if max_call_remaining2 <= 0:
+                await _settle(None)
+                raise _MaxCallDurationExceeded
             done, _ = await asyncio.wait(
                 waited,
-                timeout=self._settings.transfer_pending_timeout_seconds,
+                timeout=min(self._settings.transfer_pending_timeout_seconds, max_call_remaining2),
                 return_when=asyncio.FIRST_COMPLETED,
             )
         if not done:
             await _settle(None)
+            if self._max_call_remaining(call_started_at, self._clock()) <= 0:
+                raise _MaxCallDurationExceeded
             if pending:
                 raise _TransferPendingTimeout
             raise asyncio.TimeoutError
@@ -584,7 +662,7 @@ class SmartPBXGateway:
             "outcome": outcome.value,
             "failure_class": failure_class.value,
             "active_sessions": self._registry.snapshot()["active_sessions"],
-            "duration_ms": round(max(0.0, time.monotonic() - started_at) * 1000),
+            "duration_ms": round(max(0.0, self._clock() - started_at) * 1000),
         }, sort_keys=True))
 
 
