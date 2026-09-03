@@ -1172,6 +1172,11 @@ _TOOL_FILLER_CYCLES: dict[str, int] = {
 
 
 SMARTPBX_INITIAL_FILLER_TEXT = "Just a moment while I check that for you."
+# The direct-Sinhala counterpart. Deliberately one short, natural spoken
+# phrase rather than a rotation bank: every Sinhala filler has to be
+# pre-rendered through Gemini TTS before a call may use it, so each extra
+# variant is another synthesis the process must complete up front.
+SMARTPBX_SINHALA_INITIAL_FILLER_TEXT = "පොඩ්ඩක් ඉන්න, මම බලන්නම්."
 _SMARTPBX_CAPTURE_TOOLS = frozenset({
     "capture_spoken_number", "capture_spoken_name", "collect_number_via_keypad",
 })
@@ -2467,6 +2472,190 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
         "_default": "\u0BA4\u0BAF\u0BB5\u0BC1\u0B9A\u0BC6\u0BAF\u0BCD\u0BA4\u0BC1 \u0B95\u0BBE\u0BA4\u0BCD\u0BA4\u0BBF\u0BB0\u0BC1\u0B99\u0BCD\u0B95\u0BB3\u0BCD.",
     },
 }
+
+# ---------------------------------------------------------------------------
+# Direct SmartPBX Sinhala fixed-phrase audio
+# ---------------------------------------------------------------------------
+# Gemini TTS is request/response with a 2-5 s time to first byte, so a Sinhala
+# filler synthesised on demand lands AFTER the answer it exists to cover. Every
+# phrase below is fixed, operator-authored and call-independent, so it can be
+# rendered once per process and replayed from bytes at no synthesis cost -- the
+# same trade the English welcome-audio cache and the static bilingual IVR asset
+# already make.
+#
+# PRIVACY: this cache is an allowlist, never a general memo table. Caller
+# transcript, model output and tool text must never be admitted to it.
+SMARTPBX_SINHALA_CACHED_PHRASES: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        (
+            SMARTPBX_SINHALA_INITIAL_FILLER_TEXT,
+            *(
+                phrase
+                for phrase in MEDIA_STREAM_FILLERS.get("si", {}).values()
+                if phrase
+            ),
+        )
+    )
+)
+_SMARTPBX_MULAW_FRAME_BYTES = 640
+_SMARTPBX_SINHALA_PHRASE_AUDIO: dict[tuple[str, str, str], bytes] = {}
+_SMARTPBX_SINHALA_PHRASE_AUDIO_LOCK = threading.Lock()
+_SMARTPBX_SINHALA_PHRASE_PREWARM: tuple[Any, asyncio.Task] | None = None
+
+
+class _SmartPBXSinhalaPhraseSynthesisError(Exception):
+    """One fixed Sinhala phrase could not be rendered to usable mu-law."""
+
+
+def _smartpbx_sinhala_phrase_audio_key(text: str) -> tuple[str, str, str]:
+    """The complete request identity that produced a cached Sinhala clip."""
+    return (
+        text,
+        SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
+        SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
+    )
+
+
+def _is_smartpbx_sinhala_cacheable_phrase(text: str) -> bool:
+    """Only the fixed operator-authored phrases may ever reach the cache."""
+    return text in SMARTPBX_SINHALA_CACHED_PHRASES
+
+
+def _get_cached_smartpbx_sinhala_phrase_audio(text: str) -> bytes | None:
+    if not _is_smartpbx_sinhala_cacheable_phrase(text):
+        return None
+    with _SMARTPBX_SINHALA_PHRASE_AUDIO_LOCK:
+        return _SMARTPBX_SINHALA_PHRASE_AUDIO.get(
+            _smartpbx_sinhala_phrase_audio_key(text)
+        )
+
+
+def _store_cached_smartpbx_sinhala_phrase_audio(text: str, audio: bytes) -> None:
+    if not _is_smartpbx_sinhala_cacheable_phrase(text) or not audio:
+        return
+    with _SMARTPBX_SINHALA_PHRASE_AUDIO_LOCK:
+        _SMARTPBX_SINHALA_PHRASE_AUDIO.setdefault(
+            _smartpbx_sinhala_phrase_audio_key(text), audio
+        )
+
+
+def _smartpbx_sinhala_phrase_audio_ready() -> bool:
+    """True once every fixed phrase can be served without synthesis."""
+    return all(
+        _get_cached_smartpbx_sinhala_phrase_audio(text) is not None
+        for text in SMARTPBX_SINHALA_CACHED_PHRASES
+    )
+
+
+def _gemini_tts_audio_metadata_supported(audio_delta: Any) -> bool:
+    """True unless a delta declares a shape other than 24 kHz mono l16."""
+    for name, supported in (
+        ("mime_type", "audio/l16"),
+        ("channels", 1),
+        ("sample_rate", 24000),
+    ):
+        value = getattr(audio_delta, name, None)
+        if value is not None and value != supported:
+            return False
+    return True
+
+
+async def _synthesize_smartpbx_sinhala_phrase_audio(client: Any, text: str) -> bytes:
+    """Render one fixed Sinhala phrase to frame-aligned 8 kHz mu-law.
+
+    Deliberately transport-free and fence-free: this runs outside any call, so
+    it must never touch a session's speaking state or media generation.
+    """
+    if audioop is None:
+        raise _SmartPBXSinhalaPhraseSynthesisError()
+    stream = await client.aio.interactions.create(
+        model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
+        input=text,
+        stream=True,
+        response_format={"type": "audio"},
+        generation_config={
+            "speech_config": [{
+                "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
+            }],
+        },
+        timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
+    )
+    ratecv_state = None
+    pcm_tail = b""
+    mulaw = b""
+    async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
+        if not _gemini_tts_audio_metadata_supported(audio_delta):
+            raise _SmartPBXSinhalaPhraseSynthesisError()
+        try:
+            chunk = base64.b64decode(audio_b64, validate=True)
+        except (binascii.Error, ValueError, TypeError):
+            raise _SmartPBXSinhalaPhraseSynthesisError() from None
+        if not chunk:
+            continue
+        data = pcm_tail + chunk
+        if len(data) % 2:
+            data, pcm_tail = data[:-1], data[-1:]
+        else:
+            pcm_tail = b""
+        if not data:
+            continue
+        pcm8k, ratecv_state = audioop.ratecv(data, 2, 1, 24000, 8000, ratecv_state)
+        mulaw += audioop.lin2ulaw(pcm8k, 2)
+    if pcm_tail or not mulaw:
+        raise _SmartPBXSinhalaPhraseSynthesisError()
+    return mulaw + b"\xff" * ((-len(mulaw)) % _SMARTPBX_MULAW_FRAME_BYTES)
+
+
+async def _prewarm_smartpbx_sinhala_phrase_audio() -> None:
+    """Render every fixed Sinhala phrase once, so no call has to pay for it."""
+    try:
+        client = _get_gemini_tts_client()
+    except Exception:
+        logger.warning("smartpbx_media event=sinhala_phrase_prewarm_unavailable")
+        return
+    rendered = 0
+    for text in SMARTPBX_SINHALA_CACHED_PHRASES:
+        if _get_cached_smartpbx_sinhala_phrase_audio(text) is not None:
+            continue
+        try:
+            audio = await _synthesize_smartpbx_sinhala_phrase_audio(client, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # One unrenderable phrase must not cost the others their clip; the
+            # caller-facing gates simply keep that phrase off the fast path.
+            continue
+        _store_cached_smartpbx_sinhala_phrase_audio(text, audio)
+        rendered += 1
+    logger.info(
+        "smartpbx_media event=sinhala_phrase_prewarm rendered=%d total=%d ready=%s",
+        rendered,
+        len(SMARTPBX_SINHALA_CACHED_PHRASES),
+        str(_smartpbx_sinhala_phrase_audio_ready()).lower(),
+    )
+
+
+def _schedule_smartpbx_sinhala_phrase_prewarm() -> None:
+    """Start the one in-flight Sinhala prewarm for this loop, at most once.
+
+    Re-entrant on purpose: a prewarm that failed against a transient Gemini
+    outage is retried by the next Sinhala activation, rather than leaving every
+    later call permanently without its fillers.
+    """
+    global _SMARTPBX_SINHALA_PHRASE_PREWARM
+    if not _has_gemini_api_key() or _smartpbx_sinhala_phrase_audio_ready():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    existing = _SMARTPBX_SINHALA_PHRASE_PREWARM
+    if existing is not None and existing[0] is loop and not existing[1].done():
+        return
+    _SMARTPBX_SINHALA_PHRASE_PREWARM = (
+        loop, loop.create_task(_prewarm_smartpbx_sinhala_phrase_audio()),
+    )
+
 
 # Sentence boundary detection for streaming TTS
 _SENTENCE_END = re.compile(r'(?<=[.!?\u0964\u0DF4])\s+')
@@ -4411,6 +4600,10 @@ async def lifespan(app: FastAPI):
             )
     else:
         logger.info("SmartPBX mode: legacy Twilio handoff startup is disabled")
+        # Sinhala fixed-phrase audio must already exist by the first turn of the
+        # first Sinhala call: Gemini TTS is request/response, so a filler
+        # synthesised on demand arrives after the answer it exists to cover.
+        _schedule_smartpbx_sinhala_phrase_prewarm()
 
     # NOTE: bookings go to the Yanolja PMS via booking_api -> yanolja_service ->
     # yanolja_client. Hatton Hills is an invented demo property, so there is no
@@ -5983,12 +6176,27 @@ class MediaStreamSession:
     ) -> SmartPBXInitialFillerController | None:
         if (
             round_idx != 0
-            or not self._is_direct_smartpbx_english()
             or self.transfer_pending
             or self._is_speaking
             or self._is_capture_mode_active()
             or generation != self._speak_generation
         ):
+            return None
+        # Direct English rotates a phrase bank through live ElevenLabs TTS.
+        # Direct Sinhala gets the same controller and the same delay, but only
+        # once its one phrase is pre-rendered: Gemini TTS is request/response,
+        # so a filler synthesised here would hold the shared speak lock through
+        # a 2-5 s round trip and land on top of the answer it was covering.
+        if self._is_direct_smartpbx_english():
+            sinhala_filler_text = None
+        elif (
+            self._is_direct_smartpbx_sinhala()
+            and _get_cached_smartpbx_sinhala_phrase_audio(
+                SMARTPBX_SINHALA_INITIAL_FILLER_TEXT
+            ) is not None
+        ):
+            sinhala_filler_text = SMARTPBX_SINHALA_INITIAL_FILLER_TEXT
+        else:
             return None
 
         # Provider failover (Gemini -> Claude) runs the whole turn again on a
@@ -6050,13 +6258,21 @@ class MediaStreamSession:
                     runner.speak_generation = self._speak_generation
                     self._assistant_turn_generation = self._speak_generation
 
-            filler_lease = self._reserve_smartpbx_initial_filler()
+            # Sinhala speaks one fixed pre-rendered phrase, so it takes no
+            # lease: there is no bank to rotate and nothing to reserve.
+            filler_lease = (
+                None if sinhala_filler_text is not None
+                else self._reserve_smartpbx_initial_filler()
+            )
             controller = SmartPBXInitialFillerController(
                 speak=speak,
                 generation=generation,
                 delay_seconds=SMARTPBX_INITIAL_FILLER_DELAY_SECONDS,
                 clear_audio=clear_audio,
-                text=filler_lease.text,
+                text=(
+                    sinhala_filler_text if filler_lease is None
+                    else filler_lease.text
+                ),
                 lease=filler_lease,
             )
             controller.start()
@@ -9453,10 +9669,9 @@ class MediaStreamSession:
                             if kind != "text":
                                 continue
 
-                            if (
-                                initial_filler is not None
-                                and self._is_direct_smartpbx_english()
-                            ):
+                            # Direct Sinhala now arms the same controller, and
+                            # first content retires it on both languages.
+                            if initial_filler is not None:
                                 await initial_filler.on_content_delta()
                                 if initial_filler._cleared_after_spoke:
                                     gen = self._speak_generation
@@ -10726,91 +10941,104 @@ class MediaStreamSession:
         cancelled = False
 
         try:
-            client = self._gemini_tts_client
-            if client is None:
-                client = _get_gemini_tts_client()
-                self._gemini_tts_client = client
-            stream = await client.aio.interactions.create(
-                model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
-                input=text,
-                stream=True,
-                response_format={"type": "audio"},
-                generation_config={
-                    "speech_config": [{
-                        "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
-                    }],
-                },
-                timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
-            )
-
-            async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
-                if not self._owns_sinhala_tts_stream(
-                    expected_generation, audio_emitted=audio_emitted
-                ) or (
-                    turn_generation is not None
-                    and turn_generation >= 0
-                    and turn_generation != self._speak_generation
-                ):
-                    cancelled = True
-                    break
-                if (
-                    (
-                        getattr(audio_delta, "mime_type", None) is not None
-                        and getattr(audio_delta, "mime_type") != "audio/l16"
-                    )
-                    or (
-                        getattr(audio_delta, "channels", None) is not None
-                        and getattr(audio_delta, "channels") != 1
-                    )
-                    or (
-                        getattr(audio_delta, "sample_rate", None) is not None
-                        and getattr(audio_delta, "sample_rate") != 24000
-                    )
-                ):
-                    self._log_tts_failure("gemini", "invalid_audio_metadata")
-                    self._emit_smartpbx_tts_diagnostic(
-                        DiagnosticFailureClass.TTS_EXCEPTION
-                    )
-                    return
-                try:
-                    chunk = base64.b64decode(audio_b64, validate=True)
-                except (binascii.Error, ValueError, TypeError):
-                    self._log_tts_failure("gemini", "malformed_audio")
-                    self._emit_smartpbx_tts_diagnostic(
-                        DiagnosticFailureClass.TTS_EXCEPTION
-                    )
-                    return
-                if not chunk:
-                    continue
-
-                data = pcm_tail + chunk
-                if len(data) % 2:
-                    data, pcm_tail = data[:-1], data[-1:]
-                else:
-                    pcm_tail = b""
-                if not data:
-                    continue
-                pcm8k, ratecv_state = audioop.ratecv(
-                    data, 2, 1, 24000, 8000, ratecv_state
+            # A pre-rendered fixed phrase (initial filler, tool filler,
+            # keypad prompt) replays straight from bytes: no provider round
+            # trip, so no 2-5 s time-to-first-byte in front of audio whose
+            # whole purpose is to arrive early. The delivery/fence/mark tail
+            # below is the identical sequence the streamed path ends with, so
+            # ownership and barge-in semantics are unchanged.
+            cached_phrase_audio = _get_cached_smartpbx_sinhala_phrase_audio(text)
+            if cached_phrase_audio is not None:
+                logger.info(
+                    "smartpbx_media event=tts_phrase_cache_hit provider=gemini"
                 )
-                mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+                mulaw_buf = cached_phrase_audio
+            else:
+                client = self._gemini_tts_client
+                if client is None:
+                    client = _get_gemini_tts_client()
+                    self._gemini_tts_client = client
+                stream = await client.aio.interactions.create(
+                    model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
+                    input=text,
+                    stream=True,
+                    response_format={"type": "audio"},
+                    generation_config={
+                        "speech_config": [{
+                            "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
+                        }],
+                    },
+                    timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
+                )
 
-                while len(mulaw_buf) >= 640:
+                async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
                     if not self._owns_sinhala_tts_stream(
                         expected_generation, audio_emitted=audio_emitted
+                    ) or (
+                        turn_generation is not None
+                        and turn_generation >= 0
+                        and turn_generation != self._speak_generation
                     ):
                         cancelled = True
                         break
-                    frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
-                    if await self._send_media_audio(frame):
-                        await self._flush_pre_audio_stt()
-                        self._mark_smartpbx_turn_once("tts_first_chunk")
-                        audio_emitted = self._mark_tts_audible(expected_generation)
-                        if not audio_emitted:
+                    if (
+                        (
+                            getattr(audio_delta, "mime_type", None) is not None
+                            and getattr(audio_delta, "mime_type") != "audio/l16"
+                        )
+                        or (
+                            getattr(audio_delta, "channels", None) is not None
+                            and getattr(audio_delta, "channels") != 1
+                        )
+                        or (
+                            getattr(audio_delta, "sample_rate", None) is not None
+                            and getattr(audio_delta, "sample_rate") != 24000
+                        )
+                    ):
+                        self._log_tts_failure("gemini", "invalid_audio_metadata")
+                        self._emit_smartpbx_tts_diagnostic(
+                            DiagnosticFailureClass.TTS_EXCEPTION
+                        )
+                        return
+                    try:
+                        chunk = base64.b64decode(audio_b64, validate=True)
+                    except (binascii.Error, ValueError, TypeError):
+                        self._log_tts_failure("gemini", "malformed_audio")
+                        self._emit_smartpbx_tts_diagnostic(
+                            DiagnosticFailureClass.TTS_EXCEPTION
+                        )
+                        return
+                    if not chunk:
+                        continue
+
+                    data = pcm_tail + chunk
+                    if len(data) % 2:
+                        data, pcm_tail = data[:-1], data[-1:]
+                    else:
+                        pcm_tail = b""
+                    if not data:
+                        continue
+                    pcm8k, ratecv_state = audioop.ratecv(
+                        data, 2, 1, 24000, 8000, ratecv_state
+                    )
+                    mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+
+                    while len(mulaw_buf) >= 640:
+                        if not self._owns_sinhala_tts_stream(
+                            expected_generation, audio_emitted=audio_emitted
+                        ):
                             cancelled = True
                             break
-                if cancelled:
-                    break
+                        frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
+                        if await self._send_media_audio(frame):
+                            await self._flush_pre_audio_stt()
+                            self._mark_smartpbx_turn_once("tts_first_chunk")
+                            audio_emitted = self._mark_tts_audible(expected_generation)
+                            if not audio_emitted:
+                                cancelled = True
+                                break
+                    if cancelled:
+                        break
 
             if pcm_tail and not cancelled:
                 self._log_tts_failure("gemini", "malformed_audio")

@@ -605,6 +605,14 @@ class KavyaSmartPBXSession:
         self._model = profile.model
         pipeline._gemini_thinking_level = profile.gemini_thinking_level
         pipeline._smartpbx_gemini_max_tokens = profile.gemini_max_tokens
+        if profile.lang == "si":
+            # Fixed Sinhala filler/prompt audio is rendered once per process,
+            # off the call path. Startup already schedules it; this is the
+            # lazy safety net for a process whose first Sinhala call arrives
+            # before (or after a failure of) that startup attempt.
+            import server
+
+            server._schedule_smartpbx_sinhala_phrase_prewarm()
         return profile
 
     async def _cleanup_unstarted_prepared_stt(self, stt: Any) -> None:
