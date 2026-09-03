@@ -2271,6 +2271,50 @@ def test_deploy_workflow_rsync_excludes_smartpbx_host_control_plane_for_kavya():
     assert 'if [[ "$AGENT" == "kavya" ]]' in sync_run
 
 
+# The generic deploy engine + push trigger + secret scan + dep audit are not
+# gated by the reviewed-SHA image contract the Kavya-specific probe/publisher
+# use, but a compromised or force-moved floating tag executes attacker code
+# in a job holding VPS_SSH_KEY (root on the production VPS) or packages:write.
+# Pin every `uses:` in these four workflows to the commit SHA the tag
+# currently resolves to, with a `# vX` comment, matching build-kavya-image.yml.
+GENERIC_WORKFLOW_ACTION_PINS = {
+    "actions/checkout": ("3d3c42e5aac5ba805825da76410c181273ba90b1", "v7"),
+    "actions/setup-python": ("5fda3b95a4ea91299a34e894583c3862153e4b97", "v7"),
+    "docker/setup-buildx-action": ("37fe631027851001ddb9b187196cc803df7f5f0e", "v4"),
+    "docker/login-action": ("dbcb813823bdd20940b903addbd779551569679f", "v4"),
+    "docker/build-push-action": ("53b7df96c91f9c12dcc8a07bcb9ccacbed38856a", "v7"),
+}
+
+GENERIC_PINNED_WORKFLOWS = [
+    DEPLOY_WORKFLOW,
+    PROJECT_ROOT.parent / ".github/workflows/deploy-on-push.yml",
+    PROJECT_ROOT.parent / ".github/workflows/secret-scan.yml",
+    PROJECT_ROOT.parent / ".github/workflows/dep-audit.yml",
+]
+
+
+@pytest.mark.parametrize(
+    "workflow", GENERIC_PINNED_WORKFLOWS,
+    ids=["deploy", "deploy-on-push", "secret-scan", "dep-audit"],
+)
+def test_generic_deploy_workflows_pin_every_action_to_a_full_commit_sha(workflow):
+    text = workflow.read_text(encoding="utf-8")
+    document = yaml.load(text, Loader=yaml.BaseLoader)
+    # A reusable-workflow reference to a file in this same repo (e.g.
+    # `uses: ./.github/workflows/deploy.yml`) is not an external action and
+    # has no tag/SHA to pin.
+    references = [ref for ref in workflow_uses_strings(document) if not ref.startswith("./")]
+
+    assert references, "workflow declares no external actions"
+    for reference in references:
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", reference), reference
+        owner_repo, _, sha = reference.partition("@")
+        assert owner_repo in GENERIC_WORKFLOW_ACTION_PINS, owner_repo
+        expected_sha, expected_version = GENERIC_WORKFLOW_ACTION_PINS[owner_repo]
+        assert sha == expected_sha, reference
+        assert f"uses: {reference} # {expected_version}\n" in text, reference
+
+
 SMARTPBX_IMAGE_DEPLOY_SCRIPT = PROJECT_ROOT / "scripts" / "deploy_smartpbx_image.sh"
 
 
