@@ -203,9 +203,9 @@ def test_nginx_exposes_only_the_bounded_smartpbx_surface_with_tls():
     # P1-5: a minimal custom format -- no query string, no headers, no PII --
     # not the default combined format (which would carry the request line
     # with any query string verbatim).
-    assert "access_log /var/log/nginx/smartpbx-kavya-access.log smartpbx_min;" in nginx
+    assert "access_log /var/log/nginx/smartpbx-kavya-access.log kavya_smartpbx_min;" in nginx
     assert re.search(
-        r"log_format\s+smartpbx_min\s+'\$request_method \$uri \$status \$http_upgrade \$request_time';",
+        r"log_format\s+kavya_smartpbx_min\s+'\$request_method \$uri \$status \$http_upgrade \$request_time';",
         nginx,
     )
     assert "limit_req_zone $binary_remote_addr zone=kavya_smartpbx_req:10m rate=30r/m;" in nginx
