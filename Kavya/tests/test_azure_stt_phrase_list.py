@@ -1,9 +1,12 @@
-"""Azure STT should bias English recognition toward the booking domain.
+"""Azure STT should bias recognition toward the booking/number domain.
 
 The English Azure recognizer (SmartPBX / direct-English path) is configured
 bare, so digit strings, room names and booking terms are mis-heard. A
-PhraseListGrammar biases it. It is English-only — the Sinhala/Tamil/Arabic Azure
-configs are left untouched, since phrase lists are language-specific.
+PhraseListGrammar biases it. Direct SmartPBX Sinhala gets its own,
+number-word-only phrase list (`SI_STT_PHRASE_LIST`) so the tens/units/teens
+Azure is biased toward match `_normalize_sinhala_spoken_digits`. Tamil/Arabic
+are left untouched — phrase lists are language-specific and only English and
+Sinhala have one.
 """
 
 from __future__ import annotations
@@ -115,10 +118,27 @@ def test_english_recognizer_gets_the_phrase_list_populated(monkeypatch):
     assert "seven" in added
 
 
-@pytest.mark.parametrize("lang", ["si", "ta", "ar"])
-def test_non_english_paths_do_not_get_the_english_phrase_list(monkeypatch, lang):
+@pytest.mark.parametrize("lang", ["ta", "ar"])
+def test_non_english_non_sinhala_paths_get_no_phrase_list(monkeypatch, lang):
     factory = _run_start(monkeypatch, lang=lang)
     assert factory.grammars == [], (
-        f"{lang} must not receive the English phrase list — phrase lists are "
+        f"{lang} must not receive any phrase list — phrase lists are "
         "language-specific and the owner keeps Azure for these languages as-is"
     )
+
+
+def test_sinhala_phrase_list_constant_covers_units_tens_and_teens():
+    phrases = server.SI_STT_PHRASE_LIST
+    for word in ("එක", "පහ", "නවය", "හැට", "විසි", "පනස්", "එකොළහ", "දහනවය", "දහය"):
+        assert word in phrases, f"Sinhala number word {word} must be in the phrase list"
+
+
+def test_sinhala_recognizer_gets_the_sinhala_phrase_list_populated(monkeypatch):
+    factory = _run_start(monkeypatch, lang="si")
+
+    assert len(factory.grammars) == 1, "Sinhala must get exactly one phrase grammar"
+    added = factory.grammars[0].phrases
+    assert set(server.SI_STT_PHRASE_LIST) <= set(added)
+    # It must NOT receive the English word list — different vocabulary.
+    assert "seven" not in added
+    assert "Mount Monarch Chalet" not in added

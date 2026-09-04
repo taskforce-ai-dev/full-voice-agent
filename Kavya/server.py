@@ -2171,13 +2171,158 @@ _CAPTURE_ASK_SUPPRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
 )
 
+# ---------------------------------------------------------------------------
+# Sinhala spoken-number normalisation (Direct SmartPBX Sinhala capture only)
+# ---------------------------------------------------------------------------
+# Sinhala callers say numbers the natural way -- tens and units combined
+# ("හැට පහ" = "sixty five" = 65), not digit-by-digit the way English callers
+# are asked to dictate. Azure si-LK STT returns these as Sinhala number
+# words, sometimes mixed with ASCII digits in the same utterance
+# ("0 7 7 හැට පහ"). `handover.py`'s `spoken_number_to_digits` only knows
+# English digit words, and its token splitter (`[^0-9A-Za-z]+`) treats every
+# Sinhala character as a separator, so a bare Sinhala combined number was
+# silently dropped -- only the odd stray ASCII digit survived.
+#
+# This normaliser runs FIRST, over the raw Sinhala utterance, and rewrites
+# Sinhala number words in place to plain ASCII digit strings. Everything
+# downstream (the capture dictation-ratio heuristic, and
+# `capture_spoken_number` reached via `_override_capture_spoken_argument`)
+# then sees ordinary digits exactly as it already does for English "oh seven
+# seven". PURE TEXT TRANSFORM ONLY -- no I/O, no logging of its (privacy
+# sensitive) output. Wired into Direct SmartPBX Sinhala only
+# (`_is_direct_smartpbx_sinhala`); the Twilio Sinhala Media Streams path and
+# all English behaviour (`expand_spoken_repeats`, `spoken_number_to_digits`
+# in handover.py) are untouched.
+_SI_UNIT_WORDS: dict[str, str] = {
+    "බිංදුව": "0", "බින්දුව": "0", "ශුන්‍ය": "0", "ශුන්ය": "0", "සුන්‍ය": "0",
+    "එක": "1", "එකයි": "1",
+    "දෙක": "2", "දෙකයි": "2",
+    "තුන": "3", "තුනයි": "3",
+    "හතර": "4", "හතරයි": "4",
+    "පහ": "5", "පහයි": "5",
+    "හය": "6", "හයයි": "6",
+    "හත": "7", "හතයි": "7",
+    "අට": "8", "අටයි": "8",
+    "නවය": "9", "නවයයි": "9",
+}
+
+# Teens are their own words, not compositional the way tens + unit are.
+_SI_TEEN_WORDS: dict[str, str] = {
+    "එකොළහ": "11",
+    "දොළහ": "12",
+    "දහතුන": "13",
+    "දාහතර": "14", "දහහතර": "14",
+    "පහළොව": "15", "පහළොස්": "15",
+    "දහසය": "16",
+    "දාහත": "17", "දහහත": "17",
+    "දහඅට": "18",
+    "දහනවය": "19",
+}
+
+# Tens: a standalone number word AND the combining prefix used immediately
+# before a unit word ("හැට පහ" -> 60 + 5 -> "65"). 20-50 have distinct
+# standalone/prefix spellings (විස්ස vs විසි-, ...); 60/70/80/90 use the same
+# spelling either way.
+_SI_TENS_WORDS: dict[str, int] = {
+    "දහය": 10,
+    "විස්ස": 20, "විසි": 20,
+    "තිහ": 30, "තිස්": 30,
+    "හතළිහ": 40, "හතළිස්": 40,
+    "පනහ": 50, "පනස්": 50,
+    "හැට": 60,
+    "හැත්තෑව": 70, "හැත්තෑ": 70,
+    "අසූව": 80, "අසූ": 80,
+    "අනූව": 90, "අනූ": 90,
+}
+
+# Combined vocabulary -- shared by the dictation-ratio heuristic below and the
+# Azure si-LK phrase list (AzureSTTStream.start()).
+SI_STT_PHRASE_LIST: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        list(_SI_UNIT_WORDS) + list(_SI_TEEN_WORDS) + list(_SI_TENS_WORDS)
+    )
+)
+
+# A "word" token: Sinhala script (incl. the zero-width joiner used in some
+# conjuncts, e.g. ශුන්‍ය) or plain ASCII letters/digits -- mixed utterances
+# carry both ("0 7 7 හැට පහ"). Everything else is a separator, kept verbatim.
+_SI_WORD_RE = re.compile(r"[0-9A-Za-z඀-෿‍]+")
+_SI_TOKEN_RE = re.compile(
+    r"[0-9A-Za-z඀-෿‍]+|[^0-9A-Za-z඀-෿‍]+"
+)
+
+
+def _normalize_sinhala_spoken_digits(text: str) -> str:
+    """Rewrite Sinhala number words in ``text`` to plain ASCII digit strings.
+
+    Pure text transform, word-boundary matched -- a Sinhala word is never
+    matched as a substring of a longer one ("පහත" is not "පහ"). A tens word
+    immediately followed (across whitespace only) by a unit word combines
+    into one number ("හැට පහ" -> "65"); a tens word on its own stays its
+    standalone value ("පනස්" -> "50"). Everything else -- ordinary Sinhala
+    words, punctuation, spacing, already-ASCII digits -- passes through
+    unchanged.
+
+    >>> _normalize_sinhala_spoken_digits("හැට පහ")
+    '65'
+    >>> _normalize_sinhala_spoken_digits("විසි එක")
+    '21'
+    >>> _normalize_sinhala_spoken_digits("පනස්")
+    '50'
+    >>> _normalize_sinhala_spoken_digits("0 7 7 හැට පහ")
+    '0 7 7 65'
+    """
+    if not text:
+        return ""
+    tokens = _SI_TOKEN_RE.findall(text)
+    out: list[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        token = tokens[i]
+        if not _SI_WORD_RE.fullmatch(token):
+            out.append(token)
+            i += 1
+            continue
+        tens_value = _SI_TENS_WORDS.get(token)
+        if tens_value is not None:
+            # Look past a single whitespace-only separator for a unit word.
+            j = i + 1
+            if j < n and tokens[j].strip() == "":
+                j += 1
+            unit_digit = _SI_UNIT_WORDS.get(tokens[j]) if j < n else None
+            if unit_digit is not None and unit_digit != "0":
+                out.append(str(tens_value + int(unit_digit)))
+                i = j + 1
+                continue
+            out.append(str(tens_value))
+            i += 1
+            continue
+        teen_value = _SI_TEEN_WORDS.get(token)
+        if teen_value is not None:
+            out.append(teen_value)
+            i += 1
+            continue
+        unit_value = _SI_UNIT_WORDS.get(token)
+        if unit_value is not None:
+            out.append(unit_value)
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+    return "".join(out)
+
+
 # Tokens that read as dictated digits or a spelled letter. Used only to decide
-# whether an already-buffered capture utterance is still a dictation.
+# whether an already-buffered capture utterance is still a dictation. Sinhala
+# number words are unioned in so a Sinhala dictation ("හැට පහ...") reads as a
+# dictation independently of whether `_normalize_sinhala_spoken_digits` has
+# already run -- defense in depth, not a substitute for that normaliser.
 _CAPTURE_DICTATION_WORDS: frozenset[str] = frozenset({
     "zero", "oh", "o", "nought", "naught", "nil",
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
     "double", "triple", "treble", "plus", "hundred", "dash", "hyphen", "dot",
-})
+}) | frozenset(SI_STT_PHRASE_LIST)
 
 
 def _is_capture_ask_sentence(sentence: str) -> bool:
@@ -2199,7 +2344,7 @@ def _detect_capture_ask(sentences: Any) -> bool:
 
 def _capture_dictation_ratio(text: str) -> float:
     """Share of tokens in ``text`` that look like dictated digits or letters."""
-    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    tokens = re.findall(r"[a-z0-9඀-෿‍]+", (text or "").lower())
     if not tokens:
         return 0.0
     hits = 0
@@ -5760,17 +5905,29 @@ class AzureSTTStream:
         self._recognizer.recognized.connect(self._on_recognized)
         self._recognizer.canceled.connect(self._on_canceled)
 
-        # Bias English recognition toward the booking domain. English only —
-        # phrase lists are language-specific, so si/ta/ar keep the bare config.
-        # Defensive: a missing PhraseListGrammar (older SDK) or any failure here
-        # must never prevent recognition from starting.
+        # Bias recognition toward the booking domain. English gets the full
+        # booking-term/room-name/digit-word list; Sinhala gets its own
+        # spoken-number vocabulary (SI_STT_PHRASE_LIST) so the tens/units/
+        # teens words this line is transcribed against are the same ones
+        # `_normalize_sinhala_spoken_digits` understands. Tamil/Arabic keep
+        # the bare config — phrase lists are language-specific and the owner
+        # keeps those as-is. Defensive: a missing PhraseListGrammar (older
+        # SDK) or any failure here must never prevent recognition starting.
         phrase_list_grammar = getattr(azure_speech, "PhraseListGrammar", None)
-        if self._lang == "en" and EN_STT_PHRASE_LIST and phrase_list_grammar is not None:
+        stt_phrases: tuple[str, ...] = ()
+        if self._lang == "en":
+            stt_phrases = EN_STT_PHRASE_LIST
+        elif self._lang == "si":
+            stt_phrases = SI_STT_PHRASE_LIST
+        if stt_phrases and phrase_list_grammar is not None:
             try:
                 phrase_grammar = phrase_list_grammar.from_recognizer(self._recognizer)
-                for phrase in EN_STT_PHRASE_LIST:
+                for phrase in stt_phrases:
                     phrase_grammar.addPhrase(phrase)
-                logger.info("Azure STT English phrase list applied (%d phrases)", len(EN_STT_PHRASE_LIST))
+                logger.info(
+                    "Azure STT %s phrase list applied (%d phrases)",
+                    self._lang, len(stt_phrases),
+                )
             except Exception:
                 logger.warning("Azure STT phrase list not applied", exc_info=True)
 
@@ -8870,6 +9027,15 @@ class MediaStreamSession:
         self._deferred_flush_pending = False
         if not transcript:
             return
+        if self._is_direct_smartpbx_sinhala():
+            # Sinhala callers say numbers tens+units combined ("හැට පහ" = 65),
+            # not digit-by-digit. Rewrite those words to plain digits here, at
+            # the single seam this dispatched utterance flows through next —
+            # the dictation-ratio check below, `_process_utterance`'s history/
+            # transcript, and (via `_last_guest_utterance_raw`) the raw
+            # argument `capture_spoken_number` sees — so every consumer of
+            # this turn's text sees the same normalised digits.
+            transcript = _normalize_sinhala_spoken_digits(transcript)
         # Claim the turn synchronously, before any await, so a concurrently-queued
         # flush task sees the guard set and bails.
         self._utterance_dispatched = True
