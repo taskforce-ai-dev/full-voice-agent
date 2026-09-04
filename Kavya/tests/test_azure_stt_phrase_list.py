@@ -139,6 +139,12 @@ def test_sinhala_recognizer_gets_the_sinhala_phrase_list_populated(monkeypatch):
     assert len(factory.grammars) == 1, "Sinhala must get exactly one phrase grammar"
     added = factory.grammars[0].phrases
     assert set(server.SI_STT_PHRASE_LIST) <= set(added)
-    # It must NOT receive the English word list — different vocabulary.
+    # It must NOT receive the full English digit-word/booking-term list —
+    # different vocabulary (EN_STT_PHRASE_LIST digit words are English-only).
     assert "seven" not in added
-    assert "Mount Monarch Chalet" not in added
+    # 2026-09-04 tester feedback: Sinhala DOES now get the five room names
+    # (and their component/transliterated words) so Azure si-LK is biased
+    # toward the terms callers actually code-switch into — this is the
+    # narrow, deliberate exception to "no English word list" above.
+    assert "Mount Monarch Chalet" in added
+    assert "Suite" in added

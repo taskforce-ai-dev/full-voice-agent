@@ -14,6 +14,7 @@ from starlette.websockets import WebSocketDisconnect
 import pytest
 
 from smartpbx_gateway import SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings
+from smartpbx_gateway import _classify_hangup_cause
 
 
 START = {
@@ -61,6 +62,7 @@ class FakeSession:
         self.audio = []
         self.finishes = []
         self.close_reasons = []
+        self.hangup_causes = []
         self.terminal_future = asyncio.get_running_loop().create_future()
 
     async def start(self):
@@ -69,9 +71,10 @@ class FakeSession:
     async def feed_audio(self, audio):
         self.audio.append(audio)
 
-    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None, hangup_cause=None):
         self.finishes.append(schedule_post_call)
         self.close_reasons.append((close_reason, close_code))
+        self.hangup_causes.append(hangup_cause)
 
 
 class Factory:
@@ -435,6 +438,26 @@ async def test_gateway_first_terminal_leaves_later_frames_unread_and_cleans_once
     assert registry.snapshot()["released_total"] == 1
 
 
+@pytest.mark.asyncio
+async def test_gateway_treats_a_hangup_context_mismatch_as_a_non_fatal_hangup():
+    """2026-09-04 07:46:37: a hangup whose callId/otherLegCallId disagree with
+    the start context used to raise ProtocolViolation (close 1008), which
+    then failed to even close cleanly because Dialog's socket was already
+    gone. It must instead observe the mismatch (like DTMF) and complete as an
+    ordinary hangup, carrying whatever hangup_cause the reason maps to."""
+    mismatched_hangup = {
+        "event": "hangup",
+        "hangup": {"callId": "wrong", "otherLegCallId": "other-1", "accountId": "account-1", "reason": "NORMAL_CLEARING"},
+    }
+    _, registry, socket, factory = await run([START, mismatched_hangup])
+
+    assert socket.close_calls == [(1000, "call ended")]
+    assert factory.sessions[0].finishes == [True]
+    assert factory.sessions[0].close_reasons == [("hangup", 1000)]
+    assert factory.sessions[0].hangup_causes == ["normal_clearing"]
+    assert registry.snapshot()["released_total"] == 1
+
+
 DIAGNOSTIC_KEYS = {
     "event", "correlation_id", "stage", "outcome",
     "failure_class", "active_sessions", "duration_ms",
@@ -550,9 +573,10 @@ class _FaultSession(FakeSession):
     def __init__(self, context, transport):
         super().__init__(context, transport)
         self.finish_started = asyncio.Event()
-    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None, hangup_cause=None):
         self.finishes.append(schedule_post_call)
         self.close_reasons.append((close_reason, close_code))
+        self.hangup_causes.append(hangup_cause)
         self.finish_started.set()
         _FAULT_STATE["order"].append("session")
         if _FAULT_STATE["block_finish"]:
@@ -831,6 +855,7 @@ class _LifecycleSession:
         self.terminal_future = asyncio.get_running_loop().create_future()
         self.finishes = []
         self.close_reasons = []
+        self.hangup_causes = []
         # A session-internal terminal failure (audit #10) records this before
         # resolving terminal_future; None means the ordinary completed path.
         self.close_reason = None
@@ -840,9 +865,10 @@ class _LifecycleSession:
     async def feed_audio(self, _audio):
         if self.feed_error:
             raise self.feed_error
-    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None, hangup_cause=None):
         self.finishes.append(schedule_post_call)
         self.close_reasons.append((close_reason, close_code))
+        self.hangup_causes.append(hangup_cause)
 class _LifecycleFactory:
     def __init__(self, *, factory_error=None, start_error=None, feed_error=None):
         self.factory_error, self.start_error, self.feed_error = factory_error, start_error, feed_error
@@ -916,7 +942,7 @@ async def test_unexpected_accept_failure_emits_terminal_internal_error_tuple(cap
     ([{"event": "future-event"}, START, {"event": "stop"}], [("schema_admission", "rejected", "unsupported_event")]),
     ([START, {"event": "future-event"}, {"event": "stop"}], [("session_start", "completed", "none"), ("context_validation", "observed", "unsupported_event"), ("terminal_cleanup", "completed", "none")]),
     ([START, {"event": "dtmf", "dtmf": {"callId": "wrong", "otherLegCallId": "other-1", "digit": "5"}}, {"event": "stop"}], [("session_start", "completed", "none"), ("context_validation", "observed", "context_mismatch"), ("terminal_cleanup", "completed", "none")]),
-    ([START, {"event": "hangup", "hangup": {"callId": "wrong", "otherLegCallId": "other-1", "accountId": "account-1", "reason": "normal"}}], [("session_start", "completed", "none"), ("context_validation", "rejected", "context_mismatch")]),
+    ([START, {"event": "hangup", "hangup": {"callId": "wrong", "otherLegCallId": "other-1", "accountId": "account-1", "reason": "normal"}}], [("session_start", "completed", "none"), ("context_validation", "observed", "context_mismatch"), ("terminal_cleanup", "completed", "none")]),
 ])
 async def test_explicit_unsupported_and_context_mismatch_sequences(caplog, messages, expected):
     caplog.set_level(logging.INFO)
@@ -1210,3 +1236,22 @@ async def test_terminal_future_completion_without_a_recorded_reason_still_closes
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("NORMAL_CLEARING", "normal_clearing"),
+        ("normal_clearing", "normal_clearing"),
+        (" User_Busy ", "user_busy"),
+        ("NO_ANSWER", "no_answer"),
+        ("CALL_REJECTED", "call_rejected"),
+        ("ORIGINATOR_CANCEL", "originator_cancel"),
+        ("some-vendor-specific-text", "other"),
+    ],
+)
+def test_classify_hangup_cause_maps_to_the_closed_vocabulary(reason, expected):
+    assert _classify_hangup_cause(reason) == expected

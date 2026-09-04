@@ -175,6 +175,11 @@ class KavyaSmartPBXSession:
         self._pending_close_code: int | None = None
         self._resolved_close_reason: str | None = None
         self._resolved_close_code: int | None = None
+        # Additive detail for a "hangup" close only (see HangupCause). Never
+        # resolved/clamped against a closed-vocabulary default the way
+        # close_reason is -- absent stays absent.
+        self._pending_hangup_cause: str | None = None
+        self._resolved_hangup_cause: str | None = None
 
     @property
     def terminal_future(self) -> asyncio.Future[None]:
@@ -234,6 +239,7 @@ class KavyaSmartPBXSession:
         schedule_post_call: bool = False,
         close_reason: str | None = None,
         close_code: int | None = None,
+        hangup_cause: str | None = None,
     ) -> None:
         # The gateway's explicit reason always wins; a still-None reason here
         # (its "raw is None" branch, which never reads from the socket) leaves
@@ -242,6 +248,8 @@ class KavyaSmartPBXSession:
             self._pending_close_reason = close_reason
         if close_code is not None:
             self._pending_close_code = close_code
+        if hangup_cause is not None:
+            self._pending_hangup_cause = hangup_cause
         async with self._finish_lock:
             if self._finish_task is None:
                 self._finish_task = asyncio.create_task(
@@ -727,6 +735,14 @@ class KavyaSmartPBXSession:
             # session summary in the finally block must agree on why this call
             # ended, and neither may see it change mid-teardown.
             self._resolved_close_reason = _resolve_close_reason(self._pending_close_reason)
+            # Additive, and only ever meaningful for a "hangup" close -- a
+            # non-hangup close_reason simply has no cause to carry, and a
+            # hangup with no `reason` on the wire resolves to None too.
+            self._resolved_hangup_cause = (
+                self._pending_hangup_cause
+                if self._resolved_close_reason == SmartPBXCloseReason.HANGUP.value
+                else None
+            )
             self._resolved_close_code = (
                 self._pending_close_code if isinstance(self._pending_close_code, int) else 0
             )
@@ -854,6 +870,7 @@ class KavyaSmartPBXSession:
                         close_code=self._resolved_close_code,
                         duration_ms=self._clamped_duration_ms(),
                         barge_ins=self._clamped_barge_ins(pipeline),
+                        hangup_cause=self._resolved_hangup_cause,
                     )
                 )
         finally:
@@ -899,16 +916,26 @@ class KavyaSmartPBXSession:
         pipeline = self._pipeline
         telemetry = getattr(pipeline, "_turn_telemetry", None)
         outcome = self._resolved_close_reason or _resolve_close_reason(self._pending_close_reason)
-        _emit_smartpbx_session_summary(
-            event="session_summary",
-            session_trace_id=self._ensure_session_trace_id(),
-            outcome=outcome,
-            turns_started=min(max(int(getattr(telemetry, "turns_started", 0)), 0), 100_000),
-            turns_summarized=min(max(int(getattr(telemetry, "turns_summarized", 0)), 0), 100_000),
-            duration_ms=self._clamped_duration_ms(),
-            frames_dropped_total=min(max(int(getattr(self._transport, "frames_dropped_total", 0)), 0), 100_000),
-            barge_ins=self._clamped_barge_ins(pipeline),
-        )
+        fields: dict[str, object] = {
+            "event": "session_summary",
+            "session_trace_id": self._ensure_session_trace_id(),
+            "outcome": outcome,
+            "turns_started": min(max(int(getattr(telemetry, "turns_started", 0)), 0), 100_000),
+            "turns_summarized": min(max(int(getattr(telemetry, "turns_summarized", 0)), 0), 100_000),
+            "duration_ms": self._clamped_duration_ms(),
+            "frames_dropped_total": min(max(int(getattr(self._transport, "frames_dropped_total", 0)), 0), 100_000),
+            "barge_ins": self._clamped_barge_ins(pipeline),
+            "tts_failures": min(max(int(getattr(pipeline, "_smartpbx_tts_failures_total", 0)), 0), 100_000),
+            "tts_model_fallbacks": min(
+                max(int(getattr(pipeline, "_smartpbx_tts_model_fallbacks_total", 0)), 0), 100_000,
+            ),
+        }
+        # Additive and optional: only a "hangup" close with a recognized/
+        # unrecognized `reason` on the wire has one at all -- absent means
+        # the field is omitted, never emitted as null or "other" by default.
+        if self._resolved_hangup_cause is not None:
+            fields["hangup_cause"] = self._resolved_hangup_cause
+        _emit_smartpbx_session_summary(**fields)
 
     def _clamped_duration_ms(self) -> int:
         return min(max((time.monotonic_ns() - self._session_started_ns) // 1_000_000, 0), _SESSION_MAX_MS)

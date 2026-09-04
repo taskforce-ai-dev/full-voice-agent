@@ -200,6 +200,7 @@ async def test_post_call_payload_carries_close_diagnostics_and_turn_counts(monke
         close_code=1000,
         duration_ms=60_000,
         barge_ins=2,
+        hangup_cause="normal_clearing",
     )
 
     payload = session.payloads[0]
@@ -207,6 +208,7 @@ async def test_post_call_payload_carries_close_diagnostics_and_turn_counts(monke
     assert payload["close_code"] == 1000
     assert payload["duration_ms"] == 60_000
     assert payload["barge_ins"] == 2
+    assert payload["hangup_cause"] == "normal_clearing"
     assert payload["guest_turns"] == 2
     assert payload["agent_turns"] == 2
     assert payload["language_code"] == "si"
@@ -248,6 +250,7 @@ async def test_post_call_payload_omits_close_diagnostics_when_not_supplied(monke
     assert "close_code" not in payload
     assert "duration_ms" not in payload
     assert "barge_ins" not in payload
+    assert "hangup_cause" not in payload
     assert payload["guest_turns"] == 1
     assert payload["agent_turns"] == 0
     assert payload["language_code"] == "en"
