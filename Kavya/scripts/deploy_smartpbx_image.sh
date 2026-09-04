@@ -22,7 +22,7 @@ SMARTPBX_LOG_ARCHIVE_DIR="${SMARTPBX_LOG_ARCHIVE_DIR:-/var/log/kavya-smartpbx}"
 # Exactly the runbook's cutover event allowlist (SMARTPBX_RUNBOOK.md "Durable
 # telemetry archive"). Pilot transcript lines are included deliberately: the
 # operator has kept SMARTPBX_PILOT_TRANSCRIPT_LOGGING on for this pilot.
-SMARTPBX_LOG_ALLOWLIST_PATTERN='event=(smartpbx_protocol_diagnostic|turn_stage|turn_summary|session_summary|stt_post_dispatch_result|llm_round_outcome|llm_stream_timeout|llm_round|capture_[A-Za-z0-9_]*|dtmf_[A-Za-z0-9_]*|barge_in|assistant_turn_delivery|smartpbx_post_call|smartpbx_pilot_transcript)'
+SMARTPBX_LOG_ALLOWLIST_PATTERN='event=(smartpbx_protocol_diagnostic|turn_stage|turn_summary|session_summary|stt_post_dispatch_result|llm_round_outcome|llm_stream_timeout|llm_round|rime_tts|capture_[A-Za-z0-9_]*|dtmf_[A-Za-z0-9_]*|barge_in|assistant_turn_delivery|smartpbx_post_call|smartpbx_pilot_transcript)'
 
 fail() { printf '%s\n' 'SmartPBX image deployment failed' >&2; return 1; }
 

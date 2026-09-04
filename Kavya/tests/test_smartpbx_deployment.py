@@ -554,6 +554,7 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "tool_batch",
         "tool_round_limit",
         "tts_failure",
+        "rime_tts",
         "tts_interrupted",
         "barge_in",
         "guest_utterance",
@@ -592,8 +593,24 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
     assert "never derived from dialog" in normalized_diagnostics
     assert "only seven" not in normalized_diagnostics
     assert "bounded provider enum" in normalized_diagnostics
-    for provider in ("openai", "gemini", "claude", "elevenlabs", "azure"):
+    for provider in ("openai", "gemini", "claude", "elevenlabs", "azure", "rime"):
         assert f"`{provider}`" in diagnostics
+    for required in (
+        "`rime_tts` emits exactly",
+        "`success`",
+        "`missing_api_key`",
+        "`timeout`",
+        "`http_status`",
+        "`transport_error`",
+        "`empty_audio`",
+        "`response_too_large`",
+        "`decode_failure`",
+        "`status`",
+        "100`–`599",
+        "`audio_bytes`",
+        "0`–`10485760",
+    ):
+        assert required in diagnostics
     assert (
         "must not contain transcript text, audio, call ids, exception bodies, or secrets"
         in normalized_diagnostics
@@ -2688,7 +2705,7 @@ def test_smartpbx_image_deploy_helper_archives_allowlisted_logs_before_every_rec
         "smartpbx_protocol_diagnostic", "turn_stage", "turn_summary", "session_summary",
         "stt_post_dispatch_result", "llm_round_outcome", "llm_stream_timeout", "llm_round",
         "capture_", "dtmf_", "barge_in", "assistant_turn_delivery", "smartpbx_post_call",
-        "smartpbx_pilot_transcript",
+        "smartpbx_pilot_transcript", "rime_tts",
     ):
         assert event in script
     main_block = script.split("main() {", 1)[1].split("\nif [[", 1)[0]
@@ -2968,6 +2985,7 @@ def test_archive_outgoing_logs_filters_to_the_allowlist_and_is_root_only(tmp_pat
     fake_bin.mkdir()
     docker_log_lines = "\n".join([
         'event=turn_summary call_id=abc outcome=ok',
+        'event=rime_tts provider=rime outcome=success audio_bytes=42',
         'event=smartpbx_pilot_transcript text=redacted',
         'event=something_unrelated should_not_appear=1',
         'raw non-event line should not match either',
@@ -2995,6 +3013,7 @@ def test_archive_outgoing_logs_filters_to_the_allowlist_and_is_root_only(tmp_pat
     assert name.endswith(f"-{outgoing_id[7:19]}.log")
     content = files[0].read_text(encoding="utf-8")
     assert "event=turn_summary" in content
+    assert "event=rime_tts provider=rime outcome=success audio_bytes=42" in content
     assert "event=smartpbx_pilot_transcript" in content
     assert "something_unrelated" not in content
     assert "raw non-event line" not in content
@@ -3895,6 +3914,8 @@ SINHALA_GEMINI_TTS_DEFAULTS = {
     "SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS": "15.0",
 }
 
+SINHALA_TTS_PROVIDER_DEFAULT = "gemini"
+
 
 def parse_redacted_active_env_assignments(text: str) -> dict[str, object]:
     """Return assignment metadata without retaining dotenv values."""
@@ -3955,6 +3976,46 @@ def test_sinhala_smartpbx_settings_are_explicit_and_secret_safe():
     }.items():
         assert re.search(rf"^{name}={re.escape(default)}$", example, re.MULTILINE)
     assert_exactly_one_blank_env_assignment(example, "GEMINI_API_KEY")
+
+
+def test_sinhala_tts_canary_selector_and_secret_are_allowlisted_only_for_smartpbx():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx = compose["services"]["kavya-smartpbx"]["environment"]
+    legacy = compose["services"]["kavya"]
+
+    assert smartpbx["SMARTPBX_SINHALA_TTS_PROVIDER"] == (
+        "${SMARTPBX_SINHALA_TTS_PROVIDER:-gemini}"
+    )
+    assert smartpbx["RIME_API_KEY"] == "${RIME_API_KEY:-}"
+    assert "SMARTPBX_SINHALA_TTS_PROVIDER" not in legacy["environment"]
+    assert "RIME_API_KEY" not in legacy["environment"]
+
+    example = read_text(".env.example")
+    assert re.search(
+        rf"^SMARTPBX_SINHALA_TTS_PROVIDER={re.escape(SINHALA_TTS_PROVIDER_DEFAULT)}$",
+        example,
+        re.MULTILINE,
+    )
+    assert_exactly_one_blank_env_assignment(example, "RIME_API_KEY")
+
+
+def test_sinhala_tts_canary_runbook_is_server_side_and_reversible():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    section = runbook.split("## SmartPBX Sinhala menu and Gemini TTS", 1)[1].split(
+        "\n## ", 1
+    )[0]
+    normalized = re.sub(r"\s+", " ", section.replace("`", "")).casefold()
+
+    for required in (
+        "SMARTPBX_SINHALA_TTS_PROVIDER=gemini",
+        "RIME_API_KEY",
+        "server-side only",
+        "never appears in status responses or logs",
+        "production canary selects rime",
+        "set SMARTPBX_SINHALA_TTS_PROVIDER back to gemini",
+        "existing guarded recreate procedure",
+    ):
+        assert required.casefold() in normalized
 
 
 def test_gemini_key_assignment_contract_rejects_duplicate_whitespace_or_later_active_values():

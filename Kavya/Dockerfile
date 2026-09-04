@@ -22,10 +22,10 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8000
 
 # --- System dependencies ----------------------------------------------------
-# curl is required for the HEALTHCHECK probe.
+# curl is required for the HEALTHCHECK probe; ffmpeg decodes Rime MP3 TTS.
 # --no-install-recommends keeps the layer lean; rm the apt cache afterwards.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Working directory -------------------------------------------------------

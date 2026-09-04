@@ -73,3 +73,12 @@ def test_dockerfile_has_a_build_time_import_guard():
     assert re.search(r"^RUN\s+python\s+-c\s+[\"']import server[\"']", text, flags=re.MULTILINE), (
         "the Dockerfile must import server at build time so a missing COPY fails the build"
     )
+
+
+def test_dockerfile_installs_ffmpeg_for_rime_mp3_decoding():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert re.search(
+        r"apt-get install -y --no-install-recommends\s+curl\s+ffmpeg",
+        text,
+    ), "the production image must install ffmpeg for Rime MP3 decoding"
