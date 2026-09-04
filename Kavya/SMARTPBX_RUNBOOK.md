@@ -79,6 +79,7 @@ LLM_PROVIDER=claude
 CLAUDE_MODEL=claude-sonnet-5
 OPENAI_MODEL=gpt-4o
 GEMINI_API_KEY=
+RIME_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash
 SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS=8.0
 SMARTPBX_SINHALA_LLM_PROVIDER=gemini
@@ -88,6 +89,7 @@ SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=1024
 SMARTPBX_SINHALA_GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 SMARTPBX_SINHALA_GEMINI_TTS_VOICE=Vindemiatrix
 SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS=15.0
+SMARTPBX_SINHALA_TTS_PROVIDER=gemini
 SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER=3
 SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS=
 SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR=7
@@ -167,6 +169,15 @@ with a separate `600`-token ceiling -> Gemini
 `gemini-3.1-flash-tts-preview` / `Vindemiatrix`. The bilingual prompt before
 selection is the reviewed static μ-law asset documented below; neither menu
 segment makes a live TTS request.
+
+Direct Sinhala TTS uses `SMARTPBX_SINHALA_TTS_PROVIDER`, defaulting to
+`gemini` as the safe repository and rollback value. The protected template
+therefore uses `SMARTPBX_SINHALA_TTS_PROVIDER=gemini`. The production canary
+selects `rime` by changing that setting only in the protected
+`.env.smartpbx`; `RIME_API_KEY` is server-side only and never appears in
+status responses or logs (including `/smartpbx/status`). Rime failures fall
+back once to the existing Gemini Sinhala TTS path. Keep the key out of the
+general `.env`, tickets, commands, and diagnostics.
 
 The Gemini credential check is no-output and stripped: exactly one active,
 nonblank `GEMINI_API_KEY` is required before exposing the bilingual menu,
@@ -254,6 +265,18 @@ After the guarded deployment, run this **two-language canary call checklist**:
    `Vindemiatrix` TTS respond.
 3. Confirm `/health` and authenticated `/smartpbx/status`; inspect only
    bounded provider/event/outcome diagnostics if the second call fails.
+
+### SmartPBX-only Rime Sinhala TTS rollback
+
+If the production canary has a regression, set
+`SMARTPBX_SINHALA_TTS_PROVIDER` back to `gemini` in the protected
+`/opt/kavya/.env.smartpbx` file. Keep `RIME_API_KEY` server-side only; do not
+print it, include it in a status request, or search for it in logs. Then run
+the existing guarded recreate procedure (render `docker compose ... config`,
+wait for authenticated `active_sessions=0`, and recreate only
+`kavya-smartpbx` with the same pinned image). Verify health, status, and the
+two-language checklist before restoring traffic. Do not run a direct
+unreviewed recreate or alter the Twilio `kavya` service.
 
 ## Static SmartPBX language menu
 
@@ -584,7 +607,7 @@ event allowlist**. It may contain only the following runtime event names:
 `bad_tool_json`, `llm_round`, `llm_round_complete`, `llm_round_outcome`,
 `llm_empty_response`,
 `llm_error`, `llm_provider_degraded`, `llm_provider_failover`, `tool_execute`,
-`tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`,
+`tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`, `rime_tts`,
 `sinhala_tts_quota_degraded`, `sinhala_tts_model_fallback`,
 `tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
 `llm_stream_timeout`,
@@ -603,9 +626,18 @@ The fixed, aggregate-only fields are `correlation_id`, `stage`, `outcome`,
 `session_trace_id`, and `provider` where the named event emits that field.
 `correlation_id`, `turn_id`, and `session_trace_id` are opaque, local, randomly
 generated identifiers and are never derived from dialog. The `provider` field is
-a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, or `azure`;
+a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, `azure`, or `rime`;
 the `llm_stream_timeout` event additionally permits its normalized `unknown`
 sentinel as documented below.
+
+`rime_tts` emits exactly `provider=rime`, `outcome`, and at most one numeric
+field. `outcome` is a bounded enum: `success`, `missing_api_key`, `timeout`,
+`http_status`, `transport_error`, `empty_audio`, `response_too_large`, or
+`decode_failure`. `status` is present only for an HTTP status outcome and is a
+bounded integer `100`–`599`, clamped. `audio_bytes` is present only for a
+successful decoded response and is a bounded integer `0`–`10485760`, clamped.
+The event contains no text, MP3 bytes, response body, endpoint credential, API
+key, caller identifier, or exception body.
 
 `llm_round_outcome` emits exactly four fields beyond `provider`, and no others:
 

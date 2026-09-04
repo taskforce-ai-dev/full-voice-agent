@@ -471,6 +471,7 @@ class SmartPBXTurnTelemetry:
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+RIME_API_KEY: str = os.getenv("RIME_API_KEY", "")
 
 # OpenAI gpt-4o-mini-tts -- Kavya's Sinhala voice. Natural prosody, streams
 # fast, and handles code-switched English far better than Azure or VITS.
@@ -2077,6 +2078,157 @@ SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS = _parse_endpointing_seconds(
     3.0,
     30.0,
 )
+
+_SMARTPBX_SINHALA_TTS_PROVIDERS = frozenset({"gemini", "rime"})
+
+
+def _resolve_smartpbx_sinhala_tts_provider(raw: object) -> str:
+    """Keep Direct SmartPBX Sinhala on Gemini unless Rime is explicit."""
+    value = "" if raw is None else str(raw).strip().lower()
+    return value if value in _SMARTPBX_SINHALA_TTS_PROVIDERS else "gemini"
+
+
+SMARTPBX_SINHALA_TTS_PROVIDER = _resolve_smartpbx_sinhala_tts_provider(
+    os.getenv("SMARTPBX_SINHALA_TTS_PROVIDER")
+)
+
+# Rime Arcana's supplied contract is fixed for this reversible canary.  These
+# are deliberately constants rather than operator knobs: the selector is the
+# only rollout control, and the request shape must not drift by environment.
+_RIME_ARCANA_TTS_URL = "https://users.rime.ai/v1/rime-tts"
+_RIME_ARCANA_TTS_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+_RIME_ARCANA_TTS_OUTCOMES = frozenset({
+    "success", "missing_api_key", "timeout", "http_status", "transport_error",
+    "empty_audio", "response_too_large", "decode_failure",
+})
+
+
+class _RimeArcanaTTSFailure(Exception):
+    """A privacy-safe, bounded Rime failure classification."""
+
+    def __init__(self, outcome: str, status: int | None = None) -> None:
+        self.outcome = outcome if outcome in _RIME_ARCANA_TTS_OUTCOMES else "transport_error"
+        self.status = status if isinstance(status, int) and 100 <= status <= 599 else None
+        super().__init__(self.outcome)
+
+
+def _rime_arcana_request_payload(text: str) -> dict[str, Any]:
+    """Return the exact supplied Arcana request body for Sinhala speech."""
+    return {
+        "text": text,
+        "modelId": "arcana",
+        "speaker": "chandani",
+        "lang": "si",
+        "max_tokens": 1200,
+        "repetition_penalty": 1.6,
+        "samplingRate": 24000,
+        "speedAlpha": 1,
+        "temperature": 0.5,
+        "top_p": 1,
+    }
+
+
+def _log_rime_arcana_tts_outcome(
+    outcome: str, *, status: int | None = None, audio_bytes: int | None = None,
+) -> None:
+    """Emit bounded Rime canary telemetry; never include caller text or secrets."""
+    safe_outcome = outcome if outcome in _RIME_ARCANA_TTS_OUTCOMES else "transport_error"
+    safe_status = (
+        min(max(status, 100), 599)
+        if isinstance(status, int) and not isinstance(status, bool)
+        else None
+    )
+    safe_audio_bytes = (
+        min(max(audio_bytes, 0), _RIME_ARCANA_TTS_MAX_RESPONSE_BYTES)
+        if isinstance(audio_bytes, int) and not isinstance(audio_bytes, bool)
+        else 0
+    )
+    if safe_status is not None:
+        logger.warning(
+            "smartpbx_media event=rime_tts provider=rime outcome=%s status=%d",
+            safe_outcome, safe_status,
+        )
+    elif audio_bytes is not None:
+        logger.info(
+            "smartpbx_media event=rime_tts provider=rime outcome=%s audio_bytes=%d",
+            safe_outcome, safe_audio_bytes,
+        )
+    else:
+        logger.warning(
+            "smartpbx_media event=rime_tts provider=rime outcome=%s", safe_outcome,
+        )
+
+
+async def _request_rime_arcana_mp3(text: str) -> bytes:
+    """Fetch a bounded Rime MP3 response without retaining provider messages."""
+    if not RIME_API_KEY.strip():
+        raise _RimeArcanaTTSFailure("missing_api_key")
+    headers = {
+        "Accept": "audio/mp3",
+        "Authorization": f"Bearer {RIME_API_KEY.strip()}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient() as http:
+            async with http.stream(
+                "POST",
+                _RIME_ARCANA_TTS_URL,
+                json=_rime_arcana_request_payload(text),
+                headers=headers,
+                timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
+            ) as response:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError:
+                    raise _RimeArcanaTTSFailure("http_status", response.status_code) from None
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > _RIME_ARCANA_TTS_MAX_RESPONSE_BYTES:
+                        raise _RimeArcanaTTSFailure("response_too_large")
+                    chunks.append(chunk)
+    except _RimeArcanaTTSFailure:
+        raise
+    except httpx.TimeoutException:
+        raise _RimeArcanaTTSFailure("timeout") from None
+    except httpx.HTTPError:
+        raise _RimeArcanaTTSFailure("transport_error") from None
+    audio = b"".join(chunks)
+    if not audio:
+        raise _RimeArcanaTTSFailure("empty_audio")
+    return audio
+
+
+async def _decode_rime_arcana_mp3_to_mulaw(audio: bytes) -> bytes:
+    """Decode Rime MP3 to the existing SmartPBX 8 kHz mono mu-law wire format."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+            "-ac", "1", "-ar", "8000", "-f", "mulaw", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, OSError):
+        raise _RimeArcanaTTSFailure("decode_failure") from None
+    try:
+        output, _ = await asyncio.wait_for(
+            process.communicate(audio), timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.wait()
+        raise
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.wait()
+        raise _RimeArcanaTTSFailure("timeout") from None
+    if process.returncode != 0 or not output:
+        raise _RimeArcanaTTSFailure("decode_failure")
+    return output
 
 # Quota-aware model fallback chain (same client, same voice): primary is the
 # existing SMARTPBX_SINHALA_GEMINI_TTS_MODEL knob above; these are tried in
@@ -12097,7 +12249,7 @@ class MediaStreamSession:
 
         English        â†’ protected canonical ElevenLabs eleven_flash_v2_5 profile
         Tamil / Arabic â†’ retained ElevenLabs eleven_multilingual_v2 voices
-        SmartPBX Sinhala â†’ Gemini gemini-3.1-flash-tts-preview
+        SmartPBX Sinhala â†’ Gemini by default; Rime Arcana only when selected
         Twilio Sinhala   â†’ existing OpenAI gpt-4o-mini-tts (nova)
         """
         if self.transfer_pending:
@@ -12119,8 +12271,17 @@ class MediaStreamSession:
                     turn_generation=generation,
                 )
             elif self.lang == "si" and self._is_smartpbx_session():
+                cached_phrase_audio = _get_cached_smartpbx_sinhala_phrase_audio(text)
+                tts_method = (
+                    self._tts_rime_sinhala
+                    if (
+                        SMARTPBX_SINHALA_TTS_PROVIDER == "rime"
+                        and cached_phrase_audio is None
+                    )
+                    else self._tts_gemini_sinhala
+                )
                 await self._invoke_tts(
-                    self._tts_gemini_sinhala,
+                    tts_method,
                     text,
                     sentence=sentence,
                     turn_generation=generation,
@@ -12236,6 +12397,110 @@ class MediaStreamSession:
             )
 
     # â”€â”€ ElevenLabs TTS (Tamil) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    async def _tts_rime_sinhala(
+        self,
+        text: str,
+        *,
+        sentence: str | None = None,
+        turn_generation: int | None = None,
+    ) -> None:
+        """Use Rime Arcana once, then fall back once to existing Gemini Sinhala TTS."""
+        text = text.strip()
+        if not text:
+            return
+        expected_generation = self._speak_generation
+        if turn_generation is not None and turn_generation >= 0:
+            if turn_generation != expected_generation:
+                return
+
+        cancelled = False
+        audio_emitted = False
+        failure: _RimeArcanaTTSFailure | None = None
+        self._tts_synthesis_in_flight = True
+        self._tts_synthesis_generation = expected_generation
+        self._mark_smartpbx_turn_once("tts_request")
+        try:
+            mp3_audio = await _request_rime_arcana_mp3(text)
+            mulaw_audio = await _decode_rime_arcana_mp3_to_mulaw(mp3_audio)
+            if not self._owns_sinhala_tts_stream(
+                expected_generation, audio_emitted=audio_emitted
+            ):
+                cancelled = True
+            while mulaw_audio and not cancelled:
+                if not self._owns_sinhala_tts_stream(
+                    expected_generation, audio_emitted=audio_emitted
+                ):
+                    cancelled = True
+                    break
+                frame, mulaw_audio = (
+                    mulaw_audio[:_SMARTPBX_MULAW_FRAME_BYTES],
+                    mulaw_audio[_SMARTPBX_MULAW_FRAME_BYTES:],
+                )
+                if len(frame) < _SMARTPBX_MULAW_FRAME_BYTES:
+                    frame += b"\xff" * (_SMARTPBX_MULAW_FRAME_BYTES - len(frame))
+                if await self._send_media_audio(frame):
+                    await self._flush_pre_audio_stt()
+                    self._mark_smartpbx_turn_once("tts_first_chunk")
+                    audio_emitted = self._mark_tts_audible(expected_generation)
+                    if not audio_emitted:
+                        cancelled = True
+                        break
+            if not audio_emitted and not cancelled:
+                failure = _RimeArcanaTTSFailure("empty_audio")
+            elif (
+                audio_emitted
+                and not cancelled
+                and self._is_speaking
+                and self._speak_generation == expected_generation
+                and self._owns_smartpbx_tts_delivery(expected_generation)
+            ):
+                delivered = await self._send_tts_done(
+                    sentence=sentence, turn_generation=expected_generation,
+                )
+                if delivered:
+                    _log_rime_arcana_tts_outcome("success", audio_bytes=len(mp3_audio))
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except _RimeArcanaTTSFailure as exc:
+            failure = exc
+        except Exception:
+            if audio_emitted:
+                # A fallback after any accepted frame would replay the text over
+                # speech the caller has already heard. Keep this as a terminal
+                # transport failure; only silent Rime failures may fall back.
+                self._log_tts_failure("rime", "transport_error")
+                _log_rime_arcana_tts_outcome("transport_error")
+                cancelled = True
+            else:
+                failure = _RimeArcanaTTSFailure("decode_failure")
+        finally:
+            if self._tts_synthesis_generation == expected_generation:
+                self._tts_synthesis_in_flight = False
+                self._tts_synthesis_generation = None
+            if not audio_emitted and self._speak_generation == expected_generation:
+                self._is_speaking = False
+
+        if cancelled or failure is None:
+            return
+        _log_rime_arcana_tts_outcome(
+            failure.outcome, status=failure.status,
+        )
+        if (
+            self._speak_generation != expected_generation
+            or not self._owns_smartpbx_tts_delivery(expected_generation)
+        ):
+            return
+        # This direct invocation avoids the selector and therefore cannot recurse
+        # back into Rime. Gemini retains its existing decoder, cancellation,
+        # transport-generation, delivery accounting, and never-silent fallback.
+        await self._invoke_tts(
+            self._tts_gemini_sinhala,
+            text,
+            sentence=sentence,
+            turn_generation=expected_generation,
+        )
 
     async def _tts_gemini_sinhala(
         self,
