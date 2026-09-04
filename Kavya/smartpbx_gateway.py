@@ -13,7 +13,8 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol
 from starlette.websockets import WebSocketDisconnect
 
 from smartpbx_diagnostics import (
-    DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage, SmartPBXDiagnosticSink,
+    DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage, SmartPBXCloseReason,
+    SmartPBXDiagnosticSink,
 )
 from smartpbx_protocol import (
     ConnectedEvent, DtmfEvent, HangupEvent, MediaEvent, POLICY_VIOLATION,
@@ -27,6 +28,13 @@ logger = logging.getLogger(__name__)
 
 SMARTPBX_PROTOCOL_VERSION = "smartpbx-ai-provider-v06"
 _MAX_COUNTER = (1 << 63) - 1
+# Session-internal terminal failures (audit #10) -- when the "raw is None"
+# branch below reads one of these back off the session, the call closes
+# 1011 instead of looking like a completed hangup.
+_SESSION_INTERNAL_FAILURE_REASONS = frozenset({
+    SmartPBXCloseReason.PROFILE_UNAVAILABLE.value,
+    SmartPBXCloseReason.STT_FATAL.value,
+})
 _INTEGER_SETTINGS = {
     "SMARTPBX_MAX_CALLS": ("max_calls", 4, 1, 4),
     "SMARTPBX_MAX_MESSAGE_CHARS": ("max_message_chars", 65536, 1024, 65536),
@@ -43,6 +51,10 @@ _INTEGER_SETTINGS = {
     # An acknowledged transfer legitimately outlives ordinary idleness, but a
     # carrier terminal event that never arrives must not pin the slot forever.
     "SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS": ("transfer_pending_timeout_seconds", 300, 30, 1800),
+    # A hard ceiling independent of activity: unlike idle/transfer-pending,
+    # this one does not reset on inbound media -- a call that never goes idle
+    # and never enters transfer-pending must still end eventually.
+    "SMARTPBX_MAX_CALL_SECONDS": ("max_call_seconds", 3600, 300, 7200),
 }
 
 
@@ -59,6 +71,7 @@ class SmartPBXSettings:
     start_timeout_seconds: int
     idle_timeout_seconds: int
     transfer_pending_timeout_seconds: int
+    max_call_seconds: int
     auth_header_name: str = "X-Kavya-SmartPBX-Token"
 
     @classmethod
@@ -71,7 +84,11 @@ class SmartPBXSettings:
             return cls(False, "", "", **_default_integer_settings(), auth_header_name=header)
         token, account_id = environ.get("SMARTPBX_WS_TOKEN", ""), environ.get("SMARTPBX_ACCOUNT_ID", "")
         values = {
-            attribute: _parse_bounded_integer(environ.get(name, str(default)), minimum, maximum)
+            # A key present but blank (e.g. an unset compose passthrough with a
+            # ``:-`` default of "") must resolve to the default exactly like a
+            # missing key -- otherwise a single omitted .env line crash-loops
+            # the container instead of falling back.
+            attribute: _parse_bounded_integer(environ.get(name) or str(default), minimum, maximum)
             for name, (attribute, default, minimum, maximum) in _INTEGER_SETTINGS.items()
         }
         if not isinstance(token, str) or not isinstance(account_id, str):
@@ -88,7 +105,17 @@ class SmartPBXSettings:
         return bool(self.token and self.account_id)
 
     def token_matches(self, candidate: str) -> bool:
-        return isinstance(candidate, str) and bool(self.token) and secrets.compare_digest(self.token, candidate)
+        # Starlette decodes header bytes as latin-1, so a header byte >= 0x80
+        # arrives here as a non-ASCII str. secrets.compare_digest raises
+        # TypeError on non-ASCII str operands; reject before calling it so a
+        # crafted header is an ordinary 401/AUTHENTICATION rejection, not an
+        # unhandled exception (500 / INTERNAL_ERROR diagnostic).
+        return (
+            isinstance(candidate, str)
+            and candidate.isascii()
+            and bool(self.token)
+            and secrets.compare_digest(self.token, candidate)
+        )
 
 
 class SessionLease:
@@ -161,6 +188,10 @@ class _TransferPendingTimeout(Exception):
     """An acknowledged transfer produced no terminal event within the ceiling."""
 
 
+class _MaxCallDurationExceeded(Exception):
+    """The hard per-call ceiling elapsed, independent of activity."""
+
+
 class _TransportSendFailure(Exception):
     """The outbound sender died; the guest can no longer hear anything."""
 
@@ -171,7 +202,12 @@ class _GatewaySession(Protocol):
 
     async def start(self) -> None: ...
     async def feed_audio(self, audio: bytes) -> None: ...
-    async def finish(self, schedule_post_call: bool = False) -> None: ...
+    async def finish(
+        self,
+        schedule_post_call: bool = False,
+        close_reason: str | None = None,
+        close_code: int | None = None,
+    ) -> None: ...
 
 
 SessionFactory = Callable[[Any, SmartPBXMediaTransport, SmartPBXDiagnosticSink], Awaitable[_GatewaySession]]
@@ -180,16 +216,28 @@ SessionFactory = Callable[[Any, SmartPBXMediaTransport, SmartPBXDiagnosticSink],
 class SmartPBXGateway:
     """Authenticate and drive a single bounded Kavya SmartPBX media session."""
 
-    def __init__(self, settings: SmartPBXSettings, registry: SmartPBXSessionRegistry) -> None:
+    def __init__(
+        self,
+        settings: SmartPBXSettings,
+        registry: SmartPBXSessionRegistry,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._settings = settings
         self._registry = registry
+        # Injected so absolute-ceiling behavior (audit #2) is provable with a
+        # controlled clock rather than a real multi-minute wait -- this is
+        # deliberately NOT the process-global `time.monotonic`, so a fake
+        # clock here can never perturb real-time audio pacing elsewhere
+        # (e.g. SmartPBXMediaTransport's send cadence).
+        self._clock = clock
 
     def snapshot(self) -> dict[str, bool | int | str]:
         return smartpbx_status(self._settings, self._registry)
 
     async def handle(self, websocket: Any, session_factory: SessionFactory) -> None:
         correlation_id = f"spx-{secrets.token_hex(16)}"
-        started_at = time.monotonic()
+        started_at = self._clock()
         sink_enabled = True
 
         def sink(
@@ -208,6 +256,13 @@ class SmartPBXGateway:
         cancellation: asyncio.CancelledError | None = None
         close_outcome: tuple[int, str] | None = None
         completed_normally = False
+        # Privacy-safe closed-vocabulary reason carried into the session
+        # summary and post-call payload (smartpbx_diagnostics.SmartPBXCloseReason).
+        # A branch that leaves this None (the "raw is None" completion below)
+        # defers to whatever a session-internal terminal failure already
+        # recorded on the session itself.
+        close_reason: str | None = None
+        close_code: int | None = None
 
         token = websocket.headers.get(self._settings.auth_header_name, "")
         if not self._settings.enabled or not self._settings.configured:
@@ -251,6 +306,7 @@ class SmartPBXGateway:
             except Exception:
                 sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.SESSION_FACTORY)
                 close_outcome = (1011, "internal error")
+                close_reason, close_code = "internal_error", 1011
                 return
             try:
                 session._record_echo_rejection = self._registry.record_echo_rejection
@@ -261,14 +317,38 @@ class SmartPBXGateway:
             except Exception:
                 sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.SESSION_START)
                 close_outcome = (1011, "internal error")
+                close_reason, close_code = "internal_error", 1011
                 return
             sink(DiagnosticStage.SESSION_START, DiagnosticOutcome.COMPLETED, DiagnosticFailureClass.NONE)
 
+            # A one-element box so _receive_or_terminal can remember, across
+            # calls, the single moment transfer_pending first became true --
+            # transfer_pending is never reset, so once recorded this never
+            # needs to change again for the life of the call.
+            transfer_pending_since: list[float | None] = [None]
             while True:
-                raw = await self._receive_or_terminal(websocket, session, transport)
+                raw = await self._receive_or_terminal(
+                    websocket, session, transport,
+                    call_started_at=started_at,
+                    transfer_pending_since=transfer_pending_since,
+                )
                 if raw is None:
-                    close_outcome = (1000, "call ended")
-                    completed_normally = True
+                    # The session's own terminal future resolved, not the
+                    # socket -- the only way that happens today is a
+                    # session-internal fatal path (profile/STT). Audit #10:
+                    # this used to close 1000/completed_normally regardless,
+                    # so a missing GEMINI_API_KEY or a failed preflight ended
+                    # the call looking exactly like an ordinary hangup. Read
+                    # back whatever the session already recorded on itself
+                    # (it already emitted its own SESSION_START/FAILED
+                    # diagnostic before resolving the terminal future) and
+                    # close 1011 for a real failure instead.
+                    session_reason = getattr(session, "close_reason", None)
+                    if session_reason in _SESSION_INTERNAL_FAILURE_REASONS:
+                        close_outcome = (1011, "internal error")
+                    else:
+                        close_outcome = (1000, "call ended")
+                        completed_normally = True
                     break
                 event = parse_smartpbx_event(
                     raw,
@@ -284,6 +364,7 @@ class SmartPBXGateway:
                     except Exception:
                         sink(DiagnosticStage.AUDIO_INGESTION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.AUDIO_INGESTION)
                         close_outcome = (1011, "internal error")
+                        close_reason, close_code = "internal_error", 1011
                         return
                 elif isinstance(event, DtmfEvent):
                     try:
@@ -320,10 +401,12 @@ class SmartPBXGateway:
                 elif isinstance(event, HangupEvent):
                     validate_event_context(event, context)
                     close_outcome = (1000, "call ended")
+                    close_reason, close_code = "hangup", 1000
                     completed_normally = True
                     break
                 elif isinstance(event, StopEvent):
                     close_outcome = (1000, "call ended")
+                    close_reason, close_code = "stop", 1000
                     completed_normally = True
                     break
                 elif isinstance(event, UnsupportedEvent):
@@ -342,31 +425,50 @@ class SmartPBXGateway:
             if session is None:
                 sink(DiagnosticStage.SCHEMA_ADMISSION, DiagnosticOutcome.REJECTED, DiagnosticFailureClass.START_TIMEOUT)
                 close_outcome = (POLICY_VIOLATION, "start timeout")
+                close_reason, close_code = "start_timeout", POLICY_VIOLATION
             else:
                 sink(DiagnosticStage.AUDIO_INGESTION, DiagnosticOutcome.FAILED, DiagnosticFailureClass.IDLE_TIMEOUT)
                 close_outcome = (POLICY_VIOLATION, "idle timeout")
+                close_reason, close_code = "idle_timeout", POLICY_VIOLATION
         except _TransferPendingTimeout:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSFER_PENDING_TIMEOUT)
             close_outcome = (POLICY_VIOLATION, "transfer timeout")
+            close_reason, close_code = "transfer_pending_timeout", POLICY_VIOLATION
+        except _MaxCallDurationExceeded:
+            # Not a failure -- an expected, hard operational ceiling -- so this
+            # closes politely (1000) rather than as a policy violation.
+            sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.OBSERVED, DiagnosticFailureClass.MAX_CALL_DURATION)
+            close_outcome = (1000, "call ended")
+            close_reason, close_code = "max_call_duration", 1000
         except _TransportSendFailure:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.TRANSPORT_SEND)
             close_outcome = (1011, "internal error")
-        except WebSocketDisconnect:
+            close_reason, close_code = "transport_failure", 1011
+        except WebSocketDisconnect as error:
             disconnected = True
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.DISCONNECTED, DiagnosticFailureClass.TRANSPORT_DISCONNECT)
+            close_reason = "peer_disconnect"
+            close_code = error.code if isinstance(error.code, int) else None
         except asyncio.CancelledError as error:
             cancellation = error
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.CANCELLED, DiagnosticFailureClass.CANCELLED)
+            # Task cancellation is the container stopping (deploy/rollback),
+            # not a fault: record it as such instead of "internal_error".
+            close_reason, close_code = "shutdown", 1001
         except ProtocolViolation as error:
             stage, outcome, failure = _protocol_diagnostic(error.failure_class)
             sink(stage, outcome, failure)
             close_outcome = (error.close_code, error.public_reason)
+            close_reason, close_code = "protocol_violation", error.close_code
         except Exception:
             sink(DiagnosticStage.TERMINAL_CLEANUP, DiagnosticOutcome.FAILED, DiagnosticFailureClass.INTERNAL_ERROR)
             close_outcome = (1011, "internal error")
+            close_reason, close_code = "internal_error", 1011
         finally:
             try:
-                cleanup_task = asyncio.create_task(self._cleanup(session, transport, lease, sink))
+                cleanup_task = asyncio.create_task(
+                    self._cleanup(session, transport, lease, sink, close_reason, close_code)
+                )
                 while not cleanup_task.done():
                     try:
                         await asyncio.shield(cleanup_task)
@@ -418,17 +520,50 @@ class SmartPBXGateway:
                 continue
             raise ProtocolViolation(POLICY_VIOLATION, "start required", "start_required")
 
+    def _max_call_remaining(self, call_started_at: float, now: float) -> float:
+        return self._settings.max_call_seconds - (now - call_started_at)
+
     async def _receive_or_terminal(
         self,
         websocket: Any,
         session: _GatewaySession,
         transport: SmartPBXMediaTransport | None = None,
+        *,
+        call_started_at: float,
+        transfer_pending_since: list[float | None],
     ) -> str | None:
+        now = self._clock()
+        max_call_remaining = self._max_call_remaining(call_started_at, now)
+        if max_call_remaining <= 0:
+            raise _MaxCallDurationExceeded
         pending = bool(getattr(session, "transfer_pending", False))
-        timeout = self._settings.transfer_pending_timeout_seconds if pending else self._settings.idle_timeout_seconds
+        if pending and transfer_pending_since[0] is None:
+            # transfer_pending is documented never to reset once true, so this
+            # is recorded at most once per call.
+            transfer_pending_since[0] = now
+        if pending:
+            # An absolute ceiling from the moment the transfer was acknowledged
+            # -- unlike idle, this must NOT restart just because Dialog keeps
+            # streaming media on the pending leg (audit #2). Checked and raised
+            # BEFORE attempting to receive again: a message that is already
+            # queued must not let the caller re-enter and silently extend the
+            # ceiling by another full window.
+            ceiling_remaining = self._settings.transfer_pending_timeout_seconds - (now - transfer_pending_since[0])
+            if ceiling_remaining <= 0:
+                raise _TransferPendingTimeout
+        else:
+            # Idle genuinely does restart on every inbound message; that is
+            # its correct definition, not the bug.
+            ceiling_remaining = self._settings.idle_timeout_seconds
+        timeout = max(0.0, min(ceiling_remaining, max_call_remaining))
         terminal = getattr(session, "terminal_future", None)
         if terminal is None:
-            return await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
+            try:
+                return await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
+            except asyncio.TimeoutError:
+                if self._max_call_remaining(call_started_at, self._clock()) <= 0:
+                    raise _MaxCallDurationExceeded
+                raise
         receive_task = asyncio.create_task(websocket.receive_text())
         # A dead outbound sender leaves the guest in silence; wait on it too so
         # the call ends now instead of at the idle timeout.
@@ -453,15 +588,24 @@ class SmartPBXGateway:
         # idle deadline expires. That is bounded and acceptable; it is not 300s.
         if not done and not pending and getattr(session, "transfer_pending", False):
             # The transfer was acknowledged while we were waiting: re-wait on the
-            # transfer ceiling rather than closing on the ordinary idle deadline.
+            # transfer ceiling (also bounded by the max-call ceiling) rather than
+            # closing on the ordinary idle deadline.
             pending = True
+            now2 = self._clock()
+            transfer_pending_since[0] = now2
+            max_call_remaining2 = self._max_call_remaining(call_started_at, now2)
+            if max_call_remaining2 <= 0:
+                await _settle(None)
+                raise _MaxCallDurationExceeded
             done, _ = await asyncio.wait(
                 waited,
-                timeout=self._settings.transfer_pending_timeout_seconds,
+                timeout=min(self._settings.transfer_pending_timeout_seconds, max_call_remaining2),
                 return_when=asyncio.FIRST_COMPLETED,
             )
         if not done:
             await _settle(None)
+            if self._max_call_remaining(call_started_at, self._clock()) <= 0:
+                raise _MaxCallDurationExceeded
             if pending:
                 raise _TransferPendingTimeout
             raise asyncio.TimeoutError
@@ -487,6 +631,8 @@ class SmartPBXGateway:
         transport: SmartPBXMediaTransport | None,
         lease: SessionLease | None,
         sink: SmartPBXDiagnosticSink,
+        close_reason: str | None = None,
+        close_code: int | None = None,
     ) -> bool:
         degraded = False
         failures = {
@@ -494,20 +640,32 @@ class SmartPBXGateway:
             "transport": DiagnosticFailureClass.TRANSPORT_CLEANUP,
             "lease": DiagnosticFailureClass.LEASE_CLEANUP,
         }
+        # "session" gets a longer ceiling than its siblings: session.finish()
+        # already budgets up to 5s just to join the STT worker thread, and
+        # (audit #3) may now also wait up to 10s more for a late-completing
+        # side-effecting tool (e.g. create_booking) to settle so its booking
+        # marker reaches the post-call record. Both are shielded internally,
+        # so a session that still exceeds this is a genuine cleanup fault.
+        cleanup_timeouts = {"transport": 5, "session": 20, "lease": 5}
         for name, operation in (
             ("transport", None if transport is None else transport.close()),
             # finish() emits the session aggregate and schedules post-call work.
             # Close first so that aggregate observes terminal transport cleanup,
             # while the fault-isolated/shielded loop below still releases the
             # lease if either operation fails or is cancelled.
-            ("session", None if session is None else session.finish(schedule_post_call=True)),
+            (
+                "session",
+                None if session is None else session.finish(
+                    schedule_post_call=True, close_reason=close_reason, close_code=close_code,
+                ),
+            ),
             ("lease", None if lease is None else lease.release()),
         ):
             if operation is None:
                 continue
             task = asyncio.create_task(operation)
             try:
-                await asyncio.wait_for(task, timeout=5)
+                await asyncio.wait_for(task, timeout=cleanup_timeouts[name])
             except (Exception, asyncio.CancelledError):
                 degraded = True
                 if not task.done():
@@ -531,7 +689,7 @@ class SmartPBXGateway:
             "outcome": outcome.value,
             "failure_class": failure_class.value,
             "active_sessions": self._registry.snapshot()["active_sessions"],
-            "duration_ms": round(max(0.0, time.monotonic() - started_at) * 1000),
+            "duration_ms": round(max(0.0, self._clock() - started_at) * 1000),
         }, sort_keys=True))
 
 

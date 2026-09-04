@@ -531,7 +531,10 @@ def _env_text(environ: Mapping[str, str], name: str) -> str:
 def _bounded_integer(
     environ: Mapping[str, str], name: str, *, default: int, minimum: int, maximum: int
 ) -> int:
-    raw = environ.get(name, str(default))
+    # A key present but blank (compose ``${VAR:-}``-style passthrough with no
+    # value set) must resolve to the default exactly like a missing key --
+    # otherwise an unset .env line silently disables transfer.
+    raw = environ.get(name) or str(default)
     if not isinstance(raw, str) or not raw.isdecimal():
         raise ValueError(name)
     value = int(raw)

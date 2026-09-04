@@ -44,6 +44,19 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 COPY requirements-prod.lock.txt .
 RUN pip install --no-cache-dir -r requirements-prod.lock.txt
 
+# --- Embedding model (baked in, deterministic) --------------------------------
+# knowledge_base.py loads EMBEDDING_MODEL_NAME ("all-MiniLM-L6-v2") via
+# SentenceTransformer at KB init. Left unbaked, that download happens on every
+# container start (into the writable layer, lost on recreate) and a deploy or
+# rollback then depends on huggingface.co being reachable -- both the 40s
+# HEALTHCHECK start_period and the SmartPBX deploy script's 90s ready window
+# count against that fetch, and an HF outage/rate-limit turns a rollback into
+# SMARTPBX_ROLLBACK_ESCALATION_REQUIRED. Baking it here makes the image build
+# reproducible offline; HF_HUB_OFFLINE=1 (set at runtime, see docker-compose.yml)
+# then refuses any surprise network fetch of a different model instead of
+# silently succeeding with one.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
 # --- Application code --------------------------------------------------------
 # Only the files needed at runtime are copied. We deliberately exclude:
 #   .env              — secrets; injected at runtime via --env-file or orchestrator

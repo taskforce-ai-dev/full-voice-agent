@@ -66,13 +66,14 @@ class BlockingSTT:
         time.sleep(self._block_seconds)
 
 
-def _session(pipeline) -> KavyaSmartPBXSession:
+def _session(pipeline, *, diagnostic_sink=None) -> KavyaSmartPBXSession:
     async def post(**_):
         raise AssertionError("empty transcript must not post")
 
     return KavyaSmartPBXSession(
         CONTEXT, Transport(), pipeline=pipeline, post_call_processor=post,
         welcome_text="", llm_provider="openai", model="m",
+        diagnostic_sink=diagnostic_sink,
     )
 
 
@@ -188,7 +189,7 @@ async def test_gateway_ends_the_call_when_the_outbound_sender_dies():
         async def feed_audio(self, _audio) -> None:
             pass
 
-        async def finish(self, schedule_post_call: bool = False) -> None:
+        async def finish(self, schedule_post_call: bool = False, close_reason=None, close_code=None) -> None:
             self.finishes += int(schedule_post_call)
 
     async def factory(_context, transport, _sink=None):
@@ -479,7 +480,7 @@ async def test_gateway_reports_dropped_frames_through_status(monkeypatch):
         async def feed_audio(self, _audio):
             pass
 
-        async def finish(self, schedule_post_call=False):
+        async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
             pass
 
     async def factory(_context, _transport, _sink=None):
@@ -527,7 +528,7 @@ async def test_gateway_tracks_echo_rejections_through_status():
         async def feed_audio(self, _audio):
             pass
 
-        async def finish(self, schedule_post_call=False):
+        async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
             pass
 
     async def factory(_context, _transport, _sink=None):
@@ -980,14 +981,14 @@ async def test_session_finish_emits_one_opaque_aggregate_summary_after_cleanup(m
     pipeline._turn_telemetry = types.SimpleNamespace(turns_started=3, turns_summarized=3)
     pipeline._smartpbx_barge_ins = 2
     session = _session(pipeline)
-    await session.finish(False)
-    await session.finish(False)
+    await session.finish(False, close_reason="hangup", close_code=1000)
+    await session.finish(False, close_reason="hangup", close_code=1000)
 
     assert records == [
         {
             "event": "session_summary",
             "session_trace_id": records[0]["session_trace_id"],
-            "outcome": "finished",
+            "outcome": "hangup",
             "turns_started": 3,
             "turns_summarized": 3,
             "duration_ms": records[0]["duration_ms"],
@@ -998,6 +999,65 @@ async def test_session_finish_emits_one_opaque_aggregate_summary_after_cleanup(m
     assert isinstance(records[0]["session_trace_id"], str)
     assert 0 <= records[0]["duration_ms"] <= 600_000
     assert not ({"call_id", "caller", "phone", "transcript", "text"} & set(records[0]))
+
+
+@pytest.mark.asyncio
+async def test_finish_falls_back_to_default_outcome_when_nothing_recorded_a_reason(monkeypatch):
+    """No hangup/stop/timeout ever fired and no internal failure set one either.
+
+    finish() is only ever called by the gateway with an explicit reason in
+    practice; this exercises the closed-vocabulary fallback directly so it is
+    provably safe rather than merely untested.
+    """
+    import smartpbx_session
+
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        smartpbx_session, "_emit_smartpbx_session_summary", lambda **fields: records.append(fields),
+    )
+    session = _session(Pipeline())
+    await session.finish(False)
+
+    assert records[0]["outcome"] == "internal_error"
+
+
+@pytest.mark.asyncio
+async def test_end_call_without_language_profile_records_profile_unavailable_close_reason():
+    session = _session(Pipeline())
+
+    session._end_call_without_language_profile()
+
+    assert session.close_reason == "profile_unavailable"
+    assert session.terminal_future.done()
+
+
+@pytest.mark.asyncio
+async def test_end_call_without_stt_records_stt_fatal_close_reason():
+    session = _session(Pipeline())
+
+    session._end_call_without_stt()
+
+    assert session.close_reason == "stt_fatal"
+    assert session.terminal_future.done()
+
+
+@pytest.mark.asyncio
+async def test_finish_gateway_reason_none_falls_back_to_session_recorded_reason(monkeypatch):
+    """Mirrors the gateway's raw-is-None branch: it passes close_reason=None,
+    and finish() must use whatever the session already recorded on itself
+    rather than resolving to the generic internal_error default."""
+    import smartpbx_session
+
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        smartpbx_session, "_emit_smartpbx_session_summary", lambda **fields: records.append(fields),
+    )
+    session = _session(Pipeline())
+    session._end_call_without_stt()
+
+    await session.finish(False, close_reason=None, close_code=None)
+
+    assert records[0]["outcome"] == "stt_fatal"
 
 
 @pytest.mark.asyncio
@@ -1571,3 +1631,178 @@ async def test_flush_snapshots_and_resets_per_turn_stt_event_counts(monkeypatch)
     second = next(r for r in emitted if r["event"] == "turn_summary")
     assert second["stt_interim_events"] == 1
     assert second["stt_final_events"] == 0
+
+
+# ---------------------------------------------------------------------------
+# C3 -- profile/credential failures must emit SESSION_START/FAILED/<class>
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_end_call_without_language_profile_emits_session_start_failed_diagnostic():
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    calls = []
+
+    def sink(stage, outcome, failure_class):
+        calls.append((stage, outcome, failure_class))
+
+    session = _session(Pipeline(), diagnostic_sink=sink)
+
+    session._end_call_without_language_profile()
+
+    assert calls == [
+        (DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.PROFILE_UNAVAILABLE)
+    ]
+    assert session.close_reason == "profile_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_end_call_without_language_profile_accepts_an_explicit_failure_class():
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    calls = []
+    session = _session(Pipeline(), diagnostic_sink=lambda *args: calls.append(args))
+
+    session._end_call_without_language_profile(
+        failure_class=DiagnosticFailureClass.GEMINI_API_KEY_MISSING,
+    )
+
+    assert calls == [
+        (DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.GEMINI_API_KEY_MISSING)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_end_call_without_language_profile_diagnostic_failure_never_blocks_teardown():
+    """A raising sink must not prevent the terminal future from resolving --
+    the diagnostic is best-effort observability, not load-bearing."""
+    def raising_sink(*_args):
+        raise RuntimeError("sink boom")
+
+    session = _session(Pipeline(), diagnostic_sink=raising_sink)
+
+    session._end_call_without_language_profile()
+
+    assert session.terminal_future.done()
+    assert session.close_reason == "profile_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_missing_gemini_api_key_emits_gemini_api_key_missing_diagnostic(monkeypatch):
+    import server
+    from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
+    monkeypatch.setattr(server, "_has_gemini_api_key", lambda: False)
+    calls = []
+    session = _session(Pipeline(), diagnostic_sink=lambda *args: calls.append(args))
+
+    await session.start()
+
+    assert session.terminal_future.done()
+    assert session.close_reason == "profile_unavailable"
+    assert calls == [
+        (DiagnosticStage.SESSION_START, DiagnosticOutcome.FAILED, DiagnosticFailureClass.GEMINI_API_KEY_MISSING)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# C4 -- late tool completion after hangup: wait for the in-flight runner
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_finish_waits_for_in_flight_runner_and_merges_late_tool_results(monkeypatch):
+    """audit #3: teardown must not snapshot the post-call transcript before an
+    in-flight side-effecting tool call (e.g. create_booking) has a chance to
+    record its late result."""
+    import smartpbx_session
+
+    monkeypatch.setattr(smartpbx_session, "LATE_TOOL_RESULT_WAIT_SECONDS", 2.0)
+
+    pipeline = Pipeline()
+    pipeline.full_transcript = [{"role": "user", "text": "book it"}]
+    pipeline._smartpbx_late_tool_results = []
+    release = asyncio.Event()
+
+    async def runner():
+        await release.wait()
+        pipeline._smartpbx_late_tool_results.append({
+            "role": "system",
+            "text": "BOOKING CONFIRMED via create_booking: guest_name=Test Guest",
+        })
+
+    pipeline._smartpbx_active_runner_task = asyncio.ensure_future(runner())
+
+    posted: dict = {}
+
+    async def post(**kwargs):
+        posted.update(kwargs)
+
+    session = _session(pipeline)
+    session._post_call_processor = post
+
+    finish_task = asyncio.create_task(session.finish(True, close_reason="hangup", close_code=1000))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not finish_task.done(), "finish() must be blocked on the in-flight runner"
+
+    release.set()
+    await asyncio.wait_for(finish_task, timeout=1)
+
+    assert posted, "schedule_post_call=True with a non-empty transcript must post"
+    texts = [entry["text"] for entry in posted["full_transcript"]]
+    assert "book it" in texts
+    assert any("BOOKING CONFIRMED" in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_finish_does_not_wait_when_no_runner_is_in_flight():
+    """The common case (no tool ever executed, or it already finished) must
+    not pay any wait -- finish() completes as soon as its other teardown
+    steps do."""
+    pipeline = Pipeline()
+    pipeline.full_transcript = [{"role": "user", "text": "hello"}]
+    posted: dict = {}
+
+    async def post(**kwargs):
+        posted.update(kwargs)
+
+    session = _session(pipeline)
+    session._post_call_processor = post
+
+    await asyncio.wait_for(session.finish(True, close_reason="hangup", close_code=1000), timeout=1)
+
+    assert posted["full_transcript"] == [{"role": "user", "text": "hello"}]
+
+
+@pytest.mark.asyncio
+async def test_finish_bounded_wait_gives_up_and_still_completes(monkeypatch):
+    """A runner that never settles within the bound must not hang teardown
+    forever -- finish() proceeds without its (never-recorded) late result."""
+    import smartpbx_session
+
+    monkeypatch.setattr(smartpbx_session, "LATE_TOOL_RESULT_WAIT_SECONDS", 0.05)
+
+    pipeline = Pipeline()
+    pipeline.full_transcript = [{"role": "user", "text": "hello"}]
+    never_release = asyncio.Event()
+
+    async def runner():
+        await never_release.wait()
+
+    pipeline._smartpbx_active_runner_task = asyncio.ensure_future(runner())
+    posted: dict = {}
+
+    async def post(**kwargs):
+        posted.update(kwargs)
+
+    session = _session(pipeline)
+    session._post_call_processor = post
+
+    try:
+        await asyncio.wait_for(
+            session.finish(True, close_reason="hangup", close_code=1000), timeout=1,
+        )
+        assert posted["full_transcript"] == [{"role": "user", "text": "hello"}]
+    finally:
+        never_release.set()
+        await asyncio.gather(pipeline._smartpbx_active_runner_task, return_exceptions=True)

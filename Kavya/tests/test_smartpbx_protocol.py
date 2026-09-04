@@ -126,6 +126,33 @@ def test_rejects_message_that_exceeds_utf8_byte_limit_even_when_character_count_
     assert raised.value.close_code == MESSAGE_TOO_BIG
 
 
+def test_rejects_deeply_nested_json_as_invalid_message_not_a_recursion_error():
+    # A wall of matched brackets blows the JSON decoder's recursion budget
+    # (RecursionError from the C decoder) rather than raising JSONDecodeError.
+    # This must fail closed the same way malformed JSON does, not surface as
+    # an unhandled exception (the gateway's generic INTERNAL_ERROR/1011 path).
+    depth = 10000
+    raw = "[" * depth + "0" + "]" * depth
+    assert len(raw.encode("utf-8")) <= 65536
+
+    with pytest.raises(ProtocolViolation) as raised:
+        parse_smartpbx_event(raw, max_message_chars=65536, max_audio_bytes=1024)
+    assert raised.value.close_code == POLICY_VIOLATION
+    assert raised.value.failure_class == "invalid_message"
+
+
+def test_rejects_lone_surrogate_as_invalid_message_not_a_unicode_encode_error():
+    # A lone surrogate code point (a malformed text frame) cannot be
+    # re-encoded to UTF-8 for the size check — UnicodeEncodeError, not
+    # TypeError/JSONDecodeError. Must fail closed the same way.
+    raw = "\ud800"
+
+    with pytest.raises(ProtocolViolation) as raised:
+        parse_smartpbx_event(raw, max_message_chars=65536, max_audio_bytes=1024)
+    assert raised.value.close_code == POLICY_VIOLATION
+    assert raised.value.failure_class == "invalid_message"
+
+
 def hangup_payload(**fields):
     return {"event": "hangup", "hangup": {"callId": "call", "otherLegCallId": "other", **fields}}
 

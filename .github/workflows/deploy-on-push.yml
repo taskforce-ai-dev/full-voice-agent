@@ -38,7 +38,7 @@ jobs:
       matrix: ${{ steps.d.outputs.matrix }}
       has: ${{ steps.d.outputs.has }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with: { fetch-depth: 0 }
       - id: d
         env:
@@ -112,7 +112,7 @@ jobs:
     needs: detect
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with: { fetch-depth: 0 }
       - id: touched
         env:
@@ -131,7 +131,7 @@ jobs:
             echo "Flico Agent untouched — KB verification not required."
           fi
       - if: steps.touched.outputs.run == 'true'
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with: { python-version: '3.11' }
       - if: steps.touched.outputs.run == 'true'
         run: pip install --quiet pytest numpy pydantic

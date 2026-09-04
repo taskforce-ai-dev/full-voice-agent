@@ -52,20 +52,104 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 # --- Error tracking (Sentry): no-op unless SENTRY_DSN is set ---
+# `_sentry_before_send`/`_SENTRY_LOGGABLE_DIGITS` are defined unconditionally
+# (not inside the `if`) so they stay importable/testable even when SENTRY_DSN
+# is unset, and so `sentry_sdk.init(before_send=...)` below can reference them
+# without a forward-reference problem.
+import re
+
+# A digit run this long or longer is a phone number or booking reference;
+# never let it reach Sentry via a breadcrumb message. Same threshold as
+# smartpbx_mcp._LOGGABLE_DIGITS (kept independent here: this module's Sentry
+# setup runs before the rest of this file's imports and must not import
+# smartpbx_mcp, which pulls in httpx, this early).
+_SENTRY_LOGGABLE_DIGITS = re.compile(r"[0-9]{5,}")
+
+
+_SENTRY_DIGITS_PLACEHOLDER = "<digits>"
+_SENTRY_SCRUB_MAX_DEPTH = 8
+
+
+def _sentry_scrub_value(value, depth: int = 0):
+    """Mask 5+ digit runs in any string reachable from ``value`` (bounded depth)."""
+    if isinstance(value, str):
+        return _SENTRY_LOGGABLE_DIGITS.sub(_SENTRY_DIGITS_PLACEHOLDER, value)
+    if depth >= _SENTRY_SCRUB_MAX_DEPTH:
+        return None
+    if isinstance(value, list):
+        return [_sentry_scrub_value(item, depth + 1) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sentry_scrub_value(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        return {key: _sentry_scrub_value(item, depth + 1) for key, item in value.items()}
+    return value
+
+
+def _sentry_before_send(event: dict, _hint: dict) -> dict:
+    """Privacy scrubber for every free-text channel of a Sentry event.
+
+    Frame local variables are already disabled via ``include_local_variables=False``
+    on init. This drops ``extra``/``contexts``/``user``/``request`` wholesale,
+    drops digit-bearing breadcrumbs, and masks 5+ digit runs (phone numbers,
+    booking references) in exception values, log entries, messages, tags and
+    breadcrumb data, so a transcript fragment or caller number that an
+    exception handler folds into a message never leaves the box unmasked.
+    Never raises and never drops the event itself: a scrubber failure must
+    not hide the exception it was scrubbing.
+    """
+    try:
+        for key in ("extra", "contexts", "user", "request"):
+            event.pop(key, None)
+        breadcrumbs = event.get("breadcrumbs")
+        values = breadcrumbs.get("values") if isinstance(breadcrumbs, dict) else None
+        if isinstance(values, list):
+            kept = []
+            for crumb in values:
+                if not isinstance(crumb, dict):
+                    continue
+                message = crumb.get("message")
+                if isinstance(message, str) and _SENTRY_LOGGABLE_DIGITS.search(message):
+                    continue
+                if "data" in crumb:
+                    crumb["data"] = _sentry_scrub_value(crumb.get("data"))
+                kept.append(crumb)
+            breadcrumbs["values"] = kept
+        exception = event.get("exception")
+        exc_values = exception.get("values") if isinstance(exception, dict) else None
+        if isinstance(exc_values, list):
+            for entry in exc_values:
+                if isinstance(entry, dict) and isinstance(entry.get("value"), str):
+                    entry["value"] = _sentry_scrub_value(entry["value"])
+        for key in ("logentry", "message", "tags"):
+            if key in event:
+                event[key] = _sentry_scrub_value(event[key])
+    except Exception:
+        # Fail closed on the free-text channels rather than on the event.
+        for key in ("extra", "contexts", "user", "request", "breadcrumbs", "logentry", "message", "tags"):
+            event.pop(key, None)
+    return event
+
+
 if os.getenv("SENTRY_DSN"):
     import sentry_sdk
 
     sentry_sdk.init(
         dsn=os.getenv("SENTRY_DSN"),
-        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+        # A key present but blank (e.g. an unset compose
+        # ``${SENTRY_TRACES_SAMPLE_RATE:-0.0}`` passthrough) must resolve to the
+        # default exactly like a missing key -- float("") would otherwise raise
+        # at import and crash-loop the container whenever SENTRY_DSN is set.
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE") or "0.0"),
         environment=os.getenv("SENTRY_ENV", "production"),
         send_default_pii=os.getenv("SENTRY_SEND_PII", "false").lower() == "true",
         enable_logs=os.getenv("SENTRY_ENABLE_LOGS", "true").lower() == "true",
+        include_local_variables=False,
+        max_request_body_size="never",
+        before_send=_sentry_before_send,
     )
     sentry_sdk.set_tag("agent", "kavya")
 
 import queue
-import re
 import threading
 import time
 import wave
@@ -485,7 +569,9 @@ AZURE_SPEECH_REGION: str = os.getenv("AZURE_SPEECH_REGION", "southeastasia")
 
 # Media Streams STT backend: "google" (default) or "azure".
 # Azure reuses AZURE_SPEECH_KEY / AZURE_SPEECH_REGION (already set for Sinhala TTS).
-STT_PROVIDER: str = os.getenv("STT_PROVIDER", "google").lower()
+# A key present but blank (e.g. an unset compose ``${STT_PROVIDER:-...}``
+# passthrough) must resolve to the default exactly like a missing key.
+STT_PROVIDER: str = (os.getenv("STT_PROVIDER") or "google").lower()
 
 # Debug: dump live call audio to an 8 kHz PCM16 wav for offline STT benchmarking.
 STT_DEBUG_DUMP: bool = os.getenv("STT_DEBUG_DUMP", "0") == "1"
@@ -500,7 +586,10 @@ SMARTPBX_PILOT_TRANSCRIPT_LOGGING: bool = (
 )
 
 # LLM provider selection: "claude" (default), "openai", or "gemini"
-LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "claude")
+# A key present but blank (e.g. an unset compose ``${LLM_PROVIDER:-claude}``
+# passthrough) must resolve to the default exactly like a missing key --
+# otherwise the OpenAI branch is silently selected with MODEL="".
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER") or "claude"
 CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -614,10 +703,18 @@ def _resolve_smartpbx_sinhala_gemini_thinking_level(raw: object) -> str:
 
 
 def _resolve_smartpbx_sinhala_gemini_max_tokens(raw: object) -> int:
+    """Direct-Sinhala output ceiling, defaulting to the top of the clamp.
+
+    Gemini 3.x charges thinking tokens against this budget, so a 600-token
+    ceiling truncated real answers: production saw a first turn finish
+    `max_tokens` at `output_tokens=24` and spend a whole extra round recovering
+    from it. 1024 leaves the visible reply room after thinking; the clamp and
+    the operator override are unchanged.
+    """
     try:
-        value = int(raw) if raw not in (None, "") else 600
+        value = int(raw) if raw not in (None, "") else 1024
     except (TypeError, ValueError):
-        value = 600
+        value = 1024
     return min(max(value, 200), 1024)
 
 
@@ -1122,6 +1219,11 @@ _TOOL_FILLER_CYCLES: dict[str, int] = {
 
 
 SMARTPBX_INITIAL_FILLER_TEXT = "Just a moment while I check that for you."
+# The direct-Sinhala counterpart. Deliberately one short, natural spoken
+# phrase rather than a rotation bank: every Sinhala filler has to be
+# pre-rendered through Gemini TTS before a call may use it, so each extra
+# variant is another synthesis the process must complete up front.
+SMARTPBX_SINHALA_INITIAL_FILLER_TEXT = "පොඩ්ඩක් ඉන්න, මම බලන්නම්."
 _SMARTPBX_CAPTURE_TOOLS = frozenset({
     "capture_spoken_number", "capture_spoken_name", "collect_number_via_keypad",
 })
@@ -2407,7 +2509,7 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
         "create_booking": "\u0D94\u0DB6\u0DD9 \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD3\u0DBB\u0DD2\u0DB8 \u0DC3\u0D9A\u0DC3\u0DCA \u0D9A\u0DBB\u0DB8\u0DD2.",
         "retrieve_booking": "\u0D94\u0DB6\u0DD9 \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD3\u0DBB\u0DD2\u0DB8 \u0DB6\u0DBD\u0DB8\u0DD2.",
         "cancel_booking": "\u0D94\u0DB6\u0DD9 \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD3\u0DBB\u0DD2\u0DB8 \u0D85\u0DC0\u0DBD\u0D82\u0D9C\u0DD4 \u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DC3\u0D9A\u0DC3\u0DCA \u0D9A\u0DBB\u0DB8\u0DD2.",
-        "_default": "\u0D9A\u0DBB\u0DD4\u0DAF\u0DCF\u0D9A\u0DBB\u0DCF \u0DBB\u0DD0\u0DAF\u0DD9\u0DB1\u0DCA\u0DB1.",
+        "_default": "\u0D9A\u0DBB\u0DD4\u0DAB\u0DCF\u0D9A\u0DBB \u0DBB\u0DD0\u0DB3\u0DD9\u0DB1\u0DCA\u0DB1.",
     },
     "ta": {
         "check_availability": "\u0B85\u0BA8\u0BCD\u0BA4 \u0BA4\u0BC7\u0BA4\u0BBF\u0B95\u0BB3\u0BBF\u0BB2\u0BCD \u0B85\u0BB1\u0BC8\u0B95\u0BB3\u0BCD \u0B89\u0BB3\u0BCD\u0BB3\u0BA4\u0BBE \u0B8E\u0BA9 \u0B9A\u0BB0\u0BBF\u0BAA\u0BBE\u0BB0\u0BCD\u0B95\u0BCD\u0B95\u0BBF\u0BB1\u0BC7\u0BA9\u0BCD.",
@@ -2417,6 +2519,214 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
         "_default": "\u0BA4\u0BAF\u0BB5\u0BC1\u0B9A\u0BC6\u0BAF\u0BCD\u0BA4\u0BC1 \u0B95\u0BBE\u0BA4\u0BCD\u0BA4\u0BBF\u0BB0\u0BC1\u0B99\u0BCD\u0B95\u0BB3\u0BCD.",
     },
 }
+
+# ---------------------------------------------------------------------------
+# Direct SmartPBX Sinhala fixed-phrase audio
+# ---------------------------------------------------------------------------
+# Gemini TTS is request/response with a 2-5 s time to first byte, so a Sinhala
+# filler synthesised on demand lands AFTER the answer it exists to cover. Every
+# phrase below is fixed, operator-authored and call-independent, so it can be
+# rendered once per process and replayed from bytes at no synthesis cost -- the
+# same trade the English welcome-audio cache and the static bilingual IVR asset
+# already make.
+#
+# PRIVACY: this cache is an allowlist, never a general memo table. Caller
+# transcript, model output and tool text must never be admitted to it.
+# The keypad prompt is reached exactly when spoken capture has already
+# failed twice, so it lands on a caller who is already struggling -- the
+# worst possible moment to switch her into English. The label is model
+# output, so it is never interpolated into the Sinhala sentence: that would
+# both speak English mid-Sinhala and make the phrase unrenderable in
+# advance. Two fixed phrases cover every label the tool is offered for.
+SMARTPBX_SINHALA_KEYPAD_PROMPTS: dict[str, str] = {
+    "whatsapp": (
+        "කරුණාකර ඔබේ WhatsApp අංකය දුරකථනයේ අංක බොත්තම් වලින් ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
+    ),
+    "default": (
+        "කරුණාකර ඔබේ අංකය දුරකථනයේ අංක බොත්තම් වලින් ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
+    ),
+}
+
+
+def _smartpbx_sinhala_keypad_instruction(label: str) -> str:
+    """Select the fixed Sinhala keypad prompt for a model-supplied label."""
+    return SMARTPBX_SINHALA_KEYPAD_PROMPTS[
+        "whatsapp" if "whatsapp" in label.lower() else "default"
+    ]
+
+
+SMARTPBX_SINHALA_CACHED_PHRASES: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        (
+            SMARTPBX_SINHALA_INITIAL_FILLER_TEXT,
+            *SMARTPBX_SINHALA_KEYPAD_PROMPTS.values(),
+            *(
+                phrase
+                for phrase in MEDIA_STREAM_FILLERS.get("si", {}).values()
+                if phrase
+            ),
+        )
+    )
+)
+_SMARTPBX_MULAW_FRAME_BYTES = 640
+_SMARTPBX_SINHALA_PHRASE_AUDIO: dict[tuple[str, str, str], bytes] = {}
+_SMARTPBX_SINHALA_PHRASE_AUDIO_LOCK = threading.Lock()
+_SMARTPBX_SINHALA_PHRASE_PREWARM: tuple[Any, asyncio.Task] | None = None
+
+
+class _SmartPBXSinhalaPhraseSynthesisError(Exception):
+    """One fixed Sinhala phrase could not be rendered to usable mu-law."""
+
+
+def _smartpbx_sinhala_phrase_audio_key(text: str) -> tuple[str, str, str]:
+    """The complete request identity that produced a cached Sinhala clip."""
+    return (
+        text,
+        SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
+        SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
+    )
+
+
+def _is_smartpbx_sinhala_cacheable_phrase(text: str) -> bool:
+    """Only the fixed operator-authored phrases may ever reach the cache."""
+    return text in SMARTPBX_SINHALA_CACHED_PHRASES
+
+
+def _get_cached_smartpbx_sinhala_phrase_audio(text: str) -> bytes | None:
+    if not _is_smartpbx_sinhala_cacheable_phrase(text):
+        return None
+    with _SMARTPBX_SINHALA_PHRASE_AUDIO_LOCK:
+        return _SMARTPBX_SINHALA_PHRASE_AUDIO.get(
+            _smartpbx_sinhala_phrase_audio_key(text)
+        )
+
+
+def _store_cached_smartpbx_sinhala_phrase_audio(text: str, audio: bytes) -> None:
+    if not _is_smartpbx_sinhala_cacheable_phrase(text) or not audio:
+        return
+    with _SMARTPBX_SINHALA_PHRASE_AUDIO_LOCK:
+        _SMARTPBX_SINHALA_PHRASE_AUDIO.setdefault(
+            _smartpbx_sinhala_phrase_audio_key(text), audio
+        )
+
+
+def _smartpbx_sinhala_phrase_audio_ready() -> bool:
+    """True once every fixed phrase can be served without synthesis."""
+    return all(
+        _get_cached_smartpbx_sinhala_phrase_audio(text) is not None
+        for text in SMARTPBX_SINHALA_CACHED_PHRASES
+    )
+
+
+def _gemini_tts_audio_metadata_supported(audio_delta: Any) -> bool:
+    """True unless a delta declares a shape other than 24 kHz mono l16."""
+    for name, supported in (
+        ("mime_type", "audio/l16"),
+        ("channels", 1),
+        ("sample_rate", 24000),
+    ):
+        value = getattr(audio_delta, name, None)
+        if value is not None and value != supported:
+            return False
+    return True
+
+
+async def _synthesize_smartpbx_sinhala_phrase_audio(client: Any, text: str) -> bytes:
+    """Render one fixed Sinhala phrase to frame-aligned 8 kHz mu-law.
+
+    Deliberately transport-free and fence-free: this runs outside any call, so
+    it must never touch a session's speaking state or media generation.
+    """
+    if audioop is None:
+        raise _SmartPBXSinhalaPhraseSynthesisError()
+    stream = await client.aio.interactions.create(
+        model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
+        input=text,
+        stream=True,
+        response_format={"type": "audio"},
+        generation_config={
+            "speech_config": [{
+                "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
+            }],
+        },
+        timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
+    )
+    ratecv_state = None
+    pcm_tail = b""
+    mulaw = b""
+    async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
+        if not _gemini_tts_audio_metadata_supported(audio_delta):
+            raise _SmartPBXSinhalaPhraseSynthesisError()
+        try:
+            chunk = base64.b64decode(audio_b64, validate=True)
+        except (binascii.Error, ValueError, TypeError):
+            raise _SmartPBXSinhalaPhraseSynthesisError() from None
+        if not chunk:
+            continue
+        data = pcm_tail + chunk
+        if len(data) % 2:
+            data, pcm_tail = data[:-1], data[-1:]
+        else:
+            pcm_tail = b""
+        if not data:
+            continue
+        pcm8k, ratecv_state = audioop.ratecv(data, 2, 1, 24000, 8000, ratecv_state)
+        mulaw += audioop.lin2ulaw(pcm8k, 2)
+    if pcm_tail or not mulaw:
+        raise _SmartPBXSinhalaPhraseSynthesisError()
+    return mulaw + b"\xff" * ((-len(mulaw)) % _SMARTPBX_MULAW_FRAME_BYTES)
+
+
+async def _prewarm_smartpbx_sinhala_phrase_audio() -> None:
+    """Render every fixed Sinhala phrase once, so no call has to pay for it."""
+    try:
+        client = _get_gemini_tts_client()
+    except Exception:
+        logger.warning("smartpbx_media event=sinhala_phrase_prewarm_unavailable")
+        return
+    rendered = 0
+    for text in SMARTPBX_SINHALA_CACHED_PHRASES:
+        if _get_cached_smartpbx_sinhala_phrase_audio(text) is not None:
+            continue
+        try:
+            audio = await _synthesize_smartpbx_sinhala_phrase_audio(client, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # One unrenderable phrase must not cost the others their clip; the
+            # caller-facing gates simply keep that phrase off the fast path.
+            continue
+        _store_cached_smartpbx_sinhala_phrase_audio(text, audio)
+        rendered += 1
+    logger.info(
+        "smartpbx_media event=sinhala_phrase_prewarm rendered=%d total=%d ready=%s",
+        rendered,
+        len(SMARTPBX_SINHALA_CACHED_PHRASES),
+        str(_smartpbx_sinhala_phrase_audio_ready()).lower(),
+    )
+
+
+def _schedule_smartpbx_sinhala_phrase_prewarm() -> None:
+    """Start the one in-flight Sinhala prewarm for this loop, at most once.
+
+    Re-entrant on purpose: a prewarm that failed against a transient Gemini
+    outage is retried by the next Sinhala activation, rather than leaving every
+    later call permanently without its fillers.
+    """
+    global _SMARTPBX_SINHALA_PHRASE_PREWARM
+    if not _has_gemini_api_key() or _smartpbx_sinhala_phrase_audio_ready():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    existing = _SMARTPBX_SINHALA_PHRASE_PREWARM
+    if existing is not None and existing[0] is loop and not existing[1].done():
+        return
+    _SMARTPBX_SINHALA_PHRASE_PREWARM = (
+        loop, loop.create_task(_prewarm_smartpbx_sinhala_phrase_audio()),
+    )
+
 
 # Sentence boundary detection for streaming TTS
 _SENTENCE_END = re.compile(r'(?<=[.!?\u0964\u0DF4])\s+')
@@ -3382,27 +3692,126 @@ async def _iter_gemini_tts_audio_deltas(stream: Any) -> AsyncIterator[tuple[str,
             yield data, delta
 
 
+def _anthropic_block_text(block_content: Any) -> str:
+    """Flatten an Anthropic content payload back into the string we stored.
+
+    A ``tool_result`` block carries either the raw JSON string this codebase
+    writes or the API's own list-of-blocks form; both must survive a provider
+    swap, because the string IS the tool's result and inventing a different one
+    would tell the next provider something the tool never returned.
+    """
+    if isinstance(block_content, str):
+        return block_content
+    if isinstance(block_content, list):
+        return "".join(
+            part.get("text", "")
+            for part in block_content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _gemini_parts_from_anthropic_assistant_blocks(
+    blocks: list, *, include_function_call_ids: bool,
+) -> list[dict]:
+    """Render one Anthropic assistant content list as Gemini model parts.
+
+    Reached whenever a Claude failover turn wrote history that the NEXT turn
+    hands back to Gemini. No thought signature is ever produced here: that
+    field is a Gemini-issued, call-local value, and a Claude tool id is not one.
+    """
+    parts: list[dict] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if text:
+                parts.append({"text": text})
+        elif block_type == "tool_use":
+            args = block.get("input")
+            fc_part: dict[str, Any] = {
+                "function_call": {
+                    "name": block.get("name", "unknown"),
+                    "args": args if isinstance(args, dict) else {},
+                }
+            }
+            if include_function_call_ids and block.get("id"):
+                fc_part["function_call"]["id"] = block["id"]
+            parts.append(fc_part)
+    return parts
+
+
+def _gemini_parts_from_anthropic_user_blocks(
+    blocks: list, *, tool_names: dict[str, str], include_function_call_ids: bool,
+) -> list[dict]:
+    """Render one Anthropic user content list as Gemini user parts."""
+    parts: list[dict] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if text:
+                parts.append({"text": text})
+        elif block_type == "tool_result":
+            tool_use_id = block.get("tool_use_id", "")
+            raw = _anthropic_block_text(block.get("content"))
+            try:
+                response_data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                response_data = {"result": raw}
+            fr_part: dict[str, Any] = {
+                "function_response": {
+                    "name": tool_names.get(tool_use_id, "unknown"),
+                    "response": response_data,
+                }
+            }
+            if include_function_call_ids and tool_use_id:
+                fr_part["function_response"]["id"] = tool_use_id
+            parts.append(fr_part)
+    return parts
+
+
 def _history_to_gemini(
     history: list[dict], *, include_function_call_ids: bool = False,
 ) -> list[dict]:
-    """Convert OpenAI-format history to Gemini-native contents.
+    """Convert internal history to Gemini-native contents.
 
     OpenAI format:
       - {"role": "user",      "content": "..."}
       - {"role": "assistant", "content": "...", "tool_calls": [...]}
       - {"role": "tool",      "tool_call_id": "...", "content": "..."}
 
+    Anthropic format (left behind by a Claude failover turn):
+      - {"role": "assistant", "content": [{"type": "tool_use", ...}]}
+      - {"role": "user",      "content": [{"type": "tool_result", ...}]}
+
     Gemini format:
       - {"role": "user",  "parts": [{"text": "..."}]}
       - {"role": "model", "parts": [{"text": "..."}, {"function_call": {...}}]}
       - {"role": "user",  "parts": [{"function_response": {...}}]}
     """
-    # Build tool_call_id â†’ tool_name map from assistant messages
+    # Build tool_call_id â†’ tool_name map from assistant messages, in BOTH
+    # shapes: after a provider swap one conversation holds both.
     tc_id_to_name: dict[str, str] = {}
     for msg in history:
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+        if msg.get("role") != "assistant":
+            continue
+        if msg.get("tool_calls"):
             for tc in msg["tool_calls"]:
                 tc_id_to_name[tc["id"]] = tc["function"]["name"]
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("id")
+                ):
+                    tc_id_to_name[block["id"]] = block.get("name", "unknown")
 
     contents: list[dict] = []
     i = 0
@@ -3411,13 +3820,28 @@ def _history_to_gemini(
         role = msg.get("role")
 
         if role == "user":
-            contents.append({"role": "user", "parts": [{"text": msg["content"]}]})
+            content = msg.get("content")
+            if isinstance(content, list):
+                user_parts = _gemini_parts_from_anthropic_user_blocks(
+                    content,
+                    tool_names=tc_id_to_name,
+                    include_function_call_ids=include_function_call_ids,
+                )
+                if user_parts:
+                    contents.append({"role": "user", "parts": user_parts})
+            else:
+                contents.append({"role": "user", "parts": [{"text": content}]})
             i += 1
 
         elif role == "assistant":
             parts: list[dict] = []
-            if msg.get("content"):
-                parts.append({"text": msg["content"]})
+            content = msg.get("content")
+            if isinstance(content, list):
+                parts.extend(_gemini_parts_from_anthropic_assistant_blocks(
+                    content, include_function_call_ids=include_function_call_ids,
+                ))
+            elif content:
+                parts.append({"text": content})
             if msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     try:
@@ -3471,6 +3895,235 @@ def _history_to_gemini(
             i += 1  # skip unknown roles
 
     return contents
+
+
+def _claude_tool_result_ids(history: list[dict]) -> set[str]:
+    """Every tool call id this history actually carries a result for."""
+    answered: set[str] = set()
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                answered.add(tool_call_id)
+            continue
+        if role != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and block.get("tool_use_id")
+            ):
+                answered.add(block["tool_use_id"])
+    return answered
+
+
+def _claude_messages_from_history(history: list[dict]) -> list[dict]:
+    """Render any internal history shape into valid Anthropic Messages input.
+
+    ``self.history`` is written in whichever provider's shape ran the round, so
+    after a Gemini tool round it holds OpenAI-shaped
+    ``{"role": "assistant", "content": None, "tool_calls": [...]}`` /
+    ``{"role": "tool", ...}`` entries. Handing those to Anthropic is a 400 —
+    which, on the Sinhala failover path, is a dead call rather than a recovered
+    turn. This renders one canonical Anthropic payload per request; the session's
+    own history is never mutated, so the next Gemini turn still sees its native
+    shape (``_history_to_gemini`` reads both).
+
+    Rules, in the order they matter:
+      * Already-Anthropic entries are passed through by identity, so a history
+        that needs no conversion returns the SAME list object and the English
+        path's request is byte-for-byte what it was.
+      * tool_use/tool_result pairing and ids are preserved exactly; consecutive
+        OpenAI ``tool`` entries collapse into the single user message the API
+        requires.
+      * A tool call whose result is missing has its ``tool_use`` block dropped
+        (the API rejects an unanswered one) — never a fabricated result. A
+        tool result with no matching call is dropped for the same reason.
+      * Nothing else is dropped: assistant text keeps its tool call, and a
+        non-conversational marker entry (e.g. the booking-confirmation marker)
+        is carried as a user turn rather than lost.
+    """
+    answered_ids = _claude_tool_result_ids(history)
+    rendered: list[dict[str, Any]] = []
+    emitted_tool_use_ids: set[str] = set()
+    dropped = 0
+    index = 0
+    total = len(history)
+
+    while index < total:
+        msg = history[index]
+        if not isinstance(msg, dict):
+            dropped += 1
+            index += 1
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if role == "assistant":
+            index += 1
+            blocks: list[dict[str, Any]] = []
+            if msg.get("tool_calls"):
+                if isinstance(content, str) and content.strip():
+                    blocks.append({"type": "text", "text": content})
+                for tool_call in msg["tool_calls"]:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    call_id = tool_call.get("id")
+                    function = tool_call.get("function") or {}
+                    if not call_id or not function.get("name"):
+                        dropped += 1
+                        continue
+                    if call_id not in answered_ids:
+                        # No result exists for this call. Anthropic rejects a
+                        # dangling tool_use, and inventing a result would tell
+                        # the model a side effect happened that never did.
+                        dropped += 1
+                        continue
+                    raw_arguments = function.get("arguments") or "{}"
+                    try:
+                        parsed = json.loads(raw_arguments) if raw_arguments else {}
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = {}
+                    if not isinstance(parsed, dict):
+                        parsed = {}
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": function["name"],
+                        "input": parsed,
+                    })
+                    emitted_tool_use_ids.add(call_id)
+                if blocks:
+                    rendered.append({"role": "assistant", "content": blocks})
+                else:
+                    dropped += 1
+                continue
+            if isinstance(content, list):
+                kept: list[dict[str, Any]] = []
+                changed = False
+                for block in content:
+                    if not isinstance(block, dict):
+                        changed = True
+                        dropped += 1
+                        continue
+                    if block.get("type") == "tool_use":
+                        block_id = block.get("id")
+                        if not block_id or block_id not in answered_ids:
+                            changed = True
+                            dropped += 1
+                            continue
+                        emitted_tool_use_ids.add(block_id)
+                    elif block.get("type") == "text" and not str(
+                        block.get("text", "")
+                    ).strip():
+                        changed = True
+                        dropped += 1
+                        continue
+                    kept.append(block)
+                if not kept:
+                    dropped += 1
+                    continue
+                rendered.append(msg if not changed else {
+                    "role": "assistant", "content": kept,
+                })
+                continue
+            if isinstance(content, str) and content.strip():
+                rendered.append(msg)
+            else:
+                # `content: None` (the Gemini tool-call shape with every call
+                # dropped) and empty text are both API errors, and neither
+                # carries anything the model could read.
+                dropped += 1
+            continue
+
+        if role == "tool":
+            # Consecutive OpenAI tool results answer ONE assistant turn and
+            # must arrive as one user message.
+            tool_blocks: list[dict[str, Any]] = []
+            while index < total:
+                entry = history[index]
+                if not isinstance(entry, dict) or entry.get("role") != "tool":
+                    break
+                index += 1
+                tool_call_id = entry.get("tool_call_id")
+                if not tool_call_id or tool_call_id not in emitted_tool_use_ids:
+                    dropped += 1
+                    continue
+                tool_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": _anthropic_block_text(entry.get("content")),
+                })
+            if tool_blocks:
+                rendered.append({"role": "user", "content": tool_blocks})
+            continue
+
+        if role == "user":
+            index += 1
+            if isinstance(content, list):
+                kept_user: list[dict[str, Any]] = []
+                changed = False
+                for block in content:
+                    if not isinstance(block, dict):
+                        changed = True
+                        dropped += 1
+                        continue
+                    if block.get("type") == "tool_result":
+                        block_id = block.get("tool_use_id")
+                        if not block_id or block_id not in emitted_tool_use_ids:
+                            changed = True
+                            dropped += 1
+                            continue
+                    elif block.get("type") == "text" and not str(
+                        block.get("text", "")
+                    ).strip():
+                        changed = True
+                        dropped += 1
+                        continue
+                    kept_user.append(block)
+                if not kept_user:
+                    dropped += 1
+                    continue
+                rendered.append(msg if not changed else {
+                    "role": "user", "content": kept_user,
+                })
+                continue
+            if isinstance(content, str) and content.strip():
+                rendered.append(msg)
+            else:
+                dropped += 1
+            continue
+
+        # Any other role (a marker/system note): Anthropic accepts only user
+        # and assistant, so carry the text as a user turn rather than lose it.
+        index += 1
+        note = content if isinstance(content, str) else msg.get("text")
+        if isinstance(note, str) and note.strip():
+            rendered.append({"role": "user", "content": note})
+        else:
+            dropped += 1
+
+    while rendered and rendered[0].get("role") != "user":
+        # The API requires the first message to be a user turn; history trimmed
+        # mid-conversation can leave an assistant one in front.
+        rendered.pop(0)
+        dropped += 1
+
+    if dropped:
+        # Counts only — never an entry, a role, a tool name or any text.
+        logger.info("llm_history_render target=claude dropped_entries=%d", dropped)
+    if len(rendered) == len(history) and all(
+        a is b for a, b in zip(rendered, history)
+    ):
+        return history
+    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -3912,6 +4565,53 @@ def _note_gemini_success(state: dict[str, Any]) -> None:
     state["consecutive_failovers"] = 0
 
 
+def _rollback_gemini_failover(
+    state: dict[str, Any], snapshot: dict[str, Any], *, noted: bool
+) -> None:
+    """Undo one recorded failover after the Claude turn itself failed.
+
+    The counter answers exactly one question — "is Gemini failing repeatedly?" —
+    and a failure on the OTHER side of the swap is not evidence about Gemini. If
+    our own error were allowed to latch ``degraded``, every later turn of the
+    call would be routed to the provider that just failed, with no way back:
+    one bad turn would become a dead call. ``degraded`` is cleared for the same
+    reason, so a failing sticky turn releases the call to retry Gemini.
+    ``degraded_logged`` is deliberately left alone: the closed telemetry event
+    stays one-per-call.
+
+    ``noted`` says whether the caller recorded a failover for THIS turn before
+    running it (every per-exception route does; the sticky route does not), so
+    the counter lands back on its pre-failover value either way.
+    """
+    previous = snapshot.get("consecutive_failovers", 0)
+    state["consecutive_failovers"] = max(previous - 1, 0) if noted else previous
+    state["degraded"] = False
+
+
+def _classify_failover_turn_failure(exc: BaseException) -> str:
+    """Closed reason enum for a failed failover turn — never any message text."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    if isinstance(status, bool) or not isinstance(status, int):
+        return "local"
+    if status == 429:
+        return "quota"
+    if 500 <= status <= 599:
+        return "server"
+    return "invalid_request"
+
+
+def _history_recorded_tool_round(history: list[dict], since: int) -> bool:
+    """True when the entries appended after ``since`` include a tool round."""
+    for msg in history[since:]:
+        if not isinstance(msg, dict):
+            continue
+        if _is_tool_call_msg(msg) or _is_tool_result_msg(msg):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Application lifespan
 # ---------------------------------------------------------------------------
@@ -3971,6 +4671,10 @@ async def lifespan(app: FastAPI):
             )
     else:
         logger.info("SmartPBX mode: legacy Twilio handoff startup is disabled")
+        # Sinhala fixed-phrase audio must already exist by the first turn of the
+        # first Sinhala call: Gemini TTS is request/response, so a filler
+        # synthesised on demand arrives after the answer it exists to cover.
+        _schedule_smartpbx_sinhala_phrase_prewarm()
 
     # NOTE: bookings go to the Yanolja PMS via booking_api -> yanolja_service ->
     # yanolja_client. Hatton Hills is an invented demo property, so there is no
@@ -5316,6 +6020,13 @@ class MediaStreamSession:
         # being treated as an audible-response barge-in.
         self._tts_synthesis_in_flight = False
         self._tts_synthesis_generation: int | None = None
+        # audit #9: the English/ElevenLabs equivalent of the above. Unlike
+        # Gemini, ElevenLabs sets _is_speaking True immediately (so a genuine
+        # barge-in still fires during TTFB); this instead tracks "request
+        # started, no frame on the wire yet" so a sub-threshold/debounced STT
+        # result in that window is buffered rather than dropped.
+        self._smartpbx_en_pre_audio_active = False
+        self._smartpbx_en_pre_audio_generation: int | None = None
         self._pre_audio_stt_generation: int | None = None
         self._pre_audio_stt_first_at = 0.0
         self._pre_audio_stt_events = 0
@@ -5328,6 +6039,21 @@ class MediaStreamSession:
         self._assistant_turn_generated_sentences: list[str] = []
         self._delivered_sentences: list[str] = []
         self._track_assistant_turn_delivery: bool = False
+        # audit #5: lets a waiter (tools._await_turn_delivery) block on
+        # progress instead of busy-spinning `await asyncio.sleep(0)` every
+        # loop tick. Set by _send_tts_done on every completed sentence and by
+        # _handle_bargein on every generation bump, so a waiter wakes on
+        # either delivery progress or the delivery becoming moot.
+        self._smartpbx_delivery_event: asyncio.Event = asyncio.Event()
+        # audit #8: _handle_bargein idempotency. Two STT callbacks (an interim
+        # and a final, or two interims) can both be submitted while
+        # _is_speaking is still True and the loop is busy -- both then run
+        # _handle_bargein for what is really one interruption. The generation
+        # value claimed by the most recent run; a call for that same
+        # generation (still in progress, or already finished and bumped past
+        # it) is a duplicate and returns immediately instead of redoing the
+        # cancel/bump/retain cycle.
+        self._smartpbx_bargein_claimed_generation: int | None = None
         self._assistant_turn_speech_end_at: float = 0.0
         # Gemini failover state is per MediaStreamSession.
         self._gemini_failover_state: dict[str, Any] = _init_gemini_failover_state()
@@ -5434,6 +6160,13 @@ class MediaStreamSession:
         # Stays False for non-SmartPBX (Twilio) sessions, which never call
         # _finalize_smartpbx_turns().
         self._smartpbx_torn_down = False
+        # audit #3/#11: the currently in-flight endpointing->LLM->tool round,
+        # tracked so teardown can wait (bounded) for it to settle instead of
+        # discarding a tool that already had its side effect. Session-owned,
+        # separate from full_transcript so a late booking marker never lands
+        # in the live conversation history it can no longer be spoken from.
+        self._smartpbx_active_runner_task: "asyncio.Task[None] | None" = None
+        self._smartpbx_late_tool_results: list[dict[str, str]] = []
 
     def _is_smartpbx_session(self) -> bool:
         return self._smartpbx_transfer_context is not None
@@ -5481,6 +6214,38 @@ class MediaStreamSession:
         """Task 4 boundary; never broadens English or Twilio failure behavior."""
         return self._is_direct_smartpbx() and self.lang == "si"
 
+    def _is_direct_smartpbx_sinhala_tool_filler_round(
+        self,
+        first_tool: str,
+        *,
+        text_content: str,
+        filler_sent: bool,
+        initial_filler: "SmartPBXInitialFillerController | None",
+    ) -> bool:
+        """Whether this Sinhala tool batch may run its filler beside the tool.
+
+        The Sinhala branch used to ``await`` its filler before ``execute_tool``,
+        so the PMS call did not even start until Gemini TTS had synthesised and
+        paced the whole phrase. English has run the two concurrently since
+        Phase B; this is the same admission rule, so the exclusions match
+        exactly: the transfer tool owns its own canonical announcement and
+        delivery barrier, capture flows keep their specialised prompts, one
+        filler per turn, and a model preamble or an already-spoken initial
+        filler makes a second one redundant. Everything excluded here keeps the
+        pre-existing serialised behavior untouched.
+        """
+        return (
+            self._is_direct_smartpbx_sinhala()
+            and first_tool != "transfer_to_human"
+            and first_tool not in _SMARTPBX_CAPTURE_TOOLS
+            and not filler_sent
+            and not text_content.strip()
+            and not (
+                initial_filler is not None
+                and initial_filler.suppress_specialized_tool_filler
+            )
+        )
+
     def _reserve_smartpbx_initial_filler(self) -> _CallFillerLease:
         return self._smartpbx_filler_rotation.reserve(
             "initial", SMARTPBX_INITIAL_FILLER_BANK
@@ -5514,12 +6279,27 @@ class MediaStreamSession:
     ) -> SmartPBXInitialFillerController | None:
         if (
             round_idx != 0
-            or not self._is_direct_smartpbx_english()
             or self.transfer_pending
             or self._is_speaking
             or self._is_capture_mode_active()
             or generation != self._speak_generation
         ):
+            return None
+        # Direct English rotates a phrase bank through live ElevenLabs TTS.
+        # Direct Sinhala gets the same controller and the same delay, but only
+        # once its one phrase is pre-rendered: Gemini TTS is request/response,
+        # so a filler synthesised here would hold the shared speak lock through
+        # a 2-5 s round trip and land on top of the answer it was covering.
+        if self._is_direct_smartpbx_english():
+            sinhala_filler_text = None
+        elif (
+            self._is_direct_smartpbx_sinhala()
+            and _get_cached_smartpbx_sinhala_phrase_audio(
+                SMARTPBX_SINHALA_INITIAL_FILLER_TEXT
+            ) is not None
+        ):
+            sinhala_filler_text = SMARTPBX_SINHALA_INITIAL_FILLER_TEXT
+        else:
             return None
 
         # Provider failover (Gemini -> Claude) runs the whole turn again on a
@@ -5581,13 +6361,21 @@ class MediaStreamSession:
                     runner.speak_generation = self._speak_generation
                     self._assistant_turn_generation = self._speak_generation
 
-            filler_lease = self._reserve_smartpbx_initial_filler()
+            # Sinhala speaks one fixed pre-rendered phrase, so it takes no
+            # lease: there is no bank to rotate and nothing to reserve.
+            filler_lease = (
+                None if sinhala_filler_text is not None
+                else self._reserve_smartpbx_initial_filler()
+            )
             controller = SmartPBXInitialFillerController(
                 speak=speak,
                 generation=generation,
                 delay_seconds=SMARTPBX_INITIAL_FILLER_DELAY_SECONDS,
                 clear_audio=clear_audio,
-                text=filler_lease.text,
+                text=(
+                    sinhala_filler_text if filler_lease is None
+                    else filler_lease.text
+                ),
                 lease=filler_lease,
             )
             controller.start()
@@ -5943,6 +6731,22 @@ class MediaStreamSession:
     def _current_smartpbx_runner_can_execute_tools(self) -> bool:
         """Keep a barged-out task from crossing the tool side-effect boundary."""
         return self._current_smartpbx_runner_owns_shared_state()
+
+    def _record_smartpbx_late_tool_completion(
+        self, tool_name: str, tool_input: dict[str, Any], tool_result: str,
+    ) -> None:
+        """A tool executed after this runner lost ownership (audit #3).
+
+        Teardown already emitted the bounded ``late_tool_completion`` turn_stage
+        telemetry via ``_current_smartpbx_runner_owns_shared_state``; this is
+        the data half -- a booking that already happened must still reach the
+        post-call record even though the turn/history it would normally land
+        in is gone. Reuses ``_append_booking_confirmation_marker``'s own
+        success/shape filtering, so this is a safe no-op for every other tool
+        and for a failed or non-``create_booking`` result.
+        """
+        late = self._smartpbx_late_tool_results
+        _append_booking_confirmation_marker(late, tool_name, tool_input, tool_result)
 
     def _smartpbx_runner_raw_utterance(self) -> str:
         """Return raw capture input owned by this task, never a newer turn's."""
@@ -6429,10 +7233,17 @@ class MediaStreamSession:
             label = str(tool_input.get("label") or "").strip()
         spoken_label = label or "your number"
 
-        instruction = (
-            f"Please key in {spoken_label} on your phone's keypad now, "
-            "then press the hash key when you're done."
-        )
+        # A Sinhala caller must not be handed an English instruction, and this
+        # prompt is on the critical path: the entry window only arms once it has
+        # been spoken, so it takes a pre-rendered fixed phrase rather than a
+        # live synthesis round trip.
+        if self.lang == "si":
+            instruction = _smartpbx_sinhala_keypad_instruction(label)
+        else:
+            instruction = (
+                f"Please key in {spoken_label} on your phone's keypad now, "
+                "then press the hash key when you're done."
+            )
         collector = DtmfCollector(
             loop=self._event_loop,
             interdigit_timeout=DTMF_INTERDIGIT_TIMEOUT_SECONDS,
@@ -6715,6 +7526,11 @@ class MediaStreamSession:
             "\n\nSMARTPBX CALLER RHYTHM:\n"
             "- Answer first in one or two concise sentences.\n"
             "- Ask no more than one necessary next question.\n"
+            "- Confirm a detail the guest has just given by repeating it back "
+            "in a few words, then carry on.\n"
+            "- Do not open a reply by describing yourself (\"As an AI...\"). "
+            "Answer the question; say plainly that you are an AI agent for "
+            "Hatton Hills only when the caller asks.\n"
             if self._is_direct_smartpbx()
             else ""
         )
@@ -6883,12 +7699,32 @@ class MediaStreamSession:
     # â”€â”€ STT callback (called from background thread) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _pre_audio_synthesis_active(self) -> bool:
-        return (
-            self._is_direct_smartpbx()
-            and self._tts_synthesis_in_flight
-            and not self._is_speaking
-            and self._tts_synthesis_generation == self._speak_generation
-        )
+        """True in the window between a TTS request starting and its first
+        audio frame reaching the transport -- for either TTS path.
+
+        Gemini/Sinhala (`_tts_synthesis_in_flight`) never sets `_is_speaking`
+        until that first frame, so `not self._is_speaking` alone identifies
+        the window there. English/ElevenLabs (audit #9) sets `_is_speaking`
+        True immediately instead -- a genuine >=BARGEIN_MIN_CHARS
+        interruption must still be able to barge in during TTFB -- so it is
+        tracked separately via `_smartpbx_en_pre_audio_active`.
+        """
+        if not self._is_direct_smartpbx():
+            return False
+        if self._tts_synthesis_in_flight and not self._is_speaking:
+            return self._tts_synthesis_generation == self._speak_generation
+        if self._smartpbx_en_pre_audio_active:
+            return self._smartpbx_en_pre_audio_generation == self._speak_generation
+        return False
+
+    def _smartpbx_end_en_pre_audio_window(self, generation: int) -> None:
+        """End the English pre-audio window at the exact moment the first
+        frame reaches the transport -- not when the whole TTS call finishes.
+        Left active for the full utterance would route every later STT result
+        through pre-audio buffering instead of the normal barge-in path for
+        as long as speech plays."""
+        if self._smartpbx_en_pre_audio_generation == generation:
+            self._smartpbx_en_pre_audio_active = False
 
     def _clear_pre_audio_stt(self) -> str:
         text = self._pre_audio_stt_latest_interim or self._pre_audio_stt_committed
@@ -7088,6 +7924,16 @@ class MediaStreamSession:
         return True
 
     async def _handle_bargein(self):
+        # Idempotent per speak generation (audit #8): a duplicate STT callback
+        # for the same interruption (two interims/a final racing in while the
+        # loop is busy) must not redo the cancel/bump/retain cycle -- that
+        # would supersede the caller's own new utterance a second time and
+        # can drop it entirely. Captured up front, synchronously, before any
+        # await -- nothing else can run between this check and the claim.
+        generation = self._speak_generation
+        if self._smartpbx_bargein_claimed_generation == generation:
+            return
+        self._smartpbx_bargein_claimed_generation = generation
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=barge_in")
         else:
@@ -7110,6 +7956,10 @@ class MediaStreamSession:
         self._assistant_turn_speech_end_at = time.monotonic()
         self._cancel_reprompt()
         self._speak_generation += 1
+        # Wake any _await_turn_delivery waiter (audit #5): the generation it
+        # was waiting on is now stale, so its own condition check will exit
+        # rather than blocking out the remainder of its timeout.
+        self._smartpbx_delivery_event.set()
         # Barge-in ownership: SUPERSEDED for dispatch, RETAINED for the record.
         # The guest is speaking NEW content right now, and that utterance — not
         # an older buffer — is what the next turn must answer; prepending stale
@@ -7198,10 +8048,16 @@ class MediaStreamSession:
                 "generation",
                 getattr(self._media_transport, "_generation", cleared_generation),
             )
-            if isinstance(transport_generation, int) and not isinstance(
-                transport_generation, bool,
+            if (
+                isinstance(transport_generation, int)
+                and not isinstance(transport_generation, bool)
+                and transport_generation >= self._speak_generation
             ):
-                self._speak_generation = max(transport_generation, 0)
+                # Re-sync to the transport's fence, but never move the speak
+                # generation backwards: a closed/dead transport reports a
+                # stale generation, and clamping to it would let the
+                # per-generation barge-in claim match forever.
+                self._speak_generation = transport_generation
             return
             async with self._ws_lock:
                 await self.ws.send_text(json.dumps({
@@ -7291,6 +8147,10 @@ class MediaStreamSession:
                 self._record_delivered_sentence(sentence, turn_generation or generation)
                 self._schedule_reprompt()
             self._assistant_turn_speech_end_at = time.monotonic()
+            # Wake any _await_turn_delivery waiter (audit #5) -- whether or
+            # not this sentence counted as delivered, the waiter's own
+            # condition needs a re-check.
+            self._smartpbx_delivery_event.set()
             return delivered
         async with self._ws_lock:
             await self.ws.send_text(json.dumps({
@@ -7970,8 +8830,14 @@ class MediaStreamSession:
             self._endpointing_handle.cancel()
         self._endpointing_handle = self._event_loop.call_later(
             delay,
-            lambda: asyncio.ensure_future(self._flush_transcript()),
+            self._dispatch_smartpbx_flush_transcript,
         )
+
+    def _dispatch_smartpbx_flush_transcript(self) -> None:
+        # Tracked, not just fire-and-forget (audit #11): SmartPBX teardown
+        # (audit #3) waits on this to let an in-flight tool call settle
+        # before the post-call transcript is snapshotted.
+        self._smartpbx_active_runner_task = asyncio.ensure_future(self._flush_transcript())
 
     async def _flush_transcript(self):
         if self._teardown_dispatch_closed or self._stt_closing or self._smartpbx_torn_down:
@@ -8542,6 +9408,17 @@ class MediaStreamSession:
                     if not self._current_smartpbx_runner_owns_shared_state(
                         tool_executed=tool_executed
                     ):
+                        # audit #3: this tool (and any earlier one this round)
+                        # already had its side effect; a booking must still
+                        # reach the post-call record even though the turn it
+                        # would normally be written into is gone.
+                        for _, _tc, _parsed_input, _result_str, _ in staged_results:
+                            self._record_smartpbx_late_tool_completion(
+                                _tc["name"], _parsed_input, _result_str,
+                            )
+                        self._record_smartpbx_late_tool_completion(
+                            tc["name"], parsed_input, result_str,
+                        )
                         await self._cancel_smartpbx_round_tts(tts_tasks)
                         await self._finish_smartpbx_tool_filler(
                             tool_filler_task, cancel=True
@@ -8566,6 +9443,10 @@ class MediaStreamSession:
                 if not self._current_smartpbx_runner_owns_shared_state(
                     tool_executed=tool_executed
                 ):
+                    for _tool_index, tc, parsed_input, result_str, _tool_error in staged_results:
+                        self._record_smartpbx_late_tool_completion(
+                            tc["name"], parsed_input, result_str,
+                        )
                     return ""
                 if len(staged_results) != len(tool_list):
                     assistant_msg["tool_calls"] = assistant_msg["tool_calls"][:len(staged_results)]
@@ -8640,7 +9521,7 @@ class MediaStreamSession:
             return False
         return self.anthropic_client is not None
 
-    async def _run_claude_failover_turn(self) -> str:
+    async def _run_claude_failover_turn(self, *, noted_failover: bool = False) -> str:
         """Run this turn on Claude with Claude-shaped model AND tools, then restore.
 
         Every Gemini→Claude failover lands here — sticky and per-exception alike.
@@ -8665,18 +9546,51 @@ class MediaStreamSession:
         previous_model = self.model
         previous_tools = self.tools
         previous_provider = self.llm_provider
+        # Taken BEFORE the turn: if the swap itself fails, the recorded failover
+        # is rolled back so our own error cannot pin the call to Claude.
+        failover_state_snapshot = dict(self._gemini_failover_state)
+        history_len_before = len(self.history)
         try:
-            # Conversion itself can fail. Keep all temporary assignments inside
-            # this try so the original call profile is restored in every case.
-            self.model = CLAUDE_MODEL
-            if previous_provider == "gemini":
-                self.tools = _claude_tools_from_gemini(previous_tools)
-            self.llm_provider = "claude"
-            return await self._run_llm_claude()
-        finally:
-            self.model = previous_model
-            self.tools = previous_tools
-            self.llm_provider = previous_provider
+            try:
+                # Conversion itself can fail. Keep all temporary assignments
+                # inside this try so the original call profile is restored in
+                # every case.
+                self.model = CLAUDE_MODEL
+                if previous_provider == "gemini":
+                    self.tools = _claude_tools_from_gemini(previous_tools)
+                self.llm_provider = "claude"
+                return await self._run_llm_claude()
+            finally:
+                self.model = previous_model
+                self.tools = previous_tools
+                self.llm_provider = previous_provider
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _rollback_gemini_failover(
+                self._gemini_failover_state, failover_state_snapshot,
+                noted=noted_failover,
+            )
+            if not self._is_direct_smartpbx_non_capture():
+                # Twilio Media Streams, ConversationRelay and the dictation
+                # flows keep their existing failure handling untouched.
+                raise
+            logger.error(
+                "smartpbx_media event=llm_failover_turn_failed reason=%s",
+                _classify_failover_turn_failure(exc),
+            )
+            if not self._current_smartpbx_runner_owns_shared_state():
+                return ""
+            # Never a replay: if the failed Claude turn already committed a tool
+            # round, the caller hears the post-tool line, which asks nothing that
+            # could repeat a booking operation.
+            return await self._smartpbx_speak_recovery_and_finish(
+                tool_executed=_history_recorded_tool_round(
+                    self.history, history_len_before,
+                ),
+                gen=self._speak_generation,
+                full_text="",
+            )
 
     async def _fence_direct_sinhala_gemini_round(
         self, *, tts_tasks: list[asyncio.Task], gen: int,
@@ -8876,10 +9790,9 @@ class MediaStreamSession:
                             if kind != "text":
                                 continue
 
-                            if (
-                                initial_filler is not None
-                                and self._is_direct_smartpbx_english()
-                            ):
+                            # Direct Sinhala now arms the same controller, and
+                            # first content retires it on both languages.
+                            if initial_filler is not None:
                                 await initial_filler.on_content_delta()
                                 if initial_filler._cleared_after_spoke:
                                     gen = self._speak_generation
@@ -9132,6 +10045,19 @@ class MediaStreamSession:
                             )
                             await asyncio.sleep(0)
                             smartpbx_filler_sent = True
+                    elif self._is_direct_smartpbx_sinhala_tool_filler_round(
+                        first_tool,
+                        text_content=text_content,
+                        filler_sent=smartpbx_filler_sent,
+                        initial_filler=initial_filler,
+                    ):
+                        filler = fillers.get(first_tool, fillers.get("_default", ""))
+                        if filler:
+                            tool_filler_task = self._start_smartpbx_tool_filler(
+                                filler, generation=gen,
+                            )
+                            await asyncio.sleep(0)
+                            smartpbx_filler_sent = True
                     else:
                         filler = fillers.get(first_tool, fillers.get("_default", ""))
                         if filler:
@@ -9217,6 +10143,17 @@ class MediaStreamSession:
                         if not self._current_smartpbx_runner_owns_shared_state(
                             tool_executed=tool_executed
                         ):
+                            # audit #3: this tool (and any earlier one this
+                            # round) already had its side effect; a booking
+                            # must still reach the post-call record even
+                            # though the turn it would normally land in is gone.
+                            for _tc, _parsed_input, _result_str, _ in staged_results:
+                                self._record_smartpbx_late_tool_completion(
+                                    _tc["function"]["name"], _parsed_input, _result_str,
+                                )
+                            self._record_smartpbx_late_tool_completion(
+                                tc["function"]["name"], parsed_input, result_str,
+                            )
                             await self._cancel_smartpbx_round_tts(tts_tasks)
                             await self._finish_smartpbx_tool_filler(
                                 tool_filler_task, cancel=True
@@ -9241,6 +10178,10 @@ class MediaStreamSession:
                     if not self._current_smartpbx_runner_owns_shared_state(
                         tool_executed=tool_executed
                     ):
+                        for tc, parsed_input, result_str, _tool_error in staged_results:
+                            self._record_smartpbx_late_tool_completion(
+                                tc["function"]["name"], parsed_input, result_str,
+                            )
                         await self._finish_smartpbx_tool_filler(
                             tool_filler_task, cancel=True
                         )
@@ -9351,7 +10292,7 @@ class MediaStreamSession:
                 exc.reason,
             )
             _note_gemini_failover(self._gemini_failover_state)
-            return await self._run_claude_failover_turn()
+            return await self._run_claude_failover_turn(noted_failover=True)
         except Exception as exc:
             if not self._current_smartpbx_runner_owns_shared_state():
                 return ""
@@ -9378,7 +10319,7 @@ class MediaStreamSession:
                         "from=gemini to=claude reason=empty_response"
                     )
                     _note_gemini_failover(self._gemini_failover_state)
-                    return await self._run_claude_failover_turn()
+                    return await self._run_claude_failover_turn(noted_failover=True)
                 return await self._smartpbx_speak_recovery_and_finish(
                     tool_executed=turn_tool_executed, gen=turn_gen,
                     full_text=delivered_text,
@@ -9438,7 +10379,7 @@ class MediaStreamSession:
             )
 
             _note_gemini_failover(self._gemini_failover_state)
-            return await self._run_claude_failover_turn()
+            return await self._run_claude_failover_turn(noted_failover=True)
 
 
     # â”€â”€ Claude native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
@@ -9515,7 +10456,10 @@ class MediaStreamSession:
                     "model": self.model,
                     "max_tokens": self._provider_max_tokens("claude"),
                     "system": system_blocks,
-                    "messages": self.history,
+                    # A failover (or sticky) turn inherits a history written in
+                    # Gemini's shape; rendering is a no-op identity pass for a
+                    # history that is already Anthropic-shaped.
+                    "messages": _claude_messages_from_history(self.history),
                     "tools": self.tools if self.tools else NOT_GIVEN,
                 }
                 # Do not disable adaptive thinking.  Medium effort is a
@@ -9837,6 +10781,19 @@ class MediaStreamSession:
                         )
                         await asyncio.sleep(0)
                         smartpbx_filler_sent = True
+                elif self._is_direct_smartpbx_sinhala_tool_filler_round(
+                    first_tool,
+                    text_content=text_content,
+                    filler_sent=smartpbx_filler_sent,
+                    initial_filler=initial_filler,
+                ):
+                    filler = fillers.get(first_tool, fillers.get("_default", ""))
+                    if filler:
+                        tool_filler_task = self._start_smartpbx_tool_filler(
+                            filler, generation=gen,
+                        )
+                        await asyncio.sleep(0)
+                        smartpbx_filler_sent = True
                 else:
                     filler = fillers.get(first_tool, fillers.get("_default", ""))
                     if filler:
@@ -9918,6 +10875,17 @@ class MediaStreamSession:
                     if not self._current_smartpbx_runner_owns_shared_state(
                         tool_executed=tool_executed
                     ):
+                        # audit #3: this tool (and any earlier one this round)
+                        # already had its side effect; a booking must still
+                        # reach the post-call record even though the turn it
+                        # would normally be written into is gone.
+                        for _, _tb, _tb_input, _result_str, _ in staged_results:
+                            self._record_smartpbx_late_tool_completion(
+                                _tb["name"], _tb_input, _result_str,
+                            )
+                        self._record_smartpbx_late_tool_completion(
+                            tb["name"], tb["input"], result_str,
+                        )
                         await self._cancel_smartpbx_round_tts(tts_tasks)
                         await self._finish_smartpbx_tool_filler(
                             tool_filler_task, cancel=True
@@ -9942,6 +10910,10 @@ class MediaStreamSession:
                 if not self._current_smartpbx_runner_owns_shared_state(
                     tool_executed=tool_executed
                 ):
+                    for _tool_index, tb, tb_input, result_str, _tool_error in staged_results:
+                        self._record_smartpbx_late_tool_completion(
+                            tb["name"], tb_input, result_str,
+                        )
                     return ""
                 if len(staged_results) != len(tool_use_blocks):
                     assistant_content = assistant_content[:len(staged_results) + (1 if text_content else 0)]
@@ -10116,75 +11088,25 @@ class MediaStreamSession:
         cancelled = False
 
         try:
-            client = self._gemini_tts_client
-            if client is None:
-                client = _get_gemini_tts_client()
-                self._gemini_tts_client = client
-            stream = await client.aio.interactions.create(
-                model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
-                input=text,
-                stream=True,
-                response_format={"type": "audio"},
-                generation_config={
-                    "speech_config": [{
-                        "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
-                    }],
-                },
-                timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
-            )
-
-            async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
-                if not self._owns_sinhala_tts_stream(
-                    expected_generation, audio_emitted=audio_emitted
-                ) or (
-                    turn_generation is not None
-                    and turn_generation >= 0
-                    and turn_generation != self._speak_generation
-                ):
-                    cancelled = True
-                    break
-                if (
-                    (
-                        getattr(audio_delta, "mime_type", None) is not None
-                        and getattr(audio_delta, "mime_type") != "audio/l16"
-                    )
-                    or (
-                        getattr(audio_delta, "channels", None) is not None
-                        and getattr(audio_delta, "channels") != 1
-                    )
-                    or (
-                        getattr(audio_delta, "sample_rate", None) is not None
-                        and getattr(audio_delta, "sample_rate") != 24000
-                    )
-                ):
-                    self._log_tts_failure("gemini", "invalid_audio_metadata")
-                    self._emit_smartpbx_tts_diagnostic(
-                        DiagnosticFailureClass.TTS_EXCEPTION
-                    )
-                    return
-                try:
-                    chunk = base64.b64decode(audio_b64, validate=True)
-                except (binascii.Error, ValueError, TypeError):
-                    self._log_tts_failure("gemini", "malformed_audio")
-                    self._emit_smartpbx_tts_diagnostic(
-                        DiagnosticFailureClass.TTS_EXCEPTION
-                    )
-                    return
-                if not chunk:
-                    continue
-
-                data = pcm_tail + chunk
-                if len(data) % 2:
-                    data, pcm_tail = data[:-1], data[-1:]
-                else:
-                    pcm_tail = b""
-                if not data:
-                    continue
-                pcm8k, ratecv_state = audioop.ratecv(
-                    data, 2, 1, 24000, 8000, ratecv_state
+            # A pre-rendered fixed phrase (initial filler, tool filler,
+            # keypad prompt) replays straight from bytes: no provider round
+            # trip, so no 2-5 s time-to-first-byte in front of audio whose
+            # whole purpose is to arrive early. The delivery/fence/mark tail
+            # below is the identical sequence the streamed path ends with, so
+            # ownership and barge-in semantics are unchanged.
+            cached_phrase_audio = _get_cached_smartpbx_sinhala_phrase_audio(text)
+            if cached_phrase_audio is not None:
+                logger.info(
+                    "smartpbx_media event=tts_phrase_cache_hit provider=gemini"
                 )
-                mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
-
+                mulaw_buf = cached_phrase_audio
+                # Emit the cached clip in the same 640-byte frames as the
+                # streamed path so audible speaking state is claimed on the
+                # FIRST frame, not after the paced sender has drained the
+                # whole clip.  A single un-framed send blocked for the entire
+                # phrase with ``_is_speaking`` still False, which routed the
+                # caller's (and the agent's own echoed) audio through the
+                # pre-audio STT path and made the filler barge in on itself.
                 while len(mulaw_buf) >= 640:
                     if not self._owns_sinhala_tts_stream(
                         expected_generation, audio_emitted=audio_emitted
@@ -10199,8 +11121,92 @@ class MediaStreamSession:
                         if not audio_emitted:
                             cancelled = True
                             break
-                if cancelled:
-                    break
+            else:
+                client = self._gemini_tts_client
+                if client is None:
+                    client = _get_gemini_tts_client()
+                    self._gemini_tts_client = client
+                stream = await client.aio.interactions.create(
+                    model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
+                    input=text,
+                    stream=True,
+                    response_format={"type": "audio"},
+                    generation_config={
+                        "speech_config": [{
+                            "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
+                        }],
+                    },
+                    timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
+                )
+
+                async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
+                    if not self._owns_sinhala_tts_stream(
+                        expected_generation, audio_emitted=audio_emitted
+                    ) or (
+                        turn_generation is not None
+                        and turn_generation >= 0
+                        and turn_generation != self._speak_generation
+                    ):
+                        cancelled = True
+                        break
+                    if (
+                        (
+                            getattr(audio_delta, "mime_type", None) is not None
+                            and getattr(audio_delta, "mime_type") != "audio/l16"
+                        )
+                        or (
+                            getattr(audio_delta, "channels", None) is not None
+                            and getattr(audio_delta, "channels") != 1
+                        )
+                        or (
+                            getattr(audio_delta, "sample_rate", None) is not None
+                            and getattr(audio_delta, "sample_rate") != 24000
+                        )
+                    ):
+                        self._log_tts_failure("gemini", "invalid_audio_metadata")
+                        self._emit_smartpbx_tts_diagnostic(
+                            DiagnosticFailureClass.TTS_EXCEPTION
+                        )
+                        return
+                    try:
+                        chunk = base64.b64decode(audio_b64, validate=True)
+                    except (binascii.Error, ValueError, TypeError):
+                        self._log_tts_failure("gemini", "malformed_audio")
+                        self._emit_smartpbx_tts_diagnostic(
+                            DiagnosticFailureClass.TTS_EXCEPTION
+                        )
+                        return
+                    if not chunk:
+                        continue
+
+                    data = pcm_tail + chunk
+                    if len(data) % 2:
+                        data, pcm_tail = data[:-1], data[-1:]
+                    else:
+                        pcm_tail = b""
+                    if not data:
+                        continue
+                    pcm8k, ratecv_state = audioop.ratecv(
+                        data, 2, 1, 24000, 8000, ratecv_state
+                    )
+                    mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+
+                    while len(mulaw_buf) >= 640:
+                        if not self._owns_sinhala_tts_stream(
+                            expected_generation, audio_emitted=audio_emitted
+                        ):
+                            cancelled = True
+                            break
+                        frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
+                        if await self._send_media_audio(frame):
+                            await self._flush_pre_audio_stt()
+                            self._mark_smartpbx_turn_once("tts_first_chunk")
+                            audio_emitted = self._mark_tts_audible(expected_generation)
+                            if not audio_emitted:
+                                cancelled = True
+                                break
+                    if cancelled:
+                        break
 
             if pcm_tail and not cancelled:
                 self._log_tts_failure("gemini", "malformed_audio")
@@ -10306,110 +11312,142 @@ class MediaStreamSession:
         self._is_speaking = True
         self._mark_smartpbx_turn_once("tts_request")
         self._speaking_since = time.monotonic()
+        # audit #9: unlike Gemini/Sinhala TTS, ElevenLabs sets _is_speaking
+        # True immediately (before TTFB), so a genuine >=BARGEIN_MIN_CHARS
+        # interruption can still barge in during that window. But a
+        # sub-threshold/debounced STT result arriving in that same window was
+        # previously just dropped -- not buffered -- because
+        # _pre_audio_synthesis_active() only recognized Gemini's "in flight,
+        # not yet speaking" shape. This tracks ElevenLabs' own pre-audio
+        # window (request started, no frame on the wire yet) so
+        # _on_stt_result/_on_stt_interim route it through the same
+        # _handle_pre_audio_stt buffering Sinhala already has.
+        expected_generation = self._speak_generation
+        smartpbx_pre_audio = self._is_direct_smartpbx()
+        audio_emitted = False
+        if smartpbx_pre_audio:
+            self._smartpbx_en_pre_audio_active = True
+            self._smartpbx_en_pre_audio_generation = expected_generation
         url = _elevenlabs_stream_url(voice_id)
         headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
         payload: dict[str, Any] = {"text": text, "model_id": model_id, "voice_settings": voice_settings}
 
-        if self._consume_smartpbx_welcome_audio_marker(text):
-            cache_key = _smartpbx_welcome_audio_cache_key(
-                text, url, model_id, voice_settings,
-            )
+        try:
+            if self._consume_smartpbx_welcome_audio_marker(text):
+                cache_key = _smartpbx_welcome_audio_cache_key(
+                    text, url, model_id, voice_settings,
+                )
 
-            async def fetch_welcome_audio() -> bytes:
+                async def fetch_welcome_audio() -> bytes:
+                    async with httpx.AsyncClient() as http:
+                        async with http.stream(
+                            "POST", url, json=payload, headers=headers, timeout=15.0,
+                        ) as resp:
+                            if resp.status_code != 200:
+                                await resp.aread()
+                                self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
+                                self._emit_smartpbx_tts_diagnostic(
+                                    DiagnosticFailureClass.TTS_HTTP_STATUS
+                                )
+                                raise _ElevenLabsWelcomeHTTPStatus()
+                            chunks: list[bytes] = []
+                            async for chunk in resp.aiter_bytes(chunk_size=640):
+                                if chunk:
+                                    chunks.append(chunk)
+                            return b"".join(chunks)
+
+                try:
+                    audio = await _get_cached_smartpbx_welcome_audio(cache_key, fetch_welcome_audio)
+                    if not self._is_speaking:
+                        logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                        return
+                    self._mark_smartpbx_turn_once("tts_first_chunk")
+                    audio_emitted = True
+                    if smartpbx_pre_audio:
+                        self._smartpbx_end_en_pre_audio_window(expected_generation)
+                    await self._send_media_audio(audio)
+                    if self._is_speaking:
+                        await self._send_tts_done(
+                            sentence=sentence,
+                            turn_generation=turn_generation,
+                        )
+                    else:
+                        logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                except _ElevenLabsWelcomeHTTPStatus:
+                    self._is_speaking = False
+                except _ElevenLabsWelcomeEmptyAudio:
+                    self._log_tts_failure("elevenlabs", "empty_audio")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
+                    self._is_speaking = False
+                except httpx.TimeoutException:
+                    self._log_tts_failure("elevenlabs", "timeout")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_TIMEOUT)
+                    self._is_speaking = False
+                except Exception:
+                    self._log_tts_failure("elevenlabs", "exception")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
+                    self._is_speaking = False
+                return
+
+            try:
                 async with httpx.AsyncClient() as http:
                     async with http.stream(
                         "POST", url, json=payload, headers=headers, timeout=15.0,
                     ) as resp:
                         if resp.status_code != 200:
-                            await resp.aread()
-                            self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
-                            self._emit_smartpbx_tts_diagnostic(
-                                DiagnosticFailureClass.TTS_HTTP_STATUS
-                            )
-                            raise _ElevenLabsWelcomeHTTPStatus()
-                        chunks: list[bytes] = []
-                        async for chunk in resp.aiter_bytes(chunk_size=640):
-                            if chunk:
-                                chunks.append(chunk)
-                        return b"".join(chunks)
+                            body = await resp.aread()
+                            if self._is_smartpbx_session():
+                                self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
+                                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_HTTP_STATUS)
+                            else:
+                                logger.error("ElevenLabs %d: %s", resp.status_code, body[:200])
+                            self._is_speaking = False
+                            return
 
-            try:
-                audio = await _get_cached_smartpbx_welcome_audio(cache_key, fetch_welcome_audio)
-                if not self._is_speaking:
-                    logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
-                    return
-                self._mark_smartpbx_turn_once("tts_first_chunk")
-                await self._send_media_audio(audio)
+                        async for chunk in resp.aiter_bytes(chunk_size=640):
+                            if not self._is_speaking:
+                                break
+                            if chunk:
+                                self._mark_smartpbx_turn_once("tts_first_chunk")
+                                audio_emitted = True
+                                if smartpbx_pre_audio:
+                                    self._smartpbx_end_en_pre_audio_window(expected_generation)
+                            await self._send_media_audio(chunk)
+
                 if self._is_speaking:
                     await self._send_tts_done(
                         sentence=sentence,
                         turn_generation=turn_generation,
                     )
                 else:
-                    logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
-            except _ElevenLabsWelcomeHTTPStatus:
-                self._is_speaking = False
-            except _ElevenLabsWelcomeEmptyAudio:
-                self._log_tts_failure("elevenlabs", "empty_audio")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
-                self._is_speaking = False
+                    if self._is_smartpbx_session():
+                        logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                    else:
+                        logger.info("ElevenLabs TTS interrupted by barge-in [%s]", self.call_sid)
+
             except httpx.TimeoutException:
-                self._log_tts_failure("elevenlabs", "timeout")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_TIMEOUT)
+                if self._is_smartpbx_session():
+                    self._log_tts_failure("elevenlabs", "timeout")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_TIMEOUT)
+                else:
+                    logger.error("ElevenLabs timeout for: %s", text[:80])
                 self._is_speaking = False
             except Exception:
-                self._log_tts_failure("elevenlabs", "exception")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
-                self._is_speaking = False
-            return
-
-        try:
-            async with httpx.AsyncClient() as http:
-                async with http.stream(
-                    "POST", url, json=payload, headers=headers, timeout=15.0,
-                ) as resp:
-                    if resp.status_code != 200:
-                        body = await resp.aread()
-                        if self._is_smartpbx_session():
-                            self._log_tts_failure("elevenlabs", "http_status", resp.status_code)
-                            self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_HTTP_STATUS)
-                        else:
-                            logger.error("ElevenLabs %d: %s", resp.status_code, body[:200])
-                        self._is_speaking = False
-                        return
-
-                    async for chunk in resp.aiter_bytes(chunk_size=640):
-                        if not self._is_speaking:
-                            break
-                        if chunk:
-                            self._mark_smartpbx_turn_once("tts_first_chunk")
-                        await self._send_media_audio(chunk)
-
-            if self._is_speaking:
-                await self._send_tts_done(
-                    sentence=sentence,
-                    turn_generation=turn_generation,
-                )
-            else:
                 if self._is_smartpbx_session():
-                    logger.info("smartpbx_media event=tts_interrupted provider=elevenlabs")
+                    self._log_tts_failure("elevenlabs", "exception")
+                    self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
                 else:
-                    logger.info("ElevenLabs TTS interrupted by barge-in [%s]", self.call_sid)
-
-        except httpx.TimeoutException:
-            if self._is_smartpbx_session():
-                self._log_tts_failure("elevenlabs", "timeout")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_TIMEOUT)
-            else:
-                logger.error("ElevenLabs timeout for: %s", text[:80])
-            self._is_speaking = False
-        except Exception:
-            if self._is_smartpbx_session():
-                self._log_tts_failure("elevenlabs", "exception")
-                self._emit_smartpbx_tts_diagnostic(DiagnosticFailureClass.TTS_EXCEPTION)
-            else:
-                logger.exception("ElevenLabs TTS failed for: %s", text[:80])
-            self._is_speaking = False
+                    logger.exception("ElevenLabs TTS failed for: %s", text[:80])
+                self._is_speaking = False
+        finally:
+            if (
+                smartpbx_pre_audio
+                and self._smartpbx_en_pre_audio_generation == expected_generation
+            ):
+                self._smartpbx_en_pre_audio_active = False
+                self._smartpbx_en_pre_audio_generation = None
+                if not audio_emitted:
+                    await self._flush_pre_audio_stt()
 
     # â”€â”€ Azure TTS (Sinhala) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -11251,7 +12289,10 @@ async def _run_llm_streaming_claude(
             model=model,
             max_tokens=MAX_TOKENS,
             system=_split_claude_system_blocks(system),
-            messages=conversation_history,
+            # Same reason as the Media Streams runner: a ConversationRelay
+            # Gemini→Claude failover inherits an OpenAI-shaped tool history.
+            # Identity pass when the history is already Anthropic-shaped.
+            messages=_claude_messages_from_history(conversation_history),
             tools=tools if tools else NOT_GIVEN,
         ) as stream:
             async for event in stream:

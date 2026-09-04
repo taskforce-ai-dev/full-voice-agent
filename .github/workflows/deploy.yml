@@ -71,15 +71,15 @@ jobs:
       MODE: ${{ inputs.mode }}
     steps:
       - name: Checkout at ref
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Reject Kavya image publishing
+      - name: Reject Kavya generic deployment
         run: |
           set -euo pipefail
-          if [[ "$AGENT" == "kavya" && "$MODE" == "image" ]]; then
-            echo "Kavya image mode is disabled; use the build-only Kavya image publisher." >&2
+          if [[ "$AGENT" == "kavya" ]]; then
+            echo "Kavya is excluded from generic deploy.yml for every mode (image, fast, build); use the build-only Kavya image publisher and the guarded runbook script (scripts/deploy_smartpbx_image.sh)." >&2
             exit 1
           fi
 
@@ -114,11 +114,11 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Set up Buildx
         if: ${{ inputs.mode == 'image' }}
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GHCR
         if: ${{ inputs.mode == 'image' }}
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -140,7 +140,7 @@ jobs:
 
       - name: Build & push image
         if: ${{ inputs.mode == 'image' }}
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: ${{ steps.map.outputs.src }}
           file: ${{ steps.map.outputs.src }}/Dockerfile
@@ -173,12 +173,26 @@ jobs:
           SRC: ${{ steps.map.outputs.src }}
           OPT: ${{ steps.map.outputs.opt }}
         run: |
+          # Kavya is rejected above for every mode, so this branch never runs
+          # for it today. These extra excludes are defence in depth only: if
+          # the reject step above is ever loosened or removed by mistake, a
+          # kavya rsync still cannot overwrite the host-side control plane
+          # (compose env allowlist, nginx vhosts, the guarded deploy scripts,
+          # the runbook). Other agents are unaffected.
+          extra_excludes=()
+          if [[ "$AGENT" == "kavya" ]]; then
+            extra_excludes=(
+              --exclude='scripts/' --exclude='docker-compose.yml'
+              --exclude='nginx-smartpbx*.conf' --exclude='SMARTPBX_RUNBOOK.md'
+            )
+          fi
           rsync -az \
             --exclude='.env' --exclude='.env.*' \
             --exclude='.git/' --exclude='.github/' \
             --exclude='venv/' --exclude='.venv/' --exclude='__pycache__/' \
             --exclude='chroma_db/' --exclude='node_modules/' \
             --exclude='*.log' --exclude='active_sessions.json' --exclude='*.bak' \
+            "${extra_excludes[@]}" \
             -e "ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=no" \
             "$SRC/" "$VPS_USER@$VPS_HOST:$OPT/"
 

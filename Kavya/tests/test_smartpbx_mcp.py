@@ -150,6 +150,28 @@ def test_endpoint_alone_cannot_enable_transfer():
     assert configuration.transfer_destinations == {}
 
 
+def test_blank_bounded_limits_fall_back_to_the_code_default_like_absent():
+    """P1-4: a key present but blank (an unset compose ``${VAR:-default}``
+    passthrough) must resolve exactly like a missing key -- otherwise
+    ``invalid_limits`` silently disables transfer even with a valid
+    URL/key/destinations configured."""
+    configuration = settings(
+        SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS="",
+        SMARTPBX_MCP_READ_TIMEOUT_SECONDS="",
+        SMARTPBX_MCP_MAX_RESPONSE_BYTES="",
+        SMARTPBX_MCP_RETRIES="",
+    )
+
+    assert configuration.failure is None
+    assert configuration.enabled is True
+    assert configuration.connect_timeout_seconds == 5
+    assert configuration.read_timeout_seconds == 15
+    assert configuration.max_response_bytes == 1048576
+    assert configuration.retries == 1
+    # An actually-invalid nonblank value must still fail closed.
+    assert settings(SMARTPBX_MCP_RETRIES="not-a-number").failure == "invalid_limits"
+
+
 def test_secret_and_destinations_do_not_appear_in_settings_repr():
     rendered = repr(settings())
 
@@ -915,11 +937,18 @@ async def test_smartpbx_disabled_transfer_never_reports_legacy_transferring(capl
 
     token = smartpbx_transfer_context.set(SmartPBXTransferContext(call_control=None))
     try:
-        result = await execute_tool("transfer_to_human", {"reason": "sensitive reason"})
+        with caplog.at_level(logging.INFO, logger="tools"):
+            result = await execute_tool("transfer_to_human", {"reason": "sensitive reason"})
     finally:
         smartpbx_transfer_context.reset(token)
 
     assert result == '{"status": "unavailable"}'
+    # Prove the negative assertion below actually means something: without
+    # `caplog.at_level` above, INFO records (tools.py logs execute_tool's
+    # entry at INFO) are never captured at all and `caplog.text` is simply
+    # empty -- "sensitive reason" not in caplog.text would then pass
+    # vacuously whether or not the tool ever logs a caller-supplied reason.
+    assert "smartpbx_tool event=execute tool=transfer_to_human" in caplog.text
     assert "sensitive reason" not in caplog.text
 
 

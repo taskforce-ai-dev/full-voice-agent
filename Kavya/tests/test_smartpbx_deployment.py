@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import hashlib
 import shutil
 import subprocess
 import re
@@ -46,11 +47,40 @@ def test_kavya_smartpbx_is_loopback_only_and_uses_its_own_port():
 
     assert service["profiles"] == ["smartpbx"]
     assert service["image"] == "ghcr.io/taskforce-ai-dev/kavya:${SMARTPBX_IMAGE_TAG:-disabled}"
+    # Membership alone (`in`) is satisfied by a second, additional binding
+    # such as `0.0.0.0:8006:8000` -- pin there is exactly one published
+    # port so a public bind can never sneak in alongside the loopback one.
+    assert len(service["ports"]) == 1
     assert "127.0.0.1:8006:8000" in service["ports"]
     assert service["environment"]["KAVYA_SERVICE_MODE"] == "smartpbx"
     assert service["environment"]["ENABLE_SMARTPBX_WSS"] == "true"
     assert service["environment"]["SMARTPBX_AUTH_HEADER_NAME"] == "X-Kavya-SmartPBX-Token"
     assert service["environment"]["SMARTPBX_MAX_CALLS"] == "4"
+
+
+def test_every_kavya_smartpbx_env_var_has_a_compose_default():
+    """P1-4: a key missing from .env.smartpbx must never arrive as "" -- every
+    ``${VAR}`` in the kavya-smartpbx environment block must carry a ``:-``
+    default, so a single omitted line cannot crash-loop the container or
+    silently flip behaviour (rates off, transfer off, wrong STT/LLM)."""
+    raw = read_text("docker-compose.yml")
+    compose = yaml.safe_load(raw)
+    environment = compose["services"]["kavya-smartpbx"]["environment"]
+
+    bare = []
+    for name, value in environment.items():
+        if not isinstance(value, str):
+            continue
+        for match in re.finditer(r"\$\{([A-Z0-9_]+)(:-[^}]*)?\}", value):
+            if match.group(2) is None:
+                bare.append((name, match.group(0)))
+    assert bare == [], f"these kavya-smartpbx env entries have a ${{VAR}} with no default: {bare}"
+
+    # The service block itself: the image tag also needs a default (already
+    # covered, but pin it here so the two contracts cannot drift apart).
+    image = compose["services"]["kavya-smartpbx"]["image"]
+    for match in re.finditer(r"\$\{([A-Z0-9_]+)(:-[^}]*)?\}", image):
+        assert match.group(2) is not None, f"{image} is missing a default"
 
 
 def test_startup_preroll_is_explicitly_default_off_and_has_a_documented_two_second_canary_rollback():
@@ -63,9 +93,16 @@ def test_startup_preroll_is_explicitly_default_off_and_has_a_documented_two_seco
     assert re.search(r"^SMARTPBX_STARTUP_PREROLL_MS=0$", example, re.MULTILINE)
     assert "20 ms multiples in [0, 2000]" in example
     assert "SMARTPBX_STARTUP_PREROLL_MS=2000" in runbook
-    assert "SMARTPBX_STARTUP_PREROLL_MS=100" in runbook
     assert "SMARTPBX_STARTUP_PREROLL_MS=0" in runbook
     assert "not an Opus migration" in runbook
+    # P2-6: production's validated stable setting is the default-off 0, not
+    # 100 -- the rollback instruction must restore the same value the compose
+    # default and .env.example already agree on, not a third, undocumented one.
+    assert "SMARTPBX_STARTUP_PREROLL_MS=100" not in runbook
+    canary_section = runbook.split("## Controlled startup pre-roll canary", 1)[1].split("\n## ", 1)[0]
+    assert "restore" in canary_section.lower() or "restore" in canary_section
+    restore_sentence = canary_section[canary_section.lower().find("restore"):]
+    assert "SMARTPBX_STARTUP_PREROLL_MS=0" in restore_sentence[:200]
 
 
 def test_examples_never_enable_or_populate_live_transfer():
@@ -93,8 +130,52 @@ def test_dockerfile_locks_dependencies_and_copies_every_smartpbx_runtime_module(
         "smartpbx_protocol.py",
         "smartpbx_session.py",
         "smartpbx_transport.py",
+        "smartpbx_dtmf.py",
+        "smartpbx_diagnostics.py",
+        "handover.py",
+        "post_call.py",
+        "dashboard_client.py",
+        "english_voice_profile.py",
     ):
         assert module in dockerfile
+    # Every first-party module server.py imports at top level must ship, or
+    # the container dies at import (2026-07-31: ModuleNotFoundError 'handover').
+    import ast as _ast
+    tree = _ast.parse(read_text("server.py"))
+    local_modules = {
+        (node.module if isinstance(node, _ast.ImportFrom) else alias.name)
+        for node in tree.body
+        if isinstance(node, (_ast.Import, _ast.ImportFrom))
+        for alias in (node.names if isinstance(node, _ast.Import) else [None])
+        if (PROJECT_ROOT / f"{(node.module if isinstance(node, _ast.ImportFrom) else alias.name)}.py").exists()
+    }
+    for module in sorted(local_modules):
+        assert f"{module}.py" in dockerfile, f"{module}.py is imported by server.py but not copied into the image"
+
+
+def test_embedding_model_is_baked_into_the_image_and_offline_at_runtime():
+    """P2-8: the embedding model must not be downloaded from Hugging Face on
+    every container start -- that puts a deploy/rollback's ready window
+    behind an external network dependency and turns an HF outage into
+    SMARTPBX_ROLLBACK_ESCALATION_REQUIRED."""
+    dockerfile = read_text("Dockerfile")
+    knowledge_base = read_text("knowledge_base.py")
+    match = re.search(r'EMBEDDING_MODEL_NAME\s*:\s*str\s*=\s*"([^"]+)"', knowledge_base)
+    assert match, "could not find EMBEDDING_MODEL_NAME in knowledge_base.py"
+    model_name = match.group(1)
+
+    bake_line = f"RUN python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('{model_name}')\""
+    assert bake_line in dockerfile
+    # The bake must land after the pip-install layer (the package must exist)
+    # and before the application COPY (deterministic, cache-friendly build).
+    pip_index = dockerfile.find("pip install --no-cache-dir -r requirements-prod.lock.txt")
+    copy_index = dockerfile.find("COPY server.py")
+    bake_index = dockerfile.find(bake_line)
+    assert pip_index < bake_index < copy_index
+
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    environment = compose["services"]["kavya-smartpbx"]["environment"]
+    assert environment.get("HF_HUB_OFFLINE") == "1"
 
 
 def test_dockerfile_copies_the_neutral_diagnostics_module_for_runtime_imports():
@@ -119,10 +200,26 @@ def test_nginx_exposes_only_the_bounded_smartpbx_surface_with_tls():
     # one JSON line per rejection and no nginx record of the source.
     assert "access_log off;" not in nginx
     assert "access_log /var/log/nginx/smartpbx-kavya-access.log" in nginx
+    # P1-5: a minimal custom format -- no query string, no headers, no PII --
+    # not the default combined format (which would carry the request line
+    # with any query string verbatim).
+    assert "access_log /var/log/nginx/smartpbx-kavya-access.log smartpbx_min;" in nginx
+    assert re.search(
+        r"log_format\s+smartpbx_min\s+'\$request_method \$uri \$status \$http_upgrade \$request_time';",
+        nginx,
+    )
     assert "limit_req_zone $binary_remote_addr zone=kavya_smartpbx_req:10m rate=30r/m;" in nginx
     media = nginx.split("location = /ws/v1/smartpbx/media", 1)[1].split("location =", 1)[0]
     assert "limit_req zone=kavya_smartpbx_req burst=10 nodelay;" in media
     assert "limit_req_status 429;" in nginx
+    # /smartpbx/status and /health share the media socket's single uvicorn
+    # worker; without their own rate limit an unauthenticated client can
+    # hammer them freely (no auth is required to reach /health at all).
+    assert "limit_req_zone $binary_remote_addr zone=kavya_smartpbx_http:10m rate=60r/m;" in nginx
+    health = nginx.split("location = /health", 1)[1].split("location =", 1)[0]
+    status_block = nginx.split("location = /smartpbx/status", 1)[1].split("location /", 1)[0]
+    assert "limit_req zone=kavya_smartpbx_http burst=20 nodelay;" in health
+    assert "limit_req zone=kavya_smartpbx_http burst=20 nodelay;" in status_block
     assert nginx.count("location = /ws/v1/smartpbx/media") == 1
     assert nginx.count("location = /health") == 1
     assert nginx.count("location = /smartpbx/status") == 1
@@ -199,6 +296,20 @@ def test_smartpbx_runbook_selects_ci_short_sha_and_verifies_full_oci_revision():
     assert "org.opencontainers.image.revision" in runbook
     assert "--pull never" in runbook
     assert "<REVIEWED_COMMIT_SHA>" not in runbook
+
+
+def test_runbook_defines_reviewed_image_digest_before_its_first_use():
+    """P3-2/P4: REVIEWED_IMAGE_DIGEST must be assigned in the preconditions
+    block -- every guarded-script call and the Sinhala rollback transaction
+    read it, and an undefined var under `set -euo pipefail` aborts the
+    transaction instead of running it."""
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+
+    definition = re.search(r"^REVIEWED_IMAGE_DIGEST=", runbook, re.MULTILINE)
+    assert definition, "REVIEWED_IMAGE_DIGEST is never assigned in the runbook"
+    first_use = runbook.find('"$REVIEWED_IMAGE_DIGEST"')
+    assert first_use != -1
+    assert definition.start() < first_use
 
 
 def test_mcp_enable_and_revoke_recreate_only_the_pinned_service_and_prove_runtime_disabled():
@@ -306,7 +417,10 @@ def test_tls_and_mcp_recreates_fail_fast_and_wait_for_bounded_loopback_readiness
     revoke_invocation = re.search(r"(?m)^wait_for_smartpbx_ready\s*$", revoke).start()
     assert tls_invocation < tls.find("sudo install -m 0644 nginx-smartpbx.conf")
     assert runbook.find("Enable a supervised non-production transfer drill") + enable_invocation < runbook.find("Perform one observed drill")
-    assert revoke_invocation < revoke.find(".transfer_enabled == false")
+    # The final post-revoke verification line, not the earlier idle-gate
+    # jq filter (P1-2/P1-3's wait_for_smartpbx_idle also contains
+    # ".transfer_enabled == false" as part of a longer filter).
+    assert revoke_invocation < revoke.find("jq -e '.transfer_enabled == false'")
 
 
 def test_yanolja_credentials_are_blank_and_smartpbx_chroma_state_is_ignored():
@@ -338,10 +452,14 @@ def test_canonical_voice_configuration_covers_both_kavya_services_and_stays_disa
     assert re.search(r"^KAVYA_EN_ELEVENLABS_VOICE_ID=$", example, re.MULTILINE)
     assert re.search(r"^KAVYA_EN_ELEVENLABS_VOICE_ID=.+$", example, re.MULTILINE) is None
     assert legacy["env_file"] == [".env"]
-    assert environment["KAVYA_EN_ELEVENLABS_VOICE_ID"] == "${KAVYA_EN_ELEVENLABS_VOICE_ID}"
-    assert environment["SMARTPBX_API_KEY"] == "${SMARTPBX_API_KEY}"
-    assert environment["SMARTPBX_MCP_ACCOUNT_HEADER"] == "${SMARTPBX_MCP_ACCOUNT_HEADER}"
-    assert environment["SMARTPBX_TRANSFER_DESTINATIONS_JSON"] == "${SMARTPBX_TRANSFER_DESTINATIONS_JSON}"
+    # P1-4: these still resolve to their fail-closed/disabled state on a blank
+    # value, so the compose default is empty (KAVYA_EN_ELEVENLABS_VOICE_ID,
+    # SMARTPBX_API_KEY, SMARTPBX_MCP_ACCOUNT_HEADER) or "{}" (destinations JSON)
+    # -- never a value that would enable transfer or voice by omission.
+    assert environment["KAVYA_EN_ELEVENLABS_VOICE_ID"] == "${KAVYA_EN_ELEVENLABS_VOICE_ID:-}"
+    assert environment["SMARTPBX_API_KEY"] == "${SMARTPBX_API_KEY:-}"
+    assert environment["SMARTPBX_MCP_ACCOUNT_HEADER"] == "${SMARTPBX_MCP_ACCOUNT_HEADER:-}"
+    assert environment["SMARTPBX_TRANSFER_DESTINATIONS_JSON"] == "${SMARTPBX_TRANSFER_DESTINATIONS_JSON:-{}}"
     assert re.search(r"^SMARTPBX_API_KEY=$", example, re.MULTILINE)
     assert re.search(r"^SMARTPBX_MCP_ACCOUNT_HEADER=$", example, re.MULTILINE)
     assert re.search(r"^SMARTPBX_TRANSFER_DESTINATIONS_JSON=\{\}$", example, re.MULTILINE)
@@ -355,7 +473,10 @@ def test_canonical_voice_configuration_covers_both_kavya_services_and_stays_disa
         "transfer-disabled",
     ):
         assert required in runbook
-    assert "sha" + "256sum" not in runbook
+    # The canonical-voice procedure validates env contents, never checksums;
+    # the separate opt-in host-file integrity check may use sha256sum.
+    voice_section = runbook.split("## Canonical English voice provisioning", 1)[1].split("\n## ", 1)[0]
+    assert "sha" + "256sum" not in voice_section
 
 
 def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_operations():
@@ -711,6 +832,44 @@ def test_env_example_explains_the_smartpbx_model_and_budget_divergence():
     assert re.search(
         r"^CLAUDE_MODEL=claude-sonnet-4-5-20250929$", example, re.MULTILINE
     )
+
+
+def test_claude_md_warns_that_deploy_sh_and_vps_builds_are_not_for_smartpbx():
+    """P2-5/P3-1: Commands and Operational Details must not silently let an
+    operator route a SmartPBX change through deploy.sh / a VPS build."""
+    claude_md = read_text("CLAUDE.md")
+
+    commands_section = claude_md.split("## Commands", 1)[1].split("\n## ", 1)[0]
+    assert "WARNING" in commands_section
+    assert "kavya-smartpbx" in commands_section
+    assert "SMARTPBX_RUNBOOK.md" in commands_section
+
+    operational_section = claude_md.split("## Operational Details", 1)[1].split("\n## ", 1)[0]
+    assert "WARNING" in operational_section
+    assert "kavya-smartpbx" in operational_section
+    assert "SMARTPBX_RUNBOOK.md" in operational_section
+
+
+def test_claude_md_n8n_postcall_webhook_default_matches_code():
+    """P2-5: CLAUDE.md must not disagree with post_call.py's real default."""
+    claude_md = read_text("CLAUDE.md")
+
+    assert "N8N_POSTCALL_WEBHOOK` (default: `/webhook/post-call-data`)" in claude_md
+    assert "N8N_POSTCALL_WEBHOOK` env var (default: `/webhook/post-call-data`)" in claude_md
+    assert "/webhook/transcript" not in claude_md
+
+
+def test_agents_md_stays_in_sync_with_claude_md_on_shared_text():
+    """Keep the operator-facing warning identical wherever both files carry it."""
+    claude_md = read_text("CLAUDE.md")
+    agents_md = read_text("AGENTS.md")
+
+    for needle in (
+        "N8N_POSTCALL_WEBHOOK` (default: `/webhook/post-call-data`)",
+    ):
+        if needle in claude_md:
+            assert needle in agents_md, f"AGENTS.md is stale for: {needle}"
+    assert "/webhook/transcript" not in agents_md
 
 
 def test_runbook_allows_only_privacy_safe_telemetry_and_bounded_local_retention():
@@ -2221,15 +2380,19 @@ def test_build_kavya_image_publisher_uses_only_trusted_tooling_and_honest_writer
     assert "consumers use the verified digest" in text
 
 
-def test_deploy_workflow_rejects_kavya_image_mode_before_any_publisher_or_host_step():
+def test_deploy_workflow_rejects_kavya_for_every_mode_before_any_publisher_or_host_step():
     text = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
     document = yaml.load(text, Loader=yaml.BaseLoader)
     steps = document["jobs"]["deploy"]["steps"]
 
-    guard = workflow_step(steps, "Reject Kavya image publishing")
+    guard = workflow_step(steps, "Reject Kavya generic deployment")
     guard_run = guard["run"]
-    assert '[[ "$AGENT" == "kavya" && "$MODE" == "image" ]]' in guard_run
-    assert "Kavya image mode is disabled; use the build-only Kavya image publisher." in guard_run
+    # The condition must reject every mode, not just `image` — it must not
+    # reference $MODE at all.
+    assert '[[ "$AGENT" == "kavya" ]]' in guard_run
+    assert "$MODE" not in guard_run
+    assert "Kavya is excluded from generic deploy.yml for every mode" in guard_run
+    assert "deploy_smartpbx_image.sh" in guard_run
     assert "exit 1" in guard_run
     for later_name in (
         "Set up Buildx",
@@ -2239,6 +2402,121 @@ def test_deploy_workflow_rejects_kavya_image_mode_before_any_publisher_or_host_s
         "Sync agent files to the VPS (preserves .env + runtime state)",
     ):
         assert steps.index(guard) < steps.index(workflow_step(steps, later_name))
+
+
+def test_deploy_workflow_rsync_excludes_smartpbx_host_control_plane_for_kavya():
+    text = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    document = yaml.load(text, Loader=yaml.BaseLoader)
+    steps = document["jobs"]["deploy"]["steps"]
+
+    sync = workflow_step(steps, "Sync agent files to the VPS (preserves .env + runtime state)")
+    sync_run = sync["run"]
+    # Defence in depth: even if the reject-Kavya guard above is ever loosened,
+    # rsync must never overwrite the SmartPBX host-side control plane files.
+    for excluded in (
+        "--exclude='scripts/'",
+        "--exclude='docker-compose.yml'",
+        "--exclude='nginx-smartpbx*.conf'",
+        "--exclude='SMARTPBX_RUNBOOK.md'",
+    ):
+        assert excluded in sync_run
+    # These extra excludes must be conditional on AGENT == kavya so a build-mode
+    # deploy of any other agent still ships its own docker-compose.yml / scripts.
+    assert 'if [[ "$AGENT" == "kavya" ]]' in sync_run
+
+
+# The generic deploy engine + push trigger + secret scan + dep audit are not
+# gated by the reviewed-SHA image contract the Kavya-specific probe/publisher
+# use, but a compromised or force-moved floating tag executes attacker code
+# in a job holding VPS_SSH_KEY (root on the production VPS) or packages:write.
+# Pin every `uses:` in these four workflows to the commit SHA the tag
+# currently resolves to, with a `# vX` comment, matching build-kavya-image.yml.
+GENERIC_WORKFLOW_ACTION_PINS = {
+    "actions/checkout": ("3d3c42e5aac5ba805825da76410c181273ba90b1", "v7"),
+    "actions/setup-python": ("5fda3b95a4ea91299a34e894583c3862153e4b97", "v7"),
+    "docker/setup-buildx-action": ("37fe631027851001ddb9b187196cc803df7f5f0e", "v4"),
+    "docker/login-action": ("dbcb813823bdd20940b903addbd779551569679f", "v4"),
+    "docker/build-push-action": ("53b7df96c91f9c12dcc8a07bcb9ccacbed38856a", "v7"),
+}
+
+GENERIC_PINNED_WORKFLOWS = [
+    DEPLOY_WORKFLOW,
+    PROJECT_ROOT.parent / ".github/workflows/deploy-on-push.yml",
+    PROJECT_ROOT.parent / ".github/workflows/secret-scan.yml",
+    PROJECT_ROOT.parent / ".github/workflows/dep-audit.yml",
+]
+
+
+@pytest.mark.parametrize(
+    "workflow", GENERIC_PINNED_WORKFLOWS,
+    ids=["deploy", "deploy-on-push", "secret-scan", "dep-audit"],
+)
+def test_generic_deploy_workflows_pin_every_action_to_a_full_commit_sha(workflow):
+    text = workflow.read_text(encoding="utf-8")
+    document = yaml.load(text, Loader=yaml.BaseLoader)
+    # A reusable-workflow reference to a file in this same repo (e.g.
+    # `uses: ./.github/workflows/deploy.yml`) is not an external action and
+    # has no tag/SHA to pin.
+    references = [ref for ref in workflow_uses_strings(document) if not ref.startswith("./")]
+
+    assert references, "workflow declares no external actions"
+    for reference in references:
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", reference), reference
+        owner_repo, _, sha = reference.partition("@")
+        assert owner_repo in GENERIC_WORKFLOW_ACTION_PINS, owner_repo
+        expected_sha, expected_version = GENERIC_WORKFLOW_ACTION_PINS[owner_repo]
+        assert sha == expected_sha, reference
+        assert f"uses: {reference} # {expected_version}\n" in text, reference
+
+
+def test_dep_audit_workflow_audits_kavyas_lock_file_and_blocks_only_kavya():
+    workflow = (PROJECT_ROOT.parent / ".github/workflows/dep-audit.yml").read_text(encoding="utf-8")
+    document = yaml.load(workflow, Loader=yaml.BaseLoader)
+
+    # Kavya's advisory-vs-enforced split: every other agent stays advisory
+    # (continue-on-error), Kavya is blocking. The matrix is an expression:
+    # Kavya alone on pull_request (the only blocking row, on a trigger scoped
+    # to Kavya's requirements files), all 8 agents on the weekly/manual runs.
+    audit_job = document["jobs"]["audit"]
+    assert audit_job["continue-on-error"] == "${{ matrix.dir != 'Kavya' }}"
+    matrix_dir = audit_job["strategy"]["matrix"]["dir"]
+    assert isinstance(matrix_dir, str) and matrix_dir.startswith("${{") and matrix_dir.endswith("}}")
+    assert "github.event_name == 'pull_request' && fromJSON('[\"Kavya\"]')" in matrix_dir
+    for agent in (
+        "BSL Agent", "Flico Agent", "HattonHills", "Kavya",
+        "Kitchened", "SLIC Agent", "Sofia Agent", "WorldOfRefrigerators",
+    ):
+        assert f'"{agent}"' in matrix_dir
+    # chromadb's four deferred advisories are the only ignores, each named
+    # explicitly so a new advisory still fails the build.
+    run_text = next(
+        step for step in audit_job["steps"] if step.get("name") == "Audit pinned dependencies"
+    )["run"]
+    assert run_text.count("--ignore-vuln") == 4
+    for ignored in ("PYSEC-2026-311", "CVE-2026-45830", "CVE-2026-45831", "CVE-2026-45833"):
+        assert f"--ignore-vuln {ignored}" in run_text
+
+    step = next(
+        step for step in audit_job["steps"] if step.get("name") == "Audit pinned dependencies"
+    )
+    run = step["run"]
+    # Kavya is audited from the exact lock file its Dockerfile installs, not
+    # the loose requirements-prod.txt ranges pip-audit would otherwise
+    # silently re-resolve to the latest matching versions.
+    assert 'req="$dir/requirements-prod.lock.txt"' in run
+    assert 'pip-audit -r "$req" --no-deps' in run
+    assert 'if [ "$dir" = "Kavya" ]; then' in run
+    # Every other agent keeps the existing prod/base fallback, unaffected.
+    assert 'prod="$dir/requirements-prod.txt"' in run
+    assert 'base="$dir/requirements.txt"' in run
+
+    # A pull_request trigger exists, scoped to Kavya's own requirements files
+    # only -- it must not reintroduce the per-PR cost for the other 7 agents.
+    on = document["on"]
+    assert "pull_request" in on
+    assert on["pull_request"]["paths"] == ["Kavya/requirements*"]
+    assert "workflow_dispatch" in on
+    assert "schedule" in on
 
 
 SMARTPBX_IMAGE_DEPLOY_SCRIPT = PROJECT_ROOT / "scripts" / "deploy_smartpbx_image.sh"
@@ -2313,9 +2591,15 @@ def test_smartpbx_image_deploy_helper_recreates_only_smartpbx_and_checks_json_re
     assert "verify_isolation_baseline" in script
     for forbidden in (
         "docker system prune",
-        "docker image prune",
+        "image prune -a",
         "docker compose down",
-        "nginx",
+        # The optional host-file integrity check reads nginx config filenames
+        # (nginx-smartpbx*.conf) to verify their checksums — that is not
+        # managing nginx. What must never appear is the helper actually
+        # controlling the nginx process/service.
+        "nginx -s",
+        "reload nginx",
+        "restart nginx",
         "systemctl",
         "rsync",
         "ssh ",
@@ -2323,6 +2607,74 @@ def test_smartpbx_image_deploy_helper_recreates_only_smartpbx_and_checks_json_re
         "kavya-smartpbx flico",
     ):
         assert forbidden not in script.lower()
+
+
+def test_smartpbx_image_deploy_helper_splits_readiness_from_idleness():
+    """P1-3: post-recreate/rollback readiness must not require active_sessions==0."""
+    script = read_smartpbx_image_deploy_script()
+
+    assert "check_smartpbx_ready()" in script
+    assert "check_loopback_preflight()" in script
+    assert "wait_for_smartpbx_idle_preflight()" in script
+    ready_body = script.split("check_smartpbx_ready() {", 1)[1].split("\n}", 1)[0]
+    assert "active_sessions" not in ready_body
+    assert "transfer_enabled" not in ready_body
+    # wait_for_smartpbx_ready (post-recreate + rollback) polls readiness only.
+    ready_wait = script.split("wait_for_smartpbx_ready() {", 1)[1].split("\n}", 1)[0]
+    assert "check_smartpbx_ready" in ready_wait
+    assert "check_loopback_preflight" not in ready_wait
+    # The idle gate is bounded and only reachable from the pre-flight.
+    idle_wait = script.split("wait_for_smartpbx_idle_preflight() {", 1)[1].split("\n}", 1)[0]
+    assert "check_loopback_preflight" in idle_wait
+    assert "SMARTPBX_PREFLIGHT_IDLE_TIMEOUT_SECONDS" in idle_wait
+    assert "SMARTPBX_PREFLIGHT_IDLE_TIMEOUT" in idle_wait  # the abort message
+    main_block = script.split("main() {", 1)[1].split("\nif [[", 1)[0]
+    assert "wait_for_smartpbx_idle_preflight" in main_block
+    rollback_block = script.split("rollback_once() {", 1)[1].split("\n}", 1)[0]
+    assert "wait_for_smartpbx_ready" in rollback_block
+    assert "wait_for_smartpbx_idle_preflight" not in rollback_block
+
+
+def test_smartpbx_image_deploy_helper_archives_allowlisted_logs_before_every_recreate():
+    """P1-5: durable telemetry archive precedes both the forward and rollback recreate."""
+    script = read_smartpbx_image_deploy_script()
+
+    assert "archive_outgoing_logs" in script
+    assert "SMARTPBX_LOG_ARCHIVE_DIR" in script
+    for event in (
+        "smartpbx_protocol_diagnostic", "turn_stage", "turn_summary", "session_summary",
+        "stt_post_dispatch_result", "llm_round_outcome", "llm_stream_timeout", "llm_round",
+        "capture_", "dtmf_", "barge_in", "assistant_turn_delivery", "smartpbx_post_call",
+        "smartpbx_pilot_transcript",
+    ):
+        assert event in script
+    main_block = script.split("main() {", 1)[1].split("\nif [[", 1)[0]
+    assert main_block.find("archive_outgoing_logs") < main_block.find("recreate_smartpbx")
+    rollback_block = script.split("rollback_once() {", 1)[1].split("\n}", 1)[0]
+    assert rollback_block.find("archive_outgoing_logs") < rollback_block.find("recreate_smartpbx")
+
+
+def test_smartpbx_image_deploy_helper_prunes_stale_images_only_after_disarm():
+    """P2-1: disk hygiene never runs while rollback is still armed."""
+    script = read_smartpbx_image_deploy_script()
+
+    assert "prune_stale_kavya_images" in script
+    assert "docker image prune -f" in script
+    assert "docker builder prune -af" in script
+    main_block = script.split("main() {", 1)[1].split("\nif [[", 1)[0]
+    # Prune runs twice: once BEFORE the candidate pull (free space on a full
+    # host; the keep-set protects the armed rollback alias and both running
+    # images) and once after disarm.  Never between arm and disarm.
+    assert main_block.find("prune_stale_kavya_images") < main_block.find("verify_candidate_image")
+    armed_window = main_block.split("arm_rollback", 1)[1].split("disarm_rollback", 1)[0]
+    assert "prune_stale_kavya_images" not in armed_window
+    assert main_block.rfind("prune_stale_kavya_images") > main_block.find("disarm_rollback")
+    assert "prune_stale_kavya_images" not in script.split("rollback_once() {", 1)[1].split("\n}", 1)[0]
+    prune_body = script.split("prune_stale_kavya_images() {", 1)[1].split("\nmain() {", 1)[0]
+    assert "ROLLBACK_TAG" in prune_body
+    assert "ROLLBACK_TAG=rollback-local" in script
+    for kept in ("latest", "stable-*"):
+        assert kept in prune_body
 
 
 def test_smartpbx_image_deploy_helper_rolls_back_exact_local_baseline_without_sensitive_output():
@@ -2351,7 +2703,135 @@ def test_smartpbx_runbook_uses_the_guarded_smartpbx_image_deploy_helper():
     assert "authenticated integration probe" in runbook
 
 
+def test_smartpbx_runbook_documents_the_host_files_manifest_procedure():
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
 
+    assert "SMARTPBX_HOST_FILES_SHA256" in runbook
+    assert "git -C" in runbook
+    assert "sha256sum" in runbook
+    for name in (
+        "docker-compose.yml",
+        "nginx-smartpbx.conf",
+        "nginx-smartpbx-acme.conf",
+    ):
+        assert name in runbook
+
+
+def test_smartpbx_image_deploy_helper_verifies_host_files_before_recreate_when_manifest_set():
+    script = read_smartpbx_image_deploy_script()
+
+    assert "SMARTPBX_HOST_FILES_SHA256" in script
+    assert "check_host_files_integrity" in script
+    assert "sha256sum -c" in script
+    for required in (
+        "docker-compose.yml",
+        "nginx-smartpbx.conf",
+        "nginx-smartpbx-acme.conf",
+        "scripts/*.sh",
+    ):
+        assert required in script
+    main_block = script.split("main() {", 1)[1].split("\nif [[", 1)[0]
+    assert (
+        main_block.find("check_env_files")
+        < main_block.find("check_host_files_integrity")
+        < main_block.find("verify_candidate_image")
+        < main_block.find("arm_rollback")
+        < main_block.find("recreate_smartpbx")
+    )
+
+
+def test_check_host_files_integrity_is_optional_and_skips_when_unset(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    result = subprocess.run(
+        ["bash", "-c", f"cd {app}; source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; check_host_files_integrity"],
+        env=os.environ | {"SMARTPBX_HOST_FILES_SHA256": ""},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+
+
+def _write_host_files_fixture(app):
+    (app / "docker-compose.yml").write_text("compose\n", encoding="utf-8")
+    (app / "nginx-smartpbx.conf").write_text("nginx\n", encoding="utf-8")
+    (app / "nginx-smartpbx-acme.conf").write_text("acme\n", encoding="utf-8")
+    scripts = app / "scripts"
+    scripts.mkdir()
+    (scripts / "deploy_smartpbx_image.sh").write_text("script\n", encoding="utf-8")
+    return ("docker-compose.yml", "nginx-smartpbx.conf", "nginx-smartpbx-acme.conf", "scripts/deploy_smartpbx_image.sh")
+
+
+def _sha256_manifest(app, relative_paths):
+    lines = []
+    for rel in relative_paths:
+        digest = hashlib.sha256((app / rel).read_bytes()).hexdigest()
+        lines.append(f"{digest}  {rel}")
+    return "\n".join(lines) + "\n"
+
+
+def _run_host_files_check(app, manifest_path):
+    return subprocess.run(
+        ["bash", "-c", f"cd {app}; source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; check_host_files_integrity"],
+        env=os.environ | {"SMARTPBX_HOST_FILES_SHA256": str(manifest_path)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_check_host_files_integrity_passes_with_a_correct_manifest(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    relative_paths = _write_host_files_fixture(app)
+    manifest = tmp_path / "good.sha256"
+    manifest.write_text(_sha256_manifest(app, relative_paths), encoding="utf-8")
+
+    result = _run_host_files_check(app, manifest)
+    assert result.returncode == 0
+
+
+def test_check_host_files_integrity_fails_closed_on_missing_manifest(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    _write_host_files_fixture(app)
+
+    result = _run_host_files_check(app, tmp_path / "absent.sha256")
+    assert result.returncode != 0
+
+
+def test_check_host_files_integrity_fails_closed_when_manifest_omits_a_required_file(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    relative_paths = _write_host_files_fixture(app)
+    manifest = tmp_path / "incomplete.sha256"
+    # Omit the last required file — the check must not silently pass files it
+    # never looked for.
+    manifest.write_text(_sha256_manifest(app, relative_paths[:-1]), encoding="utf-8")
+
+    result = _run_host_files_check(app, manifest)
+    assert result.returncode != 0
+
+
+def test_check_host_files_integrity_fails_closed_on_a_tampered_file(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    relative_paths = _write_host_files_fixture(app)
+    manifest = tmp_path / "good.sha256"
+    manifest.write_text(_sha256_manifest(app, relative_paths), encoding="utf-8")
+
+    (app / "docker-compose.yml").write_text("tampered\n", encoding="utf-8")
+
+    result = _run_host_files_check(app, manifest)
+    assert result.returncode != 0
+
+
+
+@pytest.mark.skipif(
+    not Path("/usr/bin/jq").exists(),
+    reason="the fake jq wrapper shells out to a hardcoded /usr/bin/jq",
+)
 def test_smartpbx_image_deploy_functions_fail_closed_under_fake_path(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -2381,6 +2861,144 @@ def test_smartpbx_image_deploy_functions_fail_closed_under_fake_path(tmp_path):
     assert unrelated.returncode != 0
 
 
+def test_wait_for_smartpbx_idle_preflight_polls_until_idle_within_the_bound(tmp_path):
+    """P1-3: the idle gate retries -- it must not fail-fast on the first busy poll."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    counter_file = tmp_path / "calls"
+    counter_file.write_text("0", encoding="utf-8")
+    (fake_bin / "curl").write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ $* == *health* ]]; then printf \'%s\\n\' \'{"status":"ok","service_mode":"smartpbx"}\'; exit 0; fi\n'
+        f'n=$(cat {counter_file}); n=$((n + 1)); echo "$n" > {counter_file}\n'
+        'if [[ $n -ge 3 ]]; then printf \'%s\\n\' \'{"active_sessions":0,"transfer_enabled":false}\'\n'
+        'else printf \'%s\\n\' \'{"active_sessions":1,"transfer_enabled":false}\'; fi\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "jq").write_text("#!/usr/bin/env bash\nexec /usr/bin/jq \"$@\"\n", encoding="utf-8")
+    for command in (fake_bin / "curl", fake_bin / "jq"):
+        command.chmod(0o755)
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / ".env.smartpbx").write_text("SMARTPBX_WS_TOKEN=t\n", encoding="utf-8")
+    env = os.environ | {
+        "PATH": str(fake_bin) + ":" + os.environ["PATH"],
+        "SMARTPBX_PREFLIGHT_IDLE_TIMEOUT_SECONDS": "30",
+        "SMARTPBX_PREFLIGHT_IDLE_POLL_SECONDS": "0",
+    }
+    source = f"cd {app_dir}; source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; wait_for_smartpbx_idle_preflight"
+    result = subprocess.run(["bash", "-c", source], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0
+    assert int(counter_file.read_text()) >= 3
+
+
+def test_wait_for_smartpbx_idle_preflight_aborts_with_a_clear_message_after_the_bound(tmp_path):
+    """P1-3: a permanently busy line must abort with a legible operator message, not hang forever."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "curl").write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ $* == *health* ]]; then printf \'%s\\n\' \'{"status":"ok","service_mode":"smartpbx"}\'; exit 0; fi\n'
+        'printf \'%s\\n\' \'{"active_sessions":1,"transfer_enabled":false}\'\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "jq").write_text("#!/usr/bin/env bash\nexec /usr/bin/jq \"$@\"\n", encoding="utf-8")
+    for command in (fake_bin / "curl", fake_bin / "jq"):
+        command.chmod(0o755)
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / ".env.smartpbx").write_text("SMARTPBX_WS_TOKEN=t\n", encoding="utf-8")
+    env = os.environ | {
+        "PATH": str(fake_bin) + ":" + os.environ["PATH"],
+        "SMARTPBX_PREFLIGHT_IDLE_TIMEOUT_SECONDS": "0",
+        "SMARTPBX_PREFLIGHT_IDLE_POLL_SECONDS": "0",
+    }
+    source = f"cd {app_dir}; source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; wait_for_smartpbx_idle_preflight"
+    result = subprocess.run(["bash", "-c", source], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert "SMARTPBX_PREFLIGHT_IDLE_TIMEOUT" in result.stderr
+
+
+def test_archive_outgoing_logs_filters_to_the_allowlist_and_is_root_only(tmp_path):
+    """P1-5: only allowlisted events reach the archive; the file lands root-only."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker_log_lines = "\n".join([
+        'event=turn_summary call_id=abc outcome=ok',
+        'event=smartpbx_pilot_transcript text=redacted',
+        'event=something_unrelated should_not_appear=1',
+        'raw non-event line should not match either',
+    ])
+    (fake_bin / "docker").write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ $1 == logs ]]; then printf \'%s\\n\' "$DOCKER_LOG_LINES"; exit 0; fi\n'
+        'exit 98\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "docker").chmod(0o755)
+    archive_dir = tmp_path / "archive"
+    env = os.environ | {
+        "PATH": str(fake_bin) + ":" + os.environ["PATH"],
+        "DOCKER_LOG_LINES": docker_log_lines,
+        "SMARTPBX_LOG_ARCHIVE_DIR": str(archive_dir),
+    }
+    outgoing_id = "sha256:" + "ab" * 32
+    source = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; archive_outgoing_logs {outgoing_id}"
+    result = subprocess.run(["bash", "-c", source], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0
+    files = list(archive_dir.glob("*.log"))
+    assert len(files) == 1
+    name = files[0].name
+    assert name.endswith(f"-{outgoing_id[7:19]}.log")
+    content = files[0].read_text(encoding="utf-8")
+    assert "event=turn_summary" in content
+    assert "event=smartpbx_pilot_transcript" in content
+    assert "something_unrelated" not in content
+    assert "raw non-event line" not in content
+    assert oct(files[0].stat().st_mode)[-3:] == "600"
+    assert oct(archive_dir.stat().st_mode)[-3:] == "700"
+
+
+def test_prune_stale_kavya_images_keeps_running_rollback_stable_and_latest(tmp_path):
+    """P2-1: only genuinely stale tags are removed; running/rollback/stable/latest survive."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log_file = tmp_path / "docker.log"
+    (fake_bin / "docker").write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >> "$DOCKER_CALL_LOG"\n'
+        'if [[ $1 == inspect && $4 == kavya-smartpbx ]]; then printf \'%s\\n\' "ghcr.io/taskforce-ai-dev/kavya:abcdef0"; exit 0; fi\n'
+        'if [[ $1 == inspect && $4 == kavya-voice-agent ]]; then printf \'%s\\n\' "ghcr.io/taskforce-ai-dev/kavya:1234567"; exit 0; fi\n'
+        'if [[ $1 == images ]]; then\n'
+        '  printf \'%s\\n\' \\\n'
+        '    "ghcr.io/taskforce-ai-dev/kavya:abcdef0" \\\n'
+        '    "ghcr.io/taskforce-ai-dev/kavya:1234567" \\\n'
+        '    "ghcr.io/taskforce-ai-dev/kavya:rollback-local" \\\n'
+        '    "ghcr.io/taskforce-ai-dev/kavya:latest" \\\n'
+        '    "ghcr.io/taskforce-ai-dev/kavya:stable-20260901" \\\n'
+        '    "ghcr.io/taskforce-ai-dev/kavya:0ddba11"\n'
+        '  exit 0\n'
+        'fi\n'
+        'if [[ $1 == rmi ]]; then exit 0; fi\n'
+        'if [[ $1 == image && $2 == prune ]]; then exit 0; fi\n'
+        'if [[ $1 == builder && $2 == prune ]]; then exit 0; fi\n'
+        'exit 98\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "docker").chmod(0o755)
+    env = os.environ | {"PATH": str(fake_bin) + ":" + os.environ["PATH"], "DOCKER_CALL_LOG": str(log_file)}
+    source = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; prune_stale_kavya_images"
+    result = subprocess.run(["bash", "-c", source], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0
+    calls = log_file.read_text(encoding="utf-8")
+    assert "rmi ghcr.io/taskforce-ai-dev/kavya:0ddba11" in calls
+    for kept in ("abcdef0", "1234567", "rollback-local", "latest", "stable-20260901"):
+        assert f"rmi ghcr.io/taskforce-ai-dev/kavya:{kept}" not in calls
+    assert "image prune -f" in calls
+    assert "builder prune -af" in calls
+    assert "image prune -a " not in calls and not calls.rstrip().endswith("image prune -a")
+
+
 class FakeDeployHost:
     """A stateful fake PATH that executes the deploy helper without Docker."""
 
@@ -2391,8 +3009,21 @@ class FakeDeployHost:
     candidate = "sha256:" + "c" * 64
 
     def __init__(self, tmp_path, **state):
+        # Every consumer of this fake host shells out through real `sudo -n`
+        # (passwordless sudo required) and a `jq` wrapper that hard-codes
+        # /usr/bin/jq -- both host dependencies, unguarded before, that are
+        # present on CI's ubuntu runner but not necessarily on a laptop
+        # (audit-tests.md sec 4.2). Skip at this single choke point instead
+        # of decorating every one of this fixture's callers individually.
+        if shutil.which("sudo") is None:
+            pytest.skip("passwordless sudo is required by the fake deploy host")
+        if not Path("/usr/bin/jq").exists():
+            pytest.skip("/usr/bin/jq is required by the fake deploy host")
         self.root, self.bin, self.app = tmp_path, tmp_path / "bin", tmp_path / "app"
         self.bin.mkdir(); self.app.mkdir()
+        # Never let the telemetry archive touch the real host
+        # /var/log/kavya-smartpbx -- confine it to this scenario's tmp_path.
+        self.archive_dir = tmp_path / "smartpbx-log-archive"
         (self.app / ".env").write_text("SENTINEL_LOCAL_SECRET\n", encoding="utf-8")
         # The status endpoint is token-gated, so the deploy script must read the
         # token from here. Sentinel-named so the no-leak assertions cover it.
@@ -2524,15 +3155,21 @@ class FakeDeployHost:
         """), encoding="utf-8")
         path.chmod(0o755)
 
+    # Every full-main() test drives the deploy synchronously, so the
+    # pre-flight idle poll must resolve on the first check (never sleep out
+    # a real bounded wait). Dedicated tests for the bounded wait itself
+    # override these explicitly.
+    _FAST_PREFLIGHT = {"SMARTPBX_PREFLIGHT_IDLE_TIMEOUT_SECONDS": "0", "SMARTPBX_PREFLIGHT_IDLE_POLL_SECONDS": "0"}
+
     def run(self, *args, prelude="", **env):
-        environment = os.environ | {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state)} | {key: str(value) for key, value in env.items()}
+        environment = os.environ | {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state), "SMARTPBX_LOG_ARCHIVE_DIR": str(self.archive_dir)} | self._FAST_PREFLIGHT | {key: str(value) for key, value in env.items()}
         override = f"{prelude}; " if prelude else ""
         command = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; APP_DIR={self.app}; LOCK_FILE={self.root / 'lock'}; {override}main \"$@\""
         root_environment = [f"{key}={value}" for key, value in environment.items()]
         return subprocess.run(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, capture_output=True, check=False)
 
     def start(self, *args, **env):
-        environment = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state)} | {key: str(value) for key, value in env.items()}
+        environment = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LOG": str(self.log), "FAKE_STATE": str(self.state), "SMARTPBX_LOG_ARCHIVE_DIR": str(self.archive_dir)} | self._FAST_PREFLIGHT | {key: str(value) for key, value in env.items()}
         command = f"source {SMARTPBX_IMAGE_DEPLOY_SCRIPT}; APP_DIR={self.app}; LOCK_FILE={self.root / 'lock'}; main \"$@\""
         root_environment = [f"{key}={value}" for key, value in environment.items()]
         return subprocess.Popen(["sudo", "-n", "env", *root_environment, "bash", "-c", command, "fake-deploy", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -2596,6 +3233,43 @@ def test_deploy_rechecks_rollback_alias_before_forward_mutation(tmp_path):
 ])
 def test_deploy_preflight_failures_never_mutate(tmp_path, environment):
     host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+def test_deploy_missing_host_files_manifest_blocks_before_mutation(tmp_path):
+    host = FakeDeployHost(tmp_path)
+    result = host.deploy(SMARTPBX_HOST_FILES_SHA256=str(host.app / "missing-manifest.sha256"))
+    assert result.returncode != 0 and host.compose_count() == 0
+
+
+def test_deploy_correct_host_files_manifest_permits_recreate(tmp_path):
+    host = FakeDeployHost(tmp_path)
+    relative_paths = ("docker-compose.yml", "nginx-smartpbx.conf", "nginx-smartpbx-acme.conf")
+    for name in relative_paths:
+        (host.app / name).write_text(f"{name}\n", encoding="utf-8")
+    validator = host.app / "scripts" / "validate_english_voice_env.sh"
+    all_paths = relative_paths + ("scripts/validate_english_voice_env.sh",)
+    lines = [f"{hashlib.sha256((host.app / p).read_bytes()).hexdigest()}  {p}" for p in all_paths]
+    manifest = host.app / "host-files.sha256"
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = host.deploy(SMARTPBX_HOST_FILES_SHA256=str(manifest))
+    assert result.returncode == 0 and host.compose_count() == 1
+
+
+def test_deploy_tampered_host_file_after_manifest_blocks_before_mutation(tmp_path):
+    host = FakeDeployHost(tmp_path)
+    relative_paths = ("docker-compose.yml", "nginx-smartpbx.conf", "nginx-smartpbx-acme.conf")
+    for name in relative_paths:
+        (host.app / name).write_text(f"{name}\n", encoding="utf-8")
+    all_paths = relative_paths + ("scripts/validate_english_voice_env.sh",)
+    lines = [f"{hashlib.sha256((host.app / p).read_bytes()).hexdigest()}  {p}" for p in all_paths]
+    manifest = host.app / "host-files.sha256"
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Tamper docker-compose.yml after the manifest was produced.
+    (host.app / "docker-compose.yml").write_text("tampered\n", encoding="utf-8")
+
+    result = host.deploy(SMARTPBX_HOST_FILES_SHA256=str(manifest))
     assert result.returncode != 0 and host.compose_count() == 0
 
 
@@ -2666,8 +3340,13 @@ def test_deploy_signals_after_mutation_roll_back_once(tmp_path, signal_name):
     assert process.returncode != 0 and host.compose_count() == 2
 
 
-@pytest.mark.parametrize("attempt", range(10))
+@pytest.mark.parametrize("attempt", range(2))
 def test_traps_precede_arming_and_second_signal_cannot_interrupt_rollback(tmp_path, attempt):
+    # `attempt` is otherwise unused; it exists only to repeat this real
+    # sudo+SIGTERM+SIGINT process race a few times to catch flakiness in
+    # trap-arming ordering. 10 reps cost ~3.3-5.6s each (audit-tests.md
+    # sec 4.1, ~45s of the whole `-k smartpbx` subset for no added
+    # confidence beyond a couple of reps) -- trimmed to 2.
     script = read_smartpbx_image_deploy_script()
     arm = script.split("arm_rollback()", 1)[1].split("disarm_rollback()", 1)[0]
     assert arm.find("trap 'on_error") < arm.find("ROLLBACK_ARMED=1")
@@ -2992,14 +3671,20 @@ def test_stt_endpointing_knobs_are_deliverable_through_the_documented_path():
     kavya = compose["services"]["kavya"]
     assert ".env" in kavya["env_file"], "the Twilio service forwards .env vars via env_file"
 
-    for name in (
-        "STT_ENDPOINTING_SILENCE_SECONDS",
-        "STT_FINAL_GRACE_SECONDS",
-        "CAPTURE_ENDPOINTING_SILENCE_SECONDS",
-        "CAPTURE_FINAL_GRACE_SECONDS",
+    # P1-4: every passthrough must carry a compose default equal to the code
+    # default, so an omitted .env.smartpbx line falls back instead of arriving
+    # as "" (these particular parsers already tolerate blank -- see
+    # test_blank_smartpbx_allowlist_entries_fall_back_to_the_code_default --
+    # but the compose-level default is still required so `docker compose
+    # config` never warns and every entry has one, per the P1-4 fix).
+    for name, default in (
+        ("STT_ENDPOINTING_SILENCE_SECONDS", "1.0"),
+        ("STT_FINAL_GRACE_SECONDS", "0.5"),
+        ("CAPTURE_ENDPOINTING_SILENCE_SECONDS", "1.5"),
+        ("CAPTURE_FINAL_GRACE_SECONDS", "1.2"),
     ):
-        assert smartpbx_env.get(name) == f"${{{name}}}", (
-            f"{name} must be in the smartpbx environment allowlist to reach the container"
+        assert smartpbx_env.get(name) == f"${{{name}:-{default}}}", (
+            f"{name} must be in the smartpbx environment allowlist with its code default"
         )
 
     example = read_text(".env.example")
@@ -3060,13 +3745,13 @@ def test_dtmf_knobs_are_deliverable_through_the_documented_path():
     compose = yaml.safe_load(read_text("docker-compose.yml"))
     smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
 
-    for name in (
-        "DTMF_INTERDIGIT_TIMEOUT_SECONDS",
-        "DTMF_OVERALL_TIMEOUT_SECONDS",
-        "DTMF_MAX_DIGITS",
+    for name, default in (
+        ("DTMF_INTERDIGIT_TIMEOUT_SECONDS", "6.0"),
+        ("DTMF_OVERALL_TIMEOUT_SECONDS", "30.0"),
+        ("DTMF_MAX_DIGITS", "15"),
     ):
-        assert smartpbx_env.get(name) == f"${{{name}}}", (
-            f"{name} must be in the smartpbx environment allowlist to reach the container"
+        assert smartpbx_env.get(name) == f"${{{name}:-{default}}}", (
+            f"{name} must be in the smartpbx environment allowlist with its code default"
         )
 
     example = read_text(".env.example")
@@ -3083,9 +3768,9 @@ def test_dtmf_knobs_are_deliverable_through_the_documented_path():
 def test_bargein_knobs_are_deliverable_through_the_documented_path():
     compose = yaml.safe_load(read_text("docker-compose.yml"))
     smartpbx_env = compose["services"]["kavya-smartpbx"]["environment"]
-    for name in ("BARGEIN_MIN_CHARS", "BARGEIN_DEBOUNCE_SECONDS"):
-        assert smartpbx_env.get(name) == f"${{{name}}}", (
-            f"{name} must be in the smartpbx environment allowlist to reach the container"
+    for name, default in (("BARGEIN_MIN_CHARS", "12"), ("BARGEIN_DEBOUNCE_SECONDS", "0.6")):
+        assert smartpbx_env.get(name) == f"${{{name}:-{default}}}", (
+            f"{name} must be in the smartpbx environment allowlist with its code default"
         )
     example = read_text(".env.example")
     runbook = read_text("SMARTPBX_RUNBOOK.md")
@@ -3133,8 +3818,8 @@ def test_kavya_generic_rejection_and_reviewed_image_gates_remain_intact():
     probe = (workflows / "probe-kavya-image.yml").read_text(encoding="utf-8")
     publisher = (workflows / "build-kavya-image.yml").read_text(encoding="utf-8")
 
-    assert '"$AGENT" == "kavya" && "$MODE" == "image"' in generic_deploy
-    assert "Kavya image mode is disabled" in generic_deploy
+    assert '"$AGENT" == "kavya"' in generic_deploy
+    assert "Kavya is excluded from generic deploy.yml for every mode" in generic_deploy
 
     assert "repository_dispatch:" in probe
     assert "kavya_image_read_only_probe" in probe
@@ -3149,7 +3834,7 @@ SINHALA_LLM_DEFAULTS = {
     "SMARTPBX_SINHALA_LLM_PROVIDER": "gemini",
     "SMARTPBX_SINHALA_GEMINI_LLM_MODEL": "gemini-3.7-flash",
     "SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL": "low",
-    "SMARTPBX_SINHALA_GEMINI_MAX_TOKENS": "600",
+    "SMARTPBX_SINHALA_GEMINI_MAX_TOKENS": "1024",
 }
 
 SINHALA_GEMINI_TTS_DEFAULTS = {
@@ -3296,6 +3981,10 @@ def test_sinhala_smartpbx_runbook_documents_the_llm_tts_and_transaction_contract
     assert re.search(r"(?m)^.*docker compose.*\brestart\b", transaction) is None
 
 
+@pytest.mark.skipif(
+    shutil.which("docker") is None,
+    reason="this test renders the real docker-compose.yml through a real `docker compose config`",
+)
 def test_smartpbx_sinhala_llm_rendered_compose_and_protected_template_contract(tmp_path):
     # Use an isolated project directory. Never let Compose discover the real
     # repository .env, .env.smartpbx, Docker configuration, or any secret.
@@ -3640,3 +4329,20 @@ def test_documented_sinhala_rollback_transaction_orders_failures_and_cleanup(tmp
     assert len([line for line in operations if line.startswith("deploy ")]) == 1
     assert len([line for line in operations if line.startswith("updater cleanup ")]) == 1
     assert not list(tx.iterdir())
+
+
+def test_kavya_smartpbx_compose_runtime_hardening_is_pinned():
+    """stop_grace_period, bounded logging, a healthcheck, PII off and loopback
+    binding are load-bearing; none of them had an assertion before."""
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    service = compose["services"]["kavya-smartpbx"]
+    assert service["stop_grace_period"] == "30s"
+    assert service["logging"]["driver"] == "json-file"
+    assert service["logging"]["options"]["max-size"] == "10m"
+    assert service["logging"]["options"]["max-file"] == "3"
+    assert "healthcheck" in service and service["healthcheck"]["test"]
+    assert service["environment"]["SENTRY_SEND_PII"] == "false"
+    assert service["environment"]["SENTRY_ENABLE_LOGS"] == "false"
+    assert service["ports"] == ["127.0.0.1:8006:8000"]
+    legacy = compose["services"]["kavya"]
+    assert all(str(port).startswith("127.0.0.1:") for port in legacy["ports"])

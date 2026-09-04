@@ -69,9 +69,14 @@ class CountingSession(KavyaSmartPBXSession):
         super().__init__(*args, **kwargs)
         self.finish_calls = 0
 
-    async def finish(self, schedule_post_call: bool = False) -> None:
+    async def finish(
+        self,
+        schedule_post_call: bool = False,
+        close_reason: str | None = None,
+        close_code: int | None = None,
+    ) -> None:
         self.finish_calls += 1
-        await super().finish(schedule_post_call)
+        await super().finish(schedule_post_call, close_reason=close_reason, close_code=close_code)
 
 
 class SizedTranscriptSentinel:

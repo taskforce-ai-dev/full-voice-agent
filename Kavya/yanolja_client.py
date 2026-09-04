@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 YANOLJA_BASE_URL: str = os.getenv("YANOLJA_BASE_URL", "https://yanolja.taskforceai.tech/api").rstrip("/")
 YANOLJA_USERNAME: str = os.getenv("YANOLJA_USERNAME", "")
 YANOLJA_PASSWORD: str = os.getenv("YANOLJA_PASSWORD", "")
-YANOLJA_TIMEOUT: float = float(os.getenv("YANOLJA_TIMEOUT", "30"))
+# A key present but blank (e.g. an unset compose ``${YANOLJA_TIMEOUT:-30}``
+# passthrough) must resolve to the default exactly like a missing key --
+# float("") would otherwise raise at import and crash-loop the container.
+YANOLJA_TIMEOUT: float = float(os.getenv("YANOLJA_TIMEOUT") or "30")
 
 _session: Optional[aiohttp.ClientSession] = None
 _token: Optional[str] = None

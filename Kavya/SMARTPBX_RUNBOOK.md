@@ -26,6 +26,11 @@ cd /opt/kavya
 REVIEWED_CI_SHORT_SHA=abcdef0
 REVIEWED_FULL_COMMIT_SHA=0123456789abcdef0123456789abcdef01234567
 SMARTPBX_IMAGE="ghcr.io/taskforce-ai-dev/kavya:$REVIEWED_CI_SHORT_SHA"
+# The reviewed image workflow also emits this digest; every guarded-script
+# invocation below (deploy_smartpbx_image.sh takes exactly these three
+# positional values) and the Sinhala-rollback transaction need it.
+REVIEWED_IMAGE_DIGEST=$(docker image inspect "$SMARTPBX_IMAGE" --format '{{index .RepoDigests 0}}' | sed 's/^.*@//')
+[[ "$REVIEWED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
 ```
 
 Prefer the image already pulled by the successful image deploy workflow:
@@ -79,7 +84,7 @@ SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS=8.0
 SMARTPBX_SINHALA_LLM_PROVIDER=gemini
 SMARTPBX_SINHALA_GEMINI_LLM_MODEL=gemini-3.7-flash
 SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL=low
-SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=600
+SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=1024
 SMARTPBX_SINHALA_GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 SMARTPBX_SINHALA_GEMINI_TTS_VOICE=Vindemiatrix
 SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS=15.0
@@ -133,6 +138,7 @@ SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS=
 SMARTPBX_START_TIMEOUT_SECONDS=10
 SMARTPBX_IDLE_TIMEOUT_SECONDS=90
 SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS=300
+SMARTPBX_MAX_CALL_SECONDS=3600
 SMARTPBX_HUMAN_AGENT_WHATSAPP=
 SMARTPBX_MCP_URL=https://dialog.cybergate.lk:9443/ucp/v2/mcp
 SMARTPBX_API_KEY=
@@ -256,6 +262,15 @@ voice saying “සිංහල සඳහා, 2 ඔබන්න.”
 The runtime validates and caches the entire asset before starting menu
 playback. Missing, empty, oversized, misaligned, incorrectly prefixed, or
 all-silent assets fail admission before partial audio reaches the caller.
+
+`SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS` is armed from the END of menu
+playback -- after the completion mark returns, i.e. once the last frame has
+reached the wire -- not when playback is scheduled. The asset is roughly 4.4 s
+long, so arming at the start left a caller only the remainder of the window and
+cut the Sinhala half off mid-sentence. Budget the value as time the caller has
+AFTER hearing the whole menu. A replayed menu (one invalid key) opens a fresh
+window from its own end, and a menu whose playback fails still opens one, so a
+transport fault cannot park the call in the pre-selection state.
 Changing the wording or either voice requires regenerating the asset once with
 protected provider credentials, verifying the same wire contract, reviewing
 the resulting audio, and shipping it in a new image. Never generate this menu
@@ -281,11 +296,12 @@ contract at `g711_ulaw` and `8000` Hz throughout this experiment.
 
 To canary, change only the protected `.env.smartpbx` value to
 `SMARTPBX_STARTUP_PREROLL_MS=2000`, render the compose configuration, and use
-the normal guarded recreate of the same pinned image. If the result is worse or
-inconclusive, restore the validated stable setting
-`SMARTPBX_STARTUP_PREROLL_MS=100` and recreate the same pinned image
-immediately. Set `SMARTPBX_STARTUP_PREROLL_MS=0` only to fully disable the
-experiment. Do not use this knob before replies, fillers, transfers, or any
+the normal guarded recreate of the same pinned image. Production's validated
+stable setting is the default-off `SMARTPBX_STARTUP_PREROLL_MS=0` (matching
+`docker-compose.yml`'s `${SMARTPBX_STARTUP_PREROLL_MS:-0}` and `.env.example`)
+-- if the canary result is worse or inconclusive, restore
+`SMARTPBX_STARTUP_PREROLL_MS=0` and recreate the same pinned image
+immediately. Do not use this knob before replies, fillers, transfers, or any
 later sentence in a call.
 
 ## Later reviewed English digit-class rollout
@@ -391,7 +407,7 @@ Gemini. Claude and profile-configured Sinhala Gemini are exceptions:
 - `SMARTPBX_CLAUDE_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) — the
   Claude-only direct SmartPBX English/Sinhala output budget. Leave it blank to
   take the default.
-- `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS` (default `600`, clamp `[200, 1024]`) —
+- `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS` (default `1024`, clamp `[200, 1024]`) —
   the direct Sinhala Gemini ceiling. Gemini 3.x may consume thinking tokens;
   this does not alter English Gemini's preserved shared-budget contract.
 
@@ -488,6 +504,30 @@ sudo certbot certonly --webroot -w /var/www/html -d smartpbx-kavya.taskforceai.t
 test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/fullchain.pem
 test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/privkey.pem
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
+wait_for_smartpbx_idle() {
+  # Pre-flight-only idle gate (P1-2/P1-3): active_sessions==0 and no
+  # transfer drill in progress, bounded at 10 minutes. If this never
+  # returns, a call is live -- do not force the recreate; a supervised
+  # transfer drill must be revoked first (see "Optional transfer
+  # activation and compulsory revoke") before an image deploy or config
+  # change proceeds.
+  local token deadline status_json
+  token=$(sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1)
+  deadline=$((SECONDS + 600))
+  while :; do
+    status_json=$(printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$token" \
+      | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config -) || status_json=""
+    if [[ -n $status_json ]] && printf '%s' "$status_json" | jq -e '.active_sessions == 0 and .transfer_enabled == false' >/dev/null; then
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "SmartPBX did not go idle within 10 minutes -- abort; do not force a recreate while a call may be live" >&2
+      exit 1
+    fi
+    sleep 5
+  done
+}
+wait_for_smartpbx_idle
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
 smartpbx_status_token() {
   # Read-only, never echoed. The status endpoint requires the same shared
@@ -753,6 +793,30 @@ Edit `.env.smartpbx` to add only that test destination, then apply it:
 ```sh
 set -euo pipefail
 cd /opt/kavya
+wait_for_smartpbx_idle() {
+  # Pre-flight-only idle gate (P1-2/P1-3): active_sessions==0 and no
+  # transfer drill in progress, bounded at 10 minutes. If this never
+  # returns, a call is live -- do not force the recreate; a supervised
+  # transfer drill must be revoked first (see "Optional transfer
+  # activation and compulsory revoke") before an image deploy or config
+  # change proceeds.
+  local token deadline status_json
+  token=$(sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1)
+  deadline=$((SECONDS + 600))
+  while :; do
+    status_json=$(printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$token" \
+      | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config -) || status_json=""
+    if [[ -n $status_json ]] && printf '%s' "$status_json" | jq -e '.active_sessions == 0 and .transfer_enabled == false' >/dev/null; then
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "SmartPBX did not go idle within 10 minutes -- abort; do not force a recreate while a call may be live" >&2
+      exit 1
+    fi
+    sleep 5
+  done
+}
+wait_for_smartpbx_idle
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
 smartpbx_status_token() {
   # Read-only, never echoed. The status endpoint requires the same shared
@@ -781,6 +845,30 @@ configuration reached the running process before considering the drill revoked:
 ```sh
 set -euo pipefail
 cd /opt/kavya
+wait_for_smartpbx_idle() {
+  # Pre-flight-only idle gate (P1-2/P1-3): active_sessions==0 and no
+  # transfer drill in progress, bounded at 10 minutes. If this never
+  # returns, a call is live -- do not force the recreate; a supervised
+  # transfer drill must be revoked first (see "Optional transfer
+  # activation and compulsory revoke") before an image deploy or config
+  # change proceeds.
+  local token deadline status_json
+  token=$(sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1)
+  deadline=$((SECONDS + 600))
+  while :; do
+    status_json=$(printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$token" \
+      | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config -) || status_json=""
+    if [[ -n $status_json ]] && printf '%s' "$status_json" | jq -e '.active_sessions == 0 and .transfer_enabled == false' >/dev/null; then
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "SmartPBX did not go idle within 10 minutes -- abort; do not force a recreate while a call may be live" >&2
+      exit 1
+    fi
+    sleep 5
+  done
+}
+wait_for_smartpbx_idle
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate --pull never kavya-smartpbx
 smartpbx_status_token() {
   # Read-only, never echoed. The status endpoint requires the same shared
@@ -857,6 +945,33 @@ The SmartPBX Compose service uses Docker's `json-file` logging with
 maximum. Preserve that cap during operations; do not add a remote raw-log sink
 or widen the approved event set without a separately reviewed privacy change.
 
+### Durable telemetry archive
+
+Docker's `json-file` logs belong to the *container*, not the image or the
+service: `--force-recreate` deletes the outgoing container and its log files
+with it, so any incident older than the current container is otherwise
+unrecoverable. `scripts/deploy_smartpbx_image.sh` archives the outgoing
+container's telemetry immediately before every recreate it performs (forward
+deploy and rollback alike), filtered to exactly the approved event allowlist
+above (pilot transcript lines included -- the operator has chosen to keep
+`SMARTPBX_PILOT_TRANSCRIPT_LOGGING` on for this pilot), to a root-only file:
+`/var/log/kavya-smartpbx/<utc-timestamp>-<old-image-id>.log` (mode `0600`,
+directory mode `0700`). This is still aggregate-only, stays on the host, and
+does not widen the approved event set.
+
+Install the accompanying logrotate policy once, from the reviewed checkout:
+
+```sh
+sudo install -m 644 -o root -g root \
+  /opt/kavya/ops/kavya-smartpbx-logrotate /etc/logrotate.d/kavya-smartpbx
+```
+
+This keeps 8 weekly, compressed, root-only archives. The three manual
+`docker compose ... up -d --force-recreate` blocks elsewhere in this runbook
+(TLS bootstrap, transfer drill activation, transfer drill revoke) do not run
+the guarded script and therefore do not archive telemetry automatically --
+prefer the guarded script for any recreate on a host carrying live traffic.
+
 ## Withdraw and rollback without dropping calls
 
 1. Withdraw the Dialog dashboard/carrier route and verify its approved fallback.
@@ -881,9 +996,26 @@ the short tag must be the first seven characters of that revision.
 Prerequisites: run as root on the target host, keep `/opt/kavya/.env` and
 `/opt/kavya/.env.smartpbx` owned by `root:root` with mode `0600`, retain a
 healthy `flico-voice-agent` and `kavya-voice-agent`, and ensure the reviewed
-GHCR digest is pullable. The helper checks the existing SmartPBX image ID,
-repository digest, and OCI revision, then records a local rollback alias before
-it recreates only `kavya-smartpbx`.
+GHCR digest is pullable. **If a supervised transfer drill is active
+(`SMARTPBX_TRANSFER_DESTINATIONS_JSON` set to a non-`{}` destination), revoke
+it first** -- see "Optional transfer activation and compulsory revoke" above.
+The helper's pre-flight idle gate requires `transfer_enabled == false` and
+will otherwise poll for up to 10 minutes and then abort by construction.
+
+Before touching anything, the helper polls `/health` and the authenticated
+`/smartpbx/status` for **idleness** (`active_sessions == 0` and
+`transfer_enabled == false`), for a bounded wait of up to 10 minutes,
+aborting with a clear message if the line never goes idle in that window --
+it never force-recreates a container that might be carrying a live call.
+Once idle, it checks the existing SmartPBX image ID, repository digest, and
+OCI revision, then records a local rollback alias, archives the outgoing
+container's allowlisted telemetry (see "SmartPBX telemetry privacy and
+retention" below), and recreates only `kavya-smartpbx`. The **post-recreate
+and rollback** ready gate is readiness only (`/health` ok and
+`/smartpbx/status` returns 200) -- it deliberately does not re-check
+occupancy, so a call that connects in the few seconds after the new
+container comes up never fails the deploy or triggers a rollback that would
+itself cut that call.
 
 ```sh
 # As root: deploy_smartpbx_image.sh NEW_TAG EXPECTED_SHA EXPECTED_DIGEST
@@ -894,5 +1026,56 @@ It rolls back once for ordinary errors and `INT`, `TERM`, or `HUP`, and verifies
 the restored image identity and the unchanged healthy Flico and legacy Kavya
 containers. `SIGKILL`, kernel panic, power loss, and host loss cannot run a
 shell trap; an operator must inspect and recover those cases from the recorded
-baseline/rollback alias. The helper never manages Nginx, prunes images, or
-mutates another service.
+baseline/rollback alias. The helper never manages Nginx or mutates another
+service. After a successful deploy it disarms rollback and then, best-effort
+and never failing the deploy, removes stale `ghcr.io/taskforce-ai-dev/kavya`
+tags -- keeping exactly the tag now running as `kavya-smartpbx`, the tag
+running as the Twilio `kavya-voice-agent`, `rollback-local`, `latest`, and any
+`stable-*` tag -- then runs `docker image prune -f` and
+`docker builder prune -af`. It never runs an all-images prune, which would
+remove a tag either running container still needs.
+
+### Optional host-file integrity check (`SMARTPBX_HOST_FILES_SHA256`)
+
+The generic `deploy.yml` rejects `agent=kavya` for every mode (image, fast,
+build), so `/opt/kavya`'s host-side control plane — `docker-compose.yml`, the
+two nginx vhosts, and every `scripts/*.sh` helper — is normally only ever
+changed by an operator applying a reviewed diff by hand. As defence in depth
+against that guard ever being loosened by mistake, the guarded deploy helper
+supports an opt-in pre-recreate integrity check: if the env var
+`SMARTPBX_HOST_FILES_SHA256` names a checksum manifest file, the helper
+verifies `docker-compose.yml`, `nginx-smartpbx.conf`, `nginx-smartpbx-acme.conf`,
+and every `scripts/*.sh` file under `/opt/kavya` against it with `sha256sum -c`
+before recreating the container. A manifest that is missing, that omits any of
+those files, or that fails a checksum, aborts the deployment before anything is
+mutated. Leaving the variable unset (the default) skips the check entirely —
+it is opt-in, not required.
+
+Produce the manifest **from the reviewed checkout**, not from `/opt/kavya`
+itself (checksumming files already on the host proves nothing about tampering
+of those same files):
+
+```sh
+# Run on a trusted machine against the exact reviewed commit ($REVIEWED_FULL_COMMIT_SHA).
+checkout=/path/to/a/clean/full-voice-agent/checkout
+sha=$REVIEWED_FULL_COMMIT_SHA
+manifest=/opt/kavya/host-files.sha256   # root-owned, mode 0600, outside the repo tree
+
+: > "$manifest"
+for f in docker-compose.yml nginx-smartpbx.conf nginx-smartpbx-acme.conf \
+         scripts/deploy_smartpbx_image.sh scripts/update_smartpbx_sinhala_provider.sh \
+         scripts/validate_english_voice_env.sh; do
+  hash=$(git -C "$checkout" show "$sha:Kavya/$f" | sha256sum | cut -d' ' -f1)
+  printf '%s  %s\n' "$hash" "$f" >> "$manifest"
+done
+
+sudo install -o root -g root -m 0600 "$manifest" /opt/kavya/host-files.sha256
+```
+
+List every `scripts/*.sh` file that exists in the reviewed checkout under
+`Kavya/scripts/` — the check fails closed if any current `scripts/*.sh` file on
+the host has no manifest entry, so an incomplete list blocks the next deploy
+rather than silently skipping coverage. Then set
+`SMARTPBX_HOST_FILES_SHA256=/opt/kavya/host-files.sha256` in the deploy
+operator's shell (or export it inline before invoking the helper) before
+running `deploy_smartpbx_image.sh`.

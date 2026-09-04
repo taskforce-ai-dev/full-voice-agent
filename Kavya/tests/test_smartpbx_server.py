@@ -3451,6 +3451,11 @@ def test_smartpbx_status_requires_the_shared_token():
         {"X-Kavya-SmartPBX-Token": "wrong-token12"},
         {"X-Kavya-SmartPBX-Token": "status-toke"},
         {"X-Kavya-SmartPBX-Token": "status-tokenn"},
+        # Starlette decodes header bytes as latin-1, so a header byte >= 0x80
+        # arrives here as a non-ASCII str. secrets.compare_digest raises
+        # TypeError on non-ASCII str operands — this must still be an
+        # ordinary 401, not an unhandled exception.
+        {"X-Kavya-SmartPBX-Token": "caf\xe9-status-token"},
     ):
         with pytest.raises(HTTPException) as raised:
             status(_fake_request(headers))
@@ -5814,6 +5819,204 @@ async def test_multi_tool_owner_loss_cancels_specialized_filler_before_second_to
         if filler_task is not None and not filler_task.done():
             filler_task.cancel()
             await asyncio.gather(filler_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_late_completing_create_booking_reaches_the_session_owned_late_results_list(
+    monkeypatch, provider,
+):
+    """audit #3: a booking that finishes executing after teardown already
+    cleared ownership must not vanish -- it has to reach a session-owned
+    late-results list so the post-call record can still include it."""
+    import server
+
+    booking_result = json.dumps({
+        "success": True,
+        "guest_name": "Ada Lovelace",
+        "booking_reference": "BK-9001",
+        "room_type": "Deluxe",
+        "check_in": "2026-09-10",
+        "check_out": "2026-09-12",
+    })
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"guest_name": "Ada Lovelace"}),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    turn_id = f"{provider}-late-booking-turn"
+    pipeline._active_smartpbx_turn_id = turn_id
+    runner = server._SmartPBXRunnerContext(
+        turn_id=turn_id, dropped_frame_baseline=0,
+        speak_generation=pipeline._speak_generation, raw_utterance="",
+    )
+    tool_started = asyncio.Event()
+    tool_release = asyncio.Event()
+
+    async def execute(_name, _arguments):
+        tool_started.set()
+        await tool_release.wait()
+        return booking_result
+
+    async def tts(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    async def run():
+        token = server._smartpbx_runner_context.set(runner)
+        try:
+            return await _run_direct_provider(pipeline, provider)
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(tool_started.wait(), timeout=1)
+        # Simulate hangup teardown racing ahead of the in-flight tool call.
+        pipeline._finalize_smartpbx_turns()
+        tool_release.set()
+        result = await asyncio.wait_for(task, timeout=1)
+
+        assert result == ""
+        assert pipeline.full_transcript == []
+        assert len(pipeline._smartpbx_late_tool_results) == 1
+        marker = pipeline._smartpbx_late_tool_results[0]
+        assert marker["role"] == "system"
+        assert "guest_name=Ada Lovelace" in marker["text"]
+        assert "booking_reference=BK-9001" in marker["text"]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_late_completing_booking_never_recorded_for_a_non_booking_tool(
+    monkeypatch, provider,
+):
+    """The late-results path must stay a no-op for every tool other than a
+    successful create_booking (reuses _append_booking_confirmation_marker's
+    own filtering, so this pins that it is actually wired through)."""
+    import server
+
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"nights": 2}, tool_name="check_availability"),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    turn_id = f"{provider}-late-non-booking-turn"
+    pipeline._active_smartpbx_turn_id = turn_id
+    runner = server._SmartPBXRunnerContext(
+        turn_id=turn_id, dropped_frame_baseline=0,
+        speak_generation=pipeline._speak_generation, raw_utterance="",
+    )
+    tool_started = asyncio.Event()
+    tool_release = asyncio.Event()
+
+    async def execute(_name, _arguments):
+        tool_started.set()
+        await tool_release.wait()
+        return json.dumps({"status": "available"})
+
+    async def tts(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    async def run():
+        token = server._smartpbx_runner_context.set(runner)
+        try:
+            return await _run_direct_provider(pipeline, provider)
+        finally:
+            server._smartpbx_runner_context.reset(token)
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(tool_started.wait(), timeout=1)
+        pipeline._finalize_smartpbx_turns()
+        tool_release.set()
+        await asyncio.wait_for(task, timeout=1)
+
+        assert pipeline._smartpbx_late_tool_results == []
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+async def test_late_completing_booking_recorded_at_the_post_loop_ownership_check(
+    monkeypatch, provider,
+):
+    """audit #3, second bail point: execute_tool() can return while this
+    runner still owns state (so the per-tool check passes and the result is
+    staged), yet ownership can still be lost afterward -- by the specialized
+    filler/initial-filler awaits -- before staged results are committed to
+    history. The already-staged create_booking result must not vanish."""
+    import server
+
+    booking_result = json.dumps({
+        "success": True, "guest_name": "Grace Hopper", "booking_reference": "BK-42",
+    })
+    client = direct_tool_client(provider, [
+        direct_tool_round(provider, {"guest_name": "Grace Hopper"}),
+    ])
+    pipeline = direct_tool_pipeline(server, provider, client)
+    _disable_initial_filler(monkeypatch, pipeline)
+    turn_id = f"{provider}-staged-turn"
+    pipeline._active_smartpbx_turn_id = turn_id
+    runner = server._SmartPBXRunnerContext(
+        turn_id=turn_id, dropped_frame_baseline=0,
+        speak_generation=pipeline._speak_generation, raw_utterance="",
+    )
+    real_owns = pipeline._current_smartpbx_runner_owns_shared_state
+    calls = {"n": 0}
+
+    def owns(*, tool_executed=False):
+        # Every ownership check unrelated to this tool call (before it ever
+        # executes -- LLM streaming, sentence TTS, etc.) passes tool_executed
+        # =False and must behave exactly as normal. Only the two checks that
+        # guard a tool call after it has actually executed pass True: the
+        # first of those (the per-tool bail, immediately after execute_tool)
+        # must still own state so the result is staged; the next one (the
+        # post-loop bail, before history is committed) has lost it -- the
+        # shape of a hangup landing between the tool call finishing and
+        # history being committed.
+        if not tool_executed:
+            return real_owns(tool_executed=tool_executed)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_owns(tool_executed=tool_executed)
+        return False
+
+    async def execute(_name, _arguments):
+        return booking_result
+
+    async def tts(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(pipeline, "_current_smartpbx_runner_owns_shared_state", owns)
+    monkeypatch.setattr(pipeline, "_tts_elevenlabs", tts)
+    monkeypatch.setattr(server, "execute_tool", execute)
+
+    token = server._smartpbx_runner_context.set(runner)
+    try:
+        result = await asyncio.wait_for(_run_direct_provider(pipeline, provider), timeout=1)
+    finally:
+        server._smartpbx_runner_context.reset(token)
+
+    assert result == ""
+    assert pipeline.full_transcript == []
+    assert calls["n"] >= 2, "test setup must actually exercise both bail points"
+    assert len(pipeline._smartpbx_late_tool_results) == 1
+    marker = pipeline._smartpbx_late_tool_results[0]
+    assert "guest_name=Grace Hopper" in marker["text"]
+    assert "booking_reference=BK-42" in marker["text"]
 
 
 @pytest.mark.asyncio

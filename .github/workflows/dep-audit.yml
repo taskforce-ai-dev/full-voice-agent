@@ -2,17 +2,24 @@ name: dep-audit
 
 # Scans each agent's pinned Python dependencies for known CVEs using pip-audit.
 #
-# ADVISORY (non-blocking) for now: every job uses `continue-on-error: true`, so a
-# vulnerable/yanked dependency surfaces in the logs and the job summary but does
-# NOT fail the workflow. This keeps the pipeline green-able while the existing
-# pinned deps are triaged. To ENFORCE later, remove the `continue-on-error: true`
-# line from the `audit` job (and optionally drop `|| true` if you add one) so a
-# discovered CVE fails the build.
+# ADVISORY (non-blocking) for seven of the eight agents: their jobs use
+# `continue-on-error: true`, so a vulnerable/yanked dependency surfaces in the
+# logs and the job summary but does NOT fail the workflow. This keeps the
+# pipeline green-able while their existing pinned deps are triaged.
+#
+# Kavya is ENFORCED: its lock file (requirements-prod.lock.txt — what the
+# Dockerfile actually installs, not the loose requirements-prod.txt ranges)
+# is audited with `--no-deps` and `continue-on-error` is off for that matrix
+# entry, so a newly pinned or newly disclosed CVE in Kavya's real dependency
+# set fails the build. To enforce another agent, drop its
+# `continue-on-error` the same way (see the `audit` job below) once its
+# existing pinned advisories are resolved.
 
 on:
-  # NOT on pull_request/push. This job fans out to 8 parallel jobs (one per
-  # agent) and every one is `continue-on-error: true` — it has never blocked a
-  # merge and is not meant to. Running it per-PR cost ~664 billed Actions
+  # NOT on pull_request/push for the seven advisory agents. This job fans out
+  # to 8 parallel jobs (one per agent) and seven of them are
+  # `continue-on-error: true` — they have never blocked a merge and are not
+  # meant to. Running the whole matrix per-PR cost ~664 billed Actions
   # minutes in the 2026-08 cycle: a third of the 2,000-minute allowance, spent
   # on advisory output nobody gates on.
   #
@@ -20,14 +27,23 @@ on:
   # ~40 seconds but GitHub bills every job rounded UP to a whole minute, so
   # ~5 minutes of real work bills as 8.
   #
-  # Weekly is the right cadence for advisory CVE scanning anyway: it catches
-  # newly disclosed CVEs against already-merged pinned deps, which is exactly
-  # the case a per-PR run CANNOT catch. Use workflow_dispatch for an on-demand
-  # check when changing dependencies.
+  # Weekly is the right cadence for advisory CVE scanning on the other seven
+  # agents anyway: it catches newly disclosed CVEs against already-merged
+  # pinned deps, which is exactly the case a per-PR run CANNOT catch. Use
+  # workflow_dispatch for an on-demand check when changing dependencies.
   #
-  # If this is ever made blocking (drop `continue-on-error`), restore the
-  # pull_request trigger at the same time — a required check that only runs
-  # weekly is worse than no check.
+  # Kavya's `pull_request` trigger is scoped to its own requirements files
+  # only, so it does not reintroduce the per-PR cost for the other seven
+  # agents (their rows in the matrix still run, but only on this narrow
+  # trigger, and only Kavya's row is blocking).
+  #
+  # If another agent is ever made blocking (drop its `continue-on-error`),
+  # widen the `pull_request` `paths` filter below to include its
+  # requirements files too — a required check that only runs weekly is worse
+  # than no check.
+  pull_request:
+    paths:
+      - 'Kavya/requirements*'
   workflow_dispatch:
   schedule:
     # Weekly, Mondays at 06:00 UTC.
@@ -44,31 +60,28 @@ jobs:
   audit:
     name: pip-audit (${{ matrix.dir }})
     runs-on: ubuntu-latest
-    # ADVISORY: do not fail the workflow on findings yet. Tighten later by
-    # removing this line once the existing pinned advisories are resolved.
-    continue-on-error: true
+    # ADVISORY for every agent except Kavya: do not fail the workflow on
+    # findings yet. Tighten another agent later by adding it to this
+    # exclusion the same way, once its existing pinned advisories are
+    # resolved.
+    continue-on-error: ${{ matrix.dir != 'Kavya' }}
     strategy:
       # Audit every agent dir independently; one vulnerable agent does not
       # short-circuit the others.
       fail-fast: false
       matrix:
         # Folder names with spaces are passed as quoted JSON strings.
-        dir:
-          - "BSL Agent"
-          - "Flico Agent"
-          - "HattonHills"
-          - "Kavya"
-          - "Kitchened"
-          - "SLIC Agent"
-          - "Sofia Agent"
-          - "WorldOfRefrigerators"
+        # On pull_request only Kavya runs (its trigger is scoped to Kavya's
+        # requirements files and it is the only blocking row); the weekly and
+        # manual runs audit every agent.
+        dir: ${{ github.event_name == 'pull_request' && fromJSON('["Kavya"]') || fromJSON('["BSL Agent","Flico Agent","HattonHills","Kavya","Kitchened","SLIC Agent","Sofia Agent","WorldOfRefrigerators"]') }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.11'
 
@@ -78,10 +91,38 @@ jobs:
           pip install pip-audit
 
       - name: Audit pinned dependencies
-        # Prefer requirements-prod.txt; fall back to requirements.txt when the
-        # prod file is absent (e.g. some agents ship only one of the two).
+        # Kavya: audit the exact lock file its Dockerfile installs
+        # (requirements-prod.txt only pins loose ranges, so pip-audit
+        # against it resolves the LATEST matching versions, not what
+        # actually ships — see the High finding this fixes). `--no-deps`
+        # keeps pip-audit from trying to resolve/build the pins itself; it
+        # reads the lock file's exact versions directly.
+        #
+        # Every other agent: prefer requirements-prod.txt; fall back to
+        # requirements.txt when the prod file is absent (e.g. some agents
+        # ship only one of the two).
         run: |
           dir="${{ matrix.dir }}"
+
+          if [ "$dir" = "Kavya" ]; then
+            req="$dir/requirements-prod.lock.txt"
+            if [ ! -f "$req" ]; then
+              echo "::error::Kavya requires a pinned lock file at $req" >&2
+              exit 1
+            fi
+            echo "Auditing (locked, no-deps): $req"
+            # chromadb 1.5.9 advisories are acknowledged and deferred: Kavya
+            # runs Chroma embedded (no HTTP server surface) and the persisted
+            # store's on-disk format must be migrated deliberately, not by a
+            # CI bump. Remove these ignores when chromadb is upgraded.
+            pip-audit -r "$req" --no-deps \
+              --ignore-vuln PYSEC-2026-311 \
+              --ignore-vuln CVE-2026-45830 \
+              --ignore-vuln CVE-2026-45831 \
+              --ignore-vuln CVE-2026-45833
+            exit $?
+          fi
+
           prod="$dir/requirements-prod.txt"
           base="$dir/requirements.txt"
 

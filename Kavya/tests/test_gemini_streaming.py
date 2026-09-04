@@ -1681,7 +1681,7 @@ def test_gemini_to_claude_conversion_deep_copies_mixed_tool_shapes(monkeypatch):
         tool["input_schema"]["properties"]["temporary"] = {"type": "boolean"}
     assert original_tools == before
 
-    session, _spoken = _session([], lang="si", smartpbx=True)
+    session, spoken = _session([], lang="si", smartpbx=True)
     session.tools = original_tools
     original_model = session.model
     monkeypatch.setattr(
@@ -1689,8 +1689,12 @@ def test_gemini_to_claude_conversion_deep_copies_mixed_tool_shapes(monkeypatch):
         "_claude_tools_from_gemini",
         lambda _tools: (_ for _ in ()).throw(ValueError("local conversion invariant")),
     )
-    with pytest.raises(ValueError, match="local conversion invariant"):
-        asyncio.run(session._run_claude_failover_turn())
+    # A local invariant failure inside the swap is OURS, not the provider's: the
+    # caller gets the localized recovery line rather than the error filler, and
+    # the call profile is restored exactly as before.
+    recovery = asyncio.run(session._run_claude_failover_turn())
+    assert recovery and spoken == [recovery]
+    assert "සමාවෙන්න" in recovery
     assert session.llm_provider == "gemini"
     assert session.model == original_model
     assert session.tools is original_tools
@@ -1773,20 +1777,46 @@ def test_direct_sinhala_sticky_fallback_uses_injected_client_without_global_key(
     assert session.llm_provider == "gemini"
 
 
-@pytest.mark.parametrize("failure", [RuntimeError("claude failure"), asyncio.CancelledError()])
-def test_sinhala_fallback_restores_profile_when_claude_fails(monkeypatch, failure):
-    session, _spoken = _session([], lang="si", smartpbx=True)
+def test_sinhala_fallback_restores_profile_when_claude_fails(monkeypatch):
+    """A failed Claude turn restores the profile AND still answers the caller.
+
+    Re-raising here reached `_process_utterance`'s generic handler, which speaks
+    the "please wait" filler and then nothing — dead air. The direct SmartPBX
+    non-capture path now speaks the shared localized recovery line instead.
+    """
+    session, spoken = _session([], lang="si", smartpbx=True)
     original_tools = copy.deepcopy(GEMINI_SHAPED_TOOLS)
     session.tools = original_tools
     original_profile = (session.llm_provider, session.model, session.tools)
 
     async def failing_claude():
         session.tools[0]["input_schema"]["properties"]["temporary"] = {"type": "boolean"}
-        raise failure
+        raise RuntimeError("claude failure")
 
     monkeypatch.setattr(session, "_run_llm_claude", failing_claude)
-    with pytest.raises(type(failure)):
+    recovery = asyncio.run(session._run_claude_failover_turn())
+    assert recovery and spoken == [recovery]
+    assert "සමාවෙන්න" in recovery
+    assert (session.llm_provider, session.model, session.tools) == original_profile
+    assert session.tools is original_tools
+    assert "temporary" not in original_tools[0]["function_declarations"][0]["parameters"]["properties"]
+
+
+def test_sinhala_fallback_restores_profile_when_claude_is_cancelled(monkeypatch):
+    """Cancellation is a lifecycle signal, never a turn outcome: it propagates."""
+    session, spoken = _session([], lang="si", smartpbx=True)
+    original_tools = copy.deepcopy(GEMINI_SHAPED_TOOLS)
+    session.tools = original_tools
+    original_profile = (session.llm_provider, session.model, session.tools)
+
+    async def cancelled_claude():
+        session.tools[0]["input_schema"]["properties"]["temporary"] = {"type": "boolean"}
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(session, "_run_llm_claude", cancelled_claude)
+    with pytest.raises(asyncio.CancelledError):
         asyncio.run(session._run_claude_failover_turn())
+    assert spoken == []
     assert (session.llm_provider, session.model, session.tools) == original_profile
     assert session.tools is original_tools
     assert "temporary" not in original_tools[0]["function_declarations"][0]["parameters"]["properties"]
@@ -2293,3 +2323,129 @@ def test_media_stream_first_round_empty_still_fails_over(monkeypatch):
     assert result == "recovered."
     assert spoken == []
     assert session._gemini_failover_state["consecutive_failovers"] == 1
+
+
+# --- (e) a successful retry is a clean answer, not a patched-up one --------
+
+_SINHALA_RECOVERY_MARKER = "සමාවෙන්න"  # "sorry"
+
+
+def test_direct_sinhala_max_tokens_retry_speaks_only_the_retry_answer():
+    """A truncated first attempt must leave nothing half-spoken behind it.
+
+    Production saw turn 1 finish `stop_reason=max_tokens` at
+    `output_tokens=24` -- the thinking budget ate the visible reply -- and the
+    retry then answered normally. Two things must hold across that seam: the
+    caller never hears the canned Sinhala recovery line when the retry
+    succeeds, and no fragment of the truncated attempt is spoken alongside (or
+    in front of) the real answer.
+    """
+    session, spoken = _session(
+        [
+            [_text_chunk("පළමු වාක්‍යය. "),
+             _empty_chunk("MAX_TOKENS")],
+            [_text_chunk("සම්පූර්ණ "
+                         "පිළිතුර."),
+             _terminal_chunk()],
+        ],
+        lang="si",
+        smartpbx=True,
+        terminalize_direct_rounds=False,
+    )
+
+    result = asyncio.run(session._run_llm_gemini())
+
+    assert session.gemini_client.requests == 2
+    assert spoken == ["සම්පූර්ණ "
+                      "පිළිතුර."]
+    assert result == "සම්පූර්ණ " \
+                     "පිළිතුර."
+    # No recovery line, and no surviving fragment of the truncated attempt.
+    assert not any(_SINHALA_RECOVERY_MARKER in text for text in spoken)
+    assert not any("පළමු" in text for text in spoken)
+    # The discarded attempt is not carried into history either.
+    assert [message.get("content") for message in session.history] == [
+        "සම්පූර්ණ "
+        "පිළිතුර."
+    ]
+
+
+def test_direct_sinhala_empty_retry_nudge_is_silent_when_the_retry_answers():
+    """The nudge path itself must never speak; only an exhausted retry does."""
+    session, spoken = _session(
+        [
+            [_terminal_chunk()],
+            [_text_chunk("පිළිතුර."), _terminal_chunk()],
+        ],
+        lang="si",
+        smartpbx=True,
+        terminalize_direct_rounds=False,
+    )
+
+    asyncio.run(session._run_llm_gemini())
+
+    assert session.gemini_client.requests == 2
+    assert spoken == ["පිළිතුර."]
+    assert not any(_SINHALA_RECOVERY_MARKER in text for text in spoken)
+    # The nudge reached the retry request only.
+    systems = [
+        config.get("system_instruction") for config in session.gemini_client.configs
+    ]
+    assert server.GEMINI_EMPTY_RETRY_NUDGE not in (systems[0] or "")
+    assert server.GEMINI_EMPTY_RETRY_NUDGE in (systems[1] or "")
+
+
+def test_direct_sinhala_exhausted_retry_still_speaks_the_recovery_line():
+    """The counterpart: the recovery line is reached when the retry fails too.
+
+    Without this, the tests above would also pass if recovery had been deleted.
+    """
+    session, spoken = _session(
+        [[_empty_chunk("MAX_TOKENS")], [_empty_chunk("MAX_TOKENS")]],
+        lang="si",
+        smartpbx=True,
+        terminalize_direct_rounds=False,
+    )
+
+    asyncio.run(session._run_llm_gemini())
+
+    assert session.gemini_client.requests == 2
+    assert len(spoken) == 1
+    assert _SINHALA_RECOVERY_MARKER in spoken[0]
+
+
+def test_direct_english_max_tokens_retry_fences_the_truncated_round_audio():
+    """The non-batched shape, where the truncated attempt did reach TTS.
+
+    Audio already on the wire cannot be unspoken, so the contract is that the
+    stalled generation's queued remainder is cleared and its discarded text
+    never becomes history -- the retry's answer stands alone.
+    """
+    session, spoken = _session(
+        [
+            [_text_chunk("First sentence. "), _empty_chunk("MAX_TOKENS")],
+            [_text_chunk("The real answer."), _terminal_chunk()],
+        ],
+        lang="en",
+        smartpbx=True,
+        terminalize_direct_rounds=False,
+    )
+
+    from tests.test_smartpbx_server import bind_direct_smartpbx_turn
+
+    async def scenario():
+        # The production entrypoint binds the turn before the runner starts;
+        # the generation fence is deliberately gated on that ownership token.
+        bind_direct_smartpbx_turn(server, session)
+        return await session._run_llm_gemini()
+
+    result = asyncio.run(scenario())
+
+    assert session.gemini_client.requests == 2
+    assert result == "The real answer."
+    assert spoken[-1] == "The real answer."
+    # The discarded attempt is fenced off the wire and out of history.
+    assert session._media_transport.clears >= 1
+    assert [message.get("content") for message in session.history] == [
+        "The real answer."
+    ]

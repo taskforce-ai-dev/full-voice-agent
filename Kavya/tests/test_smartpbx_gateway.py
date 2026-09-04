@@ -60,6 +60,7 @@ class FakeSession:
         self.starts = 0
         self.audio = []
         self.finishes = []
+        self.close_reasons = []
         self.terminal_future = asyncio.get_running_loop().create_future()
 
     async def start(self):
@@ -68,8 +69,9 @@ class FakeSession:
     async def feed_audio(self, audio):
         self.audio.append(audio)
 
-    async def finish(self, schedule_post_call=False):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
         self.finishes.append(schedule_post_call)
+        self.close_reasons.append((close_reason, close_code))
 
 
 class Factory:
@@ -114,6 +116,18 @@ def test_settings_default_to_the_kavya_token_header_and_documented_bounds():
     assert "test-token" not in repr(configuration)
 
 
+def test_token_matches_rejects_non_ascii_candidate_without_raising():
+    # secrets.compare_digest raises TypeError on a non-ASCII str operand.
+    # Starlette decodes header bytes as latin-1, so a header byte >= 0x80
+    # arrives here as a non-ASCII str — token_matches must reject it as an
+    # ordinary mismatch, not let the TypeError escape as an internal fault.
+    configuration = settings()
+
+    assert configuration.token_matches("caf\xe9-not-ascii") is False
+    assert configuration.token_matches("test-token") is True
+    assert configuration.token_matches("wrong-token") is False
+
+
 def test_startup_preroll_setting_defaults_to_zero_accepts_two_seconds_and_rejects_unsafe_values():
     assert settings().startup_preroll_ms == 0
     assert SmartPBXSettings.from_env({"ENABLE_SMARTPBX_WSS": "false"}).startup_preroll_ms == 0
@@ -122,6 +136,29 @@ def test_startup_preroll_setting_defaults_to_zero_accepts_two_seconds_and_reject
     for value in ("-20", "2020", "1", "110"):
         with pytest.raises(ValueError):
             settings(SMARTPBX_STARTUP_PREROLL_MS=value)
+
+
+def test_blank_bounded_integer_settings_fall_back_to_the_code_default_like_absent():
+    """P1-4: a key present but blank (an unset compose ``${VAR:-default}``
+    passthrough) must resolve exactly like a missing key, not crash-loop."""
+    defaults = settings()
+    blank = settings(
+        SMARTPBX_MAX_MESSAGE_CHARS="",
+        SMARTPBX_MAX_AUDIO_BYTES="",
+        SMARTPBX_MAX_OUTBOUND_FRAMES="",
+        SMARTPBX_START_TIMEOUT_SECONDS="",
+        SMARTPBX_IDLE_TIMEOUT_SECONDS="",
+        SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS="",
+    )
+    assert blank.max_message_chars == defaults.max_message_chars == 65536
+    assert blank.max_audio_bytes == defaults.max_audio_bytes == 32768
+    assert blank.max_outbound_frames == defaults.max_outbound_frames == 512
+    assert blank.start_timeout_seconds == defaults.start_timeout_seconds == 10
+    assert blank.idle_timeout_seconds == defaults.idle_timeout_seconds == 90
+    assert blank.transfer_pending_timeout_seconds == defaults.transfer_pending_timeout_seconds == 300
+    # An actually-invalid nonblank value must still fail closed.
+    with pytest.raises(ValueError):
+        settings(SMARTPBX_START_TIMEOUT_SECONDS="not-a-number")
 
 
 @pytest.mark.asyncio
@@ -430,7 +467,17 @@ def fixed_diagnostics(caplog):
         ([], SmartPBXSettings.from_env({"ENABLE_SMARTPBX_WSS": "false"}), "test-token",
          ("schema_admission", "rejected", "disabled")),
         ([], None, "wrong-token", ("schema_admission", "rejected", "authentication")),
+        # Non-ASCII candidate: secrets.compare_digest raises TypeError on a
+        # non-ASCII str operand; token_matches must reject before calling it
+        # so this is an ordinary AUTHENTICATION rejection, not INTERNAL_ERROR.
+        ([], None, "caf\xe9-not-ascii", ("schema_admission", "rejected", "authentication")),
         (['{'], None, "test-token", ("schema_admission", "rejected", "invalid_message")),
+        # RecursionError from the JSON decoder on deeply nested input, and
+        # UnicodeEncodeError from a lone surrogate, must both be reported as
+        # an ordinary invalid_message, not surface via the gateway's generic
+        # exception handler as INTERNAL_ERROR/1011.
+        (["[" * 10000 + "0" + "]" * 10000], None, "test-token", ("schema_admission", "rejected", "invalid_message")),
+        (["\ud800"], None, "test-token", ("schema_admission", "rejected", "invalid_message")),
         ([START, {"event": "stop"}], None, "test-token",
          [("session_start", "completed", "none"), ("terminal_cleanup", "completed", "none")]),
         ([START, {"event": "dtmf", "dtmf": {"callId": "call-1", "otherLegCallId": "other-1", "digit": "5"}}, {"event": "stop"}],
@@ -475,6 +522,14 @@ async def test_gateway_four_calls_have_unique_opaque_correlations(caplog):
     assert all(__import__("re").fullmatch(r"spx-[0-9a-f]{32}", value) for value in correlations)
 
 
+# Module-scope placeholder so constructing any of the _Fault* classes below
+# before either test that sets a real value (via `global _FAULT_STATE`) never
+# raises a bare NameError -- unsafe under `-p xdist`/`--random-order`, or
+# simply from any future test in this file that instantiates one of them
+# during collection or in a different order (audit-tests.md sec 4.6).
+_FAULT_STATE: dict = {}
+
+
 class _FaultTransport:
     def __init__(self, _websocket, _context, *, max_queue_frames, on_frame_dropped=None):
         self.close_calls = 0
@@ -495,8 +550,9 @@ class _FaultSession(FakeSession):
     def __init__(self, context, transport):
         super().__init__(context, transport)
         self.finish_started = asyncio.Event()
-    async def finish(self, schedule_post_call=False):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
         self.finishes.append(schedule_post_call)
+        self.close_reasons.append((close_reason, close_code))
         self.finish_started.set()
         _FAULT_STATE["order"].append("session")
         if _FAULT_STATE["block_finish"]:
@@ -647,11 +703,31 @@ async def test_gateway_completed_call_is_not_degraded_when_the_peer_already_clos
 async def test_gateway_close_fault_on_an_uncompleted_call_is_still_degraded(caplog):
     # A close that fails on a call that did NOT complete cleanly is a genuine
     # degradation and must still be flagged.
+    #
+    # This used to feed a socket that goes silent forever after the
+    # unsupported event, forcing the gateway to sit out the real
+    # SMARTPBX_IDLE_TIMEOUT_SECONDS default (90s) before it could observe
+    # the idle-timeout exit path -- 90.09s measured, ~35% of the whole
+    # `-k smartpbx` subset's wall time (audit-tests.md sec 4.1). Two
+    # independent speedups, either of which alone would already avoid the
+    # 90s wait: the configured idle timeout is dropped to the settings
+    # floor (10s, see SMARTPBX_IDLE_TIMEOUT_SECONDS's clamp), and the
+    # socket raises the timeout explicitly on its next receive instead of
+    # blocking on a never-resolving Future -- so `_receive_or_terminal`'s
+    # `asyncio.wait(..., timeout=idle_timeout_seconds)` finds the receive
+    # task already done and returns immediately (FIRST_COMPLETED) rather
+    # than actually waiting out the timeout window. This reaches the exact
+    # same `except asyncio.TimeoutError` / IDLE_TIMEOUT diagnostic path a
+    # real idle timeout would, in effectively zero wall-clock time.
     registry = SmartPBXSessionRegistry(4)
-    socket = _CloseFaultWebSocket([START, {"event": "future-event"}])
+    socket = _CloseFaultWebSocket(
+        [START, {"event": "future-event"}, asyncio.TimeoutError()]
+    )
     factory = Factory()
     with caplog.at_level("INFO"):
-        await SmartPBXGateway(settings(), registry).handle(socket, factory)
+        await SmartPBXGateway(settings(SMARTPBX_IDLE_TIMEOUT_SECONDS="10"), registry).handle(
+            socket, factory
+        )
     assert socket.close_attempts == 1
     tuples = [(r["stage"], r["outcome"], r["failure_class"]) for r in fixed_diagnostics(caplog)]
     assert ("terminal_cleanup", "degraded", "websocket_close") in tuples
@@ -754,14 +830,19 @@ class _LifecycleSession:
         self.feed_error = feed_error
         self.terminal_future = asyncio.get_running_loop().create_future()
         self.finishes = []
+        self.close_reasons = []
+        # A session-internal terminal failure (audit #10) records this before
+        # resolving terminal_future; None means the ordinary completed path.
+        self.close_reason = None
     async def start(self):
         if self.start_error:
             raise self.start_error
     async def feed_audio(self, _audio):
         if self.feed_error:
             raise self.feed_error
-    async def finish(self, schedule_post_call=False):
+    async def finish(self, schedule_post_call=False, close_reason=None, close_code=None):
         self.finishes.append(schedule_post_call)
+        self.close_reasons.append((close_reason, close_code))
 class _LifecycleFactory:
     def __init__(self, *, factory_error=None, start_error=None, feed_error=None):
         self.factory_error, self.start_error, self.feed_error = factory_error, start_error, feed_error
@@ -994,3 +1075,138 @@ async def test_gateway_dtmf_without_a_collector_hook_still_observes(caplog):
 
     tuples = [(r["stage"], r["outcome"], r["failure_class"]) for r in fixed_diagnostics(caplog)]
     assert ("context_validation", "observed", "none") in tuples
+
+
+# ---------------------------------------------------------------------------
+# C1 -- close_reason/close_code threaded from the gateway into session.finish()
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory,messages,expected",
+    [
+        (_LifecycleFactory(), [START, {"event": "stop"}], [(True, "stop", 1000)]),
+        (
+            _LifecycleFactory(),
+            [START, {"event": "hangup", "hangup": {
+                "callId": "call-1", "otherLegCallId": "other-1",
+                "accountId": "account-1", "reason": "normal",
+            }}],
+            [(True, "hangup", 1000)],
+        ),
+        (_LifecycleFactory(start_error=RuntimeError("start")), [START], [(True, "internal_error", 1011)]),
+        (
+            _LifecycleFactory(feed_error=RuntimeError("feed")),
+            [START, {"event": "media", "media": {"payload": "YQ=="}}],
+            [(True, "internal_error", 1011)],
+        ),
+        (_LifecycleFactory(), [START, WebSocketDisconnect()], [(True, "peer_disconnect", 1000)]),
+    ],
+)
+async def test_gateway_threads_close_reason_and_code_into_session_finish(factory, messages, expected):
+    _registry, _socket, factory = await _run_lifecycle(messages, factory)
+    assert factory.session is not None
+    got = [
+        (schedule, reason, code)
+        for schedule, (reason, code) in zip(factory.session.finishes, factory.session.close_reasons)
+    ]
+    assert got == expected
+
+
+@pytest.mark.asyncio
+async def test_gateway_factory_failure_never_calls_session_finish():
+    # No session was ever constructed, so there is nothing to carry a close
+    # reason into -- this must not raise.
+    registry, socket, factory = await _run_lifecycle(
+        [START], _LifecycleFactory(factory_error=RuntimeError("factory")),
+    )
+    assert factory.session is None
+    assert socket.close_calls == [(1011, "internal error")]
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_closes_with_idle_timeout_close_reason():
+    _gateway, _registry, _socket, factory = await run(
+        [START], configuration=replace(settings(), idle_timeout_seconds=0.01),
+    )
+    assert factory.sessions[0].close_reasons == [("idle_timeout", POLICY_VIOLATION)]
+
+
+@pytest.mark.asyncio
+async def test_start_timeout_never_creates_a_session_to_carry_a_close_reason():
+    _gateway, _registry, socket, factory = await run(
+        [], configuration=replace(settings(), start_timeout_seconds=0.01),
+    )
+    assert factory.sessions == []
+    assert socket.close_calls == [(POLICY_VIOLATION, "start timeout")]
+
+
+# ---------------------------------------------------------------------------
+# C3 -- profile/credential failures must close 1011, not look like hangups
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_session_internal_profile_failure_closes_1011_not_completed(caplog):
+    """audit #10: the session resolves terminal_future itself (no socket
+    message) after a profile preflight failure. The gateway must read the
+    session's own recorded close_reason and close 1011, not treat it as an
+    ordinary completed hangup."""
+    caplog.set_level(logging.INFO)
+    factory = _LifecycleFactory()
+    registry = SmartPBXSessionRegistry(4)
+    socket = FakeWebSocket([START])
+    task = asyncio.create_task(SmartPBXGateway(settings(), registry).handle(socket, factory))
+    try:
+        await asyncio.wait_for(factory.session_ready.wait(), timeout=.2)
+        factory.session.close_reason = "profile_unavailable"
+        factory.session.terminal_future.set_result(None)
+        await asyncio.wait_for(task, timeout=.2)
+        assert socket.close_calls == [(1011, "internal error")]
+        assert factory.session.finishes == [True]
+        # finish()'s own close_reason argument is left None here -- it falls
+        # back to whatever the session already recorded on itself.
+        assert factory.session.close_reasons == [(None, None)]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_session_internal_stt_fatal_closes_1011_not_completed():
+    factory = _LifecycleFactory()
+    registry = SmartPBXSessionRegistry(4)
+    socket = FakeWebSocket([START])
+    task = asyncio.create_task(SmartPBXGateway(settings(), registry).handle(socket, factory))
+    try:
+        await asyncio.wait_for(factory.session_ready.wait(), timeout=.2)
+        factory.session.close_reason = "stt_fatal"
+        factory.session.terminal_future.set_result(None)
+        await asyncio.wait_for(task, timeout=.2)
+        assert socket.close_calls == [(1011, "internal error")]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_terminal_future_completion_without_a_recorded_reason_still_closes_1000():
+    """A plain terminal_future completion with no session-recorded failure
+    (e.g. a test double, or any future non-failure terminal path) must keep
+    the pre-existing completed/1000 behavior -- this is the regression guard
+    for the C3 change itself."""
+    factory = _LifecycleFactory()
+    registry = SmartPBXSessionRegistry(4)
+    socket = FakeWebSocket([START])
+    task = asyncio.create_task(SmartPBXGateway(settings(), registry).handle(socket, factory))
+    try:
+        await asyncio.wait_for(factory.session_ready.wait(), timeout=.2)
+        assert factory.session.close_reason is None
+        factory.session.terminal_future.set_result(None)
+        await asyncio.wait_for(task, timeout=.2)
+        assert socket.close_calls == [(1000, "call ended")]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

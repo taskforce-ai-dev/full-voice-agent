@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
-from smartpbx_diagnostics import SmartPBXDiagnosticSink
+from smartpbx_diagnostics import SmartPBXCloseReason, SmartPBXDiagnosticSink
 from smartpbx_protocol import CallContext
 from smartpbx_transport import SmartPBXMediaTransport
 
@@ -27,6 +27,19 @@ _LANGUAGE_MENU_AUDIO_PATH = Path(__file__).with_name("smartpbx_language_menu.ula
 _ULAW_FRAME_BYTES = 160
 _LANGUAGE_MENU_PREROLL_BYTES = 2_400
 _MAX_LANGUAGE_MENU_FRAMES = 512
+_CLOSE_REASONS = frozenset(reason.value for reason in SmartPBXCloseReason)
+# audit #3: how long teardown waits for an in-flight side-effecting tool call
+# (e.g. create_booking) to settle before snapshotting the post-call transcript.
+# A module-level name (not an inline literal) so tests can shrink it instead
+# of waiting out a real 10s.
+LATE_TOOL_RESULT_WAIT_SECONDS = 10.0
+
+
+def _resolve_close_reason(reason: str | None) -> str:
+    """Clamp to the closed vocabulary; an unrecognized/missing value is internal_error."""
+    if isinstance(reason, str) and reason in _CLOSE_REASONS:
+        return reason
+    return SmartPBXCloseReason.INTERNAL_ERROR.value
 
 
 @functools.lru_cache(maxsize=1)
@@ -154,6 +167,14 @@ class KavyaSmartPBXSession:
         self._session_started_ns = time.monotonic_ns()
         self._session_summary_emitted = False
         self._prepared_stt_cleanup_ids: set[int] = set()
+        # Set internally by a session-local terminal failure (missing profile,
+        # fatal STT) before the gateway even knows the call is over; the
+        # gateway supplies its own reason for every other close path via
+        # finish()'s explicit arguments, which take priority when given.
+        self._pending_close_reason: str | None = None
+        self._pending_close_code: int | None = None
+        self._resolved_close_reason: str | None = None
+        self._resolved_close_code: int | None = None
 
     @property
     def terminal_future(self) -> asyncio.Future[None]:
@@ -163,6 +184,15 @@ class KavyaSmartPBXSession:
     def transfer_pending(self) -> bool:
         """Expose the inner pipeline state to the provider-neutral gateway."""
         return bool(getattr(self._pipeline, "transfer_pending", False))
+
+    @property
+    def close_reason(self) -> str | None:
+        """The session-detected close reason, if one has been recorded yet."""
+        return self._pending_close_reason
+
+    @property
+    def close_code(self) -> int | None:
+        return self._pending_close_code
 
     async def start(self) -> None:
         async with self._start_lock:
@@ -199,7 +229,19 @@ class KavyaSmartPBXSession:
             return True
         return await self._require_pipeline().feed_dtmf(digit)
 
-    async def finish(self, schedule_post_call: bool = False) -> None:
+    async def finish(
+        self,
+        schedule_post_call: bool = False,
+        close_reason: str | None = None,
+        close_code: int | None = None,
+    ) -> None:
+        # The gateway's explicit reason always wins; a still-None reason here
+        # (its "raw is None" branch, which never reads from the socket) leaves
+        # whatever a session-internal terminal failure already recorded.
+        if close_reason is not None:
+            self._pending_close_reason = close_reason
+        if close_code is not None:
+            self._pending_close_code = close_code
         async with self._finish_lock:
             if self._finish_task is None:
                 self._finish_task = asyncio.create_task(
@@ -215,7 +257,10 @@ class KavyaSmartPBXSession:
         # before the static bilingual menu so callers cannot enter a profile
         # that cannot speak back to them.
         if not server._has_gemini_api_key():
-            self._end_call_without_language_profile()
+            from smartpbx_diagnostics import DiagnosticFailureClass
+            self._end_call_without_language_profile(
+                failure_class=DiagnosticFailureClass.GEMINI_API_KEY_MISSING,
+            )
             return
         try:
             self._language_menu_audio = _load_smartpbx_language_menu_audio()
@@ -244,9 +289,38 @@ class KavyaSmartPBXSession:
         pipeline.call_start_time = self._call_start_time
         pipeline._event_loop = asyncio.get_running_loop()
         pipeline._smartpbx_diagnostic_sink = self._diagnostic_sink
+        # The selection window is opened by the menu task itself, once its last
+        # frame has actually reached the wire -- see
+        # _arm_language_selection_timeout.
         self._language_menu_task = asyncio.create_task(self._speak_language_menu())
-        loop = asyncio.get_running_loop()
-        self._language_timeout_handle = loop.call_later(
+
+    def _arm_language_selection_timeout(self) -> None:
+        """Open the selection window at the END of the menu, not at its start.
+
+        The static menu is roughly 4.4 s of paced audio inside an 8 s window.
+        Arming when playback was merely *scheduled* spent most of that window on
+        the prompt itself and cut the Sinhala half off mid-sentence -- for a
+        caller who had not yet been told which key to press. ``send_mark``
+        returns only once the last frame has reached the wire, so that is the
+        moment the caller actually has the whole window.
+
+        Idempotent and self-fencing: a replayed menu retires the previous handle
+        and opens a fresh window from its own end, and a selection or teardown
+        that has already claimed the call arms nothing.
+        """
+        import server
+
+        if (
+            self._selected_language is not None
+            or self._finish_task is not None
+            or self._terminal_future.done()
+        ):
+            return
+        handle = self._language_timeout_handle
+        self._language_timeout_handle = None
+        if handle is not None:
+            handle.cancel()
+        self._language_timeout_handle = asyncio.get_running_loop().call_later(
             server.SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS,
             lambda: asyncio.create_task(self._activate_language("en", "timeout")),
         )
@@ -270,10 +344,19 @@ class KavyaSmartPBXSession:
         if audio is None:
             audio = _load_smartpbx_language_menu_audio()
         logger.info("smartpbx_media event=language_menu_audio_started")
-        await self._transport.send_audio(audio)
-        if self._selected_language is not None:
-            return
-        await self._transport.send_mark("language-menu")
+        try:
+            await self._transport.send_audio(audio)
+            if self._selected_language is not None:
+                return
+            await self._transport.send_mark("language-menu")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A caller who never heard the menu must still have a way out of the
+            # pre-selection state: a transport fault cannot leave the call
+            # parked until the session ceiling with no timer to default it.
+            logger.warning("smartpbx_media event=language_menu_playback_failed")
+        self._arm_language_selection_timeout()
 
     async def _activate_language(
         self,
@@ -560,6 +643,14 @@ class KavyaSmartPBXSession:
         self._model = profile.model
         pipeline._gemini_thinking_level = profile.gemini_thinking_level
         pipeline._smartpbx_gemini_max_tokens = profile.gemini_max_tokens
+        if profile.lang == "si":
+            # Fixed Sinhala filler/prompt audio is rendered once per process,
+            # off the call path. Startup already schedules it; this is the
+            # lazy safety net for a process whose first Sinhala call arrives
+            # before (or after a failure of) that startup attempt.
+            import server
+
+            server._schedule_smartpbx_sinhala_phrase_prewarm()
         return profile
 
     async def _cleanup_unstarted_prepared_stt(self, stt: Any) -> None:
@@ -587,13 +678,35 @@ class KavyaSmartPBXSession:
         )
 
     def _end_call_without_language_profile(
-        self, _profile: SmartPBXLanguageProfile | None = None,
+        self,
+        _profile: SmartPBXLanguageProfile | None = None,
+        *,
+        failure_class: "DiagnosticFailureClass | None" = None,
     ) -> None:
-        """Terminal profile failure is not a false generic STT-unavailable event."""
+        """Terminal profile failure is not a false generic STT-unavailable event.
+
+        Audit #10: without an explicit diagnostic here, a missing GEMINI_API_KEY
+        or a preflight failure ended the call exactly like an ordinary hangup --
+        completed_normally in the gateway, no diagnostic, no warning that
+        anything was ever wrong. Emitting SESSION_START/FAILED/<class> here
+        makes the failure observable before the terminal future resolves.
+        """
+        from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
+
         timeout_handle = self._language_timeout_handle
         self._language_timeout_handle = None
         if timeout_handle is not None:
             timeout_handle.cancel()
+        try:
+            self._diagnostic_sink(
+                DiagnosticStage.SESSION_START,
+                DiagnosticOutcome.FAILED,
+                failure_class if failure_class is not None else DiagnosticFailureClass.PROFILE_UNAVAILABLE,
+            )
+        except Exception:
+            pass
+        if self._pending_close_reason is None:
+            self._pending_close_reason = SmartPBXCloseReason.PROFILE_UNAVAILABLE.value
         if not self._terminal_future.done():
             self._terminal_future.set_result(None)
 
@@ -610,6 +723,13 @@ class KavyaSmartPBXSession:
             pipeline = self._pipeline
             if pipeline is None:
                 return
+            # Resolve once, up front: both the post-call payload below and the
+            # session summary in the finally block must agree on why this call
+            # ended, and neither may see it change mid-teardown.
+            self._resolved_close_reason = _resolve_close_reason(self._pending_close_reason)
+            self._resolved_close_code = (
+                self._pending_close_code if isinstance(self._pending_close_code, int) else 0
+            )
             timeout_handle = self._language_timeout_handle
             self._language_timeout_handle = None
             if timeout_handle is not None:
@@ -691,7 +811,30 @@ class KavyaSmartPBXSession:
             if self._smartpbx_transfer_context is not None and self._smartpbx_transfer_context.coordinator is not None:
                 await self._smartpbx_transfer_context.coordinator.finalize_notification_retry()
 
+            # Late tool completion (audit #3): a runner mid-`execute_tool`
+            # (e.g. `create_booking`, 2-5s of PMS latency) when the caller
+            # hangs up is deliberately NOT cancelled -- a half-committed side
+            # effect on the wire is worse than letting it finish -- but it
+            # loses ownership the moment teardown clears the active turn, so
+            # its result would otherwise never reach the post-call record.
+            # Wait, bounded, for it to settle and record its own late result
+            # (via `_record_smartpbx_late_tool_completion`) before snapshotting
+            # the transcript below. Already done (the common case -- most
+            # turns finish in well under this) returns immediately; shielded
+            # so the wait timing out here never cancels the runner itself.
+            runner_task = getattr(pipeline, "_smartpbx_active_runner_task", None)
+            if runner_task is not None and not runner_task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(runner_task), timeout=LATE_TOOL_RESULT_WAIT_SECONDS,
+                    )
+                except Exception:
+                    pass
+
             transcript = list(getattr(pipeline, "full_transcript", []))
+            late_tool_results = getattr(pipeline, "_smartpbx_late_tool_results", None)
+            if late_tool_results:
+                transcript.extend(late_tool_results)
             if schedule_post_call and transcript:
                 self._post_call_task = asyncio.create_task(
                     self._post_call_processor(
@@ -707,6 +850,10 @@ class KavyaSmartPBXSession:
                         gemini_client=getattr(pipeline, "gemini_client", None),
                         model=self._model,
                         privacy_safe=True,
+                        close_reason=self._resolved_close_reason,
+                        close_code=self._resolved_close_code,
+                        duration_ms=self._clamped_duration_ms(),
+                        barge_ins=self._clamped_barge_ins(pipeline),
                     )
                 )
         finally:
@@ -751,17 +898,24 @@ class KavyaSmartPBXSession:
         self._session_summary_emitted = True
         pipeline = self._pipeline
         telemetry = getattr(pipeline, "_turn_telemetry", None)
-        duration_ms = min(max((time.monotonic_ns() - self._session_started_ns) // 1_000_000, 0), _SESSION_MAX_MS)
+        outcome = self._resolved_close_reason or _resolve_close_reason(self._pending_close_reason)
         _emit_smartpbx_session_summary(
             event="session_summary",
             session_trace_id=self._ensure_session_trace_id(),
-            outcome="finished",
+            outcome=outcome,
             turns_started=min(max(int(getattr(telemetry, "turns_started", 0)), 0), 100_000),
             turns_summarized=min(max(int(getattr(telemetry, "turns_summarized", 0)), 0), 100_000),
-            duration_ms=duration_ms,
+            duration_ms=self._clamped_duration_ms(),
             frames_dropped_total=min(max(int(getattr(self._transport, "frames_dropped_total", 0)), 0), 100_000),
-            barge_ins=min(max(int(getattr(pipeline, "_smartpbx_barge_ins", 0)), 0), 100_000),
+            barge_ins=self._clamped_barge_ins(pipeline),
         )
+
+    def _clamped_duration_ms(self) -> int:
+        return min(max((time.monotonic_ns() - self._session_started_ns) // 1_000_000, 0), _SESSION_MAX_MS)
+
+    @staticmethod
+    def _clamped_barge_ins(pipeline: Any) -> int:
+        return min(max(int(getattr(pipeline, "_smartpbx_barge_ins", 0)), 0), 100_000)
 
     def _wire_stt_fatal_signal(self, stt: Any) -> None:
         """Let a terminally failed STT stream end the call in seconds.
@@ -793,6 +947,8 @@ class KavyaSmartPBXSession:
             )
         except Exception:
             pass
+        if self._pending_close_reason is None:
+            self._pending_close_reason = SmartPBXCloseReason.STT_FATAL.value
         if not self._terminal_future.done():
             self._terminal_future.set_result(None)
 

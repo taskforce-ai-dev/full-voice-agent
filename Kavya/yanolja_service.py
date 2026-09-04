@@ -133,7 +133,10 @@ ALL_ROOM_TYPES: tuple[str, ...] = tuple(ROOM_TYPE_PROPERTY)
 # figures. Keep in sync with room_types.base_price in the PMS (see
 # ops/hattonhills-pms/rename_to_hattonhills.sql) or the folio total will
 # disagree with what Kavya says on the call.
-DEMO_RATES_ENABLED: bool = os.getenv("DEMO_RATES_ENABLED", "true").lower() == "true"
+# A key present but blank (e.g. an unset compose ``${DEMO_RATES_ENABLED:-true}``
+# passthrough) must resolve to the default exactly like a missing key --
+# otherwise the demo rate card silently goes dark with no crash to notice.
+DEMO_RATES_ENABLED: bool = (os.getenv("DEMO_RATES_ENABLED") or "true").lower() == "true"
 
 DEMO_NIGHTLY_RATE_USD: dict[str, int] = {
     # Hatton Hills — suites sleep 2, chalets sleep 5.

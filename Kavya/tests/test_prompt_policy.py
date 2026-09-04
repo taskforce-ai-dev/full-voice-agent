@@ -524,3 +524,45 @@ def test_english_prompt_contract_remains_english_only():
         "Never expose English-only internal recovery, keypad, validation, or tool wording",
     ):
         assert sinhala_rule not in english_prompt
+
+
+def _direct_smartpbx_prompt(lang):
+    session = server.MediaStreamSession(
+        websocket=None, lang=lang, media_transport=object(), llm_provider="gemini",
+    )
+    session._smartpbx_transfer_context = object()
+    session.system_prompt = server._build_system_prompt(lang)
+    return session._active_system_prompt()
+
+
+@pytest.mark.parametrize("lang", ["en", "si"])
+def test_direct_smartpbx_rhythm_keeps_its_existing_two_rules(lang):
+    """The added conversational rules extend the rhythm block, never replace it."""
+    prompt = _direct_smartpbx_prompt(lang)
+    assert "SMARTPBX CALLER RHYTHM" in prompt
+    assert "Answer first in one or two concise sentences." in prompt
+    assert "Ask no more than one necessary next question." in prompt
+
+
+@pytest.mark.parametrize("lang", ["en", "si"])
+def test_direct_smartpbx_rhythm_asks_for_a_spoken_confirmation_readback(lang):
+    """Repeating a detail back is how a caller hears that it was heard right."""
+    prompt = _direct_smartpbx_prompt(lang)
+    assert "repeating it back in a few words" in prompt
+
+
+@pytest.mark.parametrize("lang", ["en", "si"])
+def test_direct_smartpbx_rhythm_forbids_the_as_an_ai_preface(lang):
+    """A text-chat tic on a phone call. The honest disclosure itself stays."""
+    prompt = _direct_smartpbx_prompt(lang)
+    assert 'Do not open a reply by describing yourself ("As an AI...")' in prompt
+    assert "say plainly that you are an AI agent for Hatton Hills only when the caller asks" in prompt
+    # The data-security disclosure obligation is untouched.
+    assert "Never claim to be human." in prompt
+
+
+def test_the_rhythm_block_stays_off_every_non_direct_path():
+    twilio = server.MediaStreamSession(
+        websocket=None, lang="si", media_transport=None, llm_provider="gemini",
+    )
+    assert twilio._smartpbx_rhythm_rule() == ""

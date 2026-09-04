@@ -61,6 +61,8 @@ C:/Users/mrdar/Downloads/ezeey-addon-extracted/ezeey-addon/
 
 ## Commands
 
+> **WARNING -- Twilio service only.** Everything below (`deploy.sh`, `docker compose build`, the VPS at `treehouse.taskforceai.tech`) targets the `kavya` (Twilio) service. **None of it touches `kavya-smartpbx`.** `deploy.sh`'s `PROD_FILES` list does not even include `scripts/`, `nginx-smartpbx*.conf`, or `SMARTPBX_RUNBOOK.md`, and building on the VPS is the documented 2026-08-02 resource-starvation failure mode -- see the compose file's own header. SmartPBX has its own reviewed image pipeline (`build-kavya-image.yml` -> `scripts/deploy_smartpbx_image.sh`); follow `SMARTPBX_RUNBOOK.md`, never this section, for any SmartPBX change.
+
 ```bash
 # Install dependencies
 pip install -r requirements.txt
@@ -110,16 +112,16 @@ explicit environment allowlist and must not receive Twilio credentials or
   configured English STT, and canonical ElevenLabs route. Populating Sinhala
   settings does not build a Gemini client or mutate that English call profile.
 - Press `2` is call-local: Azure STT at `si-LK`, Gemini 3.7 Flash LLM with
-  `low` thinking and a bounded 600-token output ceiling, and Gemini 3.1 Flash
+  `low` thinking and a bounded 1024-token output ceiling, and Gemini 3.1 Flash
   TTS (`gemini-3.1-flash-tts-preview`, `Vindemiatrix`).
 - The Compose-rendered defaults are
   `SMARTPBX_SINHALA_LLM_PROVIDER=gemini`,
   `SMARTPBX_SINHALA_GEMINI_LLM_MODEL=gemini-3.7-flash`,
   `SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL=low`, and
-  `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=600`. At runtime, a blank provider
+  `SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=1024`. At runtime, a blank provider
   resolves to `gemini`; an invalid nonblank provider resolves to `claude`;
   thinking accepts `low`, `medium`, or `high` and otherwise resolves to `low`;
-  and the token ceiling defaults to 600 and clamps to `[200, 1024]`.
+  and the token ceiling defaults to 1024 and clamps to `[200, 1024]`.
 - The only operator rollback is
   `SMARTPBX_SINHALA_LLM_PROVIDER=claude`. It changes the Sinhala LLM only; it
   does not alter global `LLM_PROVIDER`, the Twilio service, or an English
@@ -206,7 +208,7 @@ Availability flow: Kavya POSTs to n8n `/webhook/make-availability-request` → n
 - `/webhook/pending-requests` — Extension polls for work (GET, filtered by `checked Is False`)
 - `/webhook/availability-response` — Extension posts scraped results (POST)
 - `/webhook/make-booking` — Kavya submits booking (POST). Same async-polling pattern as availability: extension picks up the row, creates the reservation in eZee, writes the confirmation number back into the `response` field of the same DataTable row. Kavya polls `/webhook/eezy-check-results` until populated.
-- `/webhook/transcript` — Kavya POSTs call summary + transcript after each call (POST, → Google Sheets)
+- `/webhook/post-call-data` — Kavya POSTs call summary + transcript after each call (POST, → Google Sheets)
 
 **Requires**: Browser extension running on a machine logged into `live.ipms247.com` in Firefox. Without it, availability checks timeout after `N8N_POLL_TIMEOUT` seconds.
 
@@ -214,7 +216,7 @@ Availability flow: Kavya POSTs to n8n `/webhook/make-availability-request` → n
 Files in `knowledge_docs/` chunked (500 chars, 50 overlap) -> embedded with `all-MiniLM-L6-v2` -> stored in ChromaDB (`./chroma_db`). Query embeddings LRU-cached. KB context injected as user message prefix per turn (not system prompt). Prewarm on startup. Chunk IDs are SHA-256 hashes (idempotent re-indexing).
 
 **Post-call data capture** (`post_call.py`):
-When a call ends (WebSocket disconnect), `server.py` fires `asyncio.create_task(process_post_call_data(...))` to run post-call processing in the background. The flow: format the full transcript → call LLM (same provider as the conversation) to extract structured booking details (guest name, dates, room preference, outcome, follow-up needed, summary) → POST JSON payload to n8n webhook `/webhook/transcript` → n8n appends a row to Google Sheet "Kavya Call Log". Caller phone number is captured from Twilio HTTP POST params (`From`) via a module-level `_call_phone` dict bridge between HTTP handlers and WebSocket handlers. A separate `full_transcript` list (never trimmed) accumulates all user/assistant messages alongside the trimmed `conversation_history`. All errors are caught and logged — post-call failures never affect the call or server stability. Env var: `N8N_POSTCALL_WEBHOOK` (default: `/webhook/transcript`).
+When a call ends (WebSocket disconnect), `server.py` fires `asyncio.create_task(process_post_call_data(...))` to run post-call processing in the background. The flow: format the full transcript → call LLM (same provider as the conversation) to extract structured booking details (guest name, dates, room preference, outcome, follow-up needed, summary) → POST JSON payload to n8n webhook `/webhook/post-call-data` → n8n appends a row to Google Sheet "Kavya Call Log". Caller phone number is captured from Twilio HTTP POST params (`From`) via a module-level `_call_phone` dict bridge between HTTP handlers and WebSocket handlers. A separate `full_transcript` list (never trimmed) accumulates all user/assistant messages alongside the trimmed `conversation_history`. All errors are caught and logged — post-call failures never affect the call or server stability. Env var: `N8N_POSTCALL_WEBHOOK` (default: `/webhook/post-call-data`).
 
 **Google Sheet columns** (n8n workflow "Post-Call Data to Google Sheets"): Date/Time, Call SID, Language, Caller Phone, Guest Name, Location, Guests, Check-In, Check-Out, Room Preference, Availability, Outcome, Follow-Up Needed, Summary, Transcript.
 
@@ -256,6 +258,25 @@ an assertion that every Gemini exception falls back. Diagnostics and
 acceptance evidence are privacy-safe metadata only: they do not retain caller
 transcript text, prompts, tool arguments/results, audio, API keys, headers, or
 raw provider exceptions.
+
+**History is rendered per provider at the request boundary.** `self.history` is
+written in whichever provider's shape ran the round, so after one Gemini tool
+round it holds OpenAI-shaped `assistant.tool_calls` / `role: "tool"` entries —
+which Anthropic 400s on, and (before this) turned one transient Gemini error
+into a dead call, because the sticky counter then routed every later turn to the
+provider that was rejecting our payload. `_claude_messages_from_history()`
+renders any mixed history into valid Anthropic Messages input at both Claude
+request sites (`_run_llm_claude`, `_run_llm_streaming_claude`); it is an
+identity pass for an already-Anthropic history, preserves tool_use/tool_result
+pairing and ids, drops an unanswered tool call rather than **ever** fabricating a
+result, and never carries a Gemini thought signature across providers.
+`_history_to_gemini()` reads Anthropic content-block entries for the reverse
+direction, so the turn after a Claude failover tool round still runs on Gemini.
+A failover turn that fails for our own reason speaks the shared localized
+recovery line (post-tool variant when that turn already committed a tool round,
+so recovery never invites a repeat booking) and **rolls back the recorded
+failover** (`_rollback_gemini_failover`) — our own errors must never latch
+`degraded` and pin the call to the provider that just failed.
 
 **Full cutover/rollback procedure:** `SMARTPBX_RUNBOOK.md` — preconditions and immutable image identity, `.env.smartpbx` provisioning, TLS bootstrap, the five cutover gates (bad/missing auth rejected, bidirectional audio + LLM turn, KB/PMS answer + post-call record, 4-accepted/5th-rejected capacity, endpoint-down fallback), optional transfer drill with compulsory revoke, and drain-before-stop withdrawal/rollback.
 
@@ -316,6 +337,8 @@ Built dynamically by `_build_system_prompt(lang)` with today's date injected and
 4. **Booking rules**: Answer general info from KB (no tool needed), tools only for date-specific operations, collect info in order, mention complimentary activities, advance payment, honeymoon packages
 
 ## Operational Details
+
+> **WARNING -- Twilio service only.** The deployment details below (`deploy.sh`, VPS builds, `treehouse.taskforceai.tech`) are for the `kavya` (Twilio) service and **must not be used for `kavya-smartpbx`**. SmartPBX deploys only through the reviewed image pipeline described in `SMARTPBX_RUNBOOK.md`.
 
 - **Deployment**: Dockerfile (`python:3.11-slim`), `docker-compose.yml`, `nginx.conf` (SSL + WSS + rate limiting), `requirements-prod.txt`, `deploy.sh`. Target: DigitalOcean VPS at `67.207.90.109` (`treehouse.taskforceai.tech`). Docker CMD runs `server:app`. Docker port `127.0.0.1:8000` (nginx-only). Single uvicorn worker (sentence-transformers uses ~400MB-1GB RAM).
 - **Deployment DNS**: Cloudflare proxy OFF / DNS only for direct SSL. Call routing: hotel's Sri Lankan mobile → unconditional forward → Twilio US number → Kavya.
@@ -497,14 +520,14 @@ This section documents the major changes made to the project since initial devel
 **Changes:**
 - Added `post_call.py` — new module handling post-call LLM extraction and n8n webhook POST
 - At call end, LLM extracts structured booking details from the full transcript: guest name, location, pax, dates, room preference, availability result, call outcome, follow-up needed, summary
-- Extracted data + full transcript POSTed to n8n webhook `/webhook/transcript`
+- Extracted data + full transcript POSTed to n8n webhook `/webhook/post-call-data`
 - n8n workflow appends a row to Google Sheet "Kavya Call Log" (15 columns)
 - Added `_call_phone` module-level dict in `server.py` — bridges caller phone number from Twilio HTTP POST params to WebSocket sessions
 - Added `full_transcript` list (separate from trimmed `conversation_history`) — accumulates all user/assistant messages, never trimmed
 - `finally` blocks in both ConversationRelay and MediaStreamSession fire `asyncio.create_task(process_post_call_data(...))` — fully async, fire-and-forget
 - Supports all three LLM providers (Claude, OpenAI, Gemini) for extraction
 - All errors caught and logged — post-call failures never crash the server
-- Added `N8N_POSTCALL_WEBHOOK` env var (default: `/webhook/transcript`)
+- Added `N8N_POSTCALL_WEBHOOK` env var (default: `/webhook/post-call-data`)
 
 ---
 
@@ -1039,9 +1062,16 @@ Anthropic 400s on Gemini's `function_declarations` payload, and substituting
 booking tool set.
 
 ### SmartPBX migration operational hardening
-- `SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS` is validated in `smartpbx_gateway.py` as an integer setting: default `300`, clamp `[30, 1800]`. If absent, it falls back to this default through settings parsing.
+- `SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS` is validated in `smartpbx_gateway.py` as an integer setting: default `300`, clamp `[30, 1800]`. An omitted line in `.env.smartpbx` falls back to this default via the compose allowlist's own `${SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS:-300}` default (every `kavya-smartpbx` passthrough carries one -- see the env-var drift table); a key present but blank falls back the same way, because `smartpbx_gateway._parse_bounded_integer`'s caller treats a blank value as absent too. Neither path is "absent" at the Python-process level under compose -- an omitted `.env.smartpbx` line still arrives as a real value, just the compose default rather than a truly missing key.
+- `SMARTPBX_MAX_CALL_SECONDS` (Sep 2026): a hard per-call ceiling independent of both idleness and transfer-pending activity -- a call that never idles and never transfers must still end eventually. Default `3600`, clamp `[300, 7200]`. Closes the socket with code `1000` (an expected, polite close, not a policy violation) and the seven-field diagnostic `failure_class=max_call_duration`; the post-call/session-summary `close_reason` field carries `max_call_duration` too. `SmartPBXGateway.__init__` takes an injectable `clock` (default `time.monotonic`) so both ceilings are testable without a real multi-minute wait; it is deliberately not the process-global `time.monotonic` patched in place, since that would also perturb `SmartPBXMediaTransport`'s real-time audio pacing.
 - `smartpbx_transport.py` has no env-driven knobs; transport behavior is bounded by internal backpressure constants (`_SEND_BACKPRESSURE_SECONDS=0.2`, `_SEND_BACKPRESSURE_POLL=0.005`).
 - Missing `KAVYA_EN_ELEVENLABS_VOICE_ID` is a hard failure path in `english_voice_profile.load_kavya_english_voice_profile()` for English TTS: it raises `ValueError`, logged as a skip path for `_tts_elevenlabs()` rather than fabricated/fallback speech.
+- Profile/credential preflight failures (Sep 2026, audit #10): a missing `GEMINI_API_KEY` or any `_preflight_language_profile` failure (`smartpbx_session.py`, `_end_call_without_language_profile`) emits `SESSION_START/FAILED/<class>` on the seven-field diagnostic (`DiagnosticFailureClass.GEMINI_API_KEY_MISSING` or `.PROFILE_UNAVAILABLE`) before resolving the terminal future, and the gateway's "raw is None" completion branch (`smartpbx_gateway.py`, reads `session.close_reason`) now closes `1011` instead of `1000`/`completed_normally` for that case and the pre-existing fatal-STT one -- previously both looked exactly like an ordinary completed hangup, with no diagnostic and no warning.
+- Late tool completion after hangup (Sep 2026, audit #3): when a runner loses ownership (`_current_smartpbx_runner_owns_shared_state(tool_executed=True)` returns False) after `execute_tool` already ran -- both the per-tool bail immediately after `execute_tool` and the post-loop bail before history commit, in all three provider runners -- it now calls `self._record_smartpbx_late_tool_completion(...)` (for the current tool and, at the per-tool bail, every already-staged one) before discarding the round. This appends into `MediaStreamSession._smartpbx_late_tool_results`, a session-owned list separate from `full_transcript`, reusing `_append_booking_confirmation_marker`'s own success/`create_booking` filtering so every other tool stays a no-op. `_arm_endpointing` now tracks the dispatched endpointing→LLM→tool round as `self._smartpbx_active_runner_task` (previously fire-and-forget, audit #11) so `KavyaSmartPBXSession._finish_once_locked` can `asyncio.wait_for(asyncio.shield(...), timeout=smartpbx_session.LATE_TOOL_RESULT_WAIT_SECONDS)` (10s) for it to settle before snapshotting the post-call transcript, then merges `_smartpbx_late_tool_results` in. The wait is shielded so a timeout never cancels the tool call itself (consistent with the pre-existing "never cancel an in-flight tool" policy). `SmartPBXGateway._cleanup`'s per-operation timeout for the "session" step was raised from a flat 5s to 20s (`cleanup_timeouts` dict) to comfortably cover the up-to-5s STT-stop join plus the up-to-10s late-tool wait; transport/lease stay at 5s.
+- Event-loop hygiene (Sep 2026, audits #5/#8/#9):
+  - `tools._await_turn_delivery` (the `transfer_to_human` announcement-delivery wait) no longer busy-spins `await asyncio.sleep(0)` once per loop tick. `server.py`'s `_send_tts_done` and `_handle_bargein` now `.set()` `MediaStreamSession._smartpbx_delivery_event` on every progress event (a delivered sentence, or a generation bump that makes the wait moot); the waiter blocks on that event instead, falling back to the old busy-spin only for a pipeline stand-in that lacks the attribute.
+  - `MediaStreamSession._handle_bargein` is now idempotent per speak generation: it captures `self._speak_generation` synchronously as its first statement and returns immediately if that same generation was already claimed by another (concurrent or prior) call, via `self._smartpbx_bargein_claimed_generation`. Without this, two STT callbacks racing in while `_is_speaking` is still True (an interim and a final, or two interims) both ran the full cancel/bump/retain cycle, and the second run could supersede the caller's own new utterance and drop it.
+  - English/ElevenLabs TTS now has its own pre-audio window, mirroring Sinhala/Gemini's. `_pre_audio_synthesis_active()` gained a second branch: Gemini's existing "in flight, not yet speaking" shape, plus a new `_smartpbx_en_pre_audio_active`/`_smartpbx_en_pre_audio_generation` pair that `_tts_elevenlabs` sets at request start (English sets `_is_speaking` True immediately, unlike Gemini, so a genuine >=`BARGEIN_MIN_CHARS` interruption can still barge in during TTFB) and clears via `_smartpbx_end_en_pre_audio_window()` at the exact moment the first frame reaches the transport -- not when the whole utterance finishes, which would silently disable ordinary barge-in for the rest of the reply. A sub-threshold/debounced STT result arriving in that narrow window now routes through the existing `_handle_pre_audio_stt` buffering (and is flushed via `_flush_pre_audio_stt` in `_tts_elevenlabs`'s `finally` if the request fails before ever emitting audio) instead of being silently dropped.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 

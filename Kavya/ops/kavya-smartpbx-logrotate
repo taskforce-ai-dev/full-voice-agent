@@ -1,0 +1,23 @@
+# logrotate snippet for the durable SmartPBX telemetry archive.
+#
+# Install to /etc/logrotate.d/kavya-smartpbx on the VPS (root:root 0644):
+#   sudo install -m 644 -o root -g root \
+#     /opt/kavya/ops/kavya-smartpbx-logrotate /etc/logrotate.d/kavya-smartpbx
+#
+# The archive is written by scripts/deploy_smartpbx_image.sh
+# (archive_outgoing_logs), one file per recreate, named
+# <utc-stamp>-<old-image-id>.log, root-only (0600). This rotates the
+# directory's accumulated files by age/size rather than the (non-existent,
+# non-appending) single log stream that `logrotate`'s normal size trigger
+# expects, so it uses a fixed weekly/count-bounded policy instead.
+/var/log/kavya-smartpbx/*.log {
+    weekly
+    rotate 8
+    missingok
+    notifempty
+    compress
+    delaycompress
+    dateext
+    su root root
+    create 0600 root root
+}

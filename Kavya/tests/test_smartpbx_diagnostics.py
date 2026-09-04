@@ -24,8 +24,9 @@ def test_diagnostics_enums_are_exact_str_enums_with_stable_values():
             "NONE", "DISABLED", "AUTHENTICATION", "CAPACITY", "INVALID_MESSAGE", "MESSAGE_TOO_BIG",
             "UNSUPPORTED_MEDIA_FORMAT", "INVALID_MEDIA", "AUDIO_TOO_BIG", "INVALID_DTMF", "UNSUPPORTED_EVENT",
             "START_REQUIRED", "ACCOUNT_MISMATCH", "CONTEXT_MISMATCH", "DUPLICATE_START", "CONNECTED_AFTER_START",
-            "START_TIMEOUT", "IDLE_TIMEOUT", "TRANSFER_PENDING_TIMEOUT",
+            "START_TIMEOUT", "IDLE_TIMEOUT", "TRANSFER_PENDING_TIMEOUT", "MAX_CALL_DURATION",
             "SESSION_FACTORY", "SESSION_START", "AUDIO_INGESTION", "STT_UNAVAILABLE",
+            "GEMINI_API_KEY_MISSING", "PROFILE_UNAVAILABLE",
             "TTS_MISSING_API_KEY", "TTS_PROFILE_FAILURE", "TTS_HTTP_STATUS", "TTS_TIMEOUT", "TTS_EXCEPTION",
             "HANDOVER_NOT_ACTIONABLE", "TRANSPORT_DISCONNECT", "TRANSPORT_SEND",
             "CANCELLED", "SESSION_CLEANUP", "TRANSPORT_CLEANUP", "LEASE_CLEANUP",
@@ -39,6 +40,19 @@ def test_diagnostics_enums_are_exact_str_enums_with_stable_values():
         assert tuple(member.name for member in enum_type) == members
         assert tuple(member.value for member in enum_type) == tuple(member.lower() for member in members)
         assert all(isinstance(member, str) and str(member) == member.value for member in enum_type)
+
+
+def test_close_reason_is_an_exact_str_enum_with_stable_values():
+    diagnostics = load_diagnostics_module()
+    expected = (
+        "HANGUP", "STOP", "PEER_DISCONNECT", "IDLE_TIMEOUT", "START_TIMEOUT",
+        "TRANSFER_PENDING_TIMEOUT", "MAX_CALL_DURATION", "TRANSPORT_FAILURE",
+        "STT_FATAL", "PROTOCOL_VIOLATION", "PROFILE_UNAVAILABLE", "SHUTDOWN", "INTERNAL_ERROR",
+    )
+    enum_type = diagnostics.SmartPBXCloseReason
+    assert issubclass(enum_type, (str, Enum))
+    assert tuple(member.name for member in enum_type) == expected
+    assert tuple(member.value for member in enum_type) == tuple(member.lower() for member in expected)
 
 
 def test_diagnostic_sink_has_only_three_typed_positional_enum_arguments():

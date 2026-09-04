@@ -114,11 +114,19 @@ def parse_start_event(event: Mapping[str, object]) -> CallContext:
 
 def parse_smartpbx_event(raw: str, *, max_message_chars: int, max_audio_bytes: int) -> SmartPBXEvent:
     """Parse one bounded SmartPBX JSON message into the closed event union."""
-    if len(raw.encode("utf-8")) > max_message_chars:
-        raise ProtocolViolation(MESSAGE_TOO_BIG, "message too large", "message_too_big")
     try:
+        if len(raw.encode("utf-8")) > max_message_chars:
+            raise ProtocolViolation(MESSAGE_TOO_BIG, "message too large", "message_too_big")
         message = json.loads(raw)
-    except (TypeError, json.JSONDecodeError) as error:
+    except ProtocolViolation:
+        raise
+    except (TypeError, json.JSONDecodeError, RecursionError, UnicodeEncodeError) as error:
+        # RecursionError: deeply nested JSON (e.g. a wall of "[[[[...") blows
+        # the C decoder's recursion budget. UnicodeEncodeError: a lone
+        # surrogate code point (malformed text frame) cannot be re-encoded to
+        # UTF-8 for the size check. Both are protocol abuse, not an internal
+        # fault — fail closed the same way a malformed JSON body does, rather
+        # than surfacing as the gateway's generic INTERNAL_ERROR/1011 path.
         raise _invalid_message() from error
     if not isinstance(message, dict):
         raise _invalid_message()
