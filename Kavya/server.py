@@ -11250,9 +11250,6 @@ class MediaStreamSession:
                 self._emit_smartpbx_tts_diagnostic(
                     DiagnosticFailureClass.TTS_EXCEPTION
                 )
-                await self._fallback_sinhala_tts_openai(
-                    text, sentence=sentence, expected_generation=expected_generation
-                )
 
         except httpx.HTTPStatusError as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -11264,24 +11261,15 @@ class MediaStreamSession:
             self._emit_smartpbx_tts_diagnostic(
                 DiagnosticFailureClass.TTS_HTTP_STATUS
             )
-            await self._fallback_sinhala_tts_openai(
-                text, sentence=sentence, expected_generation=expected_generation
-            )
         except TimeoutError:
             self._log_tts_failure("gemini", "timeout")
             self._emit_smartpbx_tts_diagnostic(
                 DiagnosticFailureClass.TTS_TIMEOUT
             )
-            await self._fallback_sinhala_tts_openai(
-                text, sentence=sentence, expected_generation=expected_generation
-            )
         except Exception:
             self._log_tts_failure("gemini", "exception")
             self._emit_smartpbx_tts_diagnostic(
                 DiagnosticFailureClass.TTS_EXCEPTION
-            )
-            await self._fallback_sinhala_tts_openai(
-                text, sentence=sentence, expected_generation=expected_generation
             )
         finally:
             if self._tts_synthesis_generation == expected_generation:
@@ -11291,34 +11279,6 @@ class MediaStreamSession:
                     await self._flush_pre_audio_stt()
             if not audio_emitted and self._speak_generation == expected_generation:
                 self._is_speaking = False
-
-    async def _fallback_sinhala_tts_openai(
-        self,
-        text: str,
-        *,
-        sentence: str | None,
-        expected_generation: int,
-    ) -> None:
-        """Retry once with OpenAI TTS when Gemini yields no Sinhala audio.
-
-        Gemini's preview TTS model has a low daily request quota
-        (`gemini-3.1-flash-tts-preview`, ~100/day at Tier 1). Exhausting it
-        surfaces as a 200 OK stream carrying zero audio deltas -- not a raised
-        exception -- so it reaches Gemini's own empty_audio outcome as well as
-        this being reachable from a genuine Gemini exception. Either way the
-        caller would otherwise hear nothing for the rest of that day's quota
-        window; fall back once to the OpenAI voice already used for Sinhala on
-        the Twilio line rather than leave the reply silent.
-        """
-        if (
-            self._speak_generation != expected_generation
-            or not self._owns_smartpbx_tts_delivery(expected_generation)
-        ):
-            return
-        await self._flush_pre_audio_stt()
-        await self._tts_openai(
-            text, sentence=sentence, turn_generation=expected_generation
-        )
 
     async def _tts_elevenlabs(
         self,
