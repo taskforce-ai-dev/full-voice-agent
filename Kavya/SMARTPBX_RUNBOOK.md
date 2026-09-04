@@ -135,6 +135,7 @@ SMARTPBX_MAX_TOKENS=
 SMARTPBX_CLAUDE_MAX_TOKENS=
 SMARTPBX_SINHALA_CLAUDE_EFFORT=
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS=
+SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS=
 SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS=
 SMARTPBX_LLM_STALL_TIMEOUT_SECONDS=
 SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS=
@@ -364,8 +365,10 @@ headers carry only the dedicated WSS token; they never carry MCP credentials.
 ## Direct SmartPBX English reliability timing (Phase B)
 
 The shared timeout knobs govern direct SmartPBX English provider rounds and
-direct SmartPBX Sinhala Claude/Gemini rounds. The initial filler remains an
-English-only policy.
+direct SmartPBX Sinhala Claude/Gemini rounds. The initial filler now runs on
+both profiles, each on its own delay knob (below) and its own rotating
+phrase bank -- English through live ElevenLabs TTS, Sinhala through
+pre-rendered/cached Gemini TTS clips only.
 Twilio Media Streams (Arabic/Sinhala/Tamil) and the Twilio ConversationRelay
 path are unaffected — none of this timing applies outside a direct SmartPBX
 call.
@@ -374,6 +377,14 @@ call.
   the one cancellable neutral filler for the first provider round of a call.
   Cancels the instant real content, a tool selection, a barge-in, a
   generation change, a transfer, or session finish pre-empts it.
+- `SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS` (default `2.2`, clamp
+  `[0.5, 5.0]`) — the direct-Sinhala-only counterpart. Higher default than
+  the English knob because Gemini's first token is typically 1.2-1.5s
+  (3.9s when throttled), and the shared 1.5s delay fired the Sinhala filler
+  on most turns even when the answer was only moments away (2026-09-04
+  tester feedback). The Sinhala filler also never plays on two consecutive
+  turns within 15s unless this delay itself exceeds 3.5s — a fixed,
+  not-env-tunable per-session repeat guard.
 - `SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS` (default `8.0`, clamp
   `[1.0, 30.0]`) — how long a provider round may run with zero content/tool
   deltas before Kavya gives up on it.

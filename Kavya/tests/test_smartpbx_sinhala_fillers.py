@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -199,8 +200,8 @@ def test_direct_sinhala_withholds_the_initial_filler_until_its_audio_exists():
     assert asyncio.run(scenario()) is None
 
 
-def test_direct_sinhala_initial_filler_reuses_the_english_delay_and_semantics():
-    """Same controller, same delay knob, same content/tool/barge-in lifecycle."""
+def test_direct_sinhala_initial_filler_uses_its_own_delay_and_reuses_english_semantics():
+    """Own delay knob (2026-09-04), but same content/tool/barge-in lifecycle."""
     pipeline, _transport = _sinhala_pipeline()
     server._store_cached_smartpbx_sinhala_phrase_audio(
         server.SMARTPBX_SINHALA_INITIAL_FILLER_TEXT, b"\xff" * 640,
@@ -215,7 +216,10 @@ def test_direct_sinhala_initial_filler_reuses_the_english_delay_and_semantics():
         controller = pipeline._start_initial_smartpbx_filler(
             round_idx=0, generation=pipeline._speak_generation,
         )
-        assert controller.delay_seconds == server.SMARTPBX_INITIAL_FILLER_DELAY_SECONDS
+        # Sinhala no longer shares the English delay constant -- it has its
+        # own, higher default so it fires only on genuinely slow turns.
+        assert controller.delay_seconds == server.SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS
+        assert controller.delay_seconds != server.SMARTPBX_INITIAL_FILLER_DELAY_SECONDS
         # Content arriving before the delay elapses cancels a filler that has
         # not spoken -- exactly the English rule.
         await controller.on_content_delta()
@@ -605,3 +609,309 @@ def test_apology_plays_through_the_real_transport_when_sinhala_tts_fails_silentl
 
     assert speaking_seen, "the apology must claim audible speaking state while it plays"
     assert sent >= 8000 // 160, "every paced frame of the apology clip reached the wire"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-04 tester feedback: filler variety, filler frequency, keypad
+# wording, and room-name recognition (Direct SmartPBX Sinhala only).
+# ---------------------------------------------------------------------------
+
+def test_all_sinhala_filler_bank_variants_are_on_the_prewarm_allowlist():
+    """Every rotation candidate must be prewarmable -- no variant may ever be
+    spoken from a live Gemini TTS round trip."""
+    for text in server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK:
+        assert text in server.SMARTPBX_SINHALA_CACHED_PHRASES
+    for bank in server.SMARTPBX_SINHALA_TOOL_FILLER_BANKS.values():
+        for text in bank:
+            assert text in server.SMARTPBX_SINHALA_CACHED_PHRASES
+    for text in server.SMARTPBX_SINHALA_DEFAULT_FILLER_BANK:
+        assert text in server.SMARTPBX_SINHALA_CACHED_PHRASES
+
+
+def test_sinhala_initial_filler_bank_has_at_least_four_distinct_short_variants():
+    bank = server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK
+    assert len(bank) >= 4
+    assert len(set(bank)) == len(bank)
+    for phrase in bank:
+        assert 0 < len(phrase.split()) <= 6
+
+
+def test_sinhala_initial_filler_bank_rotates_without_immediate_repeat():
+    """The exact rotation mechanism `_start_initial_smartpbx_filler` uses."""
+    pipeline, _transport = _sinhala_pipeline()
+
+    picks = []
+    for _ in range(8):
+        lease = pipeline._smartpbx_filler_rotation.reserve(
+            "initial", server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK,
+        )
+        lease.commit()
+        picks.append(lease.text)
+
+    assert all(text in server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK for text in picks)
+    assert all(picks[i] != picks[i + 1] for i in range(len(picks) - 1))
+    # Every variant gets used across enough turns, not just the first.
+    assert set(picks) == set(server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK)
+
+
+def test_direct_sinhala_initial_filler_only_offers_prewarmed_bank_variants():
+    """A phrase not yet rendered must never be offered, even if it's in the bank."""
+    pipeline, _transport = _sinhala_pipeline()
+    cached = server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK[:2]
+    for text in cached:
+        server._store_cached_smartpbx_sinhala_phrase_audio(text, b"\xff" * 640)
+
+    async def scenario():
+        controller = pipeline._start_initial_smartpbx_filler(
+            round_idx=0, generation=pipeline._speak_generation,
+        )
+        assert controller is not None
+        assert controller.text in cached
+        await controller.on_barge_in()
+
+    asyncio.run(scenario())
+
+
+def test_direct_sinhala_initial_filler_rotates_across_turns_without_repeat(monkeypatch):
+    pipeline, _transport = _sinhala_pipeline()
+    for text in server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK:
+        server._store_cached_smartpbx_sinhala_phrase_audio(text, b"\xff" * 640)
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS", 0.0)
+    spoken: list[str] = []
+
+    async def fake_speak(text, generation=-1, sentence=None):
+        spoken.append(text)
+
+    pipeline._invoke_speak = fake_speak
+
+    async def run_one_turn():
+        # Isolated from the repeat-suppression rule (tested separately below)
+        # so this test only exercises rotation.
+        pipeline._smartpbx_sinhala_last_filler_at = None
+        controller = pipeline._start_initial_smartpbx_filler(
+            round_idx=0, generation=pipeline._speak_generation,
+        )
+        assert controller is not None
+        await controller.wait()
+        assert controller.spoke is True
+        await pipeline._finish_initial_smartpbx_filler(controller)
+
+    async def scenario():
+        for _ in range(4):
+            await run_one_turn()
+
+    asyncio.run(scenario())
+
+    assert len(spoken) == 4
+    assert all(spoken[i] != spoken[i + 1] for i in range(len(spoken) - 1))
+
+
+def test_sinhala_tool_filler_bank_rotates_without_immediate_repeat():
+    pipeline, _transport = _sinhala_pipeline()
+    bank = server.SMARTPBX_SINHALA_TOOL_FILLER_BANKS["check_availability"]
+    assert len(bank) >= 2
+
+    picks = []
+    for _ in range(6):
+        lease = pipeline._reserve_smartpbx_sinhala_tool_filler("check_availability")
+        lease.commit()
+        picks.append(lease.text)
+
+    # The first pick on a fresh rotation is the existing canonical phrase --
+    # unchanged wording for anything that reads MEDIA_STREAM_FILLERS directly.
+    assert picks[0] == server.MEDIA_STREAM_FILLERS["si"]["check_availability"]
+    assert all(text in bank for text in picks)
+    assert all(picks[i] != picks[i + 1] for i in range(len(picks) - 1))
+
+
+def test_check_availability_filler_typo_is_fixed():
+    """'ඇ දිනවල' was a typo for 'ඒ දිනවල' ('those dates')."""
+    filler = server.MEDIA_STREAM_FILLERS["si"]["check_availability"]
+    assert "ඇ දිනවල" not in filler
+    assert "ඒ දිනවල" in filler
+    for bank in server.SMARTPBX_SINHALA_TOOL_FILLER_BANKS.values():
+        for phrase in bank:
+            assert "ඇ දිනවල" not in phrase
+
+
+def test_sinhala_keypad_prompts_say_keypad_in_english():
+    # The hash-key clause is pulled from the live default prompt itself (not
+    # retyped here) so this test cannot silently pin a mis-typed comparison
+    # string across a Sinhala script boundary.
+    hash_key_clause = server.SMARTPBX_SINHALA_KEYPAD_PROMPTS["default"][
+        server.SMARTPBX_SINHALA_KEYPAD_PROMPTS["default"].index("ඉවර"):
+    ]
+    for prompt in server.SMARTPBX_SINHALA_KEYPAD_PROMPTS.values():
+        assert "keypad" in prompt
+        assert hash_key_clause in prompt
+        assert prompt in server.SMARTPBX_SINHALA_CACHED_PHRASES
+
+
+# --- filler frequency: the Sinhala-only delay knob and repeat suppression --
+
+def test_resolve_smartpbx_sinhala_initial_filler_delay_default_and_clamp():
+    fn = server._resolve_smartpbx_sinhala_initial_filler_delay
+    assert fn(None) == 2.2
+    assert fn("") == 2.2
+    assert fn("not-a-number") == 2.2
+    assert fn("0.1") == 0.5
+    assert fn("10") == 5.0
+    assert fn("3.0") == 3.0
+
+
+def test_sinhala_initial_filler_delay_is_independent_of_the_english_knob():
+    assert (
+        server.SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS
+        != server.SMARTPBX_INITIAL_FILLER_DELAY_SECONDS
+    )
+    assert server.SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS == 2.2
+    assert server.SMARTPBX_INITIAL_FILLER_DELAY_SECONDS == 1.5
+
+
+def test_sinhala_filler_repeat_suppression_rule():
+    fn = server._smartpbx_sinhala_filler_suppressed_by_repeat
+    # Never suppressed on the very first filler of a call.
+    assert fn(None, now=100.0, delay_seconds=2.2) is False
+    # Within the 15s window and a short (<=3.5s) configured delay: suppressed.
+    assert fn(90.0, now=100.0, delay_seconds=2.2) is True
+    # 20s gap clears the 15s window even with the short delay.
+    assert fn(80.0, now=100.0, delay_seconds=2.2) is False
+    # Exactly at the 15s boundary is NOT suppressed (strictly-less comparison).
+    assert fn(85.0, now=100.0, delay_seconds=2.2) is False
+    # A genuinely slow turn (delay > 3.5s) always speaks, even mid-window.
+    assert fn(90.0, now=100.0, delay_seconds=4.0) is False
+    # Exactly at the 3.5s boundary is still suppressed (not strictly greater).
+    assert fn(90.0, now=100.0, delay_seconds=3.5) is True
+
+
+def test_direct_sinhala_initial_filler_suppressed_on_quick_repeat():
+    pipeline, _transport = _sinhala_pipeline()
+    for text in server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK:
+        server._store_cached_smartpbx_sinhala_phrase_audio(text, b"\xff" * 640)
+    pipeline._smartpbx_sinhala_last_filler_at = time.monotonic()
+
+    async def scenario():
+        return pipeline._start_initial_smartpbx_filler(
+            round_idx=0, generation=pipeline._speak_generation,
+        )
+
+    assert asyncio.run(scenario()) is None
+
+
+def test_direct_sinhala_initial_filler_not_suppressed_after_the_window():
+    pipeline, _transport = _sinhala_pipeline()
+    for text in server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK:
+        server._store_cached_smartpbx_sinhala_phrase_audio(text, b"\xff" * 640)
+    pipeline._smartpbx_sinhala_last_filler_at = time.monotonic() - 20.0
+
+    async def scenario():
+        controller = pipeline._start_initial_smartpbx_filler(
+            round_idx=0, generation=pipeline._speak_generation,
+        )
+        assert controller is not None
+        await controller.on_barge_in()
+
+    asyncio.run(scenario())
+
+
+def test_direct_sinhala_initial_filler_not_suppressed_when_delay_raised(monkeypatch):
+    """A genuinely slow turn (operator-raised delay) always gets to speak."""
+    pipeline, _transport = _sinhala_pipeline()
+    for text in server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK:
+        server._store_cached_smartpbx_sinhala_phrase_audio(text, b"\xff" * 640)
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS", 4.0)
+    pipeline._smartpbx_sinhala_last_filler_at = time.monotonic()
+
+    async def scenario():
+        controller = pipeline._start_initial_smartpbx_filler(
+            round_idx=0, generation=pipeline._speak_generation,
+        )
+        assert controller is not None
+        await controller.on_barge_in()
+
+    asyncio.run(scenario())
+
+
+def test_direct_sinhala_initial_filler_records_last_spoken_timestamp(monkeypatch):
+    pipeline, _transport = _sinhala_pipeline()
+    for text in server.SMARTPBX_SINHALA_INITIAL_FILLER_BANK:
+        server._store_cached_smartpbx_sinhala_phrase_audio(text, b"\xff" * 640)
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS", 0.0)
+
+    async def fake_speak(text, generation=-1, sentence=None):
+        pass
+
+    pipeline._invoke_speak = fake_speak
+    assert pipeline._smartpbx_sinhala_last_filler_at is None
+
+    async def scenario():
+        controller = pipeline._start_initial_smartpbx_filler(
+            round_idx=0, generation=pipeline._speak_generation,
+        )
+        await controller.wait()
+
+    asyncio.run(scenario())
+    assert pipeline._smartpbx_sinhala_last_filler_at is not None
+
+
+def test_english_initial_filler_untouched_by_sinhala_suppression_state():
+    """English keeps its own bank/delay and never reads or writes the new
+    Sinhala-only repeat-suppression timestamp."""
+    transport = FakeTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="en", media_transport=transport, llm_provider="claude",
+    )
+    pipeline._smartpbx_transfer_context = object()
+    spoken: list[str] = []
+
+    async def fake_speak(text, generation=-1, sentence=None):
+        spoken.append(text)
+
+    pipeline._invoke_speak = fake_speak
+
+    async def scenario():
+        controller = pipeline._start_initial_smartpbx_filler(
+            round_idx=0, generation=pipeline._speak_generation,
+        )
+        assert controller is not None
+        assert controller.delay_seconds == server.SMARTPBX_INITIAL_FILLER_DELAY_SECONDS
+        assert controller.text in server.SMARTPBX_INITIAL_FILLER_BANK
+        await controller.on_barge_in()
+
+    asyncio.run(scenario())
+    assert pipeline._smartpbx_sinhala_last_filler_at is None
+
+
+# --- room-name recognition: STT phrase list + system-prompt mapping hint --
+
+def test_si_stt_phrase_list_contains_room_name_vocabulary():
+    """Every word this feature adds must actually reach the phrase list --
+    checked against server's own `_SI_ROOM_NAME_PHRASES` source of truth so
+    this test cannot pin a hand-retyped (and possibly wrong) Sinhala string.
+    """
+    for room in server.ROOM_TYPES_BY_PROPERTY[server.PROPERTY_HATTON]:
+        assert room in server.SI_STT_PHRASE_LIST
+    for word in (
+        "Suite", "Chalet", "Forest", "Eco", "Sunrise", "Vista",
+        "Premium", "Mount", "Luxe", "Monarch",
+    ):
+        assert word in server.SI_STT_PHRASE_LIST
+    for phrase in server._SI_ROOM_NAME_PHRASES:
+        assert phrase in server.SI_STT_PHRASE_LIST
+    # At least one Sinhala-script transliteration must be present -- not just
+    # the English words -- since that is the actual STT mishearing case.
+    assert any(
+        any("඀" <= ch <= "෿" for ch in phrase)
+        for phrase in server._SI_ROOM_NAME_PHRASES
+    )
+
+
+def test_sinhala_prompt_contains_room_name_mapping_hint():
+    prompt = server._build_system_prompt("si")
+    assert "ROOM NAME HINTS" in prompt
+    assert "Suite" in prompt
+    assert "Chalet" in prompt
+    assert "Mount Monarch Chalet" in prompt
+
+    english_prompt = server._build_system_prompt("en")
+    assert "ROOM NAME HINTS" not in english_prompt

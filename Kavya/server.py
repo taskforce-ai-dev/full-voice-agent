@@ -728,6 +728,25 @@ def _resolve_smartpbx_initial_filler_delay(raw: object) -> float:
     return min(max(value, 0.5), 5.0)
 
 
+def _resolve_smartpbx_sinhala_initial_filler_delay(raw: object) -> float:
+    """Direct-Sinhala-only initial filler delay, defaulting higher than English.
+
+    2026-09-04 tester feedback: Gemini's first token is typically 1.2-1.5 s
+    (3.9 s when throttled), so the shared 1.5 s English delay fired the
+    Sinhala filler on most turns even when the answer was only moments away.
+    A separate, higher default lets the Sinhala filler stay reserved for
+    genuinely slow turns; English keeps SMARTPBX_INITIAL_FILLER_DELAY_SECONDS
+    unchanged.
+    """
+    try:
+        value = float(raw) if raw not in (None, "") else 2.2
+    except (TypeError, ValueError):
+        value = 2.2
+    if not math.isfinite(value):
+        value = 2.2
+    return min(max(value, 0.5), 5.0)
+
+
 def _resolve_smartpbx_initial_response_timeout_seconds(raw: object) -> float:
     try:
         value = float(raw) if raw not in (None, "") else 8.0
@@ -791,6 +810,34 @@ SMARTPBX_SINHALA_GEMINI_MAX_TOKENS = _resolve_smartpbx_sinhala_gemini_max_tokens
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS: float = _resolve_smartpbx_initial_filler_delay(
     os.getenv("SMARTPBX_INITIAL_FILLER_DELAY_SECONDS")
 )
+SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS: float = (
+    _resolve_smartpbx_sinhala_initial_filler_delay(
+        os.getenv("SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS")
+    )
+)
+
+# Not env-tunable -- a simple, fixed per-session repeat guard, not an
+# operator knob. 2026-09-04 tester feedback: hearing the filler on
+# back-to-back turns is what read as annoying, independent of the delay that
+# gates any single turn. A turn whose configured delay is itself long
+# (> _SMARTPBX_SINHALA_FILLER_REPEAT_MIN_WAIT_SECONDS) is trusted to be
+# genuinely slow, so it always gets to speak -- silence is worse than a
+# repeat when the caller really is waiting.
+_SMARTPBX_SINHALA_FILLER_REPEAT_SUPPRESS_SECONDS: float = 15.0
+_SMARTPBX_SINHALA_FILLER_REPEAT_MIN_WAIT_SECONDS: float = 3.5
+
+
+def _smartpbx_sinhala_filler_suppressed_by_repeat(
+    last_filler_at: float | None, now: float, delay_seconds: float,
+) -> bool:
+    """True when a second Sinhala initial filler this soon would be a repeat."""
+    if last_filler_at is None:
+        return False
+    if delay_seconds > _SMARTPBX_SINHALA_FILLER_REPEAT_MIN_WAIT_SECONDS:
+        return False
+    return (now - last_filler_at) < _SMARTPBX_SINHALA_FILLER_REPEAT_SUPPRESS_SECONDS
+
+
 SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS: float = _resolve_smartpbx_initial_response_timeout_seconds(
     os.getenv("SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS")
 )
@@ -1219,10 +1266,11 @@ _TOOL_FILLER_CYCLES: dict[str, int] = {
 
 
 SMARTPBX_INITIAL_FILLER_TEXT = "Just a moment while I check that for you."
-# The direct-Sinhala counterpart. Deliberately one short, natural spoken
-# phrase rather than a rotation bank: every Sinhala filler has to be
-# pre-rendered through Gemini TTS before a call may use it, so each extra
-# variant is another synthesis the process must complete up front.
+# The direct-Sinhala counterpart. Every phrase in the bank below is
+# pre-rendered through Gemini TTS at process startup (prewarmed, see
+# SMARTPBX_SINHALA_CACHED_PHRASES), so a call only ever offers phrases whose
+# audio already exists -- the initial-filler timer never pays a live 2-5 s
+# Gemini TTS round trip.
 SMARTPBX_SINHALA_INITIAL_FILLER_TEXT = "පොඩ්ඩක් ඉන්න, මම බලන්නම්."
 # Never-silent fallback: spoken instead of dead air when a Sinhala TTS attempt
 # fails for a turn that has delivered no audio yet. Fixed and cached exactly
@@ -1232,6 +1280,17 @@ SMARTPBX_SINHALA_INITIAL_FILLER_TEXT = "පොඩ්ඩක් ඉන්න, ම�
 SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT = (
     "සමාවෙන්න, මට පොඩි තාක්ෂණික අපහසුතාවයක් තියෙනවා. "
     "කරුණාකර පොඩ්ඩක් ඉන්න, නැත්නම් ටිකෙන් නැවත උත්සාහ කරන්න."
+)
+
+# 2026-09-04 tester feedback: this one fixed phrase played on nearly every
+# turn and read as repetitive/annoying. A small bank of short, warm,
+# colloquial variants, rotated per turn (no immediate repeat) via the same
+# `_CallFillerRotation` the English SmartPBX path already uses.
+SMARTPBX_SINHALA_INITIAL_FILLER_BANK: tuple[str, ...] = (
+    SMARTPBX_SINHALA_INITIAL_FILLER_TEXT,
+    "එහෙනම් ටිකක් ඉන්නකෝ.",
+    "මම බලලා කියන්නම්, ටිකක් ඉන්න.",
+    "තත්පරයක් ඉන්නකෝ.",
 )
 _SMARTPBX_CAPTURE_TOOLS = frozenset({
     "capture_spoken_number", "capture_spoken_name", "collect_number_via_keypad",
@@ -2397,11 +2456,28 @@ _SI_TENS_WORDS: dict[str, int] = {
     "අනූව": 90, "අනූ": 90,
 }
 
+# 2026-09-04 tester feedback: Azure si-LK STT mis-hears English room names
+# spoken inside Sinhala speech (e.g. "Suite" -> "ස්විෆ්ට්", "Mount" ->
+# "මවුන්ට් පොඩ්ඩක්"), so the LLM could not map the transcript back to one of
+# the five Hatton Hills room types. Biasing the recognizer toward the room
+# names, their component words, and their common Sinhala transliterations
+# does not guarantee a clean transcript, but it raises the odds the correct
+# word appears somewhere in it -- the system prompt's room-name mapping hint
+# (below) is what recovers from the transcripts that still come back mangled.
+_SI_ROOM_NAME_PHRASES: tuple[str, ...] = (
+    *ROOM_TYPES_BY_PROPERTY[PROPERTY_HATTON],
+    "Suite", "Chalet", "Forest", "Eco", "Sunrise", "Vista", "Premium",
+    "Mount", "Luxe", "Monarch",
+    "ෆොරස්ට්", "එස්කේප්", "ස්වීට්", "සූට්", "එකෝ", "හාමනි", "සන්රයිස්",
+    "විස්ටා", "ප්‍රීමියම්", "මවුන්ට්", "ලක්ස්", "මොනාර්ක්", "ෂැලේ", "චලට්",
+)
+
 # Combined vocabulary -- shared by the dictation-ratio heuristic below and the
 # Azure si-LK phrase list (AzureSTTStream.start()).
 SI_STT_PHRASE_LIST: tuple[str, ...] = tuple(
     dict.fromkeys(
         list(_SI_UNIT_WORDS) + list(_SI_TEEN_WORDS) + list(_SI_TENS_WORDS)
+        + list(_SI_ROOM_NAME_PHRASES)
     )
 )
 
@@ -2812,7 +2888,10 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
         "_default": "لحظة من فضلك.",
     },
     "si": {
-        "check_availability": "\u0D87 \u0DAF\u0DD2\u0DB1\u0DC0\u0DBD \u0D87\u0DAD\u0DD2 \u0D9A\u0DCF\u0DB8\u0DBB \u0D9C\u0DD9\u0DB1 \u0DB6\u0DBD\u0DB8\u0DD2.",
+        # NOTE: the leading word here was a typo (\u0D87 "\u0D87" instead of \u0D92 "\u0D92") until
+        # 2026-09-04 tester feedback -- "\u0D87 \u0DAF\u0DD2\u0DB1\u0DC0\u0DBD" is not a real Sinhala
+        # phrase; "\u0D92 \u0DAF\u0DD2\u0DB1\u0DC0\u0DBD" ("those dates") is what was intended.
+        "check_availability": "\u0D92 \u0DAF\u0DD2\u0DB1\u0DC0\u0DBD \u0D87\u0DAD\u0DD2 \u0D9A\u0DCF\u0DB8\u0DBB \u0D9C\u0DD9\u0DB1 \u0DB6\u0DBD\u0DB8\u0DD2.",
         "create_booking": "\u0D94\u0DB6\u0DD9 \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD3\u0DBB\u0DD2\u0DB8 \u0DC3\u0D9A\u0DC3\u0DCA \u0D9A\u0DBB\u0DB8\u0DD2.",
         "retrieve_booking": "\u0D94\u0DB6\u0DD9 \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD3\u0DBB\u0DD2\u0DB8 \u0DB6\u0DBD\u0DB8\u0DD2.",
         "cancel_booking": "\u0D94\u0DB6\u0DD9 \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD3\u0DBB\u0DD2\u0DB8 \u0D85\u0DC0\u0DBD\u0D82\u0D9C\u0DD4 \u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DC3\u0D9A\u0DC3\u0DCA \u0D9A\u0DBB\u0DB8\u0DD2.",
@@ -2826,6 +2905,40 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
         "_default": "\u0BA4\u0BAF\u0BB5\u0BC1\u0B9A\u0BC6\u0BAF\u0BCD\u0BA4\u0BC1 \u0B95\u0BBE\u0BA4\u0BCD\u0BA4\u0BBF\u0BB0\u0BC1\u0B99\u0BCD\u0B95\u0BB3\u0BCD.",
     },
 }
+
+# 2026-09-04 tester feedback: the direct-Sinhala waiting message was one fixed
+# phrase that played on nearly every turn and read as repetitive/annoying.
+# These banks give each Sinhala filler slot 2-4 short, warm, colloquial
+# variants; a per-session `_CallFillerRotation` (the same mechanism the
+# English SmartPBX path already uses) rotates through them without an
+# immediate repeat. Every phrase below is fixed and operator-authored, so
+# every variant is added to `SMARTPBX_SINHALA_CACHED_PHRASES` and prewarmed
+# the same way the single phrase used to be -- no variant may ever be spoken
+# from a live Gemini TTS round trip.
+SMARTPBX_SINHALA_TOOL_FILLER_BANKS: dict[str, tuple[str, ...]] = {
+    "check_availability": (
+        MEDIA_STREAM_FILLERS["si"]["check_availability"],
+        "\u0D91\u0DC4\u0DD9\u0DB1\u0DB8\u0DCA \u0D9A\u0DCF\u0DB8\u0DBB \u0DAD\u0DD2\u0DBA\u0DD9\u0DB1\u0DC0\u0DAF \u0DB6\u0DBD\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+        "\u0DA7\u0DD2\u0D9A\u0D9A\u0DCA \u0D89\u0DB1\u0DCA\u0DB1, \u0D9A\u0DCF\u0DB8\u0DBB \u0DB6\u0DBD\u0DBD\u0DCF \u0D9A\u0DD2\u0DBA\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+    ),
+    "create_booking": (
+        MEDIA_STREAM_FILLERS["si"]["create_booking"],
+        "\u0D91\u0DC4\u0DD9\u0DB1\u0DB8\u0DCA \u0D94\u0DB6\u0DDA \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DAF\u0DD0\u0DB1\u0DCA \u0D9A\u0DBB\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+        "\u0DA7\u0DD2\u0D9A\u0D9A\u0DCA \u0D89\u0DB1\u0DCA\u0DB1, \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DC3\u0D9A\u0DC3\u0DCA \u0D9A\u0DBB\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+    ),
+    "retrieve_booking": (
+        MEDIA_STREAM_FILLERS["si"]["retrieve_booking"],
+        "\u0D91\u0DC4\u0DD9\u0DB1\u0DB8\u0DCA \u0D94\u0DB6\u0DDA \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DC4\u0DDC\u0DBA\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+    ),
+    "cancel_booking": (
+        MEDIA_STREAM_FILLERS["si"]["cancel_booking"],
+        "\u0D91\u0DC4\u0DD9\u0DB1\u0DB8\u0DCA \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DB1\u0DC0\u0DAD\u0DCA\u0DAD\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+    ),
+}
+SMARTPBX_SINHALA_DEFAULT_FILLER_BANK: tuple[str, ...] = (
+    MEDIA_STREAM_FILLERS["si"]["_default"],
+    "\u0D9A\u0DBB\u0DD4\u0DAB\u0DCF\u0D9A\u0DBB \u0DA7\u0DD2\u0D9A\u0D9A\u0DCA \u0D89\u0DB1\u0DCA\u0DB1.",
+)
 
 # ---------------------------------------------------------------------------
 # Direct SmartPBX Sinhala fixed-phrase audio
@@ -2846,11 +2959,17 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
 # both speak English mid-Sinhala and make the phrase unrenderable in
 # advance. Two fixed phrases cover every label the tool is offered for.
 SMARTPBX_SINHALA_KEYPAD_PROMPTS: dict[str, str] = {
+    # 2026-09-04 tester feedback: the plain Sinhala word for "keypad" is not
+    # one callers commonly use/recognise. Say the English word "keypad"
+    # alongside the Sinhala phrase (which stays for anyone who prefers it),
+    # while keeping the existing hash-key instruction.
     "whatsapp": (
-        "කරුණාකර ඔබේ WhatsApp අංකය දුරකථනයේ අංක බොත්තම් වලින් ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
+        "කරුණාකර ඔබේ WhatsApp අංකය ඔබේ දුරකථනයේ keypad එකෙන් (අංක බොත්තම් "
+        "වලින්) ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
     ),
     "default": (
-        "කරුණාකර ඔබේ අංකය දුරකථනයේ අංක බොත්තම් වලින් ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
+        "කරුණාකර ඔබේ අංකය ඔබේ දුරකථනයේ keypad එකෙන් (අංක බොත්තම් වලින්) "
+        "ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
     ),
 }
 
@@ -2867,12 +2986,20 @@ SMARTPBX_SINHALA_CACHED_PHRASES: tuple[str, ...] = tuple(
         (
             SMARTPBX_SINHALA_INITIAL_FILLER_TEXT,
             SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT,
+            *SMARTPBX_SINHALA_INITIAL_FILLER_BANK,
             *SMARTPBX_SINHALA_KEYPAD_PROMPTS.values(),
             *(
                 phrase
                 for phrase in MEDIA_STREAM_FILLERS.get("si", {}).values()
                 if phrase
             ),
+            *(
+                phrase
+                for bank in SMARTPBX_SINHALA_TOOL_FILLER_BANKS.values()
+                for phrase in bank
+                if phrase
+            ),
+            *(phrase for phrase in SMARTPBX_SINHALA_DEFAULT_FILLER_BANK if phrase),
         )
     )
 )
@@ -3069,6 +3196,13 @@ def _build_system_prompt(lang: str = "en") -> str:
             "results exactly while phrasing the surrounding response naturally.\n"
             "- Never expose English-only internal recovery, keypad, validation, or tool "
             "wording to the caller.\n\n"
+            "ROOM NAME HINTS: guests often say English room names inside Sinhala "
+            "speech and STT can mishear them. Likely matches: ස්විෆ්ට්/ස්වීට් = Suite "
+            "(Forest Escape Suite, Eco Harmony Suite, Sunrise Vista Premium Suite); "
+            "ෂැලේ/චලට් = Chalet (Mount Luxe Chalet, Mount Monarch Chalet); මවුන්ට් = "
+            "Mount; ෆොරස්ට් = Forest; එකෝ = Eco; සන්රයිස් = Sunrise; ලක්ස් = Luxe; "
+            "මොනාර්ක් = Monarch. If the room name is unclear, confirm it by name "
+            "instead of guessing, e.g. ask if they meant the Mount Monarch Chalet.\n\n"
         )
     elif lang == "ta":
         language_rules = (
@@ -6553,6 +6687,9 @@ class MediaStreamSession:
         # read into each runner and committed only by the current owner.
         self._rate_followup_eligible = False
         self._smartpbx_filler_rotation = _CallFillerRotation()
+        # Monotonic timestamp of the last direct-Sinhala initial filler that
+        # actually spoke, used only by the 15 s repeat-suppression rule below.
+        self._smartpbx_sinhala_last_filler_at: float | None = None
         self._smartpbx_initial_filler: SmartPBXInitialFillerController | None = None
         # Direct SmartPBX specialized tool fillers are session-owned. A runner
         # can return early, be cancelled, or lose a turn while one still holds
@@ -6677,6 +6814,21 @@ class MediaStreamSession:
         )
         return self._smartpbx_filler_rotation.reserve(f"tool:{tool_name}", bank)
 
+    def _reserve_smartpbx_sinhala_tool_filler(self, tool_name: str) -> _CallFillerLease:
+        """Rotate the direct-Sinhala tool filler bank (no cache-readiness gate).
+
+        Unlike the initial filler, a tool filler's `_speak()` call is allowed
+        to fall back to a live Gemini TTS round trip for an uncached phrase
+        (it already runs concurrently with the tool, not in front of it), so
+        every variant is eligible regardless of prewarm state -- prewarming
+        is still done for all of them so that fallback is never exercised
+        live in production.
+        """
+        bank = SMARTPBX_SINHALA_TOOL_FILLER_BANKS.get(
+            tool_name, SMARTPBX_SINHALA_DEFAULT_FILLER_BANK
+        )
+        return self._smartpbx_filler_rotation.reserve(f"si_tool:{tool_name}", bank)
+
     def _provider_max_tokens(self, provider: str | None = None) -> int:
         """Per-provider output budget for one direct-SmartPBX round.
 
@@ -6706,19 +6858,28 @@ class MediaStreamSession:
         ):
             return None
         # Direct English rotates a phrase bank through live ElevenLabs TTS.
-        # Direct Sinhala gets the same controller and the same delay, but only
-        # once its one phrase is pre-rendered: Gemini TTS is request/response,
-        # so a filler synthesised here would hold the shared speak lock through
-        # a 2-5 s round trip and land on top of the answer it was covering.
+        # Direct Sinhala rotates its own bank too, but only among phrases
+        # already pre-rendered: Gemini TTS is request/response, so a filler
+        # synthesised here would hold the shared speak lock through a 2-5 s
+        # round trip and land on top of the answer it was covering.
+        is_sinhala = False
+        sinhala_available: tuple[str, ...] = ()
         if self._is_direct_smartpbx_english():
-            sinhala_filler_text = None
-        elif (
-            self._is_direct_smartpbx_sinhala()
-            and _get_cached_smartpbx_sinhala_phrase_audio(
-                SMARTPBX_SINHALA_INITIAL_FILLER_TEXT
-            ) is not None
-        ):
-            sinhala_filler_text = SMARTPBX_SINHALA_INITIAL_FILLER_TEXT
+            pass
+        elif self._is_direct_smartpbx_sinhala():
+            sinhala_available = tuple(
+                text for text in SMARTPBX_SINHALA_INITIAL_FILLER_BANK
+                if _get_cached_smartpbx_sinhala_phrase_audio(text) is not None
+            )
+            if not sinhala_available:
+                return None
+            if _smartpbx_sinhala_filler_suppressed_by_repeat(
+                self._smartpbx_sinhala_last_filler_at,
+                time.monotonic(),
+                SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS,
+            ):
+                return None
+            is_sinhala = True
         else:
             return None
 
@@ -6740,6 +6901,8 @@ class MediaStreamSession:
             controller = existing
         else:
             async def speak(text: str, *, generation: int) -> None:
+                if is_sinhala:
+                    self._smartpbx_sinhala_last_filler_at = time.monotonic()
                 await self._invoke_speak(text, generation=generation)
 
             async def clear_audio() -> None:
@@ -6781,21 +6944,20 @@ class MediaStreamSession:
                     runner.speak_generation = self._speak_generation
                     self._assistant_turn_generation = self._speak_generation
 
-            # Sinhala speaks one fixed pre-rendered phrase, so it takes no
-            # lease: there is no bank to rotate and nothing to reserve.
             filler_lease = (
-                None if sinhala_filler_text is not None
+                self._smartpbx_filler_rotation.reserve("initial", sinhala_available)
+                if is_sinhala
                 else self._reserve_smartpbx_initial_filler()
             )
             controller = SmartPBXInitialFillerController(
                 speak=speak,
                 generation=generation,
-                delay_seconds=SMARTPBX_INITIAL_FILLER_DELAY_SECONDS,
-                clear_audio=clear_audio,
-                text=(
-                    sinhala_filler_text if filler_lease is None
-                    else filler_lease.text
+                delay_seconds=(
+                    SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS if is_sinhala
+                    else SMARTPBX_INITIAL_FILLER_DELAY_SECONDS
                 ),
+                clear_audio=clear_audio,
+                text=filler_lease.text,
                 lease=filler_lease,
             )
             controller.start()
@@ -10485,13 +10647,17 @@ class MediaStreamSession:
                         filler_sent=smartpbx_filler_sent,
                         initial_filler=initial_filler,
                     ):
-                        filler = fillers.get(first_tool, fillers.get("_default", ""))
-                        if filler:
+                        filler_lease = self._reserve_smartpbx_sinhala_tool_filler(
+                            first_tool
+                        )
+                        if filler_lease.text:
                             tool_filler_task = self._start_smartpbx_tool_filler(
-                                filler, generation=gen,
+                                filler_lease.text, generation=gen, lease=filler_lease,
                             )
                             await asyncio.sleep(0)
                             smartpbx_filler_sent = True
+                        else:
+                            filler_lease.release()
                     else:
                         filler = fillers.get(first_tool, fillers.get("_default", ""))
                         if filler:
@@ -11221,13 +11387,17 @@ class MediaStreamSession:
                     filler_sent=smartpbx_filler_sent,
                     initial_filler=initial_filler,
                 ):
-                    filler = fillers.get(first_tool, fillers.get("_default", ""))
-                    if filler:
+                    filler_lease = self._reserve_smartpbx_sinhala_tool_filler(
+                        first_tool
+                    )
+                    if filler_lease.text:
                         tool_filler_task = self._start_smartpbx_tool_filler(
-                            filler, generation=gen,
+                            filler_lease.text, generation=gen, lease=filler_lease,
                         )
                         await asyncio.sleep(0)
                         smartpbx_filler_sent = True
+                    else:
+                        filler_lease.release()
                 else:
                     filler = fillers.get(first_tool, fillers.get("_default", ""))
                     if filler:

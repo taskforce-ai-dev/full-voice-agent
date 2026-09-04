@@ -269,6 +269,41 @@ acceptance evidence are privacy-safe metadata only: they do not retain caller
 transcript text, prompts, tool arguments/results, audio, API keys, headers, or
 raw provider exceptions.
 
+**Direct SmartPBX Sinhala conversational polish (2026-09-04 tester feedback).**
+Three fixes from live pilot calls, all Sinhala-only:
+- **Filler variety.** The single fixed initial-filler phrase (and the fixed
+  per-tool `MEDIA_STREAM_FILLERS["si"]` phrases) are now each a small bank
+  of 2-4 short, warm, colloquial variants (`SMARTPBX_SINHALA_INITIAL_FILLER_BANK`,
+  `SMARTPBX_SINHALA_TOOL_FILLER_BANKS`, `SMARTPBX_SINHALA_DEFAULT_FILLER_BANK`),
+  rotated per turn without an immediate repeat by the same per-session
+  `_CallFillerRotation` the English SmartPBX path already uses. Every variant
+  is on the `SMARTPBX_SINHALA_CACHED_PHRASES` prewarm allowlist — the initial
+  filler only ever offers phrases whose audio is already cached (a live
+  Gemini TTS round trip would hold the speak lock through the 2-5 s it takes);
+  the tool filler is not gated on cache readiness since it already runs
+  concurrently with its tool, not in front of it. The `check_availability`
+  filler's leading word typo (`ඇ දිනවල` → `ඒ දිනවල`, "those dates") is fixed.
+- **Filler frequency.** `SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS`
+  (default `2.2`, clamp `[0.5, 5.0]`) replaces the shared English delay for
+  the Sinhala profile only — Gemini's first token is typically 1.2-1.5 s
+  (3.9 s throttled), so the shared 1.5 s English delay fired on most turns.
+  A per-session "last filler spoke at" timestamp additionally suppresses a
+  second initial filler within 15 s of the last one UNLESS the configured
+  delay itself exceeds 3.5 s (`_smartpbx_sinhala_filler_suppressed_by_repeat`)
+  — a long configured wait is trusted to be genuinely slow and always speaks.
+- **Keypad wording.** `SMARTPBX_SINHALA_KEYPAD_PROMPTS` now says "keypad" in
+  English alongside the Sinhala phrase (testers found the plain Sinhala word
+  unfamiliar); the hash-key instruction and the prewarm allowlist membership
+  are unchanged.
+- **Room-name recognition.** `SI_STT_PHRASE_LIST` gained the five room names,
+  their component English words, and common Sinhala transliterations, biasing
+  Azure `si-LK` STT toward them (mirroring the existing number-word bias).
+  The Sinhala system prompt gained a compact "ROOM NAME HINTS" block mapping
+  likely mis-hearings (e.g. `ස්විෆ්ට්/ස්වීට් = Suite`) to the five room types,
+  instructing Kavya to confirm by name rather than guess when unsure.
+English profiles, Twilio Media Streams, and every other Sinhala policy are
+untouched by this change.
+
 **History is rendered per provider at the request boundary.** `self.history` is
 written in whichever provider's shape ran the round, so after one Gemini tool
 round it holds OpenAI-shaped `assistant.tool_calls` / `role: "tool"` entries —
