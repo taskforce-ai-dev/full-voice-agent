@@ -100,6 +100,7 @@ STT_ENDPOINTING_SILENCE_SECONDS=1.0
 STT_FINAL_GRACE_SECONDS=0.5
 CAPTURE_ENDPOINTING_SILENCE_SECONDS=1.5
 CAPTURE_FINAL_GRACE_SECONDS=1.2
+CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS=0.35
 STT_DIGIT_CLASS_BOOST=
 SMARTPBX_PILOT_TRANSCRIPT_LOGGING=0
 DTMF_INTERDIGIT_TIMEOUT_SECONDS=6
@@ -575,6 +576,7 @@ event allowlist**. It may contain only the following runtime event names:
 `silence_reprompt`, `stt_final`, `stt_post_dispatch_result`,
 `stt_provider_final`, `stt_provider_interim`,
 `capture_buffer_bounded`, `capture_final_buffered`, `capture_deferred_rearm`,
+`capture_endpointing_decision`,
 `capture_forced_dispatch`,
 `stt_callback_drain`, `capture_mode_enter`, `capture_mode_exit`, `dtmf_collect_start`, and
 `dtmf_collect_done`; unlisted event names are not permitted.
@@ -621,6 +623,20 @@ expired while a prior turn was still active. It proves that, after the capture
 ask was delivered, the buffered caller fragment received the existing capture
 window instead of immediate dispatch. The record contains no transcript text,
 length, phone digits, caller identifier, prompt, or tool data.
+
+`capture_endpointing_decision` emits exactly four fields, and no others:
+
+| Field | Type | Permitted values |
+| --- | --- | --- |
+| `event` | fixed literal | `capture_endpointing_decision` |
+| `kind` | fixed literal | `phone` |
+| `outcome` | fixed literal | `accelerated` |
+| `delay_ms` | bounded integer | `100`–`1000`, clamped |
+
+It appears only when a Direct SmartPBX phone-capture provider final combines to
+an unambiguous Sri Lankan mobile number and receives the bounded short grace.
+It contains no transcript text, phone digits, caller identifier, tool data, or
+provider response.
 
 `llm_stream_timeout` emits exactly eight fields, and no others:
 

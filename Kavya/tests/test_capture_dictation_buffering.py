@@ -315,6 +315,246 @@ def test_outside_capture_mode_a_final_still_endpoints_on_the_short_grace():
     assert loop.last.delay == server.STT_FINAL_GRACE_SECONDS
 
 
+# --- (b0) a complete local phone number can finish promptly ----------------
+
+def _make_direct_smartpbx_session(*, lang="en"):
+    session, loop, processed = make_session(lang=lang)
+    # The session fixture is deliberately transport-free for ordinary capture
+    # tests.  Direct SmartPBX is narrower: it requires both call context and a
+    # media transport, so opt into that boundary explicitly here.
+    session._media_transport = object()
+    return session, loop, processed
+
+
+@pytest.mark.parametrize("spoken", (
+    "zero seven seven one two three four five six seven",
+    "seven seven one two three four five six seven",
+    "nine four seven seven one two three four five six seven",
+))
+def test_complete_lk_phone_final_uses_the_short_capture_grace(spoken):
+    session, loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode(kind="phone")
+
+    asyncio.run(session._accumulate_transcript(spoken))
+
+    assert loop.last.delay == server.CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS
+
+
+@pytest.mark.parametrize("spoken", (
+    "zero seven seven one two three four five six",  # incomplete LK local
+    "nine six zero seven seven one two three four",  # Maldives NSN
+    "plus four four two zero seven nine four six zero",  # foreign
+))
+def test_incomplete_or_foreign_phone_final_keeps_the_patient_capture_window(spoken):
+    session, loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode(kind="phone")
+
+    asyncio.run(session._accumulate_transcript(spoken))
+
+    assert loop.last.delay == session._capture_turn_timeout(final=True)
+
+
+def test_bare_maldives_nsn_is_not_mistaken_for_a_lk_mobile_fast_path():
+    session, _loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode(kind="phone")
+
+    assert session._has_complete_lk_phone_capture("960771234") is False
+
+
+def test_needs_more_refines_capture_kind_without_refilling_turn_allowance():
+    session, _loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode()
+    session._capture_mode_turns_left = 1
+
+    session._record_capture_tool_completion(
+        "capture_spoken_number", {"status": "needs_more"}
+    )
+    assert session._capture_kind == "phone"
+    assert session._capture_mode_turns_left == 1
+
+    session._record_capture_tool_completion(
+        "capture_spoken_name", {"status": "needs_more"}
+    )
+    assert session._capture_kind == "phone", "phone/name must not be reclassified"
+    assert session._capture_mode_turns_left == 1
+
+
+def test_delivered_phone_ask_refines_generic_capture_without_refilling_allowance():
+    session, _loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode()
+    session._capture_mode_turns_left = 1
+    _deliver(session, "Could I take your WhatsApp number, please?")
+
+    session._maybe_enter_capture_mode_from_ask()
+
+    assert session._capture_kind == "phone"
+    assert session._capture_mode_turns_left == 1
+
+
+def test_phone_final_replaces_the_patient_continuation_timer():
+    session, loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode(kind="phone")
+
+    async def scenario():
+        await session._accumulate_transcript("zero seven seven one two")
+        patient_timer = loop.last
+        await session._accumulate_transcript("three four five six seven")
+        assert patient_timer.cancelled is True
+
+    asyncio.run(scenario())
+
+    assert len(loop.live) == 1
+    assert loop.last.delay == server.CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS
+
+
+def test_phone_capture_interim_never_accelerates_endpointing():
+    session, loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode(kind="phone")
+
+    async def scenario():
+        await session._accumulate_transcript(
+            "zero seven seven one two three four five six seven"
+        )
+        accelerated_timer = loop.last
+        await session._set_transcript_interim("zero seven seven one two three")
+        assert accelerated_timer.cancelled is True
+
+    asyncio.run(scenario())
+
+    assert loop.last.delay == server.CAPTURE_ENDPOINTING_SILENCE_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_deferred_complete_phone_final_keeps_fast_deadline_after_turn_release():
+    session, loop, processed = _make_direct_smartpbx_session()
+    release = await _start_held_turn(session, loop, processed)
+    session._enter_capture_mode(kind="phone")
+
+    await session._accumulate_transcript(
+        "zero seven seven one two three four five six seven"
+    )
+    assert loop.last.delay == server.CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS
+    loop.last.callback()
+    await asyncio.sleep(0)
+    assert session._deferred_flush_pending is True
+
+    release.set()
+    await _wait_for_turn_release(session)
+
+    assert loop.last.delay == server.CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS
+    assert processed == ["original turn"]
+
+
+def test_twilio_capture_does_not_take_the_direct_smartpbx_phone_fast_path():
+    session, loop, _processed = make_session(smartpbx=False)
+    session._enter_capture_mode(kind="phone")
+
+    asyncio.run(
+        session._accumulate_transcript(
+            "zero seven seven one two three four five six seven"
+        )
+    )
+
+    assert loop.last.delay == session._capture_turn_timeout(final=True)
+
+
+def test_sinhala_phone_check_normalizes_a_temporary_copy_only():
+    session, loop, _processed = _make_direct_smartpbx_session(lang="si")
+    session._enter_capture_mode(kind="phone")
+    spoken = "බිංදුව හත හත එක දෙක තුන හතර පහ හය හත"
+
+    asyncio.run(session._accumulate_transcript(spoken))
+
+    assert session._committed_transcript == spoken
+    assert loop.last.delay == server.CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS
+
+
+def test_phone_endpointing_telemetry_has_the_closed_privacy_safe_shape(caplog):
+    session, _loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode(kind="phone")
+    spoken = "zero seven seven one two three four five six seven"
+
+    with caplog.at_level("INFO"):
+        asyncio.run(session._accumulate_transcript(spoken))
+
+    records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith(
+            "smartpbx_media event=capture_endpointing_decision "
+        )
+    ]
+    assert records == [
+        "smartpbx_media event=capture_endpointing_decision "
+        "kind=phone outcome=accelerated "
+        f"delay_ms={int(server.CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS * 1000)}"
+    ]
+    assert spoken not in records[0]
+    assert "0771234567" not in records[0]
+
+
+def test_phone_capture_grace_knob_clamps_to_a_safe_range():
+    parse = server._parse_endpointing_seconds
+    assert parse(
+        {"CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS": "0.01"},
+        "CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS", 0.35, 0.1, 1.0,
+    ) == 0.1
+    assert parse(
+        {"CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS": "9"},
+        "CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS", 0.35, 0.1, 1.0,
+    ) == 1.0
+
+
+@pytest.mark.asyncio
+async def test_stale_endpoint_callback_cannot_flush_after_a_newer_interim():
+    """A cancelled timer may already be queued; only its own deadline may flush."""
+    session, loop, processed = make_session()
+
+    await session._accumulate_transcript("first final")
+    stale_timer = loop.last
+    # Queue the old deadline's task but do not yield to it yet.  A newer STT
+    # result replaces the timer before that task gets a chance to run.
+    stale_timer.callback()
+    await session._set_transcript_interim("newer interim")
+    replacement_timer = loop.last
+
+    assert stale_timer.cancelled is True
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert processed == []
+
+    replacement_timer.callback()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert processed == ["first final newer interim"]
+
+
+def test_exit_capture_mode_clears_the_capture_kind():
+    session, _loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode(kind="phone")
+
+    session._exit_capture_mode("test")
+
+    assert session._is_capture_mode_active() is False
+    assert session._capture_kind == "generic"
+
+
+@pytest.mark.asyncio
+async def test_transfer_pending_clears_the_capture_kind():
+    session, _loop, _processed = _make_direct_smartpbx_session()
+    session._enter_capture_mode(kind="phone")
+    # Avoid transport I/O: the transfer prelude has already fenced audio in
+    # this lifecycle shape, so only the state-retirement seam remains.
+    session._smartpbx_transfer_audio_fenced = True
+
+    await session.enter_transfer_pending()
+
+    assert session.transfer_pending is True
+    assert session._is_capture_mode_active() is False
+    assert session._capture_kind == "generic"
+
+
 # --- (b1) a capture ask that lands while the prior turn is in flight --------
 
 @pytest.mark.asyncio

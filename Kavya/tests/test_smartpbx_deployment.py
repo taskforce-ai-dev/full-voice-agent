@@ -527,6 +527,7 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "capture_buffer_bounded",
         "capture_final_buffered",
         "capture_deferred_rearm",
+        "capture_endpointing_decision",
         "capture_forced_dispatch",
         "stt_callback_drain",
         "capture_mode_enter",
@@ -3692,6 +3693,7 @@ def test_stt_endpointing_knobs_are_deliverable_through_the_documented_path():
         ("STT_FINAL_GRACE_SECONDS", "0.5"),
         ("CAPTURE_ENDPOINTING_SILENCE_SECONDS", "1.5"),
         ("CAPTURE_FINAL_GRACE_SECONDS", "1.2"),
+        ("CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS", "0.35"),
     ):
         assert smartpbx_env.get(name) == f"${{{name}:-{default}}}", (
             f"{name} must be in the smartpbx environment allowlist with its code default"
@@ -3704,6 +3706,7 @@ def test_stt_endpointing_knobs_are_deliverable_through_the_documented_path():
         ("STT_FINAL_GRACE_SECONDS", "0.5"),
         ("CAPTURE_ENDPOINTING_SILENCE_SECONDS", "1.5"),
         ("CAPTURE_FINAL_GRACE_SECONDS", "1.2"),
+        ("CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS", "0.35"),
     ):
         assert f"{name}={default}" in example, f"{name} missing from .env.example"
         assert f"{name}={default}" in runbook, f"{name} missing from the runbook env template"
