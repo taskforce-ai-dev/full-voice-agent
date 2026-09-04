@@ -1009,6 +1009,27 @@ service modes are architecturally incapable of running in one process.
     three ConversationRelay runners. The combined dictation reaches the parser
     through that override and nowhere else, so a runner that skips it silently
     discards the fragment combining.
+  - **Sinhala spoken numbers (Direct SmartPBX Sinhala only, Sep 2026).**
+    Sinhala callers say numbers tens+units combined ("හැට පහ" = sixty-five),
+    not digit-by-digit like English callers dictate, and Azure `si-LK` STT
+    returns Sinhala number words (sometimes mixed with ASCII digits) that
+    `handover.py`'s English-only `spoken_number_to_digits` cannot parse — its
+    token splitter treats every Sinhala character as a separator, so a bare
+    Sinhala number was silently dropped. `server._normalize_sinhala_spoken_digits`
+    is a pure, word-boundary-matched text transform (units 0–9, teens 11–19,
+    tens 10/20/…/90 standalone or combined with a following unit) that runs
+    in `_flush_transcript`, gated on `_is_direct_smartpbx_sinhala()`, BEFORE
+    the dictation-ratio check and before the turn dispatches — so the same
+    normalised digits reach `_capture_dictation_ratio`,
+    `_process_utterance`'s history, and (via `_last_guest_utterance_raw` /
+    `_smartpbx_runner_raw_utterance`) the `capture_spoken_number` override.
+    `_CAPTURE_DICTATION_WORDS` also carries the raw Sinhala number-word
+    vocabulary as defense in depth. `AzureSTTStream` applies a matching
+    `SI_STT_PHRASE_LIST` PhraseListGrammar for `lang == "si"` (mirroring the
+    existing English-only `EN_STT_PHRASE_LIST` bias) so Azure is biased
+    toward the same words the normaliser understands. English behaviour
+    (`expand_spoken_repeats`, `spoken_number_to_digits`) and the Twilio
+    Sinhala Media Streams path are both untouched.
 
 ### Post-dispatch STT results: refuse only the empty ones (Aug 2026)
 A dispatched turn owns the STT endpoint (`_utterance_dispatched`), and results
