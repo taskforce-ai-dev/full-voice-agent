@@ -40,6 +40,7 @@ import binascii
 import copy
 import contextlib
 import enum
+import hashlib
 import json
 import logging
 import math
@@ -50,6 +51,7 @@ import secrets
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # --- Error tracking (Sentry): no-op unless SENTRY_DSN is set ---
 # `_sentry_before_send`/`_SENTRY_LOGGABLE_DIGITS` are defined unconditionally
@@ -2093,6 +2095,23 @@ SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS: tuple[str, ...] = (
     )
 )
 
+# Minimum spacing between consecutive prewarm synthesis requests, so a cold
+# start (19 fixed phrases today) never bursts the provider's ~10
+# requests/minute cap. Env-tunable, clamped to [0, 60] -- 0 disables pacing
+# entirely (test/local use only; never set it to 0 in production).
+SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS: float = _parse_clamped_float(
+    os.environ, "SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS", 7.0, 0.0, 60.0,
+)
+
+# Bind-mounted directory for the persistent rendered-phrase cache. Blank
+# disables disk persistence entirely (in-memory only, matching the prior
+# process-lifetime-only behaviour). Every file under it is raw mu-law audio
+# bytes, named by a sha256 hash of (model, voice, text) -- never the phrase
+# text itself, and never anything but audio.
+SMARTPBX_SINHALA_PHRASE_CACHE_DIR: str = os.environ.get(
+    "SMARTPBX_SINHALA_PHRASE_CACHE_DIR", "/app/smartpbx_phrase_cache"
+).strip()
+
 # Upper bound for the only integer the post-dispatch STT telemetry emits. The
 # event records that a late provider result was ignored while a turn was already
 # dispatched; the age of that turn is useful, an unbounded number is not. Not an
@@ -3007,17 +3026,26 @@ _SMARTPBX_MULAW_FRAME_BYTES = 640
 _SMARTPBX_SINHALA_PHRASE_AUDIO: dict[tuple[str, str, str], bytes] = {}
 _SMARTPBX_SINHALA_PHRASE_AUDIO_LOCK = threading.Lock()
 _SMARTPBX_SINHALA_PHRASE_PREWARM: tuple[Any, asyncio.Task] | None = None
+# A Sinhala activation retries prewarm on every call while readiness is false,
+# which -- once the persistent cache means "not ready" can legitimately mean
+# "quota is exhausted for the day" -- would otherwise start a fresh paced run
+# (up to 19 requests) on every single incoming call. Debounced to at most once
+# per 10 minutes; the daily quota-reset trigger below bypasses this debounce
+# deliberately, since it is a scheduled event, not a caller-triggered retry.
+_SMARTPBX_SINHALA_PHRASE_PREWARM_DEBOUNCE_SECONDS = 600.0
+_SMARTPBX_SINHALA_PHRASE_PREWARM_LAST_STARTED_AT: float | None = None
+_SMARTPBX_SINHALA_PHRASE_PREWARM_RESET_TASK: tuple[Any, asyncio.Task] | None = None
 
 
 class _SmartPBXSinhalaPhraseSynthesisError(Exception):
     """One fixed Sinhala phrase could not be rendered to usable mu-law."""
 
 
-def _smartpbx_sinhala_phrase_audio_key(text: str) -> tuple[str, str, str]:
+def _smartpbx_sinhala_phrase_audio_key(text: str, model: str | None = None) -> tuple[str, str, str]:
     """The complete request identity that produced a cached Sinhala clip."""
     return (
         text,
-        SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
+        model or SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
         SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
     )
 
@@ -3028,20 +3056,38 @@ def _is_smartpbx_sinhala_cacheable_phrase(text: str) -> bool:
 
 
 def _get_cached_smartpbx_sinhala_phrase_audio(text: str) -> bytes | None:
+    """The in-memory clip for a fixed phrase, under ANY model in the chain.
+
+    Voice is identical across the whole fallback chain, so a phrase rendered
+    on a fallback model during prewarm is just as servable as one rendered on
+    the primary model -- callers never need to know which model produced it.
+    """
     if not _is_smartpbx_sinhala_cacheable_phrase(text):
         return None
     with _SMARTPBX_SINHALA_PHRASE_AUDIO_LOCK:
-        return _SMARTPBX_SINHALA_PHRASE_AUDIO.get(
-            _smartpbx_sinhala_phrase_audio_key(text)
-        )
+        for model in _smartpbx_sinhala_tts_model_chain():
+            audio = _SMARTPBX_SINHALA_PHRASE_AUDIO.get(
+                _smartpbx_sinhala_phrase_audio_key(text, model)
+            )
+            if audio is not None:
+                return audio
+    return None
 
 
-def _store_cached_smartpbx_sinhala_phrase_audio(text: str, audio: bytes) -> None:
+def _store_cached_smartpbx_sinhala_phrase_audio(
+    text: str, audio: bytes, *, model: str | None = None
+) -> None:
+    """Store one rendered clip in memory only -- never touches disk.
+
+    Disk persistence is a deliberate, separate step
+    (`_write_smartpbx_sinhala_phrase_audio_to_disk`) so this stays the cheap,
+    synchronous primitive every existing caller already expects.
+    """
     if not _is_smartpbx_sinhala_cacheable_phrase(text) or not audio:
         return
     with _SMARTPBX_SINHALA_PHRASE_AUDIO_LOCK:
         _SMARTPBX_SINHALA_PHRASE_AUDIO.setdefault(
-            _smartpbx_sinhala_phrase_audio_key(text), audio
+            _smartpbx_sinhala_phrase_audio_key(text, model), audio
         )
 
 
@@ -3051,6 +3097,92 @@ def _smartpbx_sinhala_phrase_audio_ready() -> bool:
         _get_cached_smartpbx_sinhala_phrase_audio(text) is not None
         for text in SMARTPBX_SINHALA_CACHED_PHRASES
     )
+
+
+def _smartpbx_sinhala_phrases_ready_count() -> int:
+    """How many allowlisted phrases already have cached audio, right now."""
+    return sum(
+        1
+        for text in SMARTPBX_SINHALA_CACHED_PHRASES
+        if _get_cached_smartpbx_sinhala_phrase_audio(text) is not None
+    )
+
+
+# --- persistent (bind-mounted) phrase cache ---------------------------------
+#
+# A container restart used to lose every rendered clip, so a fresh process
+# spent its first ~19 requests re-synthesising phrases whose text and audio
+# never change. Key = sha256 of (model, voice, text) -- the file NAME encodes
+# no phrase text, ever; the file CONTENTS are raw mu-law bytes and nothing
+# else (never a caller transcript, never JSON, never a wrapper format).
+
+
+def _smartpbx_sinhala_phrase_cache_hash(model: str, text: str) -> str:
+    digest_input = "\x00".join((model, SMARTPBX_SINHALA_GEMINI_TTS_VOICE, text))
+    return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+
+
+def _smartpbx_sinhala_phrase_cache_path(model: str, text: str) -> Path | None:
+    """None means disk persistence is disabled (blank cache-dir env)."""
+    if not SMARTPBX_SINHALA_PHRASE_CACHE_DIR:
+        return None
+    digest = _smartpbx_sinhala_phrase_cache_hash(model, text)
+    return Path(SMARTPBX_SINHALA_PHRASE_CACHE_DIR) / f"{digest}.ulaw"
+
+
+def _load_smartpbx_sinhala_phrase_audio_from_disk(model: str, text: str) -> bytes | None:
+    """Read one cached clip; ignore anything unreadable, empty, or misaligned.
+
+    A file must be a non-empty, exact multiple of 160 bytes (one 20 ms 8 kHz
+    mu-law frame) to be trusted -- anything else is a truncated write or a
+    stray file and is silently skipped, never raised.
+    """
+    path = _smartpbx_sinhala_phrase_cache_path(model, text)
+    if path is None:
+        return None
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if not data or len(data) % 160 != 0:
+        return None
+    return data
+
+
+def _write_smartpbx_sinhala_phrase_audio_to_disk(model: str, text: str, audio: bytes) -> None:
+    """Best-effort atomic write; a failure here never fails the prewarm run."""
+    path = _smartpbx_sinhala_phrase_cache_path(model, text)
+    if path is None or not audio:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_bytes(audio)
+        tmp_path.replace(path)
+    except OSError:
+        logger.warning("smartpbx_media event=sinhala_phrase_cache_write_failed")
+
+
+def _load_smartpbx_sinhala_phrase_cache_from_disk() -> int:
+    """Load every allowlisted phrase from disk into memory; return the count.
+
+    Tried under every model in the fallback chain (primary first) since a
+    prior process may have persisted a phrase rendered on a fallback model.
+    Phrases already resident in memory are skipped without touching disk.
+    """
+    if not SMARTPBX_SINHALA_PHRASE_CACHE_DIR:
+        return 0
+    loaded = 0
+    for text in SMARTPBX_SINHALA_CACHED_PHRASES:
+        if _get_cached_smartpbx_sinhala_phrase_audio(text) is not None:
+            continue
+        for model in _smartpbx_sinhala_tts_model_chain():
+            audio = _load_smartpbx_sinhala_phrase_audio_from_disk(model, text)
+            if audio is not None:
+                _store_cached_smartpbx_sinhala_phrase_audio(text, audio, model=model)
+                loaded += 1
+                break
+    return loaded
 
 
 def _gemini_tts_audio_metadata_supported(audio_delta: Any) -> bool:
@@ -3066,16 +3198,22 @@ def _gemini_tts_audio_metadata_supported(audio_delta: Any) -> bool:
     return True
 
 
-async def _synthesize_smartpbx_sinhala_phrase_audio(client: Any, text: str) -> bytes:
+async def _synthesize_smartpbx_sinhala_phrase_audio(
+    client: Any, text: str, *, model: str | None = None
+) -> bytes:
     """Render one fixed Sinhala phrase to frame-aligned 8 kHz mu-law.
 
     Deliberately transport-free and fence-free: this runs outside any call, so
     it must never touch a session's speaking state or media generation.
+    `model` selects one entry of the fallback chain; defaults to the primary.
+    Raises `_GeminiTTSProviderError` for a classified provider error (so the
+    caller can back off / switch model / stop the run) and
+    `_SmartPBXSinhalaPhraseSynthesisError` for anything else unrenderable.
     """
     if audioop is None:
         raise _SmartPBXSinhalaPhraseSynthesisError()
     stream = await client.aio.interactions.create(
-        model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
+        model=model or SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
         input=text,
         stream=True,
         response_format={"type": "audio"},
@@ -3112,43 +3250,177 @@ async def _synthesize_smartpbx_sinhala_phrase_audio(client: Any, text: str) -> b
     return mulaw + b"\xff" * ((-len(mulaw)) % _SMARTPBX_MULAW_FRAME_BYTES)
 
 
+def _smartpbx_sinhala_prewarm_clock() -> float:
+    """Indirection point so prewarm pacing/elapsed_ms is testable."""
+    return time.monotonic()
+
+
+async def _smartpbx_sinhala_prewarm_sleep(seconds: float) -> None:
+    """Indirection point so prewarm pacing is testable without real waits."""
+    if seconds > 0:
+        await asyncio.sleep(seconds)
+
+
+# Closed vocabulary for the summary line's failure_codes tally and the
+# per-phrase failure log line. `_SmartPBXSinhalaPhraseSynthesisError` (bad
+# audio metadata, malformed base64, an odd PCM tail, no audioop) is never
+# evidence about quota/rate-limit, so it gets its own bounded code rather than
+# being folded into a provider code it did not earn.
+_SMARTPBX_SINHALA_PREWARM_LOCAL_FAILURE_CODE = "local_synthesis_failure"
+_SMARTPBX_SINHALA_PREWARM_UNKNOWN_FAILURE_CODE = "unknown_error"
+# Max spacing a rate_limited backoff will reach, and how many times one phrase
+# retries against a single model before the fallback chain (or a recorded
+# failure) takes over.
+_SMARTPBX_SINHALA_PREWARM_MAX_BACKOFF_SECONDS = 60.0
+_SMARTPBX_SINHALA_PREWARM_MAX_RATE_LIMIT_RETRIES = 3
+
+
 async def _prewarm_smartpbx_sinhala_phrase_audio() -> None:
-    """Render every fixed Sinhala phrase once, so no call has to pay for it."""
+    """Render every fixed Sinhala phrase once, so no call has to pay for it.
+
+    Three cost-control measures on top of the original one-shot renderer:
+    disk-backed phrases are loaded first and never re-synthesised; remaining
+    misses are rendered one at a time with a minimum spacing so a cold start
+    cannot burst the provider's per-minute cap; and a classified
+    `quota_exceeded` stops the whole run immediately rather than spending the
+    rest of the daily budget discovering the same limit phrase by phrase.
+    """
+    start = _smartpbx_sinhala_prewarm_clock()
     try:
         client = _get_gemini_tts_client()
     except Exception:
         logger.warning("smartpbx_media event=sinhala_phrase_prewarm_unavailable")
         return
-    rendered = 0
-    for text in SMARTPBX_SINHALA_CACHED_PHRASES:
+
+    loaded_from_disk = _load_smartpbx_sinhala_phrase_cache_from_disk()
+    synthesised = 0
+    failed = 0
+    failure_codes: dict[str, int] = {}
+    interval = SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS
+    last_request_started_at: float | None = None
+    stop_run = False
+
+    def _record_failure(index: int, code: str) -> None:
+        nonlocal failed
+        failed += 1
+        failure_codes[code] = failure_codes.get(code, 0) + 1
+        logger.warning(
+            "smartpbx_media event=sinhala_phrase_prewarm_phrase_failed index=%d code=%s",
+            index, code,
+        )
+
+    for index, text in enumerate(SMARTPBX_SINHALA_CACHED_PHRASES):
         if _get_cached_smartpbx_sinhala_phrase_audio(text) is not None:
             continue
-        try:
-            audio = await _synthesize_smartpbx_sinhala_phrase_audio(client, text)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # One unrenderable phrase must not cost the others their clip; the
-            # caller-facing gates simply keep that phrase off the fast path.
-            continue
-        _store_cached_smartpbx_sinhala_phrase_audio(text, audio)
-        rendered += 1
+
+        available_models = _smartpbx_sinhala_tts_available_models()
+        if not available_models:
+            # The sticky per-process state already knows every configured
+            # model is exhausted for today -- do not spend a round trip
+            # re-discovering that for every remaining phrase.
+            _record_failure(index, "quota_exceeded")
+            stop_run = True
+            break
+
+        model_index = 0
+        backoff_seconds = interval
+        rate_limit_retries = 0
+
+        while True:
+            model_name = available_models[model_index]
+            if interval > 0 and last_request_started_at is not None:
+                wait_for = interval - (
+                    _smartpbx_sinhala_prewarm_clock() - last_request_started_at
+                )
+                if wait_for > 0:
+                    await _smartpbx_sinhala_prewarm_sleep(wait_for)
+            last_request_started_at = _smartpbx_sinhala_prewarm_clock()
+
+            try:
+                audio = await _synthesize_smartpbx_sinhala_phrase_audio(
+                    client, text, model=model_name,
+                )
+            except asyncio.CancelledError:
+                raise
+            except _GeminiTTSProviderError as exc:
+                if exc.code == "quota_exceeded":
+                    _mark_smartpbx_sinhala_tts_model_exhausted(model_name)
+                    _record_failure(index, exc.code)
+                    stop_run = True
+                    break
+                if (
+                    exc.code == "rate_limited"
+                    and rate_limit_retries < _SMARTPBX_SINHALA_PREWARM_MAX_RATE_LIMIT_RETRIES
+                ):
+                    rate_limit_retries += 1
+                    backoff_seconds = min(
+                        (backoff_seconds or interval or 1.0) * 2,
+                        _SMARTPBX_SINHALA_PREWARM_MAX_BACKOFF_SECONDS,
+                    )
+                    await _smartpbx_sinhala_prewarm_sleep(backoff_seconds)
+                    continue
+                if exc.code == "rate_limited":
+                    _mark_smartpbx_sinhala_tts_model_exhausted(model_name)
+                    if model_index + 1 < len(available_models):
+                        model_index += 1
+                        rate_limit_retries = 0
+                        backoff_seconds = interval
+                        continue
+                _record_failure(index, exc.code)
+                break
+            except _SmartPBXSinhalaPhraseSynthesisError:
+                _record_failure(index, _SMARTPBX_SINHALA_PREWARM_LOCAL_FAILURE_CODE)
+                break
+            except Exception:
+                _record_failure(index, _SMARTPBX_SINHALA_PREWARM_UNKNOWN_FAILURE_CODE)
+                break
+            else:
+                _store_cached_smartpbx_sinhala_phrase_audio(text, audio, model=model_name)
+                _write_smartpbx_sinhala_phrase_audio_to_disk(model_name, text, audio)
+                synthesised += 1
+                if model_name != SMARTPBX_SINHALA_GEMINI_TTS_MODEL:
+                    logger.info(
+                        "smartpbx_media event=sinhala_phrase_prewarm_fallback_model "
+                        "index=%d model=%s",
+                        index, model_name,
+                    )
+                break
+
+        if stop_run:
+            break
+
+    elapsed_ms = int((_smartpbx_sinhala_prewarm_clock() - start) * 1000)
+    failure_codes_text = ",".join(
+        f"{code}:{count}" for code, count in sorted(failure_codes.items())
+    )
     logger.info(
-        "smartpbx_media event=sinhala_phrase_prewarm rendered=%d total=%d ready=%s",
-        rendered,
+        "smartpbx_media event=sinhala_phrase_prewarm rendered=%d total=%d ready=%s "
+        "loaded_from_disk=%d synthesised=%d failed=%d failure_codes=%s elapsed_ms=%d",
+        loaded_from_disk + synthesised,
         len(SMARTPBX_SINHALA_CACHED_PHRASES),
         str(_smartpbx_sinhala_phrase_audio_ready()).lower(),
+        loaded_from_disk,
+        synthesised,
+        failed,
+        failure_codes_text,
+        elapsed_ms,
     )
 
 
-def _schedule_smartpbx_sinhala_phrase_prewarm() -> None:
+def _schedule_smartpbx_sinhala_phrase_prewarm(*, force: bool = False) -> None:
     """Start the one in-flight Sinhala prewarm for this loop, at most once.
 
     Re-entrant on purpose: a prewarm that failed against a transient Gemini
     outage is retried by the next Sinhala activation, rather than leaving every
-    later call permanently without its fillers.
+    later call permanently without its fillers -- but debounced to at most
+    once per `_SMARTPBX_SINHALA_PHRASE_PREWARM_DEBOUNCE_SECONDS`, since with a
+    persistent cache "not ready" can legitimately mean "quota exhausted for
+    the day", and every activation retrying that would burn a paced run (up to
+    19 requests) per incoming call. `force=True` (the daily quota-reset
+    trigger) bypasses the debounce -- it is a scheduled event, not a
+    caller-triggered retry -- but still respects an in-flight run.
     """
-    global _SMARTPBX_SINHALA_PHRASE_PREWARM
+    global _SMARTPBX_SINHALA_PHRASE_PREWARM, _SMARTPBX_SINHALA_PHRASE_PREWARM_LAST_STARTED_AT
     if not _has_gemini_api_key() or _smartpbx_sinhala_phrase_audio_ready():
         return
     try:
@@ -3158,8 +3430,55 @@ def _schedule_smartpbx_sinhala_phrase_prewarm() -> None:
     existing = _SMARTPBX_SINHALA_PHRASE_PREWARM
     if existing is not None and existing[0] is loop and not existing[1].done():
         return
+    now = _smartpbx_sinhala_prewarm_clock()
+    last_started = _SMARTPBX_SINHALA_PHRASE_PREWARM_LAST_STARTED_AT
+    if (
+        not force
+        and last_started is not None
+        and (now - last_started) < _SMARTPBX_SINHALA_PHRASE_PREWARM_DEBOUNCE_SECONDS
+    ):
+        return
+    _SMARTPBX_SINHALA_PHRASE_PREWARM_LAST_STARTED_AT = now
     _SMARTPBX_SINHALA_PHRASE_PREWARM = (
         loop, loop.create_task(_prewarm_smartpbx_sinhala_phrase_audio()),
+    )
+
+
+async def _smartpbx_sinhala_phrase_prewarm_daily_reset_loop() -> None:
+    """Force one re-prewarm attempt at each Gemini Sinhala TTS quota reset.
+
+    Runs for the process lifetime: sleeps until the next
+    `SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR` boundary, forces one prewarm
+    attempt there (bypassing the activation debounce -- this is a scheduled
+    event, not a caller-triggered retry), then sleeps until the next one. A
+    day with nothing left to render is a fast no-op (`_schedule_...` returns
+    immediately once `_smartpbx_sinhala_phrase_audio_ready()` is true).
+    """
+    while True:
+        now = _smartpbx_utcnow()
+        wait_seconds = max(
+            (_smartpbx_sinhala_tts_quota_reset_boundary(now) - now).total_seconds(),
+            1.0,
+        )
+        try:
+            await _smartpbx_sinhala_prewarm_sleep(wait_seconds)
+        except asyncio.CancelledError:
+            raise
+        _schedule_smartpbx_sinhala_phrase_prewarm(force=True)
+
+
+def _schedule_smartpbx_sinhala_phrase_prewarm_daily_reset() -> None:
+    """Start the one daily quota-reset re-prewarm loop for this loop, at most once."""
+    global _SMARTPBX_SINHALA_PHRASE_PREWARM_RESET_TASK
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    existing = _SMARTPBX_SINHALA_PHRASE_PREWARM_RESET_TASK
+    if existing is not None and existing[0] is loop and not existing[1].done():
+        return
+    _SMARTPBX_SINHALA_PHRASE_PREWARM_RESET_TASK = (
+        loop, loop.create_task(_smartpbx_sinhala_phrase_prewarm_daily_reset_loop()),
     )
 
 
@@ -5209,6 +5528,10 @@ async def lifespan(app: FastAPI):
         # first Sinhala call: Gemini TTS is request/response, so a filler
         # synthesised on demand arrives after the answer it exists to cover.
         _schedule_smartpbx_sinhala_phrase_prewarm()
+        # Also retry any still-missing phrases once at the next daily Gemini
+        # quota reset -- a run that stopped on quota_exceeded should not wait
+        # for the next Sinhala call to be picked back up.
+        _schedule_smartpbx_sinhala_phrase_prewarm_daily_reset()
 
     # NOTE: bookings go to the Yanolja PMS via booking_api -> yanolja_service ->
     # yanolja_client. Hatton Hills is an invented demo property, so there is no
@@ -13957,6 +14280,8 @@ def build_service_app(
             "transfer_enabled": transfer_settings.enabled,
             "sinhala_tts_degraded": _smartpbx_sinhala_tts_degraded(),
             "sinhala_tts_model": _smartpbx_sinhala_tts_active_model(),
+            "sinhala_phrases_ready": _smartpbx_sinhala_phrases_ready_count(),
+            "sinhala_phrases_total": len(SMARTPBX_SINHALA_CACHED_PHRASES),
         }
 
     async def smartpbx_media(websocket: WebSocket) -> None:

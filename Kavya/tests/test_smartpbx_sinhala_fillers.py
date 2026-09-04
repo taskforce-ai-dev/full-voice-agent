@@ -82,11 +82,18 @@ class FakeTTSClient:
         self.aio = SimpleNamespace(interactions=self.interactions)
 
 
+async def _instant_sleep(_seconds: float) -> None:
+    """A prewarm-pacing sleep stand-in that never actually waits."""
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _isolated_phrase_cache(monkeypatch):
     """Never let one test's rendered clips leak into the next."""
     monkeypatch.setattr(server, "_SMARTPBX_SINHALA_PHRASE_AUDIO", {})
     monkeypatch.setattr(server, "_SMARTPBX_SINHALA_PHRASE_PREWARM", None)
+    monkeypatch.setattr(server, "_SMARTPBX_SINHALA_PHRASE_PREWARM_LAST_STARTED_AT", None)
+    monkeypatch.setattr(server, "_SMARTPBX_SINHALA_PHRASE_PREWARM_RESET_TASK", None)
     monkeypatch.setattr(server, "GEMINI_API_KEY", "test-gemini-key")
     monkeypatch.setattr(
         server,
@@ -98,6 +105,12 @@ def _isolated_phrase_cache(monkeypatch):
         "_smartpbx_sinhala_tts_model_state",
         {"exhausted_until": {}, "active_model": None},
     )
+    # These filler tests are about rotation/latency behaviour, not prewarm
+    # pacing/disk-persistence -- keep synthesis instant and in-memory only so
+    # they run fast and cannot bleed clips onto the real filesystem.
+    monkeypatch.setattr(server, "_smartpbx_sinhala_prewarm_sleep", _instant_sleep)
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_PHRASE_CACHE_DIR", "")
 
 
 def _sinhala_pipeline():

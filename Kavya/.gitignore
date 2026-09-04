@@ -22,6 +22,7 @@ env/
 # ChromaDB persistence
 chroma_db/
 chroma_db_smartpbx/
+smartpbx_phrase_cache/
 
 # Sentence-transformers model cache
 .cache/
