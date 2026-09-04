@@ -196,7 +196,12 @@ from post_call import (
     UNCONFIRMED_TRANSCRIPT_ROLE,
     process_post_call_data,
 )
-from handover import handover_context, send_handover_notification
+from handover import (
+    handover_context,
+    is_valid_lk_nsn,
+    send_handover_notification,
+    spoken_number_to_digits,
+)
 from english_voice_profile import load_kavya_english_voice_profile
 from smartpbx_diagnostics import DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage
 from smartpbx_dtmf import DtmfCollector
@@ -2043,6 +2048,13 @@ CAPTURE_ENDPOINTING_SILENCE_SECONDS: float = _parse_endpointing_seconds(
 CAPTURE_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "CAPTURE_FINAL_GRACE_SECONDS", 1.2, 0.2, 3.0
 )
+# A complete Sri Lankan mobile number can safely end a phone-capture episode
+# sooner than a partial dictation.  It is intentionally a narrow Direct
+# SmartPBX-only fast path; names, generic capture, interims and every Twilio
+# path retain the patient capture timers above.
+CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS: float = _parse_endpointing_seconds(
+    os.environ, "CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS", 0.35, 0.1, 1.0
+)
 SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS = _parse_endpointing_seconds(
     os.environ,
     "SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS",
@@ -2392,8 +2404,27 @@ _CAPTURE_ASK_SUPPRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
 )
 
+# A phone kind must be explicit.  A bare English "number" can mean guest
+# count, dates, a reservation reference, or a phone number, so it remains
+# generic and retains the patient window.
+_EN_PHONE_CAPTURE_ASK_PATTERN = _CAPTURE_ASK_PATTERNS[0]
+_EN_NAME_CAPTURE_ASK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    _CAPTURE_ASK_PATTERNS[3],
+    _CAPTURE_ASK_PATTERNS[4],
+)
+
+# Sinhala prompts naturally code-switch "WhatsApp", but the phone signal is
+# still explicit.  Never match bare "අංකය" (number): that would accelerate
+# dates, prices and guest counts.  These patterns are deliberately limited to
+# a phone/mobile/WhatsApp/callback expression followed by the number noun.
+_SI_PHONE_CAPTURE_ASK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:දුරකථන|මොබයිල්|ජංගම)\s*අංක(?:ය|යේ)?"),
+    re.compile(r"whats\s*app\s*අංක(?:ය|යේ)?", re.IGNORECASE),
+    re.compile(r"(?:නැවත|ආපසු).{0,40}(?:අමතන්න|කතා\s*කරන්න).{0,40}අංක(?:ය|යේ)?"),
+)
+
 # ---------------------------------------------------------------------------
-# Sinhala spoken-number normalisation (Direct SmartPBX Sinhala capture only)
+# Sinhala spoken-number normalisation (Direct SmartPBX Sinhala phone capture only)
 # ---------------------------------------------------------------------------
 # Sinhala callers say numbers the natural way -- tens and units combined
 # ("හැට පහ" = "sixty five" = 65), not digit-by-digit the way English callers
@@ -2410,10 +2441,12 @@ _CAPTURE_ASK_SUPPRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
 # `capture_spoken_number` reached via `_override_capture_spoken_argument`)
 # then sees ordinary digits exactly as it already does for English "oh seven
 # seven". PURE TEXT TRANSFORM ONLY -- no I/O, no logging of its (privacy
-# sensitive) output. Wired into Direct SmartPBX Sinhala only
-# (`_is_direct_smartpbx_sinhala`); the Twilio Sinhala Media Streams path and
-# all English behaviour (`expand_spoken_repeats`, `spoken_number_to_digits`
-# in handover.py) are untouched.
+# sensitive) output. Wired into Direct SmartPBX Sinhala PHONE capture only
+# (`_is_direct_smartpbx_sinhala` plus `_capture_kind == "phone"`). Dates,
+# prices, guest counts, names and generic capture retain their caller wording;
+# the Twilio Sinhala Media Streams path and all English behaviour
+# (`expand_spoken_repeats`, `spoken_number_to_digits` in handover.py) are
+# untouched.
 _SI_UNIT_WORDS: dict[str, str] = {
     "බිංදුව": "0", "බින්දුව": "0", "ශුන්‍ය": "0", "ශුන්ය": "0", "සුන්‍ය": "0",
     "එක": "1", "එකයි": "1",
@@ -2575,9 +2608,37 @@ def _is_capture_ask_sentence(sentence: str) -> bool:
 
 def _detect_capture_ask(sentences: Any) -> bool:
     """True when any delivered sentence of the turn asked for a dictation."""
+    return _detect_capture_ask_kind(sentences) is not None
+
+
+def _detect_capture_ask_kind(
+    sentences: Any, *, allow_sinhala_phone: bool = False
+) -> str | None:
+    """Return the conservative kind of a delivered dictation ask.
+
+    ``phone`` is returned only when the delivered wording explicitly requests
+    a phone/WhatsApp/callback number.  All other valid dictation asks remain
+    ``name`` or ``generic`` so their endpointing patience is unchanged.
+    """
     if not sentences:
-        return False
-    return any(_is_capture_ask_sentence(sentence) for sentence in sentences)
+        return None
+    saw_generic = False
+    for sentence in sentences:
+        text = " ".join((sentence or "").lower().split())
+        if not text or any(
+            pattern.search(text) for pattern in _CAPTURE_ASK_SUPPRESS_PATTERNS
+        ):
+            continue
+        if _EN_PHONE_CAPTURE_ASK_PATTERN.search(text) or (
+            allow_sinhala_phone
+            and any(pattern.search(text) for pattern in _SI_PHONE_CAPTURE_ASK_PATTERNS)
+        ):
+            return "phone"
+        if any(pattern.search(text) for pattern in _EN_NAME_CAPTURE_ASK_PATTERNS):
+            return "name"
+        if _is_capture_ask_sentence(sentence):
+            saw_generic = True
+    return "generic" if saw_generic else None
 
 
 def _capture_dictation_ratio(text: str) -> float:
@@ -6612,6 +6673,11 @@ class MediaStreamSession:
         self._committed_transcript = ""
         self._latest_interim = ""
         self._endpointing_handle: asyncio.TimerHandle | None = None
+        # Every armed endpointing callback owns one monotonically increasing
+        # token.  `TimerHandle.cancel()` cannot recall a callback that the loop
+        # has already queued, so the later flush must prove it still owns this
+        # exact deadline before it consumes the current transcript buffers.
+        self._endpointing_token: int = 0
         # Held for the duration of one guest turn (dispatch → agent finishes
         # responding). A stale endpointing timer or a late final/interim that
         # fires while a turn is in flight must not start a second llm_round.
@@ -6634,6 +6700,10 @@ class MediaStreamSession:
         # utterance instead of spending an LLM turn on each.
         self._capture_mode_active: bool = False
         self._capture_mode_turns_left: int = 0
+        # ``generic`` is the safe default.  Only a delivered explicit phone ask
+        # or the deterministic capture-tool identity may refine an active
+        # Direct SmartPBX episode to ``phone``; it never changes the allowance.
+        self._capture_kind: str = "generic"
         # Set while the turn that completed a capture is running, so its
         # read-back ("your number is oh seven seven...") cannot re-arm capture
         # mode through the ask detector.
@@ -7746,9 +7816,7 @@ class MediaStreamSession:
         self._cancel_reprompt()
         # A keypad entry in flight belongs to a conversation that is over.
         self._cancel_dtmf_collection()
-        if self._endpointing_handle:
-            self._endpointing_handle.cancel()
-            self._endpointing_handle = None
+        self._invalidate_endpointing()
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
@@ -7759,8 +7827,7 @@ class MediaStreamSession:
         if not transfer_audio_fenced:
             self._speak_generation += 1
         transfer_generation = self._speak_generation
-        self._capture_mode_active = False
-        self._capture_mode_turns_left = 0
+        self._exit_capture_mode("transfer")
         if not transfer_audio_fenced:
             await self._clear_media_audio(force=True)
             # Quiet transfers deliberately defer their one clear until the
@@ -8250,8 +8317,7 @@ class MediaStreamSession:
                 await asyncio.to_thread(self._stt.stop)
             self._write_audio_dump()
             await self._close_stt_callbacks()
-            if self._endpointing_handle:
-                self._endpointing_handle.cancel()
+            self._invalidate_endpointing()
             # Twilio Media Streams teardown ownership: RETAINED. Anything still
             # buffered — mid-dictation or ordinary speech admitted during a turn
             # — only survives if it reaches the transcript before the post-call
@@ -8491,9 +8557,7 @@ class MediaStreamSession:
         """Synchronously prevent all endpoint/turn dispatch before teardown awaits."""
         self._teardown_dispatch_closed = True
         self._smartpbx_deferred_tts_closed = True
-        if self._endpointing_handle is not None:
-            self._endpointing_handle.cancel()
-            self._endpointing_handle = None
+        self._invalidate_endpointing()
         self._deferred_flush_pending = False
 
     def _should_barge_in(self, transcript: str) -> bool:
@@ -8565,9 +8629,7 @@ class MediaStreamSession:
         # Bumping the turn id stops that stale turn's finally from clobbering it.
         self._utterance_dispatched = False
         self._utterance_turn += 1
-        if self._endpointing_handle:
-            self._endpointing_handle.cancel()
-            self._endpointing_handle = None
+        self._invalidate_endpointing()
         await self._clear_media_audio()
 
     def _mark_tts_audible(self, expected_generation: int) -> bool:
@@ -8829,16 +8891,33 @@ class MediaStreamSession:
         status = str(result.get("status", "")).lower()
         return status in {"needs_more", "invalid", "unavailable"}
 
+    def _refine_capture_kind(self, kind: str) -> None:
+        """Refine an active direct-call capture episode without re-budgeting it."""
+        if not self._is_direct_smartpbx() or kind not in {"phone", "name"}:
+            return
+        # Tool and delivered-ask evidence may refine generic capture, but no
+        # later signal is trusted enough to reinterpret a phone as a name (or
+        # vice versa) while the caller is still dictating.
+        if self._capture_kind == "generic":
+            self._capture_kind = kind
+
     def _enter_capture_mode(
-        self, turns: int = CAPTURE_MODE_MAX_TURNS, *, reason: str = "tool"
+        self,
+        turns: int = CAPTURE_MODE_MAX_TURNS,
+        *,
+        reason: str = "tool",
+        kind: str = "generic",
     ) -> None:
         if self._capture_mode_active:
             # An episode already in flight keeps its REMAINING allowance. A
             # needs_more re-ask must never hand an exhausted episode a fresh
             # budget, or a caller whose number never parses is asked forever.
+            self._refine_capture_kind(kind)
             return
         self._capture_mode_active = True
         self._capture_mode_turns_left = turns
+        self._capture_kind = "generic"
+        self._refine_capture_kind(kind)
         self._capture_bound_logged = False
         if self._is_smartpbx_session():
             logger.info(
@@ -8850,6 +8929,7 @@ class MediaStreamSession:
         was_active = self._capture_mode_active
         self._capture_mode_active = False
         self._capture_mode_turns_left = 0
+        self._capture_kind = "generic"
         if was_active and self._is_smartpbx_session():
             logger.info("smartpbx_media event=capture_mode_exit reason=%s", reason)
 
@@ -8878,6 +8958,43 @@ class MediaStreamSession:
                 )
             return CAPTURE_ENDPOINTING_SILENCE_SECONDS
         return STT_FINAL_GRACE_SECONDS if final else ENDPOINTING_SILENCE
+
+    def _has_complete_lk_phone_capture(self, text: str) -> bool:
+        """Whether ``text`` is exactly one complete Sri Lankan mobile number.
+
+        This is a timing decision only.  It never changes the caller text or
+        logs it.  The Sinhala normalisation is therefore intentionally applied
+        to a temporary copy here, while the dispatch boundary decides whether
+        it is permitted to normalise text for the phone capture tool.
+        """
+        candidate = text
+        if self._is_direct_smartpbx_sinhala():
+            candidate = _normalize_sinhala_spoken_digits(candidate)
+        digits = spoken_number_to_digits(candidate)
+        if len(digits) == 10 and digits.startswith("0"):
+            nsn = digits[1:]
+        elif len(digits) == 9:
+            nsn = digits
+        elif len(digits) == 11 and digits.startswith("94"):
+            nsn = digits[2:]
+        else:
+            return False
+        # `is_valid_lk_nsn` provides the existing length/digit contract.  The
+        # leading 7 makes this timing shortcut mobile-only, deliberately
+        # excluding indistinguishable bare foreign/Maldives prefixes.
+        return nsn.startswith("7") and is_valid_lk_nsn(nsn)
+
+    def _capture_endpointing_delay(self, *, final: bool) -> tuple[float, bool]:
+        """Return the capture deadline and whether a final earned acceleration."""
+        patient_delay = self._capture_turn_timeout(final=final)
+        if (
+            not final
+            or not self._is_direct_smartpbx()
+            or self._capture_kind != "phone"
+            or not self._has_complete_lk_phone_capture(self._committed_transcript)
+        ):
+            return patient_delay, False
+        return CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS, True
 
     def _direct_smartpbx_captured_number_confirmation(
         self,
@@ -8929,7 +9046,12 @@ class MediaStreamSession:
         if tool_name not in self._capture_complete_tools():
             return
         if self._capture_followup_required(result):
-            self._enter_capture_mode(reason="tool_needs_more")
+            kind = (
+                "name"
+                if tool_name == "capture_spoken_name"
+                else "phone"
+            )
+            self._enter_capture_mode(reason="tool_needs_more", kind=kind)
             return
         captured = str(result.get("status", "")).lower() == "captured"
         if captured:
@@ -8957,11 +9079,16 @@ class MediaStreamSession:
         """
         if self._capture_success_this_turn:
             return
+        kind = _detect_capture_ask_kind(
+            self._delivered_sentences,
+            allow_sinhala_phone=self._is_direct_smartpbx_sinhala(),
+        )
+        if kind is None:
+            return
         if self._is_capture_mode_active():
+            self._refine_capture_kind(kind)
             return
-        if not _detect_capture_ask(self._delivered_sentences):
-            return
-        self._enter_capture_mode(reason="ask")
+        self._enter_capture_mode(reason="ask", kind=kind)
 
     def _bound_capture_text(self, text: str) -> str:
         """Cap the combined dictation so a stuck episode cannot run away."""
@@ -9028,9 +9155,7 @@ class MediaStreamSession:
             provenance = "interim"
         retention_reason = reason if reason in _RETAINED_SPEECH_REASONS else "other"
         buffered = buffered[:RETAINED_SPEECH_MAX_CHARS].rstrip()
-        if self._endpointing_handle is not None:
-            self._endpointing_handle.cancel()
-            self._endpointing_handle = None
+        self._invalidate_endpointing()
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._latest_interim = ""
@@ -9340,7 +9465,17 @@ class MediaStreamSession:
         # short grace for a mid-thought continuation. Inside capture mode a final
         # does NOT dispatch: it refreshes the full capture-silence window so the
         # 2-4 digit fragments of one number combine into a single utterance.
-        self._arm_endpointing(self._capture_turn_timeout(final=True))
+        # The sole exception is a complete, unambiguous local mobile number in
+        # Direct SmartPBX phone capture; it gets the bounded fast grace.
+        delay, accelerated = self._capture_endpointing_delay(final=True)
+        if accelerated and self._is_smartpbx_session():
+            delay_ms = max(100, min(int(delay * 1000), 1000))
+            logger.info(
+                "smartpbx_media event=capture_endpointing_decision "
+                "kind=phone outcome=accelerated delay_ms=%d",
+                delay_ms,
+            )
+        self._arm_endpointing(delay)
 
     async def _set_transcript_interim(self, text: str):
         """Set pending to the latest interim (over the committed finals); reset timer."""
@@ -9403,26 +9538,50 @@ class MediaStreamSession:
         # No final has segmented this, so use the longer self-endpointing timer.
         self._arm_endpointing(self._capture_turn_timeout(final=False))
 
+    def _invalidate_endpointing(self) -> None:
+        """Retire the current timer and every callback/task derived from it."""
+        self._endpointing_token += 1
+        if self._endpointing_handle is not None:
+            self._endpointing_handle.cancel()
+            self._endpointing_handle = None
+
     def _arm_endpointing(self, delay: float) -> None:
+        # Invalidate before the closing check too: teardown may race a callback
+        # already queued by the event loop, and cancellation alone is not a
+        # sufficient ownership fence for that callback.
+        self._invalidate_endpointing()
         if self._stt_closing or self._teardown_dispatch_closed:
             return
         # A live timer now owns the pending buffer, so any request to re-flush it
         # at the end of the active turn is superseded by this deadline.
         self._deferred_flush_pending = False
-        if self._endpointing_handle:
-            self._endpointing_handle.cancel()
+        token = self._endpointing_token
         self._endpointing_handle = self._event_loop.call_later(
             delay,
-            self._dispatch_smartpbx_flush_transcript,
+            lambda: self._dispatch_smartpbx_flush_transcript(token),
         )
 
-    def _dispatch_smartpbx_flush_transcript(self) -> None:
+    def _dispatch_smartpbx_flush_transcript(
+        self, endpointing_token: int | None = None
+    ) -> None:
         # Tracked, not just fire-and-forget (audit #11): SmartPBX teardown
         # (audit #3) waits on this to let an in-flight tool call settle
         # before the post-call transcript is snapshotted.
-        self._smartpbx_active_runner_task = asyncio.ensure_future(self._flush_transcript())
+        if (
+            endpointing_token is not None
+            and endpointing_token != self._endpointing_token
+        ):
+            return
+        self._smartpbx_active_runner_task = asyncio.ensure_future(
+            self._flush_transcript(endpointing_token=endpointing_token)
+        )
 
-    async def _flush_transcript(self):
+    async def _flush_transcript(self, *, endpointing_token: int | None = None):
+        if (
+            endpointing_token is not None
+            and endpointing_token != self._endpointing_token
+        ):
+            return
         if self._teardown_dispatch_closed or self._stt_closing or self._smartpbx_torn_down:
             # See _accumulate_transcript — an endpointing timer armed just
             # before teardown must not dispatch a new turn after it.
@@ -9453,7 +9612,10 @@ class MediaStreamSession:
         self._deferred_flush_pending = False
         if not transcript:
             return
-        if self._is_direct_smartpbx_sinhala():
+        if (
+            self._is_direct_smartpbx_sinhala()
+            and self._capture_kind == "phone"
+        ):
             # Sinhala callers say numbers tens+units combined ("හැට පහ" = 65),
             # not digit-by-digit. Rewrite those words to plain digits here, at
             # the single seam this dispatched utterance flows through next —
@@ -9526,11 +9688,12 @@ class MediaStreamSession:
                     # Ordinary deferred speech keeps the zero-delay release.
                     capture_rearm = self._is_capture_mode_active()
                     final = bool(self._committed_transcript)
-                    delay = (
-                        self._capture_turn_timeout(final=final)
-                        if capture_rearm
-                        else 0.0
-                    )
+                    if capture_rearm:
+                        delay, _accelerated = self._capture_endpointing_delay(
+                            final=final
+                        )
+                    else:
+                        delay = 0.0
                     if (
                         capture_rearm
                         and delay > 0.0
