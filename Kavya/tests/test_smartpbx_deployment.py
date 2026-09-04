@@ -283,6 +283,45 @@ def test_smartpbx_reviewed_isolation_and_operations_contract():
     assert 'if KAVYA_SERVICE_MODE != "smartpbx":' in server
 
 
+def test_smartpbx_sinhala_phrase_cache_volume_and_env_have_compose_defaults():
+    """2026-09-04 rate-limit incident: the persistent phrase cache and its
+    pacing knob must be bind-mounted/env-defaulted the same way
+    chroma_db_smartpbx already is, so an omitted .env.smartpbx line cannot
+    silently disable disk persistence or pacing."""
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    service = compose["services"]["kavya-smartpbx"]
+    environment = service["environment"]
+
+    assert "./smartpbx_phrase_cache:/app/smartpbx_phrase_cache" in service["volumes"]
+    assert (
+        environment["SMARTPBX_SINHALA_PHRASE_CACHE_DIR"]
+        == "${SMARTPBX_SINHALA_PHRASE_CACHE_DIR:-/app/smartpbx_phrase_cache}"
+    )
+    assert (
+        environment["SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS"]
+        == "${SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS:-7.0}"
+    )
+
+    example = read_text(".env.example")
+    assert re.search(r"^SMARTPBX_SINHALA_PHRASE_CACHE_DIR=/app/smartpbx_phrase_cache$", example, re.MULTILINE)
+    assert re.search(r"^SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS=7\.0$", example, re.MULTILINE)
+
+    root_ignore = (PROJECT_ROOT.parent / ".gitignore").read_text(encoding="utf-8")
+    kavya_ignore = read_text(".gitignore")
+    assert "smartpbx_phrase_cache/" in root_ignore
+    assert "smartpbx_phrase_cache/" in kavya_ignore
+
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    assert "SMARTPBX_SINHALA_PHRASE_CACHE_DIR" in runbook
+    assert "SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS" in runbook
+    assert "costs exactly one Gemini TTS" in runbook
+
+    claude_md = read_text("CLAUDE.md")
+    agents_md = read_text("AGENTS.md")
+    assert "SMARTPBX_SINHALA_PHRASE_CACHE_DIR" in claude_md
+    assert "SMARTPBX_SINHALA_PHRASE_CACHE_DIR" in agents_md
+
+
 def test_smartpbx_runbook_selects_ci_short_sha_and_verifies_full_oci_revision():
     workflow = (PROJECT_ROOT.parent / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
     runbook = read_text("SMARTPBX_RUNBOOK.md")

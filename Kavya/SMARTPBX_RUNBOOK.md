@@ -987,6 +987,82 @@ same voice, same text, retried immediately within the turn. A model that hits
 `unknown_provider_error` and any malformed-audio/timeout/HTTP failure never
 fall back -- only a classified quota or rate-limit hit does.
 
+### Sinhala fixed-phrase prewarm: persistent cache, pacing, and re-prewarm
+
+The ~19 fixed Sinhala phrases (initial/tool fillers, keypad prompts, the
+TTS-unavailable apology) are rendered once per process and replayed from
+bytes -- a live Gemini TTS round trip is 2-5 s, too slow to sit in front of
+the answer it exists to cover. Two problems this section addresses: a cold
+container start used to burst all ~19 requests back-to-back, tripping
+Gemini TTS's ~10 requests/minute cap and spending ~19% of the 100
+requests/day cap on every restart; and there was no visibility into which
+phrase failed or why.
+
+**Persistent cache.** Rendered mu-law audio is written to
+`SMARTPBX_SINHALA_PHRASE_CACHE_DIR` (default `/app/smartpbx_phrase_cache`,
+bind-mounted from `./smartpbx_phrase_cache` -- same ownership pattern as
+`chroma_db_smartpbx`: created and owned by the container's runtime user,
+survives `docker compose up -d --force-recreate`, never shared with the
+Twilio `kavya` service). Each file is named by a sha256 hash of
+`(model, voice, text)` and contains nothing but raw mu-law bytes -- never
+the phrase text, never JSON, never a caller transcript. On startup every
+allowlisted phrase is loaded from disk first; only misses are synthesised.
+**Deleting the directory is always safe** -- it costs exactly one Gemini TTS
+re-render per phrase on the next prewarm, nothing more. Set
+`SMARTPBX_SINHALA_PHRASE_CACHE_DIR=` (blank) to disable disk persistence
+entirely and fall back to the pre-2026-09 in-memory-only behaviour.
+
+**Paced, classified synthesis.** Misses are rendered sequentially with a
+minimum spacing of `SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS` (default
+`7.0`, clamp `[0, 60]`), keeping a cold start under ~9 requests/minute. A
+classified `rate_limited` error backs off (doubling the spacing, capped at
+60 s, up to 3 retries against the same model before moving to the next one
+in the fallback chain). A classified `quota_exceeded` error stops the whole
+prewarm run immediately -- it does not keep spending the daily budget
+discovering the same limit phrase by phrase -- marks that model exhausted via
+the existing `SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR` chain state, and
+leaves the remaining phrases to the next scheduled prewarm. Prewarm uses the
+same model fallback chain as live calls: a phrase rendered on a fallback
+model is cached under that model's key and is just as servable at playback
+time as one rendered on the primary model (voice is identical); the summary
+line and a dedicated `sinhala_phrase_prewarm_fallback_model` log line record
+which model rendered it.
+
+**Re-prewarm triggers.** A Sinhala call activation still retries prewarm
+while any phrase is missing, but is now debounced to at most once per 10
+minutes -- otherwise, once "not ready" can legitimately mean "quota
+exhausted for the day", every incoming call would restart a full paced run.
+Independently, one re-prewarm attempt is forced at the daily Gemini quota
+reset boundary (`SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR`, default `7`,
+i.e. `07:00` UTC), bypassing that debounce since it is a scheduled event, not
+a caller-triggered retry.
+
+**Observability.** The summary log line now carries the full picture:
+
+```
+smartpbx_media event=sinhala_phrase_prewarm rendered=<N> total=<N> ready=<bool>
+  loaded_from_disk=<N> synthesised=<N> failed=<N>
+  failure_codes=quota_exceeded:1,rate_limited:2 elapsed_ms=<N>
+```
+
+`failure_codes` is a comma-separated `code:count` tally over the same closed
+vocabulary as `_GeminiTTSProviderError` plus `local_synthesis_failure`
+(malformed audio, not a provider error) and `unknown_error` — never free text.
+Each failed phrase also logs one line naming its position, not its text:
+
+```
+smartpbx_media event=sinhala_phrase_prewarm_phrase_failed index=<N> code=<code>
+```
+
+`/smartpbx/status` gains `sinhala_phrases_ready` (count of allowlisted
+phrases currently servable without synthesis) and `sinhala_phrases_total`
+(the fixed allowlist size, ~19) alongside the existing `sinhala_tts_model`
+and `sinhala_tts_degraded` fields. `ready=true` in the summary line (and full
+parity between the two status counts) still means every phrase rendered;
+short of that, the initial-filler and tool-filler banks each become usable
+as soon as at least one of their own variants is cached -- a partially warm
+cache is not a broken cache.
+
 ## SmartPBX telemetry privacy and retention
 
 Keep the cutover evidence aggregate-only and limited to the finite approved
