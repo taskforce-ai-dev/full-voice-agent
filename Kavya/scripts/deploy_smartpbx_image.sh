@@ -119,7 +119,10 @@ check_smartpbx_ready() {
   smartpbx_status_json >/dev/null || return 1
 }
 
-# Idleness = readiness AND no active call AND no live transfer. This gate
+# Idleness = readiness AND no active call. A pending transfer holds its
+# session slot, so active_sessions == 0 already implies no live transfer;
+# transfer_enabled is a configuration flag (production has a real destination
+# armed) and must NOT gate a deploy. This gate
 # belongs ONLY in the pre-flight, before anything is mutated -- it must never
 # gate a post-recreate or rollback ready check (a live call arriving in that
 # window would otherwise fail the deploy and trigger a rollback that drops
@@ -129,7 +132,7 @@ check_loopback_preflight() {
   health_json=$(curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/health) || return 1
   jq -e '.status == "ok" and .service_mode == "smartpbx"' >/dev/null <<<"$health_json" || return 1
   status_json=$(smartpbx_status_json) || return 1
-  jq -e '.active_sessions == 0 and .transfer_enabled == false' >/dev/null <<<"$status_json" || return 1
+  jq -e '.active_sessions == 0' >/dev/null <<<"$status_json" || return 1
 }
 
 # Post-recreate / rollback readiness gate. Bounded at 90s and never checks
@@ -144,13 +147,13 @@ wait_for_smartpbx_ready() {
 
 # Pre-flight-only idle gate: poll (never fail-fast) for active_sessions==0 and
 # no transfer in progress, up to a bounded wait, before touching the running
-# container. A transfer drill (transfer_enabled=true) must be revoked before
-# an image deploy -- see SMARTPBX_RUNBOOK.md.
+# container. Transfer being enabled is not a reason to wait; only an active
+# session (including one holding a pending transfer) is.
 wait_for_smartpbx_idle_preflight() {
   local deadline=$((SECONDS + SMARTPBX_PREFLIGHT_IDLE_TIMEOUT_SECONDS))
   while ! check_loopback_preflight; do
     ((SECONDS < deadline)) || {
-      printf '%s\n' 'SMARTPBX_PREFLIGHT_IDLE_TIMEOUT: active_sessions never reached 0 (or a transfer drill is still enabled) within the bounded pre-flight wait -- abort and retry later; do not force a deploy while a call may be live' >&2
+      printf '%s\n' 'SMARTPBX_PREFLIGHT_IDLE_TIMEOUT: active_sessions never reached 0 within the bounded pre-flight wait -- abort and retry later; do not force a deploy while a call may be live' >&2
       return 1
     }
     sleep "$SMARTPBX_PREFLIGHT_IDLE_POLL_SECONDS"

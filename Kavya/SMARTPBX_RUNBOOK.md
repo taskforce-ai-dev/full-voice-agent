@@ -505,19 +505,18 @@ test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/fullchain.pem
 test -s /etc/letsencrypt/live/smartpbx-kavya.taskforceai.tech/privkey.pem
 SMARTPBX_IMAGE_TAG="$REVIEWED_CI_SHORT_SHA" docker compose --env-file .env.smartpbx --profile smartpbx config > /dev/null
 wait_for_smartpbx_idle() {
-  # Pre-flight-only idle gate (P1-2/P1-3): active_sessions==0 and no
-  # transfer drill in progress, bounded at 10 minutes. If this never
-  # returns, a call is live -- do not force the recreate; a supervised
-  # transfer drill must be revoked first (see "Optional transfer
-  # activation and compulsory revoke") before an image deploy or config
-  # change proceeds.
+  # Pre-flight-only idle gate (P1-2/P1-3): active_sessions==0, bounded at
+  # 10 minutes. A pending transfer holds its session slot, so this already
+  # covers a live transfer; transfer_enabled is a configuration flag and
+  # never gates a recreate. If this never returns, a call is live -- do not
+  # force the recreate.
   local token deadline status_json
   token=$(sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1)
   deadline=$((SECONDS + 600))
   while :; do
     status_json=$(printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$token" \
       | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config -) || status_json=""
-    if [[ -n $status_json ]] && printf '%s' "$status_json" | jq -e '.active_sessions == 0 and .transfer_enabled == false' >/dev/null; then
+    if [[ -n $status_json ]] && printf '%s' "$status_json" | jq -e '.active_sessions == 0' >/dev/null; then
       return 0
     fi
     if (( SECONDS >= deadline )); then
@@ -794,19 +793,18 @@ Edit `.env.smartpbx` to add only that test destination, then apply it:
 set -euo pipefail
 cd /opt/kavya
 wait_for_smartpbx_idle() {
-  # Pre-flight-only idle gate (P1-2/P1-3): active_sessions==0 and no
-  # transfer drill in progress, bounded at 10 minutes. If this never
-  # returns, a call is live -- do not force the recreate; a supervised
-  # transfer drill must be revoked first (see "Optional transfer
-  # activation and compulsory revoke") before an image deploy or config
-  # change proceeds.
+  # Pre-flight-only idle gate (P1-2/P1-3): active_sessions==0, bounded at
+  # 10 minutes. A pending transfer holds its session slot, so this already
+  # covers a live transfer; transfer_enabled is a configuration flag and
+  # never gates a recreate. If this never returns, a call is live -- do not
+  # force the recreate.
   local token deadline status_json
   token=$(sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1)
   deadline=$((SECONDS + 600))
   while :; do
     status_json=$(printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$token" \
       | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config -) || status_json=""
-    if [[ -n $status_json ]] && printf '%s' "$status_json" | jq -e '.active_sessions == 0 and .transfer_enabled == false' >/dev/null; then
+    if [[ -n $status_json ]] && printf '%s' "$status_json" | jq -e '.active_sessions == 0' >/dev/null; then
       return 0
     fi
     if (( SECONDS >= deadline )); then
@@ -846,19 +844,18 @@ configuration reached the running process before considering the drill revoked:
 set -euo pipefail
 cd /opt/kavya
 wait_for_smartpbx_idle() {
-  # Pre-flight-only idle gate (P1-2/P1-3): active_sessions==0 and no
-  # transfer drill in progress, bounded at 10 minutes. If this never
-  # returns, a call is live -- do not force the recreate; a supervised
-  # transfer drill must be revoked first (see "Optional transfer
-  # activation and compulsory revoke") before an image deploy or config
-  # change proceeds.
+  # Pre-flight-only idle gate (P1-2/P1-3): active_sessions==0, bounded at
+  # 10 minutes. A pending transfer holds its session slot, so this already
+  # covers a live transfer; transfer_enabled is a configuration flag and
+  # never gates a recreate. If this never returns, a call is live -- do not
+  # force the recreate.
   local token deadline status_json
   token=$(sed -n 's/^SMARTPBX_WS_TOKEN=//p' /opt/kavya/.env.smartpbx | head -n 1)
   deadline=$((SECONDS + 600))
   while :; do
     status_json=$(printf 'header = "X-Kavya-SmartPBX-Token: %s"\n' "$token" \
       | curl --silent --show-error --fail --connect-timeout 2 --max-time 5 http://127.0.0.1:8006/smartpbx/status --config -) || status_json=""
-    if [[ -n $status_json ]] && printf '%s' "$status_json" | jq -e '.active_sessions == 0 and .transfer_enabled == false' >/dev/null; then
+    if [[ -n $status_json ]] && printf '%s' "$status_json" | jq -e '.active_sessions == 0' >/dev/null; then
       return 0
     fi
     if (( SECONDS >= deadline )); then
@@ -996,15 +993,14 @@ the short tag must be the first seven characters of that revision.
 Prerequisites: run as root on the target host, keep `/opt/kavya/.env` and
 `/opt/kavya/.env.smartpbx` owned by `root:root` with mode `0600`, retain a
 healthy `flico-voice-agent` and `kavya-voice-agent`, and ensure the reviewed
-GHCR digest is pullable. **If a supervised transfer drill is active
-(`SMARTPBX_TRANSFER_DESTINATIONS_JSON` set to a non-`{}` destination), revoke
-it first** -- see "Optional transfer activation and compulsory revoke" above.
-The helper's pre-flight idle gate requires `transfer_enabled == false` and
-will otherwise poll for up to 10 minutes and then abort by construction.
+GHCR digest is pullable. Transfer being enabled
+(`SMARTPBX_TRANSFER_DESTINATIONS_JSON` set to a real destination, as in
+production) does **not** block a deploy: a pending transfer holds its session
+slot, so the idle gate below already covers it.
 
 Before touching anything, the helper polls `/health` and the authenticated
-`/smartpbx/status` for **idleness** (`active_sessions == 0` and
-`transfer_enabled == false`), for a bounded wait of up to 10 minutes,
+`/smartpbx/status` for **idleness** (`active_sessions == 0`), for a bounded
+wait of up to 10 minutes,
 aborting with a clear message if the line never goes idle in that window --
 it never force-recreates a container that might be carrying a live call.
 Once idle, it checks the existing SmartPBX image ID, repository digest, and

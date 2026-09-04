@@ -2585,7 +2585,10 @@ def test_smartpbx_image_deploy_helper_recreates_only_smartpbx_and_checks_json_re
     assert "http://127.0.0.1:8006/health" in script
     assert "http://127.0.0.1:8006/smartpbx/status" in script
     assert ".status == \"ok\" and .service_mode == \"smartpbx\"" in script
-    assert ".active_sessions == 0 and .transfer_enabled == false" in script
+    assert ".active_sessions == 0" in script
+    # transfer_enabled is a configuration flag (production arms a real
+    # destination); it must never gate a deploy.
+    assert ".transfer_enabled == false" not in script
     assert "docker inspect --format '{{.Image}}' kavya-smartpbx" in script
     assert "verify_running_image" in script
     assert "verify_isolation_baseline" in script
@@ -3228,12 +3231,19 @@ def test_deploy_rechecks_rollback_alias_before_forward_mutation(tmp_path):
     {"HEALTH_FAIL": 1, "STATUS_JSON": '{"active_sessions":0,"transfer_enabled":false}'},
     {"HEALTH_JSON": "not-json"}, {"HEALTH_JSON": '{"status":"bad","service_mode":"smartpbx"}'},
     {"STATUS_JSON": '{"active_sessions":1,"transfer_enabled":false}'},
-    {"STATUS_JSON": '{"active_sessions":0,"transfer_enabled":true}'},
+    {"STATUS_JSON": '{"active_sessions":1,"transfer_enabled":true}'},
     {"VOICE_FAIL": 1}, {"CONFIG_FAIL": 1},
 ])
 def test_deploy_preflight_failures_never_mutate(tmp_path, environment):
     host = FakeDeployHost(tmp_path); result = host.deploy(**environment)
     assert result.returncode != 0 and host.compose_count() == 0
+
+
+def test_deploy_proceeds_when_transfer_is_enabled_but_the_line_is_idle(tmp_path):
+    """Production arms a real transfer destination; an idle line must deploy."""
+    host = FakeDeployHost(tmp_path)
+    result = host.deploy(STATUS_JSON='{"active_sessions":0,"transfer_enabled":true}')
+    assert result.returncode == 0 and host.compose_count() == 1
 
 
 def test_deploy_missing_host_files_manifest_blocks_before_mutation(tmp_path):
