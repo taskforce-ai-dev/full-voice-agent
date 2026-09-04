@@ -88,6 +88,9 @@ SMARTPBX_SINHALA_GEMINI_MAX_TOKENS=1024
 SMARTPBX_SINHALA_GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview
 SMARTPBX_SINHALA_GEMINI_TTS_VOICE=Vindemiatrix
 SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS=15.0
+SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER=3
+SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS=
+SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR=7
 OPENAI_TTS_MODEL=gpt-4o-mini-tts
 OPENAI_TTS_VOICE=nova
 OPENAI_TTS_INSTRUCTIONS=
@@ -570,6 +573,7 @@ event allowlist**. It may contain only the following runtime event names:
 `llm_empty_response`,
 `llm_error`, `llm_provider_degraded`, `llm_provider_failover`, `tool_execute`,
 `tool_result`, `tool_error`, `tool_batch`, `tool_round_limit`, `tts_failure`,
+`sinhala_tts_quota_degraded`, `sinhala_tts_model_fallback`,
 `tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
 `llm_stream_timeout`,
 `silence_reprompt`, `stt_final`, `stt_post_dispatch_result`,
@@ -929,6 +933,32 @@ rising counter as "Kavya is answering at unusual length" and look at the prompt
 and the KB content first. Raise `SMARTPBX_MAX_OUTBOUND_FRAMES` (ceiling 512) only
 if it is already below the default. Investigate CPU or the Dialog socket only
 once reply length has been ruled out.
+
+`sinhala_tts_degraded` is `true` once `SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER`
+(default 3, clamp `[1, 10]`) consecutive live Gemini Sinhala TTS calls in this
+process have failed with a `quota_exceeded` provider error, and resets to
+`false` the next time a live Gemini Sinhala TTS synthesis succeeds. It is
+process-wide, not per-call: point uptime monitoring or an operator alert at it
+to catch Gemini TTS quota exhaustion before a run of Sinhala guests hears only
+the cached apology line. A single `smartpbx_media event=sinhala_tts_quota_degraded`
+WARNING is logged once per degraded episode (never per turn) alongside it.
+
+`sinhala_tts_model` reports whichever Gemini model most recently completed a
+live Sinhala synthesis -- the default `SMARTPBX_SINHALA_GEMINI_TTS_MODEL`
+(`gemini-3.1-flash-tts-preview`) until a quota/rate-limit hit moves it to a
+fallback. The fallback chain is `SMARTPBX_SINHALA_GEMINI_TTS_MODEL` then
+`SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS` (comma list, default
+`gemini-2.5-flash-preview-tts,gemini-2.5-pro-preview-tts`; names must match
+`^[a-z0-9.-]+$` or the whole list falls back to that default) -- same client,
+same voice, same text, retried immediately within the turn. A model that hits
+`quota_exceeded`/`rate_limited` is skipped for the rest of that quota day
+(sticky per process, not per call) and restored at `SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR`
+(default `7`, i.e. `07:00` UTC). Each fallback logs
+`smartpbx_media event=sinhala_tts_model_fallback from=<model> to=<model> reason=quota_exceeded|rate_limited`
+(model names only); `session_summary` counts them per call as
+`tts_model_fallbacks`. `invalid_request`/`permission_denied`/`server_error`/
+`unknown_provider_error` and any malformed-audio/timeout/HTTP failure never
+fall back -- only a classified quota or rate-limit hit does.
 
 ## SmartPBX telemetry privacy and retention
 

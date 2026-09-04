@@ -131,6 +131,16 @@ explicit environment allowlist and must not receive Twilio credentials or
   deliberately withheld when that key is missing or whitespace-only, including
   from a caller who would have selected Press `1`. Never put it in tracked files
   or print it. Chirp and Gemini Transcribe are not part of this rollout.
+- Gemini Sinhala TTS has a quota-aware model fallback chain (2026-09-04):
+  `SMARTPBX_SINHALA_GEMINI_TTS_MODEL` (primary) then
+  `SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS` (comma list, default
+  `gemini-2.5-flash-preview-tts,gemini-2.5-pro-preview-tts`), same client and
+  voice, tried in order only on a classified `quota_exceeded`/`rate_limited`
+  error, never for any other failure. A model that hits quota/rate-limit is
+  skipped (sticky per process) for the rest of that quota day and restored at
+  `SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR` (default `7`, i.e. `07:00` UTC).
+  `/smartpbx/status` exposes the currently active model as `sinhala_tts_model`;
+  see `SMARTPBX_RUNBOOK.md`'s Monitoring section for the full contract.
 
 **TTS/STT:**
 - `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` — ElevenLabs TTS (English ConversationRelay + Tamil Media Streams)

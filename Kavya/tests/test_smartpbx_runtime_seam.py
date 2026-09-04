@@ -994,11 +994,60 @@ async def test_session_finish_emits_one_opaque_aggregate_summary_after_cleanup(m
             "duration_ms": records[0]["duration_ms"],
             "frames_dropped_total": 0,
             "barge_ins": 2,
+            "tts_failures": 0,
+            "tts_model_fallbacks": 0,
         }
     ]
     assert isinstance(records[0]["session_trace_id"], str)
     assert 0 <= records[0]["duration_ms"] <= 600_000
     assert not ({"call_id", "caller", "phone", "transcript", "text"} & set(records[0]))
+
+
+@pytest.mark.asyncio
+async def test_session_summary_carries_hangup_cause_only_for_a_hangup_close(monkeypatch):
+    import smartpbx_session
+
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        smartpbx_session,
+        "_emit_smartpbx_session_summary",
+        lambda **fields: records.append(fields),
+    )
+    hangup_session = _session(Pipeline())
+    await hangup_session.finish(
+        False, close_reason="hangup", close_code=1000, hangup_cause="normal_clearing",
+    )
+    assert records[-1]["hangup_cause"] == "normal_clearing"
+
+    # A non-hangup close must never carry a hangup_cause, even if one is
+    # passed in (defensive -- the gateway itself never does this today).
+    non_hangup_session = _session(Pipeline())
+    await non_hangup_session.finish(
+        False, close_reason="idle_timeout", close_code=1008, hangup_cause="normal_clearing",
+    )
+    assert "hangup_cause" not in records[-1]
+
+
+@pytest.mark.asyncio
+async def test_finish_passes_hangup_cause_through_to_the_post_call_processor():
+    captured: dict[str, object] = {}
+
+    async def post(**kwargs):
+        captured.update(kwargs)
+
+    pipeline = Pipeline()
+    pipeline.full_transcript = [{"role": "user", "text": "hi"}]
+    session = KavyaSmartPBXSession(
+        CONTEXT, Transport(), pipeline=pipeline, post_call_processor=post,
+        welcome_text="", llm_provider="openai", model="m",
+    )
+
+    await session.finish(
+        True, close_reason="hangup", close_code=1000, hangup_cause="call_rejected",
+    )
+    await session._post_call_task
+
+    assert captured["hangup_cause"] == "call_rejected"
 
 
 @pytest.mark.asyncio

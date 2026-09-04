@@ -87,6 +87,16 @@ def _isolated_phrase_cache(monkeypatch):
     monkeypatch.setattr(server, "_SMARTPBX_SINHALA_PHRASE_AUDIO", {})
     monkeypatch.setattr(server, "_SMARTPBX_SINHALA_PHRASE_PREWARM", None)
     monkeypatch.setattr(server, "GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setattr(
+        server,
+        "_smartpbx_sinhala_tts_quota_state",
+        {"consecutive_failures": 0, "degraded": False, "degraded_logged": False},
+    )
+    monkeypatch.setattr(
+        server,
+        "_smartpbx_sinhala_tts_model_state",
+        {"exhausted_until": {}, "active_model": None},
+    )
 
 
 def _sinhala_pipeline():
@@ -103,6 +113,7 @@ def _sinhala_pipeline():
 def test_only_fixed_operator_phrases_may_ever_be_cached():
     """Caller transcript and model output must never enter the phrase cache."""
     assert server.SMARTPBX_SINHALA_INITIAL_FILLER_TEXT in server.SMARTPBX_SINHALA_CACHED_PHRASES
+    assert server.SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT in server.SMARTPBX_SINHALA_CACHED_PHRASES
     for phrase in server.MEDIA_STREAM_FILLERS["si"].values():
         assert phrase in server.SMARTPBX_SINHALA_CACHED_PHRASES
 
@@ -468,3 +479,129 @@ def test_a_cached_phrase_claims_speaking_state_on_its_first_frame_not_after_play
     assert gen1 == gen0, "a sub-threshold back-channel must not barge in on the filler"
     assert barge_ins == 0
     assert sent >= 8000 // 160, "every paced frame of the clip reached the wire"
+
+
+# --- never-silent apology (2026-09-04 quota-failure incident) ---------------
+
+def test_apology_is_spoken_once_when_a_turn_fails_with_no_audio_delivered(monkeypatch):
+    """At most one apology per turn: two silent TTS failures on the same turn
+    must produce exactly one spoken clip, not two."""
+    pipeline, transport = _sinhala_pipeline()
+    pipeline._active_smartpbx_turn_id = "turn-1"
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "")
+    server._store_cached_smartpbx_sinhala_phrase_audio(
+        server.SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT, b"\xff" * 640,
+    )
+
+    asyncio.run(pipeline._tts_gemini_sinhala("first silent attempt"))
+    asyncio.run(pipeline._tts_gemini_sinhala("second silent attempt"))
+
+    assert b"".join(transport.audio) == b"\xff" * 640
+    assert transport.marks.count("tts_done") == 1
+
+
+def test_apology_is_not_spoken_when_audio_was_already_delivered_this_turn():
+    """A turn that has delivered at least one sentence is not silent -- a
+    later TTS failure in the same turn must not trigger the apology."""
+    pipeline, transport = _sinhala_pipeline()
+    pipeline._delivered_sentences = ["a sentence the guest already heard"]
+    server._store_cached_smartpbx_sinhala_phrase_audio(
+        server.SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT, b"\xff" * 640,
+    )
+
+    asyncio.run(pipeline._tts_gemini_sinhala("second attempt fails"))
+
+    assert transport.audio == []
+    assert transport.marks == []
+
+
+def test_apology_is_not_spoken_after_a_barge_in():
+    """Ownership loss (what a barge-in produces) must suppress the apology,
+    both when the caller already flagged cancellation and when only the
+    speak generation moved on."""
+    pipeline, transport = _sinhala_pipeline()
+    server._store_cached_smartpbx_sinhala_phrase_audio(
+        server.SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT, b"\xff" * 640,
+    )
+    gen = pipeline._speak_generation
+
+    asyncio.run(
+        pipeline._speak_smartpbx_sinhala_apology_if_silent(gen, cancelled=True)
+    )
+    assert transport.audio == []
+    assert transport.marks == []
+
+    pipeline._speak_generation = gen + 1
+    asyncio.run(
+        pipeline._speak_smartpbx_sinhala_apology_if_silent(gen, cancelled=False)
+    )
+    assert transport.audio == []
+    assert transport.marks == []
+
+
+def test_apology_does_nothing_extra_when_the_cache_is_empty(monkeypatch):
+    """A prewarm failure (empty cache) must not be papered over with anything
+    -- the task's explicit "do nothing extra" contract."""
+    pipeline, transport = _sinhala_pipeline()
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "")
+    # Deliberately never populated -- simulates a failed prewarm.
+
+    asyncio.run(pipeline._tts_gemini_sinhala("attempt with no cached apology"))
+
+    assert transport.audio == []
+    assert transport.marks == []
+
+
+def test_apology_plays_through_the_real_transport_when_sinhala_tts_fails_silently(
+    monkeypatch,
+):
+    """Regression companion to the cached-phrase test above: the apology reuses
+    the identical frame-by-frame send path, so it must claim audible speaking
+    state on its first frame through the real SmartPBXMediaTransport too, not
+    a fake instantaneous ``send_audio`` that would hide a broken claim."""
+    from smartpbx_protocol import CallContext, MediaFormat
+    from smartpbx_transport import SmartPBXMediaTransport
+
+    class _WS:
+        def __init__(self) -> None:
+            self.sent = 0
+
+        async def send_text(self, _text: str) -> None:
+            self.sent += 1
+
+    async def scenario() -> tuple[bool, int]:
+        ws = _WS()
+        context = CallContext("c", "o", "1", "2", "a", MediaFormat("PCMU", 8000))
+        transport = SmartPBXMediaTransport(ws, context)
+        transport.start()
+        await asyncio.sleep(0)
+        pipeline = server.MediaStreamSession(
+            websocket=None, lang="si", media_transport=transport, llm_provider="gemini",
+        )
+        pipeline._smartpbx_transfer_context = object()
+        pipeline._event_loop = asyncio.get_running_loop()
+        server._store_cached_smartpbx_sinhala_phrase_audio(
+            server.SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT, b"\xff" * 8000,  # 1.0 s
+        )
+        monkeypatch.setattr(server, "GEMINI_API_KEY", "")
+
+        speaking_seen = False
+
+        async def watcher() -> None:
+            nonlocal speaking_seen
+            for _ in range(30):
+                speaking_seen = speaking_seen or pipeline._is_speaking
+                await asyncio.sleep(0.05)
+
+        watch_task = asyncio.create_task(watcher())
+        try:
+            await pipeline._tts_gemini_sinhala("guest never hears this text")
+        finally:
+            await watch_task
+            await transport.close()
+        return speaking_seen, ws.sent
+
+    speaking_seen, sent = asyncio.run(scenario())
+
+    assert speaking_seen, "the apology must claim audible speaking state while it plays"
+    assert sent >= 8000 // 160, "every paced frame of the apology clip reached the wire"

@@ -155,7 +155,7 @@ import time
 import wave
 import xml.sax.saxutils
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from html import escape as html_escape
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 from urllib.parse import quote as url_quote
@@ -1224,6 +1224,15 @@ SMARTPBX_INITIAL_FILLER_TEXT = "Just a moment while I check that for you."
 # pre-rendered through Gemini TTS before a call may use it, so each extra
 # variant is another synthesis the process must complete up front.
 SMARTPBX_SINHALA_INITIAL_FILLER_TEXT = "පොඩ්ඩක් ඉන්න, මම බලන්නම්."
+# Never-silent fallback: spoken instead of dead air when a Sinhala TTS attempt
+# fails for a turn that has delivered no audio yet. Fixed and cached exactly
+# like the filler above — the whole point is that it must be playable from
+# bytes even when the live Gemini TTS call is the thing that just failed
+# (e.g. quota exhaustion), so it can never itself depend on that call working.
+SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT = (
+    "සමාවෙන්න, මට පොඩි තාක්ෂණික අපහසුතාවයක් තියෙනවා. "
+    "කරුණාකර පොඩ්ඩක් ඉන්න, නැත්නම් ටිකෙන් නැවත උත්සාහ කරන්න."
+)
 _SMARTPBX_CAPTURE_TOOLS = frozenset({
     "capture_spoken_number", "capture_spoken_name", "collect_number_via_keypad",
 })
@@ -1996,6 +2005,35 @@ SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS = _parse_endpointing_seconds(
     30.0,
 )
 
+# Quota-aware model fallback chain (same client, same voice): primary is the
+# existing SMARTPBX_SINHALA_GEMINI_TTS_MODEL knob above; these are tried in
+# order only after a classified quota_exceeded/rate_limited error, never for
+# any other failure. Names are validated so an operator typo cannot smuggle
+# an arbitrary string into an outbound API call; an unparseable/empty value
+# falls back to the documented default pair rather than disabling fallback.
+_SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS_DEFAULT = (
+    "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts",
+)
+_SMARTPBX_GEMINI_MODEL_NAME_PATTERN = re.compile(r"^[a-z0-9.-]+$")
+
+
+def _parse_smartpbx_sinhala_tts_fallback_models(raw: str) -> tuple[str, ...]:
+    if not isinstance(raw, str) or not raw.strip():
+        return _SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS_DEFAULT
+    candidates = (part.strip() for part in raw.split(","))
+    valid = tuple(
+        part for part in candidates
+        if part and _SMARTPBX_GEMINI_MODEL_NAME_PATTERN.fullmatch(part)
+    )
+    return valid if valid else _SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS_DEFAULT
+
+
+SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS: tuple[str, ...] = (
+    _parse_smartpbx_sinhala_tts_fallback_models(
+        os.environ.get("SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS", "")
+    )
+)
+
 # Upper bound for the only integer the post-dispatch STT telemetry emits. The
 # event records that a late provider result was ignored while a turn was already
 # dispatched; the age of that turn is useful, an unbounded number is not. Not an
@@ -2111,6 +2149,130 @@ CAPTURE_BUFFER_MAX_CHARS: int = _parse_clamped_int(
 CAPTURE_DICTATION_MIN_RATIO: float = _parse_clamped_float(
     os.environ, "CAPTURE_DICTATION_MIN_RATIO", 0.3, 0.0, 1.0
 )
+
+# How many consecutive live Gemini Sinhala TTS quota failures (across the
+# whole process, not one call) before the sticky `sinhala_tts_degraded`
+# signal latches. Env-tunable and clamped so a mis-set knob can neither
+# disable the signal (0) nor make it require an unreasonable run.
+SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER: int = _parse_clamped_int(
+    os.environ, "SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER", 3, 1, 10
+)
+
+# Process-wide (not per-call) sticky degradation signal for Gemini Sinhala TTS
+# quota exhaustion. `/smartpbx/status` reports it so an operator/uptime check
+# can see a quota problem without reading logs; it resets the moment a live
+# Gemini TTS synthesis succeeds again. Deliberately module-level: unlike the
+# per-call Gemini LLM failover counter, this must be visible to every call in
+# the process, including calls that never themselves failed.
+_smartpbx_sinhala_tts_quota_state: dict[str, Any] = {
+    "consecutive_failures": 0,
+    "degraded": False,
+    "degraded_logged": False,
+}
+
+
+def _note_smartpbx_sinhala_tts_quota_failure() -> None:
+    """Record one live Gemini Sinhala TTS quota failure; latch degradation."""
+    state = _smartpbx_sinhala_tts_quota_state
+    state["consecutive_failures"] = min(state.get("consecutive_failures", 0) + 1, 1_000_000)
+    if (
+        state["consecutive_failures"] >= SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER
+        and not state.get("degraded", False)
+    ):
+        state["degraded"] = True
+        if not state.get("degraded_logged", False):
+            logger.warning("smartpbx_media event=sinhala_tts_quota_degraded")
+            state["degraded_logged"] = True
+
+
+def _note_smartpbx_sinhala_tts_synthesis_success() -> None:
+    """A live Gemini Sinhala TTS synthesis completed: clear the streak."""
+    state = _smartpbx_sinhala_tts_quota_state
+    state["consecutive_failures"] = 0
+    state["degraded"] = False
+    state["degraded_logged"] = False
+
+
+def _smartpbx_sinhala_tts_degraded() -> bool:
+    return bool(_smartpbx_sinhala_tts_quota_state.get("degraded", False))
+
+
+# --- quota-aware Gemini Sinhala TTS model fallback chain --------------------
+#
+# Sticky per PROCESS (not per call), like the degradation signal above, but
+# tracked per model name: a model that hits quota_exceeded/rate_limited is
+# skipped for the rest of that quota day rather than retried on every turn.
+# The reset boundary is a fixed wall-clock UTC hour (the provider's quota-day
+# boundary), env-tunable so ops can correct it without a code change.
+SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR: int = _parse_clamped_int(
+    os.environ, "SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR", 7, 0, 23
+)
+
+
+def _smartpbx_utcnow() -> datetime:
+    """Indirection point so tests can inject a fixed clock."""
+    return datetime.now(timezone.utc)
+
+
+def _smartpbx_sinhala_tts_model_chain() -> tuple[str, ...]:
+    """[primary, *fallbacks], deduplicated, primary always first."""
+    chain = (SMARTPBX_SINHALA_GEMINI_TTS_MODEL, *SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS)
+    return tuple(dict.fromkeys(chain))
+
+
+_smartpbx_sinhala_tts_model_state: dict[str, Any] = {
+    "exhausted_until": {},
+    "active_model": None,
+}
+
+
+def _smartpbx_sinhala_tts_quota_reset_boundary(now: datetime) -> datetime:
+    """The next daily reset instant strictly after `now`."""
+    reset_today = now.replace(
+        hour=SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR, minute=0, second=0, microsecond=0,
+    )
+    return reset_today if now < reset_today else reset_today + timedelta(days=1)
+
+
+def _mark_smartpbx_sinhala_tts_model_exhausted(model: str, *, now: datetime | None = None) -> None:
+    now = _smartpbx_utcnow() if now is None else now
+    _smartpbx_sinhala_tts_model_state["exhausted_until"][model] = (
+        _smartpbx_sinhala_tts_quota_reset_boundary(now)
+    )
+
+
+def _smartpbx_sinhala_tts_model_is_exhausted(model: str, *, now: datetime | None = None) -> bool:
+    now = _smartpbx_utcnow() if now is None else now
+    until = _smartpbx_sinhala_tts_model_state["exhausted_until"].get(model)
+    return until is not None and now < until
+
+
+def _smartpbx_sinhala_tts_available_models(*, now: datetime | None = None) -> list[str]:
+    """The configured chain with any currently-exhausted model removed.
+
+    Order-preserving; an empty result means every configured model is
+    exhausted for today's quota window.
+    """
+    now = _smartpbx_utcnow() if now is None else now
+    return [
+        model for model in _smartpbx_sinhala_tts_model_chain()
+        if not _smartpbx_sinhala_tts_model_is_exhausted(model, now=now)
+    ]
+
+
+def _note_smartpbx_sinhala_tts_active_model(model: str) -> None:
+    _smartpbx_sinhala_tts_model_state["active_model"] = model
+
+
+def _smartpbx_sinhala_tts_active_model() -> str:
+    """The model most recently used for a successful live synthesis.
+
+    Before any call has synthesised anything in this process, this is the
+    configured primary model -- a sane, honest default for `/smartpbx/status`
+    rather than a placeholder like `None`.
+    """
+    active = _smartpbx_sinhala_tts_model_state.get("active_model")
+    return active if isinstance(active, str) and active else SMARTPBX_SINHALA_GEMINI_TTS_MODEL
 
 # ---------------------------------------------------------------------------
 # Capture-ask detection (arms capture mode BEFORE the caller answers)
@@ -2704,6 +2866,7 @@ SMARTPBX_SINHALA_CACHED_PHRASES: tuple[str, ...] = tuple(
     dict.fromkeys(
         (
             SMARTPBX_SINHALA_INITIAL_FILLER_TEXT,
+            SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT,
             *SMARTPBX_SINHALA_KEYPAD_PROMPTS.values(),
             *(
                 phrase
@@ -3824,10 +3987,102 @@ def _get_gemini_tts_client():
     return _gemini_tts_client
 
 
+# Closed vocabulary for a Gemini TTS Interactions-API provider error. Never
+# widened with a message string — only these bounded codes ever reach a log
+# line or a diagnostic.
+_GEMINI_TTS_PROVIDER_ERROR_CODES = frozenset({
+    "quota_exceeded", "rate_limited", "invalid_request",
+    "permission_denied", "server_error", "unknown_provider_error",
+})
+
+
+class _GeminiTTSProviderError(Exception):
+    """The Interactions SSE stream ended with an explicit provider error.
+
+    Raised for an `error` event, or any terminal `interaction.*` event that
+    carries a non-null `.error` — never for an in-flight event without one.
+    `.code` is always one of `_GEMINI_TTS_PROVIDER_ERROR_CODES`; the SDK's
+    error message is deliberately never retained (privacy contract).
+    """
+
+    def __init__(self, code: str) -> None:
+        self.code = code if code in _GEMINI_TTS_PROVIDER_ERROR_CODES else "unknown_provider_error"
+        super().__init__(self.code)
+
+
+class _SmartPBXSinhalaTTSLocalFailure(Exception):
+    """A local (non-provider) failure inside one model attempt.
+
+    Malformed audio, unsupported metadata, an odd final PCM tail: these are
+    never evidence about quota, so they are always terminal for the call and
+    must never trigger a retry on the next model in the fallback chain.
+    """
+
+    def __init__(self, outcome: str, failure_class: "DiagnosticFailureClass") -> None:
+        self.outcome = outcome
+        self.failure_class = failure_class
+        super().__init__(outcome)
+
+
+def _classify_gemini_tts_provider_error(error: Any) -> str:
+    """Map an SDK error object's `code`/`status` to the closed outcome vocabulary.
+
+    Only the bounded code/status fields are ever inspected — never `.message`.
+    """
+    code = getattr(error, "code", None)
+    status = getattr(error, "status", None)
+    code_text = code.strip().lower() if isinstance(code, str) else ""
+    status_text = status.strip().upper() if isinstance(status, str) else ""
+
+    if "quota" in code_text:
+        return "quota_exceeded"
+    if "rate" in code_text and "limit" in code_text:
+        return "rate_limited"
+    if "invalid" in code_text:
+        return "invalid_request"
+    if "permission" in code_text or "forbidden" in code_text:
+        return "permission_denied"
+    if "server" in code_text or "internal" in code_text or "unavailable" in code_text:
+        return "server_error"
+
+    if status_text == "RESOURCE_EXHAUSTED":
+        return "rate_limited"
+    if status_text == "PERMISSION_DENIED":
+        return "permission_denied"
+    if status_text == "INVALID_ARGUMENT":
+        return "invalid_request"
+    if status_text in {"UNAVAILABLE", "INTERNAL", "UNKNOWN"}:
+        return "server_error"
+
+    return "unknown_provider_error"
+
+
+def _diagnostic_class_for_gemini_tts_error(code: str) -> "DiagnosticFailureClass":
+    """The closest DiagnosticFailureClass for a classified provider-error code."""
+    if code == "quota_exceeded":
+        return DiagnosticFailureClass.TTS_QUOTA
+    return DiagnosticFailureClass.TTS_PROVIDER_ERROR
+
+
 async def _iter_gemini_tts_audio_deltas(stream: Any) -> AsyncIterator[tuple[str, Any]]:
-    """Yield base64 audio payloads from the documented Interactions SSE shape."""
+    """Yield base64 audio payloads from the documented Interactions SSE shape.
+
+    Raises `_GeminiTTSProviderError` for an explicit `error` event or a
+    terminal `interaction.*` event carrying an `.error`, instead of silently
+    falling through to the caller's "stream ended with no audio" path.
+    """
     async for event in stream:
-        if getattr(event, "event_type", None) != "step.delta":
+        event_type = getattr(event, "event_type", None)
+        error = getattr(event, "error", None)
+        if event_type == "error":
+            raise _GeminiTTSProviderError(_classify_gemini_tts_provider_error(error))
+        if (
+            isinstance(event_type, str)
+            and event_type.startswith("interaction.")
+            and error is not None
+        ):
+            raise _GeminiTTSProviderError(_classify_gemini_tts_provider_error(error))
+        if event_type != "step.delta":
             continue
         delta = getattr(event, "delta", None)
         if getattr(delta, "type", None) != "audio":
@@ -6275,6 +6530,14 @@ class MediaStreamSession:
         self._interrupted_smartpbx_turn_ids: set[str] = set()
         self._tool_failed_smartpbx_turn_ids: set[str] = set()
         self._tts_failed_smartpbx_turn_ids: set[str] = set()
+        # At most one never-silent apology per turn.
+        self._smartpbx_apology_spoken_turn_ids: set[str] = set()
+        # Session-lifetime count of tts_failed turns, for session_summary's
+        # tts_failures field (per-turn sets above are cleared each turn).
+        self._smartpbx_tts_failures_total = 0
+        # Session-lifetime count of Gemini Sinhala TTS model fallbacks (a
+        # quota/rate-limit hit that moved to the next model in the chain).
+        self._smartpbx_tts_model_fallbacks_total = 0
         self._smartpbx_barge_ins = 0
         self._smartpbx_cadence_by_turn: dict[str, dict[str, int]] = {}
         self._smartpbx_dropped_frame_baselines: dict[str, int] = {}
@@ -6808,6 +7071,7 @@ class MediaStreamSession:
         self._interrupted_smartpbx_turn_ids.clear()
         self._tool_failed_smartpbx_turn_ids.clear()
         self._tts_failed_smartpbx_turn_ids.clear()
+        self._smartpbx_apology_spoken_turn_ids.clear()
         self._smartpbx_cadence_by_turn.clear()
         self._smartpbx_dropped_frame_baselines.clear()
         self._smartpbx_dropped_frames_by_turn.clear()
@@ -9281,6 +9545,9 @@ class MediaStreamSession:
                 outcome = "interrupted"
             elif turn_id in self._tts_failed_smartpbx_turn_ids:
                 outcome = "tts_failed"
+                self._smartpbx_tts_failures_total = min(
+                    self._smartpbx_tts_failures_total + 1, 100_000,
+                )
             elif turn_id in self._tool_failed_smartpbx_turn_ids:
                 outcome = "tool_failed"
             if telemetry is not None and turn_id is not None:
@@ -9297,6 +9564,7 @@ class MediaStreamSession:
                 self._interrupted_smartpbx_turn_ids.discard(turn_id)
                 self._tool_failed_smartpbx_turn_ids.discard(turn_id)
                 self._tts_failed_smartpbx_turn_ids.discard(turn_id)
+                self._smartpbx_apology_spoken_turn_ids.discard(turn_id)
         # Pre-arm the patient timers for the NEXT guest turn(s) when this turn
         # actually asked the caller to dictate. Runs after the turn so it sees the
         # delivered sentences and cannot be undone by the capture tool's own exit.
@@ -11219,6 +11487,98 @@ class MediaStreamSession:
                     turn_generation=generation,
                 )
 
+    def _owns_smartpbx_apology_playback(
+        self, expected_generation: int, *, audio_emitted: bool
+    ) -> bool:
+        """Ownership fence for the apology's own playback.
+
+        Deliberately independent of `_tts_synthesis_in_flight`/
+        `_tts_synthesis_generation`: those mark a live Gemini synthesis
+        attempt, which the apology can fire without (e.g. a missing API key
+        never starts one). Generation and the existing transfer/turn fence
+        are still authoritative for whether this call may put audio on the
+        wire.
+        """
+        if (
+            self._speak_generation != expected_generation
+            or not self._owns_smartpbx_tts_delivery(expected_generation)
+        ):
+            return False
+        return not audio_emitted or self._is_speaking
+
+    async def _speak_smartpbx_sinhala_apology_if_silent(
+        self, expected_generation: int, *, cancelled: bool
+    ) -> None:
+        """Guarantee the guest hears something when Sinhala TTS fails silent.
+
+        Called from within `_tts_gemini_sinhala`'s own failure handling, while
+        `_speak_lock` is already held by this task -- it must never call back
+        into `_speak`/`_invoke_tts` (the lock is not reentrant). Instead it
+        replays the pre-rendered apology clip through the identical
+        frame-by-frame send/fence/mark path the cached-phrase fast path uses.
+
+        Plays only when: this is a Direct SmartPBX Sinhala session, the turn
+        has delivered no audio at all yet (`_delivered_sentences` empty), no
+        apology has already been spoken this turn, the guest has not barged
+        in (ownership/generation still ours), and the fixed apology phrase is
+        actually cached -- an empty cache (prewarm failed) means do nothing
+        extra, exactly as the task requires.
+        """
+        if not (self.lang == "si" and self._is_smartpbx_session()):
+            return
+        if cancelled or self._speak_generation != expected_generation:
+            return
+        if self._delivered_sentences:
+            return
+        turn_id = self._current_smartpbx_turn_id()
+        if turn_id is not None and turn_id in self._smartpbx_apology_spoken_turn_ids:
+            return
+        audio = _get_cached_smartpbx_sinhala_phrase_audio(
+            SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT
+        )
+        if not audio:
+            return
+        if turn_id is not None:
+            self._smartpbx_apology_spoken_turn_ids.add(turn_id)
+
+        audio_emitted = False
+        mulaw_buf = audio
+        while len(mulaw_buf) >= _SMARTPBX_MULAW_FRAME_BYTES:
+            if not self._owns_smartpbx_apology_playback(
+                expected_generation, audio_emitted=audio_emitted
+            ):
+                return
+            frame, mulaw_buf = (
+                mulaw_buf[:_SMARTPBX_MULAW_FRAME_BYTES],
+                mulaw_buf[_SMARTPBX_MULAW_FRAME_BYTES:],
+            )
+            if await self._send_media_audio(frame):
+                await self._flush_pre_audio_stt()
+                self._mark_smartpbx_turn_once("tts_first_chunk")
+                audio_emitted = self._mark_tts_audible(expected_generation)
+                if not audio_emitted:
+                    return
+
+        if mulaw_buf and self._owns_smartpbx_apology_playback(
+            expected_generation, audio_emitted=audio_emitted
+        ):
+            mulaw_buf += b"\xff" * (_SMARTPBX_MULAW_FRAME_BYTES - len(mulaw_buf))
+            if await self._send_media_audio(mulaw_buf):
+                await self._flush_pre_audio_stt()
+                self._mark_smartpbx_turn_once("tts_first_chunk")
+                audio_emitted = self._mark_tts_audible(expected_generation)
+
+        if (
+            audio_emitted
+            and self._is_speaking
+            and self._speak_generation == expected_generation
+            and self._owns_smartpbx_tts_delivery(expected_generation)
+        ):
+            await self._send_tts_done(
+                sentence=SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT,
+                turn_generation=expected_generation,
+            )
+
     # â”€â”€ ElevenLabs TTS (Tamil) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _tts_gemini_sinhala(
@@ -11232,14 +11592,28 @@ class MediaStreamSession:
         text = text.strip()
         if not text:
             return
-        if not _has_gemini_api_key():
-            self._log_tts_failure("gemini", "missing_api_key")
-            self._emit_smartpbx_tts_diagnostic(
-                DiagnosticFailureClass.TTS_MISSING_API_KEY
-            )
-            return
 
         expected_generation = self._speak_generation
+        cancelled = False
+        audio_emitted = False
+
+        async def _fail(
+            outcome: str, failure_class: "DiagnosticFailureClass", status: int | None = None,
+        ) -> None:
+            """One choke point for every failure exit: log, diagnose, count
+            quota streaks, and offer the never-silent apology."""
+            self._log_tts_failure("gemini", outcome, status)
+            self._emit_smartpbx_tts_diagnostic(failure_class)
+            if outcome == "quota_exceeded":
+                _note_smartpbx_sinhala_tts_quota_failure()
+            await self._speak_smartpbx_sinhala_apology_if_silent(
+                expected_generation, cancelled=cancelled,
+            )
+
+        if not _has_gemini_api_key():
+            await _fail("missing_api_key", DiagnosticFailureClass.TTS_MISSING_API_KEY)
+            return
+
         if turn_generation is not None and turn_generation >= 0:
             if turn_generation != expected_generation:
                 return
@@ -11250,8 +11624,6 @@ class MediaStreamSession:
         ratecv_state = None
         pcm_tail = b""
         mulaw_buf = b""
-        audio_emitted = False
-        cancelled = False
 
         try:
             # A pre-rendered fixed phrase (initial filler, tool filler,
@@ -11261,6 +11633,9 @@ class MediaStreamSession:
             # below is the identical sequence the streamed path ends with, so
             # ownership and barge-in semantics are unchanged.
             cached_phrase_audio = _get_cached_smartpbx_sinhala_phrase_audio(text)
+            # Only a genuine live Gemini call is evidence about the quota --
+            # a cached-phrase replay never touches the API.
+            used_live_gemini_client = cached_phrase_audio is None
             if cached_phrase_audio is not None:
                 logger.info(
                     "smartpbx_media event=tts_phrase_cache_hit provider=gemini"
@@ -11288,97 +11663,134 @@ class MediaStreamSession:
                             cancelled = True
                             break
             else:
-                client = self._gemini_tts_client
-                if client is None:
-                    client = _get_gemini_tts_client()
-                    self._gemini_tts_client = client
-                stream = await client.aio.interactions.create(
-                    model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
-                    input=text,
-                    stream=True,
-                    response_format={"type": "audio"},
-                    generation_config={
-                        "speech_config": [{
-                            "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
-                        }],
-                    },
-                    timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
-                )
+                available_models = _smartpbx_sinhala_tts_available_models()
+                if not available_models:
+                    # Every configured model is currently marked exhausted for
+                    # today's quota window -- do not spend a round trip
+                    # discovering what the sticky state already tells us.
+                    raise _GeminiTTSProviderError("quota_exceeded")
 
-                async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
-                    if not self._owns_sinhala_tts_stream(
-                        expected_generation, audio_emitted=audio_emitted
-                    ) or (
-                        turn_generation is not None
-                        and turn_generation >= 0
-                        and turn_generation != self._speak_generation
-                    ):
-                        cancelled = True
-                        break
-                    if (
-                        (
-                            getattr(audio_delta, "mime_type", None) is not None
-                            and getattr(audio_delta, "mime_type") != "audio/l16"
-                        )
-                        or (
-                            getattr(audio_delta, "channels", None) is not None
-                            and getattr(audio_delta, "channels") != 1
-                        )
-                        or (
-                            getattr(audio_delta, "sample_rate", None) is not None
-                            and getattr(audio_delta, "sample_rate") != 24000
-                        )
-                    ):
-                        self._log_tts_failure("gemini", "invalid_audio_metadata")
-                        self._emit_smartpbx_tts_diagnostic(
-                            DiagnosticFailureClass.TTS_EXCEPTION
-                        )
-                        return
-                    try:
-                        chunk = base64.b64decode(audio_b64, validate=True)
-                    except (binascii.Error, ValueError, TypeError):
-                        self._log_tts_failure("gemini", "malformed_audio")
-                        self._emit_smartpbx_tts_diagnostic(
-                            DiagnosticFailureClass.TTS_EXCEPTION
-                        )
-                        return
-                    if not chunk:
-                        continue
-
-                    data = pcm_tail + chunk
-                    if len(data) % 2:
-                        data, pcm_tail = data[:-1], data[-1:]
-                    else:
-                        pcm_tail = b""
-                    if not data:
-                        continue
-                    pcm8k, ratecv_state = audioop.ratecv(
-                        data, 2, 1, 24000, 8000, ratecv_state
+                model_index = 0
+                model_name = available_models[0]
+                while True:
+                    model_name = available_models[model_index]
+                    client = self._gemini_tts_client
+                    if client is None:
+                        client = _get_gemini_tts_client()
+                        self._gemini_tts_client = client
+                    stream = await client.aio.interactions.create(
+                        model=model_name,
+                        input=text,
+                        stream=True,
+                        response_format={"type": "audio"},
+                        generation_config={
+                            "speech_config": [{
+                                "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
+                            }],
+                        },
+                        timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
                     )
-                    mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+                    # Every model attempt resynthesises the whole phrase from
+                    # scratch -- fresh decode/resample state, never a resume.
+                    ratecv_state = None
+                    pcm_tail = b""
+                    mulaw_buf = b""
 
-                    while len(mulaw_buf) >= 640:
-                        if not self._owns_sinhala_tts_stream(
-                            expected_generation, audio_emitted=audio_emitted
-                        ):
-                            cancelled = True
-                            break
-                        frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
-                        if await self._send_media_audio(frame):
-                            await self._flush_pre_audio_stt()
-                            self._mark_smartpbx_turn_once("tts_first_chunk")
-                            audio_emitted = self._mark_tts_audible(expected_generation)
-                            if not audio_emitted:
+                    try:
+                        async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
+                            if not self._owns_sinhala_tts_stream(
+                                expected_generation, audio_emitted=audio_emitted
+                            ) or (
+                                turn_generation is not None
+                                and turn_generation >= 0
+                                and turn_generation != self._speak_generation
+                            ):
                                 cancelled = True
                                 break
-                    if cancelled:
-                        break
+                            if (
+                                (
+                                    getattr(audio_delta, "mime_type", None) is not None
+                                    and getattr(audio_delta, "mime_type") != "audio/l16"
+                                )
+                                or (
+                                    getattr(audio_delta, "channels", None) is not None
+                                    and getattr(audio_delta, "channels") != 1
+                                )
+                                or (
+                                    getattr(audio_delta, "sample_rate", None) is not None
+                                    and getattr(audio_delta, "sample_rate") != 24000
+                                )
+                            ):
+                                raise _SmartPBXSinhalaTTSLocalFailure(
+                                    "invalid_audio_metadata", DiagnosticFailureClass.TTS_EXCEPTION,
+                                )
+                            try:
+                                chunk = base64.b64decode(audio_b64, validate=True)
+                            except (binascii.Error, ValueError, TypeError):
+                                raise _SmartPBXSinhalaTTSLocalFailure(
+                                    "malformed_audio", DiagnosticFailureClass.TTS_EXCEPTION,
+                                ) from None
+                            if not chunk:
+                                continue
+
+                            data = pcm_tail + chunk
+                            if len(data) % 2:
+                                data, pcm_tail = data[:-1], data[-1:]
+                            else:
+                                pcm_tail = b""
+                            if not data:
+                                continue
+                            pcm8k, ratecv_state = audioop.ratecv(
+                                data, 2, 1, 24000, 8000, ratecv_state
+                            )
+                            mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+
+                            while len(mulaw_buf) >= 640:
+                                if not self._owns_sinhala_tts_stream(
+                                    expected_generation, audio_emitted=audio_emitted
+                                ):
+                                    cancelled = True
+                                    break
+                                frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
+                                if await self._send_media_audio(frame):
+                                    await self._flush_pre_audio_stt()
+                                    self._mark_smartpbx_turn_once("tts_first_chunk")
+                                    audio_emitted = self._mark_tts_audible(expected_generation)
+                                    if not audio_emitted:
+                                        cancelled = True
+                                        break
+                            if cancelled:
+                                break
+                    except _GeminiTTSProviderError as exc:
+                        # Retry the SAME text on the next model ONLY for a
+                        # classified quota/rate-limit hit that produced no
+                        # audio for this text yet -- never any other provider
+                        # error, and never once the guest already heard part
+                        # of this reply (a mid-utterance model/voice switch
+                        # would be its own, worse defect).
+                        if (
+                            exc.code in ("quota_exceeded", "rate_limited")
+                            and not audio_emitted
+                            and not cancelled
+                        ):
+                            _mark_smartpbx_sinhala_tts_model_exhausted(model_name)
+                            if model_index + 1 < len(available_models):
+                                next_model = available_models[model_index + 1]
+                                logger.warning(
+                                    "smartpbx_media event=sinhala_tts_model_fallback "
+                                    "from=%s to=%s reason=%s",
+                                    model_name, next_model, exc.code,
+                                )
+                                self._smartpbx_tts_model_fallbacks_total = min(
+                                    self._smartpbx_tts_model_fallbacks_total + 1, 100_000,
+                                )
+                                model_index += 1
+                                continue
+                        raise
+                    break
 
             if pcm_tail and not cancelled:
-                self._log_tts_failure("gemini", "malformed_audio")
-                self._emit_smartpbx_tts_diagnostic(
-                    DiagnosticFailureClass.TTS_EXCEPTION
-                )
+                await _fail("malformed_audio", DiagnosticFailureClass.TTS_EXCEPTION)
                 return
 
             if (
@@ -11411,32 +11823,27 @@ class MediaStreamSession:
                     sentence=sentence,
                     turn_generation=expected_generation,
                 )
+                if used_live_gemini_client:
+                    _note_smartpbx_sinhala_tts_synthesis_success()
+                    _note_smartpbx_sinhala_tts_active_model(model_name)
             elif not audio_emitted and not cancelled:
-                self._log_tts_failure("gemini", "empty_audio")
-                self._emit_smartpbx_tts_diagnostic(
-                    DiagnosticFailureClass.TTS_EXCEPTION
-                )
+                await _fail("empty_audio", DiagnosticFailureClass.TTS_EXCEPTION)
 
+        except _GeminiTTSProviderError as exc:
+            await _fail(exc.code, _diagnostic_class_for_gemini_tts_error(exc.code))
+        except _SmartPBXSinhalaTTSLocalFailure as exc:
+            await _fail(exc.outcome, exc.failure_class)
         except httpx.HTTPStatusError as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if not isinstance(status, int) or isinstance(status, bool):
                 status = None
             elif status < 100 or status > 599:
                 status = max(100, min(status, 599))
-            self._log_tts_failure("gemini", "http_status", status)
-            self._emit_smartpbx_tts_diagnostic(
-                DiagnosticFailureClass.TTS_HTTP_STATUS
-            )
+            await _fail("http_status", DiagnosticFailureClass.TTS_HTTP_STATUS, status)
         except TimeoutError:
-            self._log_tts_failure("gemini", "timeout")
-            self._emit_smartpbx_tts_diagnostic(
-                DiagnosticFailureClass.TTS_TIMEOUT
-            )
+            await _fail("timeout", DiagnosticFailureClass.TTS_TIMEOUT)
         except Exception:
-            self._log_tts_failure("gemini", "exception")
-            self._emit_smartpbx_tts_diagnostic(
-                DiagnosticFailureClass.TTS_EXCEPTION
-            )
+            await _fail("exception", DiagnosticFailureClass.TTS_EXCEPTION)
         finally:
             if self._tts_synthesis_generation == expected_generation:
                 self._tts_synthesis_in_flight = False
@@ -13375,7 +13782,12 @@ def build_service_app(
             request.headers.get(settings.auth_header_name, "")
         ):
             raise HTTPException(status_code=401)
-        return {**gateway.snapshot(), "transfer_enabled": transfer_settings.enabled}
+        return {
+            **gateway.snapshot(),
+            "transfer_enabled": transfer_settings.enabled,
+            "sinhala_tts_degraded": _smartpbx_sinhala_tts_degraded(),
+            "sinhala_tts_model": _smartpbx_sinhala_tts_active_model(),
+        }
 
     async def smartpbx_media(websocket: WebSocket) -> None:
         await gateway.handle(websocket, _new_smartpbx_session)

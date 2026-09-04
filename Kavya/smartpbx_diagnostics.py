@@ -56,6 +56,8 @@ class DiagnosticFailureClass(StrEnum):
     TTS_HTTP_STATUS = "tts_http_status"
     TTS_TIMEOUT = "tts_timeout"
     TTS_EXCEPTION = "tts_exception"
+    TTS_QUOTA = "tts_quota"
+    TTS_PROVIDER_ERROR = "tts_provider_error"
     HANDOVER_NOT_ACTIONABLE = "handover_not_actionable"
     TRANSPORT_DISCONNECT = "transport_disconnect"
     TRANSPORT_SEND = "transport_send"
@@ -97,3 +99,20 @@ class SmartPBXCloseReason(StrEnum):
     PROFILE_UNAVAILABLE = "profile_unavailable"
     SHUTDOWN = "shutdown"
     INTERNAL_ERROR = "internal_error"
+
+
+class HangupCause(StrEnum):
+    """Closed vocabulary for Dialog's optional `hangup.reason` field.
+
+    Never the raw provider string: an unrecognized reason maps to OTHER, and
+    a call that ended for a non-hangup reason (or a hangup that carried no
+    `reason` at all) carries no HangupCause -- the field is omitted, not a
+    null OTHER. Additive to `SmartPBXCloseReason`, not a replacement for it.
+    """
+
+    NORMAL_CLEARING = "normal_clearing"
+    USER_BUSY = "user_busy"
+    NO_ANSWER = "no_answer"
+    CALL_REJECTED = "call_rejected"
+    ORIGINATOR_CANCEL = "originator_cancel"
+    OTHER = "other"

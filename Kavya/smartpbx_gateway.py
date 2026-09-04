@@ -13,8 +13,8 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol
 from starlette.websockets import WebSocketDisconnect
 
 from smartpbx_diagnostics import (
-    DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage, SmartPBXCloseReason,
-    SmartPBXDiagnosticSink,
+    DiagnosticFailureClass, DiagnosticOutcome, DiagnosticStage, HangupCause,
+    SmartPBXCloseReason, SmartPBXDiagnosticSink,
 )
 from smartpbx_protocol import (
     ConnectedEvent, DtmfEvent, HangupEvent, MediaEvent, POLICY_VIOLATION,
@@ -35,6 +35,25 @@ _SESSION_INTERNAL_FAILURE_REASONS = frozenset({
     SmartPBXCloseReason.PROFILE_UNAVAILABLE.value,
     SmartPBXCloseReason.STT_FATAL.value,
 })
+# Dialog's documented spec values for the optional `hangup.reason` field.
+# Matched case-insensitively; anything else becomes HangupCause.OTHER so the
+# raw provider string never reaches a log line or a payload.
+_HANGUP_REASON_TO_CAUSE = {
+    "NORMAL_CLEARING": HangupCause.NORMAL_CLEARING,
+    "USER_BUSY": HangupCause.USER_BUSY,
+    "NO_ANSWER": HangupCause.NO_ANSWER,
+    "CALL_REJECTED": HangupCause.CALL_REJECTED,
+    "ORIGINATOR_CANCEL": HangupCause.ORIGINATOR_CANCEL,
+}
+
+
+def _classify_hangup_cause(reason: str | None) -> str | None:
+    """Bound Dialog's optional hangup `reason` to the closed HangupCause
+    vocabulary. A missing reason stays None (the field is omitted downstream,
+    never a null/"other"); any other unrecognized text becomes "other"."""
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return _HANGUP_REASON_TO_CAUSE.get(reason.strip().upper(), HangupCause.OTHER).value
 _INTEGER_SETTINGS = {
     "SMARTPBX_MAX_CALLS": ("max_calls", 4, 1, 4),
     "SMARTPBX_MAX_MESSAGE_CHARS": ("max_message_chars", 65536, 1024, 65536),
@@ -207,6 +226,7 @@ class _GatewaySession(Protocol):
         schedule_post_call: bool = False,
         close_reason: str | None = None,
         close_code: int | None = None,
+        hangup_cause: str | None = None,
     ) -> None: ...
 
 
@@ -263,6 +283,10 @@ class SmartPBXGateway:
         # recorded on the session itself.
         close_reason: str | None = None
         close_code: int | None = None
+        # Additive, closed-vocabulary detail for a `hangup` close only (see
+        # HangupCause). Every other close path leaves this None, and None
+        # means the field stays absent downstream -- never a null "other".
+        hangup_cause: str | None = None
 
         token = websocket.headers.get(self._settings.auth_header_name, "")
         if not self._settings.enabled or not self._settings.configured:
@@ -399,9 +423,27 @@ class SmartPBXGateway:
                     if feed_dtmf is not None:
                         await feed_dtmf(event.digit)
                 elif isinstance(event, HangupEvent):
-                    validate_event_context(event, context)
+                    # A hangup whose callId/otherLegCallId mismatch the start
+                    # context is treated the same as DTMF's non-fatal
+                    # mismatch above: Dialog has already told us the call is
+                    # over, so raising ProtocolViolation here only trades one
+                    # clean hangup for a 1008 close that then fails anyway
+                    # because Dialog's socket is already gone. Observe and
+                    # proceed as a normal hangup.
+                    try:
+                        validate_event_context(event, context)
+                    except ProtocolViolation as error:
+                        if error.failure_class == "context_mismatch":
+                            sink(
+                                DiagnosticStage.CONTEXT_VALIDATION,
+                                DiagnosticOutcome.OBSERVED,
+                                DiagnosticFailureClass.CONTEXT_MISMATCH,
+                            )
+                        else:
+                            raise
                     close_outcome = (1000, "call ended")
                     close_reason, close_code = "hangup", 1000
+                    hangup_cause = _classify_hangup_cause(event.reason)
                     completed_normally = True
                     break
                 elif isinstance(event, StopEvent):
@@ -467,7 +509,10 @@ class SmartPBXGateway:
         finally:
             try:
                 cleanup_task = asyncio.create_task(
-                    self._cleanup(session, transport, lease, sink, close_reason, close_code)
+                    self._cleanup(
+                        session, transport, lease, sink, close_reason, close_code,
+                        hangup_cause=hangup_cause,
+                    )
                 )
                 while not cleanup_task.done():
                     try:
@@ -633,6 +678,8 @@ class SmartPBXGateway:
         sink: SmartPBXDiagnosticSink,
         close_reason: str | None = None,
         close_code: int | None = None,
+        *,
+        hangup_cause: str | None = None,
     ) -> bool:
         degraded = False
         failures = {
@@ -657,6 +704,7 @@ class SmartPBXGateway:
                 "session",
                 None if session is None else session.finish(
                     schedule_post_call=True, close_reason=close_reason, close_code=close_code,
+                    **({"hangup_cause": hangup_cause} if hangup_cause is not None else {}),
                 ),
             ),
             ("lease", None if lease is None else lease.release()),

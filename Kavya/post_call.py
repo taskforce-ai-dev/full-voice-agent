@@ -531,6 +531,7 @@ async def process_post_call_data(
     close_code: int | None = None,
     duration_ms: int | None = None,
     barge_ins: int | None = None,
+    hangup_cause: str | None = None,
 ) -> None:
     """Orchestrate post-call processing: extract details, POST to n8n.
 
@@ -539,11 +540,13 @@ async def process_post_call_data(
     function's operational logs only; it does not change transcript retention
     or downstream payload semantics.
 
-    `close_reason`/`close_code`/`duration_ms`/`barge_ins` are optional,
-    privacy-safe (enum/count-only) fields carried from the gateway's close
-    outcome -- currently only the SmartPBX path supplies them. `guest_turns`/
-    `agent_turns` are always derived here from `full_transcript`, for every
-    caller, since they need no extra plumbing.
+    `close_reason`/`close_code`/`duration_ms`/`barge_ins`/`hangup_cause` are
+    optional, privacy-safe (enum/count-only) fields carried from the
+    gateway's close outcome -- currently only the SmartPBX path supplies
+    them. `hangup_cause` is additive and only ever set alongside
+    `close_reason="hangup"`. `guest_turns`/`agent_turns` are always derived
+    here from `full_transcript`, for every caller, since they need no extra
+    plumbing.
     """
     try:
         if privacy_safe:
@@ -605,6 +608,8 @@ async def process_post_call_data(
             payload["duration_ms"] = duration_ms
         if barge_ins is not None:
             payload["barge_ins"] = barge_ins
+        if hangup_cause is not None:
+            payload["hangup_cause"] = hangup_cause
 
         # POST to n8n
         await _post_to_n8n(payload, privacy_safe=privacy_safe)
@@ -641,6 +646,7 @@ async def process_post_call_data(
                     guest_turns=guest_turns,
                     agent_turns=agent_turns,
                     barge_ins=barge_ins,
+                    hangup_cause=hangup_cause,
                 )
             except Exception as exc:
                 if privacy_safe:
