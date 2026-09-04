@@ -172,6 +172,7 @@ async def send_call_completed(
     guest_turns: int | None = None,
     agent_turns: int | None = None,
     barge_ins: int | None = None,
+    hangup_cause: str | None = None,
 ) -> None:
     """Emit a call.completed event with full transcript + extracted summary."""
     _announce_once(privacy_safe=privacy_safe)
@@ -204,6 +205,8 @@ async def send_call_completed(
         metadata["agent_turns"] = agent_turns
     if barge_ins is not None:
         metadata["barge_ins"] = barge_ins
+    if hangup_cause is not None:
+        metadata["hangup_cause"] = hangup_cause
 
     payload = {
         "eventType": "call.completed",

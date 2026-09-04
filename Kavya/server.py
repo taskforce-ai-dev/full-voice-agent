@@ -155,7 +155,7 @@ import time
 import wave
 import xml.sax.saxutils
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from html import escape as html_escape
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 from urllib.parse import quote as url_quote
@@ -728,6 +728,25 @@ def _resolve_smartpbx_initial_filler_delay(raw: object) -> float:
     return min(max(value, 0.5), 5.0)
 
 
+def _resolve_smartpbx_sinhala_initial_filler_delay(raw: object) -> float:
+    """Direct-Sinhala-only initial filler delay, defaulting higher than English.
+
+    2026-09-04 tester feedback: Gemini's first token is typically 1.2-1.5 s
+    (3.9 s when throttled), so the shared 1.5 s English delay fired the
+    Sinhala filler on most turns even when the answer was only moments away.
+    A separate, higher default lets the Sinhala filler stay reserved for
+    genuinely slow turns; English keeps SMARTPBX_INITIAL_FILLER_DELAY_SECONDS
+    unchanged.
+    """
+    try:
+        value = float(raw) if raw not in (None, "") else 2.2
+    except (TypeError, ValueError):
+        value = 2.2
+    if not math.isfinite(value):
+        value = 2.2
+    return min(max(value, 0.5), 5.0)
+
+
 def _resolve_smartpbx_initial_response_timeout_seconds(raw: object) -> float:
     try:
         value = float(raw) if raw not in (None, "") else 8.0
@@ -791,6 +810,34 @@ SMARTPBX_SINHALA_GEMINI_MAX_TOKENS = _resolve_smartpbx_sinhala_gemini_max_tokens
 SMARTPBX_INITIAL_FILLER_DELAY_SECONDS: float = _resolve_smartpbx_initial_filler_delay(
     os.getenv("SMARTPBX_INITIAL_FILLER_DELAY_SECONDS")
 )
+SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS: float = (
+    _resolve_smartpbx_sinhala_initial_filler_delay(
+        os.getenv("SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS")
+    )
+)
+
+# Not env-tunable -- a simple, fixed per-session repeat guard, not an
+# operator knob. 2026-09-04 tester feedback: hearing the filler on
+# back-to-back turns is what read as annoying, independent of the delay that
+# gates any single turn. A turn whose configured delay is itself long
+# (> _SMARTPBX_SINHALA_FILLER_REPEAT_MIN_WAIT_SECONDS) is trusted to be
+# genuinely slow, so it always gets to speak -- silence is worse than a
+# repeat when the caller really is waiting.
+_SMARTPBX_SINHALA_FILLER_REPEAT_SUPPRESS_SECONDS: float = 15.0
+_SMARTPBX_SINHALA_FILLER_REPEAT_MIN_WAIT_SECONDS: float = 3.5
+
+
+def _smartpbx_sinhala_filler_suppressed_by_repeat(
+    last_filler_at: float | None, now: float, delay_seconds: float,
+) -> bool:
+    """True when a second Sinhala initial filler this soon would be a repeat."""
+    if last_filler_at is None:
+        return False
+    if delay_seconds > _SMARTPBX_SINHALA_FILLER_REPEAT_MIN_WAIT_SECONDS:
+        return False
+    return (now - last_filler_at) < _SMARTPBX_SINHALA_FILLER_REPEAT_SUPPRESS_SECONDS
+
+
 SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS: float = _resolve_smartpbx_initial_response_timeout_seconds(
     os.getenv("SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS")
 )
@@ -1219,11 +1266,32 @@ _TOOL_FILLER_CYCLES: dict[str, int] = {
 
 
 SMARTPBX_INITIAL_FILLER_TEXT = "Just a moment while I check that for you."
-# The direct-Sinhala counterpart. Deliberately one short, natural spoken
-# phrase rather than a rotation bank: every Sinhala filler has to be
-# pre-rendered through Gemini TTS before a call may use it, so each extra
-# variant is another synthesis the process must complete up front.
+# The direct-Sinhala counterpart. Every phrase in the bank below is
+# pre-rendered through Gemini TTS at process startup (prewarmed, see
+# SMARTPBX_SINHALA_CACHED_PHRASES), so a call only ever offers phrases whose
+# audio already exists -- the initial-filler timer never pays a live 2-5 s
+# Gemini TTS round trip.
 SMARTPBX_SINHALA_INITIAL_FILLER_TEXT = "පොඩ්ඩක් ඉන්න, මම බලන්නම්."
+# Never-silent fallback: spoken instead of dead air when a Sinhala TTS attempt
+# fails for a turn that has delivered no audio yet. Fixed and cached exactly
+# like the filler above — the whole point is that it must be playable from
+# bytes even when the live Gemini TTS call is the thing that just failed
+# (e.g. quota exhaustion), so it can never itself depend on that call working.
+SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT = (
+    "සමාවෙන්න, මට පොඩි තාක්ෂණික අපහසුතාවයක් තියෙනවා. "
+    "කරුණාකර පොඩ්ඩක් ඉන්න, නැත්නම් ටිකෙන් නැවත උත්සාහ කරන්න."
+)
+
+# 2026-09-04 tester feedback: this one fixed phrase played on nearly every
+# turn and read as repetitive/annoying. A small bank of short, warm,
+# colloquial variants, rotated per turn (no immediate repeat) via the same
+# `_CallFillerRotation` the English SmartPBX path already uses.
+SMARTPBX_SINHALA_INITIAL_FILLER_BANK: tuple[str, ...] = (
+    SMARTPBX_SINHALA_INITIAL_FILLER_TEXT,
+    "එහෙනම් ටිකක් ඉන්නකෝ.",
+    "මම බලලා කියන්නම්, ටිකක් ඉන්න.",
+    "තත්පරයක් ඉන්නකෝ.",
+)
 _SMARTPBX_CAPTURE_TOOLS = frozenset({
     "capture_spoken_number", "capture_spoken_name", "collect_number_via_keypad",
 })
@@ -1996,6 +2064,35 @@ SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS = _parse_endpointing_seconds(
     30.0,
 )
 
+# Quota-aware model fallback chain (same client, same voice): primary is the
+# existing SMARTPBX_SINHALA_GEMINI_TTS_MODEL knob above; these are tried in
+# order only after a classified quota_exceeded/rate_limited error, never for
+# any other failure. Names are validated so an operator typo cannot smuggle
+# an arbitrary string into an outbound API call; an unparseable/empty value
+# falls back to the documented default pair rather than disabling fallback.
+_SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS_DEFAULT = (
+    "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts",
+)
+_SMARTPBX_GEMINI_MODEL_NAME_PATTERN = re.compile(r"^[a-z0-9.-]+$")
+
+
+def _parse_smartpbx_sinhala_tts_fallback_models(raw: str) -> tuple[str, ...]:
+    if not isinstance(raw, str) or not raw.strip():
+        return _SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS_DEFAULT
+    candidates = (part.strip() for part in raw.split(","))
+    valid = tuple(
+        part for part in candidates
+        if part and _SMARTPBX_GEMINI_MODEL_NAME_PATTERN.fullmatch(part)
+    )
+    return valid if valid else _SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS_DEFAULT
+
+
+SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS: tuple[str, ...] = (
+    _parse_smartpbx_sinhala_tts_fallback_models(
+        os.environ.get("SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS", "")
+    )
+)
+
 # Upper bound for the only integer the post-dispatch STT telemetry emits. The
 # event records that a late provider result was ignored while a turn was already
 # dispatched; the age of that turn is useful, an unbounded number is not. Not an
@@ -2111,6 +2208,130 @@ CAPTURE_BUFFER_MAX_CHARS: int = _parse_clamped_int(
 CAPTURE_DICTATION_MIN_RATIO: float = _parse_clamped_float(
     os.environ, "CAPTURE_DICTATION_MIN_RATIO", 0.3, 0.0, 1.0
 )
+
+# How many consecutive live Gemini Sinhala TTS quota failures (across the
+# whole process, not one call) before the sticky `sinhala_tts_degraded`
+# signal latches. Env-tunable and clamped so a mis-set knob can neither
+# disable the signal (0) nor make it require an unreasonable run.
+SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER: int = _parse_clamped_int(
+    os.environ, "SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER", 3, 1, 10
+)
+
+# Process-wide (not per-call) sticky degradation signal for Gemini Sinhala TTS
+# quota exhaustion. `/smartpbx/status` reports it so an operator/uptime check
+# can see a quota problem without reading logs; it resets the moment a live
+# Gemini TTS synthesis succeeds again. Deliberately module-level: unlike the
+# per-call Gemini LLM failover counter, this must be visible to every call in
+# the process, including calls that never themselves failed.
+_smartpbx_sinhala_tts_quota_state: dict[str, Any] = {
+    "consecutive_failures": 0,
+    "degraded": False,
+    "degraded_logged": False,
+}
+
+
+def _note_smartpbx_sinhala_tts_quota_failure() -> None:
+    """Record one live Gemini Sinhala TTS quota failure; latch degradation."""
+    state = _smartpbx_sinhala_tts_quota_state
+    state["consecutive_failures"] = min(state.get("consecutive_failures", 0) + 1, 1_000_000)
+    if (
+        state["consecutive_failures"] >= SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER
+        and not state.get("degraded", False)
+    ):
+        state["degraded"] = True
+        if not state.get("degraded_logged", False):
+            logger.warning("smartpbx_media event=sinhala_tts_quota_degraded")
+            state["degraded_logged"] = True
+
+
+def _note_smartpbx_sinhala_tts_synthesis_success() -> None:
+    """A live Gemini Sinhala TTS synthesis completed: clear the streak."""
+    state = _smartpbx_sinhala_tts_quota_state
+    state["consecutive_failures"] = 0
+    state["degraded"] = False
+    state["degraded_logged"] = False
+
+
+def _smartpbx_sinhala_tts_degraded() -> bool:
+    return bool(_smartpbx_sinhala_tts_quota_state.get("degraded", False))
+
+
+# --- quota-aware Gemini Sinhala TTS model fallback chain --------------------
+#
+# Sticky per PROCESS (not per call), like the degradation signal above, but
+# tracked per model name: a model that hits quota_exceeded/rate_limited is
+# skipped for the rest of that quota day rather than retried on every turn.
+# The reset boundary is a fixed wall-clock UTC hour (the provider's quota-day
+# boundary), env-tunable so ops can correct it without a code change.
+SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR: int = _parse_clamped_int(
+    os.environ, "SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR", 7, 0, 23
+)
+
+
+def _smartpbx_utcnow() -> datetime:
+    """Indirection point so tests can inject a fixed clock."""
+    return datetime.now(timezone.utc)
+
+
+def _smartpbx_sinhala_tts_model_chain() -> tuple[str, ...]:
+    """[primary, *fallbacks], deduplicated, primary always first."""
+    chain = (SMARTPBX_SINHALA_GEMINI_TTS_MODEL, *SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS)
+    return tuple(dict.fromkeys(chain))
+
+
+_smartpbx_sinhala_tts_model_state: dict[str, Any] = {
+    "exhausted_until": {},
+    "active_model": None,
+}
+
+
+def _smartpbx_sinhala_tts_quota_reset_boundary(now: datetime) -> datetime:
+    """The next daily reset instant strictly after `now`."""
+    reset_today = now.replace(
+        hour=SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR, minute=0, second=0, microsecond=0,
+    )
+    return reset_today if now < reset_today else reset_today + timedelta(days=1)
+
+
+def _mark_smartpbx_sinhala_tts_model_exhausted(model: str, *, now: datetime | None = None) -> None:
+    now = _smartpbx_utcnow() if now is None else now
+    _smartpbx_sinhala_tts_model_state["exhausted_until"][model] = (
+        _smartpbx_sinhala_tts_quota_reset_boundary(now)
+    )
+
+
+def _smartpbx_sinhala_tts_model_is_exhausted(model: str, *, now: datetime | None = None) -> bool:
+    now = _smartpbx_utcnow() if now is None else now
+    until = _smartpbx_sinhala_tts_model_state["exhausted_until"].get(model)
+    return until is not None and now < until
+
+
+def _smartpbx_sinhala_tts_available_models(*, now: datetime | None = None) -> list[str]:
+    """The configured chain with any currently-exhausted model removed.
+
+    Order-preserving; an empty result means every configured model is
+    exhausted for today's quota window.
+    """
+    now = _smartpbx_utcnow() if now is None else now
+    return [
+        model for model in _smartpbx_sinhala_tts_model_chain()
+        if not _smartpbx_sinhala_tts_model_is_exhausted(model, now=now)
+    ]
+
+
+def _note_smartpbx_sinhala_tts_active_model(model: str) -> None:
+    _smartpbx_sinhala_tts_model_state["active_model"] = model
+
+
+def _smartpbx_sinhala_tts_active_model() -> str:
+    """The model most recently used for a successful live synthesis.
+
+    Before any call has synthesised anything in this process, this is the
+    configured primary model -- a sane, honest default for `/smartpbx/status`
+    rather than a placeholder like `None`.
+    """
+    active = _smartpbx_sinhala_tts_model_state.get("active_model")
+    return active if isinstance(active, str) and active else SMARTPBX_SINHALA_GEMINI_TTS_MODEL
 
 # ---------------------------------------------------------------------------
 # Capture-ask detection (arms capture mode BEFORE the caller answers)
@@ -2235,11 +2456,28 @@ _SI_TENS_WORDS: dict[str, int] = {
     "අනූව": 90, "අනූ": 90,
 }
 
+# 2026-09-04 tester feedback: Azure si-LK STT mis-hears English room names
+# spoken inside Sinhala speech (e.g. "Suite" -> "ස්විෆ්ට්", "Mount" ->
+# "මවුන්ට් පොඩ්ඩක්"), so the LLM could not map the transcript back to one of
+# the five Hatton Hills room types. Biasing the recognizer toward the room
+# names, their component words, and their common Sinhala transliterations
+# does not guarantee a clean transcript, but it raises the odds the correct
+# word appears somewhere in it -- the system prompt's room-name mapping hint
+# (below) is what recovers from the transcripts that still come back mangled.
+_SI_ROOM_NAME_PHRASES: tuple[str, ...] = (
+    *ROOM_TYPES_BY_PROPERTY[PROPERTY_HATTON],
+    "Suite", "Chalet", "Forest", "Eco", "Sunrise", "Vista", "Premium",
+    "Mount", "Luxe", "Monarch",
+    "ෆොරස්ට්", "එස්කේප්", "ස්වීට්", "සූට්", "එකෝ", "හාමනි", "සන්රයිස්",
+    "විස්ටා", "ප්‍රීමියම්", "මවුන්ට්", "ලක්ස්", "මොනාර්ක්", "ෂැලේ", "චලට්",
+)
+
 # Combined vocabulary -- shared by the dictation-ratio heuristic below and the
 # Azure si-LK phrase list (AzureSTTStream.start()).
 SI_STT_PHRASE_LIST: tuple[str, ...] = tuple(
     dict.fromkeys(
         list(_SI_UNIT_WORDS) + list(_SI_TEEN_WORDS) + list(_SI_TENS_WORDS)
+        + list(_SI_ROOM_NAME_PHRASES)
     )
 )
 
@@ -2650,7 +2888,10 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
         "_default": "لحظة من فضلك.",
     },
     "si": {
-        "check_availability": "\u0D87 \u0DAF\u0DD2\u0DB1\u0DC0\u0DBD \u0D87\u0DAD\u0DD2 \u0D9A\u0DCF\u0DB8\u0DBB \u0D9C\u0DD9\u0DB1 \u0DB6\u0DBD\u0DB8\u0DD2.",
+        # NOTE: the leading word here was a typo (\u0D87 "\u0D87" instead of \u0D92 "\u0D92") until
+        # 2026-09-04 tester feedback -- "\u0D87 \u0DAF\u0DD2\u0DB1\u0DC0\u0DBD" is not a real Sinhala
+        # phrase; "\u0D92 \u0DAF\u0DD2\u0DB1\u0DC0\u0DBD" ("those dates") is what was intended.
+        "check_availability": "\u0D92 \u0DAF\u0DD2\u0DB1\u0DC0\u0DBD \u0D87\u0DAD\u0DD2 \u0D9A\u0DCF\u0DB8\u0DBB \u0D9C\u0DD9\u0DB1 \u0DB6\u0DBD\u0DB8\u0DD2.",
         "create_booking": "\u0D94\u0DB6\u0DD9 \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD3\u0DBB\u0DD2\u0DB8 \u0DC3\u0D9A\u0DC3\u0DCA \u0D9A\u0DBB\u0DB8\u0DD2.",
         "retrieve_booking": "\u0D94\u0DB6\u0DD9 \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD3\u0DBB\u0DD2\u0DB8 \u0DB6\u0DBD\u0DB8\u0DD2.",
         "cancel_booking": "\u0D94\u0DB6\u0DD9 \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD3\u0DBB\u0DD2\u0DB8 \u0D85\u0DC0\u0DBD\u0D82\u0D9C\u0DD4 \u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DC3\u0D9A\u0DC3\u0DCA \u0D9A\u0DBB\u0DB8\u0DD2.",
@@ -2664,6 +2905,40 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
         "_default": "\u0BA4\u0BAF\u0BB5\u0BC1\u0B9A\u0BC6\u0BAF\u0BCD\u0BA4\u0BC1 \u0B95\u0BBE\u0BA4\u0BCD\u0BA4\u0BBF\u0BB0\u0BC1\u0B99\u0BCD\u0B95\u0BB3\u0BCD.",
     },
 }
+
+# 2026-09-04 tester feedback: the direct-Sinhala waiting message was one fixed
+# phrase that played on nearly every turn and read as repetitive/annoying.
+# These banks give each Sinhala filler slot 2-4 short, warm, colloquial
+# variants; a per-session `_CallFillerRotation` (the same mechanism the
+# English SmartPBX path already uses) rotates through them without an
+# immediate repeat. Every phrase below is fixed and operator-authored, so
+# every variant is added to `SMARTPBX_SINHALA_CACHED_PHRASES` and prewarmed
+# the same way the single phrase used to be -- no variant may ever be spoken
+# from a live Gemini TTS round trip.
+SMARTPBX_SINHALA_TOOL_FILLER_BANKS: dict[str, tuple[str, ...]] = {
+    "check_availability": (
+        MEDIA_STREAM_FILLERS["si"]["check_availability"],
+        "\u0D91\u0DC4\u0DD9\u0DB1\u0DB8\u0DCA \u0D9A\u0DCF\u0DB8\u0DBB \u0DAD\u0DD2\u0DBA\u0DD9\u0DB1\u0DC0\u0DAF \u0DB6\u0DBD\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+        "\u0DA7\u0DD2\u0D9A\u0D9A\u0DCA \u0D89\u0DB1\u0DCA\u0DB1, \u0D9A\u0DCF\u0DB8\u0DBB \u0DB6\u0DBD\u0DBD\u0DCF \u0D9A\u0DD2\u0DBA\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+    ),
+    "create_booking": (
+        MEDIA_STREAM_FILLERS["si"]["create_booking"],
+        "\u0D91\u0DC4\u0DD9\u0DB1\u0DB8\u0DCA \u0D94\u0DB6\u0DDA \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DAF\u0DD0\u0DB1\u0DCA \u0D9A\u0DBB\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+        "\u0DA7\u0DD2\u0D9A\u0D9A\u0DCA \u0D89\u0DB1\u0DCA\u0DB1, \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DC3\u0D9A\u0DC3\u0DCA \u0D9A\u0DBB\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+    ),
+    "retrieve_booking": (
+        MEDIA_STREAM_FILLERS["si"]["retrieve_booking"],
+        "\u0D91\u0DC4\u0DD9\u0DB1\u0DB8\u0DCA \u0D94\u0DB6\u0DDA \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DC4\u0DDC\u0DBA\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+    ),
+    "cancel_booking": (
+        MEDIA_STREAM_FILLERS["si"]["cancel_booking"],
+        "\u0D91\u0DC4\u0DD9\u0DB1\u0DB8\u0DCA \u0DC0\u0DD9\u0DB1\u0DCA\u0D9A\u0DD2\u0DBB\u0DD3\u0DB8 \u0DB1\u0DC0\u0DAD\u0DCA\u0DAD\u0DB1\u0DCA\u0DB1\u0DB8\u0DCA.",
+    ),
+}
+SMARTPBX_SINHALA_DEFAULT_FILLER_BANK: tuple[str, ...] = (
+    MEDIA_STREAM_FILLERS["si"]["_default"],
+    "\u0D9A\u0DBB\u0DD4\u0DAB\u0DCF\u0D9A\u0DBB \u0DA7\u0DD2\u0D9A\u0D9A\u0DCA \u0D89\u0DB1\u0DCA\u0DB1.",
+)
 
 # ---------------------------------------------------------------------------
 # Direct SmartPBX Sinhala fixed-phrase audio
@@ -2684,11 +2959,17 @@ MEDIA_STREAM_FILLERS: dict[str, dict[str, str]] = {
 # both speak English mid-Sinhala and make the phrase unrenderable in
 # advance. Two fixed phrases cover every label the tool is offered for.
 SMARTPBX_SINHALA_KEYPAD_PROMPTS: dict[str, str] = {
+    # 2026-09-04 tester feedback: the plain Sinhala word for "keypad" is not
+    # one callers commonly use/recognise. Say the English word "keypad"
+    # alongside the Sinhala phrase (which stays for anyone who prefers it),
+    # while keeping the existing hash-key instruction.
     "whatsapp": (
-        "කරුණාකර ඔබේ WhatsApp අංකය දුරකථනයේ අංක බොත්තම් වලින් ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
+        "කරුණාකර ඔබේ WhatsApp අංකය ඔබේ දුරකථනයේ keypad එකෙන් (අංක බොත්තම් "
+        "වලින්) ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
     ),
     "default": (
-        "කරුණාකර ඔබේ අංකය දුරකථනයේ අංක බොත්තම් වලින් ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
+        "කරුණාකර ඔබේ අංකය ඔබේ දුරකථනයේ keypad එකෙන් (අංක බොත්තම් වලින්) "
+        "ඇතුළත් කරන්න. ඉවර වුණාම හෑෂ් බොත්තම ඔබන්න."
     ),
 }
 
@@ -2704,12 +2985,21 @@ SMARTPBX_SINHALA_CACHED_PHRASES: tuple[str, ...] = tuple(
     dict.fromkeys(
         (
             SMARTPBX_SINHALA_INITIAL_FILLER_TEXT,
+            SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT,
+            *SMARTPBX_SINHALA_INITIAL_FILLER_BANK,
             *SMARTPBX_SINHALA_KEYPAD_PROMPTS.values(),
             *(
                 phrase
                 for phrase in MEDIA_STREAM_FILLERS.get("si", {}).values()
                 if phrase
             ),
+            *(
+                phrase
+                for bank in SMARTPBX_SINHALA_TOOL_FILLER_BANKS.values()
+                for phrase in bank
+                if phrase
+            ),
+            *(phrase for phrase in SMARTPBX_SINHALA_DEFAULT_FILLER_BANK if phrase),
         )
     )
 )
@@ -2906,6 +3196,13 @@ def _build_system_prompt(lang: str = "en") -> str:
             "results exactly while phrasing the surrounding response naturally.\n"
             "- Never expose English-only internal recovery, keypad, validation, or tool "
             "wording to the caller.\n\n"
+            "ROOM NAME HINTS: guests often say English room names inside Sinhala "
+            "speech and STT can mishear them. Likely matches: ස්විෆ්ට්/ස්වීට් = Suite "
+            "(Forest Escape Suite, Eco Harmony Suite, Sunrise Vista Premium Suite); "
+            "ෂැලේ/චලට් = Chalet (Mount Luxe Chalet, Mount Monarch Chalet); මවුන්ට් = "
+            "Mount; ෆොරස්ට් = Forest; එකෝ = Eco; සන්රයිස් = Sunrise; ලක්ස් = Luxe; "
+            "මොනාර්ක් = Monarch. If the room name is unclear, confirm it by name "
+            "instead of guessing, e.g. ask if they meant the Mount Monarch Chalet.\n\n"
         )
     elif lang == "ta":
         language_rules = (
@@ -3824,10 +4121,102 @@ def _get_gemini_tts_client():
     return _gemini_tts_client
 
 
+# Closed vocabulary for a Gemini TTS Interactions-API provider error. Never
+# widened with a message string — only these bounded codes ever reach a log
+# line or a diagnostic.
+_GEMINI_TTS_PROVIDER_ERROR_CODES = frozenset({
+    "quota_exceeded", "rate_limited", "invalid_request",
+    "permission_denied", "server_error", "unknown_provider_error",
+})
+
+
+class _GeminiTTSProviderError(Exception):
+    """The Interactions SSE stream ended with an explicit provider error.
+
+    Raised for an `error` event, or any terminal `interaction.*` event that
+    carries a non-null `.error` — never for an in-flight event without one.
+    `.code` is always one of `_GEMINI_TTS_PROVIDER_ERROR_CODES`; the SDK's
+    error message is deliberately never retained (privacy contract).
+    """
+
+    def __init__(self, code: str) -> None:
+        self.code = code if code in _GEMINI_TTS_PROVIDER_ERROR_CODES else "unknown_provider_error"
+        super().__init__(self.code)
+
+
+class _SmartPBXSinhalaTTSLocalFailure(Exception):
+    """A local (non-provider) failure inside one model attempt.
+
+    Malformed audio, unsupported metadata, an odd final PCM tail: these are
+    never evidence about quota, so they are always terminal for the call and
+    must never trigger a retry on the next model in the fallback chain.
+    """
+
+    def __init__(self, outcome: str, failure_class: "DiagnosticFailureClass") -> None:
+        self.outcome = outcome
+        self.failure_class = failure_class
+        super().__init__(outcome)
+
+
+def _classify_gemini_tts_provider_error(error: Any) -> str:
+    """Map an SDK error object's `code`/`status` to the closed outcome vocabulary.
+
+    Only the bounded code/status fields are ever inspected — never `.message`.
+    """
+    code = getattr(error, "code", None)
+    status = getattr(error, "status", None)
+    code_text = code.strip().lower() if isinstance(code, str) else ""
+    status_text = status.strip().upper() if isinstance(status, str) else ""
+
+    if "quota" in code_text:
+        return "quota_exceeded"
+    if "rate" in code_text and "limit" in code_text:
+        return "rate_limited"
+    if "invalid" in code_text:
+        return "invalid_request"
+    if "permission" in code_text or "forbidden" in code_text:
+        return "permission_denied"
+    if "server" in code_text or "internal" in code_text or "unavailable" in code_text:
+        return "server_error"
+
+    if status_text == "RESOURCE_EXHAUSTED":
+        return "rate_limited"
+    if status_text == "PERMISSION_DENIED":
+        return "permission_denied"
+    if status_text == "INVALID_ARGUMENT":
+        return "invalid_request"
+    if status_text in {"UNAVAILABLE", "INTERNAL", "UNKNOWN"}:
+        return "server_error"
+
+    return "unknown_provider_error"
+
+
+def _diagnostic_class_for_gemini_tts_error(code: str) -> "DiagnosticFailureClass":
+    """The closest DiagnosticFailureClass for a classified provider-error code."""
+    if code == "quota_exceeded":
+        return DiagnosticFailureClass.TTS_QUOTA
+    return DiagnosticFailureClass.TTS_PROVIDER_ERROR
+
+
 async def _iter_gemini_tts_audio_deltas(stream: Any) -> AsyncIterator[tuple[str, Any]]:
-    """Yield base64 audio payloads from the documented Interactions SSE shape."""
+    """Yield base64 audio payloads from the documented Interactions SSE shape.
+
+    Raises `_GeminiTTSProviderError` for an explicit `error` event or a
+    terminal `interaction.*` event carrying an `.error`, instead of silently
+    falling through to the caller's "stream ended with no audio" path.
+    """
     async for event in stream:
-        if getattr(event, "event_type", None) != "step.delta":
+        event_type = getattr(event, "event_type", None)
+        error = getattr(event, "error", None)
+        if event_type == "error":
+            raise _GeminiTTSProviderError(_classify_gemini_tts_provider_error(error))
+        if (
+            isinstance(event_type, str)
+            and event_type.startswith("interaction.")
+            and error is not None
+        ):
+            raise _GeminiTTSProviderError(_classify_gemini_tts_provider_error(error))
+        if event_type != "step.delta":
             continue
         delta = getattr(event, "delta", None)
         if getattr(delta, "type", None) != "audio":
@@ -6275,6 +6664,14 @@ class MediaStreamSession:
         self._interrupted_smartpbx_turn_ids: set[str] = set()
         self._tool_failed_smartpbx_turn_ids: set[str] = set()
         self._tts_failed_smartpbx_turn_ids: set[str] = set()
+        # At most one never-silent apology per turn.
+        self._smartpbx_apology_spoken_turn_ids: set[str] = set()
+        # Session-lifetime count of tts_failed turns, for session_summary's
+        # tts_failures field (per-turn sets above are cleared each turn).
+        self._smartpbx_tts_failures_total = 0
+        # Session-lifetime count of Gemini Sinhala TTS model fallbacks (a
+        # quota/rate-limit hit that moved to the next model in the chain).
+        self._smartpbx_tts_model_fallbacks_total = 0
         self._smartpbx_barge_ins = 0
         self._smartpbx_cadence_by_turn: dict[str, dict[str, int]] = {}
         self._smartpbx_dropped_frame_baselines: dict[str, int] = {}
@@ -6290,6 +6687,9 @@ class MediaStreamSession:
         # read into each runner and committed only by the current owner.
         self._rate_followup_eligible = False
         self._smartpbx_filler_rotation = _CallFillerRotation()
+        # Monotonic timestamp of the last direct-Sinhala initial filler that
+        # actually spoke, used only by the 15 s repeat-suppression rule below.
+        self._smartpbx_sinhala_last_filler_at: float | None = None
         self._smartpbx_initial_filler: SmartPBXInitialFillerController | None = None
         # Direct SmartPBX specialized tool fillers are session-owned. A runner
         # can return early, be cancelled, or lose a turn while one still holds
@@ -6414,6 +6814,21 @@ class MediaStreamSession:
         )
         return self._smartpbx_filler_rotation.reserve(f"tool:{tool_name}", bank)
 
+    def _reserve_smartpbx_sinhala_tool_filler(self, tool_name: str) -> _CallFillerLease:
+        """Rotate the direct-Sinhala tool filler bank (no cache-readiness gate).
+
+        Unlike the initial filler, a tool filler's `_speak()` call is allowed
+        to fall back to a live Gemini TTS round trip for an uncached phrase
+        (it already runs concurrently with the tool, not in front of it), so
+        every variant is eligible regardless of prewarm state -- prewarming
+        is still done for all of them so that fallback is never exercised
+        live in production.
+        """
+        bank = SMARTPBX_SINHALA_TOOL_FILLER_BANKS.get(
+            tool_name, SMARTPBX_SINHALA_DEFAULT_FILLER_BANK
+        )
+        return self._smartpbx_filler_rotation.reserve(f"si_tool:{tool_name}", bank)
+
     def _provider_max_tokens(self, provider: str | None = None) -> int:
         """Per-provider output budget for one direct-SmartPBX round.
 
@@ -6443,19 +6858,28 @@ class MediaStreamSession:
         ):
             return None
         # Direct English rotates a phrase bank through live ElevenLabs TTS.
-        # Direct Sinhala gets the same controller and the same delay, but only
-        # once its one phrase is pre-rendered: Gemini TTS is request/response,
-        # so a filler synthesised here would hold the shared speak lock through
-        # a 2-5 s round trip and land on top of the answer it was covering.
+        # Direct Sinhala rotates its own bank too, but only among phrases
+        # already pre-rendered: Gemini TTS is request/response, so a filler
+        # synthesised here would hold the shared speak lock through a 2-5 s
+        # round trip and land on top of the answer it was covering.
+        is_sinhala = False
+        sinhala_available: tuple[str, ...] = ()
         if self._is_direct_smartpbx_english():
-            sinhala_filler_text = None
-        elif (
-            self._is_direct_smartpbx_sinhala()
-            and _get_cached_smartpbx_sinhala_phrase_audio(
-                SMARTPBX_SINHALA_INITIAL_FILLER_TEXT
-            ) is not None
-        ):
-            sinhala_filler_text = SMARTPBX_SINHALA_INITIAL_FILLER_TEXT
+            pass
+        elif self._is_direct_smartpbx_sinhala():
+            sinhala_available = tuple(
+                text for text in SMARTPBX_SINHALA_INITIAL_FILLER_BANK
+                if _get_cached_smartpbx_sinhala_phrase_audio(text) is not None
+            )
+            if not sinhala_available:
+                return None
+            if _smartpbx_sinhala_filler_suppressed_by_repeat(
+                self._smartpbx_sinhala_last_filler_at,
+                time.monotonic(),
+                SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS,
+            ):
+                return None
+            is_sinhala = True
         else:
             return None
 
@@ -6477,6 +6901,8 @@ class MediaStreamSession:
             controller = existing
         else:
             async def speak(text: str, *, generation: int) -> None:
+                if is_sinhala:
+                    self._smartpbx_sinhala_last_filler_at = time.monotonic()
                 await self._invoke_speak(text, generation=generation)
 
             async def clear_audio() -> None:
@@ -6518,21 +6944,20 @@ class MediaStreamSession:
                     runner.speak_generation = self._speak_generation
                     self._assistant_turn_generation = self._speak_generation
 
-            # Sinhala speaks one fixed pre-rendered phrase, so it takes no
-            # lease: there is no bank to rotate and nothing to reserve.
             filler_lease = (
-                None if sinhala_filler_text is not None
+                self._smartpbx_filler_rotation.reserve("initial", sinhala_available)
+                if is_sinhala
                 else self._reserve_smartpbx_initial_filler()
             )
             controller = SmartPBXInitialFillerController(
                 speak=speak,
                 generation=generation,
-                delay_seconds=SMARTPBX_INITIAL_FILLER_DELAY_SECONDS,
-                clear_audio=clear_audio,
-                text=(
-                    sinhala_filler_text if filler_lease is None
-                    else filler_lease.text
+                delay_seconds=(
+                    SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS if is_sinhala
+                    else SMARTPBX_INITIAL_FILLER_DELAY_SECONDS
                 ),
+                clear_audio=clear_audio,
+                text=filler_lease.text,
                 lease=filler_lease,
             )
             controller.start()
@@ -6808,6 +7233,7 @@ class MediaStreamSession:
         self._interrupted_smartpbx_turn_ids.clear()
         self._tool_failed_smartpbx_turn_ids.clear()
         self._tts_failed_smartpbx_turn_ids.clear()
+        self._smartpbx_apology_spoken_turn_ids.clear()
         self._smartpbx_cadence_by_turn.clear()
         self._smartpbx_dropped_frame_baselines.clear()
         self._smartpbx_dropped_frames_by_turn.clear()
@@ -9281,6 +9707,9 @@ class MediaStreamSession:
                 outcome = "interrupted"
             elif turn_id in self._tts_failed_smartpbx_turn_ids:
                 outcome = "tts_failed"
+                self._smartpbx_tts_failures_total = min(
+                    self._smartpbx_tts_failures_total + 1, 100_000,
+                )
             elif turn_id in self._tool_failed_smartpbx_turn_ids:
                 outcome = "tool_failed"
             if telemetry is not None and turn_id is not None:
@@ -9297,6 +9726,7 @@ class MediaStreamSession:
                 self._interrupted_smartpbx_turn_ids.discard(turn_id)
                 self._tool_failed_smartpbx_turn_ids.discard(turn_id)
                 self._tts_failed_smartpbx_turn_ids.discard(turn_id)
+                self._smartpbx_apology_spoken_turn_ids.discard(turn_id)
         # Pre-arm the patient timers for the NEXT guest turn(s) when this turn
         # actually asked the caller to dictate. Runs after the turn so it sees the
         # delivered sentences and cannot be undone by the capture tool's own exit.
@@ -10217,13 +10647,17 @@ class MediaStreamSession:
                         filler_sent=smartpbx_filler_sent,
                         initial_filler=initial_filler,
                     ):
-                        filler = fillers.get(first_tool, fillers.get("_default", ""))
-                        if filler:
+                        filler_lease = self._reserve_smartpbx_sinhala_tool_filler(
+                            first_tool
+                        )
+                        if filler_lease.text:
                             tool_filler_task = self._start_smartpbx_tool_filler(
-                                filler, generation=gen,
+                                filler_lease.text, generation=gen, lease=filler_lease,
                             )
                             await asyncio.sleep(0)
                             smartpbx_filler_sent = True
+                        else:
+                            filler_lease.release()
                     else:
                         filler = fillers.get(first_tool, fillers.get("_default", ""))
                         if filler:
@@ -10953,13 +11387,17 @@ class MediaStreamSession:
                     filler_sent=smartpbx_filler_sent,
                     initial_filler=initial_filler,
                 ):
-                    filler = fillers.get(first_tool, fillers.get("_default", ""))
-                    if filler:
+                    filler_lease = self._reserve_smartpbx_sinhala_tool_filler(
+                        first_tool
+                    )
+                    if filler_lease.text:
                         tool_filler_task = self._start_smartpbx_tool_filler(
-                            filler, generation=gen,
+                            filler_lease.text, generation=gen, lease=filler_lease,
                         )
                         await asyncio.sleep(0)
                         smartpbx_filler_sent = True
+                    else:
+                        filler_lease.release()
                 else:
                     filler = fillers.get(first_tool, fillers.get("_default", ""))
                     if filler:
@@ -11219,6 +11657,98 @@ class MediaStreamSession:
                     turn_generation=generation,
                 )
 
+    def _owns_smartpbx_apology_playback(
+        self, expected_generation: int, *, audio_emitted: bool
+    ) -> bool:
+        """Ownership fence for the apology's own playback.
+
+        Deliberately independent of `_tts_synthesis_in_flight`/
+        `_tts_synthesis_generation`: those mark a live Gemini synthesis
+        attempt, which the apology can fire without (e.g. a missing API key
+        never starts one). Generation and the existing transfer/turn fence
+        are still authoritative for whether this call may put audio on the
+        wire.
+        """
+        if (
+            self._speak_generation != expected_generation
+            or not self._owns_smartpbx_tts_delivery(expected_generation)
+        ):
+            return False
+        return not audio_emitted or self._is_speaking
+
+    async def _speak_smartpbx_sinhala_apology_if_silent(
+        self, expected_generation: int, *, cancelled: bool
+    ) -> None:
+        """Guarantee the guest hears something when Sinhala TTS fails silent.
+
+        Called from within `_tts_gemini_sinhala`'s own failure handling, while
+        `_speak_lock` is already held by this task -- it must never call back
+        into `_speak`/`_invoke_tts` (the lock is not reentrant). Instead it
+        replays the pre-rendered apology clip through the identical
+        frame-by-frame send/fence/mark path the cached-phrase fast path uses.
+
+        Plays only when: this is a Direct SmartPBX Sinhala session, the turn
+        has delivered no audio at all yet (`_delivered_sentences` empty), no
+        apology has already been spoken this turn, the guest has not barged
+        in (ownership/generation still ours), and the fixed apology phrase is
+        actually cached -- an empty cache (prewarm failed) means do nothing
+        extra, exactly as the task requires.
+        """
+        if not (self.lang == "si" and self._is_smartpbx_session()):
+            return
+        if cancelled or self._speak_generation != expected_generation:
+            return
+        if self._delivered_sentences:
+            return
+        turn_id = self._current_smartpbx_turn_id()
+        if turn_id is not None and turn_id in self._smartpbx_apology_spoken_turn_ids:
+            return
+        audio = _get_cached_smartpbx_sinhala_phrase_audio(
+            SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT
+        )
+        if not audio:
+            return
+        if turn_id is not None:
+            self._smartpbx_apology_spoken_turn_ids.add(turn_id)
+
+        audio_emitted = False
+        mulaw_buf = audio
+        while len(mulaw_buf) >= _SMARTPBX_MULAW_FRAME_BYTES:
+            if not self._owns_smartpbx_apology_playback(
+                expected_generation, audio_emitted=audio_emitted
+            ):
+                return
+            frame, mulaw_buf = (
+                mulaw_buf[:_SMARTPBX_MULAW_FRAME_BYTES],
+                mulaw_buf[_SMARTPBX_MULAW_FRAME_BYTES:],
+            )
+            if await self._send_media_audio(frame):
+                await self._flush_pre_audio_stt()
+                self._mark_smartpbx_turn_once("tts_first_chunk")
+                audio_emitted = self._mark_tts_audible(expected_generation)
+                if not audio_emitted:
+                    return
+
+        if mulaw_buf and self._owns_smartpbx_apology_playback(
+            expected_generation, audio_emitted=audio_emitted
+        ):
+            mulaw_buf += b"\xff" * (_SMARTPBX_MULAW_FRAME_BYTES - len(mulaw_buf))
+            if await self._send_media_audio(mulaw_buf):
+                await self._flush_pre_audio_stt()
+                self._mark_smartpbx_turn_once("tts_first_chunk")
+                audio_emitted = self._mark_tts_audible(expected_generation)
+
+        if (
+            audio_emitted
+            and self._is_speaking
+            and self._speak_generation == expected_generation
+            and self._owns_smartpbx_tts_delivery(expected_generation)
+        ):
+            await self._send_tts_done(
+                sentence=SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT,
+                turn_generation=expected_generation,
+            )
+
     # â”€â”€ ElevenLabs TTS (Tamil) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _tts_gemini_sinhala(
@@ -11232,14 +11762,28 @@ class MediaStreamSession:
         text = text.strip()
         if not text:
             return
-        if not _has_gemini_api_key():
-            self._log_tts_failure("gemini", "missing_api_key")
-            self._emit_smartpbx_tts_diagnostic(
-                DiagnosticFailureClass.TTS_MISSING_API_KEY
-            )
-            return
 
         expected_generation = self._speak_generation
+        cancelled = False
+        audio_emitted = False
+
+        async def _fail(
+            outcome: str, failure_class: "DiagnosticFailureClass", status: int | None = None,
+        ) -> None:
+            """One choke point for every failure exit: log, diagnose, count
+            quota streaks, and offer the never-silent apology."""
+            self._log_tts_failure("gemini", outcome, status)
+            self._emit_smartpbx_tts_diagnostic(failure_class)
+            if outcome == "quota_exceeded":
+                _note_smartpbx_sinhala_tts_quota_failure()
+            await self._speak_smartpbx_sinhala_apology_if_silent(
+                expected_generation, cancelled=cancelled,
+            )
+
+        if not _has_gemini_api_key():
+            await _fail("missing_api_key", DiagnosticFailureClass.TTS_MISSING_API_KEY)
+            return
+
         if turn_generation is not None and turn_generation >= 0:
             if turn_generation != expected_generation:
                 return
@@ -11250,8 +11794,6 @@ class MediaStreamSession:
         ratecv_state = None
         pcm_tail = b""
         mulaw_buf = b""
-        audio_emitted = False
-        cancelled = False
 
         try:
             # A pre-rendered fixed phrase (initial filler, tool filler,
@@ -11261,6 +11803,9 @@ class MediaStreamSession:
             # below is the identical sequence the streamed path ends with, so
             # ownership and barge-in semantics are unchanged.
             cached_phrase_audio = _get_cached_smartpbx_sinhala_phrase_audio(text)
+            # Only a genuine live Gemini call is evidence about the quota --
+            # a cached-phrase replay never touches the API.
+            used_live_gemini_client = cached_phrase_audio is None
             if cached_phrase_audio is not None:
                 logger.info(
                     "smartpbx_media event=tts_phrase_cache_hit provider=gemini"
@@ -11288,97 +11833,134 @@ class MediaStreamSession:
                             cancelled = True
                             break
             else:
-                client = self._gemini_tts_client
-                if client is None:
-                    client = _get_gemini_tts_client()
-                    self._gemini_tts_client = client
-                stream = await client.aio.interactions.create(
-                    model=SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
-                    input=text,
-                    stream=True,
-                    response_format={"type": "audio"},
-                    generation_config={
-                        "speech_config": [{
-                            "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
-                        }],
-                    },
-                    timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
-                )
+                available_models = _smartpbx_sinhala_tts_available_models()
+                if not available_models:
+                    # Every configured model is currently marked exhausted for
+                    # today's quota window -- do not spend a round trip
+                    # discovering what the sticky state already tells us.
+                    raise _GeminiTTSProviderError("quota_exceeded")
 
-                async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
-                    if not self._owns_sinhala_tts_stream(
-                        expected_generation, audio_emitted=audio_emitted
-                    ) or (
-                        turn_generation is not None
-                        and turn_generation >= 0
-                        and turn_generation != self._speak_generation
-                    ):
-                        cancelled = True
-                        break
-                    if (
-                        (
-                            getattr(audio_delta, "mime_type", None) is not None
-                            and getattr(audio_delta, "mime_type") != "audio/l16"
-                        )
-                        or (
-                            getattr(audio_delta, "channels", None) is not None
-                            and getattr(audio_delta, "channels") != 1
-                        )
-                        or (
-                            getattr(audio_delta, "sample_rate", None) is not None
-                            and getattr(audio_delta, "sample_rate") != 24000
-                        )
-                    ):
-                        self._log_tts_failure("gemini", "invalid_audio_metadata")
-                        self._emit_smartpbx_tts_diagnostic(
-                            DiagnosticFailureClass.TTS_EXCEPTION
-                        )
-                        return
-                    try:
-                        chunk = base64.b64decode(audio_b64, validate=True)
-                    except (binascii.Error, ValueError, TypeError):
-                        self._log_tts_failure("gemini", "malformed_audio")
-                        self._emit_smartpbx_tts_diagnostic(
-                            DiagnosticFailureClass.TTS_EXCEPTION
-                        )
-                        return
-                    if not chunk:
-                        continue
-
-                    data = pcm_tail + chunk
-                    if len(data) % 2:
-                        data, pcm_tail = data[:-1], data[-1:]
-                    else:
-                        pcm_tail = b""
-                    if not data:
-                        continue
-                    pcm8k, ratecv_state = audioop.ratecv(
-                        data, 2, 1, 24000, 8000, ratecv_state
+                model_index = 0
+                model_name = available_models[0]
+                while True:
+                    model_name = available_models[model_index]
+                    client = self._gemini_tts_client
+                    if client is None:
+                        client = _get_gemini_tts_client()
+                        self._gemini_tts_client = client
+                    stream = await client.aio.interactions.create(
+                        model=model_name,
+                        input=text,
+                        stream=True,
+                        response_format={"type": "audio"},
+                        generation_config={
+                            "speech_config": [{
+                                "voice": SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
+                            }],
+                        },
+                        timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
                     )
-                    mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+                    # Every model attempt resynthesises the whole phrase from
+                    # scratch -- fresh decode/resample state, never a resume.
+                    ratecv_state = None
+                    pcm_tail = b""
+                    mulaw_buf = b""
 
-                    while len(mulaw_buf) >= 640:
-                        if not self._owns_sinhala_tts_stream(
-                            expected_generation, audio_emitted=audio_emitted
-                        ):
-                            cancelled = True
-                            break
-                        frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
-                        if await self._send_media_audio(frame):
-                            await self._flush_pre_audio_stt()
-                            self._mark_smartpbx_turn_once("tts_first_chunk")
-                            audio_emitted = self._mark_tts_audible(expected_generation)
-                            if not audio_emitted:
+                    try:
+                        async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
+                            if not self._owns_sinhala_tts_stream(
+                                expected_generation, audio_emitted=audio_emitted
+                            ) or (
+                                turn_generation is not None
+                                and turn_generation >= 0
+                                and turn_generation != self._speak_generation
+                            ):
                                 cancelled = True
                                 break
-                    if cancelled:
-                        break
+                            if (
+                                (
+                                    getattr(audio_delta, "mime_type", None) is not None
+                                    and getattr(audio_delta, "mime_type") != "audio/l16"
+                                )
+                                or (
+                                    getattr(audio_delta, "channels", None) is not None
+                                    and getattr(audio_delta, "channels") != 1
+                                )
+                                or (
+                                    getattr(audio_delta, "sample_rate", None) is not None
+                                    and getattr(audio_delta, "sample_rate") != 24000
+                                )
+                            ):
+                                raise _SmartPBXSinhalaTTSLocalFailure(
+                                    "invalid_audio_metadata", DiagnosticFailureClass.TTS_EXCEPTION,
+                                )
+                            try:
+                                chunk = base64.b64decode(audio_b64, validate=True)
+                            except (binascii.Error, ValueError, TypeError):
+                                raise _SmartPBXSinhalaTTSLocalFailure(
+                                    "malformed_audio", DiagnosticFailureClass.TTS_EXCEPTION,
+                                ) from None
+                            if not chunk:
+                                continue
+
+                            data = pcm_tail + chunk
+                            if len(data) % 2:
+                                data, pcm_tail = data[:-1], data[-1:]
+                            else:
+                                pcm_tail = b""
+                            if not data:
+                                continue
+                            pcm8k, ratecv_state = audioop.ratecv(
+                                data, 2, 1, 24000, 8000, ratecv_state
+                            )
+                            mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+
+                            while len(mulaw_buf) >= 640:
+                                if not self._owns_sinhala_tts_stream(
+                                    expected_generation, audio_emitted=audio_emitted
+                                ):
+                                    cancelled = True
+                                    break
+                                frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
+                                if await self._send_media_audio(frame):
+                                    await self._flush_pre_audio_stt()
+                                    self._mark_smartpbx_turn_once("tts_first_chunk")
+                                    audio_emitted = self._mark_tts_audible(expected_generation)
+                                    if not audio_emitted:
+                                        cancelled = True
+                                        break
+                            if cancelled:
+                                break
+                    except _GeminiTTSProviderError as exc:
+                        # Retry the SAME text on the next model ONLY for a
+                        # classified quota/rate-limit hit that produced no
+                        # audio for this text yet -- never any other provider
+                        # error, and never once the guest already heard part
+                        # of this reply (a mid-utterance model/voice switch
+                        # would be its own, worse defect).
+                        if (
+                            exc.code in ("quota_exceeded", "rate_limited")
+                            and not audio_emitted
+                            and not cancelled
+                        ):
+                            _mark_smartpbx_sinhala_tts_model_exhausted(model_name)
+                            if model_index + 1 < len(available_models):
+                                next_model = available_models[model_index + 1]
+                                logger.warning(
+                                    "smartpbx_media event=sinhala_tts_model_fallback "
+                                    "from=%s to=%s reason=%s",
+                                    model_name, next_model, exc.code,
+                                )
+                                self._smartpbx_tts_model_fallbacks_total = min(
+                                    self._smartpbx_tts_model_fallbacks_total + 1, 100_000,
+                                )
+                                model_index += 1
+                                continue
+                        raise
+                    break
 
             if pcm_tail and not cancelled:
-                self._log_tts_failure("gemini", "malformed_audio")
-                self._emit_smartpbx_tts_diagnostic(
-                    DiagnosticFailureClass.TTS_EXCEPTION
-                )
+                await _fail("malformed_audio", DiagnosticFailureClass.TTS_EXCEPTION)
                 return
 
             if (
@@ -11411,32 +11993,27 @@ class MediaStreamSession:
                     sentence=sentence,
                     turn_generation=expected_generation,
                 )
+                if used_live_gemini_client:
+                    _note_smartpbx_sinhala_tts_synthesis_success()
+                    _note_smartpbx_sinhala_tts_active_model(model_name)
             elif not audio_emitted and not cancelled:
-                self._log_tts_failure("gemini", "empty_audio")
-                self._emit_smartpbx_tts_diagnostic(
-                    DiagnosticFailureClass.TTS_EXCEPTION
-                )
+                await _fail("empty_audio", DiagnosticFailureClass.TTS_EXCEPTION)
 
+        except _GeminiTTSProviderError as exc:
+            await _fail(exc.code, _diagnostic_class_for_gemini_tts_error(exc.code))
+        except _SmartPBXSinhalaTTSLocalFailure as exc:
+            await _fail(exc.outcome, exc.failure_class)
         except httpx.HTTPStatusError as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if not isinstance(status, int) or isinstance(status, bool):
                 status = None
             elif status < 100 or status > 599:
                 status = max(100, min(status, 599))
-            self._log_tts_failure("gemini", "http_status", status)
-            self._emit_smartpbx_tts_diagnostic(
-                DiagnosticFailureClass.TTS_HTTP_STATUS
-            )
+            await _fail("http_status", DiagnosticFailureClass.TTS_HTTP_STATUS, status)
         except TimeoutError:
-            self._log_tts_failure("gemini", "timeout")
-            self._emit_smartpbx_tts_diagnostic(
-                DiagnosticFailureClass.TTS_TIMEOUT
-            )
+            await _fail("timeout", DiagnosticFailureClass.TTS_TIMEOUT)
         except Exception:
-            self._log_tts_failure("gemini", "exception")
-            self._emit_smartpbx_tts_diagnostic(
-                DiagnosticFailureClass.TTS_EXCEPTION
-            )
+            await _fail("exception", DiagnosticFailureClass.TTS_EXCEPTION)
         finally:
             if self._tts_synthesis_generation == expected_generation:
                 self._tts_synthesis_in_flight = False
@@ -13375,7 +13952,12 @@ def build_service_app(
             request.headers.get(settings.auth_header_name, "")
         ):
             raise HTTPException(status_code=401)
-        return {**gateway.snapshot(), "transfer_enabled": transfer_settings.enabled}
+        return {
+            **gateway.snapshot(),
+            "transfer_enabled": transfer_settings.enabled,
+            "sinhala_tts_degraded": _smartpbx_sinhala_tts_degraded(),
+            "sinhala_tts_model": _smartpbx_sinhala_tts_active_model(),
+        }
 
     async def smartpbx_media(websocket: WebSocket) -> None:
         await gateway.handle(websocket, _new_smartpbx_session)
