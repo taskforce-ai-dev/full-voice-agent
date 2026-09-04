@@ -4012,7 +4012,7 @@ def test_sinhala_tts_canary_runbook_is_server_side_and_reversible():
         "server-side only",
         "never appears in status responses or logs",
         "production canary selects rime",
-        "sets SMARTPBX_SINHALA_TTS_PROVIDER back to gemini",
+        "set SMARTPBX_SINHALA_TTS_PROVIDER back to gemini",
         "existing guarded recreate procedure",
     ):
         assert required.casefold() in normalized
