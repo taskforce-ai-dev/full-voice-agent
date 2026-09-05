@@ -2101,6 +2101,9 @@ _RIME_ARCANA_TTS_OUTCOMES = frozenset({
     "success", "missing_api_key", "timeout", "http_status", "transport_error",
     "empty_audio", "response_too_large",
 })
+_rime_arcana_emit_success: ContextVar[bool] = ContextVar(
+    "rime_arcana_emit_success", default=True,
+)
 
 
 class _RimeArcanaTTSFailure(Exception):
@@ -2238,13 +2241,14 @@ async def _stream_rime_arcana_mulaw(text: str) -> AsyncIterator[bytes]:
         failure = _RimeArcanaTTSFailure("transport_error")
         _log_rime_arcana_tts_outcome(failure.outcome)
         raise failure from None
-    _log_rime_arcana_tts_outcome(
-        "success",
-        first_chunk_ms=first_chunk_ms,
-        total_ms=int((time.monotonic() - stream_started) * 1000),
-        chunk_count=chunk_count,
-        audio_bytes=audio_bytes,
-    )
+    if _rime_arcana_emit_success.get():
+        _log_rime_arcana_tts_outcome(
+            "success",
+            first_chunk_ms=first_chunk_ms,
+            total_ms=int((time.monotonic() - stream_started) * 1000),
+            chunk_count=chunk_count,
+            audio_bytes=audio_bytes,
+        )
 
 # Quota-aware model fallback chain (same client, same voice): primary is the
 # existing SMARTPBX_SINHALA_GEMINI_TTS_MODEL knob above; these are tried in
@@ -12433,12 +12437,21 @@ class MediaStreamSession:
         cancelled = False
         audio_emitted = False
         failure: _RimeArcanaTTSFailure | None = None
+        stream_started = time.monotonic()
+        first_chunk_ms: int | None = None
+        stream_chunk_count = 0
+        stream_audio_bytes = 0
+        rime_success_token = _rime_arcana_emit_success.set(False)
         self._tts_synthesis_in_flight = True
         self._tts_synthesis_generation = expected_generation
         self._mark_smartpbx_turn_once("tts_request")
         try:
             async with contextlib.aclosing(_stream_rime_arcana_mulaw(text)) as provider_stream:
                 async for provider_chunk in provider_stream:
+                    stream_chunk_count += 1
+                    stream_audio_bytes += len(provider_chunk)
+                    if first_chunk_ms is None:
+                        first_chunk_ms = int((time.monotonic() - stream_started) * 1000)
                     if not self._owns_sinhala_tts_stream(
                         expected_generation, audio_emitted=audio_emitted
                     ):
@@ -12476,7 +12489,7 @@ class MediaStreamSession:
                     ):
                         cancelled = True
                         break
-            if not audio_emitted and not cancelled:
+            if not audio_emitted and not cancelled and failure is None:
                 failure = _RimeArcanaTTSFailure("empty_audio")
             elif (
                 audio_emitted
@@ -12485,9 +12498,26 @@ class MediaStreamSession:
                 and self._speak_generation == expected_generation
                 and self._owns_smartpbx_tts_delivery(expected_generation)
             ):
-                await self._send_tts_done(
-                    sentence=sentence, turn_generation=expected_generation,
-                )
+                try:
+                    delivered = await self._send_tts_done(
+                        sentence=sentence, turn_generation=expected_generation,
+                    )
+                except Exception:
+                    self._log_tts_failure("rime", "transport_error")
+                    _log_rime_arcana_tts_outcome("transport_error")
+                    self._is_speaking = False
+                    cancelled = True
+                else:
+                    if delivered:
+                        _log_rime_arcana_tts_outcome(
+                            "success",
+                            first_chunk_ms=first_chunk_ms,
+                            total_ms=int((time.monotonic() - stream_started) * 1000),
+                            chunk_count=stream_chunk_count,
+                            audio_bytes=stream_audio_bytes,
+                        )
+                    else:
+                        cancelled = True
         except asyncio.CancelledError:
             cancelled = True
             raise
@@ -12505,6 +12535,7 @@ class MediaStreamSession:
             else:
                 failure = _RimeArcanaTTSFailure("transport_error")
         finally:
+            _rime_arcana_emit_success.reset(rime_success_token)
             if self._tts_synthesis_generation == expected_generation:
                 self._tts_synthesis_in_flight = False
                 self._tts_synthesis_generation = None

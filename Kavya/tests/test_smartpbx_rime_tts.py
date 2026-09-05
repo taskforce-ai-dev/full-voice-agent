@@ -38,6 +38,16 @@ class RejectSecondTransport(FakeTransport):
         await super().send_audio(audio)
 
 
+class RejectTtsDoneTransport(FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mark_attempts = 0
+
+    async def send_mark(self, name: str) -> None:
+        self.mark_attempts += 1
+        raise RuntimeError("transport rejected tts completion mark")
+
+
 class FakeRimeResponse:
     status_code = 200
 
@@ -374,6 +384,86 @@ async def test_false_rime_transport_rejection_logs_once_and_closes_provider(
         if "event=rime_tts" in record.getMessage()
     ] == [
         "smartpbx_media event=rime_tts provider=rime outcome=transport_error",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pre_audio_rime_transport_failure_keeps_its_classification(monkeypatch):
+    import server
+
+    pipeline, _transport = make_direct_sinhala(server)
+    gemini_calls: list[str] = []
+    created_outcomes: list[str] = []
+    original_failure = server._RimeArcanaTTSFailure
+
+    class RecordingRimeFailure(original_failure):
+        def __init__(self, outcome: str, status: int | None = None) -> None:
+            created_outcomes.append(outcome)
+            super().__init__(outcome, status)
+
+    async def reject_audio(_audio: bytes) -> bool:
+        return False
+
+    async def stream(_text: str, **_kwargs):
+        yield b"not-accepted"
+
+    async def gemini(text: str, **_kwargs):
+        gemini_calls.append(text)
+
+    monkeypatch.setattr(server, "_RimeArcanaTTSFailure", RecordingRimeFailure)
+    monkeypatch.setattr(server, "_stream_rime_arcana_mulaw", stream)
+    monkeypatch.setattr(pipeline, "_send_media_audio", reject_audio)
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", gemini)
+
+    await pipeline._tts_rime_sinhala("සිංහල")
+
+    assert created_outcomes == ["transport_error"]
+    assert gemini_calls == ["සිංහල"]
+
+
+@pytest.mark.asyncio
+async def test_final_rime_tts_mark_failure_logs_once_without_provider_success(
+    monkeypatch, caplog,
+):
+    import server
+
+    transport = RejectTtsDoneTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="si", media_transport=transport, llm_provider="gemini",
+    )
+    pipeline._smartpbx_transfer_context = object()
+    response = FakeRimeResponse([b"accepted"])
+    client = FakeRimeClient(response)
+    gemini_calls: list[str] = []
+
+    async def gemini(text: str, **_kwargs):
+        gemini_calls.append(text)
+
+    monkeypatch.setattr(server, "RIME_API_KEY", "test-rime-key")
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", gemini)
+    caplog.set_level(logging.INFO)
+
+    await pipeline._tts_rime_sinhala("සිංහල", sentence="සිංහල")
+
+    assert response.yielded == 1
+    assert client.http_stream.closed is True
+    assert transport.audio == [b"accepted"]
+    assert transport.mark_attempts == 1
+    assert transport.marks == []
+    assert pipeline._is_speaking is False
+    assert gemini_calls == []
+    assert [
+        record.getMessage() for record in caplog.records
+        if "event=rime_tts" in record.getMessage()
+    ] == [
+        "smartpbx_media event=rime_tts provider=rime outcome=transport_error",
+    ]
+    assert [
+        record.getMessage() for record in caplog.records
+        if "event=tts_failure" in record.getMessage()
+    ] == [
+        "smartpbx_media event=tts_failure provider=rime outcome=transport_error",
     ]
 
 
