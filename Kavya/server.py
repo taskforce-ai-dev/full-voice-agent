@@ -1879,6 +1879,20 @@ def _parse_endpointing_seconds(
     return min(max(value, minimum), maximum)
 
 
+def _parse_sinhala_azure_segmentation_silence_ms(environ) -> int:
+    """Read the optional Sinhala Azure segmentation timeout in milliseconds."""
+    raw = environ.get("SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS", "")
+    if not isinstance(raw, str) or not raw.strip():
+        return 0
+    try:
+        value = int(raw.strip(), 10)
+    except (TypeError, ValueError):
+        return 0
+    if value == 0:
+        return 0
+    return min(max(value, 100), 5000)
+
+
 def _parse_clamped_float(
     environ, name: str, default: float, minimum: float, maximum: float
 ) -> float:
@@ -2058,6 +2072,9 @@ CAPTURE_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
 CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS", 0.35, 0.1, 1.0
 )
+SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS: int = (
+    _parse_sinhala_azure_segmentation_silence_ms(os.environ)
+)
 SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS = _parse_endpointing_seconds(
     os.environ,
     "SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS",
@@ -2099,8 +2116,11 @@ _RIME_ARCANA_TTS_URL = "https://users.rime.ai/v1/rime-tts"
 _RIME_ARCANA_TTS_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 _RIME_ARCANA_TTS_OUTCOMES = frozenset({
     "success", "missing_api_key", "timeout", "http_status", "transport_error",
-    "empty_audio", "response_too_large", "decode_failure",
+    "empty_audio", "response_too_large",
 })
+_rime_arcana_emit_success: ContextVar[bool] = ContextVar(
+    "rime_arcana_emit_success", default=True,
+)
 
 
 class _RimeArcanaTTSFailure(Exception):
@@ -2121,7 +2141,7 @@ def _rime_arcana_request_payload(text: str) -> dict[str, Any]:
         "lang": "si",
         "max_tokens": 1200,
         "repetition_penalty": 1.6,
-        "samplingRate": 24000,
+        "samplingRate": 8000,
         "speedAlpha": 1,
         "temperature": 0.5,
         "top_p": 1,
@@ -2129,7 +2149,13 @@ def _rime_arcana_request_payload(text: str) -> dict[str, Any]:
 
 
 def _log_rime_arcana_tts_outcome(
-    outcome: str, *, status: int | None = None, audio_bytes: int | None = None,
+    outcome: str,
+    *,
+    status: int | None = None,
+    first_chunk_ms: int | None = None,
+    total_ms: int | None = None,
+    chunk_count: int | None = None,
+    audio_bytes: int | None = None,
 ) -> None:
     """Emit bounded Rime canary telemetry; never include caller text or secrets."""
     safe_outcome = outcome if outcome in _RIME_ARCANA_TTS_OUTCOMES else "transport_error"
@@ -2138,20 +2164,27 @@ def _log_rime_arcana_tts_outcome(
         if isinstance(status, int) and not isinstance(status, bool)
         else None
     )
-    safe_audio_bytes = (
-        min(max(audio_bytes, 0), _RIME_ARCANA_TTS_MAX_RESPONSE_BYTES)
-        if isinstance(audio_bytes, int) and not isinstance(audio_bytes, bool)
-        else 0
-    )
-    if safe_status is not None:
+    def _bounded_metric(value: int | None, maximum: int) -> int:
+        return (
+            min(max(value, 0), maximum)
+            if isinstance(value, int) and not isinstance(value, bool)
+            else 0
+        )
+
+    if safe_outcome == "http_status" and safe_status is not None:
         logger.warning(
             "smartpbx_media event=rime_tts provider=rime outcome=%s status=%d",
             safe_outcome, safe_status,
         )
-    elif audio_bytes is not None:
+    elif safe_outcome == "success":
         logger.info(
-            "smartpbx_media event=rime_tts provider=rime outcome=%s audio_bytes=%d",
-            safe_outcome, safe_audio_bytes,
+            "smartpbx_media event=rime_tts provider=rime outcome=%s "
+            "first_chunk_ms=%d total_ms=%d chunk_count=%d audio_bytes=%d",
+            safe_outcome,
+            _bounded_metric(first_chunk_ms, _SMARTPBX_TELEMETRY_MAX_MS),
+            _bounded_metric(total_ms, _SMARTPBX_TELEMETRY_MAX_MS),
+            _bounded_metric(chunk_count, 100_000),
+            _bounded_metric(audio_bytes, _RIME_ARCANA_TTS_MAX_RESPONSE_BYTES),
         )
     else:
         logger.warning(
@@ -2159,15 +2192,21 @@ def _log_rime_arcana_tts_outcome(
         )
 
 
-async def _request_rime_arcana_mp3(text: str) -> bytes:
-    """Fetch a bounded Rime MP3 response without retaining provider messages."""
+async def _stream_rime_arcana_mulaw(text: str) -> AsyncIterator[bytes]:
+    """Yield bounded Rime Arcana PCMU bytes as the provider produces them."""
     if not RIME_API_KEY.strip():
-        raise _RimeArcanaTTSFailure("missing_api_key")
+        failure = _RimeArcanaTTSFailure("missing_api_key")
+        _log_rime_arcana_tts_outcome(failure.outcome)
+        raise failure
     headers = {
-        "Accept": "audio/mp3",
+        "Accept": "audio/PCMU",
         "Authorization": f"Bearer {RIME_API_KEY.strip()}",
         "Content-Type": "application/json",
     }
+    stream_started = time.monotonic()
+    first_chunk_ms: int | None = None
+    chunk_count = 0
+    audio_bytes = 0
     try:
         async with httpx.AsyncClient() as http:
             async with http.stream(
@@ -2181,54 +2220,52 @@ async def _request_rime_arcana_mp3(text: str) -> bytes:
                     response.raise_for_status()
                 except httpx.HTTPStatusError:
                     raise _RimeArcanaTTSFailure("http_status", response.status_code) from None
-                chunks: list[bytes] = []
-                total = 0
+                response_headers = getattr(response, "headers", None)
+                if response_headers is None:
+                    raise _RimeArcanaTTSFailure("transport_error")
+                content_type = response_headers.get("content-type", "")
+                media_type = content_type.split(";", 1)[0].strip().lower()
+                if media_type not in {"audio/pcmu", "audio/basic"}:
+                    raise _RimeArcanaTTSFailure("transport_error")
                 async for chunk in response.aiter_bytes():
-                    total += len(chunk)
-                    if total > _RIME_ARCANA_TTS_MAX_RESPONSE_BYTES:
+                    if not chunk:
+                        continue
+                    audio_bytes += len(chunk)
+                    if audio_bytes > _RIME_ARCANA_TTS_MAX_RESPONSE_BYTES:
                         raise _RimeArcanaTTSFailure("response_too_large")
-                    chunks.append(chunk)
-    except _RimeArcanaTTSFailure:
+                    chunk_count += 1
+                    if first_chunk_ms is None:
+                        first_chunk_ms = int((time.monotonic() - stream_started) * 1000)
+                    yield chunk
+        if not audio_bytes:
+            raise _RimeArcanaTTSFailure("empty_audio")
+    except _RimeArcanaTTSFailure as failure:
+        _log_rime_arcana_tts_outcome(
+            failure.outcome, status=failure.status,
+        )
+        raise
+    except asyncio.CancelledError:
         raise
     except httpx.TimeoutException:
-        raise _RimeArcanaTTSFailure("timeout") from None
+        failure = _RimeArcanaTTSFailure("timeout")
+        _log_rime_arcana_tts_outcome(failure.outcome)
+        raise failure from None
     except httpx.HTTPError:
-        raise _RimeArcanaTTSFailure("transport_error") from None
-    audio = b"".join(chunks)
-    if not audio:
-        raise _RimeArcanaTTSFailure("empty_audio")
-    return audio
-
-
-async def _decode_rime_arcana_mp3_to_mulaw(audio: bytes) -> bytes:
-    """Decode Rime MP3 to the existing SmartPBX 8 kHz mono mu-law wire format."""
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-            "-ac", "1", "-ar", "8000", "-f", "mulaw", "pipe:1",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+        failure = _RimeArcanaTTSFailure("transport_error")
+        _log_rime_arcana_tts_outcome(failure.outcome)
+        raise failure from None
+    except Exception:
+        failure = _RimeArcanaTTSFailure("transport_error")
+        _log_rime_arcana_tts_outcome(failure.outcome)
+        raise failure from None
+    if _rime_arcana_emit_success.get():
+        _log_rime_arcana_tts_outcome(
+            "success",
+            first_chunk_ms=first_chunk_ms,
+            total_ms=int((time.monotonic() - stream_started) * 1000),
+            chunk_count=chunk_count,
+            audio_bytes=audio_bytes,
         )
-    except (FileNotFoundError, OSError):
-        raise _RimeArcanaTTSFailure("decode_failure") from None
-    try:
-        output, _ = await asyncio.wait_for(
-            process.communicate(audio), timeout=SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS,
-        )
-    except asyncio.CancelledError:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
-        await process.wait()
-        raise
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
-        await process.wait()
-        raise _RimeArcanaTTSFailure("timeout") from None
-    if process.returncode != 0 or not output:
-        raise _RimeArcanaTTSFailure("decode_failure")
-    return output
 
 # Quota-aware model fallback chain (same client, same voice): primary is the
 # existing SMARTPBX_SINHALA_GEMINI_TTS_MODEL knob above; these are tried in
@@ -6781,11 +6818,15 @@ class AzureSTTStream:
         on_interim_result: Any = None,
         lang: str = "si",
         privacy_safe: bool = False,
+        *,
+        direct_smartpbx_sinhala: bool = False,
     ):
         self._on_final = on_final_result
         self._on_interim = on_interim_result
         self._lang = lang
         self._privacy_safe = privacy_safe
+        self._direct_smartpbx_sinhala = direct_smartpbx_sinhala
+        self._segmentation_diagnostic_emitted = False
         self._chunk_count = 0
         self._running = False
         self._push_stream = None
@@ -6811,12 +6852,29 @@ class AzureSTTStream:
             subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION,
         )
         speech_config.speech_recognition_language = primary
-        # FOLLOW-UP (not applied here): Azure's own segmentation silence
-        # (PropertyId.Speech_SegmentationSilenceTimeoutMs, ~500ms default) is the
-        # ~549ms measured interim→final gap before our grace even starts. Lowering
-        # it would cut more latency, but it changes recognition segmentation and
-        # cannot be verified without live Azure, so it is left for a measured,
-        # separately-tested change rather than forced blind.
+        segmentation_silence_ms = SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS
+        if (
+            self._direct_smartpbx_sinhala
+            and self._lang == "si"
+            and segmentation_silence_ms
+        ):
+            speech_config.set_property(
+                azure_speech.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+                str(segmentation_silence_ms),
+            )
+        if (
+            self._direct_smartpbx_sinhala
+            and self._lang == "si"
+            and segmentation_silence_ms
+            and not self._segmentation_diagnostic_emitted
+        ):
+            logger.info(
+                "smartpbx_media event=stt_provider_start segmentation=%s "
+                "segmentation_silence_ms=%d",
+                "enabled",
+                segmentation_silence_ms,
+            )
+            self._segmentation_diagnostic_emitted = True
         # 8 kHz / 16-bit / mono PCM — what mulaw decodes to.
         fmt = azure_speech.audio.AudioStreamFormat(
             samples_per_second=8000, bits_per_sample=16, channels=1,
@@ -6950,6 +7008,7 @@ def _make_stt(
     *,
     provider: str | None = None,
     fail_closed: bool = False,
+    direct_smartpbx_sinhala: bool = False,
 ):
     """Build the configured STT backend. STT_PROVIDER: 'google' (default) | 'azure'.
 
@@ -6972,7 +7031,13 @@ def _make_stt(
             )
         )
         if azure_ready:
-            return AzureSTTStream(on_final_result, on_interim_result, lang, privacy_safe)
+            return AzureSTTStream(
+                on_final_result,
+                on_interim_result,
+                lang,
+                privacy_safe,
+                direct_smartpbx_sinhala=direct_smartpbx_sinhala,
+            )
         if fail_closed:
             raise RuntimeError("requested STT provider unavailable")
         logger.error("STT_PROVIDER=azure but Azure STT unavailable — falling back to Google")
@@ -12417,36 +12482,59 @@ class MediaStreamSession:
         cancelled = False
         audio_emitted = False
         failure: _RimeArcanaTTSFailure | None = None
+        stream_started = time.monotonic()
+        first_chunk_ms: int | None = None
+        stream_chunk_count = 0
+        stream_audio_bytes = 0
+        rime_success_token = _rime_arcana_emit_success.set(False)
         self._tts_synthesis_in_flight = True
         self._tts_synthesis_generation = expected_generation
         self._mark_smartpbx_turn_once("tts_request")
         try:
-            mp3_audio = await _request_rime_arcana_mp3(text)
-            mulaw_audio = await _decode_rime_arcana_mp3_to_mulaw(mp3_audio)
-            if not self._owns_sinhala_tts_stream(
-                expected_generation, audio_emitted=audio_emitted
-            ):
-                cancelled = True
-            while mulaw_audio and not cancelled:
-                if not self._owns_sinhala_tts_stream(
-                    expected_generation, audio_emitted=audio_emitted
-                ):
-                    cancelled = True
-                    break
-                frame, mulaw_audio = (
-                    mulaw_audio[:_SMARTPBX_MULAW_FRAME_BYTES],
-                    mulaw_audio[_SMARTPBX_MULAW_FRAME_BYTES:],
-                )
-                if len(frame) < _SMARTPBX_MULAW_FRAME_BYTES:
-                    frame += b"\xff" * (_SMARTPBX_MULAW_FRAME_BYTES - len(frame))
-                if await self._send_media_audio(frame):
-                    await self._flush_pre_audio_stt()
+            async with contextlib.aclosing(_stream_rime_arcana_mulaw(text)) as provider_stream:
+                async for provider_chunk in provider_stream:
+                    stream_chunk_count += 1
+                    stream_audio_bytes += len(provider_chunk)
+                    if first_chunk_ms is None:
+                        first_chunk_ms = int((time.monotonic() - stream_started) * 1000)
+                    if not self._owns_sinhala_tts_stream(
+                        expected_generation, audio_emitted=audio_emitted
+                    ):
+                        cancelled = True
+                        break
+                    try:
+                        accepted = await self._send_media_audio(provider_chunk)
+                    except Exception:
+                        _log_rime_arcana_tts_outcome("transport_error")
+                        if audio_emitted:
+                            cancelled = True
+                        else:
+                            failure = _RimeArcanaTTSFailure("transport_error")
+                        break
+                    if not self._owns_sinhala_tts_stream(
+                        expected_generation, audio_emitted=audio_emitted
+                    ):
+                        cancelled = True
+                        break
+                    if not accepted:
+                        _log_rime_arcana_tts_outcome("transport_error")
+                        if audio_emitted:
+                            cancelled = True
+                        else:
+                            failure = _RimeArcanaTTSFailure("transport_error")
+                        break
                     self._mark_smartpbx_turn_once("tts_first_chunk")
                     audio_emitted = self._mark_tts_audible(expected_generation)
                     if not audio_emitted:
                         cancelled = True
                         break
-            if not audio_emitted and not cancelled:
+                    await self._flush_pre_audio_stt()
+                    if not self._owns_sinhala_tts_stream(
+                        expected_generation, audio_emitted=audio_emitted
+                    ):
+                        cancelled = True
+                        break
+            if not audio_emitted and not cancelled and failure is None:
                 failure = _RimeArcanaTTSFailure("empty_audio")
             elif (
                 audio_emitted
@@ -12455,27 +12543,44 @@ class MediaStreamSession:
                 and self._speak_generation == expected_generation
                 and self._owns_smartpbx_tts_delivery(expected_generation)
             ):
-                delivered = await self._send_tts_done(
-                    sentence=sentence, turn_generation=expected_generation,
-                )
-                if delivered:
-                    _log_rime_arcana_tts_outcome("success", audio_bytes=len(mp3_audio))
+                try:
+                    delivered = await self._send_tts_done(
+                        sentence=sentence, turn_generation=expected_generation,
+                    )
+                except Exception:
+                    self._log_tts_failure("rime", "transport_error")
+                    _log_rime_arcana_tts_outcome("transport_error")
+                    self._is_speaking = False
+                    cancelled = True
+                else:
+                    if delivered:
+                        _log_rime_arcana_tts_outcome(
+                            "success",
+                            first_chunk_ms=first_chunk_ms,
+                            total_ms=int((time.monotonic() - stream_started) * 1000),
+                            chunk_count=stream_chunk_count,
+                            audio_bytes=stream_audio_bytes,
+                        )
+                    else:
+                        cancelled = True
         except asyncio.CancelledError:
             cancelled = True
             raise
         except _RimeArcanaTTSFailure as exc:
             failure = exc
+            if audio_emitted:
+                cancelled = True
         except Exception:
             if audio_emitted:
                 # A fallback after any accepted frame would replay the text over
                 # speech the caller has already heard. Keep this as a terminal
                 # transport failure; only silent Rime failures may fall back.
                 self._log_tts_failure("rime", "transport_error")
-                _log_rime_arcana_tts_outcome("transport_error")
                 cancelled = True
             else:
-                failure = _RimeArcanaTTSFailure("decode_failure")
+                failure = _RimeArcanaTTSFailure("transport_error")
         finally:
+            _rime_arcana_emit_success.reset(rime_success_token)
             if self._tts_synthesis_generation == expected_generation:
                 self._tts_synthesis_in_flight = False
                 self._tts_synthesis_generation = None
@@ -12484,9 +12589,6 @@ class MediaStreamSession:
 
         if cancelled or failure is None:
             return
-        _log_rime_arcana_tts_outcome(
-            failure.outcome, status=failure.status,
-        )
         if (
             self._speak_generation != expected_generation
             or not self._owns_smartpbx_tts_delivery(expected_generation)

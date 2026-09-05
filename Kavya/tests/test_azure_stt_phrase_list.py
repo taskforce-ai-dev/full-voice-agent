@@ -11,6 +11,9 @@ Sinhala have one.
 
 from __future__ import annotations
 
+import importlib
+import logging
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -41,9 +44,16 @@ def _signal():
 
 
 def _fake_azure(factory):
+    factory.speech_configs = []
+
     class SpeechConfig:
         def __init__(self, **_kwargs):
             self.speech_recognition_language = None
+            self.properties: list[tuple[object, str]] = []
+            factory.speech_configs.append(self)
+
+        def set_property(self, property_id, value):
+            self.properties.append((property_id, value))
 
     class Recognizer:
         def __init__(self, **_kwargs):
@@ -62,12 +72,15 @@ def _fake_azure(factory):
     return SimpleNamespace(
         SpeechConfig=SpeechConfig,
         SpeechRecognizer=Recognizer,
+        PropertyId=SimpleNamespace(
+            Speech_SegmentationSilenceTimeoutMs="Speech_SegmentationSilenceTimeoutMs",
+        ),
         audio=audio,
         PhraseListGrammar=factory,
     )
 
 
-def _run_start(monkeypatch, lang):
+def _run_start(monkeypatch, lang, *, direct_smartpbx_sinhala=False):
     factory = _PhraseListGrammarFactory()
     monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", True)
     monkeypatch.setattr(server, "AZURE_SPEECH_KEY", "test-key")
@@ -76,9 +89,47 @@ def _run_start(monkeypatch, lang):
     if server.audioop is None:  # pragma: no cover - audioop present on <3.13
         monkeypatch.setattr(server, "audioop", SimpleNamespace())
 
-    stream = server.AzureSTTStream(on_final_result=lambda *_: None, lang=lang)
+    stream = server._make_stt(
+        on_final_result=lambda *_: None,
+        on_interim_result=None,
+        lang=lang,
+        privacy_safe=True,
+        provider="azure",
+        fail_closed=True,
+        direct_smartpbx_sinhala=direct_smartpbx_sinhala,
+    )
     stream.start()
+    factory.stream = stream
     return factory
+
+
+def _run_start_with_segmentation_env(
+    monkeypatch, lang, raw, *, direct_smartpbx_sinhala=None,
+):
+    """Reload the env-parsed server setting, then restore import state."""
+    name = "SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS"
+    previous = os.environ.get(name)
+    if raw is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = raw
+    importlib.reload(server)
+    try:
+        return _run_start(
+            monkeypatch,
+            lang,
+            direct_smartpbx_sinhala=(
+                lang == "si"
+                if direct_smartpbx_sinhala is None
+                else direct_smartpbx_sinhala
+            ),
+        )
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+        importlib.reload(server)
 
 
 def test_phrase_list_constant_is_maintainable_and_domain_specific():
@@ -148,3 +199,135 @@ def test_sinhala_recognizer_gets_the_sinhala_phrase_list_populated(monkeypatch):
     # narrow, deliberate exception to "no English word list" above.
     assert "Mount Monarch Chalet" in added
     assert "Suite" in added
+
+
+@pytest.mark.parametrize("raw", [None, "", "invalid", "0"])
+def test_sinhala_segmentation_silence_is_disabled_for_absent_invalid_or_zero_values(
+    monkeypatch, raw,
+):
+    factory = _run_start_with_segmentation_env(monkeypatch, "si", raw)
+
+    assert factory.speech_configs[0].properties == []
+
+
+def test_sinhala_segmentation_silence_applies_800_ms_to_the_azure_property(monkeypatch):
+    factory = _run_start_with_segmentation_env(monkeypatch, "si", "800")
+
+    assert factory.speech_configs[0].properties == [
+        ("Speech_SegmentationSilenceTimeoutMs", "800"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("-1", "100"), ("99", "100"), ("5001", "5000"), ("99999", "5000")],
+)
+def test_nonzero_sinhala_segmentation_silence_is_clamped_to_azure_bounds(
+    monkeypatch, raw, expected,
+):
+    factory = _run_start_with_segmentation_env(monkeypatch, "si", raw)
+
+    assert factory.speech_configs[0].properties == [
+        ("Speech_SegmentationSilenceTimeoutMs", expected),
+    ]
+
+
+def test_english_segmentation_silence_setting_remains_untouched(monkeypatch):
+    factory = _run_start_with_segmentation_env(monkeypatch, "en", "800")
+
+    assert factory.speech_configs[0].properties == []
+
+
+def test_make_stt_keeps_legacy_capability_false_and_forwards_direct_capability(monkeypatch):
+    monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", True)
+    monkeypatch.setattr(server, "audioop", object())
+    monkeypatch.setattr(server, "AZURE_SPEECH_KEY", "test-key")
+
+    legacy = server._make_stt(
+        lambda *_: None,
+        lambda *_: None,
+        "si",
+        provider="azure",
+        fail_closed=True,
+    )
+    direct = server._make_stt(
+        lambda *_: None,
+        lambda *_: None,
+        "si",
+        provider="azure",
+        fail_closed=True,
+        direct_smartpbx_sinhala=True,
+    )
+
+    assert legacy._direct_smartpbx_sinhala is False
+    assert direct._direct_smartpbx_sinhala is True
+
+
+def test_legacy_sinhala_azure_never_sets_segmentation_or_logs_startup(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO):
+        factory = _run_start_with_segmentation_env(
+            monkeypatch, "si", "800", direct_smartpbx_sinhala=False,
+        )
+
+    assert factory.speech_configs[0].properties == []
+    assert not [
+        record.getMessage()
+        for record in caplog.records
+        if "event=stt_provider_start" in record.getMessage()
+    ]
+
+
+def test_direct_sinhala_segmentation_startup_diagnostic_is_bounded_and_one_shot(
+    monkeypatch, caplog,
+):
+    with caplog.at_level(logging.INFO):
+        factory = _run_start_with_segmentation_env(monkeypatch, "si", "800")
+        factory.stream.start()
+
+    diagnostics = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=stt_provider_start" in record.getMessage()
+    ]
+    assert diagnostics == [
+        "smartpbx_media event=stt_provider_start segmentation=enabled "
+        "segmentation_silence_ms=800",
+    ]
+    # Check only field values.  ``si`` is a valid substring of the field name
+    # ``segmentation_silence_ms``; treating the whole line as opaque text
+    # turns a privacy assertion into a false positive while still allowing a
+    # sensitive value to pass unnoticed.  Every diagnostic field is emitted
+    # as key=value, so the values are the only part that can contain payload.
+    diagnostic_values = [
+        token.split("=", 1)[1].casefold()
+        for token in diagnostics[0].split()
+        if "=" in token
+    ]
+    assert all(
+        private not in value
+        for private in ("si", "caller", "transcript", "secret", "token", "password")
+        for value in diagnostic_values
+    )
+
+
+@pytest.mark.parametrize(
+    ("lang", "raw", "direct_smartpbx_sinhala"),
+    [("en", "800", True), ("ta", "800", True), ("ar", "800", True), ("si", "0", True)],
+)
+def test_non_enabled_sinhala_capability_paths_have_no_property_or_diagnostic(
+    monkeypatch, caplog, lang, raw, direct_smartpbx_sinhala,
+):
+    with caplog.at_level(logging.INFO):
+        factory = _run_start_with_segmentation_env(
+            monkeypatch,
+            lang,
+            raw,
+            direct_smartpbx_sinhala=direct_smartpbx_sinhala,
+        )
+
+    assert factory.speech_configs[0].properties == []
+    assert not [
+        record.getMessage()
+        for record in caplog.records
+        if "event=stt_provider_start" in record.getMessage()
+    ]

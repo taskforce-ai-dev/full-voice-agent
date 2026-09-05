@@ -604,7 +604,6 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "`transport_error`",
         "`empty_audio`",
         "`response_too_large`",
-        "`decode_failure`",
         "`status`",
         "100`–`599",
         "`audio_bytes`",
@@ -4016,6 +4015,41 @@ def test_sinhala_tts_canary_runbook_is_server_side_and_reversible():
         "existing guarded recreate procedure",
     ):
         assert required.casefold() in normalized
+
+
+def test_sinhala_azure_segmentation_canary_is_allowlisted_and_reversible():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx = compose["services"]["kavya-smartpbx"]["environment"]
+    legacy = compose["services"]["kavya"]["environment"]
+    variable = "SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS"
+
+    assert smartpbx[variable] == "${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-0}"
+    assert variable not in legacy
+
+    example = read_text(".env.example")
+    assert re.search(rf"^{variable}=0$", example, re.MULTILINE)
+
+    runbook = read_text("SMARTPBX_RUNBOOK.md")
+    normalized = re.sub(r"\s+", " ", runbook).casefold()
+    canary_sentences = [
+        sentence for sentence in re.split(r"[.!?]", normalized)
+        if variable.casefold() in sentence or "800 ms" in sentence
+    ]
+    assert any(
+        "800 ms" in sentence and variable.casefold() in sentence
+        for sentence in canary_sentences
+    )
+    assert any(
+        "rollback" in sentence
+        and f"{variable}=0".casefold() in sentence
+        for sentence in canary_sentences
+    )
+    assert any(
+        "rollback" in sentence
+        and variable.casefold() in sentence
+        and ("omission" in sentence or "omitted" in sentence)
+        for sentence in canary_sentences
+    )
 
 
 def test_gemini_key_assignment_contract_rejects_duplicate_whitespace_or_later_active_values():

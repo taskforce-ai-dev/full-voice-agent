@@ -101,6 +101,7 @@ KAVYA_EN_ELEVENLABS_VOICE_ID=
 ELEVENLABS_VOICE_ID=
 ELEVENLABS_VOICE_ID_AR=
 STT_PROVIDER=azure
+SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0
 STT_ENDPOINTING_SILENCE_SECONDS=1.0
 STT_FINAL_GRACE_SECONDS=0.5
 CAPTURE_ENDPOINTING_SILENCE_SECONDS=1.5
@@ -331,6 +332,25 @@ stable setting is the default-off `SMARTPBX_STARTUP_PREROLL_MS=0` (matching
 `SMARTPBX_STARTUP_PREROLL_MS=0` and recreate the same pinned image
 immediately. Do not use this knob before replies, fillers, transfers, or any
 later sentence in a call.
+
+## Controlled Sinhala Azure segmentation canary
+
+`SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` is a direct SmartPBX Sinhala
+Azure-only recognizer setting. It is default-off (`0`), which preserves Azure's
+service default and leaves English, Google STT, both Twilio paths, shared
+endpointing/final/capture grace, barge-in, locale, and audio format unchanged.
+The controlled production canary value is
+`SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=800`, meaning 800 (800 ms).
+
+For the canary, set that exact variable to `800` in the protected
+`.env.smartpbx`, render the SmartPBX Compose configuration, and use the normal
+guarded recreate of the same pinned image. Verify only the privacy-safe
+`stt_provider_start` diagnostic: it reports `segmentation=enabled` and
+`segmentation_silence_ms=800` and never contains transcript or caller data.
+
+There are two independent rollback choices for this exact variable. Rollback option 1: set `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0` and recreate the same pinned image. Rollback option 2: omit/remove `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` from the protected environment file; that omission lets Compose supply zero via
+`${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-0}`, then recreate the same
+pinned image. The protected file is `.env.smartpbx`.
 
 ## Later reviewed English digit-class rollout
 
@@ -602,6 +622,7 @@ it requires both loopback endpoints before the final TLS vhost is installed.
 Before enabling the Dialog route, the cutover evidence export is a **finite approved
 event allowlist**. It may contain only the following runtime event names:
 `smartpbx_protocol_diagnostic`, `stt_digit_class_state`, `stt_interim_shape`,
+`stt_provider_start`,
 `turn_stage`, `turn_summary`, `session_summary`, `echo_rejected`,
 `agent_response`, `assistant_turn_delivery`, `audio_dump_written`,
 `bad_tool_json`, `llm_round`, `llm_round_complete`, `llm_round_outcome`,
@@ -630,14 +651,23 @@ a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, `azure`, or
 the `llm_stream_timeout` event additionally permits its normalized `unknown`
 sentinel as documented below.
 
-`rime_tts` emits exactly `provider=rime`, `outcome`, and at most one numeric
-field. `outcome` is a bounded enum: `success`, `missing_api_key`, `timeout`,
-`http_status`, `transport_error`, `empty_audio`, `response_too_large`, or
-`decode_failure`. `status` is present only for an HTTP status outcome and is a
-bounded integer `100`–`599`, clamped. `audio_bytes` is present only for a
-successful decoded response and is a bounded integer `0`–`10485760`, clamped.
-The event contains no text, MP3 bytes, response body, endpoint credential, API
-key, caller identifier, or exception body.
+`rime_tts` emits exactly `provider=rime`, `outcome`, and only the documented
+bounded metadata: `status` is present for an HTTP status outcome; a successful
+native PCMU stream also emits `first_chunk_ms`, `total_ms`, `chunk_count`, and
+`audio_bytes`. `outcome` is a bounded enum: `success`,
+`missing_api_key`, `timeout`, `http_status`, `transport_error`, `empty_audio`,
+or `response_too_large`. `status` is present only for an HTTP status outcome
+and is a bounded integer `100`–`599`, clamped. `first_chunk_ms` and `total_ms`
+are bounded integers `0`–`600000`; `chunk_count` is bounded `0`–`100000`; and
+`audio_bytes` is bounded `0`–`10485760`. The event contains no text, audio
+bytes, response body, endpoint credential, API key, Authorization value,
+caller identifier, or exception body.
+
+`stt_provider_start` emits exactly `segmentation` (`enabled` or `disabled`) and
+`segmentation_silence_ms` (bounded `0`-`5000`), alongside its fixed event name.
+It appears at most once for each privacy-safe Azure startup and contains no
+language, transcript, caller data, digits, credentials, SDK body, or exception
+message.
 
 `llm_round_outcome` emits exactly four fields beyond `provider`, and no others:
 
