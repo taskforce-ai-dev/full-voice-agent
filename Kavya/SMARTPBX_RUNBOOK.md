@@ -93,6 +93,8 @@ SMARTPBX_SINHALA_TTS_PROVIDER=gemini
 SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER=3
 SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS=
 SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR=7
+SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS=
+SMARTPBX_SINHALA_TTS_MIN_CHARS=12
 OPENAI_TTS_MODEL=gpt-4o-mini-tts
 OPENAI_TTS_VOICE=nova
 OPENAI_TTS_INSTRUCTIONS=
@@ -1015,9 +1017,64 @@ same voice, same text, retried immediately within the turn. A model that hits
 (default `7`, i.e. `07:00` UTC). Each fallback logs
 `smartpbx_media event=sinhala_tts_model_fallback from=<model> to=<model> reason=quota_exceeded|rate_limited`
 (model names only); `session_summary` counts them per call as
-`tts_model_fallbacks`. `invalid_request`/`permission_denied`/`server_error`/
+`tts_model_fallbacks`. `permission_denied`/`server_error`/
 `unknown_provider_error` and any malformed-audio/timeout/HTTP failure never
-fall back -- only a classified quota or rate-limit hit does.
+trigger a model change on any model; `invalid_request` never triggers one on
+the primary model either -- only a classified quota/rate-limit hit does that
+(and marks the model exhausted). `invalid_request` on a non-primary model
+instead takes the bounded, non-exhausting text-specific retry below.
+
+**Text-specific retry on a fallback model (2026-09-04).** A fallback model
+(never the primary) that ends a synthesis attempt with zero audio deltas and
+no error event (`empty_audio`), or an explicit `invalid_request`, is retried
+with the SAME text on the next available model once, bounded by the chain
+length -- 2026-09-04 live evidence found both shapes on
+`gemini-2.5-flash-preview-tts` for very short Sinhala utterances
+("ඔව්, හරි." produced zero deltas; "ආයුබෝවන්." was rejected outright).
+Neither reason marks the model exhausted (they are properties of the text,
+not the model), so the very next turn still tries that same model first --
+the retry is not gated on text length; a long reply that happens to hit
+`empty_audio`/`invalid_request` retries exactly the same way a short
+acknowledgement does. Logs `smartpbx_media event=sinhala_tts_model_retry
+from=<model> to=<model> reason=empty_audio|invalid_request` and counts on
+`MediaStreamSession._smartpbx_tts_model_retries_total` (not currently
+exposed in `session_summary`). Only when every model in the chain has been
+tried for this text does the existing never-silent apology play.
+
+An `empty_audio` occurrence (an intermediate retry or the final give-up)
+additionally logs `smartpbx_media event=sinhala_tts_stream_empty
+model=<model> events=<kind>=<count> ...` -- a bounded histogram (at most 8
+distinct kinds, overflow folded into `other`) of the stream event kinds
+actually seen (e.g. `interaction.created=1 interaction.completed=1`) before
+giving up with no audio and no error. These are SDK protocol-level type
+tags, never transcript content, so the line is privacy-safe as-is.
+
+**Short-utterance cache bank.** `SMARTPBX_SINHALA_SHORT_UTTERANCE_BANK` adds
+Kavya's most common short Sinhala acknowledgements/confirmations (`ඔව්.`,
+`හරි.`, `ඔව්, හරි.`, `හොඳයි.`, `ස්තූතියි.`, `සමාවෙන්න.`, `ඔව්, ඒ හරි.`, `නැහැ.`)
+to the same prewarmed `SMARTPBX_SINHALA_CACHED_PHRASES` allowlist the
+filler/keypad phrases use, so an exact (or punctuation/whitespace-variant)
+match never reaches a live TTS request. Cache lookup canonicalizes both the
+requested text and the bank entries (collapsed whitespace, trailing sentence
+punctuation stripped) before comparing, so "ඔව්, හරි." and "ඔව්, හරි" hit the
+same cached clip. `SMARTPBX_SINHALA_TTS_MIN_CHARS` (default `12`) documents
+the length below which a fallback model is disproportionately likely to hit
+one of the above failure shapes -- it never blocks synthesis: an uncached
+short text on a fallback model is still attempted live, with the same retry.
+
+**Per-sentence synthesis on a non-streaming model.** `gemini-3.1-flash-tts-preview`
+(the primary) streams incrementally, so a multi-sentence reply is still
+batched into one request. `SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS` (comma
+list, default `gemini-2.5-flash-preview-tts,gemini-2.5-pro-preview-tts`,
+same name validation as the fallback list) names models that instead return
+one terminal delta holding the whole reply's audio -- 2026-09-04 live
+evidence measured ~12 s to first audio for a 154-token reply on such a
+model, batched, versus ~3 s for a 47-char sentence synthesised alone. When
+the model that would currently be tried first is one of these, a no-tool
+reply is synthesised per sentence instead of as one request, capped at 4
+live TTS requests per turn (any sentences beyond the cap are merged into the
+final request rather than each starting a new one). The streaming primary
+and capture-mode turns are unaffected.
 
 ### Sinhala fixed-phrase prewarm: persistent cache, pacing, and re-prewarm
 
