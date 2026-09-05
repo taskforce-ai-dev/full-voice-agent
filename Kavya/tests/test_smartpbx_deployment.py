@@ -4036,11 +4036,19 @@ def test_sinhala_azure_segmentation_canary_is_allowlisted_and_reversible():
         sentence for sentence in re.split(r"[.!?]", normalized)
         if variable.casefold() in sentence or "800 ms" in sentence
     ]
-    assert any("800 ms" in sentence and variable.casefold() in sentence for sentence in canary_sentences)
-    assert f"{variable}=0".casefold() in normalized
+    assert any(
+        "800 ms" in sentence and variable.casefold() in sentence
+        for sentence in canary_sentences
+    )
     assert any(
         "rollback" in sentence
-        and ("zero" in sentence or "omission" in sentence or "omitted" in sentence)
+        and f"{variable}=0".casefold() in sentence
+        for sentence in canary_sentences
+    )
+    assert any(
+        "rollback" in sentence
+        and variable.casefold() in sentence
+        and ("omission" in sentence or "omitted" in sentence)
         for sentence in canary_sentences
     )
 
