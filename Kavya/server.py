@@ -2313,6 +2313,33 @@ SMARTPBX_SINHALA_PHRASE_CACHE_DIR: str = os.environ.get(
     "SMARTPBX_SINHALA_PHRASE_CACHE_DIR", "/app/smartpbx_phrase_cache"
 ).strip()
 
+# Which fallback models return one terminal audio delta instead of streaming
+# incrementally (2026-09-04 live evidence: gemini-2.5-flash-preview-tts held
+# a 154-token reply's audio until a single ~12 s-late delta). Same name
+# validation as the fallback list above -- an operator typo must not
+# silently disable per-sentence synthesis and re-introduce that wait.
+_SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS_DEFAULT = (
+    "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts",
+)
+
+
+def _parse_smartpbx_sinhala_tts_non_streaming_models(raw: str) -> frozenset[str]:
+    if not isinstance(raw, str) or not raw.strip():
+        return frozenset(_SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS_DEFAULT)
+    candidates = (part.strip() for part in raw.split(","))
+    valid = frozenset(
+        part for part in candidates
+        if part and _SMARTPBX_GEMINI_MODEL_NAME_PATTERN.fullmatch(part)
+    )
+    return valid if valid else frozenset(_SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS_DEFAULT)
+
+
+SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS: frozenset[str] = (
+    _parse_smartpbx_sinhala_tts_non_streaming_models(
+        os.environ.get("SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS", "")
+    )
+)
+
 # Upper bound for the only integer the post-dispatch STT telemetry emits. The
 # event records that a late provider result was ignored while a turn was already
 # dispatched; the age of that turn is useful, an unbounded number is not. Not an
@@ -2390,6 +2417,18 @@ def _parse_clamped_int(environ, name: str, default: int, minimum: int, maximum: 
     except (TypeError, ValueError):
         return default
     return min(max(value, minimum), maximum)
+
+
+# Below this length, a fallback Gemini TTS model is disproportionately likely
+# to return either zero audio deltas or an explicit invalid_request
+# (2026-09-04 live evidence: a 9-char Sinhala acknowledgement produced no
+# audio and no error). This is tuning/documentation surface for the
+# short-utterance cache bank (SMARTPBX_SINHALA_SHORT_UTTERANCE_BANK) and the
+# per-model retry -- it never blocks synthesis outright: an uncached short
+# text on a fallback model is still attempted live, with the same retry.
+SMARTPBX_SINHALA_TTS_MIN_CHARS: int = _parse_clamped_int(
+    os.environ, "SMARTPBX_SINHALA_TTS_MIN_CHARS", 12, 1, 100
+)
 
 
 # DTMF keypad number capture. Keypad entry bypasses STT and is exact, so Kavya
@@ -2552,6 +2591,43 @@ def _smartpbx_sinhala_tts_active_model() -> str:
     """
     active = _smartpbx_sinhala_tts_model_state.get("active_model")
     return active if isinstance(active, str) and active else SMARTPBX_SINHALA_GEMINI_TTS_MODEL
+
+
+def _smartpbx_sinhala_tts_current_model(*, now: datetime | None = None) -> str:
+    """The model the next live synthesis attempt would actually try first.
+
+    Prefers the head of the still-available chain, so a batching decision
+    (below) reacts the instant a model is marked exhausted -- not only after
+    the next successful synthesis updates `active_model`. Falls back to the
+    last model that actually succeeded when the whole chain is currently
+    exhausted (matches `_smartpbx_sinhala_tts_active_model`'s "sane default"
+    contract; the apology path handles the exhausted-chain case regardless).
+    """
+    available = _smartpbx_sinhala_tts_available_models(now=now)
+    return available[0] if available else _smartpbx_sinhala_tts_active_model()
+
+
+def _smartpbx_sinhala_tts_model_is_non_streaming(model: str) -> bool:
+    """True for a model that returns one terminal audio delta, not a stream.
+
+    Gemini's request/response ("non-streaming") TTS models hold the whole
+    reply until it is fully rendered -- batching a multi-sentence reply into
+    one request on such a model means the caller hears nothing until the
+    *entire* reply has synthesised (2026-09-04 live evidence: ~12 s for a
+    154-token reply). `_run_llm_gemini` uses this to switch such a turn to
+    per-sentence synthesis instead of the whole-reply batch the streaming
+    primary uses.
+    """
+    return model in SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS
+
+
+# Sentences beyond this many live TTS requests in one turn are merged into
+# the final request instead of each starting a new one -- per-sentence
+# synthesis trades one big non-streaming wait for several smaller ones, and
+# an unbounded number of those is its own latency/cost risk for a very long
+# reply. Not an env knob: this is a fixed safety cap, not an operator tuning
+# parameter.
+_SMARTPBX_SINHALA_TTS_MAX_SENTENCE_REQUESTS_PER_TURN: int = 4
 
 # ---------------------------------------------------------------------------
 # Capture-ask detection (arms capture mode BEFORE the caller answers)
@@ -3250,6 +3326,26 @@ def _smartpbx_sinhala_keypad_instruction(label: str) -> str:
     ]
 
 
+# 2026-09-04 live evidence: the very shortest guest-facing acknowledgements
+# ("ඔව්, හරි." -- 9 chars) are exactly what a non-streaming fallback model
+# fails on -- zero audio deltas with no error, or an outright invalid_request.
+# These are Kavya's own short spoken turns (acknowledgements/confirmations
+# drawn from the Sinhala system prompt and the recovery/filler phrasing), not
+# caller speech, so they are fixed, operator-authored and safe to prewarm
+# exactly like the filler/keypad phrases above. Kept small (<=10) because
+# each entry costs one prewarm request; the persistent cache makes that a
+# one-off, not a per-call cost.
+SMARTPBX_SINHALA_SHORT_UTTERANCE_BANK: tuple[str, ...] = (
+    "ඔව්.",
+    "හරි.",
+    "ඔව්, හරි.",
+    "හොඳයි.",
+    "ස්තූතියි.",
+    "සමාවෙන්න.",
+    "ඔව්, ඒ හරි.",
+    "නැහැ.",
+)
+
 SMARTPBX_SINHALA_CACHED_PHRASES: tuple[str, ...] = tuple(
     dict.fromkeys(
         (
@@ -3269,6 +3365,7 @@ SMARTPBX_SINHALA_CACHED_PHRASES: tuple[str, ...] = tuple(
                 if phrase
             ),
             *(phrase for phrase in SMARTPBX_SINHALA_DEFAULT_FILLER_BANK if phrase),
+            *SMARTPBX_SINHALA_SHORT_UTTERANCE_BANK,
         )
     )
 )
@@ -3291,18 +3388,44 @@ class _SmartPBXSinhalaPhraseSynthesisError(Exception):
     """One fixed Sinhala phrase could not be rendered to usable mu-law."""
 
 
+# A caller-turn's exact text rarely matches the bank byte-for-byte -- the
+# model may add/drop a trailing period, or emit an extra space. The cache key
+# is this canonical form (collapsed whitespace, no trailing sentence
+# punctuation) so "ඔව්, හරි." and "ඔව්, හරි" and "ඔව්,  හරි." all hit the same
+# prewarmed clip. Never applied to the text actually sent to a live Gemini
+# request -- only to cache lookup/storage.
+_SMARTPBX_SINHALA_WHITESPACE_PATTERN = re.compile(r"\s+")
+_SMARTPBX_SINHALA_TRAILING_PUNCT_PATTERN = re.compile(r"[.,!?।॥]+$")
+
+
+def _canonicalize_smartpbx_sinhala_phrase(text: str) -> str:
+    """Collapse whitespace/trailing punctuation variance for cache lookup."""
+    collapsed = _SMARTPBX_SINHALA_WHITESPACE_PATTERN.sub(" ", text.strip())
+    return _SMARTPBX_SINHALA_TRAILING_PUNCT_PATTERN.sub("", collapsed).strip()
+
+
+_SMARTPBX_SINHALA_CACHED_PHRASES_CANONICAL: dict[str, str] = {
+    _canonicalize_smartpbx_sinhala_phrase(phrase): phrase
+    for phrase in SMARTPBX_SINHALA_CACHED_PHRASES
+}
+
+
 def _smartpbx_sinhala_phrase_audio_key(text: str, model: str | None = None) -> tuple[str, str, str]:
     """The complete request identity that produced a cached Sinhala clip."""
+    canonical = _SMARTPBX_SINHALA_CACHED_PHRASES_CANONICAL.get(
+        _canonicalize_smartpbx_sinhala_phrase(text), text
+    )
     return (
-        text,
+        canonical,
         model or SMARTPBX_SINHALA_GEMINI_TTS_MODEL,
         SMARTPBX_SINHALA_GEMINI_TTS_VOICE,
     )
 
 
 def _is_smartpbx_sinhala_cacheable_phrase(text: str) -> bool:
-    """Only the fixed operator-authored phrases may ever reach the cache."""
-    return text in SMARTPBX_SINHALA_CACHED_PHRASES
+    """Only the fixed operator-authored phrases (or a punctuation/whitespace
+    variant of one) may ever reach the cache."""
+    return _canonicalize_smartpbx_sinhala_phrase(text) in _SMARTPBX_SINHALA_CACHED_PHRASES_CANONICAL
 
 
 def _get_cached_smartpbx_sinhala_phrase_audio(text: str) -> bytes | None:
@@ -4767,15 +4890,46 @@ def _diagnostic_class_for_gemini_tts_error(code: str) -> "DiagnosticFailureClass
     return DiagnosticFailureClass.TTS_PROVIDER_ERROR
 
 
-async def _iter_gemini_tts_audio_deltas(stream: Any) -> AsyncIterator[tuple[str, Any]]:
+# Bounded diagnostic surface for "the stream ended with no audio and no
+# error" (2026-09-04 live evidence): distinct event kinds are capped so a
+# malformed/unexpected stream shape cannot inflate the log line into an
+# unbounded cardinality field. Overflow folds into "other" -- these are SDK
+# protocol-level type tags (e.g. "step.delta", "interaction.created"), never
+# content, so the counts are privacy-safe to log verbatim.
+_GEMINI_TTS_EVENT_KIND_HISTOGRAM_MAX_KINDS = 8
+
+
+def _note_gemini_tts_event_kind(event_counts: dict[str, int] | None, event_type: Any) -> None:
+    """Count one stream event's kind into a bounded, privacy-safe histogram."""
+    if event_counts is None:
+        return
+    key = event_type if isinstance(event_type, str) and event_type else "unknown"
+    if key not in event_counts and len(event_counts) >= _GEMINI_TTS_EVENT_KIND_HISTOGRAM_MAX_KINDS:
+        key = "other"
+    event_counts[key] = event_counts.get(key, 0) + 1
+
+
+def _format_gemini_tts_event_kind_histogram(event_counts: dict[str, int]) -> str:
+    """`kind=count` pairs (insertion order) for a bounded-cardinality log line."""
+    return " ".join(f"{kind}={count}" for kind, count in event_counts.items())
+
+
+async def _iter_gemini_tts_audio_deltas(
+    stream: Any, *, event_counts: dict[str, int] | None = None,
+) -> AsyncIterator[tuple[str, Any]]:
     """Yield base64 audio payloads from the documented Interactions SSE shape.
 
     Raises `_GeminiTTSProviderError` for an explicit `error` event or a
     terminal `interaction.*` event carrying an `.error`, instead of silently
     falling through to the caller's "stream ended with no audio" path.
+
+    `event_counts`, when given, is filled with a bounded histogram of every
+    event kind seen -- diagnostic-only, so the caller can log what the
+    stream actually contained when it ends with zero audio.
     """
     async for event in stream:
         event_type = getattr(event, "event_type", None)
+        _note_gemini_tts_event_kind(event_counts, event_type)
         error = getattr(event, "error", None)
         if event_type == "error":
             raise _GeminiTTSProviderError(_classify_gemini_tts_provider_error(error))
@@ -7282,6 +7436,11 @@ class MediaStreamSession:
         # Session-lifetime count of Gemini Sinhala TTS model fallbacks (a
         # quota/rate-limit hit that moved to the next model in the chain).
         self._smartpbx_tts_model_fallbacks_total = 0
+        # Session-lifetime count of text-specific same-turn retries on a
+        # non-primary model (empty_audio/invalid_request) -- these do not
+        # mark the model exhausted, so they are counted separately from the
+        # quota/rate-limit fallbacks above.
+        self._smartpbx_tts_model_retries_total = 0
         self._smartpbx_barge_ins = 0
         self._smartpbx_cadence_by_turn: dict[str, dict[str, int]] = {}
         self._smartpbx_dropped_frame_baselines: dict[str, int] = {}
@@ -10967,10 +11126,31 @@ class MediaStreamSession:
                 text_content = ""
                 function_calls: list[dict] = []
                 sentence_buffer = ""
-                batch_direct_sinhala = (
+                direct_sinhala_active = (
                     direct_sinhala and not self._is_capture_mode_active()
                 )
+                # A non-streaming Gemini TTS model (e.g. a fallback the
+                # primary quota-exhausted into) holds a whole-reply request's
+                # audio until it is entirely rendered -- batching would trade
+                # ~3 s to first audio for ~12 s (2026-09-04 live evidence).
+                # Such a turn synthesises per sentence instead, same as the
+                # streaming-model non-batch path below, but with a per-turn
+                # request cap (merged tail) since each request is its own
+                # full non-streaming round trip.
+                direct_sinhala_non_streaming = (
+                    direct_sinhala_active
+                    and _smartpbx_sinhala_tts_model_is_non_streaming(
+                        _smartpbx_sinhala_tts_current_model()
+                    )
+                )
+                batch_direct_sinhala = (
+                    direct_sinhala_active and not direct_sinhala_non_streaming
+                )
                 deferred_sinhala_sentences: list[str] = []
+                # Overflow past the per-turn sentence-request cap, merged
+                # into the final request rather than each starting a new one.
+                capped_sinhala_carry_sentences: list[str] = []
+                capped_sinhala_requests_started = 0
                 tts_tasks: list[asyncio.Task] = []
                 turn_tts_tasks = tts_tasks
                 has_tool_use = False
@@ -10991,23 +11171,34 @@ class MediaStreamSession:
                     function_calls = []
                     sentence_buffer = ""
                     deferred_sinhala_sentences = []
+                    capped_sinhala_carry_sentences = []
+                    capped_sinhala_requests_started = 0
                     has_tool_use = False
                     finish_reason = None
                     saw_terminal_metadata = False
                     reported_output_tokens = None
 
                     async def _restore_deferred_sinhala_sentences() -> None:
-                        """Return a no-longer-text-only round to sentence streaming."""
-                        nonlocal deferred_sinhala_sentences
-                        if not batch_direct_sinhala or not deferred_sinhala_sentences:
+                        """Return a no-longer-text-only round to sentence streaming.
+
+                        Flushes both the whole-reply batch buffer and any
+                        sentences the per-turn request cap carried past their
+                        completion -- a tool call means the round is no
+                        longer just accumulating a spoken reply, so
+                        everything held back must be spoken now, uncapped.
+                        """
+                        nonlocal deferred_sinhala_sentences, capped_sinhala_carry_sentences
+                        pending = [*deferred_sinhala_sentences, *capped_sinhala_carry_sentences]
+                        deferred_sinhala_sentences = []
+                        capped_sinhala_carry_sentences = []
+                        if not pending:
                             return
-                        for sentence in deferred_sinhala_sentences:
+                        for sentence in pending:
                             task = self._start_smartpbx_round_tts(
                                 sentence, generation=gen, sentence=sentence,
                             )
                             if task is not None:
                                 tts_tasks.append(task)
-                        deferred_sinhala_sentences = []
                         if tts_tasks:
                             await asyncio.sleep(0)
 
@@ -11113,6 +11304,25 @@ class MediaStreamSession:
                             # restore the preamble to the normal sentence-level path.
                             if batch_direct_sinhala:
                                 deferred_sinhala_sentences.extend(sentences)
+                                continue
+                            if direct_sinhala_non_streaming:
+                                for s in sentences:
+                                    if (
+                                        capped_sinhala_requests_started
+                                        >= _SMARTPBX_SINHALA_TTS_MAX_SENTENCE_REQUESTS_PER_TURN - 1
+                                    ):
+                                        # Budget spent -- merge into the tail
+                                        # (the final request) instead of
+                                        # starting another live TTS call.
+                                        capped_sinhala_carry_sentences.append(s)
+                                        continue
+                                    task = self._start_smartpbx_round_tts(
+                                        s, generation=gen, sentence=s,
+                                    )
+                                    if task is not None:
+                                        tts_tasks.append(task)
+                                    capped_sinhala_requests_started += 1
+                                await asyncio.sleep(0)
                                 continue
                             for s in sentences:
                                 task = self._start_smartpbx_round_tts(
@@ -11532,6 +11742,13 @@ class MediaStreamSession:
                         # barge-in; the normal per-sentence path is already
                         # generation-fenced at this same boundary.
                         remaining = ""
+                elif direct_sinhala_non_streaming and capped_sinhala_carry_sentences:
+                    # Sentences the per-turn request cap held back are merged
+                    # into this final request rather than each starting a
+                    # new live TTS call.
+                    remaining = " ".join(
+                        [*capped_sinhala_carry_sentences, remaining]
+                    ).strip()
                 if remaining:
                     task = self._start_smartpbx_round_tts(
                         remaining, generation=gen, sentence=remaining,
@@ -12619,6 +12836,12 @@ class MediaStreamSession:
         expected_generation = self._speak_generation
         cancelled = False
         audio_emitted = False
+        # Filled per live-synthesis attempt below; read here (never assigned
+        # in this outer scope) only when a stream ends with zero audio, so a
+        # cached-phrase replay (which never touches this) always passes an
+        # empty histogram and logs nothing extra.
+        event_counts: dict[str, int] = {}
+        last_attempt_model: str | None = None
 
         async def _fail(
             outcome: str, failure_class: "DiagnosticFailureClass", status: int | None = None,
@@ -12626,6 +12849,18 @@ class MediaStreamSession:
             """One choke point for every failure exit: log, diagnose, count
             quota streaks, and offer the never-silent apology."""
             self._log_tts_failure("gemini", outcome, status)
+            if outcome == "empty_audio" and event_counts:
+                # Diagnostic-only: what kinds of events the stream actually
+                # carried before giving up with no audio and no error --
+                # SDK protocol-level type tags and counts only, never content.
+                # `event_counts` is only ever non-empty once the live-synthesis
+                # branch below has run at least one attempt, at which point
+                # `last_attempt_model` has always been set alongside it.
+                logger.warning(
+                    "smartpbx_media event=sinhala_tts_stream_empty model=%s events=%s",
+                    last_attempt_model,
+                    _format_gemini_tts_event_kind_histogram(event_counts),
+                )
             self._emit_smartpbx_tts_diagnostic(failure_class)
             if outcome == "quota_exceeded":
                 _note_smartpbx_sinhala_tts_quota_failure()
@@ -12718,9 +12953,16 @@ class MediaStreamSession:
                     ratecv_state = None
                     pcm_tail = b""
                     mulaw_buf = b""
+                    any_audio_delta = False
+                    event_counts.clear()
+                    last_attempt_model = model_name
+                    is_primary_attempt = model_name == SMARTPBX_SINHALA_GEMINI_TTS_MODEL
 
                     try:
-                        async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(stream):
+                        async for audio_b64, audio_delta in _iter_gemini_tts_audio_deltas(
+                            stream, event_counts=event_counts,
+                        ):
+                            any_audio_delta = True
                             if not self._owns_sinhala_tts_stream(
                                 expected_generation, audio_emitted=audio_emitted
                             ) or (
@@ -12809,7 +13051,63 @@ class MediaStreamSession:
                                 )
                                 model_index += 1
                                 continue
+                        # invalid_request on a NON-primary model is treated as
+                        # text-specific (some texts a fallback model rejects
+                        # outright -- 2026-09-04 live evidence: a short
+                        # Sinhala greeting), not evidence the model itself is
+                        # broken for every text. Retry the same text on the
+                        # next model without marking this one exhausted; a
+                        # primary-model invalid_request is unchanged (never
+                        # retried -- see the non-fallback provider-error
+                        # contract above).
+                        if (
+                            exc.code == "invalid_request"
+                            and not is_primary_attempt
+                            and not audio_emitted
+                            and not cancelled
+                            and model_index + 1 < len(available_models)
+                        ):
+                            next_model = available_models[model_index + 1]
+                            logger.warning(
+                                "smartpbx_media event=sinhala_tts_model_retry "
+                                "from=%s to=%s reason=%s",
+                                model_name, next_model, exc.code,
+                            )
+                            self._smartpbx_tts_model_retries_total = min(
+                                self._smartpbx_tts_model_retries_total + 1, 100_000,
+                            )
+                            model_index += 1
+                            continue
                         raise
+                    # A stream that completed with no error and literally no
+                    # audio delta is the other text-specific 2026-09-04
+                    # incident shape ("ඔව්, හරි." -- zero deltas, no error).
+                    # Same bound and same "never mark exhausted" rule as the
+                    # invalid_request retry above.
+                    if (
+                        not any_audio_delta
+                        and not is_primary_attempt
+                        and not audio_emitted
+                        and not cancelled
+                        and model_index + 1 < len(available_models)
+                    ):
+                        next_model = available_models[model_index + 1]
+                        logger.warning(
+                            "smartpbx_media event=sinhala_tts_model_retry "
+                            "from=%s to=%s reason=empty_audio",
+                            model_name, next_model,
+                        )
+                        if event_counts:
+                            logger.warning(
+                                "smartpbx_media event=sinhala_tts_stream_empty "
+                                "model=%s events=%s",
+                                model_name, _format_gemini_tts_event_kind_histogram(event_counts),
+                            )
+                        self._smartpbx_tts_model_retries_total = min(
+                            self._smartpbx_tts_model_retries_total + 1, 100_000,
+                        )
+                        model_index += 1
+                        continue
                     break
 
             if pcm_tail and not cancelled:
