@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 import pytest
 
@@ -23,6 +24,18 @@ class FakeTransport:
 
     async def send_mark(self, name: str) -> None:
         self.marks.append(name)
+
+
+class RejectSecondTransport(FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_attempts = 0
+
+    async def send_audio(self, audio: bytes) -> None:
+        self.send_attempts += 1
+        if self.send_attempts == 2:
+            raise RuntimeError("transport rejected second audio chunk")
+        await super().send_audio(audio)
 
 
 class FakeRimeResponse:
@@ -98,13 +111,18 @@ def test_rime_provider_selector_defaults_to_gemini_and_rejects_unknown_values():
 def test_rime_arcana_request_payload_uses_the_fixed_sinhala_pcmu_contract():
     import server
 
-    payload = server._rime_arcana_request_payload("සිංහල")
-
-    assert payload["text"] == "සිංහල"
-    assert payload["modelId"] == "arcana"
-    assert payload["speaker"] == "chandani"
-    assert payload["lang"] == "si"
-    assert payload["samplingRate"] == 8000
+    assert server._rime_arcana_request_payload("සිංහල") == {
+        "text": "සිංහල",
+        "modelId": "arcana",
+        "speaker": "chandani",
+        "lang": "si",
+        "max_tokens": 1200,
+        "repetition_penalty": 1.6,
+        "samplingRate": 8000,
+        "speedAlpha": 1,
+        "temperature": 0.5,
+        "top_p": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -229,6 +247,36 @@ async def test_rime_failure_after_accepted_audio_never_falls_back_to_gemini(monk
 
 
 @pytest.mark.asyncio
+async def test_transport_rejection_on_second_rime_chunk_never_falls_back_to_gemini(
+    monkeypatch,
+):
+    import server
+
+    transport = RejectSecondTransport()
+    pipeline = server.MediaStreamSession(
+        websocket=None, lang="si", media_transport=transport, llm_provider="gemini",
+    )
+    pipeline._smartpbx_transfer_context = object()
+    gemini_calls: list[str] = []
+
+    async def stream(_text: str):
+        yield b"accepted"
+        yield b"rejected"
+
+    async def gemini(text: str, **_kwargs):
+        gemini_calls.append(text)
+
+    monkeypatch.setattr(server, "_stream_rime_arcana_mulaw", stream)
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", gemini)
+
+    await pipeline._tts_rime_sinhala("සිංහල", sentence="සිංහල")
+
+    assert transport.send_attempts == 2
+    assert transport.audio == [b"accepted"]
+    assert gemini_calls == []
+
+
+@pytest.mark.asyncio
 async def test_generation_supersession_drops_later_rime_audio_and_tts_done(monkeypatch):
     import server
 
@@ -252,17 +300,19 @@ async def test_generation_supersession_drops_later_rime_audio_and_tts_done(monke
 async def test_rime_response_size_is_enforced_incrementally(monkeypatch):
     import server
 
-    response = FakeRimeResponse([b"1234", b"56", b"never-read"])
+    response = FakeRimeResponse([
+        b"x" * (10 * 1024 * 1024), b"overflow", b"never-read",
+    ])
     client = FakeRimeClient(response)
     monkeypatch.setattr(server, "RIME_API_KEY", "test-rime-key")
-    monkeypatch.setattr(server, "_RIME_ARCANA_TTS_MAX_RESPONSE_BYTES", 5)
     monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
 
-    with pytest.raises(server._RimeArcanaTTSFailure) as raised:
+    with pytest.raises(Exception) as raised:
         _ = [chunk async for chunk in server._stream_rime_arcana_mulaw("සිංහල")]
 
-    assert raised.value.outcome == "response_too_large"
+    assert getattr(raised.value, "outcome", None) == "response_too_large"
     assert response.yielded == 2
+    assert client.http_stream.closed is True
 
 
 @pytest.mark.asyncio
@@ -323,6 +373,46 @@ async def test_rime_telemetry_is_bounded_and_privacy_safe(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_successful_rime_telemetry_has_bounded_stream_metadata_without_content(
+    monkeypatch, caplog,
+):
+    import server
+
+    secret = "rime-success-secret"
+    caller_text = "සිංහල caller 0771234567"
+    audio = [b"RAW_AUDIO_BODY", b"\x00\x01\xfe\xff"]
+    response = FakeRimeResponse(audio)
+    client = FakeRimeClient(response)
+    monkeypatch.setattr(server, "RIME_API_KEY", secret)
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    caplog.set_level(logging.INFO)
+
+    _ = [chunk async for chunk in server._stream_rime_arcana_mulaw(caller_text)]
+
+    records = [
+        record.getMessage() for record in caplog.records
+        if "event=rime_tts" in record.getMessage()
+    ]
+    assert len(records) == 1
+    telemetry = records[0]
+    fields = dict(re.findall(r"([a-z_]+)=([^\s]+)", telemetry))
+    assert set(fields) == {
+        "event", "provider", "outcome", "elapsed_ms", "chunk_count", "audio_bytes",
+    }
+    assert fields["event"] == "rime_tts"
+    assert fields["provider"] == "rime"
+    assert fields["outcome"] == "success"
+    assert 0 <= int(fields["elapsed_ms"]) <= 10_000
+    assert 1 <= int(fields["chunk_count"]) <= 100_000
+    assert 1 <= int(fields["audio_bytes"]) <= server._RIME_ARCANA_TTS_MAX_RESPONSE_BYTES
+    for sensitive in (
+        caller_text, "0771234567", secret, b"".join(audio).decode("latin1"),
+        "RAW_AUDIO_BODY", "exception text",
+    ):
+        assert sensitive not in telemetry
+
+
+@pytest.mark.asyncio
 async def test_rime_route_is_limited_to_direct_smartpbx_sinhala(monkeypatch):
     import server
 
@@ -333,6 +423,7 @@ async def test_rime_route_is_limited_to_direct_smartpbx_sinhala(monkeypatch):
     )
     direct_english._smartpbx_transfer_context = object()
     twilio_sinhala = server.MediaStreamSession(websocket=None, lang="si")
+    twilio_english = server.MediaStreamSession(websocket=None, lang="en")
     routes: list[str] = []
 
     async def rime(*_args, **_kwargs):
@@ -347,7 +438,7 @@ async def test_rime_route_is_limited_to_direct_smartpbx_sinhala(monkeypatch):
     async def openai(*_args, **_kwargs):
         routes.append("openai")
 
-    for pipeline in (direct_sinhala, direct_english, twilio_sinhala):
+    for pipeline in (direct_sinhala, direct_english, twilio_sinhala, twilio_english):
         monkeypatch.setattr(pipeline, "_tts_rime_sinhala", rime)
         monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", gemini)
         monkeypatch.setattr(pipeline, "_tts_elevenlabs", elevenlabs)
@@ -356,8 +447,10 @@ async def test_rime_route_is_limited_to_direct_smartpbx_sinhala(monkeypatch):
     await direct_sinhala._speak("සිංහල")
     await direct_english._speak("English")
     await twilio_sinhala._speak("සිංහල")
+    await twilio_english._speak("English")
 
-    assert routes == ["rime", "elevenlabs", "openai"]
+    assert routes == ["rime", "elevenlabs", "openai", "elevenlabs"]
+    assert routes.count("rime") == 1
 
 
 @pytest.mark.asyncio
