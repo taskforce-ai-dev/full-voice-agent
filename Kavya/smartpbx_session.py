@@ -597,7 +597,8 @@ class KavyaSmartPBXSession:
                 provider=profile.stt_provider,
                 fail_closed=profile.stt_fail_closed,
                 # This preflight is the explicit direct-SmartPBX boundary;
-                # legacy MediaStreamSession.run() passes its own false gate.
+                # legacy MediaStreamSession.run() relies on the factory's
+                # default false gate and keeps its historical call shape.
                 direct_smartpbx_sinhala=profile.lang == "si",
             )
         except asyncio.CancelledError:

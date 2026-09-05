@@ -8782,7 +8782,6 @@ class MediaStreamSession:
             on_final_result=self._on_stt_result,
             on_interim_result=self._on_stt_interim,
             lang=self.lang,
-            direct_smartpbx_sinhala=self._is_direct_smartpbx_sinhala(),
         )
         self._stt.start()
 

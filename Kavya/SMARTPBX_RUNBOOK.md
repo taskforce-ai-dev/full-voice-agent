@@ -348,10 +348,9 @@ guarded recreate of the same pinned image. Verify only the privacy-safe
 `stt_provider_start` diagnostic: it reports `segmentation=enabled` and
 `segmentation_silence_ms=800` and never contains transcript or caller data.
 
-There are two independent rollback choices for this exact variable. Rollback option 1: set `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0` and recreate the same pinned image. Rollback option 2: omit/remove `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` from the protected
-`.env.smartpbx`; that omission lets Compose supply zero via
+There are two independent rollback choices for this exact variable. Rollback option 1: set `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0` and recreate the same pinned image. Rollback option 2: omit/remove `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` from the protected environment file; that omission lets Compose supply zero via
 `${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-0}`, then recreate the same
-pinned image.
+pinned image. The protected file is `.env.smartpbx`.
 
 ## Later reviewed English digit-class rollout
 

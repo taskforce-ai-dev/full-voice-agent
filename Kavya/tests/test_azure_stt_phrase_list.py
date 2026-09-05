@@ -293,9 +293,20 @@ def test_direct_sinhala_segmentation_startup_diagnostic_is_bounded_and_one_shot(
         "smartpbx_media event=stt_provider_start segmentation=enabled "
         "segmentation_silence_ms=800",
     ]
+    # Check only field values.  ``si`` is a valid substring of the field name
+    # ``segmentation_silence_ms``; treating the whole line as opaque text
+    # turns a privacy assertion into a false positive while still allowing a
+    # sensitive value to pass unnoticed.  Every diagnostic field is emitted
+    # as key=value, so the values are the only part that can contain payload.
+    diagnostic_values = [
+        token.split("=", 1)[1].casefold()
+        for token in diagnostics[0].split()
+        if "=" in token
+    ]
     assert all(
-        private not in diagnostics[0]
+        private not in value
         for private in ("si", "caller", "transcript", "secret", "token", "password")
+        for value in diagnostic_values
     )
 
 

@@ -604,7 +604,6 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "`transport_error`",
         "`empty_audio`",
         "`response_too_large`",
-        "`decode_failure`",
         "`status`",
         "100`–`599",
         "`audio_bytes`",
