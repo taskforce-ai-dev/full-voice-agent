@@ -630,14 +630,17 @@ a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, `azure`, or
 the `llm_stream_timeout` event additionally permits its normalized `unknown`
 sentinel as documented below.
 
-`rime_tts` emits exactly `provider=rime`, `outcome`, and at most one numeric
-field. `outcome` is a bounded enum: `success`, `missing_api_key`, `timeout`,
-`http_status`, `transport_error`, `empty_audio`, `response_too_large`, or
-`decode_failure`. `status` is present only for an HTTP status outcome and is a
-bounded integer `100`–`599`, clamped. `audio_bytes` is present only for a
-successful decoded response and is a bounded integer `0`–`10485760`, clamped.
-The event contains no text, MP3 bytes, response body, endpoint credential, API
-key, caller identifier, or exception body.
+`rime_tts` emits exactly `provider=rime`, `outcome`, and only the documented
+bounded metadata: `status` is present for an HTTP status outcome; a successful
+native PCMU stream also emits `first_chunk_ms`, `total_ms`, `chunk_count`, and
+`audio_bytes`. `outcome` is a bounded enum: `success`,
+`missing_api_key`, `timeout`, `http_status`, `transport_error`, `empty_audio`,
+or `response_too_large`. `status` is present only for an HTTP status outcome
+and is a bounded integer `100`–`599`, clamped. `first_chunk_ms` and `total_ms`
+are bounded integers `0`–`600000`; `chunk_count` is bounded `0`–`100000`; and
+`audio_bytes` is bounded `0`–`10485760`. The event contains no text, audio
+bytes, response body, endpoint credential, API key, Authorization value,
+caller identifier, or exception body.
 
 `llm_round_outcome` emits exactly four fields beyond `provider`, and no others:
 
