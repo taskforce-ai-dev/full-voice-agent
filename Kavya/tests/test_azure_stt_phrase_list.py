@@ -11,6 +11,8 @@ Sinhala have one.
 
 from __future__ import annotations
 
+import importlib
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -41,9 +43,16 @@ def _signal():
 
 
 def _fake_azure(factory):
+    factory.speech_configs = []
+
     class SpeechConfig:
         def __init__(self, **_kwargs):
             self.speech_recognition_language = None
+            self.properties: list[tuple[object, str]] = []
+            factory.speech_configs.append(self)
+
+        def set_property(self, property_id, value):
+            self.properties.append((property_id, value))
 
     class Recognizer:
         def __init__(self, **_kwargs):
@@ -62,6 +71,9 @@ def _fake_azure(factory):
     return SimpleNamespace(
         SpeechConfig=SpeechConfig,
         SpeechRecognizer=Recognizer,
+        PropertyId=SimpleNamespace(
+            Speech_SegmentationSilenceTimeoutMs="Speech_SegmentationSilenceTimeoutMs",
+        ),
         audio=audio,
         PhraseListGrammar=factory,
     )
@@ -79,6 +91,25 @@ def _run_start(monkeypatch, lang):
     stream = server.AzureSTTStream(on_final_result=lambda *_: None, lang=lang)
     stream.start()
     return factory
+
+
+def _run_start_with_segmentation_env(monkeypatch, lang, raw):
+    """Reload the env-parsed server setting, then restore import state."""
+    name = "SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS"
+    previous = os.environ.get(name)
+    if raw is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = raw
+    importlib.reload(server)
+    try:
+        return _run_start(monkeypatch, lang)
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+        importlib.reload(server)
 
 
 def test_phrase_list_constant_is_maintainable_and_domain_specific():
@@ -148,3 +179,40 @@ def test_sinhala_recognizer_gets_the_sinhala_phrase_list_populated(monkeypatch):
     # narrow, deliberate exception to "no English word list" above.
     assert "Mount Monarch Chalet" in added
     assert "Suite" in added
+
+
+@pytest.mark.parametrize("raw", [None, "", "invalid", "0"])
+def test_sinhala_segmentation_silence_is_disabled_for_absent_invalid_or_zero_values(
+    monkeypatch, raw,
+):
+    factory = _run_start_with_segmentation_env(monkeypatch, "si", raw)
+
+    assert factory.speech_configs[0].properties == []
+
+
+def test_sinhala_segmentation_silence_applies_800_ms_to_the_azure_property(monkeypatch):
+    factory = _run_start_with_segmentation_env(monkeypatch, "si", "800")
+
+    assert factory.speech_configs[0].properties == [
+        ("Speech_SegmentationSilenceTimeoutMs", "800"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("-1", "100"), ("99", "100"), ("5001", "5000"), ("99999", "5000")],
+)
+def test_nonzero_sinhala_segmentation_silence_is_clamped_to_azure_bounds(
+    monkeypatch, raw, expected,
+):
+    factory = _run_start_with_segmentation_env(monkeypatch, "si", raw)
+
+    assert factory.speech_configs[0].properties == [
+        ("Speech_SegmentationSilenceTimeoutMs", expected),
+    ]
+
+
+def test_english_segmentation_silence_setting_remains_untouched(monkeypatch):
+    factory = _run_start_with_segmentation_env(monkeypatch, "en", "800")
+
+    assert factory.speech_configs[0].properties == []
