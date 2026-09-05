@@ -101,6 +101,7 @@ KAVYA_EN_ELEVENLABS_VOICE_ID=
 ELEVENLABS_VOICE_ID=
 ELEVENLABS_VOICE_ID_AR=
 STT_PROVIDER=azure
+SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0
 STT_ENDPOINTING_SILENCE_SECONDS=1.0
 STT_FINAL_GRACE_SECONDS=0.5
 CAPTURE_ENDPOINTING_SILENCE_SECONDS=1.5
@@ -331,6 +332,30 @@ stable setting is the default-off `SMARTPBX_STARTUP_PREROLL_MS=0` (matching
 `SMARTPBX_STARTUP_PREROLL_MS=0` and recreate the same pinned image
 immediately. Do not use this knob before replies, fillers, transfers, or any
 later sentence in a call.
+
+## Controlled Sinhala Azure segmentation canary
+
+`SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` is a direct SmartPBX Sinhala
+Azure-only recognizer setting. It is default-off (`0`), which preserves Azure's
+service default and leaves English, Google STT, both Twilio paths, shared
+endpointing/final/capture grace, barge-in, locale, and audio format unchanged.
+The controlled production canary value is
+`SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=800`.
+
+For the canary, set that exact variable to `800` in the protected
+`.env.smartpbx`, render the SmartPBX Compose configuration, and use the normal
+guarded recreate of the same pinned image. Verify only the privacy-safe
+`stt_provider_start` diagnostic: it reports `segmentation=enabled` and
+`segmentation_silence_ms=800` and never contains transcript or caller data.
+
+There are two independent rollback choices for this exact variable:
+
+1. Set `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0` and recreate the same
+   pinned image; or
+2. Omit/remove `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` from the
+   protected `.env.smartpbx` so Compose supplies zero via
+   `${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-0}`, then recreate the
+   same pinned image.
 
 ## Later reviewed English digit-class rollout
 
@@ -602,6 +627,7 @@ it requires both loopback endpoints before the final TLS vhost is installed.
 Before enabling the Dialog route, the cutover evidence export is a **finite approved
 event allowlist**. It may contain only the following runtime event names:
 `smartpbx_protocol_diagnostic`, `stt_digit_class_state`, `stt_interim_shape`,
+`stt_provider_start`,
 `turn_stage`, `turn_summary`, `session_summary`, `echo_rejected`,
 `agent_response`, `assistant_turn_delivery`, `audio_dump_written`,
 `bad_tool_json`, `llm_round`, `llm_round_complete`, `llm_round_outcome`,
@@ -641,6 +667,12 @@ are bounded integers `0`–`600000`; `chunk_count` is bounded `0`–`100000`; an
 `audio_bytes` is bounded `0`–`10485760`. The event contains no text, audio
 bytes, response body, endpoint credential, API key, Authorization value,
 caller identifier, or exception body.
+
+`stt_provider_start` emits exactly `segmentation` (`enabled` or `disabled`) and
+`segmentation_silence_ms` (bounded `0`-`5000`), alongside its fixed event name.
+It appears at most once for each privacy-safe Azure startup and contains no
+language, transcript, caller data, digits, credentials, SDK body, or exception
+message.
 
 `llm_round_outcome` emits exactly four fields beyond `provider`, and no others:
 

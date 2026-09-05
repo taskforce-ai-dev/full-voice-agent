@@ -1879,6 +1879,20 @@ def _parse_endpointing_seconds(
     return min(max(value, minimum), maximum)
 
 
+def _parse_sinhala_azure_segmentation_silence_ms(environ) -> int:
+    """Read the optional Sinhala Azure segmentation timeout in milliseconds."""
+    raw = environ.get("SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS", "")
+    if not isinstance(raw, str) or not raw.strip():
+        return 0
+    try:
+        value = int(raw.strip(), 10)
+    except (TypeError, ValueError):
+        return 0
+    if value == 0:
+        return 0
+    return min(max(value, 100), 5000)
+
+
 def _parse_clamped_float(
     environ, name: str, default: float, minimum: float, maximum: float
 ) -> float:
@@ -2057,6 +2071,9 @@ CAPTURE_FINAL_GRACE_SECONDS: float = _parse_endpointing_seconds(
 # path retain the patient capture timers above.
 CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS: float = _parse_endpointing_seconds(
     os.environ, "CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS", 0.35, 0.1, 1.0
+)
+SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS: int = (
+    _parse_sinhala_azure_segmentation_silence_ms(os.environ)
 )
 SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS = _parse_endpointing_seconds(
     os.environ,
@@ -6831,12 +6848,19 @@ class AzureSTTStream:
             subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION,
         )
         speech_config.speech_recognition_language = primary
-        # FOLLOW-UP (not applied here): Azure's own segmentation silence
-        # (PropertyId.Speech_SegmentationSilenceTimeoutMs, ~500ms default) is the
-        # ~549ms measured interim→final gap before our grace even starts. Lowering
-        # it would cut more latency, but it changes recognition segmentation and
-        # cannot be verified without live Azure, so it is left for a measured,
-        # separately-tested change rather than forced blind.
+        segmentation_silence_ms = SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS
+        if self._lang == "si" and segmentation_silence_ms:
+            speech_config.set_property(
+                azure_speech.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+                str(segmentation_silence_ms),
+            )
+        if self._privacy_safe:
+            logger.info(
+                "smartpbx_media event=stt_provider_start segmentation=%s "
+                "segmentation_silence_ms=%d",
+                "enabled" if self._lang == "si" and segmentation_silence_ms else "disabled",
+                segmentation_silence_ms if self._lang == "si" else 0,
+            )
         # 8 kHz / 16-bit / mono PCM — what mulaw decodes to.
         fmt = azure_speech.audio.AudioStreamFormat(
             samples_per_second=8000, bits_per_sample=16, channels=1,
