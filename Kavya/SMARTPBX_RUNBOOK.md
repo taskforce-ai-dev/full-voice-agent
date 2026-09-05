@@ -340,7 +340,7 @@ Azure-only recognizer setting. It is default-off (`0`), which preserves Azure's
 service default and leaves English, Google STT, both Twilio paths, shared
 endpointing/final/capture grace, barge-in, locale, and audio format unchanged.
 The controlled production canary value is
-`SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=800`.
+`SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=800`, meaning 800 (800 ms).
 
 For the canary, set that exact variable to `800` in the protected
 `.env.smartpbx`, render the SmartPBX Compose configuration, and use the normal
@@ -348,14 +348,10 @@ guarded recreate of the same pinned image. Verify only the privacy-safe
 `stt_provider_start` diagnostic: it reports `segmentation=enabled` and
 `segmentation_silence_ms=800` and never contains transcript or caller data.
 
-There are two independent rollback choices for this exact variable:
-
-1. Set `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0` and recreate the same
-   pinned image; or
-2. Omit/remove `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` from the
-   protected `.env.smartpbx` so Compose supplies zero via
-   `${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-0}`, then recreate the
-   same pinned image.
+There are two independent rollback choices for this exact variable. Rollback option 1: set `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0` and recreate the same pinned image. Rollback option 2: omit/remove `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` from the protected
+`.env.smartpbx`; that omission lets Compose supply zero via
+`${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-0}`, then recreate the same
+pinned image.
 
 ## Later reviewed English digit-class rollout
 

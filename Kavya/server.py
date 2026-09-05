@@ -6818,11 +6818,15 @@ class AzureSTTStream:
         on_interim_result: Any = None,
         lang: str = "si",
         privacy_safe: bool = False,
+        *,
+        direct_smartpbx_sinhala: bool = False,
     ):
         self._on_final = on_final_result
         self._on_interim = on_interim_result
         self._lang = lang
         self._privacy_safe = privacy_safe
+        self._direct_smartpbx_sinhala = direct_smartpbx_sinhala
+        self._segmentation_diagnostic_emitted = False
         self._chunk_count = 0
         self._running = False
         self._push_stream = None
@@ -6849,18 +6853,28 @@ class AzureSTTStream:
         )
         speech_config.speech_recognition_language = primary
         segmentation_silence_ms = SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS
-        if self._lang == "si" and segmentation_silence_ms:
+        if (
+            self._direct_smartpbx_sinhala
+            and self._lang == "si"
+            and segmentation_silence_ms
+        ):
             speech_config.set_property(
                 azure_speech.PropertyId.Speech_SegmentationSilenceTimeoutMs,
                 str(segmentation_silence_ms),
             )
-        if self._privacy_safe:
+        if (
+            self._direct_smartpbx_sinhala
+            and self._lang == "si"
+            and segmentation_silence_ms
+            and not self._segmentation_diagnostic_emitted
+        ):
             logger.info(
                 "smartpbx_media event=stt_provider_start segmentation=%s "
                 "segmentation_silence_ms=%d",
-                "enabled" if self._lang == "si" and segmentation_silence_ms else "disabled",
-                segmentation_silence_ms if self._lang == "si" else 0,
+                "enabled",
+                segmentation_silence_ms,
             )
+            self._segmentation_diagnostic_emitted = True
         # 8 kHz / 16-bit / mono PCM — what mulaw decodes to.
         fmt = azure_speech.audio.AudioStreamFormat(
             samples_per_second=8000, bits_per_sample=16, channels=1,
@@ -6994,6 +7008,7 @@ def _make_stt(
     *,
     provider: str | None = None,
     fail_closed: bool = False,
+    direct_smartpbx_sinhala: bool = False,
 ):
     """Build the configured STT backend. STT_PROVIDER: 'google' (default) | 'azure'.
 
@@ -7016,7 +7031,13 @@ def _make_stt(
             )
         )
         if azure_ready:
-            return AzureSTTStream(on_final_result, on_interim_result, lang, privacy_safe)
+            return AzureSTTStream(
+                on_final_result,
+                on_interim_result,
+                lang,
+                privacy_safe,
+                direct_smartpbx_sinhala=direct_smartpbx_sinhala,
+            )
         if fail_closed:
             raise RuntimeError("requested STT provider unavailable")
         logger.error("STT_PROVIDER=azure but Azure STT unavailable — falling back to Google")
@@ -8761,6 +8782,7 @@ class MediaStreamSession:
             on_final_result=self._on_stt_result,
             on_interim_result=self._on_stt_interim,
             lang=self.lang,
+            direct_smartpbx_sinhala=self._is_direct_smartpbx_sinhala(),
         )
         self._stt.start()
 

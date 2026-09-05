@@ -12,6 +12,7 @@ Sinhala have one.
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 from types import SimpleNamespace
 
@@ -79,7 +80,7 @@ def _fake_azure(factory):
     )
 
 
-def _run_start(monkeypatch, lang):
+def _run_start(monkeypatch, lang, *, direct_smartpbx_sinhala=False):
     factory = _PhraseListGrammarFactory()
     monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", True)
     monkeypatch.setattr(server, "AZURE_SPEECH_KEY", "test-key")
@@ -88,12 +89,23 @@ def _run_start(monkeypatch, lang):
     if server.audioop is None:  # pragma: no cover - audioop present on <3.13
         monkeypatch.setattr(server, "audioop", SimpleNamespace())
 
-    stream = server.AzureSTTStream(on_final_result=lambda *_: None, lang=lang)
+    stream = server._make_stt(
+        on_final_result=lambda *_: None,
+        on_interim_result=None,
+        lang=lang,
+        privacy_safe=True,
+        provider="azure",
+        fail_closed=True,
+        direct_smartpbx_sinhala=direct_smartpbx_sinhala,
+    )
     stream.start()
+    factory.stream = stream
     return factory
 
 
-def _run_start_with_segmentation_env(monkeypatch, lang, raw):
+def _run_start_with_segmentation_env(
+    monkeypatch, lang, raw, *, direct_smartpbx_sinhala=None,
+):
     """Reload the env-parsed server setting, then restore import state."""
     name = "SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS"
     previous = os.environ.get(name)
@@ -103,7 +115,15 @@ def _run_start_with_segmentation_env(monkeypatch, lang, raw):
         os.environ[name] = raw
     importlib.reload(server)
     try:
-        return _run_start(monkeypatch, lang)
+        return _run_start(
+            monkeypatch,
+            lang,
+            direct_smartpbx_sinhala=(
+                lang == "si"
+                if direct_smartpbx_sinhala is None
+                else direct_smartpbx_sinhala
+            ),
+        )
     finally:
         if previous is None:
             os.environ.pop(name, None)
@@ -216,3 +236,87 @@ def test_english_segmentation_silence_setting_remains_untouched(monkeypatch):
     factory = _run_start_with_segmentation_env(monkeypatch, "en", "800")
 
     assert factory.speech_configs[0].properties == []
+
+
+def test_make_stt_keeps_legacy_capability_false_and_forwards_direct_capability(monkeypatch):
+    monkeypatch.setattr(server, "AZURE_STT_AVAILABLE", True)
+    monkeypatch.setattr(server, "audioop", object())
+    monkeypatch.setattr(server, "AZURE_SPEECH_KEY", "test-key")
+
+    legacy = server._make_stt(
+        lambda *_: None,
+        lambda *_: None,
+        "si",
+        provider="azure",
+        fail_closed=True,
+    )
+    direct = server._make_stt(
+        lambda *_: None,
+        lambda *_: None,
+        "si",
+        provider="azure",
+        fail_closed=True,
+        direct_smartpbx_sinhala=True,
+    )
+
+    assert legacy._direct_smartpbx_sinhala is False
+    assert direct._direct_smartpbx_sinhala is True
+
+
+def test_legacy_sinhala_azure_never_sets_segmentation_or_logs_startup(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO):
+        factory = _run_start_with_segmentation_env(
+            monkeypatch, "si", "800", direct_smartpbx_sinhala=False,
+        )
+
+    assert factory.speech_configs[0].properties == []
+    assert not [
+        record.getMessage()
+        for record in caplog.records
+        if "event=stt_provider_start" in record.getMessage()
+    ]
+
+
+def test_direct_sinhala_segmentation_startup_diagnostic_is_bounded_and_one_shot(
+    monkeypatch, caplog,
+):
+    with caplog.at_level(logging.INFO):
+        factory = _run_start_with_segmentation_env(monkeypatch, "si", "800")
+        factory.stream.start()
+
+    diagnostics = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=stt_provider_start" in record.getMessage()
+    ]
+    assert diagnostics == [
+        "smartpbx_media event=stt_provider_start segmentation=enabled "
+        "segmentation_silence_ms=800",
+    ]
+    assert all(
+        private not in diagnostics[0]
+        for private in ("si", "caller", "transcript", "secret", "token", "password")
+    )
+
+
+@pytest.mark.parametrize(
+    ("lang", "raw", "direct_smartpbx_sinhala"),
+    [("en", "800", True), ("ta", "800", True), ("ar", "800", True), ("si", "0", True)],
+)
+def test_non_enabled_sinhala_capability_paths_have_no_property_or_diagnostic(
+    monkeypatch, caplog, lang, raw, direct_smartpbx_sinhala,
+):
+    with caplog.at_level(logging.INFO):
+        factory = _run_start_with_segmentation_env(
+            monkeypatch,
+            lang,
+            raw,
+            direct_smartpbx_sinhala=direct_smartpbx_sinhala,
+        )
+
+    assert factory.speech_configs[0].properties == []
+    assert not [
+        record.getMessage()
+        for record in caplog.records
+        if "event=stt_provider_start" in record.getMessage()
+    ]
