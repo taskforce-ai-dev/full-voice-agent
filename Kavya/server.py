@@ -2151,7 +2151,7 @@ def _log_rime_arcana_tts_outcome(
             else 0
         )
 
-    if safe_status is not None:
+    if safe_outcome == "http_status" and safe_status is not None:
         logger.warning(
             "smartpbx_media event=rime_tts provider=rime outcome=%s status=%d",
             safe_outcome, safe_status,
@@ -2201,11 +2201,12 @@ async def _stream_rime_arcana_mulaw(text: str) -> AsyncIterator[bytes]:
                 except httpx.HTTPStatusError:
                     raise _RimeArcanaTTSFailure("http_status", response.status_code) from None
                 response_headers = getattr(response, "headers", None)
-                if response_headers is not None:
-                    content_type = response_headers.get("content-type", "")
-                    media_type = content_type.split(";", 1)[0].strip().lower()
-                    if media_type not in {"audio/pcmu", "audio/basic"}:
-                        raise _RimeArcanaTTSFailure("transport_error")
+                if response_headers is None:
+                    raise _RimeArcanaTTSFailure("transport_error")
+                content_type = response_headers.get("content-type", "")
+                media_type = content_type.split(";", 1)[0].strip().lower()
+                if media_type not in {"audio/pcmu", "audio/basic"}:
+                    raise _RimeArcanaTTSFailure("transport_error")
                 async for chunk in response.aiter_bytes():
                     if not chunk:
                         continue
@@ -12436,35 +12437,45 @@ class MediaStreamSession:
         self._tts_synthesis_generation = expected_generation
         self._mark_smartpbx_turn_once("tts_request")
         try:
-            async for provider_chunk in _stream_rime_arcana_mulaw(text):
-                if not self._owns_sinhala_tts_stream(
-                    expected_generation, audio_emitted=audio_emitted
-                ):
-                    cancelled = True
-                    break
-                accepted = await self._send_media_audio(provider_chunk)
-                if not self._owns_sinhala_tts_stream(
-                    expected_generation, audio_emitted=audio_emitted
-                ):
-                    cancelled = True
-                    break
-                if not accepted:
-                    if audio_emitted:
+            async with contextlib.aclosing(_stream_rime_arcana_mulaw(text)) as provider_stream:
+                async for provider_chunk in provider_stream:
+                    if not self._owns_sinhala_tts_stream(
+                        expected_generation, audio_emitted=audio_emitted
+                    ):
                         cancelled = True
-                    else:
-                        failure = _RimeArcanaTTSFailure("transport_error")
-                    break
-                self._mark_smartpbx_turn_once("tts_first_chunk")
-                audio_emitted = self._mark_tts_audible(expected_generation)
-                if not audio_emitted:
-                    cancelled = True
-                    break
-                await self._flush_pre_audio_stt()
-                if not self._owns_sinhala_tts_stream(
-                    expected_generation, audio_emitted=audio_emitted
-                ):
-                    cancelled = True
-                    break
+                        break
+                    try:
+                        accepted = await self._send_media_audio(provider_chunk)
+                    except Exception:
+                        _log_rime_arcana_tts_outcome("transport_error")
+                        if audio_emitted:
+                            cancelled = True
+                        else:
+                            failure = _RimeArcanaTTSFailure("transport_error")
+                        break
+                    if not self._owns_sinhala_tts_stream(
+                        expected_generation, audio_emitted=audio_emitted
+                    ):
+                        cancelled = True
+                        break
+                    if not accepted:
+                        _log_rime_arcana_tts_outcome("transport_error")
+                        if audio_emitted:
+                            cancelled = True
+                        else:
+                            failure = _RimeArcanaTTSFailure("transport_error")
+                        break
+                    self._mark_smartpbx_turn_once("tts_first_chunk")
+                    audio_emitted = self._mark_tts_audible(expected_generation)
+                    if not audio_emitted:
+                        cancelled = True
+                        break
+                    await self._flush_pre_audio_stt()
+                    if not self._owns_sinhala_tts_stream(
+                        expected_generation, audio_emitted=audio_emitted
+                    ):
+                        cancelled = True
+                        break
             if not audio_emitted and not cancelled:
                 failure = _RimeArcanaTTSFailure("empty_audio")
             elif (
@@ -12474,7 +12485,7 @@ class MediaStreamSession:
                 and self._speak_generation == expected_generation
                 and self._owns_smartpbx_tts_delivery(expected_generation)
             ):
-                delivered = await self._send_tts_done(
+                await self._send_tts_done(
                     sentence=sentence, turn_generation=expected_generation,
                 )
         except asyncio.CancelledError:

@@ -41,9 +41,16 @@ class RejectSecondTransport(FakeTransport):
 class FakeRimeResponse:
     status_code = 200
 
-    def __init__(self, chunks: list[bytes], *, failure: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        failure: BaseException | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.chunks = chunks
         self.failure = failure
+        self.headers = {"content-type": "audio/PCMU"} if headers is None else headers
         self.yielded = 0
 
     def raise_for_status(self) -> None:
@@ -151,6 +158,51 @@ async def test_rime_stream_uses_pcmu_headers_and_streams_before_provider_eof(mon
 
 
 @pytest.mark.asyncio
+async def test_rime_stream_requires_response_headers_before_yielding(monkeypatch):
+    import server
+
+    response = FakeRimeResponse([b"must-not-send"])
+    del response.headers
+    client = FakeRimeClient(response)
+    monkeypatch.setattr(server, "RIME_API_KEY", "test-rime-key")
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+
+    with pytest.raises(server._RimeArcanaTTSFailure) as raised:
+        _ = [chunk async for chunk in server._stream_rime_arcana_mulaw("සිංහල")]
+
+    assert raised.value.outcome == "transport_error"
+    assert response.yielded == 0
+    assert client.http_stream.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [{}, {"content-type": "audio/mpeg"}])
+async def test_rime_missing_or_wrong_content_type_falls_back_before_audio(
+    monkeypatch, headers,
+):
+    import server
+
+    response = FakeRimeResponse([b"must-not-send"], headers=headers)
+    client = FakeRimeClient(response)
+    pipeline, transport = make_direct_sinhala(server)
+    gemini_calls: list[str] = []
+
+    async def gemini(text: str, **_kwargs):
+        gemini_calls.append(text)
+
+    monkeypatch.setattr(server, "RIME_API_KEY", "test-rime-key")
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", gemini)
+
+    await pipeline._tts_rime_sinhala("සිංහල")
+
+    assert response.yielded == 0
+    assert client.http_stream.closed is True
+    assert transport.audio == []
+    assert gemini_calls == ["සිංහල"]
+
+
+@pytest.mark.asyncio
 async def test_first_rime_audio_is_accepted_before_provider_eof_and_chunks_are_untouched(
     monkeypatch,
 ):
@@ -248,7 +300,7 @@ async def test_rime_failure_after_accepted_audio_never_falls_back_to_gemini(monk
 
 @pytest.mark.asyncio
 async def test_transport_rejection_on_second_rime_chunk_never_falls_back_to_gemini(
-    monkeypatch,
+    monkeypatch, caplog,
 ):
     import server
 
@@ -258,22 +310,71 @@ async def test_transport_rejection_on_second_rime_chunk_never_falls_back_to_gemi
     )
     pipeline._smartpbx_transfer_context = object()
     gemini_calls: list[str] = []
-
-    async def stream(_text: str):
-        yield b"accepted"
-        yield b"rejected"
+    response = FakeRimeResponse([b"accepted", b"rejected", b"never-read"])
+    client = FakeRimeClient(response)
 
     async def gemini(text: str, **_kwargs):
         gemini_calls.append(text)
 
-    monkeypatch.setattr(server, "_stream_rime_arcana_mulaw", stream)
+    monkeypatch.setattr(server, "RIME_API_KEY", "test-rime-key")
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
     monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", gemini)
+    caplog.set_level(logging.INFO)
 
     await pipeline._tts_rime_sinhala("සිංහල", sentence="සිංහල")
 
     assert transport.send_attempts == 2
     assert transport.audio == [b"accepted"]
     assert gemini_calls == []
+    assert response.yielded == 2
+    assert client.http_stream.closed is True
+    assert [
+        record.getMessage() for record in caplog.records
+        if "event=rime_tts" in record.getMessage()
+    ] == [
+        "smartpbx_media event=rime_tts provider=rime outcome=transport_error",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_false_rime_transport_rejection_logs_once_and_closes_provider(
+    monkeypatch, caplog,
+):
+    import server
+
+    pipeline, transport = make_direct_sinhala(server)
+    response = FakeRimeResponse([b"accepted", b"rejected", b"never-read"])
+    client = FakeRimeClient(response)
+    gemini_calls: list[str] = []
+    send_attempts = 0
+
+    async def reject_second_send(_audio: bytes) -> bool:
+        nonlocal send_attempts
+        send_attempts += 1
+        return send_attempts == 1
+
+    async def gemini(text: str, **_kwargs):
+        gemini_calls.append(text)
+
+    monkeypatch.setattr(server, "RIME_API_KEY", "test-rime-key")
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda: client)
+    monkeypatch.setattr(pipeline, "_send_media_audio", reject_second_send)
+    monkeypatch.setattr(pipeline, "_tts_gemini_sinhala", gemini)
+    caplog.set_level(logging.INFO)
+
+    await pipeline._tts_rime_sinhala("සිංහල")
+
+    assert send_attempts == 2
+    assert transport.audio == []
+    assert gemini_calls == []
+    assert response.yielded == 2
+    assert client.http_stream.closed is True
+    assert [
+        record.getMessage() for record in caplog.records
+        if "event=rime_tts" in record.getMessage()
+    ] == [
+        "smartpbx_media event=rime_tts provider=rime outcome=transport_error",
+    ]
 
 
 @pytest.mark.asyncio
@@ -372,6 +473,23 @@ async def test_rime_telemetry_is_bounded_and_privacy_safe(monkeypatch, caplog):
     assert response_body not in telemetry
     assert exception_text not in telemetry
     assert len(telemetry) <= 1000
+
+
+def test_rime_telemetry_status_is_limited_to_http_status_outcomes(caplog):
+    import server
+
+    caplog.set_level(logging.INFO)
+    server._log_rime_arcana_tts_outcome("transport_error", status=503)
+    server._log_rime_arcana_tts_outcome("http_status", status=700)
+
+    records = [
+        record.getMessage() for record in caplog.records
+        if "event=rime_tts" in record.getMessage()
+    ]
+    assert records == [
+        "smartpbx_media event=rime_tts provider=rime outcome=transport_error",
+        "smartpbx_media event=rime_tts provider=rime outcome=http_status status=599",
+    ]
 
 
 @pytest.mark.asyncio
