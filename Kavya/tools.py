@@ -746,7 +746,41 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         # number is unusable (wrong length -> normalize_whatsapp returns ""),
         # yanolja_service.book falls back to this so the booking still carries a
         # reachable WhatsApp number instead of storing garbage or nothing.
-        from handover import _get_handover_context
+        from handover import _get_handover_context, normalize_whatsapp
+
+        if transfer_context is not None:
+            caller_context = _get_handover_context()
+            if caller_context.get("_stt_capture_confirmation_required") is True:
+                return json.dumps({
+                    "status": "confirmation_required",
+                    "message": (
+                        "Do not create the booking yet. Read the recognized "
+                        "name or number back and receive explicit confirmation."
+                    ),
+                })
+            raw_guest_phone = tool_input.get("guest_phone", "")
+            normalized_guest_phone = normalize_whatsapp(
+                raw_guest_phone,
+                reject_ambiguous_lk_mobile=True,
+            )
+            if not normalized_guest_phone:
+                canonical_candidate = normalize_whatsapp(raw_guest_phone)
+                if (
+                    canonical_candidate
+                    and canonical_candidate
+                    == caller_context.get("_capture_validated_number")
+                ):
+                    normalized_guest_phone = canonical_candidate
+            if not normalized_guest_phone:
+                return json.dumps({
+                    "status": "invalid_number",
+                    "message": (
+                        "Do not create the booking yet. Ask the guest for their "
+                        "complete mobile number again, capture it, read it back, "
+                        "and receive explicit confirmation."
+                    ),
+                })
+            tool_input = {**tool_input, "guest_phone": normalized_guest_phone}
 
         caller_phone = _get_handover_context().get("caller_phone", "")
 
@@ -855,15 +889,24 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         state = ctx.setdefault("_capture_spoken_number", {})
         prior_attempts = int(state.get("attempts", 0))
 
-        normalized = normalize_whatsapp(digits)
+        normalized = normalize_whatsapp(
+            spoken, reject_ambiguous_lk_mobile=True,
+        )
         if normalized:
             ctx.pop("_capture_spoken_number", None)
-            return json.dumps(_build_capture_result_payload(
+            ctx["_capture_validated_number"] = normalized
+            payload = _build_capture_result_payload(
                 spoken=spoken,
                 digits=digits,
                 normalized=normalized,
                 attempts=prior_attempts,
-            ))
+            )
+            if (
+                ctx.get("_stt_capture_kind") == "phone"
+                and ctx.get("_stt_capture_confirmation_required") is True
+            ):
+                payload["confirmation_required"] = True
+            return json.dumps(payload)
 
         # EVERY ATTEMPT STANDS ALONE. A recognizer that drops an operand ("double"
         # without its digit) or a caller who restarts mid-number used to leave
@@ -874,6 +917,7 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         # number again. Fragments of one dictation are combined upstream by
         # capture mode, so a genuine multi-part number still arrives here whole.
         attempts = prior_attempts + 1
+        ctx.pop("_capture_validated_number", None)
         state.clear()
         state["attempts"] = attempts
         return json.dumps(_build_capture_result_payload(
@@ -903,13 +947,20 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         from handover import handover_context
 
         handover_context.set(ctx)
-        return json.dumps({
+        payload = {
             "status": "captured" if name else "invalid",
             "name": name,
             "readback": name,
             "length": len(name),
             "spelling": spoken,
-        })
+        }
+        if (
+            name
+            and ctx.get("_stt_capture_kind") == "name"
+            and ctx.get("_stt_capture_confirmation_required") is True
+        ):
+            payload["confirmation_required"] = True
+        return json.dumps(payload)
 
     else:
         logger.error("Unknown tool requested: %s", tool_name)

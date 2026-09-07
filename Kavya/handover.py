@@ -211,7 +211,6 @@ def assemble_spoken_name(raw: Any) -> str:
     """
     if not raw:
         return ""
-
     raw_text = str(raw).replace("-", " ")
     raw_text = raw_text.replace("|", " ")
     cleaned_text = re.sub(r"[.,]", " ", raw_text)
@@ -368,7 +367,9 @@ def spoken_number_to_digits(raw: Any) -> str:
     return "".join(parts)
 
 
-def normalize_whatsapp(raw: Any) -> str:
+def normalize_whatsapp(
+    raw: Any, *, reject_ambiguous_lk_mobile: bool = False,
+) -> str:
     """Normalise a spoken/dialled phone number to digits with a country code.
 
     Returns "" when the number is unusable OR the wrong length. It never
@@ -382,8 +383,11 @@ def normalize_whatsapp(raw: Any) -> str:
     Sri Lankan numbers are validated to a 9-digit national significant number
     (local trunk `077...`, bare `77...`, or `94...`). Genuine international
     numbers are accepted on their own terms if they pass an E.164 sanity check
-    (8-15 digits), so a foreign guest is not forced into Sri Lankan lengths --
-    only absurd lengths are rejected.
+    (8-15 digits), so a foreign guest is not forced into Sri Lankan lengths.
+    Capture and booking callers may set ``reject_ambiguous_lk_mobile`` to
+    reject a bare wrong-length `7...` candidate instead of silently
+    reclassifying it as international. The default preserves genuine +7
+    international numbers used by existing notification/storage callers.
 
     >>> normalize_whatsapp("+94 77 123 4567")
     '94771234567'
@@ -408,6 +412,8 @@ def normalize_whatsapp(raw: Any) -> str:
     """
     if not raw:
         return ""
+    raw_text = str(raw).strip()
+    explicit_plus = raw_text.startswith("+")
     # Single chokepoint: the same deterministic word->digit conversion used by
     # the live capture tool, so a wholly-spoken number ("nought seven six ...")
     # and its dialled equivalent normalise identically and cannot diverge.
@@ -438,14 +444,26 @@ def normalize_whatsapp(raw: Any) -> str:
         nsn = digits[len(DEFAULT_COUNTRY_CODE):]
         if is_valid_lk_nsn(nsn):
             return digits
-        # A "94..." of the wrong local length is not a Sri Lankan number. It may
-        # be a foreign number that merely happens to start 94 -- keep it only if
-        # it is E.164-sane, otherwise reject it.
-        return digits if _is_e164_sane(digits) else ""
+        # 94 is Sri Lanka's country code. A wrong-length 94-prefixed candidate
+        # is therefore a damaged local number, never a different country.
+        return ""
 
     # Bare national significant number ("771234567").
     if is_valid_lk_nsn(digits):
         return f"{DEFAULT_COUNTRY_CODE}{digits}"
+
+    # The live Sinhala pilot produced 77776067166 after Azure duplicated and
+    # misheard parts of a local mobile number.  A bare 7-prefixed candidate is
+    # overwhelmingly a Sri Lankan mobile dictation, so the wrong length must
+    # fail closed instead of taking the generic international path below.
+    # Explicit 00-prefixed foreign numbers were already handled above; other
+    # country codes, including Maldives 960, retain the E.164 path.
+    if (
+        reject_ambiguous_lk_mobile
+        and digits.startswith("7")
+        and not explicit_plus
+    ):
+        return ""
 
     # Anything else is treated as an already-complete international number
     # dictated with its country code (e.g. +1 415 555 0132 -> 14155550132).

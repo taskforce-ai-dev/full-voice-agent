@@ -111,6 +111,7 @@ def _patch_session(session: _FakeSession):
         # 074294451 into a plausible 9474294451 sent to a stranger).
         ("074294451", ""),                    # trunk form, one digit dropped
         ("07742944510", ""),                  # trunk form, one digit too many
+        ("947776067166", ""),                 # 94-prefixed local, too long
         ("74294451", ""),                     # bare, 8 digits - too short
         ("77", ""),                           # far too short
     ],
@@ -144,7 +145,24 @@ def test_international_numbers_are_accepted_on_their_own_length():
     is kept as-is; only absurd lengths are rejected."""
     assert normalize_whatsapp("+1 415 555 0132") == "14155550132"   # 11, kept
     assert normalize_whatsapp("0044 7700 900123") == "447700900123"  # 12, kept
+    assert normalize_whatsapp("+7 701 123 4567") == "77011234567"     # explicit +7
+    assert normalize_whatsapp("960 777 1234") == "9607771234"        # Maldives
     assert normalize_whatsapp("+1 415 555 013299999") == ""          # 16, absurd
+
+
+def test_capture_validation_rejects_ambiguous_wrong_length_lk_mobile():
+    # This exact bare shape was accepted during the 2026-09-07 Sinhala pilot.
+    # The strict capture/booking boundary rejects it, while the shared default
+    # remains capable of representing a genuine +7 international number.
+    assert normalize_whatsapp(
+        "77776067166", reject_ambiguous_lk_mobile=True,
+    ) == ""
+    assert normalize_whatsapp(
+        "+7 701 123 4567", reject_ambiguous_lk_mobile=True,
+    ) == "77011234567"
+    assert normalize_whatsapp(
+        "960 777 1234", reject_ambiguous_lk_mobile=True,
+    ) == "9607771234"
 
 
 def test_normalize_whatsapp_international_not_mangled():

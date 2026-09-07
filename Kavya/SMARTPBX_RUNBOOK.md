@@ -336,21 +336,30 @@ later sentence in a call.
 ## Controlled Sinhala Azure segmentation canary
 
 `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` is a direct SmartPBX Sinhala
-Azure-only recognizer setting. It is default-off (`0`), which preserves Azure's
-service default and leaves English, Google STT, both Twilio paths, shared
-endpointing/final/capture grace, barge-in, locale, and audio format unchanged.
-The controlled production canary value is
-`SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=800`, meaning 800 (800 ms).
+Azure-only recognizer setting. The reviewed default is `1200` ms; any non-zero
+value below `1200` is raised to that floor. This avoids committing the short
+thinking pauses that the 800 ms pilot turned into premature turns, while
+leaving English, Google STT, both Twilio paths, shared final/capture grace,
+barge-in, locale, and audio format unchanged.
 
-For the canary, set that exact variable to `800` in the protected
+For the canary, set that exact variable to `1200` in the protected
 `.env.smartpbx`, render the SmartPBX Compose configuration, and use the normal
 guarded recreate of the same pinned image. Verify only the privacy-safe
 `stt_provider_start` diagnostic: it reports `segmentation=enabled` and
-`segmentation_silence_ms=800` and never contains transcript or caller data.
+`segmentation_silence_ms=1200` and never contains transcript or caller data.
 
-There are two independent rollback choices for this exact variable. Rollback option 1: set `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0` and recreate the same pinned image. Rollback option 2: omit/remove `SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS` from the protected environment file; that omission lets Compose supply zero via
-`${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-0}`, then recreate the same
-pinned image. The protected file is `.env.smartpbx`.
+Rollback for this exact variable: set
+`SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS=0` and recreate the same pinned
+image. Omitting/removing the variable is not a rollback: Compose then restores
+the reviewed `1200` ms default via
+`${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-1200}`. The protected file is
+`.env.smartpbx`.
+
+Direct Sinhala Azure recognition uses detailed final results only to obtain the
+bounded NBest confidence score. If a requested name or phone number is below
+`SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD` (default `0.65`), Kavya must
+read back what she understood and receive an explicit yes/no before accepting
+it or calling `create_booking`. The score and transcript are not logged.
 
 ## Later reviewed English digit-class rollout
 

@@ -4023,32 +4023,30 @@ def test_sinhala_azure_segmentation_canary_is_allowlisted_and_reversible():
     legacy = compose["services"]["kavya"]["environment"]
     variable = "SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS"
 
-    assert smartpbx[variable] == "${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-0}"
+    assert smartpbx[variable] == "${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-1200}"
     assert variable not in legacy
 
     example = read_text(".env.example")
-    assert re.search(rf"^{variable}=0$", example, re.MULTILINE)
+    assert re.search(rf"^{variable}=1200$", example, re.MULTILINE)
 
     runbook = read_text("SMARTPBX_RUNBOOK.md")
     normalized = re.sub(r"\s+", " ", runbook).casefold()
-    canary_sentences = [
-        sentence for sentence in re.split(r"[.!?]", normalized)
-        if variable.casefold() in sentence or "800 ms" in sentence
-    ]
-    assert any(
-        "800 ms" in sentence and variable.casefold() in sentence
-        for sentence in canary_sentences
-    )
-    assert any(
-        "rollback" in sentence
-        and f"{variable}=0".casefold() in sentence
-        for sentence in canary_sentences
-    )
-    assert any(
-        "rollback" in sentence
-        and variable.casefold() in sentence
-        and ("omission" in sentence or "omitted" in sentence)
-        for sentence in canary_sentences
+    assert "reviewed default is `1200` ms" in normalized
+    assert f"{variable}=0".casefold() in normalized
+    assert "omitting/removing the variable is not a rollback" in normalized
+    assert f"${{{variable}:-1200}}".casefold() in normalized
+
+
+def test_sinhala_azure_low_confidence_threshold_is_smartpbx_only():
+    compose = yaml.safe_load(read_text("docker-compose.yml"))
+    smartpbx = compose["services"]["kavya-smartpbx"]["environment"]
+    legacy = compose["services"]["kavya"]["environment"]
+    variable = "SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD"
+
+    assert smartpbx[variable] == f"${{{variable}:-0.65}}"
+    assert variable not in legacy
+    assert re.search(
+        rf"^{variable}=0\.65$", read_text(".env.example"), re.MULTILINE,
     )
 
 

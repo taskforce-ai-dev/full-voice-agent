@@ -151,6 +151,40 @@ def test_incomplete_or_invalid_spoken_number_never_persists_a_guest_phone_slot(r
     assert "phone:" not in session._active_system_prompt().lower()
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "result", "slot"),
+    (
+        (
+            "capture_spoken_number",
+            {
+                "status": "captured",
+                "valid": True,
+                "normalized": "94771234567",
+                "confirmation_required": True,
+            },
+            "guest_phone",
+        ),
+        (
+            "capture_spoken_name",
+            {
+                "status": "captured",
+                "name": "Test Guest",
+                "confirmation_required": True,
+            },
+            "guest_name",
+        ),
+    ),
+)
+def test_low_confidence_capture_is_not_persisted_before_confirmation(
+    tool_name, result, slot,
+):
+    session = make_session()
+
+    session._record_capture_tool_completion(tool_name, result)
+
+    assert slot not in session._booking_slots
+
+
 @pytest.mark.parametrize("runner_name", ("_run_llm", "_run_llm_gemini", "_run_llm_claude"))
 def test_captured_spoken_name_persists_as_authoritative_guest_name_for_every_media_runner(
     runner_name,
