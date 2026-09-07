@@ -6833,6 +6833,90 @@ def _azure_final_confidence(result: Any) -> float | None:
     return confidence if 0.0 <= confidence <= 1.0 else None
 
 
+@dataclass(frozen=True)
+class AzureFinalMetadata:
+    """Bounded Azure final identity used only inside one live call."""
+
+    result_id: str | None
+    offset: int | None
+    duration: int | None
+    confidence: float | None
+
+    @property
+    def interval(self) -> tuple[int, int] | None:
+        if self.offset is None or self.duration is None or self.duration <= 0:
+            return None
+        return self.offset, self.offset + self.duration
+
+
+@dataclass(frozen=True)
+class _AzureFinalSegment:
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class _PendingCaptureConfirmation:
+    kind: str
+    value: str
+    readback: str
+    attempts: int = 0
+
+
+_CAPTURE_CONFIRM_YES = frozenset({
+    "yes", "yeah", "yep", "correct", "right", "okay", "ok",
+    "yes that is correct", "yes thats correct", "that is correct",
+    "thats correct", "ඔව්", "හරි", "ඔව් හරි", "එහෙමයි",
+})
+_CAPTURE_CONFIRM_NO = frozenset({
+    "no", "nope", "not correct", "that is wrong", "thats wrong",
+    "no that is wrong",
+    "නැහැ", "නෑ", "නැ", "වරදියි", "නැහැ ඒක වැරදියි",
+})
+
+
+def _capture_confirmation_reply(text: str) -> str:
+    """Classify only a complete, explicit reply to an identity readback.
+
+    Anything with additional material is a fresh correction attempt, never an
+    implicit confirmation.  That preserves the existing whole-number rule and
+    prevents a phrase such as ``yes, but double six at the end`` from accepting
+    the old number before the correction has been captured.
+    """
+    # Python's ``\w`` excludes Sinhala combining vowel signs, so a pattern
+    # limited to ``\w`` silently changes explicit replies such as ``ඔව්``
+    # before classification. Preserve the complete Sinhala Unicode block
+    # while still reducing punctuation-only material to separators.
+    normalized = re.sub(r"[^\w\s\u0D80-\u0DFF]", " ", str(text).casefold())
+    normalized = " ".join(normalized.split())
+    if normalized in _CAPTURE_CONFIRM_YES:
+        return "confirmed"
+    if normalized in _CAPTURE_CONFIRM_NO:
+        return "rejected"
+    return "replacement"
+
+
+def _azure_nonnegative_int(value: Any) -> int | None:
+    """Accept only SDK-shaped non-negative integer ticks, never coercions."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _azure_final_metadata(result: Any) -> AzureFinalMetadata:
+    """Extract identity/timing without logging Azure's result or raw JSON."""
+    raw_result_id = getattr(result, "result_id", None)
+    result_id = raw_result_id.strip() if isinstance(raw_result_id, str) else None
+    if result_id is not None and len(result_id) > 256:
+        result_id = None
+    return AzureFinalMetadata(
+        result_id=result_id or None,
+        offset=_azure_nonnegative_int(getattr(result, "offset", None)),
+        duration=_azure_nonnegative_int(getattr(result, "duration", None)),
+        confidence=_azure_final_confidence(result),
+    )
+
+
 class AzureSTTStream:
     """Streams audio to Azure Speech-to-Text — drop-in alternative to GoogleSTTStream.
 
@@ -6856,11 +6940,13 @@ class AzureSTTStream:
         privacy_safe: bool = False,
         *,
         on_final_result_with_confidence: Any = None,
+        on_final_result_with_metadata: Any = None,
         direct_smartpbx_sinhala: bool = False,
     ):
         self._on_final = on_final_result
         self._on_interim = on_interim_result
         self._on_final_with_confidence = on_final_result_with_confidence
+        self._on_final_with_metadata = on_final_result_with_metadata
         self._lang = lang
         self._privacy_safe = privacy_safe
         self._direct_smartpbx_sinhala = direct_smartpbx_sinhala
@@ -7019,7 +7105,9 @@ class AzureSTTStream:
                 logger.info("smartpbx_media event=stt_provider_final")
             else:
                 logger.info("Azure STT final: %r", text)
-            if self._on_final_with_confidence is not None:
+            if self._on_final_with_metadata is not None:
+                self._on_final_with_metadata(text, _azure_final_metadata(evt.result))
+            elif self._on_final_with_confidence is not None:
                 self._on_final_with_confidence(
                     text, _azure_final_confidence(evt.result)
                 )
@@ -7054,6 +7142,7 @@ def _make_stt(
     privacy_safe: bool = False,
     *,
     on_final_result_with_confidence: Any = None,
+    on_final_result_with_metadata: Any = None,
     provider: str | None = None,
     fail_closed: bool = False,
     direct_smartpbx_sinhala: bool = False,
@@ -7085,6 +7174,7 @@ def _make_stt(
                 lang,
                 privacy_safe,
                 on_final_result_with_confidence=on_final_result_with_confidence,
+                on_final_result_with_metadata=on_final_result_with_metadata,
                 direct_smartpbx_sinhala=direct_smartpbx_sinhala,
             )
         if fail_closed:
@@ -7261,6 +7351,15 @@ class MediaStreamSession:
         # each cumulative interim simply overwrites the pending text.
         self._committed_transcript = ""
         self._committed_transcript_confidence: float | None = None
+        # Azure's identity is retained as bounded metadata only. Pending spans
+        # describe the current utterance; the two LRUs let a late provider
+        # duplicate be refused after that utterance has already dispatched.
+        self._azure_final_segments: list[_AzureFinalSegment] = []
+        self._azure_final_result_ids: OrderedDict[str, None] = OrderedDict()
+        self._azure_final_intervals: OrderedDict[tuple[int, int], None] = OrderedDict()
+        self._pre_audio_stt_final_records: list[
+            tuple[str, AzureFinalMetadata | None]
+        ] = []
         self._latest_interim = ""
         self._endpointing_handle: asyncio.TimerHandle | None = None
         # Every armed endpointing callback owns one monotonically increasing
@@ -7289,6 +7388,14 @@ class MediaStreamSession:
         self._last_guest_utterance_confidence: float | None = None
         self._last_guest_utterance_capture_kind: str = "generic"
         self._last_guest_utterance_confirmation_required: bool = False
+        self._pending_capture_confirmation: _PendingCaptureConfirmation | None = None
+        self._capture_confirmation_outcome: tuple[str, str] | None = None
+        self._confirmed_capture_slots: set[str] = set()
+        # Once two spoken-number attempts have failed, Sinhala SmartPBX must
+        # stay on the keypad path until that collection completes or ends.  A
+        # session flag (mirrored as a non-PII context marker) prevents the
+        # model from restarting the same spoken loop on the next turn.
+        self._keypad_required: bool = False
         # Capture-mode keeps endpointing looser while the caller is dictating
         # a number or name across fragments, and combines the fragments into one
         # utterance instead of spending an LLM turn on each.
@@ -7315,7 +7422,7 @@ class MediaStreamSession:
         # Set only by KavyaSmartPBXSession. None preserves legacy Twilio tools.
         self._smartpbx_transfer_context: Any | None = None
         self._smartpbx_welcome_audio_pending: str | None = None
-        self._smartpbx_caller_context: dict[str, str] | None = None
+        self._smartpbx_caller_context: dict[str, Any] | None = None
         self._record_echo_rejection: Callable[[int, float], None] | None = None
         self.transfer_pending = False
         self._turn_telemetry: SmartPBXTurnTelemetry | None = None
@@ -8421,6 +8528,7 @@ class MediaStreamSession:
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._committed_transcript_confidence = None
+        self._azure_final_segments = []
         self._latest_interim = ""
         self._deferred_flush_pending = False
         self._utterance_dispatched = False
@@ -8526,6 +8634,8 @@ class MediaStreamSession:
             # result paths before the identity-fenced ownership release below.
             collector.cancel()
             self._release_dtmf_collector(collector)
+        if self._is_direct_smartpbx_sinhala():
+            result = self._finalize_keypad_capture_result(result)
         if self._is_smartpbx_session():
             logger.info("smartpbx_media event=dtmf_collect_done status=%s", result.get("status"))
         return json.dumps(result)
@@ -8569,6 +8679,12 @@ class MediaStreamSession:
                 continue
             text = str(value).strip()
             if text:
+                # A model may repeat an old tool argument or invent a new one
+                # while composing create_booking.  Identity values promoted by
+                # capture are caller-owned; only the confirmation state machine
+                # may replace them.
+                if key in {"guest_name", "guest_phone"} and key in self._confirmed_capture_slots:
+                    continue
                 self._booking_slots[key] = text
 
     def _capture_explicit_residency(self, utterance: str) -> None:
@@ -8797,20 +8913,55 @@ class MediaStreamSession:
         )
 
     def _stt_confirmation_note(self) -> str:
-        """Turn-local instruction for a low-confidence Sinhala capture."""
-        if not self._last_guest_utterance_confirmation_required:
+        """Render the durable low-confidence identity guard for the active turn."""
+        if self._keypad_required:
+            return (
+                "\n\nPHONE KEYPAD REQUIRED:\n"
+                "- The spoken number could not be verified after two full attempts.\n"
+                "- Call collect_number_via_keypad now; do not call capture_spoken_number again.\n"
+                "- Do not call create_booking or notify_human_handover until a valid keypad number is captured.\n"
+            )
+        pending = self._pending_capture_confirmation
+        if pending is not None:
+            return (
+                "\n\nCAPTURE CONFIRMATION REQUIRED:\n"
+                f"- The requested {pending.kind} was recognized with low confidence.\n"
+                f"- Read back exactly this value: {pending.readback}. Ask for an explicit yes/no.\n"
+                "- Do not call create_booking or notify_human_handover until the caller says yes.\n"
+            )
+        if self._last_guest_utterance_confirmation_required:
+            kind = self._last_guest_utterance_capture_kind
+            if kind in {"name", "phone"}:
+                return (
+                    "\n\nLATEST RECOGNITION SAFETY NOTE:\n"
+                    f"- Azure marked the latest requested {kind} transcription as low confidence.\n"
+                    "- Read back exactly what you understood and ask for an explicit yes/no "
+                    "confirmation before accepting it.\n"
+                    "- Do not call create_booking or notify_human_handover on the same turn. "
+                    f"If the guest says no, ask for the complete {kind} again.\n"
+                )
+        if self._capture_confirmation_outcome is None:
             return ""
-        kind = self._last_guest_utterance_capture_kind
-        if kind not in {"name", "phone"}:
-            return ""
-        return (
-            "\n\nLATEST RECOGNITION SAFETY NOTE:\n"
-            f"- Azure marked the latest requested {kind} transcription as low confidence.\n"
-            "- Read back exactly what you understood and ask for an explicit yes/no "
-            "confirmation before accepting it.\n"
-            "- Do not call create_booking on the same turn. If the guest says no, "
-            f"ask for the complete {kind} again.\n"
-        )
+        outcome, kind = self._capture_confirmation_outcome
+        if outcome == "rejected":
+            return (
+                "\n\nCAPTURE CORRECTION:\n"
+                f"- The caller rejected the previous {kind}. Ask for the complete {kind} again; "
+                "do not reuse or patch the old value.\n"
+            )
+        if outcome == "replacement":
+            return (
+                "\n\nCAPTURE CORRECTION:\n"
+                f"- The caller is correcting the previous {kind}. Capture their complete new "
+                f"{kind}; never patch the old value.\n"
+            )
+        if outcome == "retained":
+            return (
+                "\n\nCAPTURE CORRECTION:\n"
+                f"- The caller rejected a proposed new {kind}. Keep the already confirmed "
+                f"{kind}; do not ask for it again.\n"
+            )
+        return ""
 
     def _log_tool_result(self, tool_name: str, result: str) -> None:
         self._mark_smartpbx_turn("tool_complete")
@@ -8998,26 +9149,61 @@ class MediaStreamSession:
         if self._smartpbx_en_pre_audio_generation == generation:
             self._smartpbx_en_pre_audio_active = False
 
-    def _clear_pre_audio_stt(self) -> str:
+    def _clear_pre_audio_stt(
+        self,
+    ) -> tuple[str, list[tuple[str, AzureFinalMetadata | None]], bool]:
+        """Return buffered pre-audio speech without losing Azure identity.
+
+        A latest interim remains the authoritative pre-audio snapshot, exactly
+        as before.  In its absence, individual Azure finals retain their
+        metadata until they reach the loop-owned accumulator.
+        """
+        has_interim = bool(self._pre_audio_stt_latest_interim)
         text = self._pre_audio_stt_latest_interim or self._pre_audio_stt_committed
+        final_records = self._pre_audio_stt_final_records
         self._pre_audio_stt_generation = None
         self._pre_audio_stt_first_at = 0.0
         self._pre_audio_stt_events = 0
         self._pre_audio_stt_committed = ""
         self._pre_audio_stt_latest_interim = ""
-        return text
+        self._pre_audio_stt_final_records = []
+        return text, final_records, has_interim
 
     async def _flush_pre_audio_stt(self) -> None:
         """Admit one unproven pre-audio tail without cancelling real speech."""
-        text = self._clear_pre_audio_stt()
+        text, final_records, has_interim = self._clear_pre_audio_stt()
+        if has_interim:
+            if text:
+                await self._set_transcript_interim(text)
+            return
+        if final_records:
+            for final_text, metadata in final_records:
+                if metadata is None:
+                    # Preserve the established one-argument seam for English,
+                    # Google, Twilio, and test/runtime wrappers.
+                    await self._accumulate_transcript(final_text)
+                else:
+                    await self._accumulate_transcript(
+                        final_text, metadata.confidence, metadata,
+                    )
+            return
         if text:
             await self._accumulate_transcript(text)
 
-    async def _handle_pre_audio_stt(self, result_type: str, text: str) -> None:
+    async def _handle_pre_audio_stt(
+        self,
+        result_type: str,
+        text: str,
+        metadata: AzureFinalMetadata | None = None,
+    ) -> None:
         """Yield only on bounded continuing STT activity before audio exists."""
         if not self._pre_audio_synthesis_active():
             if result_type == "final":
-                await self._accumulate_transcript(text)
+                await self._accumulate_transcript(
+                    text,
+                    metadata.confidence if metadata is not None else None,
+                    metadata,
+                )
             else:
                 await self._set_transcript_interim(text)
             return
@@ -9037,6 +9223,7 @@ class MediaStreamSession:
                 else text
             )
             self._pre_audio_stt_latest_interim = ""
+            self._pre_audio_stt_final_records.append((text, metadata))
         else:
             committed = self._pre_audio_stt_committed
             exact_prefix = f"{committed} "
@@ -9062,11 +9249,24 @@ class MediaStreamSession:
         )
         if not sustained:
             return
-        caller_text = self._clear_pre_audio_stt()
+        caller_text, final_records, has_interim = self._clear_pre_audio_stt()
         # The shared barge-in transition cancels and joins the pending direct
         # TTS, fences its generation, and clears queued media before this new
         # caller speech becomes the next dispatch exactly once.
         await self._handle_bargein()
+        if has_interim:
+            if caller_text:
+                await self._set_transcript_interim(caller_text)
+            return
+        if final_records:
+            for final_text, final_metadata in final_records:
+                if final_metadata is None:
+                    await self._accumulate_transcript(final_text)
+                else:
+                    await self._accumulate_transcript(
+                        final_text, final_metadata.confidence, final_metadata,
+                    )
+            return
         if caller_text:
             await self._accumulate_transcript(caller_text)
 
@@ -9076,8 +9276,27 @@ class MediaStreamSession:
         """Direct Sinhala Azure final callback with bounded recognition metadata."""
         self._on_stt_result(transcript, confidence=confidence)
 
+    def _on_stt_result_with_metadata(
+        self, transcript: str, metadata: AzureFinalMetadata,
+    ) -> None:
+        """Submit a Direct Sinhala Azure final before any speaking decision.
+
+        This remains an SDK-thread callback.  In particular, a late repeated
+        Azure final must be reconciled on the event loop before it can be
+        mistaken for fresh caller speech and trigger a barge-in.
+        """
+        self._on_stt_result(
+            transcript,
+            confidence=metadata.confidence,
+            metadata=metadata,
+        )
+
     def _on_stt_result(
-        self, transcript: str, *, confidence: float | None = None,
+        self,
+        transcript: str,
+        *,
+        confidence: float | None = None,
+        metadata: AzureFinalMetadata | None = None,
     ):
         """Called from STT thread on FINAL results."""
         if self.transfer_pending:
@@ -9092,8 +9311,15 @@ class MediaStreamSession:
         # every loop-side reader of the transcript buffers.
         if self._event_loop is None:
             return
+        if metadata is not None:
+            self._submit_stt_callback(
+                self._handle_azure_final_result, transcript, metadata,
+            )
+            return
         if self._pre_audio_synthesis_active():
-            self._submit_stt_callback(self._handle_pre_audio_stt, "final", transcript)
+            self._submit_stt_callback(
+                self._handle_pre_audio_stt, "final", transcript, metadata,
+            )
             return
         if self._is_speaking:
             if self._is_echo(transcript):
@@ -9527,7 +9753,10 @@ class MediaStreamSession:
     @staticmethod
     def _capture_followup_required(result: dict[str, Any]) -> bool:
         status = str(result.get("status", "")).lower()
-        return status in {"needs_more", "invalid", "unavailable"}
+        return status in {
+            "needs_more", "invalid", "invalid_number", "unavailable",
+            "keypad_required", "no_input", "cancelled",
+        }
 
     def _refine_capture_kind(self, kind: str) -> None:
         """Refine an active direct-call capture episode without re-budgeting it."""
@@ -9680,32 +9909,226 @@ class MediaStreamSession:
             return None
         return f"I've got that as {readback} — is that correct?"
 
+    @staticmethod
+    def _capture_slot_for_kind(kind: str) -> str:
+        return "guest_name" if kind == "name" else "guest_phone"
+
+    def _capture_context(self) -> dict[str, Any] | None:
+        context = self._smartpbx_caller_context
+        return context if isinstance(context, dict) else None
+
+    def _clear_pending_capture_confirmation(self) -> None:
+        self._pending_capture_confirmation = None
+        context = self._capture_context()
+        if context is not None:
+            context.pop("_pending_capture_confirmation", None)
+            context.pop("_capture_candidate_pending", None)
+
+    def _set_keypad_required(self) -> None:
+        """Fence a failed spoken-phone episode to the direct Sinhala keypad."""
+        if not self._is_direct_smartpbx_sinhala():
+            return
+        self._keypad_required = True
+        self._exit_capture_mode("keypad_required")
+        context = self._capture_context()
+        if context is not None:
+            context["_keypad_required"] = True
+            # This also blocks reuse of a previously confirmed phone while a
+            # caller is replacing it.  It carries no customer value itself.
+            context["_capture_candidate_pending"] = "phone"
+
+    def _clear_keypad_required(self, *, keep_retry_marker: bool = False) -> None:
+        """End one keypad episode without reviving stale spoken state."""
+        self._keypad_required = False
+        context = self._capture_context()
+        if context is None:
+            return
+        context.pop("_keypad_required", None)
+        context.pop("_capture_spoken_number", None)
+        if not keep_retry_marker:
+            context.pop("_capture_candidate_pending", None)
+
+    def _set_pending_capture_confirmation(
+        self, *, kind: str, value: str, readback: str, attempts: int = 0,
+    ) -> None:
+        self._pending_capture_confirmation = _PendingCaptureConfirmation(
+            kind=kind, value=value, readback=readback or value, attempts=attempts,
+        )
+        context = self._capture_context()
+        if context is not None:
+            # Tools need only the fact that an identity is unresolved.  Keeping
+            # the candidate in the session avoids another PII-bearing state.
+            context["_pending_capture_confirmation"] = kind
+            context.pop("_capture_candidate_pending", None)
+
+    def _promote_capture_confirmation(
+        self, pending: _PendingCaptureConfirmation,
+    ) -> None:
+        slot = self._capture_slot_for_kind(pending.kind)
+        self._booking_slots[slot] = pending.value
+        self._confirmed_capture_slots.add(slot)
+        context = self._capture_context()
+        if context is not None:
+            if pending.kind == "phone":
+                context["_capture_validated_number"] = pending.value
+                context["_confirmed_capture_phone"] = True
+            else:
+                context["spelled_name"] = pending.value
+                context["_confirmed_capture_name"] = True
+        if pending.kind == "phone":
+            self._clear_keypad_required()
+        self._clear_pending_capture_confirmation()
+
+    def _apply_pending_capture_confirmation(self, text: str) -> str:
+        """Resolve a caller's explicit reply to the currently pending identity."""
+        pending = self._pending_capture_confirmation
+        if pending is None:
+            return "none"
+        outcome = _capture_confirmation_reply(text)
+        if outcome == "confirmed":
+            self._promote_capture_confirmation(pending)
+        else:
+            self._clear_pending_capture_confirmation()
+            context = self._capture_context()
+            # A caller can reject the readback with a whole correction rather
+            # than a bare "no". That correction reaches this turn's LLM before
+            # its capture tool, so every non-confirmed outcome must fence stale
+            # identity arguments for the entire recapture episode.
+            if context is not None:
+                context["_capture_candidate_pending"] = pending.kind
+            if outcome == "rejected":
+                # A rejected replacement is not permission to revive the
+                # older confirmed slot.  Preserve that slot internally for a
+                # later readback if useful, but keep every side effect fenced
+                # until the caller supplies and confirms a complete value.
+                self._enter_capture_mode(
+                    reason="confirmation_rejected", kind=pending.kind,
+                )
+            elif outcome == "replacement":
+                self._enter_capture_mode(
+                    reason="confirmation_replacement", kind=pending.kind,
+                )
+        self._capture_confirmation_outcome = (outcome, pending.kind)
+        return outcome
+
+    def _record_booking_tool_completion(
+        self, tool_name: str, tool_input: Any, result: dict[str, Any] | None,
+    ) -> None:
+        """Persist booking arguments only when the side effect was admissible."""
+        if (
+            tool_name == "create_booking"
+            and isinstance(result, dict)
+            and str(result.get("status", "")).lower()
+            in {"confirmation_required", "capture_required", "invalid_number"}
+        ):
+            return
+        self._capture_booking_slots(tool_name, tool_input)
+
+    def _finalize_keypad_capture_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a collected SmartPBX keypad number through the capture seam."""
+        status = str(result.get("status", "")).lower()
+        context = self._capture_context()
+        keep_retry_marker = bool(
+            context is not None and context.get("_confirmed_capture_phone")
+        )
+        if status in {"no_input", "cancelled", "invalid", "invalid_number"}:
+            # The collector has ended. Let the guest make one complete new
+            # spoken attempt, but never let an unresolved replacement expose
+            # the older confirmed number to a side-effect tool.
+            self._clear_keypad_required(keep_retry_marker=keep_retry_marker)
+            return result
+        if status != "collected":
+            return result
+        from handover import normalize_whatsapp
+
+        digits = str(result.get("digits", "")).strip()
+        normalized = normalize_whatsapp(digits, reject_ambiguous_lk_mobile=True)
+        if not normalized:
+            self._clear_keypad_required(keep_retry_marker=keep_retry_marker)
+            return {
+                "status": "invalid_number",
+                "valid": False,
+                "normalized": "",
+                "readback": "",
+                "length": len(digits),
+            }
+        captured = {
+            "status": "captured",
+            "valid": True,
+            "normalized": normalized,
+            "readback": " ".join(digits),
+            "length": len(digits),
+        }
+        self._clear_keypad_required()
+        self._record_capture_tool_completion("capture_spoken_number", captured)
+        return captured
+
     def _record_capture_tool_completion(self, tool_name: str, result: dict[str, Any]) -> None:
         if tool_name not in self._capture_complete_tools():
             return
+        status = str(result.get("status", "")).lower()
+        kind = "name" if tool_name == "capture_spoken_name" else "phone"
+        context = self._capture_context()
+        if kind == "phone" and (
+            status == "keypad_required"
+            or (status == "needs_more" and result.get("fallback_allowed") is True)
+        ):
+            self._set_keypad_required()
+            return
         if self._capture_followup_required(result):
-            kind = (
-                "name"
-                if tool_name == "capture_spoken_name"
-                else "phone"
-            )
+            # A keypad no-input/cancel/invalid result ends the required
+            # episode. Re-enter one fresh spoken episode.  If the caller was
+            # replacing a confirmed phone, retain the retry marker so booking
+            # and handover cannot fall back to that old value mid-correction.
+            if kind == "phone" and status == "needs_more":
+                # This is a failed *spoken* attempt. Keep its attempt counter
+                # so the second failure reaches the keypad gate, and keep the
+                # retry marker if it was replacing a confirmed number.
+                if context is not None:
+                    if context.get("_confirmed_capture_phone"):
+                        context["_capture_candidate_pending"] = "phone"
+                    else:
+                        context.pop("_capture_candidate_pending", None)
+            elif kind == "name" and context is not None:
+                if context.get("_confirmed_capture_name"):
+                    context["_capture_candidate_pending"] = "name"
+                else:
+                    context.pop("_capture_candidate_pending", None)
+            elif kind == "phone" and status in {"no_input", "cancelled", "invalid", "invalid_number"}:
+                self._clear_keypad_required(
+                    keep_retry_marker=bool(
+                        context is not None and context.get("_confirmed_capture_phone")
+                    ),
+                )
+            elif context is not None:
+                context.pop("_capture_candidate_pending", None)
             self._enter_capture_mode(reason="tool_needs_more", kind=kind)
             return
-        captured = str(result.get("status", "")).lower() == "captured"
+        captured = status == "captured"
         if captured:
             confirmation_required = result.get("confirmation_required") is True
-            if (
-                not confirmation_required
-                and tool_name == "capture_spoken_number"
-                and result.get("valid") is not False
-            ):
-                normalized = str(result.get("normalized", "")).strip()
-                if normalized:
-                    self._booking_slots["guest_phone"] = normalized
-            elif not confirmation_required and tool_name == "capture_spoken_name":
-                name = str(result.get("name", "")).strip()
-                if name:
-                    self._booking_slots["guest_name"] = name
+            kind = "name" if tool_name == "capture_spoken_name" else "phone"
+            value = (
+                str(result.get("name", "")).strip()
+                if kind == "name"
+                else str(result.get("normalized", "")).strip()
+            )
+            if value and (kind != "phone" or result.get("valid") is not False):
+                readback = str(result.get("readback", "")).strip()
+                slot = self._capture_slot_for_kind(kind)
+                if confirmation_required or (
+                    slot in self._confirmed_capture_slots
+                    and self._booking_slots.get(slot) != value
+                ):
+                    self._set_pending_capture_confirmation(
+                        kind=kind,
+                        value=value,
+                        readback=readback,
+                    )
+                else:
+                    self._promote_capture_confirmation(
+                        _PendingCaptureConfirmation(kind, value, readback)
+                    )
             # The read-back of a successful capture reads exactly like an ask, so
             # stand the ask detector down for the remainder of this turn.
             self._capture_success_this_turn = True
@@ -9802,6 +10225,7 @@ class MediaStreamSession:
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._committed_transcript_confidence = None
+        self._azure_final_segments = []
         self._latest_interim = ""
         self._deferred_flush_pending = False
         if not buffered:
@@ -9984,13 +10408,15 @@ class MediaStreamSession:
         it. Such a result may be the provider's own tail — but it may equally be
         the caller repeating or correcting themselves, which is the most common
         thing a caller does when the agent falls silent mid-turn, and NOTHING
-        available here separates the two. The STT callbacks
-        (`GoogleSTTStream._on_final` / `_on_interim`, `AzureSTTStream._on_recognized`
-        / `_on_recognizing`) deliver a bare `str`: no result id, no segment id, no
-        audio-time span. `_stream_epoch` is an internal gRPC-swap fence, identical
-        for a tail and for a repetition. Text plus elapsed time is not proof of
-        ownership, so neither is used, and the staleness window was removed rather
-        than left as an unused knob.
+        available on the shared callback path separates the two. Google, English
+        Azure, and Twilio reach this gate with a bare `str`: no result id, no
+        segment id, no audio-time span. `_stream_epoch` is an internal gRPC-swap
+        fence, identical for a tail and for a repetition. Direct SmartPBX Sinhala
+        Azure is the sole exception: it forwards bounded final identity and
+        coverage metadata, and its proven duplicate check runs before this shared
+        gate. Text plus elapsed time is not proof of ownership, so neither is
+        used, and the staleness window was removed rather than left as an unused
+        knob.
 
         Admitted results take the normal path: they accumulate into the pending
         buffers, cancel and reset the silence re-prompt, and `_flush_transcript`
@@ -10065,8 +10491,131 @@ class MediaStreamSession:
             "ignored_post_dispatch_max_elapsed_ms": record["max_elapsed_ms"],
         }
 
+    @staticmethod
+    def _azure_intervals_cover(
+        intervals: list[tuple[int, int]], start: int, end: int,
+    ) -> bool:
+        """Whether an interval is fully covered, without text inference."""
+        cursor = start
+        for segment_start, segment_end in sorted(intervals):
+            if segment_end <= cursor:
+                continue
+            if segment_start > cursor:
+                return False
+            cursor = max(cursor, segment_end)
+            if cursor >= end:
+                return True
+        return False
+
+    def _azure_pending_coverage(self) -> tuple[int, int] | None:
+        """Contiguous audio coverage of current pending Azure final segments."""
+        if not self._azure_final_segments:
+            return None
+        ordered = sorted((item.start, item.end) for item in self._azure_final_segments)
+        start, end = ordered[0]
+        for segment_start, segment_end in ordered[1:]:
+            if segment_start > end:
+                return None
+            end = max(end, segment_end)
+        return start, end
+
+    def _remember_azure_final_metadata(self, metadata: AzureFinalMetadata) -> None:
+        """Keep bounded opaque identity/coverage after the pending turn flushes."""
+        if metadata.result_id:
+            self._azure_final_result_ids[metadata.result_id] = None
+            self._azure_final_result_ids.move_to_end(metadata.result_id)
+            while len(self._azure_final_result_ids) > 256:
+                self._azure_final_result_ids.popitem(last=False)
+        interval = metadata.interval
+        if interval is not None:
+            self._azure_final_intervals[interval] = None
+            self._azure_final_intervals.move_to_end(interval)
+            while len(self._azure_final_intervals) > 256:
+                self._azure_final_intervals.popitem(last=False)
+
+    def _reconcile_azure_final(
+        self, metadata: AzureFinalMetadata | None,
+    ) -> str:
+        """Classify Azure final identity before it can mutate a caller turn.
+
+        Only Direct SmartPBX Sinhala receives this metadata.  A repeated result
+        id or fully-covered audio interval proves that a provider final is a
+        duplicate.  Partial overlap deliberately remains an ordinary segment:
+        without word timestamps, subtracting its text could delete caller speech.
+        """
+        if (
+            metadata is None
+            or not self._uses_smartpbx_azure_final_endpointing()
+        ):
+            return "append"
+        if (
+            metadata.result_id is not None
+            and metadata.result_id in self._azure_final_result_ids
+        ):
+            return "duplicate_result_id"
+        interval = metadata.interval
+        if interval is None:
+            return "append"
+        start, end = interval
+        if self._azure_intervals_cover(
+            list(self._azure_final_intervals), start, end,
+        ):
+            return "covered_audio"
+        pending = self._azure_pending_coverage()
+        if pending is not None:
+            pending_start, pending_end = pending
+            if start <= pending_start and end > pending_end:
+                return "cumulative_extension"
+        return "append"
+
+    def _record_azure_final_segment(self, metadata: AzureFinalMetadata) -> None:
+        """Record a loop-admitted Azure final without retaining its text."""
+        self._remember_azure_final_metadata(metadata)
+        interval = metadata.interval
+        if interval is not None:
+            self._azure_final_segments.append(_AzureFinalSegment(*interval))
+
+    def _log_azure_final_reconciliation(self, reconciliation: str) -> None:
+        """Emit the bounded, privacy-safe record for a proven duplicate."""
+        if not self._is_smartpbx_session():
+            return
+        basis = (
+            "result_id"
+            if reconciliation == "duplicate_result_id"
+            else "audio_coverage"
+        )
+        logger.info(
+            "smartpbx_media event=stt_azure_final_reconciled "
+            "action=ignored basis=%s",
+            basis,
+        )
+
+    async def _handle_azure_final_result(
+        self, text: str, metadata: AzureFinalMetadata,
+    ) -> None:
+        """Loop-own a metadata final before pre-audio or barge-in handling."""
+        if self._smartpbx_torn_down or self.transfer_pending:
+            return
+        reconciliation = self._reconcile_azure_final(metadata)
+        if reconciliation in {"duplicate_result_id", "covered_audio"}:
+            self._log_azure_final_reconciliation(reconciliation)
+            return
+        if self._pre_audio_synthesis_active():
+            await self._handle_pre_audio_stt("final", text, metadata)
+            return
+        if self._is_speaking:
+            if self._is_echo(text):
+                return
+            if self._should_barge_in(text):
+                await self._handle_bargein()
+            return
+        await self._accumulate_transcript(text, metadata=metadata)
+
     async def _accumulate_transcript(
-        self, text: str, confidence: float | None = None,
+        self,
+        text: str,
+        confidence: float | None = None,
+        metadata: AzureFinalMetadata | None = None,
     ):
         if self._smartpbx_torn_down:
             # A residual STT callback landed after teardown finalized this
@@ -10074,6 +10623,12 @@ class MediaStreamSession:
             # endpointing timer / open a new turn after session_summary.
             return
         if self.transfer_pending:
+            return
+        if confidence is None and metadata is not None:
+            confidence = metadata.confidence
+        reconciliation = self._reconcile_azure_final(metadata)
+        if reconciliation in {"duplicate_result_id", "covered_audio"}:
+            self._log_azure_final_reconciliation(reconciliation)
             return
         if self._reject_post_dispatch_result("final", text):
             return
@@ -10095,7 +10650,7 @@ class MediaStreamSession:
         # shape so the prefix cannot be duplicated into the caller turn.
         committed = self._committed_transcript
         exact_prefix = f"{committed} "
-        cumulative_azure_final = bool(
+        cumulative_azure_final = reconciliation == "cumulative_extension" or bool(
             committed
             and self._uses_smartpbx_azure_final_endpointing()
             and text.startswith(exact_prefix)
@@ -10109,10 +10664,15 @@ class MediaStreamSession:
         if capture:
             combined = self._bound_capture_text(combined)
         self._committed_transcript = combined
+        if metadata is not None and self._uses_smartpbx_azure_final_endpointing():
+            if reconciliation == "cumulative_extension":
+                self._azure_final_segments = []
+            self._record_azure_final_segment(metadata)
         if confidence is not None and 0.0 <= confidence <= 1.0:
             self._committed_transcript_confidence = (
                 confidence
-                if self._committed_transcript_confidence is None
+                if cumulative_azure_final
+                or self._committed_transcript_confidence is None
                 else min(self._committed_transcript_confidence, confidence)
             )
         self._pending_transcript = self._committed_transcript
@@ -10278,6 +10838,7 @@ class MediaStreamSession:
         self._pending_transcript = ""
         self._committed_transcript = ""
         self._committed_transcript_confidence = None
+        self._azure_final_segments = []
         self._latest_interim = ""
         self._endpointing_handle = None
         self._deferred_flush_pending = False
@@ -10459,6 +11020,12 @@ class MediaStreamSession:
             runner.residency_question_asked = self._latest_assistant_asked_residency()
             self._stage_turn_rate_state(text, runner)
         self._last_guest_utterance_raw = text
+        # A low-confidence identity must outlive the recognition turn.  Resolve
+        # its caller reply before prompt construction or any booking tool can
+        # see this turn, but only on the direct Sinhala path that created it.
+        self._capture_confirmation_outcome = None
+        if self._is_direct_smartpbx_sinhala() and self._pending_capture_confirmation:
+            self._apply_pending_capture_confirmation(text)
         self._capture_success_this_turn = False
         self._start_assistant_turn_delivery_tracking()
         outcome = "completed"
@@ -10910,13 +11477,15 @@ class MediaStreamSession:
                         "content": result_str,
                     })
                 for _tool_index, tc, parsed_input, result_str, tool_error in staged_results:
-                    self._capture_booking_slots(tc["name"], parsed_input)
                     try:
                         parsed_result = json.loads(result_str)
                     except (json.JSONDecodeError, TypeError):
                         parsed_result = None
                     if isinstance(parsed_result, dict):
                         self._record_capture_tool_completion(tc["name"], parsed_result)
+                    self._record_booking_tool_completion(
+                        tc["name"], parsed_input, parsed_result,
+                    )
                     _append_booking_confirmation_marker(
                         self.full_transcript,
                         tc["name"],
@@ -11666,7 +12235,9 @@ class MediaStreamSession:
                             parsed_input,
                             result_str,
                         )
-                        self._capture_booking_slots(tc["function"]["name"], parsed_input)
+                        self._record_booking_tool_completion(
+                            tc["function"]["name"], parsed_input, parsed_result,
+                        )
                         if tool_error is not None:
                             self._log_tool_failure(tc["function"]["name"], tool_error)
                         self._log_tool_result(tc["function"]["name"], result_str)
@@ -12402,7 +12973,9 @@ class MediaStreamSession:
                         tool_input,
                         result_str,
                     )
-                    self._capture_booking_slots(tb["name"], tool_input)
+                    self._record_booking_tool_completion(
+                        tb["name"], tool_input, parsed_result,
+                    )
                     if tool_error is not None:
                         self._log_tool_failure(tb["name"], tool_error)
                     self._log_tool_result(tb["name"], result_str)
