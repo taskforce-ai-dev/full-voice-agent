@@ -1880,17 +1880,17 @@ def _parse_endpointing_seconds(
 
 
 def _parse_sinhala_azure_segmentation_silence_ms(environ) -> int:
-    """Read the optional Sinhala Azure segmentation timeout in milliseconds."""
+    """Read the Sinhala Azure segmentation timeout; explicit zero rolls back."""
     raw = environ.get("SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS", "")
     if not isinstance(raw, str) or not raw.strip():
-        return 0
+        return 1200
     try:
         value = int(raw.strip(), 10)
     except (TypeError, ValueError):
-        return 0
+        return 1200
     if value == 0:
         return 0
-    return min(max(value, 100), 5000)
+    return min(max(value, 1200), 5000)
 
 
 def _parse_clamped_float(
@@ -2074,6 +2074,13 @@ CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS: float = _parse_endpointing_seconds(
 )
 SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS: int = (
     _parse_sinhala_azure_segmentation_silence_ms(os.environ)
+)
+SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD: float = _parse_clamped_float(
+    os.environ,
+    "SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD",
+    0.65,
+    0.0,
+    1.0,
 )
 SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS = _parse_endpointing_seconds(
     os.environ,
@@ -2631,6 +2638,12 @@ _SI_PHONE_CAPTURE_ASK_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:නැවත|ආපසු).{0,40}(?:අමතන්න|කතා\s*කරන්න).{0,40}අංක(?:ය|යේ)?"),
 )
 
+_SI_NAME_CAPTURE_ASK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:සම්පූර්ණ|මුල්|අවසන්)\s*නම"),
+    re.compile(r"වාසගම"),
+    re.compile(r"නම.{0,40}(?:කියන්න|ලබා\s*දෙන්න|පවසන්න|නැවත)"),
+)
+
 # ---------------------------------------------------------------------------
 # Sinhala spoken-number normalisation (Direct SmartPBX Sinhala phone capture only)
 # ---------------------------------------------------------------------------
@@ -2842,7 +2855,10 @@ def _detect_capture_ask_kind(
             and any(pattern.search(text) for pattern in _SI_PHONE_CAPTURE_ASK_PATTERNS)
         ):
             return "phone"
-        if any(pattern.search(text) for pattern in _EN_NAME_CAPTURE_ASK_PATTERNS):
+        if any(pattern.search(text) for pattern in _EN_NAME_CAPTURE_ASK_PATTERNS) or (
+            allow_sinhala_phone
+            and any(pattern.search(text) for pattern in _SI_NAME_CAPTURE_ASK_PATTERNS)
+        ):
             return "name"
         if _is_capture_ask_sentence(sentence):
             saw_generic = True
@@ -4069,6 +4085,11 @@ def _build_system_prompt(lang: str = "en") -> str:
         "attempts, or if the guest is struggling or asks to use the keypad, "
         "offer collect_number_via_keypad as a fallback. The fallback may be "
         "offered only after `attempts >= 2`.\n"
+        "- LOW-CONFIDENCE CAPTURE: if capture_spoken_number or "
+        "capture_spoken_name returns `confirmation_required: true`, read the "
+        "tool's value back and ask for an explicit yes/no confirmation. Do not "
+        "call create_booking on the same turn. If the guest says no, discard "
+        "that reading and ask for the complete name or number again.\n"
         "- When a guest expresses booking intent, collect only what is needed to "
         "check availability: check-in and check-out dates, and number of guests "
         "(adults and children with ages). Ask ONE question at a time. Do NOT "
@@ -6797,6 +6818,21 @@ class GoogleSTTStream:
                             self._on_interim(transcript)
 
 
+def _azure_final_confidence(result: Any) -> float | None:
+    """Extract the first ranked Azure final confidence without leaking payloads."""
+    raw_json = getattr(result, "json", None)
+    if not isinstance(raw_json, str) or not raw_json:
+        return None
+    try:
+        payload = json.loads(raw_json)
+        nbest = payload.get("NBest")
+        value = nbest[0].get("Confidence")
+        confidence = float(value)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return confidence if 0.0 <= confidence <= 1.0 else None
+
+
 class AzureSTTStream:
     """Streams audio to Azure Speech-to-Text — drop-in alternative to GoogleSTTStream.
 
@@ -6808,8 +6844,8 @@ class AzureSTTStream:
     language per call (si-LK / ta-IN) — for a Sinhala-only line that tends to beat
     Google's alternative_language_codes code-switching, which was part of why Google
     rarely committed a final result for conversational Sinhala. Azure fires its own
-    `recognized` (final) events, so the 1.5 s interim-endpointing fallback still
-    applies but is no longer the only path to a final.
+    `recognized` (final) events. Legacy paths retain interim endpointing;
+    Direct SmartPBX Sinhala waits for those authoritative finals.
     """
 
     def __init__(
@@ -6819,10 +6855,12 @@ class AzureSTTStream:
         lang: str = "si",
         privacy_safe: bool = False,
         *,
+        on_final_result_with_confidence: Any = None,
         direct_smartpbx_sinhala: bool = False,
     ):
         self._on_final = on_final_result
         self._on_interim = on_interim_result
+        self._on_final_with_confidence = on_final_result_with_confidence
         self._lang = lang
         self._privacy_safe = privacy_safe
         self._direct_smartpbx_sinhala = direct_smartpbx_sinhala
@@ -6852,6 +6890,10 @@ class AzureSTTStream:
             subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION,
         )
         speech_config.speech_recognition_language = primary
+        if self._direct_smartpbx_sinhala:
+            # Azure exposes NBest confidence only in Detailed final results.
+            # Interims intentionally remain confidence-free.
+            speech_config.output_format = azure_speech.OutputFormat.Detailed
         segmentation_silence_ms = SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS
         if (
             self._direct_smartpbx_sinhala
@@ -6977,7 +7019,12 @@ class AzureSTTStream:
                 logger.info("smartpbx_media event=stt_provider_final")
             else:
                 logger.info("Azure STT final: %r", text)
-            self._on_final(text)
+            if self._on_final_with_confidence is not None:
+                self._on_final_with_confidence(
+                    text, _azure_final_confidence(evt.result)
+                )
+            else:
+                self._on_final(text)
 
     def _on_canceled(self, evt):
         # Azure invokes this on an SDK thread.  Claim the one terminal
@@ -7006,6 +7053,7 @@ def _make_stt(
     lang: str,
     privacy_safe: bool = False,
     *,
+    on_final_result_with_confidence: Any = None,
     provider: str | None = None,
     fail_closed: bool = False,
     direct_smartpbx_sinhala: bool = False,
@@ -7036,6 +7084,7 @@ def _make_stt(
                 on_interim_result,
                 lang,
                 privacy_safe,
+                on_final_result_with_confidence=on_final_result_with_confidence,
                 direct_smartpbx_sinhala=direct_smartpbx_sinhala,
             )
         if fail_closed:
@@ -7211,6 +7260,7 @@ class MediaStreamSession:
         # already-committed words. Empty on the interim-only path (Google), where
         # each cumulative interim simply overwrites the pending text.
         self._committed_transcript = ""
+        self._committed_transcript_confidence: float | None = None
         self._latest_interim = ""
         self._endpointing_handle: asyncio.TimerHandle | None = None
         # Every armed endpointing callback owns one monotonically increasing
@@ -7233,8 +7283,12 @@ class MediaStreamSession:
         # re-arms the flush so that speech becomes the next turn instead of
         # sitting in the buffer until the caller speaks again.
         self._deferred_flush_pending: bool = False
+        self._smartpbx_azure_final_endpointing: bool = False
         self._utterance_turn = 0
         self._last_guest_utterance_raw: str = ""
+        self._last_guest_utterance_confidence: float | None = None
+        self._last_guest_utterance_capture_kind: str = "generic"
+        self._last_guest_utterance_confirmation_required: bool = False
         # Capture-mode keeps endpointing looser while the caller is dictating
         # a number or name across fragments, and combines the fragments into one
         # utterance instead of spending an LLM turn on each.
@@ -7380,6 +7434,13 @@ class MediaStreamSession:
     def _is_direct_smartpbx_sinhala(self) -> bool:
         """Task 4 boundary; never broadens English or Twilio failure behavior."""
         return self._is_direct_smartpbx() and self.lang == "si"
+
+    def _uses_smartpbx_azure_final_endpointing(self) -> bool:
+        """Whether Azure finals alone own endpointing for this Sinhala call."""
+        return (
+            self._smartpbx_azure_final_endpointing
+            and self._is_direct_smartpbx_sinhala()
+        )
 
     def _is_direct_smartpbx_sinhala_tool_filler_round(
         self,
@@ -8359,6 +8420,7 @@ class MediaStreamSession:
         self._invalidate_endpointing()
         self._pending_transcript = ""
         self._committed_transcript = ""
+        self._committed_transcript_confidence = None
         self._latest_interim = ""
         self._deferred_flush_pending = False
         self._utterance_dispatched = False
@@ -8727,7 +8789,28 @@ class MediaStreamSession:
 
     def _active_system_prompt(self) -> str:
         """The system prompt plus direct-SmartPBX rhythm and booking slots."""
-        return self.system_prompt + self._smartpbx_rhythm_rule() + self._booking_slots_note()
+        return (
+            self.system_prompt
+            + self._smartpbx_rhythm_rule()
+            + self._booking_slots_note()
+            + self._stt_confirmation_note()
+        )
+
+    def _stt_confirmation_note(self) -> str:
+        """Turn-local instruction for a low-confidence Sinhala capture."""
+        if not self._last_guest_utterance_confirmation_required:
+            return ""
+        kind = self._last_guest_utterance_capture_kind
+        if kind not in {"name", "phone"}:
+            return ""
+        return (
+            "\n\nLATEST RECOGNITION SAFETY NOTE:\n"
+            f"- Azure marked the latest requested {kind} transcription as low confidence.\n"
+            "- Read back exactly what you understood and ask for an explicit yes/no "
+            "confirmation before accepting it.\n"
+            "- Do not call create_booking on the same turn. If the guest says no, "
+            f"ask for the complete {kind} again.\n"
+        )
 
     def _log_tool_result(self, tool_name: str, result: str) -> None:
         self._mark_smartpbx_turn("tool_complete")
@@ -8987,7 +9070,15 @@ class MediaStreamSession:
         if caller_text:
             await self._accumulate_transcript(caller_text)
 
-    def _on_stt_result(self, transcript: str):
+    def _on_stt_result_with_confidence(
+        self, transcript: str, confidence: float | None,
+    ) -> None:
+        """Direct Sinhala Azure final callback with bounded recognition metadata."""
+        self._on_stt_result(transcript, confidence=confidence)
+
+    def _on_stt_result(
+        self, transcript: str, *, confidence: float | None = None,
+    ):
         """Called from STT thread on FINAL results."""
         if self.transfer_pending:
             return
@@ -9010,7 +9101,9 @@ class MediaStreamSession:
             if self._should_barge_in(transcript):
                 self._submit_stt_callback(self._handle_bargein)
             return
-        self._submit_stt_callback(self._accumulate_transcript, transcript)
+        self._submit_stt_callback(
+            self._accumulate_transcript, transcript, confidence
+        )
 
     def _on_stt_interim(self, transcript: str):
         """Called from STT thread on INTERIM results.
@@ -9595,11 +9688,16 @@ class MediaStreamSession:
             return
         captured = str(result.get("status", "")).lower() == "captured"
         if captured:
-            if tool_name == "capture_spoken_number" and result.get("valid") is not False:
+            confirmation_required = result.get("confirmation_required") is True
+            if (
+                not confirmation_required
+                and tool_name == "capture_spoken_number"
+                and result.get("valid") is not False
+            ):
                 normalized = str(result.get("normalized", "")).strip()
                 if normalized:
                     self._booking_slots["guest_phone"] = normalized
-            elif tool_name == "capture_spoken_name":
+            elif not confirmation_required and tool_name == "capture_spoken_name":
                 name = str(result.get("name", "")).strip()
                 if name:
                     self._booking_slots["guest_name"] = name
@@ -9698,6 +9796,7 @@ class MediaStreamSession:
         self._invalidate_endpointing()
         self._pending_transcript = ""
         self._committed_transcript = ""
+        self._committed_transcript_confidence = None
         self._latest_interim = ""
         self._deferred_flush_pending = False
         if not buffered:
@@ -9961,7 +10060,9 @@ class MediaStreamSession:
             "ignored_post_dispatch_max_elapsed_ms": record["max_elapsed_ms"],
         }
 
-    async def _accumulate_transcript(self, text: str):
+    async def _accumulate_transcript(
+        self, text: str, confidence: float | None = None,
+    ):
         if self._smartpbx_torn_down:
             # A residual STT callback landed after teardown finalized this
             # session's turns — drop silently rather than arm a new
@@ -9983,16 +10084,32 @@ class MediaStreamSession:
         # the re-prompt counter so future silences start fresh.
         self._cancel_reprompt()
         self._reprompt_count = 0
-        # Provider finals commit across segments of one utterance.
-        combined = (
-            self._committed_transcript + " " + text
-            if self._committed_transcript
-            else text
+        # Provider finals normally commit as successive segments. Direct
+        # Sinhala Azure can also return a cumulative final containing the
+        # already-committed prefix. Reuse the provider text in that one exact
+        # shape so the prefix cannot be duplicated into the caller turn.
+        committed = self._committed_transcript
+        exact_prefix = f"{committed} "
+        cumulative_azure_final = bool(
+            committed
+            and self._uses_smartpbx_azure_final_endpointing()
+            and text.startswith(exact_prefix)
+            and len(text) > len(exact_prefix)
+            and not text[len(exact_prefix)].isspace()
+        )
+        combined = text if cumulative_azure_final else (
+            committed + " " + text if committed else text
         )
         capture = self._is_capture_mode_active()
         if capture:
             combined = self._bound_capture_text(combined)
         self._committed_transcript = combined
+        if confidence is not None and 0.0 <= confidence <= 1.0:
+            self._committed_transcript_confidence = (
+                confidence
+                if self._committed_transcript_confidence is None
+                else min(self._committed_transcript_confidence, confidence)
+            )
         self._pending_transcript = self._committed_transcript
         if capture and self._is_smartpbx_session():
             # No transcript text in the log line — this path carries the caller's
@@ -10075,6 +10192,13 @@ class MediaStreamSession:
         if self._is_capture_mode_active():
             pending = self._bound_capture_text(pending)
         self._pending_transcript = pending
+        if self._uses_smartpbx_azure_final_endpointing():
+            # Azure interims are hypotheses, not endpoints. A new interim also
+            # proves the caller continued after any prior final, so cancel that
+            # final's short grace and let the next recognized/final event own
+            # the one authoritative dispatch.
+            self._invalidate_endpointing()
+            return
         # No final has segmented this, so use the longer self-endpointing timer.
         self._arm_endpointing(self._capture_turn_timeout(final=False))
 
@@ -10145,8 +10269,10 @@ class MediaStreamSession:
             return
         transcript = self._pending_transcript.strip()
         had_committed_final = bool(self._committed_transcript)
+        transcript_confidence = self._committed_transcript_confidence
         self._pending_transcript = ""
         self._committed_transcript = ""
+        self._committed_transcript_confidence = None
         self._latest_interim = ""
         self._endpointing_handle = None
         self._deferred_flush_pending = False
@@ -10172,7 +10298,8 @@ class MediaStreamSession:
         # armed when the caller's speech was dispatched — the turn that ARMED it
         # (the ask, or the first needs_more) is not itself a capture turn.
         capture_turn = self._is_capture_mode_active()
-        if capture_turn and (
+        capture_kind = self._capture_kind if capture_turn else "generic"
+        if capture_turn and capture_kind != "name" and (
             _capture_dictation_ratio(transcript) < CAPTURE_DICTATION_MIN_RATIO
         ):
             # The caller moved on ("actually, can I ask about breakfast?").
@@ -10180,6 +10307,16 @@ class MediaStreamSession:
             # patient timers for a conversation that is no longer a dictation.
             self._exit_capture_mode("low_dictation_ratio")
             capture_turn = False
+            capture_kind = "generic"
+        self._last_guest_utterance_confidence = transcript_confidence
+        self._last_guest_utterance_capture_kind = capture_kind
+        self._last_guest_utterance_confirmation_required = bool(
+            self._is_direct_smartpbx_sinhala()
+            and capture_kind in {"name", "phone"}
+            and transcript_confidence is not None
+            and transcript_confidence
+            < SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD
+        )
         endpoint_source = (
             "capture" if capture_turn else "final" if had_committed_final else "interim"
         )
@@ -10262,6 +10399,12 @@ class MediaStreamSession:
             )
             if self._smartpbx_caller_context is None:
                 self._smartpbx_caller_context = {}
+            self._smartpbx_caller_context["_stt_capture_kind"] = (
+                self._last_guest_utterance_capture_kind
+            )
+            self._smartpbx_caller_context[
+                "_stt_capture_confirmation_required"
+            ] = self._last_guest_utterance_confirmation_required
             # Keep a live reference to the per-session caller-context dict.
             # execute_tool paths intentionally mutate this dict in-place, and
             # callers set/reset between turns would otherwise lose state.

@@ -49,6 +49,7 @@ def _fake_azure(factory):
     class SpeechConfig:
         def __init__(self, **_kwargs):
             self.speech_recognition_language = None
+            self.output_format = None
             self.properties: list[tuple[object, str]] = []
             factory.speech_configs.append(self)
 
@@ -75,6 +76,8 @@ def _fake_azure(factory):
         PropertyId=SimpleNamespace(
             Speech_SegmentationSilenceTimeoutMs="Speech_SegmentationSilenceTimeoutMs",
         ),
+        OutputFormat=SimpleNamespace(Detailed="Detailed"),
+        ResultReason=SimpleNamespace(RecognizedSpeech="RecognizedSpeech"),
         audio=audio,
         PhraseListGrammar=factory,
     )
@@ -201,26 +204,32 @@ def test_sinhala_recognizer_gets_the_sinhala_phrase_list_populated(monkeypatch):
     assert "Suite" in added
 
 
-@pytest.mark.parametrize("raw", [None, "", "invalid", "0"])
-def test_sinhala_segmentation_silence_is_disabled_for_absent_invalid_or_zero_values(
-    monkeypatch, raw,
-):
+@pytest.mark.parametrize("raw", [None, "", "invalid"])
+def test_sinhala_segmentation_defaults_to_less_aggressive_1200_ms(monkeypatch, raw):
     factory = _run_start_with_segmentation_env(monkeypatch, "si", raw)
+
+    assert factory.speech_configs[0].properties == [
+        ("Speech_SegmentationSilenceTimeoutMs", "1200"),
+    ]
+
+
+def test_explicit_zero_still_disables_sinhala_segmentation_override(monkeypatch):
+    factory = _run_start_with_segmentation_env(monkeypatch, "si", "0")
 
     assert factory.speech_configs[0].properties == []
 
 
-def test_sinhala_segmentation_silence_applies_800_ms_to_the_azure_property(monkeypatch):
+def test_old_800_ms_setting_is_raised_to_safe_1200_ms_floor(monkeypatch):
     factory = _run_start_with_segmentation_env(monkeypatch, "si", "800")
 
     assert factory.speech_configs[0].properties == [
-        ("Speech_SegmentationSilenceTimeoutMs", "800"),
+        ("Speech_SegmentationSilenceTimeoutMs", "1200"),
     ]
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("-1", "100"), ("99", "100"), ("5001", "5000"), ("99999", "5000")],
+    [("-1", "1200"), ("99", "1200"), ("5001", "5000"), ("99999", "5000")],
 )
 def test_nonzero_sinhala_segmentation_silence_is_clamped_to_azure_bounds(
     monkeypatch, raw, expected,
@@ -236,6 +245,58 @@ def test_english_segmentation_silence_setting_remains_untouched(monkeypatch):
     factory = _run_start_with_segmentation_env(monkeypatch, "en", "800")
 
     assert factory.speech_configs[0].properties == []
+
+
+def test_detailed_results_are_enabled_only_for_direct_sinhala(monkeypatch):
+    direct = _run_start(monkeypatch, "si", direct_smartpbx_sinhala=True)
+    assert direct.speech_configs[0].output_format == "Detailed"
+
+    legacy = _run_start(monkeypatch, "si", direct_smartpbx_sinhala=False)
+    assert legacy.speech_configs[0].output_format is None
+
+
+@pytest.mark.parametrize(
+    ("raw_json", "expected"),
+    [
+        ('{"NBest":[{"Confidence":0.42}]}', 0.42),
+        ('{"NBest":[]}', None),
+        ('{"NBest":[{"Confidence":2}]}', None),
+        ("not-json", None),
+        (None, None),
+    ],
+)
+def test_azure_final_confidence_parser_is_bounded(raw_json, expected):
+    result = SimpleNamespace(json=raw_json)
+    assert server._azure_final_confidence(result) == expected
+
+
+def test_direct_sinhala_azure_final_delivers_confidence_with_text(monkeypatch):
+    calls: list[tuple[str, float | None]] = []
+    stream = server.AzureSTTStream(
+        on_final_result=lambda _text: (_ for _ in ()).throw(
+            AssertionError("metadata callback must own this result")
+        ),
+        on_final_result_with_confidence=lambda text, confidence: calls.append(
+            (text, confidence)
+        ),
+        lang="si",
+        direct_smartpbx_sinhala=True,
+    )
+    stream._running = True
+    monkeypatch.setattr(
+        server,
+        "azure_speech",
+        SimpleNamespace(ResultReason=SimpleNamespace(RecognizedSpeech="recognized")),
+    )
+    event = SimpleNamespace(result=SimpleNamespace(
+        reason="recognized",
+        text="අමුත්තාගේ නම",
+        json='{"NBest":[{"Confidence":0.42}]}',
+    ))
+
+    stream._on_recognized(event)
+
+    assert calls == [("අමුත්තාගේ නම", 0.42)]
 
 
 def test_make_stt_keeps_legacy_capability_false_and_forwards_direct_capability(monkeypatch):
@@ -291,7 +352,7 @@ def test_direct_sinhala_segmentation_startup_diagnostic_is_bounded_and_one_shot(
     ]
     assert diagnostics == [
         "smartpbx_media event=stt_provider_start segmentation=enabled "
-        "segmentation_silence_ms=800",
+        "segmentation_silence_ms=1200",
     ]
     # Check only field values.  ``si`` is a valid substring of the field name
     # ``segmentation_silence_ms``; treating the whole line as opaque text

@@ -61,6 +61,7 @@ class RecordingPipeline:
         self._endpointing_handle = None
         self._smartpbx_transfer_context = None
         self._smartpbx_welcome_audio_pending = None
+        self._smartpbx_azure_final_endpointing = False
         self._event_loop = None
         self._dtmf_collector = None
         self.transfer_pending = False
@@ -77,6 +78,11 @@ class RecordingPipeline:
         self.consume_dtmf = False
 
     def _on_stt_result(self, _text: str) -> None:
+        return None
+
+    def _on_stt_result_with_confidence(
+        self, _text: str, _confidence: float | None,
+    ) -> None:
         return None
 
     def _on_stt_interim(self, _text: str) -> None:
@@ -436,6 +442,7 @@ async def test_english_selection_keeps_existing_provider_model_tools_and_clients
     assert pipeline.tools is not original_tools
     assert pipeline.tools[0] is not original_tools[0]
     assert session._resolve_language_profile("en").lang == "en"
+    assert pipeline._smartpbx_azure_final_endpointing is False
 
 
 @pytest.mark.asyncio
@@ -465,6 +472,8 @@ async def test_concurrent_english_and_sinhala_profiles_never_cross_mutate(monkey
     )
     assert english_stt.profile_at_start["llm_provider"] == "claude"
     assert sinhala_stt.profile_at_start["llm_provider"] == "gemini"
+    assert english_pipeline._smartpbx_azure_final_endpointing is False
+    assert sinhala_pipeline._smartpbx_azure_final_endpointing is True
     assert english_pipeline.tools is not sinhala_pipeline.tools
     sinhala_pipeline.tools[0]["function_declarations"][0]["name"] = "changed"
     assert english_pipeline.tools == [{"name": "transfer_to_human"}, {"name": "check_availability"}]

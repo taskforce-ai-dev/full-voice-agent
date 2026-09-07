@@ -173,6 +173,11 @@ def test_prompt_uses_yes_no_read_back_for_uncertain_names():
     assert "yes/no confirmation" in PROMPT
 
 
+def test_prompt_requires_confirmation_for_low_confidence_capture_results():
+    assert "confirmation_required" in PROMPT
+    assert "do not call create_booking on the same turn" in PROMPT.lower()
+
+
 def test_name_confirmation_is_not_gated_on_unperceivable_audio_signal():
     """Kavya's model only ever sees STT transcript text - it has no acoustic
     or per-token confidence signal, so it cannot genuinely assess whether

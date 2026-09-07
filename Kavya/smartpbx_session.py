@@ -591,6 +591,11 @@ class KavyaSmartPBXSession:
         try:
             stt = self._stt_factory(
                 on_final_result=pipeline._on_stt_result,
+                on_final_result_with_confidence=(
+                    pipeline._on_stt_result_with_confidence
+                    if profile.lang == "si" and profile.stt_provider == "azure"
+                    else None
+                ),
                 on_interim_result=pipeline._on_stt_interim,
                 lang=profile.stt_language,
                 privacy_safe=True,
@@ -641,6 +646,9 @@ class KavyaSmartPBXSession:
         # English keeps the adapter's already-resolved provider/model/client,
         # while still breaking every shared mutable tools reference.
         pipeline.tools = copy.deepcopy(prepared_tools)
+        pipeline._smartpbx_azure_final_endpointing = (
+            profile.lang == "si" and profile.stt_provider == "azure"
+        )
         if profile.lang == "en":
             return profile
         if profile.llm_provider == "gemini":

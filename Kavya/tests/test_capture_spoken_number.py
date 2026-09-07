@@ -92,6 +92,154 @@ async def test_capture_flags_a_wrong_length_number_as_needing_a_fresh_attempt():
 
 
 @pytest.mark.asyncio
+async def test_capture_rejects_the_live_sinhala_wrong_length_7_prefix():
+    token = handover.handover_context.set({})
+    try:
+        result = json.loads(await tools.execute_tool(
+            "capture_spoken_number",
+            {"spoken": "77. උක්ත 77 60 6 අඩු 7. ඔහු 166."},
+        ))
+
+        assert result["digits"] == "77776067166"
+        assert result["valid"] is False
+        assert result["normalized"] == ""
+        assert result["status"] == "needs_more"
+        assert result["readback"] == ""
+        assert result["fallback_allowed"] is False
+    finally:
+        handover.handover_context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_valid_number_requires_explicit_confirmation():
+    token = handover.handover_context.set({
+        "_stt_capture_kind": "phone",
+        "_stt_capture_confirmation_required": True,
+    })
+    try:
+        result = json.loads(await tools.execute_tool(
+            "capture_spoken_number",
+            {"spoken": "zero seven seven one two three four five six seven"},
+        ))
+
+        assert result["status"] == "captured"
+        assert result["valid"] is True
+        assert result["confirmation_required"] is True
+        assert result["readback"] == "0 7 7 1 2 3 4 5 6 7"
+    finally:
+        handover.handover_context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_spelled_name_requires_explicit_confirmation():
+    token = handover.handover_context.set({
+        "_stt_capture_kind": "name",
+        "_stt_capture_confirmation_required": True,
+    })
+    try:
+        result = json.loads(await tools.execute_tool(
+            "capture_spoken_name", {"spoken": "a s h r i k a"},
+        ))
+
+        assert result["status"] == "captured"
+        assert result["name"] == "Ashrika"
+        assert result["confirmation_required"] is True
+    finally:
+        handover.handover_context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_direct_smartpbx_booking_rejects_an_invalid_guest_phone(monkeypatch):
+    booking_calls = []
+
+    async def book(**kwargs):
+        booking_calls.append(kwargs)
+        return {"success": True}
+
+    monkeypatch.setattr(tools, "create_booking", book)
+    transfer_token = tools.smartpbx_transfer_context.set(
+        tools.SmartPBXTransferContext(call_control=None)
+    )
+    caller_token = handover.handover_context.set({"caller_phone": "0771234567"})
+    try:
+        result = json.loads(await tools.execute_tool("create_booking", {
+            "check_in": "2026-09-10",
+            "check_out": "2026-09-11",
+            "room_type": tools.ROOM_TYPES_BY_PROPERTY[tools.PROPERTY_HATTON][0],
+            "guest_name": "Test Guest",
+            "guest_phone": "77776067166",
+        }))
+    finally:
+        handover.handover_context.reset(caller_token)
+        tools.smartpbx_transfer_context.reset(transfer_token)
+
+    assert result["status"] == "invalid_number"
+    assert booking_calls == []
+
+
+@pytest.mark.asyncio
+async def test_direct_smartpbx_booking_waits_for_low_confidence_confirmation(monkeypatch):
+    booking_calls = []
+
+    async def fake_create_booking(**kwargs):
+        booking_calls.append(kwargs)
+        return {"status": "confirmed"}
+
+    monkeypatch.setattr(tools, "create_booking", fake_create_booking)
+    transfer_token = tools.smartpbx_transfer_context.set(object())
+    caller_token = handover.handover_context.set({
+        "caller_phone": "+94771234567",
+        "_stt_capture_kind": "phone",
+        "_stt_capture_confirmation_required": True,
+    })
+    try:
+        result = json.loads(await tools.execute_tool("create_booking", {
+            "check_in": "2026-10-10",
+            "check_out": "2026-10-11",
+            "room_type": tools.ROOM_TYPES_BY_PROPERTY[tools.PROPERTY_HATTON][0],
+            "guest_name": "Test Guest",
+            "guest_phone": "0771234567",
+        }))
+    finally:
+        handover.handover_context.reset(caller_token)
+        tools.smartpbx_transfer_context.reset(transfer_token)
+
+    assert result["status"] == "confirmation_required"
+    assert booking_calls == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_plus_seven_capture_remains_bookable_after_normalization(monkeypatch):
+    booking_calls = []
+
+    async def fake_create_booking(**kwargs):
+        booking_calls.append(kwargs)
+        return {"status": "confirmed"}
+
+    monkeypatch.setattr(tools, "create_booking", fake_create_booking)
+    transfer_token = tools.smartpbx_transfer_context.set(object())
+    caller_token = handover.handover_context.set({"caller_phone": "+94771234567"})
+    try:
+        captured = json.loads(await tools.execute_tool(
+            "capture_spoken_number", {"spoken": "+7 701 123 4567"},
+        ))
+        result = json.loads(await tools.execute_tool("create_booking", {
+            "check_in": "2026-10-10",
+            "check_out": "2026-10-11",
+            "room_type": tools.ROOM_TYPES_BY_PROPERTY[tools.PROPERTY_HATTON][0],
+            "guest_name": "Test Guest",
+            "guest_phone": captured["normalized"],
+        }))
+    finally:
+        handover.handover_context.reset(caller_token)
+        tools.smartpbx_transfer_context.reset(transfer_token)
+
+    assert captured["normalized"] == "77011234567"
+    assert result["status"] == "confirmed"
+    assert booking_calls[0]["guest_phone"] == "77011234567"
+
+
+@pytest.mark.asyncio
 async def test_capture_handles_triple_and_nought():
     # 9 digits do not normalize to a valid Sri Lankan number: the attempt is
     # discarded and re-asked, never read back as a wrong number.

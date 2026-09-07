@@ -540,6 +540,16 @@ def test_exit_capture_mode_clears_the_capture_kind():
     assert session._capture_kind == "generic"
 
 
+def test_direct_sinhala_full_name_ask_enters_name_capture_mode():
+    session, _loop, _processed = _make_direct_smartpbx_session(lang="si")
+    _deliver(session, "කරුණාකර ඔබගේ සම්පූර්ණ නම ලබා දෙන්න පුළුවන්ද?")
+
+    session._maybe_enter_capture_mode_from_ask()
+
+    assert session._is_capture_mode_active() is True
+    assert session._capture_kind == "name"
+
+
 @pytest.mark.asyncio
 async def test_transfer_pending_clears_the_capture_kind():
     session, _loop, _processed = _make_direct_smartpbx_session()
