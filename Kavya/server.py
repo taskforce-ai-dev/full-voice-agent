@@ -6870,6 +6870,7 @@ _CAPTURE_CONFIRM_YES = frozenset({
 })
 _CAPTURE_CONFIRM_NO = frozenset({
     "no", "nope", "not correct", "that is wrong", "thats wrong",
+    "no that is wrong",
     "නැහැ", "නෑ", "නැ", "වරදියි", "නැහැ ඒක වැරදියි",
 })
 
