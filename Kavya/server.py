@@ -9101,9 +9101,14 @@ class MediaStreamSession:
             if self._should_barge_in(transcript):
                 self._submit_stt_callback(self._handle_bargein)
             return
-        self._submit_stt_callback(
-            self._accumulate_transcript, transcript, confidence
-        )
+        if confidence is None:
+            # Preserve the established one-argument callback seam for Google,
+            # English, Twilio, and existing lifecycle wrappers.
+            self._submit_stt_callback(self._accumulate_transcript, transcript)
+        else:
+            self._submit_stt_callback(
+                self._accumulate_transcript, transcript, confidence
+            )
 
     def _on_stt_interim(self, transcript: str):
         """Called from STT thread on INTERIM results.
@@ -10399,12 +10404,17 @@ class MediaStreamSession:
             )
             if self._smartpbx_caller_context is None:
                 self._smartpbx_caller_context = {}
-            self._smartpbx_caller_context["_stt_capture_kind"] = (
-                self._last_guest_utterance_capture_kind
+            self._smartpbx_caller_context.pop("_stt_capture_kind", None)
+            self._smartpbx_caller_context.pop(
+                "_stt_capture_confirmation_required", None,
             )
-            self._smartpbx_caller_context[
-                "_stt_capture_confirmation_required"
-            ] = self._last_guest_utterance_confirmation_required
+            if self._last_guest_utterance_confirmation_required:
+                self._smartpbx_caller_context["_stt_capture_kind"] = (
+                    self._last_guest_utterance_capture_kind
+                )
+                self._smartpbx_caller_context[
+                    "_stt_capture_confirmation_required"
+                ] = True
             # Keep a live reference to the per-session caller-context dict.
             # execute_tool paths intentionally mutate this dict in-place, and
             # callers set/reset between turns would otherwise lose state.

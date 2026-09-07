@@ -211,9 +211,6 @@ def assemble_spoken_name(raw: Any) -> str:
     """
     if not raw:
         return ""
-    raw_text = str(raw).strip()
-    explicit_plus = raw_text.startswith("+")
-
     raw_text = str(raw).replace("-", " ")
     raw_text = raw_text.replace("|", " ")
     cleaned_text = re.sub(r"[.,]", " ", raw_text)
@@ -415,6 +412,8 @@ def normalize_whatsapp(
     """
     if not raw:
         return ""
+    raw_text = str(raw).strip()
+    explicit_plus = raw_text.startswith("+")
     # Single chokepoint: the same deterministic word->digit conversion used by
     # the live capture tool, so a wholly-spoken number ("nought seven six ...")
     # and its dialled equivalent normalise identically and cannot diverge.

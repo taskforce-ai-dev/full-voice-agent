@@ -33,7 +33,7 @@ def _session(*, lang="si", direct=True, final_only=True):
     session = server.MediaStreamSession(
         websocket=None,
         lang=lang,
-        media_transport=None,
+        media_transport=object() if direct else None,
         llm_provider="gemini" if lang == "si" else "claude",
     )
     if direct:

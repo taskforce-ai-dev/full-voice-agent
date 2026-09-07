@@ -4031,25 +4031,10 @@ def test_sinhala_azure_segmentation_canary_is_allowlisted_and_reversible():
 
     runbook = read_text("SMARTPBX_RUNBOOK.md")
     normalized = re.sub(r"\s+", " ", runbook).casefold()
-    canary_sentences = [
-        sentence for sentence in re.split(r"[.!?]", normalized)
-        if variable.casefold() in sentence or "1200 ms" in sentence
-    ]
-    assert any(
-        "1200 ms" in sentence and variable.casefold() in sentence
-        for sentence in canary_sentences
-    )
-    assert any(
-        "rollback" in sentence
-        and f"{variable}=0".casefold() in sentence
-        for sentence in canary_sentences
-    )
-    assert any(
-        "not a rollback" in sentence
-        and variable.casefold() in sentence
-        and ("omission" in sentence or "omitting" in sentence)
-        for sentence in canary_sentences
-    )
+    assert "reviewed default is `1200` ms" in normalized
+    assert f"{variable}=0".casefold() in normalized
+    assert "omitting/removing the variable is not a rollback" in normalized
+    assert f"${{{variable}:-1200}}".casefold() in normalized
 
 
 def test_sinhala_azure_low_confidence_threshold_is_smartpbx_only():
