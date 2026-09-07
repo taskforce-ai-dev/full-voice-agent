@@ -76,8 +76,11 @@ async def test_duplicate_azure_result_id_is_ignored_without_text_guessing(caplog
     pipeline = _session()
     metadata = _metadata("private-result-id", 0, 100)
 
-    await pipeline._accumulate_transcript("first final", metadata=metadata)
-    await pipeline._accumulate_transcript("different text must still dedupe", metadata=metadata)
+    with caplog.at_level("INFO"):
+        await pipeline._accumulate_transcript("first final", metadata=metadata)
+        await pipeline._accumulate_transcript(
+            "different text must still dedupe", metadata=metadata,
+        )
 
     assert pipeline._committed_transcript == "first final"
     assert pipeline._smartpbx_stt_final_events == 1

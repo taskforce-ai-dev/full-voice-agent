@@ -78,7 +78,20 @@ def _metadata(result_id, offset, duration, confidence=0.9):
     ],
 )
 def test_azure_final_metadata_is_bounded_and_validated(result, expected):
-    assert server._azure_final_metadata(result) == expected
+    actual = server._azure_final_metadata(result)
+    # Other compatibility tests reload ``server`` during collection. Compare
+    # the stable value contract rather than dataclass class identity.
+    assert (
+        actual.result_id,
+        actual.offset,
+        actual.duration,
+        actual.confidence,
+    ) == (
+        expected.result_id,
+        expected.offset,
+        expected.duration,
+        expected.confidence,
+    )
 
 
 def test_direct_azure_callback_forwards_metadata_without_using_legacy_seams(

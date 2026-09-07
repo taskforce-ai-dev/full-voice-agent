@@ -6882,7 +6882,11 @@ def _capture_confirmation_reply(text: str) -> str:
     prevents a phrase such as ``yes, but double six at the end`` from accepting
     the old number before the correction has been captured.
     """
-    normalized = re.sub(r"[^\w\s]", " ", str(text).casefold())
+    # Python's ``\w`` excludes Sinhala combining vowel signs, so a pattern
+    # limited to ``\w`` silently changes explicit replies such as ``ඔව්``
+    # before classification. Preserve the complete Sinhala Unicode block
+    # while still reducing punctuation-only material to separators.
+    normalized = re.sub(r"[^\w\s\u0D80-\u0DFF]", " ", str(text).casefold())
     normalized = " ".join(normalized.split())
     if normalized in _CAPTURE_CONFIRM_YES:
         return "confirmed"
@@ -8924,6 +8928,17 @@ class MediaStreamSession:
                 f"- Read back exactly this value: {pending.readback}. Ask for an explicit yes/no.\n"
                 "- Do not call create_booking or notify_human_handover until the caller says yes.\n"
             )
+        if self._last_guest_utterance_confirmation_required:
+            kind = self._last_guest_utterance_capture_kind
+            if kind in {"name", "phone"}:
+                return (
+                    "\n\nLATEST RECOGNITION SAFETY NOTE:\n"
+                    f"- Azure marked the latest requested {kind} transcription as low confidence.\n"
+                    "- Read back exactly what you understood and ask for an explicit yes/no "
+                    "confirmation before accepting it.\n"
+                    "- Do not call create_booking or notify_human_handover on the same turn. "
+                    f"If the guest says no, ask for the complete {kind} again.\n"
+                )
         if self._capture_confirmation_outcome is None:
             return ""
         outcome, kind = self._capture_confirmation_outcome
@@ -9162,11 +9177,14 @@ class MediaStreamSession:
             return
         if final_records:
             for final_text, metadata in final_records:
-                await self._accumulate_transcript(
-                    final_text,
-                    metadata.confidence if metadata is not None else None,
-                    metadata,
-                )
+                if metadata is None:
+                    # Preserve the established one-argument seam for English,
+                    # Google, Twilio, and test/runtime wrappers.
+                    await self._accumulate_transcript(final_text)
+                else:
+                    await self._accumulate_transcript(
+                        final_text, metadata.confidence, metadata,
+                    )
             return
         if text:
             await self._accumulate_transcript(text)
@@ -9241,11 +9259,12 @@ class MediaStreamSession:
             return
         if final_records:
             for final_text, final_metadata in final_records:
-                await self._accumulate_transcript(
-                    final_text,
-                    final_metadata.confidence if final_metadata is not None else None,
-                    final_metadata,
-                )
+                if final_metadata is None:
+                    await self._accumulate_transcript(final_text)
+                else:
+                    await self._accumulate_transcript(
+                        final_text, final_metadata.confidence, final_metadata,
+                    )
             return
         if caller_text:
             await self._accumulate_transcript(caller_text)
