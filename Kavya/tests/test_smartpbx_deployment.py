@@ -562,6 +562,7 @@ def test_cutover_gates_require_fixed_private_protocol_diagnostics_and_preserve_o
         "silence_reprompt",
         "stt_final",
         "stt_post_dispatch_result",
+        "stt_azure_final_reconciled",
         "stt_provider_final",
         "stt_provider_interim",
         "capture_buffer_bounded",

@@ -355,11 +355,14 @@ the reviewed `1200` ms default via
 `${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-1200}`. The protected file is
 `.env.smartpbx`.
 
-Direct Sinhala Azure recognition uses detailed final results only to obtain the
-bounded NBest confidence score. If a requested name or phone number is below
-`SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD` (default `0.65`), Kavya must
-read back what she understood and receive an explicit yes/no before accepting
-it or calling `create_booking`. The score and transcript are not logged.
+Direct Sinhala Azure recognition uses detailed final results to obtain the
+bounded NBest confidence score and bounded result identity/timing
+(`result_id`, `offset`, `duration`) for exact duplicate/audio-coverage
+reconciliation within the live call. When a requested name or phone number
+falls below `SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD` (default `0.65`),
+Kavya must read back what she understood and receive an explicit yes/no
+before accepting it or calling `create_booking`. The score, identity/timing
+metadata, and transcript are not logged.
 
 ## Later reviewed English digit-class rollout
 
@@ -642,7 +645,7 @@ event allowlist**. It may contain only the following runtime event names:
 `tts_interrupted`, `barge_in`, `guest_utterance`, `kb_error`,
 `llm_stream_timeout`,
 `silence_reprompt`, `stt_final`, `stt_post_dispatch_result`,
-`stt_provider_final`, `stt_provider_interim`,
+`stt_provider_final`, `stt_provider_interim`, `stt_azure_final_reconciled`,
 `capture_buffer_bounded`, `capture_final_buffered`, `capture_deferred_rearm`,
 `capture_endpointing_decision`,
 `capture_forced_dispatch`,
@@ -659,6 +662,10 @@ generated identifiers and are never derived from dialog. The `provider` field is
 a bounded provider enum: `openai`, `gemini`, `claude`, `elevenlabs`, `azure`, or `rime`;
 the `llm_stream_timeout` event additionally permits its normalized `unknown`
 sentinel as documented below.
+
+`stt_azure_final_reconciled` emits only `action=ignored` and
+`basis=result_id|audio_coverage`; it never emits Azure result IDs, offsets,
+durations, transcript text, or call identifiers.
 
 `rime_tts` emits exactly `provider=rime`, `outcome`, and only the documented
 bounded metadata: `status` is present for an HTTP status outcome; a successful

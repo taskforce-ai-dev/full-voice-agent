@@ -85,6 +85,9 @@ class RecordingPipeline:
     ) -> None:
         return None
 
+    def _on_stt_result_with_metadata(self, _text: str, _metadata) -> None:
+        return None
+
     def _on_stt_interim(self, _text: str) -> None:
         return None
 

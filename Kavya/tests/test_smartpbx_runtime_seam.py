@@ -50,6 +50,9 @@ class Pipeline:
     def _on_stt_result(self, _text) -> None:
         pass
 
+    def _on_stt_result_with_metadata(self, _text, _metadata) -> None:
+        pass
+
     def _on_stt_interim(self, _text) -> None:
         pass
 

@@ -596,6 +596,11 @@ class KavyaSmartPBXSession:
                     if profile.lang == "si" and profile.stt_provider == "azure"
                     else None
                 ),
+                on_final_result_with_metadata=(
+                    pipeline._on_stt_result_with_metadata
+                    if profile.lang == "si" and profile.stt_provider == "azure"
+                    else None
+                ),
                 on_interim_result=pipeline._on_stt_interim,
                 lang=profile.stt_language,
                 privacy_safe=True,
@@ -649,6 +654,12 @@ class KavyaSmartPBXSession:
         pipeline._smartpbx_azure_final_endpointing = (
             profile.lang == "si" and profile.stt_provider == "azure"
         )
+        caller_context = getattr(pipeline, "_smartpbx_caller_context", None)
+        if isinstance(caller_context, dict):
+            if profile.lang == "si":
+                caller_context["_capture_provenance_required"] = True
+            else:
+                caller_context.pop("_capture_provenance_required", None)
         if profile.lang == "en":
             return profile
         if profile.llm_provider == "gemini":

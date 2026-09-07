@@ -727,15 +727,37 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         if not _matches_room_type(property_name, requested_room):
             return _room_type_error(property_name, requested_room)
 
-        if not str(tool_input.get("guest_name") or "").strip():
+        from handover import _get_handover_context, normalize_whatsapp
+
+        caller_context = _get_handover_context()
+        if (
+            caller_context.get("_pending_capture_confirmation") in {"name", "phone"}
+            or caller_context.get("_capture_candidate_pending") in {"name", "phone"}
+        ):
+            return json.dumps({
+                "status": "confirmation_required",
+                "message": (
+                    "Do not create the booking yet. The recognized name or number "
+                    "still needs the guest's explicit confirmation."
+                ),
+            })
+
+        confirmed_capture_name = (
+            caller_context.get("spelled_name") or ""
+        ).strip()
+        if (
+            caller_context.get("_capture_provenance_required") is True
+            and caller_context.get("_confirmed_capture_name") is True
+            and confirmed_capture_name
+        ):
+            # Direct Sinhala identity is caller-confirmed state, not a stale
+            # argument the model happens to repeat in a later tool batch.
+            tool_input = {**tool_input, "guest_name": confirmed_capture_name}
+        elif not str(tool_input.get("guest_name") or "").strip():
             # If spelling already ran and returned a parsed name, use it so
             # create_booking gets exactly what the guest confirmed.
-            from handover import _get_handover_context
-
-            ctx = _get_handover_context()
-            guest_name = (ctx.get("spelled_name") or "").strip()
-            if guest_name:
-                tool_input["guest_name"] = guest_name
+            if confirmed_capture_name:
+                tool_input["guest_name"] = confirmed_capture_name
 
         logger.info(
             "create_booking for property: %s, room type: %s", property_name, requested_room
@@ -746,10 +768,7 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         # number is unusable (wrong length -> normalize_whatsapp returns ""),
         # yanolja_service.book falls back to this so the booking still carries a
         # reachable WhatsApp number instead of storing garbage or nothing.
-        from handover import _get_handover_context, normalize_whatsapp
-
         if transfer_context is not None:
-            caller_context = _get_handover_context()
             if caller_context.get("_stt_capture_confirmation_required") is True:
                 return json.dumps({
                     "status": "confirmation_required",
@@ -758,7 +777,23 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
                         "name or number back and receive explicit confirmation."
                     ),
                 })
-            raw_guest_phone = tool_input.get("guest_phone", "")
+            captured_phone = caller_context.get("_capture_validated_number")
+            raw_guest_phone = (
+                captured_phone
+                if caller_context.get("_capture_provenance_required") and captured_phone
+                else tool_input.get("guest_phone", "")
+            )
+            if (
+                caller_context.get("_capture_provenance_required")
+                and not captured_phone
+            ):
+                return json.dumps({
+                    "status": "capture_required",
+                    "message": (
+                        "Do not create the booking yet. Capture the guest's complete "
+                        "mobile number through the approved spoken or keypad path."
+                    ),
+                })
             normalized_guest_phone = normalize_whatsapp(
                 raw_guest_phone,
                 reject_ambiguous_lk_mobile=True,
@@ -843,13 +878,53 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         from handover import _get_handover_context, send_handover_notification
 
         ctx = _get_handover_context()
-        outcome = await send_handover_notification(
-            call_sid=ctx.get("call_sid", ""),
-            customer_name=tool_input.get("customer_name", ""),
-            customer_whatsapp=tool_input.get("customer_whatsapp", ""),
-            call_summary=tool_input.get("call_summary", ""),
-            human_agent_whatsapp=ctx.get("human_agent_whatsapp", ""),
-        )
+        if (
+            ctx.get("_pending_capture_confirmation") in {"name", "phone"}
+            or ctx.get("_capture_candidate_pending") in {"name", "phone"}
+            or ctx.get("_stt_capture_confirmation_required") is True
+        ):
+            return json.dumps({
+                "status": "confirmation_required",
+                "message": (
+                    "Do not notify the manager yet. The recognized name or number "
+                    "still needs the guest's explicit confirmation."
+                ),
+            })
+        smartpbx_sinhala_capture = ctx.get("_capture_provenance_required") is True
+        if smartpbx_sinhala_capture:
+            captured_phone = ctx.get("_capture_validated_number")
+            confirmed_name = (ctx.get("spelled_name") or "").strip()
+            if not captured_phone:
+                return json.dumps({
+                    "status": "capture_required",
+                    "message": (
+                        "Do not notify the manager yet. Capture the guest's complete "
+                        "mobile number through the approved spoken or keypad path."
+                    ),
+                })
+            # Do not let a model-provided value bypass direct-Sinhala capture
+            # provenance. This applies to a caller-confirmed name as well as
+            # the validated phone. Legacy callers keep their existing arguments.
+            outcome = await send_handover_notification(
+                call_sid=ctx.get("call_sid", ""),
+                customer_name=(
+                    confirmed_name
+                    if ctx.get("_confirmed_capture_name") is True and confirmed_name
+                    else tool_input.get("customer_name", "")
+                ),
+                customer_whatsapp=captured_phone,
+                call_summary=tool_input.get("call_summary", ""),
+                human_agent_whatsapp=ctx.get("human_agent_whatsapp", ""),
+                privacy_safe=True,
+            )
+        else:
+            outcome = await send_handover_notification(
+                call_sid=ctx.get("call_sid", ""),
+                customer_name=tool_input.get("customer_name", ""),
+                customer_whatsapp=tool_input.get("customer_whatsapp", ""),
+                call_summary=tool_input.get("call_summary", ""),
+                human_agent_whatsapp=ctx.get("human_agent_whatsapp", ""),
+            )
         if outcome.get("ok"):
             # Let the session skip its end-of-call safety net.
             ctx["notified"] = True
@@ -883,9 +958,20 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         from handover import _get_handover_context, normalize_whatsapp, spoken_number_to_digits
 
         spoken = tool_input.get("spoken") or ""
-        digits = spoken_number_to_digits(spoken)
-
         ctx = _get_handover_context()
+        if (
+            ctx.get("_capture_provenance_required") is True
+            and ctx.get("_keypad_required") is True
+        ):
+            return json.dumps({
+                "status": "keypad_required",
+                "message": (
+                    "Use collect_number_via_keypad now. Do not restart spoken "
+                    "number capture until this keypad collection ends."
+                ),
+            })
+
+        digits = spoken_number_to_digits(spoken)
         state = ctx.setdefault("_capture_spoken_number", {})
         prior_attempts = int(state.get("attempts", 0))
 
@@ -894,7 +980,6 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         )
         if normalized:
             ctx.pop("_capture_spoken_number", None)
-            ctx["_capture_validated_number"] = normalized
             payload = _build_capture_result_payload(
                 spoken=spoken,
                 digits=digits,
@@ -906,6 +991,10 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
                 and ctx.get("_stt_capture_confirmation_required") is True
             ):
                 payload["confirmation_required"] = True
+            elif not ctx.get("_capture_provenance_required"):
+                ctx["_capture_validated_number"] = normalized
+            if ctx.get("_capture_provenance_required"):
+                ctx["_capture_candidate_pending"] = "phone"
             return json.dumps(payload)
 
         # EVERY ATTEMPT STANDS ALONE. A recognizer that drops an operand ("double"
@@ -917,15 +1006,29 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         # number again. Fragments of one dictation are combined upstream by
         # capture mode, so a genuine multi-part number still arrives here whole.
         attempts = prior_attempts + 1
-        ctx.pop("_capture_validated_number", None)
+        direct_capture = ctx.get("_capture_provenance_required") is True
+        if not direct_capture:
+            ctx.pop("_capture_validated_number", None)
+            ctx.pop("_capture_candidate_pending", None)
+        elif ctx.get("_confirmed_capture_phone"):
+            # A failed replacement must fence create/notify until another
+            # valid number is captured; otherwise they could silently reuse
+            # the already-confirmed old number in the same tool batch.
+            ctx["_capture_candidate_pending"] = "phone"
+        else:
+            ctx.pop("_capture_candidate_pending", None)
         state.clear()
         state["attempts"] = attempts
-        return json.dumps(_build_capture_result_payload(
+        payload = _build_capture_result_payload(
             spoken=spoken,
             digits=digits,
             normalized="",
             attempts=attempts,
-        ))
+        )
+        if direct_capture and payload.get("fallback_allowed") is True:
+            ctx["_keypad_required"] = True
+            ctx["_capture_candidate_pending"] = "phone"
+        return json.dumps(payload)
 
     elif tool_name == "collect_number_via_keypad":
         # Real collection is intercepted at the session level, where the live
@@ -941,12 +1044,6 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         spoken = tool_input.get("spoken") or ""
         name = assemble_spoken_name(spoken)
         ctx = _get_handover_context()
-        ctx["spelled_name"] = name
-        # Keep explicit set in case this is the first handover access and we
-        # need to replace None defaults with a per-call session dict.
-        from handover import handover_context
-
-        handover_context.set(ctx)
         payload = {
             "status": "captured" if name else "invalid",
             "name": name,
@@ -960,6 +1057,10 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
             and ctx.get("_stt_capture_confirmation_required") is True
         ):
             payload["confirmation_required"] = True
+        elif name and not ctx.get("_capture_provenance_required"):
+            ctx["spelled_name"] = name
+        if name and ctx.get("_capture_provenance_required"):
+            ctx["_capture_candidate_pending"] = "name"
         return json.dumps(payload)
 
     else:
