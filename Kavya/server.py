@@ -2726,12 +2726,50 @@ _SI_ROOM_NAME_PHRASES: tuple[str, ...] = (
     "විස්ටා", "ප්‍රීමියම්", "මවුන්ට්", "ලක්ස්", "මොනාර්ක්", "ෂැලේ", "චලට්",
 )
 
-# Combined vocabulary -- shared by the dictation-ratio heuristic below and the
-# Azure si-LK phrase list (AzureSTTStream.start()).
+# The English line already owns the maintained starter vocabulary for common
+# Sri Lankan names. Reuse its capitalised entries here without changing the
+# ConversationRelay hint string. Azure recommends phrase lists for names, and
+# these hints help si-LK retain code-switched names instead of replacing them
+# with unrelated Sinhala words.
+# Source: https://learn.microsoft.com/azure/ai-services/speech-service/improve-accuracy-phrase-list
+_SI_COMMON_NAME_PHRASES: tuple[str, ...] = tuple(
+    phrase.strip()
+    for phrase in _DEFAULT_EN_HINTS.split(",")
+    if phrase.strip()[:1].isupper()
+)
+_SI_SPELLED_NAME_PHRASES: tuple[str, ...] = tuple(
+    " ".join(name.upper()) for name in _SI_COMMON_NAME_PHRASES
+)
+
+# Azure si-LK commonly renders an English letter-by-letter spelling as Sinhala
+# letter names ("C H A N Y A" -> "සී එච් ඒ එන් වයි ඒ"). The deterministic
+# name parser consumes ASCII letters, so keep the recognizer vocabulary and the
+# dispatch normalizer below on this single table. Exact-token replacement is
+# safe only inside an explicitly active name-capture episode: several short
+# forms (notably "ඒ") are ordinary Sinhala words in normal conversation.
+_SI_SPOKEN_LETTER_WORDS: dict[str, str] = {
+    "ඒ": "A", "බී": "B", "සී": "C", "ඩී": "D", "ඊ": "E",
+    "එෆ්": "F", "ජී": "G", "එච්": "H", "අයි": "I", "ජේ": "J",
+    "කේ": "K", "එල්": "L", "එම්": "M", "එන්": "N", "ඕ": "O",
+    "පී": "P", "කිව්": "Q", "කියු": "Q", "ආර්": "R", "එස්": "S",
+    "ටී": "T", "යූ": "U", "වී": "V", "ඩබ්ලිව්": "W",
+    "ඩබ්ලියු": "W", "එක්ස්": "X", "වයි": "Y", "සෙඩ්": "Z",
+}
+_SI_LATIN_LETTER_PHRASES: tuple[str, ...] = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+# Existing Sinhala vocabulary -- shared by the dictation-ratio heuristic below
+# and every Azure si-LK path. Keep the new identity hints separate so the
+# dormant Twilio Sinhala recognizer remains byte-for-byte unchanged.
 SI_STT_PHRASE_LIST: tuple[str, ...] = tuple(
     dict.fromkeys(
         list(_SI_UNIT_WORDS) + list(_SI_TEEN_WORDS) + list(_SI_TENS_WORDS)
         + list(_SI_ROOM_NAME_PHRASES)
+    )
+)
+SMARTPBX_SI_NAME_STT_PHRASES: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        list(_SI_COMMON_NAME_PHRASES) + list(_SI_SPELLED_NAME_PHRASES)
+        + list(_SI_LATIN_LETTER_PHRASES) + list(_SI_SPOKEN_LETTER_WORDS)
     )
 )
 
@@ -2742,6 +2780,31 @@ _SI_WORD_RE = re.compile(r"[0-9A-Za-z඀-෿‍]+")
 _SI_TOKEN_RE = re.compile(
     r"[0-9A-Za-z඀-෿‍]+|[^0-9A-Za-z඀-෿‍]+"
 )
+
+
+def _normalize_sinhala_spoken_letters(text: str) -> str:
+    """Rewrite exact Sinhala letter names to ASCII inside name capture.
+
+    The caller's separators and all unrelated words are preserved verbatim so
+    the existing strict `assemble_spoken_name` parser remains the only name
+    assembler. Callers of this helper own the capture-kind boundary.
+    """
+    if not text:
+        return ""
+    tokens = _SI_TOKEN_RE.findall(text)
+    spoken_letter_count = sum(
+        1
+        for token in tokens
+        if _SI_WORD_RE.fullmatch(token) and token in _SI_SPOKEN_LETTER_WORDS
+    )
+    if spoken_letter_count < 2:
+        return text
+    return "".join(
+        _SI_SPOKEN_LETTER_WORDS.get(token, token)
+        if _SI_WORD_RE.fullmatch(token)
+        else token
+        for token in tokens
+    )
 
 
 def _normalize_sinhala_spoken_digits(text: str) -> str:
@@ -7030,6 +7093,8 @@ class AzureSTTStream:
             stt_phrases = EN_STT_PHRASE_LIST
         elif self._lang == "si":
             stt_phrases = SI_STT_PHRASE_LIST
+            if self._direct_smartpbx_sinhala:
+                stt_phrases += SMARTPBX_SI_NAME_STT_PHRASES
         if stt_phrases and phrase_list_grammar is not None:
             try:
                 phrase_grammar = phrase_list_grammar.from_recognizer(self._recognizer)
@@ -10856,6 +10921,15 @@ class MediaStreamSession:
             # argument `capture_spoken_number` sees — so every consumer of
             # this turn's text sees the same normalised digits.
             transcript = _normalize_sinhala_spoken_digits(transcript)
+        elif (
+            self._is_direct_smartpbx_sinhala()
+            and self._capture_kind == "name"
+        ):
+            # Azure si-LK can hear a spelling correctly while rendering each
+            # English letter as a Sinhala letter name. Convert only at the
+            # explicit name-capture boundary so ordinary Sinhala remains
+            # untouched and the deterministic parser receives ASCII letters.
+            transcript = _normalize_sinhala_spoken_letters(transcript)
         # Claim the turn synchronously, before any await, so a concurrently-queued
         # flush task sees the guard set and bails.
         self._utterance_dispatched = True
