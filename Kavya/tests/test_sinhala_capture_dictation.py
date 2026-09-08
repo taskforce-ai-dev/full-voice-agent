@@ -16,6 +16,7 @@ import asyncio
 
 import pytest
 
+import handover
 import server
 
 
@@ -193,6 +194,46 @@ async def test_sinhala_name_capture_with_number_words_stays_verbatim():
     await asyncio.sleep(0)
 
     assert processed == ["හැට පහ"]
+
+
+@pytest.mark.asyncio
+async def test_sinhala_name_capture_normalises_azure_spoken_letters():
+    session, loop, processed = make_smartpbx_session(lang="si")
+    session._enter_capture_mode(kind="name")
+
+    await session._accumulate_transcript("උක්ත සාන්යා සී එච් ඒ. එන් වයි. ඒ.")
+    loop.last.callback()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert processed == ["උක්ත සාන්යා C H A. N Y. A."]
+    assert handover.assemble_spoken_name(processed[0]) == "Chanya"
+
+
+@pytest.mark.asyncio
+async def test_sinhala_phone_capture_does_not_normalise_spoken_letters():
+    session, loop, processed = make_smartpbx_session(lang="si")
+    session._enter_capture_mode(kind="phone")
+
+    await session._accumulate_transcript("සී එච් ඒ")
+    loop.last.callback()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert processed == ["සී එච් ඒ"]
+
+
+@pytest.mark.asyncio
+async def test_sinhala_name_capture_does_not_rewrite_an_isolated_letter_homograph():
+    session, loop, processed = make_smartpbx_session(lang="si")
+    session._enter_capture_mode(kind="name")
+
+    await session._accumulate_transcript("ඒ නම නැවත කියන්න")
+    loop.last.callback()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert processed == ["ඒ නම නැවත කියන්න"]
 
 
 @pytest.mark.asyncio

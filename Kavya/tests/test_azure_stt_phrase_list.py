@@ -187,6 +187,32 @@ def test_sinhala_phrase_list_constant_covers_units_tens_and_teens():
         assert word in phrases, f"Sinhala number word {word} must be in the phrase list"
 
 
+def test_sinhala_phrase_list_covers_local_names_and_spelled_letters():
+    phrases = server.SMARTPBX_SI_NAME_STT_PHRASES
+
+    for name in ("Chanya", "Shehani", "Oshadi"):
+        assert name in phrases
+    assert "C H A N Y A" in phrases
+    for letter_word in ("සී", "එච්", "ඒ", "එන්", "වයි"):
+        assert letter_word in phrases
+    assert len(server.SI_STT_PHRASE_LIST) + len(phrases) <= 500
+
+
+def test_direct_sinhala_recognizer_gets_name_and_spelling_hints(monkeypatch):
+    factory = _run_start(monkeypatch, lang="si", direct_smartpbx_sinhala=True)
+
+    added = factory.grammars[0].phrases
+    assert set(server.SMARTPBX_SI_NAME_STT_PHRASES) <= set(added)
+
+
+def test_legacy_sinhala_recognizer_does_not_get_smartpbx_name_hints(monkeypatch):
+    factory = _run_start(monkeypatch, lang="si", direct_smartpbx_sinhala=False)
+
+    added = factory.grammars[0].phrases
+    assert "Chanya" not in added
+    assert "C H A N Y A" not in added
+
+
 def test_sinhala_recognizer_gets_the_sinhala_phrase_list_populated(monkeypatch):
     factory = _run_start(monkeypatch, lang="si")
 
