@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
+from .readiness import ReadinessAuthority, ReadinessError, ReadinessEvidence
 from .state import GenerationState, Stage, StateError
 
 
@@ -104,31 +105,9 @@ class GenerationWorktree:
         object.__setattr__(self, "path", Path(self.path))
 
 
-@dataclass(frozen=True)
-class PRReadiness:
-    """Immutable prerequisites supplied by the verification/orchestration seam."""
-
-    readiness_report_path: Path
-    readiness_verified: bool
-    secret_scan_passed: bool
-    ci_registered: bool
-    provenance_source_revision: str
-    template_revision: str
-    artifact_digests: Mapping[str, str]
-    review_label: str
-    wss_url: str
-    expected_wss_hostname: str
-    allowed_wss_paths: tuple[str, ...]
-    readiness_digest: str
-    secret_scan_digest: str
-    ci_registration_digest: str
-    provenance_digest: str
-    worktree_ownership_digest: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "readiness_report_path", Path(self.readiness_report_path))
-        object.__setattr__(self, "artifact_digests", MappingProxyType(dict(self.artifact_digests)))
-        object.__setattr__(self, "allowed_wss_paths", tuple(self.allowed_wss_paths))
+# Compatibility name for record data.  This value is never a capability: only
+# ReadinessAuthority.load() may supply it to the provider boundary.
+PRReadiness = ReadinessEvidence
 
 
 @dataclass(frozen=True)
@@ -158,7 +137,7 @@ def open_linked_prs(
     provider: PRProvider,
     *,
     state: GenerationState,
-    readiness: PRReadiness,
+    readiness_authority: ReadinessAuthority,
     worktrees: Sequence[GenerationWorktree],
     inspector: WorktreeInspector,
     redactions: Sequence[str] = (),
@@ -170,6 +149,17 @@ def open_linked_prs(
     before any provider call and are never returned or persisted by this module.
     """
     normalized_redactions = _validate_redactions(state, redactions)
+    if not isinstance(readiness_authority, ReadinessAuthority):
+        _block(state, "authoritative readiness record is required")
+        raise StateError("PR prerequisite failed: authoritative readiness record is required")
+    try:
+        # Do not accept a caller-built readiness object here.  The persisted
+        # record is hash-checked and bound to this generation/worktree set at
+        # the last possible point before any provider interaction.
+        readiness = readiness_authority.load(state, worktrees=worktrees)
+    except ReadinessError as error:
+        _block(state, "authoritative readiness record is invalid")
+        raise StateError("PR prerequisite failed: authoritative readiness record is invalid") from error
     _require_verified(state, readiness)
     _validate_readiness(state, readiness)
     by_role = _validate_worktrees(state, readiness, worktrees)

@@ -26,11 +26,13 @@ from .knowledge import (
     recompute_knowledge_review_digest,
 )
 from .provenance import ProvenanceError, validate_allowlist_metadata
+from .readiness import ReadinessAuthority, ReadinessError, ReadinessEvidence
 from .render import IncompleteTemplateError, render_backend
 from .resources import AllocationRegistry, DerivedResources, ResourceConflict, derive_resources
 from .schema import ManifestError, manifest_digest, parse_manifest
 from .secrets import SecretAudit, SecretProvider
 from .state import GenerationState, Stage, StateError
+from .verify import VerificationReport
 
 
 class GenerationError(RuntimeError):
@@ -374,10 +376,75 @@ class GenerationOrchestrator:
             )
         )
 
+    def record_verified_pr_readiness(
+        self,
+        generation_id: str,
+        *,
+        readiness: ReadinessEvidence,
+        worktrees: tuple[object, ...],
+        verification_reports: Mapping[str, VerificationReport],
+    ) -> Path:
+        """Persist the sole PR authority after all role reports are truly ready.
+
+        This is deliberately the only state transition into ``VERIFIED`` for
+        the PR lane.  It refuses caller booleans unless they agree with reports
+        produced by the verification seam and writes durable evidence before
+        recording the state transition.
+        """
+        stored = self._load_verified(generation_id)
+        state = stored.state
+        if state.stage is not Stage.GENERATED:
+            raise GenerationBlockedError("verified readiness requires stage GENERATED")
+        if not isinstance(readiness, ReadinessEvidence) or not isinstance(verification_reports, Mapping):
+            raise GenerationBlockedError("verified readiness evidence is required")
+        if set(verification_reports) != {"backend", "operations", "website"}:
+            raise GenerationBlockedError("verified readiness requires reports for every role")
+        for role, report in verification_reports.items():
+            if not isinstance(report, VerificationReport) or not report.ready_for_pr:
+                raise GenerationBlockedError(f"{role} verification is not PR-ready")
+            if report.artifact_digest != readiness.artifact_digests.get(role):
+                raise GenerationBlockedError(f"{role} artifact digest does not match verification")
+            if report.source_revision != readiness.provenance_source_revision:
+                raise GenerationBlockedError(f"{role} source revision does not match verification")
+        if not (readiness.readiness_verified and readiness.secret_scan_passed and readiness.ci_registered):
+            raise GenerationBlockedError("real verification, secret scan, and CI registration are required")
+        authority = ReadinessAuthority(self._state_root)
+        try:
+            record_path = authority.persist(
+                state,
+                readiness=readiness,
+                worktrees=worktrees,
+                verification_reports=verification_reports,
+            )
+            for name, digest in {
+                "readiness": readiness.readiness_digest,
+                "secret_scan": readiness.secret_scan_digest,
+                "ci_registration": readiness.ci_registration_digest,
+                "provenance": readiness.provenance_digest,
+                "worktree_ownership": readiness.worktree_ownership_digest,
+                "artifact_backend": readiness.artifact_digests["backend"],
+                "artifact_operations": readiness.artifact_digests["operations"],
+                "artifact_website": readiness.artifact_digests["website"],
+            }.items():
+                state.record_stage_digest(name, digest)
+            state.transition(Stage.VERIFIED)
+        except (ReadinessError, StateError, KeyError) as error:
+            raise GenerationBlockedError("verified readiness cannot be persisted") from error
+        self._save(stored)
+        return record_path
+
     def open_pr(self, generation_id: str) -> GenerationState:
         stored = self._load_verified(generation_id)
         if stored.state.stage is not Stage.VERIFIED:
             raise GenerationBlockedError("VERIFIED state is required before opening review requests")
+        try:
+            ReadinessAuthority(self._state_root).load(stored.state)
+        except ReadinessError as error:
+            raise GenerationBlockedError("authoritative readiness record is unavailable or invalid") from error
+        # The actual provider lane receives its authority below through
+        # open_linked_prs(), which always invokes ReadinessAuthority.load().
+        # This CLI-only placeholder has no provider or worktree seams and can
+        # therefore never turn caller-provided flags into a provider action.
         raise GenerationBlockedError("review request coordinator is unavailable until the PR lane is configured")
 
     def _load_verified(self, generation_id: str) -> _StoredGeneration:

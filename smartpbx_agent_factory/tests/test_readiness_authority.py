@@ -17,9 +17,11 @@ from smartpbx_agent_factory.prs import (
     GenerationOwnershipEvidence,
     GenerationWorktree,
     PRReadiness,
+    open_linked_prs,
 )
 from smartpbx_agent_factory.readiness import ReadinessAuthority, ReadinessError
 from smartpbx_agent_factory.state import GenerationState, Stage
+from smartpbx_agent_factory.verify import VerificationReport
 
 
 def _state() -> GenerationState:
@@ -88,9 +90,27 @@ def _worktrees() -> tuple[GenerationWorktree, ...]:
     )
 
 
+def _reports() -> dict[str, VerificationReport]:
+    evidence = (
+        "Dockerfile", "server.py", "smartpbx_gateway.py", "smartpbx_protocol.py",
+        "smartpbx_transport.py", "smartpbx_diagnostics.py", "docker-compose.yml",
+        ".github-workflow-fragment.yml", ".smartpbx-factory-provenance.json",
+    )
+    return {
+        role: VerificationReport(
+            agent_slug=f"acme-{role}", artifact_digest=digest, template_version="v1",
+            source_revision="a" * 40, ci_identifier=f"ci-{role}",
+            protocol_events=("connected", "start", "media", "stop", "hangup"),
+            static_contracts_passed=True, runtime_lifecycle_verified=True, ready_for_pr=True,
+            runtime_status="CI_LIFECYCLE_VERIFIED", evidence=evidence,
+        )
+        for role, digest in _readiness().artifact_digests.items()
+    }
+
+
 def test_authority_persists_canonical_private_generation_contained_record(tmp_path: Path) -> None:
     authority = ReadinessAuthority(tmp_path / ".smartpbx-generations")
-    record_path = authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees())
+    record_path = authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees(), verification_reports=_reports())
 
     assert record_path == tmp_path / ".smartpbx-generations" / "gen-001" / "readiness.json"
     assert record_path.stat().st_mode & 0o777 == 0o600
@@ -104,7 +124,7 @@ def test_authority_persists_canonical_private_generation_contained_record(tmp_pa
 
 def test_authority_rejects_tampered_or_wrong_generation_record_before_provider_use(tmp_path: Path) -> None:
     authority = ReadinessAuthority(tmp_path / ".smartpbx-generations")
-    record_path = authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees())
+    record_path = authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees(), verification_reports=_reports())
     document = json.loads(record_path.read_text(encoding="utf-8"))
     document["artifact_digests"]["backend"] = "0" * 64
     record_path.write_text(json.dumps(document), encoding="utf-8")
@@ -116,7 +136,7 @@ def test_authority_rejects_tampered_or_wrong_generation_record_before_provider_u
 def test_authority_rejects_symlinked_record_or_parent(tmp_path: Path) -> None:
     root = tmp_path / ".smartpbx-generations"
     authority = ReadinessAuthority(root)
-    authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees())
+    authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees(), verification_reports=_reports())
     record_path = authority.record_path("gen-001")
     replacement = tmp_path / "replacement.json"
     replacement.write_text("{}", encoding="utf-8")
@@ -129,7 +149,7 @@ def test_authority_rejects_symlinked_record_or_parent(tmp_path: Path) -> None:
 
 def test_authority_rejects_record_if_role_worktree_binding_changes(tmp_path: Path) -> None:
     authority = ReadinessAuthority(tmp_path / ".smartpbx-generations")
-    authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees())
+    authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees(), verification_reports=_reports())
     changed = list(_worktrees())
     changed[0] = replace(changed[0], branch_sha="0" * 40)
 
@@ -139,8 +159,19 @@ def test_authority_rejects_record_if_role_worktree_binding_changes(tmp_path: Pat
 
 def test_authority_requires_private_record_permissions(tmp_path: Path) -> None:
     authority = ReadinessAuthority(tmp_path / ".smartpbx-generations")
-    record_path = authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees())
+    record_path = authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees(), verification_reports=_reports())
     os.chmod(record_path, 0o644)
 
     with pytest.raises(ReadinessError, match="0600"):
         authority.load(_state(), worktrees=_worktrees())
+
+
+def test_provider_boundary_does_not_accept_caller_built_readiness() -> None:
+    with pytest.raises(TypeError, match="readiness"):
+        open_linked_prs(
+            object(),
+            state=_state(),
+            readiness=_readiness(),
+            worktrees=_worktrees(),
+            inspector=object(),
+        )

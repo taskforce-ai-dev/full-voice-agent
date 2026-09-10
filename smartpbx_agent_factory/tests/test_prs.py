@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import tempfile
 
 import pytest
 
@@ -11,9 +12,11 @@ from smartpbx_agent_factory.prs import (
     PRCreationFailure,
     PRReadiness,
     WorktreeInspection,
-    open_linked_prs,
+    open_linked_prs as _open_linked_prs,
 )
+from smartpbx_agent_factory.readiness import ReadinessAuthority, ReadinessError
 from smartpbx_agent_factory.state import GenerationState, Stage, StateError
+from smartpbx_agent_factory.verify import VerificationReport
 
 
 @dataclass
@@ -123,6 +126,24 @@ def fixture_stage_digests() -> dict[str, str]:
     }
 
 
+def fixture_verification_reports(readiness: PRReadiness) -> dict[str, VerificationReport]:
+    evidence = (
+        "Dockerfile", "server.py", "smartpbx_gateway.py", "smartpbx_protocol.py",
+        "smartpbx_transport.py", "smartpbx_diagnostics.py", "docker-compose.yml",
+        ".github-workflow-fragment.yml", ".smartpbx-factory-provenance.json",
+    )
+    return {
+        role: VerificationReport(
+            agent_slug=f"acme-{role}", artifact_digest=digest, template_version="v1",
+            source_revision=readiness.provenance_source_revision, ci_identifier=f"ci-{role}",
+            protocol_events=("connected", "start", "media", "stop", "hangup"),
+            static_contracts_passed=True, runtime_lifecycle_verified=True, ready_for_pr=True,
+            runtime_status="CI_LIFECYCLE_VERIFIED", evidence=evidence,
+        )
+        for role, digest in readiness.artifact_digests.items()
+    }
+
+
 def fixture_ownership() -> GenerationOwnershipEvidence:
     return GenerationOwnershipEvidence(
         generation_id="gen-001",
@@ -164,6 +185,37 @@ def fixture_inspector(
             )
             for worktree in worktrees
         }
+    )
+
+
+def open_linked_prs(
+    provider: FakePRProvider,
+    *,
+    state: GenerationState,
+    readiness: PRReadiness,
+    worktrees: tuple[GenerationWorktree, ...],
+    inspector: FakeWorktreeInspector,
+    **kwargs: object,
+):
+    """Legacy test adapter: production code only accepts a persisted authority."""
+    authority = ReadinessAuthority(Path(tempfile.mkdtemp()) / ".smartpbx-generations")
+    try:
+        authority.persist(
+            state,
+            readiness=readiness,
+            worktrees=worktrees,
+            verification_reports=fixture_verification_reports(readiness),
+        )
+    except ReadinessError as error:
+        state.block("authoritative readiness record is invalid")
+        raise StateError("PR prerequisite failed: authoritative readiness record is invalid") from error
+    return _open_linked_prs(
+        provider,
+        state=state,
+        readiness_authority=authority,
+        worktrees=worktrees,
+        inspector=inspector,
+        **kwargs,
     )
 
 
