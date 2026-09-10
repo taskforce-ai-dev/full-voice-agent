@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -26,7 +27,7 @@ from .knowledge import (
 )
 from .provenance import ProvenanceError, validate_allowlist_metadata
 from .render import IncompleteTemplateError, render_backend
-from .resources import AllocationRegistry, DerivedResources, derive_resources
+from .resources import AllocationRegistry, DerivedResources, ResourceConflict, derive_resources
 from .schema import ManifestError, manifest_digest, parse_manifest
 from .secrets import SecretAudit, SecretProvider
 from .state import GenerationState, Stage, StateError
@@ -136,18 +137,22 @@ class GenerationOrchestrator:
         except (OSError, json.JSONDecodeError, ManifestError) as error:
             raise GenerationBlockedError(str(error)) from error
         digest = manifest_digest(manifest)
-        resources = derive_resources(manifest, AllocationRegistry())
         knowledge_digest = _digest_payload({"sources": [asdict(source) for source in manifest.knowledge_sources]})
-        resource_digest = _digest_payload(asdict(resources))
-        plan_digest = _digest_payload(
-            {"manifest": digest, "knowledge": knowledge_digest, "resources": resource_digest}
-        )
-        state = GenerationState.start(f"gen-{uuid.uuid4().hex}", digest)
-        state.transition(Stage.INPUT_COLLECTED)
-        stored = _StoredGeneration(
-            state, manifest_path, resources, knowledge_digest, resource_digest, plan_digest, CleanupInventory()
-        )
-        self._save(stored)
+        with self._allocation_lock():
+            try:
+                resources = derive_resources(manifest, self._reserved_resources())
+            except ResourceConflict as error:
+                raise GenerationBlockedError(f"resource allocation conflict: {error}") from error
+            resource_digest = _digest_payload(asdict(resources))
+            plan_digest = _digest_payload(
+                {"manifest": digest, "knowledge": knowledge_digest, "resources": resource_digest}
+            )
+            state = GenerationState.start(f"gen-{uuid.uuid4().hex}", digest)
+            state.transition(Stage.INPUT_COLLECTED)
+            stored = _StoredGeneration(
+                state, manifest_path, resources, knowledge_digest, resource_digest, plan_digest, CleanupInventory()
+            )
+            self._save(stored)
         return PlanReport(
             generation_id=state.generation_id,
             state=state,
@@ -452,6 +457,57 @@ class GenerationOrchestrator:
             raise GenerationInfrastructureError("state root may not be a symlink")
         if self._state_root.stat().st_mode & 0o777 != 0o700:
             raise GenerationInfrastructureError("state root must not be group or world accessible")
+
+    @contextmanager
+    def _allocation_lock(self):
+        """Serialize derive-plus-persist so two plans cannot reserve the same set."""
+        try:
+            import fcntl
+
+            self._ensure_state_root(create=True)
+            path = self._state_root / ".allocation.lock"
+            if path.is_symlink():
+                raise GenerationInfrastructureError("allocation lock may not be a symlink")
+            descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+                if path.stat().st_mode & 0o777 != 0o600:
+                    raise GenerationInfrastructureError("allocation lock must be private")
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+        except OSError as error:
+            raise GenerationInfrastructureError("cannot lock resource allocations") from error
+
+    def _reserved_resources(self) -> AllocationRegistry:
+        allocations: dict[str, list[object]] = {
+            "ports": [], "hostnames": [], "services": [], "containers": [], "slugs": [],
+            "folders": [], "wss_headers": [], "ghcr_repositories": [], "ci_identifiers": [],
+            "secret_record_keys": [],
+        }
+        for path in self._state_root.glob("gen-*.json"):
+            if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
+                raise GenerationInfrastructureError("reserved generation state is unsafe")
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                resources = DerivedResources(**dict(raw["resources"]))
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+                raise GenerationInfrastructureError("reserved generation state is invalid") from error
+            allocations["ports"].extend((resources.website_port, resources.smartpbx_port))
+            allocations["hostnames"].extend((resources.website_hostname, resources.smartpbx_hostname))
+            allocations["services"].extend((resources.website_service, resources.smartpbx_service))
+            allocations["containers"].extend((resources.website_service, resources.smartpbx_service))
+            allocations["slugs"].append(resources.slug)
+            allocations["folders"].append(resources.folder_identity)
+            allocations["wss_headers"].append(resources.wss_header)
+            allocations["ghcr_repositories"].append(resources.ghcr_repository)
+            allocations["ci_identifiers"].append(resources.ci_identifier)
+            allocations["secret_record_keys"].append(resources.secret_record_key)
+        return AllocationRegistry(allocations)
 
     @staticmethod
     def _require_private_state_file(path: Path) -> None:
