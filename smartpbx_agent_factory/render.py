@@ -11,13 +11,14 @@ import hashlib
 import json
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
 
 from .model import AgentManifest
 from .provenance import ProvenanceError, TemplateAllowlist, validate_allowlist_metadata
 from .resources import DerivedResources
+from .schema import manifest_digest
 from .state import GenerationState, Stage
 
 
@@ -123,9 +124,18 @@ def _verify_supplied_templates(root: Path, allowlist: TemplateAllowlist) -> Mapp
     return verified
 
 
-def _review_facts(review: KnowledgeReviewLike, state: GenerationState | None) -> tuple[str, ...]:
+def _review_facts(review: KnowledgeReviewLike, state: GenerationState | None, manifest: AgentManifest) -> tuple[str, ...]:
+    dataclass_parameters = getattr(review, "__dataclass_params__", None)
+    if not is_dataclass(review) or not getattr(dataclass_parameters, "frozen", False):
+        raise ReviewNotApprovedError("knowledge review must be a concrete immutable KnowledgeReview dataclass")
     if not isinstance(state, GenerationState):
         raise ReviewNotApprovedError("knowledge review requires GenerationState approval")
+    if state.manifest_digest != manifest_digest(manifest):
+        raise ReviewNotApprovedError("generation state manifest digest does not match manifest")
+    if state.stage not in {Stage.GENERATED, Stage.VERIFIED, Stage.THREE_PRS_OPENED}:
+        raise ReviewNotApprovedError("generation state requires matching plan approval before rendering")
+    if not state.plan_digest or state.plan_approval_digest != state.plan_digest:
+        raise ReviewNotApprovedError("generation state requires matching plan approval before rendering")
     digest = getattr(review, "digest", "")
     if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
         raise ReviewNotApprovedError("knowledge review digest must be a sha256 hex digest")
@@ -144,7 +154,27 @@ def _review_facts(review: KnowledgeReviewLike, state: GenerationState | None) ->
         if not isinstance(text, str):
             raise ReviewNotApprovedError("knowledge review facts must be KnowledgeFact values with text or statement")
         rendered.append(text)
-    return tuple(rendered)
+    normalized = tuple(rendered)
+    if digest != _canonical_review_digest(normalized, getattr(review, "documents", None)):
+        raise ReviewNotApprovedError("knowledge review canonical digest does not match reviewed content")
+    return normalized
+
+
+def _canonical_review_digest(facts: tuple[str, ...], documents: object) -> str:
+    """Synthetic-contract digest; real rendering awaits the Lane B concrete type."""
+    payload = "\n".join(facts)
+    if documents is not None:
+        if not isinstance(documents, Mapping):
+            raise ReviewNotApprovedError("knowledge review documents must be a mapping")
+        rows: list[str] = []
+        for filename in sorted(documents):
+            content = documents[filename]
+            if not isinstance(filename, str) or not isinstance(content, str):
+                raise ReviewNotApprovedError("knowledge review documents must contain text names and content")
+            rows.append(f"{filename}\0{content}")
+        if rows:
+            payload += "\n" + "\n".join(rows)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _knowledge_documents(review: KnowledgeReviewLike, facts: tuple[str, ...]) -> Mapping[str, str]:
@@ -425,7 +455,7 @@ def render_backend(
     templates = _verify_supplied_templates(root, allowlist)
     if resources.slug != manifest.slug or resources.folder_identity != f"SmartPBX Agents/{manifest.slug}":
         raise RenderError("derived resources do not match manifest identity")
-    facts = _review_facts(review, state)
+    facts = _review_facts(review, state, manifest)
     files = _files(manifest, resources, _knowledge_documents(review, facts), templates)
     _scan_outputs(files)
     rendered_root = Path(output_dir) / resources.folder_identity
