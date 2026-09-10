@@ -1,0 +1,30 @@
+name: smartpbx-generated-agents
+
+on:
+  pull_request:
+    paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", ".github/workflows/smartpbx-generated-agents.yml"]
+  push:
+    branches: [main]
+    paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", ".github/workflows/smartpbx-generated-agents.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  smartpbx-generated-agent:
+    name: smartpbx-generated-agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Discover generated agents
+        run: find "SmartPBX Agents" -mindepth 1 -maxdepth 1 -type d -print0 > /tmp/smartpbx-agent-dirs || true
+      - name: Run disposable generated-agent contracts
+        run: |
+          while IFS= read -r -d '' agent_dir; do
+            python -m pytest "$agent_dir/tests"
+            docker build -f "$agent_dir/Dockerfile" -t smartpbx-generated-contract "$agent_dir"
+            docker run --rm --entrypoint python smartpbx-generated-contract -c "import server, smartpbx_gateway, smartpbx_protocol"
+          done < /tmp/smartpbx-agent-dirs

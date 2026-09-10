@@ -1,0 +1,376 @@
+"""Fail-closed rendering for isolated, inquiry-only SmartPBX backend trees.
+
+This module deliberately has no fallback to Kavya or to a mutable source tree.
+The checked-in template allowlist is currently blocked, so normal rendering stops
+until an approved, digest-bound ``TemplateAllowlist`` is supplied.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Protocol
+
+from .model import AgentManifest
+from .provenance import ProvenanceError, TemplateAllowlist, validate_allowlist_metadata
+from .resources import DerivedResources
+
+
+class RenderError(ValueError):
+    """Raised when a generated backend artifact would be unsafe or incomplete."""
+
+
+class TemplateUnavailableError(RenderError):
+    """Raised when no approved, immutable template allowlist is available."""
+
+
+class IdentityLeakError(RenderError):
+    """Raised when an output would contain another customer's identity or a secret."""
+
+
+class ReviewNotApprovedError(RenderError):
+    """Raised when knowledge review has not been approved for this render."""
+
+
+class KnowledgeReviewLike(Protocol):
+    digest: str
+    approved: bool
+
+
+@dataclass(frozen=True)
+class RenderReport:
+    output_dir: Path
+    artifact_digest: str
+    files: tuple[str, ...]
+    enabled_capabilities: tuple[str, ...]
+    template_version: str
+    review_digest: str
+
+
+_TEMPLATE_ROOT = Path(__file__).parent / "template_v1"
+_DEFAULT_ALLOWLIST = _TEMPLATE_ROOT / "file_allowlist.json"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_IDENTITY_PATTERNS = (
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (r"hatton\s+hills", r"treehouse", r"mosvold", r"yanolja", r"kavya")
+)
+_SECRET_PATTERNS = (
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"begin\s+private\s+key",
+        r"smartpbx_ws_token\s*=",
+        r"(?:api[-_ ]?key)\s*[:=]\s*[^\s${]",
+        r"\bsk-[a-z0-9_-]{12,}",
+        r"\bAC[a-f0-9]{32}\b",
+    )
+)
+_BUSINESS_TOOLS = ("create_booking", "transfer_to_human", "hangup_call")
+
+
+def _load_default_allowlist() -> TemplateAllowlist:
+    try:
+        raw = json.loads(_DEFAULT_ALLOWLIST.read_text(encoding="utf-8"))
+        return validate_allowlist_metadata(raw)
+    except (OSError, json.JSONDecodeError, ProvenanceError) as exc:
+        raise TemplateUnavailableError(
+            "TEMPLATE_ALLOWLIST_UNAVAILABLE: approved deployed template provenance is required"
+        ) from exc
+
+
+def _verify_supplied_templates(root: Path, allowlist: TemplateAllowlist) -> Mapping[str, str]:
+    """Verify an already-approved allowlist without accepting unlisted files."""
+    if not root.is_dir() or root.is_symlink():
+        raise TemplateUnavailableError("TEMPLATE_ALLOWLIST_UNAVAILABLE: template root is not a safe directory")
+    expected = {entry.template_path: entry.sha256 for entry in allowlist.files.values()}
+    if not expected:
+        raise TemplateUnavailableError("TEMPLATE_ALLOWLIST_UNAVAILABLE: template allowlist has no files")
+    actual: dict[str, Path] = {}
+    for candidate in root.rglob("*"):
+        relative = candidate.relative_to(root).as_posix()
+        if candidate.is_symlink():
+            raise TemplateUnavailableError(f"TEMPLATE_ALLOWLIST_UNAVAILABLE: template symlink: {relative}")
+        if candidate.is_file():
+            actual[relative] = candidate
+    if set(actual) != set(expected):
+        raise TemplateUnavailableError("TEMPLATE_ALLOWLIST_UNAVAILABLE: template files do not exactly match allowlist")
+    verified: dict[str, str] = {}
+    for relative, candidate in actual.items():
+        digest = "sha256:" + hashlib.sha256(candidate.read_bytes()).hexdigest()
+        if digest != expected[relative]:
+            raise TemplateUnavailableError(f"TEMPLATE_ALLOWLIST_UNAVAILABLE: template hash drift: {relative}")
+        try:
+            verified[relative] = candidate.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise TemplateUnavailableError(f"TEMPLATE_ALLOWLIST_UNAVAILABLE: template is not UTF-8: {relative}") from exc
+    return verified
+
+
+def _review_facts(review: KnowledgeReviewLike) -> tuple[str, ...]:
+    if not getattr(review, "approved", False):
+        raise ReviewNotApprovedError("knowledge review is not approved")
+    digest = getattr(review, "digest", "")
+    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+        raise ReviewNotApprovedError("knowledge review digest must be a sha256 hex digest")
+    facts = getattr(review, "facts", ())
+    if not isinstance(facts, tuple) or any(not isinstance(fact, str) for fact in facts):
+        raise ReviewNotApprovedError("knowledge review facts must be an immutable tuple of strings")
+    return facts
+
+
+def _python_gateway(resources: DerivedResources) -> str:
+    return f'''"""Generated SmartPBX gateway. Authentication always precedes accept()."""
+from __future__ import annotations
+
+import json
+import secrets
+from dataclasses import dataclass
+from typing import Mapping
+
+
+@dataclass(frozen=True)
+class SmartPBXSettings:
+    token: str
+    account_id: str
+    auth_header_name: str = "{resources.wss_header}"
+    max_calls: int = 1
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str]) -> "SmartPBXSettings":
+        token = environ.get("SMARTPBX_WS_TOKEN", "")
+        account_id = environ.get("SMARTPBX_ACCOUNT_ID", "")
+        header = environ.get("SMARTPBX_AUTH_HEADER_NAME", "{resources.wss_header}")
+        if not token or not account_id or not header:
+            raise ValueError("SmartPBX settings are incomplete")
+        return cls(token=token, account_id=account_id, auth_header_name=header)
+
+    def token_matches(self, candidate: object) -> bool:
+        return isinstance(candidate, str) and candidate.isascii() and secrets.compare_digest(self.token, candidate)
+
+
+class SmartPBXSessionRegistry:
+    def __init__(self, max_sessions: int) -> None:
+        if not isinstance(max_sessions, int) or isinstance(max_sessions, bool) or max_sessions < 1:
+            raise ValueError("max_sessions must be positive")
+        self.max_sessions = max_sessions
+
+
+class SmartPBXGateway:
+    def __init__(self, settings: SmartPBXSettings, registry: SmartPBXSessionRegistry) -> None:
+        self.settings = settings
+        self.registry = registry
+
+    async def handle(self, websocket, factory) -> None:
+        candidate = websocket.headers.get(self.settings.auth_header_name)
+        if not self.settings.token_matches(candidate):
+            await websocket.close(code=1008, reason="unauthorized")
+            return
+        await websocket.accept()
+        session = None
+        while True:
+            event = json.loads(await websocket.receive_text())
+            if event.get("event") == "start":
+                start = event.get("start", {{}})
+                if start.get("accountId") != self.settings.account_id:
+                    await websocket.close(code=1008, reason="unauthorized")
+                    return
+                session = await factory(start, None)
+                if hasattr(session, "start"):
+                    await session.start()
+            elif event.get("event") == "stop":
+                if session is not None and hasattr(session, "finish"):
+                    await session.finish()
+                return
+'''
+
+
+def _files(manifest: AgentManifest, resources: DerivedResources, facts: tuple[str, ...]) -> Mapping[str, str]:
+    enabled = manifest.capabilities.enabled_names
+    if enabled:
+        raise RenderError("capability rendering is unavailable until an explicit capability module is approved")
+    title = manifest.display_name
+    knowledge = "\n\n".join(facts) or "No approved facts were supplied."
+    compose = f'''services:
+  {resources.smartpbx_service}:
+    profiles: ["smartpbx"]
+    build: .
+    environment:
+      ENABLE_SMARTPBX_WSS: "true"
+      SMARTPBX_WS_TOKEN: ${{SMARTPBX_WS_TOKEN?required}}
+      SMARTPBX_ACCOUNT_ID: ${{SMARTPBX_ACCOUNT_ID?required}}
+      SMARTPBX_AUTH_HEADER_NAME: "{resources.wss_header}"
+    ports: ["{resources.smartpbx_port}:8080"]
+  {resources.website_service}:
+    profiles: ["website-demo"]
+    build: .
+    command: python website_demo.py
+    ports: ["{resources.website_port}:8081"]
+'''
+    workflow_fragment = '''name: generated-agent-contract
+jobs:
+  smartpbx-generated-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python -m pytest tests
+      - run: docker build -t generated-agent-contract .
+'''
+    client_connect = f'''# Client Connect sheet
+
+websocket_url: {resources.wss_url}
+authentication_header: {resources.wss_header}
+reachable_after_provisioning: false
+activation_state: pending
+'''
+    return {
+        "AGENTS.md": "# Generated SmartPBX agent\n\nNo production provisioning or release is authorized by this tree.\n",
+        "CLAUDE.md": "# Generated SmartPBX agent\n\nInquiry-only capability policy.\n",
+        "README.md": f"# {title}\n\nGenerated inquiry-only SmartPBX backend.\n",
+        "Dockerfile": "FROM python:3.11-slim\nWORKDIR /app\nCOPY . .\nCMD [\"python\", \"server.py\"]\n",
+        ".dockerignore": ".env\n__pycache__/\n.pytest_cache/\n",
+        ".env.example": "ENABLE_SMARTPBX_WSS\nSMARTPBX_WS_TOKEN\nSMARTPBX_ACCOUNT_ID\nSMARTPBX_AUTH_HEADER_NAME\n",
+        "docker-compose.yml": compose,
+        "requirements-prod.txt": "# Standard-library runtime only.\n",
+        "requirements-prod.lock.txt": "# No runtime packages.\n",
+        "server.py": "ROUTES = ('/smartpbx/status', '/ws/v1/smartpbx/media')\nfrom smartpbx_gateway import SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings\n",
+        "smartpbx_diagnostics.py": "def redacted_status(active_sessions=0):\n    return {'active_sessions': active_sessions}\n",
+        "smartpbx_gateway.py": _python_gateway(resources),
+        "smartpbx_protocol.py": "PROTOCOL_VERSION = 'smartpbx-ai-provider-v07'\n",
+        "smartpbx_session.py": "class InquirySession:\n    async def start(self): pass\n    async def finish(self): pass\n",
+        "smartpbx_transport.py": "class SmartPBXMediaTransport: pass\n",
+        "tools.py": "TOOL_REGISTRY = {}\n",
+        "website_demo.py": "ROUTES = ('/voice/demo-incoming',)\n# Browser tokens are issued only by the shared approved issuer.\n",
+        "knowledge_docs/approved-facts.md": f"# Approved knowledge\n\n{knowledge}\n",
+        "nginx-smartpbx.conf": "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n",
+        f"nginx-{resources.smartpbx_service}.conf": "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n",
+        "scripts/deploy_smartpbx_image.sh": "#!/bin/sh\necho 'Manual release approval required.'\nexit 1\n",
+        "SMARTPBX_RUNBOOK.md": "# Runbook\n\nThis generated artifact is review-only.\n",
+        "CLIENT_CONNECT.md": client_connect,
+        "demo-routing-activation.md": "# Future routing activation\n\nrelease_allowed: false\nstate: pending\nRequires separately approved backend health and shared routing activation.\n",
+        "tests/test_generated_contract.py": "def test_contract_paths():\n    from server import ROUTES\n    assert '/smartpbx/status' in ROUTES\n",
+        "tests/test_generated_security.py": '''import asyncio
+import json
+
+from smartpbx_gateway import SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings
+from tools import TOOL_REGISTRY
+
+
+class FakeWebSocket:
+    def __init__(self, messages, header, token):
+        self.headers = {header: token}
+        self.messages = list(messages)
+        self.accepted = False
+        self.close_calls = []
+
+    async def accept(self):
+        self.accepted = True
+
+    async def close(self, code=1000, reason=""):
+        self.close_calls.append((code, reason))
+
+    async def receive_text(self):
+        return json.dumps(self.messages.pop(0))
+
+
+class Factory:
+    def __init__(self):
+        self.sessions = []
+
+    async def __call__(self, start, _transport):
+        self.sessions.append(start)
+        return self
+
+    async def start(self):
+        return None
+
+    async def finish(self):
+        return None
+
+
+def test_inquiry_only_registry_and_preaccept_authentication():
+    assert TOOL_REGISTRY == {}
+
+    async def exercise():
+        settings = SmartPBXSettings("correct", "account-fixture")
+        gateway = SmartPBXGateway(settings, SmartPBXSessionRegistry(1))
+        wrong = FakeWebSocket([], settings.auth_header_name, "wrong")
+        wrong_factory = Factory()
+        await gateway.handle(wrong, wrong_factory)
+        assert wrong.accepted is False
+        assert wrong.close_calls == [(1008, "unauthorized")]
+        assert wrong_factory.sessions == []
+        valid = FakeWebSocket([
+            {"event": "start", "start": {"accountId": "account-fixture"}},
+            {"event": "stop"},
+        ], settings.auth_header_name, "correct")
+        valid_factory = Factory()
+        await gateway.handle(valid, valid_factory)
+        assert valid.accepted is True
+        assert len(valid_factory.sessions) == 1
+
+    asyncio.run(exercise())
+''',
+        ".github-workflow-fragment.yml": workflow_fragment,
+    }
+
+
+def _scan_outputs(files: Mapping[str, str]) -> None:
+    for relative, content in files.items():
+        for pattern in _IDENTITY_PATTERNS:
+            if pattern.search(content):
+                raise IdentityLeakError(f"identity leak in generated output: {relative}")
+        for pattern in _SECRET_PATTERNS:
+            if pattern.search(content):
+                raise IdentityLeakError(f"secret leak in generated output: {relative}")
+        if "{{" in content or "}}" in content:
+            raise IdentityLeakError(f"unresolved template marker in generated output: {relative}")
+        if not relative.startswith("tools.py") and any(name in content for name in _BUSINESS_TOOLS):
+            raise IdentityLeakError(f"business tool leak in generated output: {relative}")
+
+
+def _write_files(root: Path, files: Mapping[str, str]) -> tuple[str, ...]:
+    if root.exists():
+        raise RenderError(f"generated backend target already exists: {root}")
+    for relative, content in files.items():
+        target = root / relative
+        if target.parent != root and root not in target.parents:
+            raise RenderError("generated file escapes output root")
+        target.parent.mkdir(parents=True, exist_ok=False) if not target.parent.exists() else None
+        target.write_text(content, encoding="utf-8")
+    return tuple(sorted(files))
+
+
+def render_backend(
+    manifest: AgentManifest,
+    review: KnowledgeReviewLike,
+    resources: DerivedResources,
+    output_dir: Path,
+    *,
+    template_allowlist: TemplateAllowlist | None = None,
+    template_root: Path | None = None,
+) -> RenderReport:
+    """Render a deterministic backend tree from exact, verified template evidence.
+
+    Omitting the explicit seam loads the checked-in allowlist, which currently
+    raises ``TEMPLATE_ALLOWLIST_UNAVAILABLE`` by design.
+    """
+    allowlist = template_allowlist or _load_default_allowlist()
+    root = Path(template_root) if template_root is not None else _TEMPLATE_ROOT
+    _verify_supplied_templates(root, allowlist)
+    if resources.slug != manifest.slug or resources.folder_identity != f"SmartPBX Agents/{manifest.slug}":
+        raise RenderError("derived resources do not match manifest identity")
+    facts = _review_facts(review)
+    files = _files(manifest, resources, facts)
+    _scan_outputs(files)
+    rendered_root = Path(output_dir) / resources.folder_identity
+    names = _write_files(rendered_root, files)
+    digest_input = "".join(f"{name}\0{files[name]}\0" for name in names).encode("utf-8")
+    return RenderReport(
+        output_dir=rendered_root,
+        artifact_digest=hashlib.sha256(digest_input).hexdigest(),
+        files=names,
+        enabled_capabilities=manifest.capabilities.enabled_names,
+        template_version=allowlist.template_version,
+        review_digest=review.digest,
+    )
