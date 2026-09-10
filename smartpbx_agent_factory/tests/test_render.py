@@ -103,7 +103,26 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
     """A deliberately synthetic, hash-pinned test seam; never production input."""
     templates = {
         "runtime/server.py.tmpl": "ROUTES = ('/smartpbx/status', '/ws/v1/smartpbx/media')\n",
-        "runtime/smartpbx_gateway.py.tmpl": "# synthetic gateway marker\n",
+        "runtime/smartpbx_gateway.py.tmpl": '''import secrets
+
+POLICY_VIOLATION = 1008
+
+
+async def _safe_close(websocket, code, reason):
+    await websocket.close(code=code, reason=reason)
+
+
+class CarrierIngressSettings:
+    def token_matches(self, candidate):
+        return secrets.compare_digest("token", candidate)
+
+
+async def handle(websocket, settings):
+    if not settings.token_matches(websocket.headers.get("X-Token", "")):
+        await _safe_close(websocket, POLICY_VIOLATION, "unauthorized")
+        return
+    await websocket.accept()
+''',
         "runtime/smartpbx_protocol.py.tmpl": "PROTOCOL = 'smartpbx-ai-provider-v07'\n",
         "runtime/smartpbx_session.py.tmpl": "# synthetic session marker\n",
         "runtime/smartpbx_transport.py.tmpl": "# synthetic transport marker\n",
@@ -124,10 +143,12 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
         "infrastructure/docker-compose.yml.tmpl": """services:
   {{smartpbx_service}}:
     profiles: [\"smartpbx\"]
+    ports: [\"127.0.0.1:{{smartpbx_port}}:8000\"]
     environment:
       SMARTPBX_WS_TOKEN: \"required\"
   {{website_service}}:
     profiles: [\"website-demo\"]
+    ports: [\"127.0.0.1:{{website_port}}:8081\"]
     environment:
       WEBSITE_DEMO_ENABLED: \"true\"
       TWILIO_AUTH_TOKEN: \"required\"
@@ -138,11 +159,22 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
         "infrastructure/nginx-website.conf.tmpl": "location /voice/demo-incoming {}\n",
         "infrastructure/env.example.tmpl": "SMARTPBX_WS_TOKEN\n",
         "infrastructure/README.md.tmpl": "Synthetic fixture runtime.\n",
-        "infrastructure/CLIENT_CONNECT.md.tmpl": "Synthetic fixture client connect.\n",
-        "infrastructure/demo-routing-activation.md.tmpl": "Synthetic fixture pending checklist.\n",
+        "infrastructure/CLIENT_CONNECT.md.tmpl": """# Client Connect candidate sheet
+
+REVIEW-ONLY
+
+activation: blocked
+websocket_url: wss://{{smartpbx_hostname}}/ws/v1/smartpbx/media
+authentication_header: {{wss_header}}
+""",
+        "infrastructure/demo-routing-activation.md.tmpl": "release_allowed: false\nstate: pending\n",
         "infrastructure/requirements-prod.txt.tmpl": "# Synthetic fixture requirements.\n",
         "infrastructure/requirements-prod.lock.txt.tmpl": "# Synthetic fixture lock.\n",
-        "infrastructure/ci-runtime-review.yml.tmpl": "jobs: {}\n",
+        "infrastructure/ci-runtime-review.yml.tmpl": """jobs:
+  runtime-infrastructure-static:
+    steps:
+      - run: python -c "import startup"
+""",
         "infrastructure/scripts/deploy_runtime_image.sh.tmpl": "#!/bin/sh\nexit 1\n",
     }
     files = {}
@@ -273,7 +305,10 @@ def test_output_scan_keeps_existing_pem_and_plaintext_secret_rejection(content):
 
 
 def test_renderer_rejects_identity_and_secret_leaks_from_review(tmp_path):
-    review = fixture_review(facts=(KnowledgeFact("Hatton Hills is a hotel", "https://acme.example/facts", "source-001#document"),))
+    review = fixture_review(
+        facts=(KnowledgeFact("Hatton Hills is a hotel", "https://acme.example/facts", "source-001#document"),),
+        documents=(),
+    )
     with pytest.raises(IdentityLeakError, match="identity leak"):
         render_backend(
             fixture_manifest(), review, fixture_resources(), tmp_path,

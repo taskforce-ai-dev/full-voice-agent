@@ -36,18 +36,19 @@ def test_backend_has_two_separate_service_profiles_and_bidirectional_isolation(t
     assert "SMARTPBX_WS_TOKEN" not in website
 
 
-def test_generated_contract_declares_preaccept_auth_and_pending_activation(tmp_path):
+def test_generated_contract_declares_preaccept_auth_and_blocked_activation(tmp_path):
     render_fixture(tmp_path)
     root = tmp_path / "SmartPBX Agents/acme-inquiry"
     gateway = (root / "smartpbx_gateway.py").read_text(encoding="utf-8")
     sheet = (root / "CLIENT_CONNECT.md").read_text(encoding="utf-8")
     env_example = (root / ".env.example").read_text(encoding="utf-8")
     assert "compare_digest" in gateway
-    assert "await websocket.close(code=1008, reason=\"unauthorized\")" in gateway
+    assert 'await _safe_close(websocket, POLICY_VIOLATION, "unauthorized")' in gateway
     assert "await websocket.accept()" in gateway
     assert "wss://smartpbx-acme-inquiry.taskforceai.tech/ws/v1/smartpbx/media" in sheet
     assert "X-Acme-Guide-SmartPBX-Token" in sheet
-    assert "reachable_after_provisioning: false" in sheet
+    assert "REVIEW-ONLY" in sheet
+    assert "activation: blocked" in sheet
     assert "SMARTPBX_WS_TOKEN" in env_example
     assert "SMARTPBX_WS_TOKEN=" not in env_example
 
@@ -57,8 +58,8 @@ def test_generated_tree_contains_non_deploy_ci_gate_and_pending_activation_check
     root = tmp_path / "SmartPBX Agents/acme-inquiry"
     fragment = (root / ".github-workflow-fragment.yml").read_text(encoding="utf-8")
     checklist = (root / "demo-routing-activation.md").read_text(encoding="utf-8")
-    assert "smartpbx-generated-agent" in fragment
-    assert "pytest" in fragment
+    assert "runtime-infrastructure-static" in fragment
+    assert 'python -c "import startup"' in fragment
     assert "deploy" not in fragment.lower()
     assert "release_allowed: false" in checklist
     assert "pending" in checklist
