@@ -14,7 +14,15 @@ from typing import Any, Callable, Mapping
 
 from .catalogue import CapabilityCatalogue
 from .gitops import WorktreeHandle, WorktreeManager
+from .knowledge import (
+    KnowledgeBuilder,
+    KnowledgeBuilderImpl,
+    KnowledgeError,
+    KnowledgeReview,
+    recompute_knowledge_review_digest,
+)
 from .provenance import ProvenanceError, validate_allowlist_metadata
+from .render import IncompleteTemplateError, render_backend
 from .resources import AllocationRegistry, DerivedResources, derive_resources
 from .schema import ManifestError, manifest_digest, parse_manifest
 from .secrets import SecretAudit, SecretProvider
@@ -75,6 +83,7 @@ class GenerationOrchestrator:
         *,
         catalogue_path: Path | None = None,
         worktree_manager_factory: Callable[[Path], WorktreeManager] = WorktreeManager,
+        knowledge_builder_factory: Callable[[Path], KnowledgeBuilder] | None = None,
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise GenerationInfrastructureError("state root must be an absolute path")
@@ -84,6 +93,9 @@ class GenerationOrchestrator:
         root = Path(__file__).parent
         self._catalogue_path = (catalogue_path or root / "template_v1" / "provider_catalogue.json").resolve()
         self._worktree_manager_factory = worktree_manager_factory
+        self._knowledge_builder_factory = knowledge_builder_factory or (
+            lambda approved_root: KnowledgeBuilderImpl(approved_source_roots=(approved_root,))
+        )
 
     def inspect(self, manifest_path: Path) -> Mapping[str, object]:
         """Report non-mutating prerequisite status; no target checkout is touched."""
@@ -152,9 +164,19 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("plan approval is required before generation")
         if stored.state.stage is not Stage.GENERATED:
             raise GenerationBlockedError(f"generation cannot start from {stored.state.stage.value}")
-        raise GenerationBlockedError(
-            "generation renderers and operations prerequisites must be configured before artifact output"
-        )
+        manifest = self._current_manifest(stored)
+        review = self._build_knowledge_review(stored, manifest)
+        if review.digest != stored.state.knowledge_approval_digest:
+            raise GenerationBlockedError("knowledge review changed after approval; create a new generation")
+        # The checked-in runtime provenance is intentionally partial.  Calling
+        # the renderer keeps that boundary authoritative: it rejects before any
+        # generated-tree write, instead of allowing this coordinator to claim a
+        # backend, verification, or PR is ready.
+        try:
+            render_backend(manifest, review, stored.resources, self._state_root / "generated", state=stored.state)
+        except IncompleteTemplateError as error:
+            raise GenerationBlockedError(str(error)) from error
+        raise GenerationBlockedError("generated backend requires configured operations, website, verification, and PR bindings")
 
     def resume(
         self,
@@ -197,6 +219,8 @@ class GenerationOrchestrator:
         audited_names = audit.fetched_names + audit.generated_names
         if len(audited_names) != len(set(audited_names)) or set(audited_names) != expected_names:
             raise GenerationBlockedError("secret audit names do not exactly match manifest requirements")
+        manifest = self._current_manifest(stored)
+        review = self._build_knowledge_review(stored, manifest)
         audit_digest = _digest_payload(
             {
                 "fetched_names": audit.fetched_names,
@@ -208,7 +232,7 @@ class GenerationOrchestrator:
             state.record_stage_digest("secrets", audit_digest)
             state.transition(Stage.SECRETS_RESOLVED)
             state.transition(Stage.KNOWLEDGE_REVIEW_REQUIRED)
-            state.record_knowledge_review_digest(stored.knowledge_digest)
+            state.record_knowledge_review_digest(review.digest)
         except StateError as error:
             raise GenerationBlockedError(str(error)) from error
         self._save(stored)
@@ -318,17 +342,7 @@ class GenerationOrchestrator:
 
     def _load_verified(self, generation_id: str) -> _StoredGeneration:
         stored = self._load(generation_id)
-        try:
-            raw = json.loads(stored.manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(raw, Mapping):
-                raise ManifestError("manifest must be an object")
-            manifest = parse_manifest(
-                raw,
-                approved_source_roots=(stored.manifest_path.parent,),
-                catalogue=CapabilityCatalogue.load(self._catalogue_path),
-            )
-        except (OSError, json.JSONDecodeError, ManifestError) as error:
-            raise GenerationBlockedError(str(error)) from error
+        manifest = self._current_manifest(stored)
         if manifest_digest(manifest) != stored.state.manifest_digest:
             raise GenerationBlockedError("manifest digest changed; create a new generation")
         knowledge_digest = _digest_payload({"sources": [asdict(source) for source in manifest.knowledge_sources]})
@@ -348,6 +362,35 @@ class GenerationOrchestrator:
         ):
             raise GenerationBlockedError("generation input digest changed; create a new generation")
         return stored
+
+    def _current_manifest(self, stored: _StoredGeneration):
+        try:
+            raw = json.loads(stored.manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, Mapping):
+                raise ManifestError("manifest must be an object")
+            manifest = parse_manifest(
+                raw,
+                approved_source_roots=(stored.manifest_path.parent,),
+                catalogue=CapabilityCatalogue.load(self._catalogue_path),
+            )
+        except (OSError, json.JSONDecodeError, ManifestError) as error:
+            raise GenerationBlockedError(str(error)) from error
+        return manifest
+
+    def _build_knowledge_review(self, stored: _StoredGeneration, manifest: Any) -> KnowledgeReview:
+        output_dir = self._state_root / "knowledge-reviews" / stored.state.generation_id
+        if output_dir.is_symlink() or output_dir.parent.is_symlink():
+            raise GenerationInfrastructureError("knowledge review output may not traverse a symlink")
+        try:
+            builder = self._knowledge_builder_factory(stored.manifest_path.parent)
+            review = builder.build(manifest.knowledge_sources, output_dir)
+            if type(review) is not KnowledgeReview:
+                raise KnowledgeError("knowledge builder returned an invalid review")
+            if review.digest != recompute_knowledge_review_digest(review):
+                raise KnowledgeError("knowledge review digest is not canonical")
+        except (KnowledgeError, OSError, TypeError, ValueError) as error:
+            raise GenerationBlockedError(f"knowledge review digest is invalid: {error}") from error
+        return review
 
     def _manifest_path(self, value: Path) -> Path:
         if not isinstance(value, Path) or not value.is_file():
