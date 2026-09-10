@@ -51,25 +51,10 @@ class GenerationState:
     blocked_reason: str | None = None
 
     @classmethod
-    def start(
-        cls,
-        generation_id: str,
-        manifest_digest: str,
-        knowledge_review_digest: str | None = None,
-        plan_digest: str | None = None,
-    ) -> "GenerationState":
+    def start(cls, generation_id: str, manifest_digest: str) -> "GenerationState":
         if not generation_id or not manifest_digest:
             raise StateError("generation_id and manifest_digest are required")
-        if knowledge_review_digest is not None and not knowledge_review_digest:
-            raise StateError("knowledge review digest must not be empty")
-        if plan_digest is not None and not plan_digest:
-            raise StateError("plan digest must not be empty")
-        return cls(
-            generation_id=generation_id,
-            manifest_digest=manifest_digest,
-            knowledge_review_digest=knowledge_review_digest,
-            plan_digest=plan_digest,
-        )
+        return cls(generation_id=generation_id, manifest_digest=manifest_digest)
 
     def transition(self, target: Stage) -> None:
         if not isinstance(target, Stage):
@@ -83,10 +68,26 @@ class GenerationState:
         self.knowledge_approval_digest = digest
         self.transition(Stage.PLAN_REVIEW_REQUIRED)
 
+    def record_knowledge_review_digest(self, digest: str) -> None:
+        self._record_review_digest(Stage.KNOWLEDGE_REVIEW_REQUIRED, "knowledge", digest)
+
     def approve_plan(self, digest: str) -> None:
         self._require_approval(Stage.PLAN_REVIEW_REQUIRED, digest, "plan")
         self.plan_approval_digest = digest
         self.transition(Stage.GENERATED)
+
+    def record_plan_digest(self, digest: str) -> None:
+        self._record_review_digest(Stage.PLAN_REVIEW_REQUIRED, "plan", digest)
+
+    def _record_review_digest(self, expected_stage: Stage, name: str, digest: str) -> None:
+        if self.stage is not expected_stage:
+            raise StateError(f"{name} review digest requires stage {expected_stage.value}")
+        if not isinstance(digest, str) or not digest:
+            raise StateError(f"{name} review digest must not be empty")
+        attribute = "knowledge_review_digest" if name == "knowledge" else "plan_digest"
+        if getattr(self, attribute) is not None:
+            raise StateError(f"{name} review digest already recorded")
+        setattr(self, attribute, digest)
 
     def _require_approval(self, expected: Stage, digest: str, name: str) -> None:
         if self.stage is not expected:
@@ -146,6 +147,7 @@ class GenerationState:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise StateError("invalid serialized generation state") from exc
+        _require_stage_artifacts(state)
         if (
             state.knowledge_approval_digest is not None
             and state.knowledge_approval_digest != state.knowledge_review_digest
@@ -154,3 +156,17 @@ class GenerationState:
         if state.plan_approval_digest is not None and state.plan_approval_digest != state.plan_digest:
             raise StateError("plan approval digest does not match expected review digest")
         return state
+
+
+def _require_stage_artifacts(state: GenerationState) -> None:
+    if state.stage in {
+        Stage.PLAN_REVIEW_REQUIRED,
+        Stage.GENERATED,
+        Stage.VERIFIED,
+        Stage.THREE_PRS_OPENED,
+    }:
+        if state.knowledge_review_digest is None or state.knowledge_approval_digest is None:
+            raise StateError("serialized stage requires knowledge approval")
+    if state.stage in {Stage.GENERATED, Stage.VERIFIED, Stage.THREE_PRS_OPENED}:
+        if state.plan_digest is None or state.plan_approval_digest is None:
+            raise StateError("serialized stage requires plan approval")

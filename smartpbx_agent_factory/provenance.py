@@ -6,6 +6,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 
@@ -30,6 +31,9 @@ class TemplateAllowlist:
     protocol_version: str
     environment_schema_version: str
     files: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
 
 
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")

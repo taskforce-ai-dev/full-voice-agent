@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 
@@ -17,6 +18,15 @@ class CapabilityCatalogue:
     version: int
     languages: Mapping[str, Mapping[str, tuple[str, ...]]]
     status: str = ""
+
+    def __post_init__(self) -> None:
+        frozen = {
+            language: MappingProxyType(
+                {component: tuple(providers) for component, providers in pipeline.items()}
+            )
+            for language, pipeline in self.languages.items()
+        }
+        object.__setattr__(self, "languages", MappingProxyType(frozen))
 
     @classmethod
     def load(cls, path: Path) -> "CapabilityCatalogue":

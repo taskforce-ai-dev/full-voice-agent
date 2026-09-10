@@ -137,6 +137,8 @@ def validate_slug(slug: str) -> str:
 def _parse_language(raw: object, index: int) -> LanguageProfile:
     value = _mapping(raw, f"languages[{index}]")
     _strict_keys(value, {"code", "language", "locale", "stt", "llm", "tts", "fallback", "greeting", "voice"}, f"languages[{index}]")
+    if "code" in value and "language" in value:
+        raise ManifestError(f"languages[{index}] cannot contain both code and language aliases")
     code = _text(value.get("code", value.get("language")), f"languages[{index}].code")
     locale = _text(value.get("locale", code), f"languages[{index}].locale")
     providers = {}
@@ -145,6 +147,8 @@ def _parse_language(raw: object, index: int) -> LanguageProfile:
         model = ""
         if isinstance(provider, Mapping):
             _strict_keys(provider, {"provider", "name", "model"}, f"languages[{index}].{name}")
+            if "provider" in provider and "name" in provider:
+                raise ManifestError(f"languages[{index}].{name} cannot contain provider and name aliases")
             model = _optional_text(provider.get("model"), f"languages[{index}].{name}.model") or ""
             provider = provider.get("provider", provider.get("name"))
         providers[name] = (_text(provider, f"languages[{index}].{name}"), model)
@@ -294,6 +298,11 @@ def parse_manifest(
         collect_other=_text_tuple(pii_raw.get("collect_other", ()), "pii_policy.collect_other"),
         confirmation_policy=_text(pii_raw.get("confirmation_policy", "confirm-uncertain"), "pii_policy.confirmation_policy"),
     )
+    if (
+        (pii.collect_name or pii.collect_phone or pii.collect_other)
+        and not pii.explicit_consent
+    ):
+        raise ManifestError("PII collection requires pii_policy.explicit_consent")
     capabilities_raw = _mapping(raw["capabilities"], "capabilities")
     _strict_keys(capabilities_raw, set(_CAPABILITIES), "capabilities")
     capabilities = CapabilitySelection(**{name: _parse_capability(name, capabilities_raw.get(name)) for name in _CAPABILITIES})
