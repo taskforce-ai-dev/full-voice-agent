@@ -98,8 +98,8 @@ def fixture_readiness() -> PRReadiness:
         template_revision="b" * 40,
         artifact_digests={"backend": "c" * 64, "operations": "d" * 64, "website": "e" * 64},
         review_label="Acme inquiry review",
-        wss_url="wss://smartpbx-acme.example.test/ws/v1/smartpbx/media",
-        expected_wss_hostname="smartpbx-acme.example.test",
+        wss_url="wss://smartpbx-acme.taskforceai.tech/ws/v1/smartpbx/media",
+        expected_wss_hostname="smartpbx-acme.taskforceai.tech",
         allowed_wss_paths=("/ws/v1/smartpbx/media",),
         readiness_digest="f" * 64,
         secret_scan_digest="1" * 64,
@@ -401,7 +401,14 @@ def test_readiness_report_path_must_be_the_exact_generation_metadata_filename(fa
     assert fake_provider.open_order == []
 
 
-@pytest.mark.parametrize("field, value", (("repository", "taskforce/backend/extra"), ("branch", "backend\nunsafe")))
+@pytest.mark.parametrize(
+    "field, value",
+    (
+        ("repository", "taskforce/backend/extra"),
+        ("branch", "backend\nunsafe"),
+        ("branch", "backend/token=credential-value"),
+    ),
+)
 def test_repository_and_branch_must_be_bounded_safe_git_identifiers(
     field: str, value: str, fake_provider: FakePRProvider
 ) -> None:
@@ -430,6 +437,48 @@ def test_review_label_rejects_control_characters_before_provider_call(fake_provi
             fake_provider,
             state=state,
             readiness=replace(fixture_readiness(), review_label="Acme\nunsafe"),
+            worktrees=fixture_worktrees(),
+            inspector=fixture_inspector(),
+        )
+
+    assert state.stage is Stage.BLOCKED
+    assert fake_provider.open_order == []
+
+
+@pytest.mark.parametrize(
+    "review_label",
+    ("Authorization: Bearer credential-value", "api_key=credential-value"),
+)
+def test_review_label_rejects_credential_like_values_before_provider_call(
+    review_label: str, fake_provider: FakePRProvider
+) -> None:
+    state = fixture_state()
+
+    with pytest.raises(StateError, match="review label"):
+        open_linked_prs(
+            fake_provider,
+            state=state,
+            readiness=replace(fixture_readiness(), review_label=review_label),
+            worktrees=fixture_worktrees(),
+            inspector=fixture_inspector(),
+        )
+
+    assert state.stage is Stage.BLOCKED
+    assert fake_provider.open_order == []
+
+
+def test_expected_wss_hostname_rejects_numeric_alternate_ipv4_form(fake_provider: FakePRProvider) -> None:
+    state = fixture_state()
+
+    with pytest.raises(StateError, match="public WSS URL"):
+        open_linked_prs(
+            fake_provider,
+            state=state,
+            readiness=replace(
+                fixture_readiness(),
+                wss_url="wss://127.1/ws/v1/smartpbx/media",
+                expected_wss_hostname="127.1",
+            ),
             worktrees=fixture_worktrees(),
             inspector=fixture_inspector(),
         )
