@@ -22,11 +22,23 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from smartpbx_agent_factory.provenance import ProvenanceError, validate_allowlist_metadata
+from smartpbx_agent_factory.verify import _allowlist_digest
+
+
 PROVENANCE = ".smartpbx-factory-provenance.json"
 PROTOCOL_FIXTURE = ROOT / "smartpbx_agent_factory" / "tests" / "fixtures" / "protocol_messages.json"
+TEMPLATE_ALLOWLIST = ROOT / "smartpbx_agent_factory" / "template_v1" / "file_allowlist.json"
+CANDIDATE_PROVENANCE = ROOT / "smartpbx_agent_factory" / "template_v1" / "candidate_runtime_provenance.json"
 SAFE_ZERO_COUNTERS = ("active_sessions", "active_tasks", "active_resources")
 RECONCILED_COUNTERS = ("admitted_total", "released_total")
 AUTH_HEADER = re.compile(r"^\s*SMARTPBX_AUTH_HEADER_NAME:\s*['\"]([^'\"]+)['\"]\s*$", re.MULTILINE)
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SHA = re.compile(r"^[0-9a-f]{40}$")
+LANE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 HEALTH_WAIT_SECONDS = 20
 HEALTH_POLL_SECONDS = 0.25
 WEBSOCKET_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -75,6 +87,72 @@ def _synthetic_or_nondeployable(value: object) -> bool:
     return isinstance(value, str) and any(marker in value.lower() for marker in ("synthetic", "nondeployable"))
 
 
+def _repository_document(path: Path, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LifecycleError(f"repository {label} is unavailable") from exc
+    if not isinstance(value, dict):
+        raise LifecycleError(f"repository {label} must be an object")
+    return value
+
+
+def _document_digest(document: dict[str, object]) -> str:
+    return hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def _normal_runtime_binding(provenance: dict[str, object]) -> None:
+    document = _repository_document(TEMPLATE_ALLOWLIST, "template allowlist")
+    try:
+        allowlist = validate_allowlist_metadata(document)
+    except ProvenanceError as exc:
+        raise LifecycleError("repository template allowlist is not approved") from exc
+    expected_digest = _allowlist_digest(allowlist)
+    expected = {
+        "template_allowlist_digest": expected_digest,
+        "source_revision": allowlist.source_revision,
+        "template_version": allowlist.template_version,
+    }
+    if any(provenance.get(key) != value for key, value in expected.items()):
+        raise LifecycleError("generated provenance does not match the approved repository template allowlist")
+
+
+def _canonical_fixture_binding(provenance: dict[str, object]) -> None:
+    candidate = _repository_document(CANDIDATE_PROVENANCE, "candidate runtime provenance")
+    template = _repository_document(TEMPLATE_ALLOWLIST, "template allowlist")
+    source_revision = candidate.get("source_revision")
+    template_version = template.get("template_version")
+    if not isinstance(source_revision, str) or not SHA.fullmatch(source_revision):
+        raise LifecycleError("repository candidate provenance lacks an immutable source revision")
+    if not isinstance(template_version, str) or not template_version:
+        raise LifecycleError("repository template allowlist lacks a template version")
+    components = candidate.get("components")
+    if not isinstance(components, list) or not components:
+        raise LifecycleError("repository candidate provenance lacks runtime template evidence")
+    for component in components:
+        if not isinstance(component, dict):
+            raise LifecycleError("repository candidate provenance has invalid template evidence")
+        template_path, expected_hash = component.get("template_path"), component.get("template_sha256")
+        if (
+            not isinstance(template_path, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,239}", template_path)
+            or "/../" in f"/{template_path}"
+            or not isinstance(expected_hash, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_hash)
+        ):
+            raise LifecycleError("repository candidate provenance has incomplete template evidence")
+        source = ROOT / "smartpbx_agent_factory" / "template_v1" / template_path
+        if source.is_symlink() or not source.is_file() or "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest() != expected_hash:
+            raise LifecycleError("repository candidate runtime template does not match provenance")
+    expected = {
+        "candidate_provenance_digest": _document_digest(candidate),
+        "source_revision": source_revision,
+        "template_version": template_version,
+    }
+    if any(provenance.get(key) != value for key, value in expected.items()):
+        raise LifecycleError("canonical fixture provenance does not match the repository candidate runtime")
+
+
 def require_ci_runtime(agent_dir: Path, provenance: dict[str, object], *, canonical_fixture: bool) -> None:
     marked_nonproduction = any(
         _synthetic_or_nondeployable(provenance.get(key)) for key in ("runtime_status", "runtime")
@@ -85,10 +163,11 @@ def require_ci_runtime(agent_dir: Path, provenance: dict[str, object], *, canoni
         review_only_release = provenance.get("release_state") == "review-only"
         if not review_only_release or provenance.get("canonical_ci_fixture") is not True:
             raise LifecycleError("canonical fixture provenance is not review-only CI evidence")
+        _canonical_fixture_binding(provenance)
     elif marked_nonproduction:
         raise LifecycleError("generated provenance explicitly marks the runtime nondeployable")
-    if not isinstance(provenance.get("template_allowlist_digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", provenance["template_allowlist_digest"]):
-        raise LifecycleError("generated provenance is not bound to an approved template allowlist")
+    else:
+        _normal_runtime_binding(provenance)
     for required in ("Dockerfile", "server.py", "smartpbx_gateway.py", "smartpbx_diagnostics.py", "docker-compose.yml"):
         if not (agent_dir / required).is_file():
             raise LifecycleError("generated agent is incomplete")
@@ -176,6 +255,13 @@ def status_snapshot(base_url: str, header: str, token: str) -> tuple[int, int]:
     if values["admitted_total"] != values["released_total"]:
         raise LifecycleError("status admitted and released counters do not reconcile")
     return values["admitted_total"], values["released_total"]
+
+
+def rejected_status(base_url: str, header: str, token: str | None) -> None:
+    headers = {header: token} if token is not None else None
+    status, _ = http_request(f"{base_url}/smartpbx/status", headers)
+    if status not in {401, 403}:
+        raise LifecycleError("missing or wrong status authentication was not rejected")
 
 
 class LoopbackWebSocket:
@@ -326,10 +412,43 @@ def inspect_image(image: str, provenance: dict[str, object]) -> None:
         raise LifecycleError("built image provenance differs from the generated tree")
 
 
+def write_attestation(path: Path, *, provenance: dict[str, object], lane: str, source_sha: str, canonical_fixture: bool) -> None:
+    if not LANE.fullmatch(lane) or not SHA.fullmatch(source_sha):
+        raise LifecycleError("CI attestation lane or source SHA is invalid")
+    artifact = provenance.get("artifact_digest")
+    source_revision = provenance.get("source_revision")
+    template_version = provenance.get("template_version")
+    if not isinstance(artifact, str) or not SHA256.fullmatch(artifact) or not isinstance(source_revision, str) or not SHA.fullmatch(source_revision) or not isinstance(template_version, str):
+        raise LifecycleError("CI attestation provenance is incomplete")
+    document = {
+        "schema_version": 1,
+        "lane": lane,
+        "source_sha": source_sha,
+        "artifact_digest": artifact,
+        "source_revision": source_revision,
+        "template_version": template_version,
+        "template_allowlist_digest": provenance.get("template_allowlist_digest", ""),
+        "candidate_provenance_digest": provenance.get("candidate_provenance_digest", "") if canonical_fixture else "",
+        "fixture_kind": "canonical-review-only" if canonical_fixture else "generated-agent",
+        "observed_cases": ["status-auth-rejected", "wss-auth-rejected", "cross-agent-rejected", "stop-cleanup", "hangup-cleanup"],
+    }
+    if not isinstance(document["template_allowlist_digest"], str) or (not canonical_fixture and not SHA256.fullmatch(document["template_allowlist_digest"])):
+        raise LifecycleError("CI attestation has no exact template binding")
+    if canonical_fixture and not SHA256.fullmatch(document["candidate_provenance_digest"]):
+        raise LifecycleError("CI attestation has no exact candidate binding")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="CI-only disposable SmartPBX lifecycle verifier")
     parser.add_argument("agent_dir", type=Path)
     parser.add_argument("--canonical-fixture", action="store_true")
+    parser.add_argument("--attestation", type=Path, required=True)
+    parser.add_argument("--lane", required=True)
+    parser.add_argument("--source-sha", required=True)
     args = parser.parse_args()
     agent_dir = args.agent_dir.resolve()
     if not agent_dir.is_dir():
@@ -367,6 +486,10 @@ def main() -> int:
         wait_for_health(base_url)
         admitted, released = status_snapshot(base_url, header, token)
         for candidate in (None, secrets.token_urlsafe(32)):
+            rejected_status(base_url, header, candidate)
+            if status_snapshot(base_url, header, token) != (admitted, released):
+                raise LifecycleError("rejected status authentication changed lifecycle counters")
+        for candidate in (None, secrets.token_urlsafe(32)):
             rejected_connection("127.0.0.1", port, header, candidate)
             if status_snapshot(base_url, header, token) != (admitted, released):
                 raise LifecycleError("pre-accept authentication rejection changed lifecycle counters")
@@ -385,6 +508,7 @@ def main() -> int:
         command(["docker", "rm", "--force", container], allow_failure=True)
         command(["docker", "image", "rm", "--force", image], allow_failure=True)
         command(["docker", "network", "rm", network], allow_failure=True)
+    write_attestation(args.attestation, provenance=provenance, lane=args.lane, source_sha=args.source_sha, canonical_fixture=args.canonical_fixture)
     print("smartpbx lifecycle: verified cases=5")
     return 0
 

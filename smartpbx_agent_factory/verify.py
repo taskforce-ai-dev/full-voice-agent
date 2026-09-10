@@ -190,6 +190,92 @@ class VerificationReport:
             raise VerificationError("safe report evidence is invalid")
 
 
+_ATTESTATION_CASES = (
+    "status-auth-rejected",
+    "wss-auth-rejected",
+    "cross-agent-rejected",
+    "stop-cleanup",
+    "hangup-cleanup",
+)
+
+
+@dataclass(frozen=True)
+class LifecycleAttestation:
+    """Repository-owned, redacted CI observation bound to one exact artifact."""
+
+    lane: str
+    source_sha: str
+    artifact_digest: str
+    source_revision: str
+    template_version: str
+    template_allowlist_digest: str
+    candidate_provenance_digest: str
+    fixture_kind: str
+    observed_cases: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _safe_report_text(self.lane, "attestation lane", _CI_IDENTIFIER, limit=63)
+        _safe_report_text(self.source_sha, "attestation source_sha", _REVISION, limit=40)
+        _safe_report_text(self.artifact_digest, "attestation artifact_digest", _SHA256, limit=64)
+        _safe_report_text(self.source_revision, "attestation source_revision", _REVISION, limit=40)
+        _safe_report_text(self.template_version, "attestation template_version", _VERSION)
+        if self.fixture_kind not in {"generated-agent", "canonical-review-only"} or self.observed_cases != _ATTESTATION_CASES:
+            raise VerificationError("lifecycle attestation has an invalid fixed contract")
+        if self.fixture_kind == "generated-agent":
+            _safe_report_text(self.template_allowlist_digest, "attestation template_allowlist_digest", _SHA256, limit=64)
+            if self.candidate_provenance_digest:
+                raise VerificationError("generated lifecycle attestation has unexpected candidate evidence")
+        else:
+            _safe_report_text(self.candidate_provenance_digest, "attestation candidate_provenance_digest", _SHA256, limit=64)
+            if self.template_allowlist_digest and not _SHA256.fullmatch(self.template_allowlist_digest):
+                raise VerificationError("canonical lifecycle attestation has invalid template evidence")
+
+
+def load_lifecycle_attestation(path: Path, *, agent_dir: Path, lane: str, source_sha: str) -> LifecycleAttestation:
+    """Load only a repository-produced lifecycle observation, never caller booleans."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VerificationError("lifecycle attestation is unavailable") from exc
+    expected_keys = {
+        "schema_version", "lane", "source_sha", "artifact_digest", "source_revision", "template_version",
+        "template_allowlist_digest", "candidate_provenance_digest", "fixture_kind", "observed_cases",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_keys or raw.get("schema_version") != 1 or raw.get("lane") != lane or raw.get("source_sha") != source_sha:
+        raise VerificationError("lifecycle attestation has an invalid repository schema")
+    observed = raw.get("observed_cases")
+    if not isinstance(observed, list) or not all(isinstance(item, str) for item in observed):
+        raise VerificationError("lifecycle attestation observed cases are invalid")
+    attestation = LifecycleAttestation(
+        lane=raw["lane"], source_sha=raw["source_sha"], artifact_digest=raw["artifact_digest"],
+        source_revision=raw["source_revision"], template_version=raw["template_version"],
+        template_allowlist_digest=raw["template_allowlist_digest"],
+        candidate_provenance_digest=raw["candidate_provenance_digest"], fixture_kind=raw["fixture_kind"],
+        observed_cases=tuple(observed),
+    )
+    agent_dir = Path(agent_dir)
+    if attestation.artifact_digest != _artifact_digest(agent_dir):
+        raise VerificationError("lifecycle attestation does not match the exact generated artifact")
+    try:
+        provenance = json.loads(_read_required(agent_dir, _PROVENANCE_FILE))
+    except json.JSONDecodeError as exc:
+        raise VerificationError("lifecycle attestation generated provenance is invalid") from exc
+    if not isinstance(provenance, dict) or any(
+        provenance.get(key) != value for key, value in (
+            ("artifact_digest", attestation.artifact_digest),
+            ("source_revision", attestation.source_revision),
+            ("template_version", attestation.template_version),
+        )
+    ):
+        raise VerificationError("lifecycle attestation provenance binding changed")
+    if attestation.fixture_kind == "generated-agent":
+        if provenance.get("template_allowlist_digest") != attestation.template_allowlist_digest:
+            raise VerificationError("lifecycle attestation allowlist binding changed")
+    elif provenance.get("candidate_provenance_digest") != attestation.candidate_provenance_digest:
+        raise VerificationError("lifecycle attestation candidate binding changed")
+    return attestation
+
+
 def _safe_protocol_value(value: object, *, depth: int = 0) -> None:
     if depth > 2:
         raise VerificationError("protocol fixture nesting is unsafe")

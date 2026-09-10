@@ -147,11 +147,16 @@ def test_ci_lifecycle_runner_requires_the_runtime_integration_contract():
         "SMARTPBX_ALLOW_SYNTHETIC_FOR_CI=1", "SMARTPBX_PRODUCT_PROFILE_PATH=/app/config/product_profile.json",
         "SMARTPBX_KNOWLEDGE_DIR=/app/knowledge_docs", "SMARTPBX_PROVIDER_PROFILE_PATH=/app/config/provider_profile.json",
         "active_sessions", "active_tasks", "active_resources", "admitted_total", "released_total",
-        "canonical_ci_fixture", "template_allowlist_digest", "--canonical-fixture",
+        "canonical_ci_fixture", "template_allowlist_digest", "candidate_provenance_digest", "--canonical-fixture",
+        "validate_allowlist_metadata", "_normal_runtime_binding", "_canonical_fixture_binding",
+        "rejected_status", "--attestation", "observed_cases",
     ):
         assert required in runner
     assert "ANTHROPIC_API_KEY" not in runner
     assert "GEMINI_API_KEY" not in runner
+    materializer = (Path(__file__).parents[2] / "scripts" / "materialize_smartpbx_ci_fixture.py").read_text(encoding="utf-8")
+    assert "runtime_template_digests" in materializer
+    assert "differs from the exact repository template" in materializer
 
 
 def test_ci_workflow_cannot_pass_without_the_canonical_review_only_fixture():
@@ -159,6 +164,15 @@ def test_ci_workflow_cannot_pass_without_the_canonical_review_only_fixture():
     assert 'canonical_fixture="SmartPBX Agents/.ci-lifecycle-canonical"' in workflow
     assert "canonical review-only CI fixture is required" in workflow
     assert "--canonical-fixture" in workflow
+    assert "--attestation" in workflow
+    assert "actions/upload-artifact@v4" in workflow
+
+
+def test_verifier_exposes_a_redacted_attestation_reader_without_caller_booleans():
+    source = inspect.getsource(__import__("smartpbx_agent_factory.verify", fromlist=["load_lifecycle_attestation"]))
+    assert "def load_lifecycle_attestation" in source
+    assert "observed_cases" in source
+    assert "lifecycle_succeeded" not in source
 
 
 def test_provenance_cannot_be_rewritten_to_match_a_modified_artifact(tmp_path):
