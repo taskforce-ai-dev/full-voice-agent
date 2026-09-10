@@ -1,0 +1,84 @@
+# ============================================================
+# Docker Compose -- Horizon Airline & Aviation Academy Voice Agent (Vidya)
+# ============================================================
+# De-identified aviation-college INQUIRY demo. Runs the production
+# server (server.py) behind Twilio: English via ConversationRelay
+# (Claude + ElevenLabs), Sinhala via Media Streams (Claude +
+# OpenAI TTS + Azure STT). Inquiry-only -- no PMS / booking creds.
+#
+# Usage:
+#   docker compose up -d          # start in background
+#   docker compose logs -f horizon  # tail logs
+#   docker compose down           # stop and remove container
+# ============================================================
+
+services:
+  horizon:
+    # -- Image is built in CI and pulled from GHCR --------------
+    # NOT built here. .github/workflows/deploy.yml (mode: image) builds on the
+    # GitHub runner and pushes ghcr.io/taskforce-ai-dev/horizon:<sha>; the VPS
+    # only pulls. Building on the production host is what starved the box on
+    # 2026-08-02. See CONTRIBUTING.md §6.
+    #
+    # IMAGE_TAG is exported by the deploy step and pins this to one immutable
+    # SHA tag. It falls back to :latest for a manual `docker compose up` on the
+    # VPS. To roll back by hand:
+    #   IMAGE_TAG=<sha> docker compose pull && IMAGE_TAG=<sha> docker compose up -d
+    image: ghcr.io/taskforce-ai-dev/horizon:${IMAGE_TAG:-latest}
+    container_name: horizon-voice-agent
+
+    # -- Networking ---------------------------------------------
+    # Twilio webhooks hit port 8000 in the container; nginx proxies
+    # to the loopback-published host port 8050.
+    ports:
+      - "127.0.0.1:8050:8000"
+
+    # -- Secrets & configuration --------------------------------
+    # All API keys (Anthropic, ElevenLabs, OpenAI, Azure, Twilio)
+    # are loaded from .env -- never baked into the image.
+    env_file:
+      - .env
+
+    environment:
+      # Google Cloud STT service-account file, mounted below.
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json
+
+    # -- Persistent volumes -------------------------------------
+    volumes:
+      # ChromaDB vector store -- survives container restarts so
+      # embeddings don't need to be regenerated each time.
+      - ./chroma_db:/app/chroma_db
+
+      # Knowledge documents -- mount as a bind so new/updated
+      # docs can be dropped in without rebuilding the image.
+      - ./knowledge_docs:/app/knowledge_docs
+
+      # GCP service-account JSON for Google Cloud STT (read-only).
+      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+
+    # -- Restart policy -----------------------------------------
+    # Always restart unless explicitly stopped with
+    # `docker compose stop` or `docker compose down`.
+    restart: unless-stopped
+
+    # -- Logging ------------------------------------------------
+    # Cap log size to prevent disk exhaustion on long-running
+    # deployments.  3 rotated files x 10 MB each = 30 MB max.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # -- Health check -------------------------------------------
+    # Hits the FastAPI /health endpoint every 30 s.
+    # The container is marked unhealthy after 3 consecutive
+    # failures (retries) with a 10 s timeout per probe.
+    # start_period gives the app 40 s to boot (model warm-up,
+    # ChromaDB init, etc.) before checks count as failures.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

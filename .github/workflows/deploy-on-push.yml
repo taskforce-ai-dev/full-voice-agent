@@ -52,7 +52,7 @@ jobs:
           fi
           echo "Changed files:"; printf '%s\n' "$CHANGED"
           items=""
-          for entry in "BSL Agent:bsl" "Flico Agent:flico" "HattonHills:hatton" "SLIC Agent:slic" "Sofia Agent:sofia" "Kavya:kavya" "Kitchened:kitchened" "WorldOfRefrigerators:wor"; do
+          for entry in "BSL Agent:bsl" "Flico Agent:flico" "HattonHills:hatton" "SLIC Agent:slic" "Sofia Agent:sofia" "Kavya:kavya" "Kitchened:kitchened" "WorldOfRefrigerators:wor" "Horizon Agent:horizon"; do
             dir="${entry%%:*}"; id="${entry##*:}"
             match=$(printf '%s\n' "$CHANGED" | grep -F "$dir/" || true)
             [ -z "$match" ] && continue
