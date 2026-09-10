@@ -17,7 +17,10 @@ from .gitops import WorktreeHandle, WorktreeManager
 from .knowledge import (
     KnowledgeBuilder,
     KnowledgeBuilderImpl,
+    KnowledgeConflict,
+    KnowledgeDocument,
     KnowledgeError,
+    KnowledgeFact,
     KnowledgeReview,
     recompute_knowledge_review_digest,
 )
@@ -61,6 +64,7 @@ class _StoredGeneration:
     resource_digest: str
     plan_digest: str
     cleanup_inventory: "CleanupInventory | None"
+    knowledge_review: KnowledgeReview | None = None
 
 
 @dataclass(frozen=True)
@@ -165,9 +169,7 @@ class GenerationOrchestrator:
         if stored.state.stage is not Stage.GENERATED:
             raise GenerationBlockedError(f"generation cannot start from {stored.state.stage.value}")
         manifest = self._current_manifest(stored)
-        review = self._build_knowledge_review(stored, manifest)
-        if review.digest != stored.state.knowledge_approval_digest:
-            raise GenerationBlockedError("knowledge review changed after approval; create a new generation")
+        review = self._approved_knowledge_review(stored)
         # The checked-in runtime provenance is intentionally partial.  Calling
         # the renderer keeps that boundary authoritative: it rejects before any
         # generated-tree write, instead of allowing this coordinator to claim a
@@ -221,6 +223,7 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("secret audit names do not exactly match manifest requirements")
         manifest = self._current_manifest(stored)
         review = self._build_knowledge_review(stored, manifest)
+        stored = _replace_knowledge_review(stored, review)
         audit_digest = _digest_payload(
             {
                 "fetched_names": audit.fetched_names,
@@ -382,6 +385,15 @@ class GenerationOrchestrator:
         if output_dir.is_symlink() or output_dir.parent.is_symlink():
             raise GenerationInfrastructureError("knowledge review output may not traverse a symlink")
         try:
+            output_dir.parent.mkdir(mode=0o700, exist_ok=True)
+            output_dir.mkdir(mode=0o700, exist_ok=True)
+            if (
+                not output_dir.parent.is_dir()
+                or not output_dir.is_dir()
+                or output_dir.parent.stat().st_mode & 0o777 != 0o700
+                or output_dir.stat().st_mode & 0o777 != 0o700
+            ):
+                raise GenerationInfrastructureError("knowledge review output must be private")
             builder = self._knowledge_builder_factory(stored.manifest_path.parent)
             review = builder.build(manifest.knowledge_sources, output_dir)
             if type(review) is not KnowledgeReview:
@@ -390,6 +402,23 @@ class GenerationOrchestrator:
                 raise KnowledgeError("knowledge review digest is not canonical")
         except (KnowledgeError, OSError, TypeError, ValueError) as error:
             raise GenerationBlockedError(f"knowledge review digest is invalid: {error}") from error
+        return review
+
+    @staticmethod
+    def _approved_knowledge_review(stored: _StoredGeneration) -> KnowledgeReview:
+        review = stored.knowledge_review
+        if type(review) is not KnowledgeReview:
+            raise GenerationBlockedError("canonical knowledge review is unavailable")
+        try:
+            digest = recompute_knowledge_review_digest(review)
+        except KnowledgeError as error:
+            raise GenerationBlockedError("canonical knowledge review is invalid") from error
+        if (
+            digest != review.digest
+            or review.digest != stored.state.knowledge_review_digest
+            or review.digest != stored.state.knowledge_approval_digest
+        ):
+            raise GenerationBlockedError("canonical knowledge review is not approved for generation")
         return review
 
     def _manifest_path(self, value: Path) -> Path:
@@ -438,7 +467,7 @@ class GenerationOrchestrator:
             path = self._state_path(stored.state.generation_id)
             self._require_private_state_file(path)
             payload = {
-                "version": 4,
+                "version": 5,
                 "state": stored.state.to_dict(),
                 "manifest_path": str(stored.manifest_path),
                 "resources": asdict(stored.resources),
@@ -446,6 +475,7 @@ class GenerationOrchestrator:
                 "resource_digest": stored.resource_digest,
                 "plan_digest": stored.plan_digest,
                 "cleanup_inventory": _serialize_cleanup_inventory(stored.cleanup_inventory),
+                "knowledge_review": _serialize_knowledge_review(stored.knowledge_review),
             }
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{stored.state.generation_id}.", dir=self._state_root, text=True
@@ -479,7 +509,7 @@ class GenerationOrchestrator:
             path = self._state_path(generation_id)
             self._require_private_state_file(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2, 3, 4}:
+            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2, 3, 4, 5}:
                 raise ValueError("state document is invalid")
             state = GenerationState.from_dict(dict(raw["state"]))
             resources = DerivedResources(**dict(raw["resources"]))
@@ -492,8 +522,12 @@ class GenerationOrchestrator:
                 for value in digests
             ):
                 raise ValueError("state document is invalid")
-            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory")) if raw["version"] == 4 else None
-            return _StoredGeneration(state, manifest_path, resources, *digests, inventory)
+            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory")) if raw["version"] in {4, 5} else None
+            review = _parse_knowledge_review(raw.get("knowledge_review")) if raw["version"] == 5 else None
+            if state.stage in {Stage.KNOWLEDGE_REVIEW_REQUIRED, Stage.PLAN_REVIEW_REQUIRED, Stage.GENERATED, Stage.VERIFIED, Stage.THREE_PRS_OPENED}:
+                if review is None or review.digest != state.knowledge_review_digest:
+                    raise ValueError("state document is missing its canonical knowledge review")
+            return _StoredGeneration(state, manifest_path, resources, *digests, inventory, review)
         except (OSError, KeyError, TypeError, ValueError, StateError) as error:
             raise GenerationInfrastructureError("cannot load generation state") from error
 
@@ -713,7 +747,101 @@ def _replace_cleanup_inventory(stored: _StoredGeneration, inventory: CleanupInve
         stored.resource_digest,
         stored.plan_digest,
         inventory,
+        stored.knowledge_review,
     )
+
+
+def _replace_knowledge_review(stored: _StoredGeneration, review: KnowledgeReview) -> _StoredGeneration:
+    return _StoredGeneration(
+        stored.state,
+        stored.manifest_path,
+        stored.resources,
+        stored.knowledge_digest,
+        stored.resource_digest,
+        stored.plan_digest,
+        stored.cleanup_inventory,
+        review,
+    )
+
+
+def _serialize_knowledge_review(review: KnowledgeReview | None) -> object:
+    if review is None:
+        return None
+    if type(review) is not KnowledgeReview or review.digest != recompute_knowledge_review_digest(review):
+        raise GenerationInfrastructureError("canonical knowledge review cannot be persisted")
+    return {
+        "facts": [asdict(fact) for fact in review.facts],
+        "conflicts": [asdict(conflict) for conflict in review.conflicts],
+        "missing_facts": list(review.missing_facts),
+        "sensitive_findings": list(review.sensitive_findings),
+        "inaccessible_sources": list(review.inaccessible_sources),
+        "duplicate_facts": list(review.duplicate_facts),
+        "instruction_findings": list(review.instruction_findings),
+        "digest": review.digest,
+        "documents": [asdict(document) for document in review.documents],
+        "executed_instructions": review.executed_instructions,
+    }
+
+
+def _parse_knowledge_review(raw: object) -> KnowledgeReview | None:
+    if raw is None:
+        return None
+    keys = {
+        "facts", "conflicts", "missing_facts", "sensitive_findings", "inaccessible_sources",
+        "duplicate_facts", "instruction_findings", "digest", "documents", "executed_instructions",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != keys:
+        raise ValueError("state knowledge review is invalid")
+
+    def records(value: object, kind: type[Any], fields: set[str]) -> tuple[Any, ...]:
+        if not isinstance(value, list) or any(not isinstance(item, Mapping) or set(item) != fields for item in value):
+            raise ValueError("state knowledge review is invalid")
+        try:
+            return tuple(kind(**dict(item)) for item in value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("state knowledge review is invalid") from error
+
+    def strings(value: object) -> tuple[str, ...]:
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValueError("state knowledge review is invalid")
+        return tuple(value)
+
+    try:
+        raw_conflicts = raw["conflicts"]
+        if (
+            not isinstance(raw_conflicts, list)
+            or any(
+                not isinstance(item, Mapping)
+                or set(item) != {"subject", "values", "source_locations"}
+                or not isinstance(item["subject"], str)
+                or not isinstance(item["values"], list)
+                or not isinstance(item["source_locations"], list)
+                or not all(isinstance(value, str) for value in item["values"])
+                or not all(isinstance(value, str) for value in item["source_locations"])
+                for item in raw_conflicts
+            )
+        ):
+            raise ValueError("state knowledge review is invalid")
+        review = KnowledgeReview(
+            facts=records(raw["facts"], KnowledgeFact, {"text", "source_uri", "location"}),
+            conflicts=tuple(
+                KnowledgeConflict(item["subject"], tuple(item["values"]), tuple(item["source_locations"]))
+                for item in raw_conflicts
+            ),
+            missing_facts=strings(raw["missing_facts"]),
+            sensitive_findings=strings(raw["sensitive_findings"]),
+            inaccessible_sources=strings(raw["inaccessible_sources"]),
+            duplicate_facts=strings(raw["duplicate_facts"]),
+            instruction_findings=strings(raw["instruction_findings"]),
+            digest=raw["digest"],
+            documents=records(raw["documents"], KnowledgeDocument, {"uri", "owner", "effective_date", "classification", "text"}),
+            executed_instructions=raw["executed_instructions"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("state knowledge review is invalid") from error
+    if review.digest != recompute_knowledge_review_digest(review):
+        raise ValueError("state knowledge review digest is invalid")
+    return review
 
 
 def _redacted_plan(
