@@ -26,9 +26,14 @@ _MAX_REDACTION_LENGTH = 4096
 _MAX_REPOSITORY_LENGTH = 200
 _MAX_BRANCH_LENGTH = 255
 _MAX_REVIEW_LABEL_LENGTH = 160
+_CONTROL_PLANE_SUFFIX = ".taskforceai.tech"
 _HANDLE = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+_CREDENTIAL_LIKE = re.compile(
+    r"(?:authorization\s*:\s*bearer\s+\S+|(?:api[_-]?key|secret|token|password)\s*[:=]\s*\S+|(?:sk|ghp)_[A-Za-z0-9_-]{8,})",
+    re.IGNORECASE,
+)
 
 
 def _is_digest(value: object) -> bool:
@@ -283,6 +288,10 @@ def _contains_control(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
 
+def _contains_credential_like(value: str) -> bool:
+    return _CREDENTIAL_LIKE.search(value) is not None
+
+
 def _generation_metadata_path(state: GenerationState, path: Path) -> bool:
     if path.is_absolute() or ".." in path.parts:
         return False
@@ -293,14 +302,21 @@ def _valid_public_hostname(value: object) -> bool:
     if not isinstance(value, str) or not value or len(value) > 253 or _contains_control(value):
         return False
     hostname = value.lower()
+    labels = hostname.split(".")
     try:
         ipaddress.ip_address(hostname)
         return False
     except ValueError:
         pass
-    if "." not in hostname or hostname.endswith((".localhost", ".local", ".internal", ".lan", ".home")):
+    if (
+        "." not in hostname
+        or all(label.isdigit() for label in labels)
+        or hostname.endswith((".localhost", ".local", ".internal", ".lan", ".home"))
+        or not hostname.startswith("smartpbx-")
+        or not hostname.endswith(_CONTROL_PLANE_SUFFIX)
+    ):
         return False
-    return all(_HOST_LABEL.fullmatch(label) is not None for label in hostname.split("."))
+    return all(_HOST_LABEL.fullmatch(label) is not None for label in labels)
 
 
 def _valid_wss_url(value: object, expected_hostname: object, allowed_paths: object) -> bool:
@@ -372,6 +388,7 @@ def _valid_repository(value: object) -> bool:
         isinstance(value, str)
         and 1 <= len(value) <= _MAX_REPOSITORY_LENGTH
         and not _contains_control(value)
+        and not _contains_credential_like(value)
         and _REPOSITORY.fullmatch(value) is not None
     )
 
@@ -381,6 +398,7 @@ def _valid_branch(value: object) -> bool:
         isinstance(value, str)
         and 1 <= len(value) <= _MAX_BRANCH_LENGTH
         and not _contains_control(value)
+        and not _contains_credential_like(value)
         and not any(marker in value for marker in (" ", "\t", "\\", "..", "@{", "//"))
         and not value.startswith(("-", "/", "."))
         and not value.endswith(("/", "."))
@@ -393,6 +411,7 @@ def _valid_review_label(value: object) -> bool:
         and bool(value.strip())
         and len(value) <= _MAX_REVIEW_LABEL_LENGTH
         and not _contains_control(value)
+        and not _contains_credential_like(value)
     )
 
 
