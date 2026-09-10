@@ -11,7 +11,7 @@ from smartpbx_agent_factory.catalogue import CapabilityCatalogue
 from smartpbx_agent_factory.provenance import TemplateAllowlist, TemplateFile
 from smartpbx_agent_factory.render import IncompleteTemplateError, IdentityLeakError, ReviewNotApprovedError, render_backend
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
-from smartpbx_agent_factory.schema import parse_manifest
+from smartpbx_agent_factory.schema import manifest_digest, parse_manifest
 from smartpbx_agent_factory.state import GenerationState, Stage
 
 
@@ -26,9 +26,16 @@ class FixtureFact:
 
 @dataclass(frozen=True)
 class FixtureReview:
-    digest: str = "a" * 64
     facts: tuple[FixtureFact, ...] = (FixtureFact("Acme provides approved information."),)
     documents: dict[str, str] | None = None
+    claimed_digest: str | None = None
+
+    @property
+    def digest(self):
+        payload = "\n".join(fact.text for fact in self.facts)
+        if self.documents:
+            payload += "\n" + "\n".join(f"{name}\0{self.documents[name]}" for name in sorted(self.documents))
+        return self.claimed_digest or hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def fixture_manifest():
@@ -40,13 +47,17 @@ def fixture_resources():
     return derive_resources(fixture_manifest(), AllocationRegistry())
 
 
-def fixture_state(digest="a" * 64):
-    state = GenerationState.start("generation-fixture", "manifest-fixture")
+def fixture_state(review=None, *, plan_approved=True):
+    review = review or FixtureReview()
+    state = GenerationState.start("generation-fixture", manifest_digest(fixture_manifest()))
     state.transition(Stage.INPUT_COLLECTED)
     state.transition(Stage.SECRETS_RESOLVED)
     state.transition(Stage.KNOWLEDGE_REVIEW_REQUIRED)
-    state.record_knowledge_review_digest(digest)
-    state.approve_knowledge(digest)
+    state.record_knowledge_review_digest(review.digest)
+    state.approve_knowledge(review.digest)
+    if plan_approved:
+        state.record_plan_digest("plan-fixture")
+        state.approve_plan("plan-fixture")
     return state
 
 
@@ -89,7 +100,8 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
 
 def test_partial_v06_provenance_fails_closed_without_complete_runtime_template(tmp_path):
     with pytest.raises(IncompleteTemplateError, match="INCOMPLETE_TEMPLATE"):
-        render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path, state=fixture_state())
+        review = FixtureReview()
+        render_backend(fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(review))
 
 
 def test_inquiry_only_render_has_no_business_tools(tmp_path):
@@ -107,10 +119,11 @@ def test_inquiry_only_render_has_no_business_tools(tmp_path):
 
 
 def test_renderer_rejects_identity_and_secret_leaks_from_review(tmp_path):
+    review = FixtureReview(facts=(FixtureFact("Hatton Hills is a hotel"),))
     with pytest.raises(IdentityLeakError, match="identity leak"):
         render_backend(
-            fixture_manifest(), FixtureReview(facts=(FixtureFact("Hatton Hills is a hotel"),)), fixture_resources(), tmp_path,
-            state=fixture_state(), template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+            fixture_manifest(), review, fixture_resources(), tmp_path,
+            state=fixture_state(review), template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
         )
 
 
@@ -124,9 +137,40 @@ def test_renderer_is_deterministic_for_the_same_approved_inputs(tmp_path):
 
 
 def test_renderer_requires_generation_state_approval_for_the_exact_review_digest(tmp_path):
+    review = FixtureReview()
     with pytest.raises(ReviewNotApprovedError, match="digest"):
         render_backend(
-            fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path, state=fixture_state("b" * 64),
+            fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(FixtureReview(claimed_digest="b" * 64)),
+            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        )
+
+
+def test_renderer_rejects_plan_review_state_before_plan_approval(tmp_path):
+    review = FixtureReview()
+    with pytest.raises(ReviewNotApprovedError, match="plan approval"):
+        render_backend(
+            fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(review, plan_approved=False),
+            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        )
+
+
+def test_renderer_rejects_state_with_a_different_canonical_manifest_digest(tmp_path):
+    review = FixtureReview()
+    state = fixture_state(review)
+    state.manifest_digest = "0" * 64
+    with pytest.raises(ReviewNotApprovedError, match="manifest digest"):
+        render_backend(
+            fixture_manifest(), review, fixture_resources(), tmp_path, state=state,
+            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        )
+
+
+def test_renderer_rejects_review_with_forged_digest_after_facts_change(tmp_path):
+    original = FixtureReview()
+    forged = FixtureReview(facts=(FixtureFact("altered approved fact"),), claimed_digest=original.digest)
+    with pytest.raises(ReviewNotApprovedError, match="canonical digest"):
+        render_backend(
+            fixture_manifest(), forged, fixture_resources(), tmp_path, state=fixture_state(original),
             template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
         )
 
@@ -135,7 +179,7 @@ def test_scan_rejects_identity_leak_in_late_review_document(tmp_path):
     review = FixtureReview(documents={"early.md": "approved", "late.md": "Hatton Hills"})
     with pytest.raises(IdentityLeakError, match="identity leak"):
         render_backend(
-            fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(),
+            fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(review),
             template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
         )
 
