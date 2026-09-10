@@ -45,15 +45,19 @@ en/ru, Media Streams for ar/si) rather than Dialog SIP.
   HattonHills base path.)
 - **Arabic (`ar`):** Media Streams — Claude brain + Azure STT (`ar-SA`) +
   ElevenLabs Arabic voice (`ELEVENLABS_VOICE_ID_AR`). (No Dialog equivalent.)
-- **Sinhala (`si`):** Media Streams — **Gemini brain** (`SI_GEMINI_MODEL`,
-  `SI_LLM_PROVIDER=gemini`) + **Gemini TTS** (`GEMINI_TTS_MODEL`
-  `gemini-3.1-flash-tts-preview`, voice `Vindemiatrix`) + Azure STT (`si-LK`) —
-  the Kavya Dialog stack, ported into `_tts_gemini`. **⚠ Preview-model quota:**
-  ~100 Gemini-TTS requests/day; on any failure (quota/error/no audio, or a
-  missing `GEMINI_API_KEY`) Sinhala degrades to Claude brain + OpenAI TTS (`sage`)
-  so the call still works.
+- **Sinhala (`si`):** Media Streams — **Gemini brain** (`SI_GEMINI_MODEL`
+  default `gemini-3.7-flash`, forced via `SI_LLM_PROVIDER=gemini` regardless of
+  the global `LLM_PROVIDER`; `_run_llm_gemini(model=SI_GEMINI_MODEL)`) + **Gemini
+  TTS** (`GEMINI_TTS_MODEL` `gemini-3.1-flash-tts-preview`, voice `Vindemiatrix`,
+  via `MediaStreamSession._tts_gemini` — Interactions API returns 24 kHz PCM,
+  downsampled to 8 kHz mulaw like `_tts_openai`) + Azure STT (`si-LK`). This is
+  the Kavya Dialog stack, ported over. **⚠ Preview-model quota:** ~100
+  Gemini-TTS requests/day; on any failure (quota/error/no audio, or a missing
+  `GEMINI_API_KEY`) Sinhala degrades to Claude brain + OpenAI TTS (`sage`) so the
+  call still works.
 - **Knowledge base:** ChromaDB RAG over `knowledge_docs/`.
-- `ta` code path from the HattonHills base remains present but is **not offered**.
+- `ta` code path from the HattonHills base remains present but is **not offered**
+  for this demo (en + si + ar + ru only).
 
 ## Runtime shape
 
@@ -81,9 +85,10 @@ Real secrets live only in **`/opt/horizon/.env`** on the VPS (never committed).
 - Arabic voice: `ELEVENLABS_VOICE_ID_AR`; Arabic STT via `STT_PROVIDER=azure`
 - Sinhala brain + voice (Gemini): `GEMINI_API_KEY`, `SI_LLM_PROVIDER=gemini`,
   `SI_GEMINI_MODEL=gemini-3.7-flash`,
-  `GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview`, `GEMINI_TTS_VOICE=Vindemiatrix`
-- Sinhala voice fallback (only if Gemini TTS unavailable): `OPENAI_API_KEY`,
-  `OPENAI_TTS_MODEL=gpt-4o-mini-tts`, `OPENAI_TTS_VOICE=sage`,
+  `GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview`,
+  `GEMINI_TTS_VOICE=Vindemiatrix`, `GEMINI_TTS_TIMEOUT_SECONDS`
+- Sinhala voice fallback (used only if Gemini TTS is unavailable):
+  `OPENAI_API_KEY`, `OPENAI_TTS_MODEL=gpt-4o-mini-tts`, `OPENAI_TTS_VOICE=sage`,
   `OPENAI_TTS_INSTRUCTIONS`
 - STT: `STT_PROVIDER=azure`, `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION=southeastasia`
 - Telephony: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`
