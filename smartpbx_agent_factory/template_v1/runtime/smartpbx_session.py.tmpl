@@ -6,7 +6,7 @@ import asyncio
 from typing import Any
 
 from product_profile import ProductProfile, test_product_profile
-from provider_adapters import AfterCallHook, ConversationProviderAdapter, Retriever
+from provider_adapters import AfterCallHook, ConversationProviderAdapter, RecognizerFatal, Retriever
 from turn_engine import ConversationTurnEngine
 
 
@@ -29,7 +29,11 @@ class InquirySmartPBXSession:
         self._product_profile = product_profile or test_product_profile()
         self._after_call_hook = after_call_hook
         self._turn_engine = ConversationTurnEngine(
-            provider_adapter, transport, self._product_profile, retriever=retriever
+            provider_adapter,
+            transport,
+            self._product_profile,
+            retriever=retriever,
+            on_terminal_failure=self._complete_recognizer_fatal,
         )
         self.terminal_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self.close_reason: str | None = None
@@ -65,6 +69,15 @@ class InquirySmartPBXSession:
             return
         language = self._product_profile.language(self._selected_language or self._product_profile.default_language)
         await self._turn_engine.accept_audio(audio, language)
+
+    async def _complete_recognizer_fatal(self, _failure: RecognizerFatal) -> None:
+        """Complete the call terminal signal once without retaining provider detail."""
+        if self._finished:
+            return
+        self._finished = True
+        self.close_reason = "stt_fatal"
+        if not self.terminal_future.done():
+            self.terminal_future.set_result(None)
 
     async def finish(self, **_kwargs: object) -> None:
         if self._finished:

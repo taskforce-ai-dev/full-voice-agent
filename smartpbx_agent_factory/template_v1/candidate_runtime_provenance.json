@@ -18,17 +18,17 @@
     },
     {
       "template_path": "runtime/smartpbx_session.py.tmpl",
-      "template_sha256": "sha256:eea154317c23d2da66ec96f4af10854ed3491be4d5527741dbc0a5e58b7a198a",
+      "template_sha256": "sha256:ce7cc6921160b7af1605ea550a831089ca97c84746ae189465c407c44873a402",
       "source_path": "Kavya/smartpbx_session.py",
-      "source_ranges": ["121-220", "261-650", "1005-1048"],
-      "extraction": "call-local start, language selection, STT feeding, and injected pipeline seam"
+      "source_ranges": ["121-220", "261-650", "1005-1048", "6591-6746", "7017-7200"],
+      "extraction": "call-local start, language selection, STT feeding, injected pipeline seam, and once-only transcript-free STT fatal completion"
     },
     {
       "template_path": "runtime/turn_engine.py.tmpl",
-      "template_sha256": "sha256:df08787d84fbca84e0f6d9f2e97330253d8b6cbc62f982885c6051c4183b4fe1",
+      "template_sha256": "sha256:983ac160a3bf6cf1fd78cd721f3d45b161cf84590a05d86bb8468a5636db75d3",
       "source_path": "Kavya/server.py",
-      "source_ranges": ["2992-3016", "8540-8567", "9189-9206", "9359-9555", "9703-9728", "10835-11027", "13112-13190"],
-      "extraction": "continuous STT callback admission, loop-owned interim/final endpointing, speaking-time material/debounce/echo barge-in policy, exactly-once turn ownership, generation fencing, and delivered-media mark barrier"
+      "source_ranges": ["2992-3016", "6591-6746", "7017-7200", "8540-8567", "9189-9206", "9359-9555", "9703-9728", "10835-11027", "13112-13190"],
+      "extraction": "continuous STT callback/fatal admission, loop-owned interim/final endpointing, speaking-time material/debounce/echo barge-in policy, exactly-once turn ownership, immediate generation-scoped provisional TTS, failure fencing, and terminal-only delivered-media/history commit"
     },
     {
       "template_path": "runtime/llm_adapters.py.tmpl",
@@ -60,10 +60,10 @@
     },
     {
       "template_path": "runtime/provider_adapters.py.tmpl",
-      "template_sha256": "sha256:62e2223ac8b4c5efbaa133cb06d56733a3dc38936e8badd331fffa90bfd77a40",
+      "template_sha256": "sha256:74adf6f283b2d00374f0f710ac47431dfb2c71c621626f6cfb3e0dc3fe0a5afe",
       "source_path": null,
       "source_ranges": [],
-      "extraction": "inversion boundary for separately approved continuous STT, terminal-committed LLM, and TTS implementations"
+      "extraction": "inversion boundary for separately approved continuous STT/fatal callbacks, generation-scoped provisional/terminal/fence LLM events, and TTS implementations"
     },
     {
       "template_path": "runtime/stt_adapters.py.tmpl",

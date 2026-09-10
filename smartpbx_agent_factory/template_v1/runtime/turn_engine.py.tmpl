@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterable, Callable
+from collections.abc import AsyncIterable, Awaitable, Callable
+from inspect import isawaitable
 from time import monotonic
 from typing import Any
 
@@ -16,10 +17,15 @@ from product_profile import LanguageProfile, ProductProfile
 from provider_adapters import (
     ContinuousRecognizer,
     ConversationProviderAdapter,
+    GenerationFence,
     ProvisionalSentence,
+    RecognizerEvent,
+    RecognizerFatal,
     RecognizerResult,
+    RecoveryBoundary,
     Retriever,
     TerminalCommit,
+    ThinkingProgress,
 )
 
 
@@ -41,6 +47,7 @@ class ConversationTurnEngine:
         pre_audio_min_seconds: float = 0.25,
         duplicate_identity_window_seconds: float = 2.0,
         clock: Callable[[], float] = monotonic,
+        on_terminal_failure: Callable[[RecognizerFatal], Awaitable[None] | None] | None = None,
     ) -> None:
         if (
             not isinstance(endpointing_silence_seconds, (int, float))
@@ -79,6 +86,7 @@ class ConversationTurnEngine:
         self._pre_audio_min_seconds = pre_audio_min_seconds
         self._duplicate_identity_window_seconds = duplicate_identity_window_seconds
         self._clock = clock
+        self._on_terminal_failure = on_terminal_failure
         self.turns_completed = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._recognizer: ContinuousRecognizer | None = None
@@ -90,6 +98,8 @@ class ConversationTurnEngine:
         self._pending_transcript = ""
         self._endpoint_handle: asyncio.TimerHandle | None = None
         self._turn_task: asyncio.Task[None] | None = None
+        self._sentence_tts_task: asyncio.Task[None] | None = None
+        self._delivery_epoch = 0
         self._deferred_endpoint_due = False
         self._audible_generation: int | None = None
         self._audible_since: float | None = None
@@ -99,6 +109,8 @@ class ConversationTurnEngine:
         self._tasks: set[asyncio.Task[Any]] = set()
         self._callback_lock = asyncio.Lock()
         self._closed = False
+        self.terminal_failure: RecognizerFatal | None = None
+        self.committed_responses: list[str] = []
 
     @property
     def active(self) -> bool:
@@ -177,7 +189,7 @@ class ConversationTurnEngine:
         self._language = language
         self._recognizer = await self._provider_adapter.start_recognizer(
             language.code,
-            lambda result: self._on_recognizer_result(epoch, result),
+            lambda event: self._on_recognizer_event(epoch, event),
         )
 
     async def _close_recognizer(self) -> None:
@@ -185,20 +197,43 @@ class ConversationTurnEngine:
         if recognizer is not None:
             await recognizer.close()
 
-    def _on_recognizer_result(self, epoch: int, result: RecognizerResult) -> None:
+    def _on_recognizer_event(self, epoch: int, event: RecognizerEvent) -> None:
         """Provider callbacks may be threaded; mutation always returns to our loop."""
         loop = self._loop
-        if self._closed or loop is None or not isinstance(result, RecognizerResult):
+        if self._closed or loop is None or not isinstance(event, RecognizerEvent):
             return
         try:
-            loop.call_soon_threadsafe(self._schedule_recognizer_result, epoch, result)
+            loop.call_soon_threadsafe(self._schedule_recognizer_event, epoch, event)
         except RuntimeError:
             return
 
-    def _schedule_recognizer_result(self, epoch: int, result: RecognizerResult) -> None:
+    def _schedule_recognizer_event(self, epoch: int, event: RecognizerEvent) -> None:
         if self._closed or epoch != self._recognizer_epoch:
             return
-        self._track(asyncio.create_task(self._handle_recognizer_result(epoch, result)))
+        if isinstance(event, RecognizerFatal):
+            self._track(asyncio.create_task(self._handle_recognizer_fatal(epoch, event)))
+            return
+        self._track(asyncio.create_task(self._handle_recognizer_result(epoch, event)))
+
+    async def _handle_recognizer_fatal(self, epoch: int, failure: RecognizerFatal) -> None:
+        """Fail one session once without retaining any provider payload."""
+        async with self._callback_lock:
+            if self._closed or epoch != self._recognizer_epoch or self.terminal_failure is not None:
+                return
+            self.terminal_failure = failure
+            self._closed = True
+            self._recognizer_epoch += 1
+            self._pending_transcript = ""
+            self._deferred_endpoint_due = False
+            await self._cancel_active_turn(clear_audio=True)
+            await self._close_recognizer()
+            if self._on_terminal_failure is not None:
+                try:
+                    callback_result = self._on_terminal_failure(failure)
+                    if isawaitable(callback_result):
+                        await callback_result
+                except Exception:
+                    return
 
     async def _handle_recognizer_result(self, epoch: int, result: RecognizerResult) -> None:
         async with self._callback_lock:
@@ -258,6 +293,7 @@ class ConversationTurnEngine:
     async def _cancel_active_turn(self, *, clear_audio: bool) -> None:
         self._invalidate_endpointing()
         self._generation += 1
+        self._delivery_epoch += 1
         self._deferred_endpoint_due = False
         self._audible_generation = None
         self._audible_since = None
@@ -265,6 +301,7 @@ class ConversationTurnEngine:
         self._pre_audio_first_result_at = None
         self._pre_audio_result_count = 0
         task, self._turn_task = self._turn_task, None
+        await self._cancel_sentence_tts()
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -332,31 +369,22 @@ class ConversationTurnEngine:
             if not self._owns_generation(generation):
                 return
             prompt = _build_prompt(self._product_profile, language, context)
-            emitted = False
             response = await self._provider_adapter.generate_response(transcript, language.code, prompt)
-            async for response_chunk in _iterate_committed_text(response):
-                if not self._owns_generation(generation):
-                    return
-                if not response_chunk:
-                    continue
-                audio_result = await self._provider_adapter.synthesize_audio(response_chunk, language.code)
-                async for audio_chunk in _iterate_audio(audio_result):
-                    if not self._owns_generation(generation):
-                        return
-                    if audio_chunk:
-                        await self._transport.send_audio(audio_chunk)
-                        if self._owns_generation(generation) and self._audible_generation != generation:
-                            self._audible_generation = generation
-                            self._audible_since = self._clock()
-                            self._pre_audio_generation = None
-                        emitted = True
+            committed_sentences = await self._speak_response(response, language, generation)
+            if committed_sentences is None:
+                return
             if not self._owns_generation(generation):
                 return
-            if emitted:
+            if committed_sentences:
                 send_mark = getattr(self._transport, "send_mark", None)
                 if callable(send_mark):
                     await send_mark("conversation-turn")
             if self._owns_generation(generation):
+                committed_response = " ".join(
+                    sentence.strip() for sentence in committed_sentences if sentence.strip()
+                )
+                if committed_response:
+                    self.committed_responses.append(committed_response)
                 self.turns_completed += 1
         finally:
             if self._turn_task is asyncio.current_task():
@@ -367,6 +395,140 @@ class ConversationTurnEngine:
                 if self._deferred_endpoint_due and self._pending_transcript.strip() and not self._closed:
                     self._deferred_endpoint_due = False
                     self._arm_endpointing(0.0)
+
+    async def _speak_response(
+        self,
+        response: str | AsyncIterable[
+            ProvisionalSentence | ThinkingProgress | TerminalCommit | GenerationFence | RecoveryBoundary
+        ],
+        language: LanguageProfile,
+        turn_generation: int,
+    ) -> list[str] | None:
+        """Speak complete provisional sentences; commit them only at terminal metadata.
+
+        The provider owns a single recovery retry.  A fence has to cancel and
+        drain the current sentence task before transport media is cleared, so a
+        failed preamble cannot leak into a retried response or assistant history.
+        """
+        if isinstance(response, str):
+            if response:
+                await self._speak_sentence(response, language, turn_generation)
+            return [response] if self._owns_generation(turn_generation) else None
+
+        active_attempt: int | None = None
+        fenced_attempts: set[int] = set()
+        retry_used = False
+        provisional_sentences: list[str] = []
+        try:
+            async for item in response:
+                if not self._owns_generation(turn_generation):
+                    return None
+                if isinstance(item, ThinkingProgress):
+                    continue
+                if isinstance(item, ProvisionalSentence):
+                    if item.generation in fenced_attempts:
+                        continue
+                    if active_attempt is None:
+                        active_attempt = item.generation
+                    elif item.generation != active_attempt:
+                        await self._fence_provisional_media()
+                        return None
+                    if item.text:
+                        await self._speak_sentence(item.text, language, turn_generation)
+                        if not self._owns_generation(turn_generation):
+                            return None
+                        provisional_sentences.append(item.text)
+                    continue
+                if isinstance(item, TerminalCommit):
+                    if active_attempt is None:
+                        active_attempt = item.generation
+                    if item.generation != active_attempt or item.generation in fenced_attempts:
+                        await self._fence_provisional_media()
+                        return None
+                    return provisional_sentences
+                if isinstance(item, GenerationFence):
+                    if item.generation in fenced_attempts:
+                        continue
+                    if active_attempt is not None and item.generation != active_attempt:
+                        continue
+                    fenced_attempts.add(item.generation)
+                    await self._fence_provisional_media()
+                    provisional_sentences.clear()
+                    active_attempt = None
+                    if not item.retrying or retry_used:
+                        return None
+                    retry_used = True
+                    continue
+                if isinstance(item, RecoveryBoundary):
+                    if active_attempt is None or item.generation == active_attempt:
+                        if item.generation not in fenced_attempts:
+                            fenced_attempts.add(item.generation)
+                            await self._fence_provisional_media()
+                        return None
+                    continue
+                raise TypeError("LLM adapter yielded an unsupported stream event")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._fence_provisional_media()
+            return None
+        await self._fence_provisional_media()
+        return None
+
+    async def _speak_sentence(
+        self, sentence: str, language: LanguageProfile, turn_generation: int
+    ) -> None:
+        delivery_epoch = self._delivery_epoch
+        task = asyncio.create_task(
+            self._send_sentence_audio(sentence, language, turn_generation, delivery_epoch)
+        )
+        self._sentence_tts_task = task
+        try:
+            await task
+        finally:
+            if self._sentence_tts_task is task:
+                self._sentence_tts_task = None
+
+    async def _send_sentence_audio(
+        self,
+        sentence: str,
+        language: LanguageProfile,
+        turn_generation: int,
+        delivery_epoch: int,
+    ) -> None:
+        audio_result = await self._provider_adapter.synthesize_audio(sentence, language.code)
+        async for audio_chunk in _iterate_audio(audio_result):
+            if (
+                not self._owns_generation(turn_generation)
+                or delivery_epoch != self._delivery_epoch
+            ):
+                return
+            if not audio_chunk:
+                continue
+            await self._transport.send_audio(audio_chunk)
+            if (
+                self._owns_generation(turn_generation)
+                and delivery_epoch == self._delivery_epoch
+                and self._audible_generation != turn_generation
+            ):
+                self._audible_generation = turn_generation
+                self._audible_since = self._clock()
+                self._pre_audio_generation = None
+
+    async def _cancel_sentence_tts(self) -> None:
+        task = self._sentence_tts_task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _fence_provisional_media(self) -> None:
+        """Atomically fence sentence synthesis before discarding queued media."""
+        self._delivery_epoch += 1
+        await self._cancel_sentence_tts()
+        clear_audio = getattr(self._transport, "clear_audio", None)
+        if callable(clear_audio):
+            await clear_audio()
 
     def _track(self, task: asyncio.Task[Any]) -> None:
         self._tasks.add(task)
@@ -382,26 +544,6 @@ def _build_prompt(profile: ProductProfile, language: LanguageProfile, context: s
     if context:
         pieces.append(context)
     return "\n\n".join(piece for piece in pieces if piece)
-
-
-async def _iterate_committed_text(
-    value: str | AsyncIterable[ProvisionalSentence | TerminalCommit],
-) -> AsyncIterable[str]:
-    if isinstance(value, str):
-        yield value
-        return
-    provisional: list[str] = []
-    async for item in value:
-        if isinstance(item, ProvisionalSentence):
-            provisional.append(item.text)
-            continue
-        if isinstance(item, TerminalCommit):
-            for sentence in provisional:
-                if sentence:
-                    yield sentence
-            return
-        raise TypeError("LLM adapter yielded an unsupported stream event")
-    raise RuntimeError("LLM stream ended before terminal commit")
 
 
 async def _iterate_audio(value: bytes | AsyncIterable[bytes]) -> AsyncIterable[bytes]:

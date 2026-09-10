@@ -19,7 +19,7 @@ import pytest
 def runtime_module(tmp_path, monkeypatch):
     """Load the three dependency-free runtime templates as disposable modules."""
     runtime = Path(__file__).parents[1] / "template_v1" / "runtime"
-    for name in ("product_profile", "provider_adapters", "turn_engine"):
+    for name in ("product_profile", "provider_adapters", "turn_engine", "smartpbx_session"):
         (tmp_path / f"{name}.py").write_text(
             (runtime / f"{name}.py.tmpl").read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -32,17 +32,20 @@ def runtime_module(tmp_path, monkeypatch):
 class RecordingTransport:
     def __init__(self) -> None:
         self.events: list[tuple[str, bytes | str]] = []
+        self.pending_audio: list[bytes] = []
         self.clears = 0
         self.mark_release = asyncio.Event()
         self.hold_mark = False
 
     async def send_audio(self, audio: bytes) -> None:
         self.events.append(("audio", audio))
+        self.pending_audio.append(audio)
 
     async def send_mark(self, name: str) -> None:
         self.events.append(("mark", name))
         if self.hold_mark:
             await self.mark_release.wait()
+        self.pending_audio.clear()
 
     async def clear_audio(self) -> None:
         self.clears += 1
@@ -314,15 +317,86 @@ def test_late_epoch_callback_cannot_start_a_task_or_emit_stale_audio(runtime_mod
     asyncio.run(exercise())
 
 
-def test_provisional_llm_sentences_are_not_spoken_until_terminal_commit(runtime_module):
+def test_recognizer_fatal_fences_turn_media_and_completes_once(runtime_module):
+    async def exercise():
+        adapter, transport = RecordingAdapter(), RecordingTransport()
+        adapter.block_first_response = True
+        engine, _language, recognizer = await _new_engine(runtime_module, adapter, transport)
+        result = runtime_module.RecognizerResult
+        fatal = runtime_module.RecognizerFatal
+
+        recognizer.emit(result("question", is_final=True))
+        await asyncio.wait_for(adapter.first_response_started.wait(), timeout=0.2)
+        recognizer.emit(fatal("provider_unavailable"))
+        await engine.drain()
+
+        assert engine.terminal_failure == fatal("provider_unavailable")
+        assert transport.clears == 1
+        assert recognizer.closed is True
+        assert engine.turns_completed == 0
+        assert adapter.generated == ["question"]
+
+        recognizer.emit(fatal("provider_unavailable"))
+        await engine.drain()
+        assert transport.clears == 1
+
+    asyncio.run(exercise())
+
+
+def test_expected_recognizer_close_never_reports_a_fatal(runtime_module):
+    async def exercise():
+        adapter, transport = RecordingAdapter(), RecordingTransport()
+        engine, _language, recognizer = await _new_engine(runtime_module, adapter, transport)
+
+        await engine.close()
+
+        assert recognizer.closed is True
+        assert engine.terminal_failure is None
+        assert transport.clears == 1
+
+    asyncio.run(exercise())
+
+
+def test_session_completes_one_terminal_failure_signal_for_recognizer_fatal(runtime_module):
+    async def exercise():
+        session_module = importlib.import_module("smartpbx_session")
+        profile_module = importlib.import_module("product_profile")
+        adapter, transport = RecordingAdapter(), RecordingTransport()
+        session = session_module.InquirySmartPBXSession(
+            None,
+            transport,
+            None,
+            provider_adapter=adapter,
+            product_profile=profile_module.test_product_profile(),
+        )
+        await session.start()
+        assert adapter.recognizer is not None
+
+        adapter.recognizer.emit(runtime_module.RecognizerFatal("provider_timeout"))
+        await session._turn_engine.drain()
+
+        assert session.terminal_future.done()
+        assert session.terminal_future.result() is None
+        assert session.close_reason == "stt_fatal"
+        assert transport.clears == 1
+        assert adapter.recognizer.closed is True
+
+        adapter.recognizer.emit(runtime_module.RecognizerFatal("provider_timeout"))
+        await session._turn_engine.drain()
+        assert transport.clears == 1
+
+    asyncio.run(exercise())
+
+
+def test_provisional_sentence_starts_tts_before_terminal_commit(runtime_module):
     async def exercise():
         adapter, transport = RecordingAdapter(), RecordingTransport()
         commit = asyncio.Event()
 
         async def stream():
-            yield runtime_module.ProvisionalSentence("not committed")
+            yield runtime_module.ProvisionalSentence(1, "speak promptly")
             await commit.wait()
-            yield runtime_module.TerminalCommit()
+            yield runtime_module.TerminalCommit(1)
 
         adapter.response_factory = lambda _transcript: stream()
         engine, _language, recognizer = await _new_engine(runtime_module, adapter, transport)
@@ -331,11 +405,14 @@ def test_provisional_llm_sentences_are_not_spoken_until_terminal_commit(runtime_
         recognizer.emit(result("question", is_final=True))
         for _ in range(4):
             await asyncio.sleep(0)
-        assert transport.events == []
+        assert transport.events == [("audio", b"speak promptly")]
+        assert engine.turns_completed == 0
+        assert engine.committed_responses == []
 
         commit.set()
         await engine.drain()
-        assert transport.events == [("audio", b"not committed"), ("mark", "conversation-turn")]
+        assert transport.events == [("audio", b"speak promptly"), ("mark", "conversation-turn")]
+        assert engine.committed_responses == ["speak promptly"]
 
     asyncio.run(exercise())
 
@@ -346,9 +423,9 @@ def test_cancelled_generation_cannot_speak_after_a_late_terminal_commit(runtime_
         old_commit = asyncio.Event()
 
         async def old_stream():
-            yield runtime_module.ProvisionalSentence("stale sentence")
+            yield runtime_module.ProvisionalSentence(1, "stale sentence")
             await old_commit.wait()
-            yield runtime_module.TerminalCommit()
+            yield runtime_module.TerminalCommit(1)
 
         adapter.response_factory = lambda transcript: old_stream() if transcript == "first" else transcript
         engine, _language, recognizer = await _new_engine(
@@ -370,9 +447,81 @@ def test_cancelled_generation_cannot_speak_after_a_late_terminal_commit(runtime_
         old_commit.set()
         await engine.drain()
 
-        assert ("audio", b"stale sentence") not in transport.events
+        assert transport.pending_audio == []
+        assert engine.committed_responses == ["this is a material interruption"]
         assert ("audio", b"this is a material interruption") in transport.events
         assert adapter.generated == ["first", "this is a material interruption"]
+
+    asyncio.run(exercise())
+
+
+def test_truncated_preamble_fences_media_then_allows_one_adapter_retry(runtime_module):
+    async def exercise():
+        adapter, transport = RecordingAdapter(), RecordingTransport()
+        release_retry = asyncio.Event()
+        retry_started = asyncio.Event()
+
+        async def stream():
+            yield runtime_module.ProvisionalSentence(1, "unsafe preamble")
+            yield runtime_module.GenerationFence(
+                1, runtime_module.RoundOutcome.MAX_TOKENS_TRUNCATED, retrying=True
+            )
+            retry_started.set()
+            await release_retry.wait()
+            yield runtime_module.ProvisionalSentence(2, "recovered answer")
+            yield runtime_module.TerminalCommit(2)
+
+        adapter.response_factory = lambda _transcript: stream()
+        engine, _language, recognizer = await _new_engine(runtime_module, adapter, transport)
+        result = runtime_module.RecognizerResult
+
+        recognizer.emit(result("question", is_final=True))
+        await asyncio.wait_for(retry_started.wait(), timeout=0.2)
+
+        assert transport.clears == 1
+        assert transport.pending_audio == []
+        assert engine.committed_responses == []
+        assert engine.turns_completed == 0
+        assert adapter.generated == ["question"]
+
+        release_retry.set()
+        await engine.drain()
+
+        assert transport.events == [
+            ("audio", b"unsafe preamble"),
+            ("audio", b"recovered answer"),
+            ("mark", "conversation-turn"),
+        ]
+        assert transport.pending_audio == []
+        assert transport.clears == 1
+        assert adapter.generated == ["question"]
+        assert engine.committed_responses == ["recovered answer"]
+        assert engine.turns_completed == 1
+
+    asyncio.run(exercise())
+
+
+def test_aborted_preamble_clears_media_without_history_or_stale_task(runtime_module):
+    async def exercise():
+        adapter, transport = RecordingAdapter(), RecordingTransport()
+
+        async def stream():
+            yield runtime_module.ProvisionalSentence(1, "truncated preamble")
+            raise RuntimeError("provider stream aborted")
+
+        adapter.response_factory = lambda _transcript: stream()
+        engine, _language, recognizer = await _new_engine(runtime_module, adapter, transport)
+        result = runtime_module.RecognizerResult
+
+        recognizer.emit(result("question", is_final=True))
+        await engine.drain()
+
+        assert transport.events == [("audio", b"truncated preamble")]
+        assert transport.pending_audio == []
+        assert transport.clears == 1
+        assert engine.committed_responses == []
+        assert engine.turns_completed == 0
+        assert engine._turn_task is None
 
     asyncio.run(exercise())
 

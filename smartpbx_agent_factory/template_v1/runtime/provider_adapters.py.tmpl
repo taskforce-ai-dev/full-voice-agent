@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 from product_profile import LanguageProfile, ProductProfile
@@ -39,7 +40,24 @@ class RecognizerResult:
         return (self.result_id, self.is_final, self.text)
 
 
-RecognizerCallback = Callable[[RecognizerResult], None]
+@dataclass(frozen=True)
+class RecognizerFatal:
+    """Bounded provider failure class; never carries provider payload or text."""
+
+    failure_class: str
+
+    def __post_init__(self) -> None:
+        if self.failure_class not in {
+            "provider_unavailable",
+            "provider_timeout",
+            "provider_stream_aborted",
+            "provider_protocol_error",
+        }:
+            raise ValueError("invalid recognizer fatal class")
+
+
+RecognizerEvent = RecognizerResult | RecognizerFatal
+RecognizerCallback = Callable[[RecognizerEvent], None]
 
 
 class ContinuousRecognizer(Protocol):
@@ -66,24 +84,80 @@ class LLMAdapter(Protocol):
 
     async def generate_response(
         self, transcript: str, language: str, prompt: str
-    ) -> str | AsyncIterable["ProvisionalSentence | TerminalCommit"]:
-        """Return one atomic response or a terminal-committed streaming response."""
+    ) -> str | AsyncIterable["LLMStreamEvent"]:
+        """Return one atomic response or a generation-scoped streaming response."""
 
 
 @dataclass(frozen=True)
 class ProvisionalSentence:
-    """A generation-local sentence that is unsafe to speak until committed."""
+    """A complete sentence that may be spoken before terminal commit."""
 
+    generation: int
     text: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.text, str):
-            raise ValueError("provisional sentence must be text")
+        if (
+            not isinstance(self.generation, int)
+            or isinstance(self.generation, bool)
+            or self.generation < 0
+            or not isinstance(self.text, str)
+        ):
+            raise ValueError("provisional sentence is invalid")
+
+
+@dataclass(frozen=True)
+class ThinkingProgress:
+    """Non-spoken provider progress for a generation."""
+
+    generation: int
+
+
+class RoundOutcome(str, Enum):
+    """The normalized terminal state for an uncommitted provider attempt."""
+
+    COMPLETED = "completed"
+    TRUE_EMPTY = "true_empty"
+    MAX_TOKENS_TRUNCATED = "max_tokens_truncated"
+    STREAM_ABORTED = "stream_aborted"
+    INCOMPLETE_TOOL_BLOCK = "incomplete_tool_block"
+    MALFORMED_TOOL_JSON = "malformed_tool_json"
+    TIMEOUT = "timeout"
+    ABORTED = "aborted"
 
 
 @dataclass(frozen=True)
 class TerminalCommit:
-    """The provider completed the current response; provisional text is durable."""
+    """The provider completed one generation; prior speech may enter history."""
+
+    generation: int
+    metadata: object | None = None
+
+
+@dataclass(frozen=True)
+class GenerationFence:
+    """Discard one unsafe generation before an adapter-owned single retry."""
+
+    generation: int
+    reason: RoundOutcome
+    retrying: bool
+
+
+@dataclass(frozen=True)
+class RecoveryBoundary:
+    """A failed generation has no further response stream to commit."""
+
+    generation: int
+    reason: RoundOutcome
+    retrying: bool = False
+
+
+LLMStreamEvent = (
+    ProvisionalSentence
+    | ThinkingProgress
+    | TerminalCommit
+    | GenerationFence
+    | RecoveryBoundary
+)
 
 
 class TTSAdapter(Protocol):
