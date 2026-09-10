@@ -66,7 +66,10 @@ def _scan_artifact_tree(root: Path, secret_values: Iterable[str]) -> None:
 
 def _remove_generation_artifacts(agent_dir: Path) -> None:
     """Remove precisely one generated agent directory; never clean a parent tree."""
-    if agent_dir.exists():
+    agents = agent_dir.parent
+    if agents.is_symlink() or agent_dir.is_symlink():
+        raise SecretError("operations artifact path may not traverse a symlink")
+    if agent_dir.exists() and agent_dir.is_dir():
         shutil.rmtree(agent_dir)
 
 
@@ -85,13 +88,23 @@ def render_operations_artifacts(
     provider.validate()
     if not isinstance(output_dir, Path):
         raise SecretError("output directory must be a Path")
-    root = output_dir.resolve()
-    agent_dir = root / "agents" / resources.slug
+    root = output_dir.absolute()
+    if root.is_symlink() or not root.is_dir():
+        raise SecretError("operations output directory must be a real directory")
+    agents = root / "agents"
+    if agents.is_symlink() or (agents.exists() and not agents.is_dir()):
+        raise SecretError("operations artifact path may not traverse a symlink")
+    agent_dir = agents / resources.slug
+    if agent_dir.is_symlink():
+        raise SecretError("operations artifact path may not traverse a symlink")
     secret_path = agent_dir / "secrets.sops.yaml"
     metadata_path = agent_dir / "metadata.yaml"
     secret_name = f"{resources.slug}/wss_token"
     try:
-        agent_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+        agents.mkdir(mode=0o700, exist_ok=True)
+        if agents.is_symlink() or not agents.is_dir():
+            raise SecretError("operations artifact directory is unsafe")
+        agent_dir.mkdir(exist_ok=False, mode=0o700)
         value = provider.generate(secret_name, length=32)
         if not isinstance(value, str) or not value:
             raise SecretError("secret provider returned an invalid generated value")
