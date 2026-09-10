@@ -1,13 +1,19 @@
 """Renderer contracts use explicit synthetic templates, never deployed provenance."""
 
-import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from smartpbx_agent_factory.catalogue import CapabilityCatalogue
+from smartpbx_agent_factory.knowledge import (
+    KnowledgeConflict,
+    KnowledgeDocument,
+    KnowledgeFact,
+    KnowledgeReview,
+    recompute_knowledge_review_digest,
+)
 from smartpbx_agent_factory.provenance import TemplateAllowlist, TemplateFile
 from smartpbx_agent_factory.render import IncompleteTemplateError, IdentityLeakError, ReviewNotApprovedError, render_backend
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
@@ -19,23 +25,34 @@ FIXTURE = Path(__file__).parent / "fixtures" / "acme-minimal.json"
 CATALOGUE = Path(__file__).parent / "fixtures" / "approved-provider-catalogue.json"
 
 
-@dataclass(frozen=True)
-class FixtureFact:
-    text: str
-
-
-@dataclass(frozen=True)
-class FixtureReview:
-    facts: tuple[FixtureFact, ...] = (FixtureFact("Acme provides approved information."),)
-    documents: dict[str, str] | None = None
-    claimed_digest: str | None = None
-
-    @property
-    def digest(self):
-        payload = "\n".join(fact.text for fact in self.facts)
-        if self.documents:
-            payload += "\n" + "\n".join(f"{name}\0{self.documents[name]}" for name in sorted(self.documents))
-        return self.claimed_digest or hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def fixture_review(
+    *,
+    facts: tuple[KnowledgeFact, ...] = (
+        KnowledgeFact("Acme provides approved information.", "https://acme.example/facts", "source-001#document"),
+    ),
+    documents: tuple[KnowledgeDocument, ...] = (
+        KnowledgeDocument(
+            uri="https://acme.example/facts",
+            owner="Acme Factory",
+            effective_date="2026-09-10",
+            classification="public",
+            text="Acme provides approved information.",
+        ),
+    ),
+    conflicts: tuple[KnowledgeConflict, ...] = (),
+) -> KnowledgeReview:
+    draft = KnowledgeReview(
+        facts=facts,
+        conflicts=conflicts,
+        missing_facts=(),
+        sensitive_findings=(),
+        inaccessible_sources=(),
+        duplicate_facts=(),
+        instruction_findings=(),
+        digest="",
+        documents=documents,
+    )
+    return replace(draft, digest=recompute_knowledge_review_digest(draft))
 
 
 def fixture_manifest():
@@ -48,7 +65,7 @@ def fixture_resources():
 
 
 def fixture_state(review=None, *, plan_approved=True):
-    review = review or FixtureReview()
+    review = review or fixture_review()
     state = GenerationState.start("generation-fixture", manifest_digest(fixture_manifest()))
     state.transition(Stage.INPUT_COLLECTED)
     state.transition(Stage.SECRETS_RESOLVED)
@@ -100,14 +117,15 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
 
 def test_partial_v06_provenance_fails_closed_without_complete_runtime_template(tmp_path):
     with pytest.raises(IncompleteTemplateError, match="INCOMPLETE_TEMPLATE"):
-        review = FixtureReview()
+        review = fixture_review()
         render_backend(fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(review))
 
 
 def test_inquiry_only_render_has_no_business_tools(tmp_path):
+    review = fixture_review()
     report = render_backend(
-        fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path,
-        state=fixture_state(), template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        fixture_manifest(), review, fixture_resources(), tmp_path,
+        state=fixture_state(review), template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
     )
     tools = (tmp_path / "SmartPBX Agents/acme-inquiry/tools.py").read_text(encoding="utf-8")
     assert "create_booking" not in tools
@@ -119,7 +137,7 @@ def test_inquiry_only_render_has_no_business_tools(tmp_path):
 
 
 def test_renderer_rejects_identity_and_secret_leaks_from_review(tmp_path):
-    review = FixtureReview(facts=(FixtureFact("Hatton Hills is a hotel"),))
+    review = fixture_review(facts=(KnowledgeFact("Hatton Hills is a hotel", "https://acme.example/facts", "source-001#document"),))
     with pytest.raises(IdentityLeakError, match="identity leak"):
         render_backend(
             fixture_manifest(), review, fixture_resources(), tmp_path,
@@ -130,23 +148,24 @@ def test_renderer_rejects_identity_and_secret_leaks_from_review(tmp_path):
 def test_renderer_is_deterministic_for_the_same_approved_inputs(tmp_path):
     first_root, second_root = tmp_path / "first", tmp_path / "second"
     first_template, second_template = fixture_templates(first_root / "synthetic"), fixture_templates(second_root / "synthetic")
-    first = render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), first_root, state=fixture_state(), template_allowlist=first_template, template_root=first_root / "synthetic")
-    second = render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), second_root, state=fixture_state(), template_allowlist=second_template, template_root=second_root / "synthetic")
+    first_review, second_review = fixture_review(), fixture_review()
+    first = render_backend(fixture_manifest(), first_review, fixture_resources(), first_root, state=fixture_state(first_review), template_allowlist=first_template, template_root=first_root / "synthetic")
+    second = render_backend(fixture_manifest(), second_review, fixture_resources(), second_root, state=fixture_state(second_review), template_allowlist=second_template, template_root=second_root / "synthetic")
     assert first.artifact_digest == second.artifact_digest
     assert first.files == second.files
 
 
 def test_renderer_requires_generation_state_approval_for_the_exact_review_digest(tmp_path):
-    review = FixtureReview()
+    review = fixture_review()
     with pytest.raises(ReviewNotApprovedError, match="digest"):
         render_backend(
-            fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(FixtureReview(claimed_digest="b" * 64)),
+            fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(replace(review, digest="b" * 64)),
             template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
         )
 
 
 def test_renderer_rejects_plan_review_state_before_plan_approval(tmp_path):
-    review = FixtureReview()
+    review = fixture_review()
     with pytest.raises(ReviewNotApprovedError, match="plan approval"):
         render_backend(
             fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(review, plan_approved=False),
@@ -155,7 +174,7 @@ def test_renderer_rejects_plan_review_state_before_plan_approval(tmp_path):
 
 
 def test_renderer_rejects_state_with_a_different_canonical_manifest_digest(tmp_path):
-    review = FixtureReview()
+    review = fixture_review()
     state = fixture_state(review)
     state.manifest_digest = "0" * 64
     with pytest.raises(ReviewNotApprovedError, match="manifest digest"):
@@ -166,8 +185,37 @@ def test_renderer_rejects_state_with_a_different_canonical_manifest_digest(tmp_p
 
 
 def test_renderer_rejects_review_with_forged_digest_after_facts_change(tmp_path):
-    original = FixtureReview()
-    forged = FixtureReview(facts=(FixtureFact("altered approved fact"),), claimed_digest=original.digest)
+    original = fixture_review()
+    forged = replace(
+        original,
+        facts=(KnowledgeFact("altered approved fact", "https://acme.example/facts", "source-001#document"),),
+    )
+    with pytest.raises(ReviewNotApprovedError, match="canonical digest"):
+        render_backend(
+            fixture_manifest(), forged, fixture_resources(), tmp_path, state=fixture_state(original),
+            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        )
+
+
+def test_renderer_rejects_review_with_forged_digest_after_document_change(tmp_path):
+    original = fixture_review()
+    forged = replace(
+        original,
+        documents=(replace(original.documents[0], text="altered approved document"),),
+    )
+    with pytest.raises(ReviewNotApprovedError, match="canonical digest"):
+        render_backend(
+            fixture_manifest(), forged, fixture_resources(), tmp_path, state=fixture_state(original),
+            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        )
+
+
+def test_renderer_rejects_review_with_forged_digest_after_conflict_change(tmp_path):
+    original = fixture_review()
+    forged = replace(
+        original,
+        conflicts=(KnowledgeConflict("hours", ("09:00", "17:00"), ("source-001#document", "source-001#document")),),
+    )
     with pytest.raises(ReviewNotApprovedError, match="canonical digest"):
         render_backend(
             fixture_manifest(), forged, fixture_resources(), tmp_path, state=fixture_state(original),
@@ -176,7 +224,7 @@ def test_renderer_rejects_review_with_forged_digest_after_facts_change(tmp_path)
 
 
 def test_scan_rejects_identity_leak_in_late_review_document(tmp_path):
-    review = FixtureReview(documents={"early.md": "approved", "late.md": "Hatton Hills"})
+    review = fixture_review(documents=(replace(fixture_review().documents[0], text="Hatton Hills"),))
     with pytest.raises(IdentityLeakError, match="identity leak"):
         render_backend(
             fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(review),
@@ -198,7 +246,7 @@ def test_failed_write_removes_only_the_new_generation_root(tmp_path, monkeypatch
     monkeypatch.setattr(Path, "write_text", fail_after_first)
     with pytest.raises(OSError, match="synthetic write failure"):
         render_backend(
-            fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path, state=fixture_state(),
+            fixture_manifest(), fixture_review(), fixture_resources(), tmp_path, state=fixture_state(),
             template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
         )
     assert not (tmp_path / "SmartPBX Agents/acme-inquiry").exists()
