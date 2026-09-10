@@ -85,6 +85,34 @@ class TurnDrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.cancelled())
         self.assertIsNone(engine._reprompt_task)
 
+    async def test_recognizer_fatal_cancels_and_awaits_the_current_reprompt(self) -> None:
+        engine = self._engine()
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def waiting_reprompt() -> None:
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        engine._reprompt_after_silence = waiting_reprompt
+        await engine._arm_reprompt()
+        task = engine._reprompt_task
+        self.assertIsNotNone(task)
+        await entered.wait()
+
+        failure = self._engine_module.RecognizerFatal("provider_timeout")
+        await engine._handle_recognizer_fatal(0, failure)
+
+        self.assertIs(engine.terminal_failure, failure)
+        self.assertTrue(engine._closed)
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(task.cancelled())
+        self.assertIsNone(engine._reprompt_task)
+
     async def test_reprompt_exception_is_observed_and_clears_current_ownership(self) -> None:
         engine = self._engine()
         reported: list[dict[str, object]] = []
