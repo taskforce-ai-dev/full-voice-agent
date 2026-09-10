@@ -22,7 +22,10 @@ class FakeRunner:
 
 def valid_prerequisites(tmp_path: Path) -> OperationsPrerequisites:
     repository = tmp_path / "operations"
-    repository.mkdir()
+    (repository / ".git").mkdir(parents=True)
+    (repository / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = git@github.com:example/private-operations.git\n', encoding="utf-8"
+    )
     recipients = Path(__file__).parent / "fixtures" / "age-recipients.txt"
     return OperationsPrerequisites(
         repository_path=repository,
@@ -59,8 +62,10 @@ def test_generated_token_is_reused_for_resume_without_printing_value(tmp_path: P
     ("mutate", "reason"),
     (
         (lambda prereqs: setattr(prereqs, "repository_path", Path("relative")), "repository_path"),
+        (lambda prereqs: setattr(prereqs, "canonical_remote", "git@github.com:example/wrong.git"), "canonical_remote"),
         (lambda prereqs: setattr(prereqs, "repository_is_private", False), "private_repository"),
         (lambda prereqs: setattr(prereqs, "owner", ""), "owner"),
+        (lambda prereqs: setattr(prereqs, "recipient_file", None), "recipient_file"),
         (lambda prereqs: setattr(prereqs, "recipient_review_source", ""), "recipient_review_source"),
         (lambda prereqs: setattr(prereqs, "credential_source_policy", {}), "credential_source_policy"),
         (lambda prereqs: setattr(prereqs, "sops_binary", Path("relative/sops")), "sops_binary"),
