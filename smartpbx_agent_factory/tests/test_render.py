@@ -108,6 +108,10 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
         "runtime/smartpbx_diagnostics.py.tmpl": "# synthetic diagnostics marker\n",
         "runtime/tools.py.tmpl": "TOOL_REGISTRY = {}\n",
         "runtime/website_demo.py.tmpl": "ROUTES = ('/voice/demo-incoming',)\n",
+        "runtime/startup.py.tmpl": "app = object()\n",
+        "runtime/product_profile.py.tmpl": "def load_product_profile(path): return object()\n",
+        "runtime/provider_adapters.py.tmpl": "class ConversationProviderAdapter: pass\n",
+        "runtime/turn_engine.py.tmpl": "class ConversationTurnEngine: pass\n",
         "infrastructure/Dockerfile.tmpl": "FROM python:3.11-slim\n",
         "infrastructure/docker-compose.yml.tmpl": "services: {}\n",
         "infrastructure/nginx-smartpbx.conf.tmpl": "location /smartpbx/status {}\n",
@@ -116,6 +120,10 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
         "infrastructure/README.md.tmpl": "Synthetic fixture runtime.\n",
         "infrastructure/CLIENT_CONNECT.md.tmpl": "Synthetic fixture client connect.\n",
         "infrastructure/demo-routing-activation.md.tmpl": "Synthetic fixture pending checklist.\n",
+        "infrastructure/requirements-prod.txt.tmpl": "# Synthetic fixture requirements.\n",
+        "infrastructure/requirements-prod.lock.txt.tmpl": "# Synthetic fixture lock.\n",
+        "infrastructure/ci-runtime-review.yml.tmpl": "jobs: {}\n",
+        "infrastructure/scripts/deploy_runtime_image.sh.tmpl": "#!/bin/sh\nexit 1\n",
     }
     files = {}
     for relative, text in templates.items():

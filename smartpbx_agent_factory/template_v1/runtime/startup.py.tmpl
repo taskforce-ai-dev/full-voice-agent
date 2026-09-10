@@ -1,0 +1,80 @@
+"""Generated one-time ASGI composition for the reviewed runtime candidate."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Mapping
+
+from server import build_service_app, load_runtime
+from smartpbx_gateway import CarrierIngressSettings
+
+
+class ReviewOnlyProviderAdapter:
+    """A closed adapter until a separately reviewed provider implementation exists."""
+
+    active = False
+
+    async def transcribe_audio(self, *_args: object) -> str | None:
+        raise RuntimeError("provider adapter is not approved")
+
+    async def generate_response(self, *_args: object) -> str:
+        raise RuntimeError("provider adapter is not approved")
+
+    async def synthesize_audio(self, *_args: object) -> bytes:
+        raise RuntimeError("provider adapter is not approved")
+
+
+@dataclass(frozen=True)
+class RuntimeConfiguration:
+    token: str
+    account_id: str
+    auth_header_name: str
+    max_calls: int
+    product_profile_path: str
+    knowledge_dir: str
+    google_credentials_path: str
+    stt_provider: str
+    llm_provider: str
+    tts_provider: str
+    anthropic_api_key: str
+    rime_api_key: str
+
+    @classmethod
+    def from_environ(cls, environ: Mapping[str, str]) -> "RuntimeConfiguration":
+        names = (
+            "SMARTPBX_WS_TOKEN", "SMARTPBX_ACCOUNT_ID", "SMARTPBX_AUTH_HEADER_NAME",
+            "SMARTPBX_PRODUCT_PROFILE_PATH", "SMARTPBX_KNOWLEDGE_DIR", "GOOGLE_APPLICATION_CREDENTIALS",
+            "STT_PROVIDER", "LLM_PROVIDER", "TTS_PROVIDER", "ANTHROPIC_API_KEY", "RIME_API_KEY",
+        )
+        values = {name: environ.get(name, "") for name in names}
+        missing = [name for name in names if not values[name]]
+        if missing:
+            raise RuntimeError("missing required runtime configuration: " + ", ".join(missing))
+        try:
+            max_calls = int(environ.get("SMARTPBX_MAX_CALLS", "4"))
+        except ValueError as error:
+            raise RuntimeError("SMARTPBX_MAX_CALLS must be an integer") from error
+        return cls(
+            token=values["SMARTPBX_WS_TOKEN"], account_id=values["SMARTPBX_ACCOUNT_ID"],
+            auth_header_name=values["SMARTPBX_AUTH_HEADER_NAME"], max_calls=max_calls,
+            product_profile_path=values["SMARTPBX_PRODUCT_PROFILE_PATH"], knowledge_dir=values["SMARTPBX_KNOWLEDGE_DIR"],
+            google_credentials_path=values["GOOGLE_APPLICATION_CREDENTIALS"], stt_provider=values["STT_PROVIDER"],
+            llm_provider=values["LLM_PROVIDER"], tts_provider=values["TTS_PROVIDER"],
+            anthropic_api_key=values["ANTHROPIC_API_KEY"], rime_api_key=values["RIME_API_KEY"],
+        )
+
+
+def create_app():
+    config = RuntimeConfiguration.from_environ(os.environ)
+    ingress = CarrierIngressSettings(
+        enabled=True, token=config.token, account_id=config.account_id,
+        auth_header_name=config.auth_header_name, max_calls=config.max_calls,
+    )
+    return build_service_app(load_runtime(
+        ingress=ingress, product_profile_path=config.product_profile_path,
+        provider_adapter=ReviewOnlyProviderAdapter(),
+    ))
+
+
+app = create_app()

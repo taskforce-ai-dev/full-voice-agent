@@ -11,13 +11,20 @@ WORKDIR /app
 COPY requirements-prod.lock.txt ./
 RUN pip install --no-cache-dir -r requirements-prod.lock.txt
 
-# Explicit runtime allowlist: no source-tree wildcard is permitted.
-COPY runtime/server.py runtime/smartpbx_gateway.py runtime/smartpbx_protocol.py ./
-COPY runtime/smartpbx_session.py runtime/smartpbx_transport.py runtime/smartpbx_diagnostics.py ./
-COPY runtime/product_profile.py runtime/provider_adapters.py runtime/turn_engine.py ./
+# Explicit rendered-output allowlist: no source-tree wildcard is permitted.
+COPY startup.py server.py smartpbx_gateway.py smartpbx_protocol.py ./
+COPY smartpbx_session.py smartpbx_transport.py smartpbx_diagnostics.py ./
+COPY product_profile.py provider_adapters.py turn_engine.py ./
+COPY config/product_profile.json ./config/product_profile.json
+COPY knowledge_docs/ ./knowledge_docs/
 
-# Fail during image construction if an allowlisted runtime import is incomplete.
-RUN python -c "import server"
+# The import guard follows the ASGI module used by CMD. Build-only values stay
+# inside this layer and are never written to ENV or the resulting image.
+RUN SMARTPBX_WS_TOKEN=build-check-token SMARTPBX_ACCOUNT_ID=build-check-account \
+    SMARTPBX_AUTH_HEADER_NAME=X-Build-Check-Token SMARTPBX_PRODUCT_PROFILE_PATH=/app/config/product_profile.json \
+    SMARTPBX_KNOWLEDGE_DIR=/app/knowledge_docs GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json \
+    STT_PROVIDER=google LLM_PROVIDER=anthropic TTS_PROVIDER=rime \
+    ANTHROPIC_API_KEY=build-check-key RIME_API_KEY=build-check-key python -c "import startup"
 
 EXPOSE 8000
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws-max-size", "65536"]
+CMD ["uvicorn", "startup:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws-max-size", "65536"]

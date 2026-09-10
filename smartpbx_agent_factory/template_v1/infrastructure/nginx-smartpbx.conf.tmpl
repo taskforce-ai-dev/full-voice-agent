@@ -10,30 +10,30 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
 
     location = /ws/v1/smartpbx/media {
-        proxy_pass http://127.0.0.1:8006;
+        proxy_pass http://127.0.0.1:{{smartpbx_port}};
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header X-SmartPBX-Token $http_x_smartpbx_token;
+        proxy_set_header {{wss_header}} $http_x_smartpbx_token;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 120s;
     }
 
     location = /health {
-        proxy_pass http://127.0.0.1:8006;
+        proxy_pass http://127.0.0.1:{{smartpbx_port}};
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     # The runtime validates X-SmartPBX-Token before returning status.
     location = /smartpbx/status {
-        proxy_pass http://127.0.0.1:8006;
+        proxy_pass http://127.0.0.1:{{smartpbx_port}};
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-SmartPBX-Token $http_x_smartpbx_token;
+        proxy_set_header {{wss_header}} $http_x_smartpbx_token;
     }
 
     location / { return 404; }

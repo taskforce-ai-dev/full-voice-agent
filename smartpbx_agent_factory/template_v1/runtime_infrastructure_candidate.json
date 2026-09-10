@@ -3,6 +3,19 @@
   "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
   "oci_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
   "source_image_digest": "sha256:3d1cfce67574efd1c8bde484d26345c027713c4d169f37804114fecec5b81350",
+  "runtime_outputs": [
+    "startup.py",
+    "server.py",
+    "smartpbx_gateway.py",
+    "smartpbx_protocol.py",
+    "smartpbx_session.py",
+    "smartpbx_transport.py",
+    "smartpbx_diagnostics.py",
+    "product_profile.py",
+    "provider_adapters.py",
+    "turn_engine.py",
+    "config/product_profile.json"
+  ],
   "approval": {
     "rendering": "blocked",
     "release": "blocked",

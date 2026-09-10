@@ -18,7 +18,7 @@ from typing import Mapping
 from .gitops import WorktreeHandle, WorktreeManager, WorktreeConflictError, manager_owned_worktree_target
 from .knowledge import KnowledgeError, KnowledgeReview, recompute_knowledge_review_digest
 from .model import AgentManifest
-from .provenance import ProvenanceError, TemplateAllowlist, validate_allowlist_metadata
+from .provenance import ProvenanceError, TemplateAllowlist, render_template_text, validate_allowlist_metadata
 from .resources import DerivedResources
 from .schema import manifest_digest
 from .state import GenerationState, Stage
@@ -321,29 +321,67 @@ authentication_header: {resources.wss_header}
 reachable_after_provisioning: false
 activation_state: pending
 '''
+    infrastructure_variables = {
+        "smartpbx_service": resources.smartpbx_service,
+        "smartpbx_port": resources.smartpbx_port,
+        "smartpbx_hostname": resources.smartpbx_hostname,
+        "wss_header": resources.wss_header,
+        "ghcr_repository": resources.ghcr_repository,
+        "smartpbx_memory_limit": "1536m",
+        "smartpbx_cpus": "2.0",
+        "smartpbx_pids_limit": 256,
+        "tls_certificate_path": "/run/secrets/smartpbx-tls-fullchain.pem",
+        "tls_certificate_key_path": "/run/secrets/smartpbx-tls-private-key.pem",
+    }
+
+    def infrastructure_template(name: str, fallback: str) -> str:
+        return render_template_text(templates.get(f"infrastructure/{name}", fallback), infrastructure_variables)
+
+    product_profile = {
+        "display_name": manifest.display_name,
+        "default_language": manifest.languages[0].code,
+        "languages": {
+            language.code: {
+                "locale": language.locale,
+                "stt": language.stt,
+                "llm": language.llm,
+                "tts": language.tts,
+                "prompt_block": "Answer approved inquiries only.",
+                "greeting": language.greeting,
+            }
+            for language in manifest.languages
+        },
+        "room_catalogue": {}, "room_aliases": {}, "transliterations": {}, "rates": {},
+        "post_call_vocabulary": [], "knowledge_paths": ["/app/knowledge_docs/approved-facts.md"],
+    }
     return {
         "AGENTS.md": "# Generated SmartPBX agent\n\nNo production provisioning or release is authorized by this tree.\n",
         "CLAUDE.md": "# Generated SmartPBX agent\n\nInquiry-only capability policy.\n",
         "README.md": f"# {title}\n\nGenerated inquiry-only SmartPBX backend.\n",
-        "Dockerfile": "FROM python:3.11-slim\nWORKDIR /app\nCOPY . .\nCMD [\"python\", \"server.py\"]\n",
+        "Dockerfile": infrastructure_template("Dockerfile.tmpl", "FROM python:3.11-slim\nWORKDIR /app\nCOPY . .\nCMD [\"python\", \"server.py\"]\n"),
         ".dockerignore": ".env\n__pycache__/\n.pytest_cache/\n",
-        ".env.example": "ENABLE_SMARTPBX_WSS\nSMARTPBX_WS_TOKEN\nSMARTPBX_ACCOUNT_ID\nSMARTPBX_AUTH_HEADER_NAME\n",
-        "docker-compose.yml": compose,
-        "requirements-prod.txt": "# Standard-library runtime only.\n",
-        "requirements-prod.lock.txt": "# No runtime packages.\n",
-        "server.py": "ROUTES = ('/smartpbx/status', '/ws/v1/smartpbx/media')\nfrom smartpbx_gateway import SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings\n",
+        ".env.example": infrastructure_template("env.example.tmpl", "ENABLE_SMARTPBX_WSS\nSMARTPBX_WS_TOKEN\nSMARTPBX_ACCOUNT_ID\nSMARTPBX_AUTH_HEADER_NAME\n"),
+        "docker-compose.yml": infrastructure_template("docker-compose.yml.tmpl", compose),
+        "requirements-prod.txt": infrastructure_template("requirements-prod.txt.tmpl", "# Standard-library runtime only.\n"),
+        "requirements-prod.lock.txt": infrastructure_template("requirements-prod.lock.txt.tmpl", "# No runtime packages.\n"),
+        "startup.py": templates.get("runtime/startup.py.tmpl", "app = object()\n"),
+        "server.py": templates.get("runtime/server.py.tmpl", "ROUTES = ('/smartpbx/status', '/ws/v1/smartpbx/media')\nfrom smartpbx_gateway import SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings\n"),
         "smartpbx_diagnostics.py": templates.get("runtime/smartpbx_diagnostics.py.tmpl", "def redacted_status(active_sessions=0):\n    return {'active_sessions': active_sessions}\n"),
         "smartpbx_gateway.py": _python_gateway(resources),
         "smartpbx_protocol.py": templates.get("runtime/smartpbx_protocol.py.tmpl", "PROTOCOL_VERSION = 'smartpbx-ai-provider-v06'\n"),
-        "smartpbx_session.py": "class InquirySession:\n    async def start(self): pass\n    async def finish(self): pass\n",
+        "smartpbx_session.py": templates.get("runtime/smartpbx_session.py.tmpl", "class InquirySession:\n    async def start(self): pass\n    async def finish(self): pass\n"),
         "smartpbx_transport.py": templates.get("runtime/smartpbx_transport.py.tmpl", "class SmartPBXMediaTransport: pass\n"),
+        "product_profile.py": templates.get("runtime/product_profile.py.tmpl", "def load_product_profile(path): return object()\n"),
+        "provider_adapters.py": templates.get("runtime/provider_adapters.py.tmpl", "class ConversationProviderAdapter: pass\n"),
+        "turn_engine.py": templates.get("runtime/turn_engine.py.tmpl", "class ConversationTurnEngine: pass\n"),
+        "config/product_profile.json": json.dumps(product_profile, sort_keys=True, indent=2) + "\n",
         "tools.py": "TOOL_REGISTRY = {}\n",
         "website_demo.py": "ROUTES = ('/voice/demo-incoming',)\n# Browser tokens are issued only by the shared approved issuer.\n",
-        "nginx-smartpbx.conf": "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n",
-        f"nginx-{resources.smartpbx_service}.conf": "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n",
-        "scripts/deploy_smartpbx_image.sh": "#!/bin/sh\necho 'Manual release approval required.'\nexit 1\n",
-        "SMARTPBX_RUNBOOK.md": "# Runbook\n\nThis generated artifact is review-only.\n",
-        "CLIENT_CONNECT.md": client_connect,
+        "nginx-smartpbx.conf": infrastructure_template("nginx-smartpbx.conf.tmpl", "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n"),
+        f"nginx-{resources.smartpbx_service}.conf": infrastructure_template("nginx-smartpbx.conf.tmpl", "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n"),
+        "scripts/deploy_smartpbx_image.sh": infrastructure_template("scripts/deploy_runtime_image.sh.tmpl", "#!/bin/sh\necho 'Manual release approval required.'\nexit 1\n"),
+        "SMARTPBX_RUNBOOK.md": infrastructure_template("SMARTPBX_RUNBOOK.md.tmpl", "# Runbook\n\nThis generated artifact is review-only.\n"),
+        "CLIENT_CONNECT.md": infrastructure_template("CLIENT_CONNECT.md.tmpl", client_connect),
         "demo-routing-activation.md": "# Future routing activation\n\nrelease_allowed: false\nstate: pending\nRequires separately approved backend health and shared routing activation.\n",
         "tests/test_generated_contract.py": "def test_contract_paths():\n    from server import ROUTES\n    assert '/smartpbx/status' in ROUTES\n",
         "tests/test_generated_security.py": '''import asyncio
@@ -408,7 +446,7 @@ def test_inquiry_only_registry_and_preaccept_authentication():
 
     asyncio.run(exercise())
 ''',
-        ".github-workflow-fragment.yml": workflow_fragment,
+        ".github-workflow-fragment.yml": infrastructure_template("ci-runtime-review.yml.tmpl", workflow_fragment),
     } | {f"knowledge_docs/{filename}": f"# Approved knowledge\n\n{content}\n" for filename, content in documents.items()}
 
 
