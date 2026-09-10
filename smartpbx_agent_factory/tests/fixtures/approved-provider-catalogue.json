@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "catalogue_status": "approved",
+  "languages": {
+    "en-US": {
+      "stt": ["deepgram"],
+      "llm": ["claude"],
+      "tts": ["elevenlabs"],
+      "fallback": []
+    }
+  }
+}

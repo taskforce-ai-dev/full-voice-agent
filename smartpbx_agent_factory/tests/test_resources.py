@@ -5,15 +5,18 @@ import pytest
 
 from smartpbx_agent_factory.resources import AllocationRegistry, ResourceConflict, derive_resources
 from smartpbx_agent_factory.schema import parse_manifest
+from smartpbx_agent_factory.catalogue import CapabilityCatalogue
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "acme-minimal.json"
+CATALOGUE = Path(__file__).parent / "fixtures" / "approved-provider-catalogue.json"
 
 
 def fixture_manifest(slug="acme-inquiry"):
     raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
     raw["slug"] = slug
-    return parse_manifest(raw)
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    return parse_manifest(raw, approved_source_roots=(Path.cwd(),), catalogue=catalogue)
 
 
 def test_resource_allocator_rejects_port_and_hostname_collision():
@@ -38,3 +41,36 @@ def test_registry_reserve_makes_derived_resources_collide():
     registry.reserve(first)
     with pytest.raises(ResourceConflict):
         derive_resources(fixture_manifest(), registry)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "slugs",
+        "folders",
+        "services",
+        "containers",
+        "ports",
+        "hostnames",
+        "wss_headers",
+        "ghcr_repositories",
+        "ci_identifiers",
+        "secret_record_keys",
+    ],
+)
+def test_registry_rejects_every_hard_conflict(kind):
+    resources = derive_resources(fixture_manifest(), AllocationRegistry())
+    value = {
+        "slugs": resources.slug,
+        "folders": resources.folder_identity,
+        "services": resources.smartpbx_service,
+        "containers": resources.smartpbx_service,
+        "ports": resources.smartpbx_port,
+        "hostnames": resources.smartpbx_hostname,
+        "wss_headers": resources.wss_header,
+        "ghcr_repositories": resources.ghcr_repository,
+        "ci_identifiers": resources.ci_identifier,
+        "secret_record_keys": resources.secret_record_key,
+    }[kind]
+    with pytest.raises(ResourceConflict):
+        derive_resources(fixture_manifest(), AllocationRegistry({kind: [value]}))

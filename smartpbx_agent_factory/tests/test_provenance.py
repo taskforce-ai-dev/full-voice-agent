@@ -1,4 +1,5 @@
-import hashlib
+import json
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +9,7 @@ from smartpbx_agent_factory.provenance import (
     validate_image_digest,
     validate_source_revision,
     verify_deployed_image_source,
+    verify_template_files,
 )
 
 
@@ -41,6 +43,14 @@ def test_deployed_image_source_requires_matching_revision_and_digest():
 def test_template_substitution_rejects_unknown_variable():
     with pytest.raises(ProvenanceError, match="unknown variable"):
         render_template_text("Hello {{company_name}}", {"agent_name": "A"})
+
+
+def test_checked_in_blocked_allowlist_cannot_verify_templates(tmp_path):
+    allowlist = json.loads(
+        (Path(__file__).parents[1] / "template_v1" / "file_allowlist.json").read_text(encoding="utf-8")
+    )
+    with pytest.raises(ProvenanceError, match="approved|blocked"):
+        verify_template_files(tmp_path, allowlist)
 
 
 def test_template_substitution_rejects_unresolved_braces_and_nul():

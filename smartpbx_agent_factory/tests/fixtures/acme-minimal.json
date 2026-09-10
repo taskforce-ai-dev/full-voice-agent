@@ -42,7 +42,8 @@
   "smartpbx": {
     "account_id": "account-fixture",
     "capacity": 1,
-    "protocol_profile": "smartpbx-ai-provider-v06"
+    "protocol_profile": "smartpbx-ai-provider-v07",
+    "status_authentication": true
   },
   "operations": {
     "alert_owner": "owner@example.invalid",
