@@ -1,0 +1,18 @@
+# REVIEW-ONLY CI fragment. It is static evidence, not a release workflow.
+jobs:
+  runtime-infrastructure-static:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify exact dependency pins
+        run: test -f requirements-prod.lock.txt
+      - name: Verify runtime import contract
+        env:
+          SMARTPBX_RUNTIME_MODE: synthetic
+          SMARTPBX_ALLOW_SYNTHETIC_FOR_CI: "1"
+          SMARTPBX_WS_TOKEN: build-check-token
+          SMARTPBX_ACCOUNT_ID: build-check-account
+          SMARTPBX_AUTH_HEADER_NAME: X-Build-Check-Token
+          SMARTPBX_PRODUCT_PROFILE_PATH: config/product_profile.json
+          SMARTPBX_KNOWLEDGE_DIR: knowledge_docs
+          SMARTPBX_PROVIDER_PROFILE_PATH: config/provider_profile.json
+        run: python -c "import startup"
