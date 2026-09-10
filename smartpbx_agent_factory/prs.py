@@ -8,6 +8,7 @@ Task 8's orchestration boundary supplies immutable readiness evidence and uses
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 from pathlib import Path
 import re
 from types import MappingProxyType
@@ -22,7 +23,12 @@ _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _ROLES = ("backend", "operations", "website")
 _MAX_URL_LENGTH = 2048
 _MAX_REDACTION_LENGTH = 4096
+_MAX_REPOSITORY_LENGTH = 200
+_MAX_BRANCH_LENGTH = 255
+_MAX_REVIEW_LABEL_LENGTH = 160
 _HANDLE = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
+_REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 
 
 def _is_digest(value: object) -> bool:
@@ -41,6 +47,27 @@ class PRProvider(Protocol):
     def comment_pull_request(self, *, pull_request_url: str, body: str) -> None: ...
 
     def update_pull_request_body(self, *, pull_request_url: str, body: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class WorktreeInspection:
+    """A just-in-time Task 8 inspection bound to an opaque ownership handle."""
+
+    path: Path
+    repository: str
+    branch: str
+    head_sha: str
+    clean: bool
+    ownership_handle: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", Path(self.path))
+
+
+class WorktreeInspector(Protocol):
+    """Task 8 implementation seam; this module never executes Git itself."""
+
+    def inspect_worktree(self, *, path: Path, ownership_handle: str) -> WorktreeInspection: ...
 
 
 @dataclass(frozen=True)
@@ -85,6 +112,7 @@ class PRReadiness:
     artifact_digests: Mapping[str, str]
     review_label: str
     wss_url: str
+    expected_wss_hostname: str
     allowed_wss_paths: tuple[str, ...]
     readiness_digest: str
     secret_scan_digest: str
@@ -127,6 +155,7 @@ def open_linked_prs(
     state: GenerationState,
     readiness: PRReadiness,
     worktrees: Sequence[GenerationWorktree],
+    inspector: WorktreeInspector,
     redactions: Sequence[str] = (),
     replace_bodies: bool = False,
 ) -> PRSet:
@@ -143,6 +172,7 @@ def open_linked_prs(
 
     try:
         for role in _ROLES:
+            _inspect_worktree(state, readiness, by_role[role], inspector)
             body = _initial_body(role, state, readiness, by_role[role], urls)
             url = provider.open_pull_request(
                 repository=by_role[role].repository,
@@ -150,7 +180,7 @@ def open_linked_prs(
                 title=_redact(_title(role, readiness.review_label), normalized_redactions),
                 body=_redact(body, normalized_redactions),
             )
-            urls[role] = _validate_provider_url(url)
+            urls[role] = _validate_provider_url(url, by_role[role].repository)
     except Exception as exc:
         failed_role = next(role for role in _ROLES if role not in urls)
         _block(state, f"PR creation failed for {failed_role}")
@@ -237,9 +267,11 @@ def _validate_readiness(state: GenerationState, readiness: PRReadiness) -> None:
         )
     ):
         failures.append("readiness evidence digests")
-    if not isinstance(readiness.review_label, str) or not readiness.review_label.strip():
+    if not _valid_review_label(readiness.review_label):
         failures.append("review label")
-    if not _valid_wss_url(readiness.wss_url, readiness.allowed_wss_paths):
+    if not _valid_wss_url(
+        readiness.wss_url, readiness.expected_wss_hostname, readiness.allowed_wss_paths
+    ):
         failures.append("public WSS URL")
     if failures:
         reason = "PR prerequisite failed: " + ", ".join(failures)
@@ -254,15 +286,30 @@ def _contains_control(value: str) -> bool:
 def _generation_metadata_path(state: GenerationState, path: Path) -> bool:
     if path.is_absolute() or ".." in path.parts:
         return False
-    return len(path.parts) >= 3 and path.parts[:2] == (".smartpbx-generations", state.generation_id)
+    return path.parts == (".smartpbx-generations", state.generation_id, "readiness.json")
 
 
-def _valid_wss_url(value: object, allowed_paths: object) -> bool:
+def _valid_public_hostname(value: object) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 253 or _contains_control(value):
+        return False
+    hostname = value.lower()
+    try:
+        ipaddress.ip_address(hostname)
+        return False
+    except ValueError:
+        pass
+    if "." not in hostname or hostname.endswith((".localhost", ".local", ".internal", ".lan", ".home")):
+        return False
+    return all(_HOST_LABEL.fullmatch(label) is not None for label in hostname.split("."))
+
+
+def _valid_wss_url(value: object, expected_hostname: object, allowed_paths: object) -> bool:
     if (
         not isinstance(value, str)
         or not value
         or len(value) > _MAX_URL_LENGTH
         or _contains_control(value)
+        or not _valid_public_hostname(expected_hostname)
         or not isinstance(allowed_paths, tuple)
         or not allowed_paths
         or any(
@@ -282,7 +329,7 @@ def _valid_wss_url(value: object, allowed_paths: object) -> bool:
         return False
     return (
         parsed.scheme == "wss"
-        and bool(parsed.hostname)
+        and parsed.hostname == str(expected_hostname).lower()
         and not parsed.username
         and not parsed.password
         and not parsed.query
@@ -291,7 +338,7 @@ def _valid_wss_url(value: object, allowed_paths: object) -> bool:
     )
 
 
-def _validate_provider_url(value: object) -> str:
+def _validate_provider_url(value: object, repository: str) -> str:
     if not isinstance(value, str) or not value or len(value) > _MAX_URL_LENGTH or _contains_control(value):
         raise ValueError("provider returned an invalid pull request URL")
     try:
@@ -301,15 +348,52 @@ def _validate_provider_url(value: object) -> str:
         raise ValueError("provider returned an invalid pull request URL") from exc
     if (
         parsed.scheme != "https"
-        or not parsed.hostname
-        or not parsed.path.startswith("/")
+        or parsed.netloc != "github.com"
         or parsed.username
         or parsed.password
         or parsed.query
         or parsed.fragment
+        or parsed.path != f"/{repository}/pull/{_pull_number(parsed.path, repository)}"
     ):
         raise ValueError("provider returned an invalid pull request URL")
     return value
+
+
+def _pull_number(path: str, repository: str) -> str:
+    prefix = f"/{repository}/pull/"
+    if not path.startswith(prefix):
+        return ""
+    number = path[len(prefix):]
+    return number if re.fullmatch(r"[1-9][0-9]{0,9}", number) else ""
+
+
+def _valid_repository(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= _MAX_REPOSITORY_LENGTH
+        and not _contains_control(value)
+        and _REPOSITORY.fullmatch(value) is not None
+    )
+
+
+def _valid_branch(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= _MAX_BRANCH_LENGTH
+        and not _contains_control(value)
+        and not any(marker in value for marker in (" ", "\t", "\\", "..", "@{", "//"))
+        and not value.startswith(("-", "/", "."))
+        and not value.endswith(("/", "."))
+    )
+
+
+def _valid_review_label(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value) <= _MAX_REVIEW_LABEL_LENGTH
+        and not _contains_control(value)
+    )
 
 
 def _validate_redactions(state: GenerationState, values: Sequence[str]) -> tuple[str, ...]:
@@ -356,8 +440,8 @@ def _validate_worktrees(
             _reject_worktree(state, role)
         if (
             not worktree.clean
-            or not worktree.repository
-            or not worktree.branch
+            or not _valid_repository(worktree.repository)
+            or not _valid_branch(worktree.branch)
             or not _is_sha(worktree.branch_sha)
             or not worktree.path.is_absolute()
             or not candidate_root.is_absolute()
@@ -381,6 +465,40 @@ def _validate_worktrees(
 def _reject_worktree(state: GenerationState, role: str) -> None:
     _block(state, f"PR prerequisite failed: {role} worktree is not clean and generation-owned")
     raise StateError(f"PR prerequisite failed: {role} worktree must be clean and generation-owned")
+
+
+def _inspect_worktree(
+    state: GenerationState,
+    readiness: PRReadiness,
+    worktree: GenerationWorktree,
+    inspector: WorktreeInspector,
+) -> None:
+    """Re-read Task 8's verified worktree handle immediately before provider use."""
+    try:
+        inspection = inspector.inspect_worktree(
+            path=worktree.path, ownership_handle=worktree.ownership.handle
+        )
+        inspected_path = inspection.path.resolve(strict=False)
+        expected_path = worktree.path.resolve(strict=False)
+        root = worktree.ownership.generation_root.resolve(strict=False)
+        inspected_path.relative_to(root)
+    except (AttributeError, OSError, TypeError, ValueError):
+        _reject_worktree(state, worktree.role)
+    if (
+        not isinstance(inspection, WorktreeInspection)
+        or inspected_path != expected_path
+        or inspection.repository != worktree.repository
+        or inspection.branch != worktree.branch
+        or inspection.head_sha != worktree.branch_sha
+        or not inspection.clean
+        or inspection.ownership_handle != worktree.ownership.handle
+        or not _valid_repository(inspection.repository)
+        or not _valid_branch(inspection.branch)
+        or not _is_sha(inspection.head_sha)
+        or inspection.ownership_handle != worktree.ownership.handle
+        or worktree.ownership.digest != readiness.worktree_ownership_digest
+    ):
+        _reject_worktree(state, worktree.role)
 
 
 def _title(role: str, review_label: str) -> str:
