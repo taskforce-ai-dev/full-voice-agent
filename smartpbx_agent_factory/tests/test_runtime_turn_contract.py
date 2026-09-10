@@ -54,6 +54,7 @@ class RecordingTransport:
 
     async def clear_audio(self) -> None:
         self.clears += 1
+        self.pending_audio.clear()
         self.audio_cleared.set()
 
 
@@ -80,6 +81,7 @@ class RecordingAdapter:
         self.recognizer: RecordingRecognizer | None = None
         self.started_languages: list[str] = []
         self.generated: list[str] = []
+        self.response_generated = asyncio.Event()
         self.block_first_response = False
         self.first_response_started = asyncio.Event()
         self.response_factory = None
@@ -91,6 +93,7 @@ class RecordingAdapter:
 
     async def generate_response(self, transcript: str, _language: str, _prompt: str):
         self.generated.append(transcript)
+        self.response_generated.set()
         if self.response_factory is not None:
             return self.response_factory(transcript)
         if self.block_first_response and transcript == "first":
@@ -170,8 +173,18 @@ def test_barge_in_cancels_old_generation_and_fences_late_tts(runtime_module):
 
         recognizer.emit(result("first", is_final=True, result_id=1))
         await _await_event(transport.audio_sent)
-        recognizer.emit(result("this is a material interruption", is_final=False, result_id=2))
-        recognizer.emit(result("second", is_final=True, result_id=3))
+        await _await_event(transport.mark_sent)
+        adapter.response_generated.clear()
+        await engine._handle_recognizer_result(
+            engine._recognizer_epoch,
+            result("this is a material interruption", is_final=False, result_id=2),
+        )
+        await engine._handle_recognizer_result(
+            engine._recognizer_epoch,
+            result("second", is_final=True, result_id=3),
+        )
+        await _await_event(transport.audio_cleared)
+        await _await_event(adapter.response_generated)
         transport.mark_release.set()
         await engine.drain()
 
@@ -180,6 +193,7 @@ def test_barge_in_cancels_old_generation_and_fences_late_tts(runtime_module):
         assert ("audio", b"second") in transport.events
         assert ("audio", b"late") not in transport.events
         assert engine.turns_completed == 1
+        await engine.close()
 
     asyncio.run(exercise())
 
@@ -285,6 +299,7 @@ def test_provider_echo_is_not_admitted_as_a_barge_in(runtime_module):
         transport.mark_release.set()
         await engine.drain()
         assert adapter.generated == ["this is echoed assistant audio"]
+        await engine.close()
 
     asyncio.run(exercise())
 
@@ -331,7 +346,7 @@ def test_recognizer_fatal_fences_turn_media_and_completes_once(runtime_module):
         result = runtime_module.RecognizerResult
         fatal = runtime_module.RecognizerFatal
 
-        recognizer.emit(result("question", is_final=True))
+        recognizer.emit(result("first", is_final=True))
         await asyncio.wait_for(adapter.first_response_started.wait(), timeout=0.2)
         recognizer.emit(fatal("provider_unavailable"))
         await engine.drain()
@@ -340,11 +355,12 @@ def test_recognizer_fatal_fences_turn_media_and_completes_once(runtime_module):
         assert transport.clears == 1
         assert recognizer.closed is True
         assert engine.turns_completed == 0
-        assert adapter.generated == ["question"]
+        assert adapter.generated == ["first"]
 
         recognizer.emit(fatal("provider_unavailable"))
         await engine.drain()
         assert transport.clears == 1
+        await engine.close()
 
     asyncio.run(exercise())
 
@@ -439,13 +455,19 @@ def test_cancelled_generation_cannot_speak_after_a_late_terminal_commit(runtime_
             transport,
             pre_audio_min_events=1,
             pre_audio_min_seconds=0.0,
+            barge_in_debounce_seconds=0.0,
         )
         result = runtime_module.RecognizerResult
 
         recognizer.emit(result("first", is_final=True))
         await _await_event(transport.audio_sent)
-        recognizer.emit(result("this is a material interruption", is_final=False))
+        adapter.response_generated.clear()
+        await engine._handle_recognizer_result(
+            engine._recognizer_epoch,
+            result("this is a material interruption", is_final=False),
+        )
         await _await_event(transport.audio_cleared)
+        await _await_event(adapter.response_generated)
         assert transport.clears == 1
         old_commit.set()
         await engine.drain()
@@ -454,6 +476,7 @@ def test_cancelled_generation_cannot_speak_after_a_late_terminal_commit(runtime_
         assert engine.committed_responses == ["this is a material interruption"]
         assert ("audio", b"this is a material interruption") in transport.events
         assert adapter.generated == ["first", "this is a material interruption"]
+        await engine.close()
 
     asyncio.run(exercise())
 
@@ -463,11 +486,12 @@ def test_truncated_preamble_fences_media_then_allows_one_adapter_retry(runtime_m
         adapter, transport = RecordingAdapter(), RecordingTransport()
         release_retry = asyncio.Event()
         retry_started = asyncio.Event()
+        events_module = importlib.import_module("provider_adapters")
 
         async def stream():
             yield runtime_module.ProvisionalSentence(1, "unsafe preamble")
             yield runtime_module.GenerationFence(
-                1, runtime_module.RoundOutcome.MAX_TOKENS_TRUNCATED, retrying=True
+                1, events_module.RoundOutcome.MAX_TOKENS_TRUNCATED, retrying=True
             )
             retry_started.set()
             await release_retry.wait()
@@ -500,6 +524,7 @@ def test_truncated_preamble_fences_media_then_allows_one_adapter_retry(runtime_m
         assert adapter.generated == ["question"]
         assert engine.committed_responses == ["recovered answer"]
         assert engine.turns_completed == 1
+        await engine.close()
 
     asyncio.run(exercise())
 
@@ -525,6 +550,7 @@ def test_aborted_preamble_clears_media_without_history_or_stale_task(runtime_mod
         assert engine.committed_responses == []
         assert engine.turns_completed == 0
         assert engine._turn_task is None
+        await engine.close()
 
     asyncio.run(exercise())
 

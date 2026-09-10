@@ -136,6 +136,26 @@ class TurnDrainTests(unittest.IsolatedAsyncioTestCase):
         finally:
             loop.set_exception_handler(prior_handler)
 
+    async def test_current_generation_echo_is_not_queued_for_another_turn(self) -> None:
+        engine = self._engine()
+        text = "this is echoed assistant audio"
+        active_turn = asyncio.create_task(asyncio.Event().wait())
+        engine._loop = asyncio.get_running_loop()
+        engine._generation = 1
+        engine._audible_generation = 1
+        engine._assistant_turn_sentences = [text]
+        engine._turn_task = active_turn
+        try:
+            await engine._handle_recognizer_result(
+                engine._recognizer_epoch,
+                self._engine_module.RecognizerResult(text, is_final=False),
+            )
+            self.assertEqual(engine._pending_transcript, "")
+            self.assertIsNone(engine._endpoint_handle)
+            self.assertFalse(engine._deferred_endpoint_due)
+        finally:
+            await engine.close()
+
     async def test_rearm_cannot_overwrite_a_newer_reprompt_while_awaiting_an_older_one(self) -> None:
         engine = self._engine()
         first_started = asyncio.Event()
