@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import importlib.util
+import sys
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 
@@ -21,6 +22,7 @@ def _lane():
     spec = importlib.util.spec_from_loader(loader.name, loader)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
     loader.exec_module(module)
     return module
 

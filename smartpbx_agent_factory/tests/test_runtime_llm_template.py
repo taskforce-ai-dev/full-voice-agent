@@ -24,7 +24,10 @@ def test_candidate_llm_template_keeps_streaming_and_safety_boundaries_explicit()
     assert "retry_used" in source
     assert "_validate_inquiry_messages" in source
     assert "provider emitted a tool event in inquiry-only mode" in source
-    assert "buffer_until_terminal" in source
+    assert "class ProvisionalSentence" in source
+    assert "class GenerationFence" in source
+    assert "class TerminalCommit" in source
+    assert "class RecoveryBoundary" in source
     assert "provisional" in source
     assert '"tools"' not in source
 
