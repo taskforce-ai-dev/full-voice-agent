@@ -3,6 +3,7 @@
   "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
   "source_hashes": {
     "Kavya/server.py": "sha256:27e58046ce3b4c32eb0331bdafe4c0d300d7e7596ebea9dc680d7de4febee28b",
+    "Kavya/english_voice_profile.py": "sha256:7d694df737dcdcf6382b416467bde7269bc16edb654bc6e13aed94fc032c0274",
     "Kavya/smartpbx_gateway.py": "sha256:901c41c42b774cb12248719d3e5469599619a5eba8c82e447bb507d4772a18ee",
     "Kavya/smartpbx_session.py": "sha256:18695c13c0174f3c3c45a53d7de76cc76c6d76984e998ddb4c6265fe5f19c76e",
     "Kavya/smartpbx_transport.py": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e"
@@ -70,6 +71,17 @@
       "source_path": "Kavya/server.py",
       "source_ranges": ["575-582", "1855-1863", "6549-6881", "6884-6980", "6983-7252", "9359-9443"],
       "extraction": "startup-injected Google mu-law and Azure PCM streaming adapters exposed through the shared continuous-recognizer contract; SDK callbacks cross only through the session-owned event-loop bridge"
+    },
+    {
+      "template_path": "runtime/tts_adapters.py.tmpl",
+      "template_sha256": "sha256:92d40736674601eb15b4da9f0d03026cf1f5f50de8846975c4dea741001026db",
+      "source_path": "Kavya/server.py",
+      "source_ranges": ["3075-3090", "2092-2310", "13112-13152", "13407-13848"],
+      "source_evidence": [
+        {"source_path": "Kavya/server.py", "source_ranges": ["3075-3090", "2092-2310", "13112-13152", "13407-13848"]},
+        {"source_path": "Kavya/english_voice_profile.py", "source_ranges": ["1-59"]}
+      ],
+      "extraction": "startup-injected English ElevenLabs and Sinhala Gemini or approved Rime streaming TTS; validated 8 kHz mu-law conversion, 20 ms framing, and generation-fenced transport handoff"
     }
   ]
 }

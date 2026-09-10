@@ -62,6 +62,7 @@ def test_partial_candidate_runtime_records_only_pinned_source_lineage():
     assert candidate["source_revision"] == "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e"
     expected = {
         "Kavya/server.py",
+        "Kavya/english_voice_profile.py",
         "Kavya/smartpbx_gateway.py",
         "Kavya/smartpbx_session.py",
         "Kavya/smartpbx_transport.py",
