@@ -108,6 +108,8 @@ class SecretProvider(Protocol):
 
     def validate(self) -> None: ...
 
+    def audit_report(self) -> SecretAudit: ...
+
 
 class RepositoryVisibilityVerifier(Protocol):
     """Authoritatively determines whether an existing operations repository is private."""

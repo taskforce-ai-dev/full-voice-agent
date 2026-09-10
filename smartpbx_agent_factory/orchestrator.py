@@ -177,10 +177,10 @@ class GenerationOrchestrator:
         return state
 
     def record_secrets_resolved(
-        self, generation_id: str, *, provider: SecretProvider, audit: SecretAudit
+        self, generation_id: str, *, provider: SecretProvider
     ) -> GenerationState:
         """Advance only from a validated, redacted SecretProvider audit artifact."""
-        if not isinstance(audit, SecretAudit) or not hasattr(provider, "validate"):
+        if not hasattr(provider, "validate") or not hasattr(provider, "audit_report"):
             raise GenerationBlockedError("validated SecretProvider audit is required")
         stored = self._load_verified(generation_id)
         state = stored.state
@@ -188,9 +188,22 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("secret resolution requires stage INPUT_COLLECTED")
         try:
             provider.validate()
+            audit = provider.audit_report()
         except Exception as error:
-            raise GenerationBlockedError("SecretProvider validation failed") from error
-        audit_digest = _digest_payload(dict(audit))
+            raise GenerationBlockedError("SecretProvider validation or audit retrieval failed") from error
+        if not isinstance(audit, SecretAudit):
+            raise GenerationBlockedError("SecretProvider audit is invalid")
+        expected_names = {f"{stored.resources.slug}/wss_token"}
+        audited_names = audit.fetched_names + audit.generated_names
+        if len(audited_names) != len(set(audited_names)) or set(audited_names) != expected_names:
+            raise GenerationBlockedError("secret audit names do not exactly match manifest requirements")
+        audit_digest = _digest_payload(
+            {
+                "fetched_names": audit.fetched_names,
+                "generated_names": audit.generated_names,
+                "ciphertext_paths": audit.ciphertext_paths,
+            }
+        )
         try:
             state.record_stage_digest("secrets", audit_digest)
             state.transition(Stage.SECRETS_RESOLVED)
