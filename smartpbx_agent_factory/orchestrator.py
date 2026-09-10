@@ -276,10 +276,13 @@ class GenerationOrchestrator:
         try:
             stored = self._load_verified(generation_id)
             if not self._checkpoint_is_valid(stored, "backend", handles["backend"]):
-                render_backend(manifest, review, stored.resources, handles["backend"], worktree_manager=binding.backend.manager, state=stored.state)
+                backend_report = render_backend(
+                    manifest, review, stored.resources, handles["backend"],
+                    worktree_manager=binding.backend.manager, state=stored.state,
+                )
                 handles["backend"] = self._commit_and_checkpoint(
                     generation_id, "backend", binding.backend.manager, handles["backend"],
-                    (Path("SmartPBX Agents") / stored.resources.slug,),
+                    (Path("SmartPBX Agents") / stored.resources.slug,), artifact_digest=backend_report.artifact_digest,
                 )
             stored = self._load_verified(generation_id)
             backend_digest = stored.state.lane_records["backend"]["artifact_digest"]
@@ -373,7 +376,7 @@ class GenerationOrchestrator:
 
     def _commit_and_checkpoint(
         self, generation_id: str, role: str, manager: object, handle: WorktreeHandle,
-        allowed_paths: tuple[Path, ...], *, ciphertext_reference: str = "",
+        allowed_paths: tuple[Path, ...], *, ciphertext_reference: str = "", artifact_digest: str | None = None,
     ) -> WorktreeHandle:
         commit = getattr(manager, "stage_and_commit", None)
         if not callable(commit):
@@ -383,8 +386,11 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("lane manager did not return an authoritative committed handle")
         self.record_owned_worktree(generation_id, manager, updated)
         stored = self._load_verified(generation_id)
-        digest = _tree_digest(updated.target)
-        stored.state.record_lane(role, output_digest=digest, head_sha=updated.revision, artifact_digest=digest, ciphertext_reference=ciphertext_reference)
+        output_digest = _tree_digest(updated.target)
+        canonical_artifact = artifact_digest or output_digest
+        if not isinstance(canonical_artifact, str) or len(canonical_artifact) != 64 or set(canonical_artifact) - set("0123456789abcdef"):
+            raise GenerationBlockedError("lane renderer did not return a canonical artifact digest")
+        stored.state.record_lane(role, output_digest=output_digest, head_sha=updated.revision, artifact_digest=canonical_artifact, ciphertext_reference=ciphertext_reference)
         self._save(stored)
         return updated
 

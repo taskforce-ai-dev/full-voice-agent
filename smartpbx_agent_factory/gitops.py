@@ -207,6 +207,8 @@ class WorktreeManager:
         safe_paths = tuple(self._relative_commit_path(path) for path in allowed_paths)
         if not safe_paths:
             raise WorktreeConflictError("factory review commit paths are required")
+        if self._run(("git", "-C", str(target), "diff", "--cached", "--name-only")).strip():
+            raise WorktreeConflictError("generation worktree has pre-staged index changes")
         changed = self._changed_paths(target)
         if not changed:
             raise WorktreeConflictError("factory review lane has no renderer output to commit")
@@ -236,7 +238,11 @@ class WorktreeManager:
         raw = self._run(("git", "-C", str(target), "status", "--porcelain", "--untracked-files=all"))
         paths: list[str] = []
         for line in raw.splitlines():
-            if len(line) < 4 or line[2] != " " or line[0] == "?" and line[1] != "?":
+            if (
+                len(line) < 4 or line[2] != " " or
+                (line[:2] != "??" and line[0] != " ") or
+                "R" in line[:2] or "C" in line[:2]
+            ):
                 raise WorktreeConflictError("generation worktree status is invalid")
             path = line[3:]
             if not path or " -> " in path or path.startswith('"') or "\x00" in path:

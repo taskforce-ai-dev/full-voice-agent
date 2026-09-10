@@ -126,3 +126,18 @@ def test_changed_worktree_head_rejects_a_persisted_lane_checkpoint(tmp_path):
         GenerationOrchestrator(tmp_path / "state", catalogue_path=CATALOGUE)._checkpoint_is_valid(
             stored, "backend", WorktreeHandle(tmp_path, output, "f" * 40)
         )
+
+
+def test_checkpoint_keeps_canonical_backend_artifact_digest_separate_from_tree_output_digest():
+    from smartpbx_agent_factory.state import GenerationState
+
+    state = GenerationState.start("gen-digest", "a" * 64)
+    state.record_lane("backend", output_digest="b" * 64, head_sha="c" * 40, artifact_digest="d" * 64)
+    restored = GenerationState.from_dict(state.to_dict())
+    assert restored.lane_records["backend"] == {
+        "output_digest": "b" * 64,
+        "head_sha": "c" * 40,
+        "artifact_digest": "d" * 64,
+        "ciphertext_reference": "",
+    }
+    assert restored.lane_records["backend"]["output_digest"] != restored.lane_records["backend"]["artifact_digest"]
