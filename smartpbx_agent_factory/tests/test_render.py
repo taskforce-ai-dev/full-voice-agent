@@ -9,9 +9,10 @@ import pytest
 
 from smartpbx_agent_factory.catalogue import CapabilityCatalogue
 from smartpbx_agent_factory.provenance import TemplateAllowlist, TemplateFile
-from smartpbx_agent_factory.render import IdentityLeakError, TemplateUnavailableError, render_backend
+from smartpbx_agent_factory.render import IncompleteTemplateError, IdentityLeakError, ReviewNotApprovedError, render_backend
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
 from smartpbx_agent_factory.schema import parse_manifest
+from smartpbx_agent_factory.state import GenerationState, Stage
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "acme-minimal.json"
@@ -19,10 +20,15 @@ CATALOGUE = Path(__file__).parent / "fixtures" / "approved-provider-catalogue.js
 
 
 @dataclass(frozen=True)
+class FixtureFact:
+    text: str
+
+
+@dataclass(frozen=True)
 class FixtureReview:
     digest: str = "a" * 64
-    approved: bool = True
-    facts: tuple[str, ...] = ("Acme provides approved information.",)
+    facts: tuple[FixtureFact, ...] = (FixtureFact("Acme provides approved information."),)
+    documents: dict[str, str] | None = None
 
 
 def fixture_manifest():
@@ -32,6 +38,16 @@ def fixture_manifest():
 
 def fixture_resources():
     return derive_resources(fixture_manifest(), AllocationRegistry())
+
+
+def fixture_state(digest="a" * 64):
+    state = GenerationState.start("generation-fixture", "manifest-fixture")
+    state.transition(Stage.INPUT_COLLECTED)
+    state.transition(Stage.SECRETS_RESOLVED)
+    state.transition(Stage.KNOWLEDGE_REVIEW_REQUIRED)
+    state.record_knowledge_review_digest(digest)
+    state.approve_knowledge(digest)
+    return state
 
 
 def fixture_templates(root: Path) -> TemplateAllowlist:
@@ -71,38 +87,74 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
     )
 
 
-def test_real_template_path_uses_the_approved_v06_source_bound_allowlist(tmp_path):
-    report = render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path)
-    protocol = (tmp_path / "SmartPBX Agents/acme-inquiry/smartpbx_protocol.py").read_text(encoding="utf-8")
-    assert report.template_version == "v1"
-    assert "SMARTPBX_PROTOCOL_VERSION" not in protocol
-    assert "POLICY_VIOLATION = 1008" in protocol
+def test_partial_v06_provenance_fails_closed_without_complete_runtime_template(tmp_path):
+    with pytest.raises(IncompleteTemplateError, match="INCOMPLETE_TEMPLATE"):
+        render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path, state=fixture_state())
 
 
 def test_inquiry_only_render_has_no_business_tools(tmp_path):
     report = render_backend(
         fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path,
-        template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        state=fixture_state(), template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
     )
     tools = (tmp_path / "SmartPBX Agents/acme-inquiry/tools.py").read_text(encoding="utf-8")
     assert "create_booking" not in tools
     assert "transfer_to_human" not in tools
     assert "hangup_call" not in tools
     assert report.enabled_capabilities == ()
+    assert report.synthetic is True
+    assert report.deployable is False
 
 
 def test_renderer_rejects_identity_and_secret_leaks_from_review(tmp_path):
     with pytest.raises(IdentityLeakError, match="identity leak"):
         render_backend(
-            fixture_manifest(), FixtureReview(facts=("Hatton Hills is a hotel",)), fixture_resources(), tmp_path,
-            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+            fixture_manifest(), FixtureReview(facts=(FixtureFact("Hatton Hills is a hotel"),)), fixture_resources(), tmp_path,
+            state=fixture_state(), template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
         )
 
 
 def test_renderer_is_deterministic_for_the_same_approved_inputs(tmp_path):
     first_root, second_root = tmp_path / "first", tmp_path / "second"
     first_template, second_template = fixture_templates(first_root / "synthetic"), fixture_templates(second_root / "synthetic")
-    first = render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), first_root, template_allowlist=first_template, template_root=first_root / "synthetic")
-    second = render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), second_root, template_allowlist=second_template, template_root=second_root / "synthetic")
+    first = render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), first_root, state=fixture_state(), template_allowlist=first_template, template_root=first_root / "synthetic")
+    second = render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), second_root, state=fixture_state(), template_allowlist=second_template, template_root=second_root / "synthetic")
     assert first.artifact_digest == second.artifact_digest
     assert first.files == second.files
+
+
+def test_renderer_requires_generation_state_approval_for_the_exact_review_digest(tmp_path):
+    with pytest.raises(ReviewNotApprovedError, match="digest"):
+        render_backend(
+            fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path, state=fixture_state("b" * 64),
+            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        )
+
+
+def test_scan_rejects_identity_leak_in_late_review_document(tmp_path):
+    review = FixtureReview(documents={"early.md": "approved", "late.md": "Hatton Hills"})
+    with pytest.raises(IdentityLeakError, match="identity leak"):
+        render_backend(
+            fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(),
+            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        )
+
+
+def test_failed_write_removes_only_the_new_generation_root(tmp_path, monkeypatch):
+    original = Path.write_text
+    writes = 0
+
+    def fail_after_first(path, content, *args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes > 1 and "SmartPBX Agents" in path.as_posix():
+            raise OSError("synthetic write failure")
+        return original(path, content, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_after_first)
+    with pytest.raises(OSError, match="synthetic write failure"):
+        render_backend(
+            fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path, state=fixture_state(),
+            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        )
+    assert not (tmp_path / "SmartPBX Agents/acme-inquiry").exists()

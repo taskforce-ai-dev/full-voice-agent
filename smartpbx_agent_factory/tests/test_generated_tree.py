@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from test_render import FixtureReview, fixture_manifest, fixture_resources, fixture_templates
+from test_render import FixtureReview, fixture_manifest, fixture_resources, fixture_state, fixture_templates
 from smartpbx_agent_factory.render import render_backend
 
 
@@ -10,7 +10,7 @@ def render_fixture(tmp_path: Path):
     template_root = tmp_path / "synthetic"
     return render_backend(
         fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path,
-        template_allowlist=fixture_templates(template_root), template_root=template_root,
+        state=fixture_state(), template_allowlist=fixture_templates(template_root), template_root=template_root,
     )
 
 
@@ -24,6 +24,9 @@ def test_backend_has_two_separate_service_profiles_and_bidirectional_isolation(t
     assert "smartpbx-acme-inquiry" in compose
     assert "SMARTPBX_WS_TOKEN" in compose
     assert "TWILIO_AUTH_TOKEN" not in compose
+    assert 'profiles: ["smartpbx"]' in compose
+    assert 'profiles: ["website-demo"]' in compose
+    assert '127.0.0.1:' in compose
     assert "/smartpbx/status" in smartpbx
     assert "/voice/demo-incoming" not in smartpbx
     assert "/voice/demo-incoming" in website
@@ -67,3 +70,4 @@ def test_root_generated_agent_workflow_has_exact_safe_triggers_and_stable_check_
     assert "workflow_call" not in workflow
     assert "gh workflow run" not in workflow
     assert "docker push" not in workflow
+    assert "test -s /tmp/smartpbx-agent-dirs" in workflow

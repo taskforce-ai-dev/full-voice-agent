@@ -39,11 +39,11 @@ def test_file_allowlist_accepts_metadata_wrapper(tmp_path):
     assert result["Kavya/server.py"] == digest
 
 
-def test_frozen_template_allowlist_records_approved_v06_source_and_immutable_image():
+def test_partial_template_metadata_records_v06_source_and_immutable_image_without_approval():
     import json
 
     allowlist = json.loads((__import__("pathlib").Path("smartpbx_agent_factory/template_v1/file_allowlist.json")).read_text())
-    assert allowlist["status"] == "approved"
+    assert allowlist["status"] == "partial"
     assert allowlist["source_revision"] == "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e"
     assert allowlist["oci_revision"] == allowlist["source_revision"]
     assert allowlist["image_digest"] == "sha256:3d1cfce67574efd1c8bde484d26345c027713c4d169f37804114fecec5b81350"
