@@ -44,13 +44,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_runtime_arguments(bootstrap)
     wizard = commands.add_parser("new", help="interactively write a reviewable non-secret manifest")
     wizard.add_argument("--output", required=True, type=Path)
-    wizard.add_argument(
-        "--approved-source-root",
-        required=True,
-        action="append",
-        type=Path,
-        help="absolute non-secret knowledge root; repeat for each approved root",
-    )
+    _add_runtime_arguments(wizard)
     for name in ("inspect", "plan"):
         command = commands.add_parser(name)
         command.add_argument("--manifest", required=True, type=Path)
@@ -85,15 +79,6 @@ def invoke_cli(argv: Sequence[str] | None = None) -> CLIResult:
         args = parser.parse_args(argv)
     except SystemExit as error:
         return CLIResult(EXIT_INVALID_INPUT if error.code else EXIT_SUCCESS)
-    if args.command == "new":
-        try:
-            path = create_manifest_wizard(
-                args.output,
-                approved_source_roots=tuple(args.approved_source_root),
-            )
-            return CLIResult(EXIT_SUCCESS, f"manifest={path}\nnext: inspect --config <factory.json> --manifest {path}\n")
-        except (ValueError, OSError) as error:
-            return CLIResult(EXIT_INVALID_INPUT, stderr=f"manifest wizard blocked: {error}\n")
     if not args.config:
         return CLIResult(EXIT_INVALID_INPUT, stderr="--config is required; the factory will not guess repositories, revisions, or credential sources\n")
     try:
@@ -104,6 +89,15 @@ def invoke_cli(argv: Sequence[str] | None = None) -> CLIResult:
     if args.command == "bootstrap":
         checks = inspect_config(config)
         return CLIResult(EXIT_SUCCESS if all(value == "ready" for value in checks.values()) else EXIT_BLOCKED_GATE, f"{checks}\n")
+    if args.command == "new":
+        try:
+            path = create_manifest_wizard(
+                args.output,
+                approved_source_roots=config.approved_source_roots,
+            )
+            return CLIResult(EXIT_SUCCESS, f"manifest={path}\nnext: inspect --config {args.config} --manifest {path}\n")
+        except (ValueError, OSError) as error:
+            return CLIResult(EXIT_INVALID_INPUT, stderr=f"manifest wizard blocked: {error}\n")
     orchestrator = bootstrap.orchestrator()
     try:
         if args.command == "inspect":

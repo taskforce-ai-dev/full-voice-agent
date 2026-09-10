@@ -89,7 +89,6 @@ class RepositoryOwnedCIVerificationCoordinator:
         return result
 
     def worktrees_for(self, *, generation_id: str, inventory: object, readiness: ReadinessEvidence) -> tuple[object, ...]:
-        """Ask the same repository-owned adapter to bind CI proof to PR sources."""
         build = getattr(self.ci_result_adapter, "worktrees_for", None)
         if not callable(build):
             raise GenerationBlockedError("repository-owned CI worktree binding is pending")
@@ -160,6 +159,8 @@ class _StoredGeneration:
     plan_artifact: Mapping[str, object] | None = None
     binding: Mapping[str, Mapping[str, str]] | None = None
     sealed_secret: "SealedSecretBundle | None" = None
+    approved_source_roots: tuple[Path, ...] = ()
+    approved_source_roots_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -200,9 +201,10 @@ class GenerationOrchestrator:
         *,
         catalogue_path: Path | None = None,
         worktree_manager_factory: Callable[[Path], WorktreeManager] = WorktreeManager,
-        knowledge_builder_factory: Callable[[Path], KnowledgeBuilder] | None = None,
+        knowledge_builder_factory: Callable[[tuple[Path, ...]], KnowledgeBuilder] | None = None,
         inventory_provider: InventoryProvider | None = None,
         verification_coordinator: RepositoryOwnedCIVerificationCoordinator | None = None,
+        approved_source_roots: tuple[Path, ...] | None = None,
         pr_coordinator: object | None = None,
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
@@ -214,10 +216,15 @@ class GenerationOrchestrator:
         self._catalogue_path = (catalogue_path or root / "template_v1" / "provider_catalogue.json").resolve()
         self._worktree_manager_factory = worktree_manager_factory
         self._knowledge_builder_factory = knowledge_builder_factory or (
-            lambda approved_root: KnowledgeBuilderImpl(approved_source_roots=(approved_root,))
+            lambda approved_roots: KnowledgeBuilderImpl(approved_source_roots=approved_roots)
         )
         self._inventory_provider = inventory_provider
         self._verification_coordinator = verification_coordinator
+        self._configured_approved_source_roots = (
+            self._validate_approved_source_roots(approved_source_roots)
+            if approved_source_roots is not None
+            else None
+        )
         self._pr_coordinator = pr_coordinator
         self._last_pr_set: object | None = None
 
@@ -243,6 +250,8 @@ class GenerationOrchestrator:
 
     def plan(self, manifest_path: Path) -> PlanReport:
         manifest_path = self._manifest_path(manifest_path)
+        approved_source_roots = self._roots_for_plan(manifest_path)
+        approved_source_roots_digest = _approved_source_roots_digest(approved_source_roots)
         try:
             raw = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(raw, Mapping):
@@ -250,7 +259,7 @@ class GenerationOrchestrator:
             catalogue = CapabilityCatalogue.load(self._catalogue_path)
             manifest = parse_manifest(
                 raw,
-                approved_source_roots=(manifest_path.parent,),
+                approved_source_roots=approved_source_roots,
                 catalogue=catalogue,
             )
         except (OSError, json.JSONDecodeError, ManifestError) as error:
@@ -263,13 +272,19 @@ class GenerationOrchestrator:
             except ResourceConflict as error:
                 raise GenerationBlockedError(f"resource allocation conflict: {error}") from error
             resource_digest = _digest_payload(asdict(resources))
-            artifact = _canonical_plan_artifact(manifest.slug, resources, digest, knowledge_digest, resource_digest)
+            artifact = _canonical_plan_artifact(
+                manifest.slug, resources, digest, knowledge_digest, resource_digest,
+                approved_source_roots_digest,
+            )
             plan_digest = _digest_payload(artifact)
             artifact = {**artifact, "digest": plan_digest}
             state = GenerationState.start(f"gen-{uuid.uuid4().hex}", digest)
             state.transition(Stage.INPUT_COLLECTED)
             stored = _StoredGeneration(
-                state, manifest_path, resources, knowledge_digest, resource_digest, plan_digest, CleanupInventory(), None, artifact
+                state, manifest_path, resources, knowledge_digest, resource_digest, plan_digest,
+                CleanupInventory(), None, artifact,
+                approved_source_roots=approved_source_roots,
+                approved_source_roots_digest=approved_source_roots_digest,
             )
             self._save(stored)
         return PlanReport(
@@ -279,7 +294,10 @@ class GenerationOrchestrator:
             knowledge_digest=knowledge_digest,
             resource_digest=resource_digest,
             plan_digest=plan_digest,
-            rendered_plan=_redacted_plan(state.generation_id, manifest.slug, resources, digest, knowledge_digest, resource_digest, plan_digest),
+            rendered_plan=_redacted_plan(
+                state.generation_id, manifest.slug, resources, digest, knowledge_digest,
+                resource_digest, plan_digest, approved_source_roots_digest,
+            ),
         )
 
     def generate(
@@ -316,6 +334,7 @@ class GenerationOrchestrator:
                 stored.resource_digest, stored.plan_digest, stored.cleanup_inventory,
                 stored.knowledge_review, stored.plan_artifact, serialized_binding,
                 stored.sealed_secret,
+                stored.approved_source_roots, stored.approved_source_roots_digest,
             )
             self._save(stored)
         try:
@@ -710,6 +729,8 @@ class GenerationOrchestrator:
                 stored.plan_artifact,
                 stored.binding,
                 stored.sealed_secret,
+                stored.approved_source_roots,
+                stored.approved_source_roots_digest,
             )
         )
         return stored.state
@@ -750,6 +771,8 @@ class GenerationOrchestrator:
                 stored.plan_artifact,
                 stored.binding,
                 stored.sealed_secret,
+                stored.approved_source_roots,
+                stored.approved_source_roots_digest,
             )
         )
 
@@ -809,7 +832,9 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("verification requires exact committed generation lanes")
         try:
             self._verification_coordinator.preflight()
-            self._verification_coordinator.publish_for_ci(generation_id=generation_id, inventory=stored.cleanup_inventory)
+            self._verification_coordinator.publish_for_ci(
+                generation_id=generation_id, inventory=stored.cleanup_inventory
+            )
             readiness, reports = self._verification_coordinator.verify(
                 generation_id=generation_id, resources=stored.resources, lane_records=stored.state.lane_records
             )
@@ -874,7 +899,9 @@ class GenerationOrchestrator:
         if not callable(open_requests):
             raise GenerationBlockedError("review request coordinator is unavailable until the PR lane is configured")
         try:
-            result = open_requests(generation_id=generation_id, state=stored.state, inventory=stored.cleanup_inventory)
+            result = open_requests(
+                generation_id=generation_id, state=stored.state, inventory=stored.cleanup_inventory
+            )
         except GenerationBlockedError:
             raise
         except Exception as error:
@@ -889,6 +916,7 @@ class GenerationOrchestrator:
 
     def _load_verified(self, generation_id: str) -> _StoredGeneration:
         stored = self._load(generation_id)
+        self._assert_approved_source_roots_binding(stored)
         manifest = self._current_manifest(stored)
         if manifest_digest(manifest) != stored.state.manifest_digest:
             raise GenerationBlockedError("manifest digest changed; create a new generation")
@@ -902,7 +930,8 @@ class GenerationOrchestrator:
         resource_digest = _digest_payload(asdict(resources))
         plan_digest = _digest_payload(
             _canonical_plan_artifact(
-                manifest.slug, resources, stored.state.manifest_digest, knowledge_digest, resource_digest
+                manifest.slug, resources, stored.state.manifest_digest, knowledge_digest,
+                resource_digest, stored.approved_source_roots_digest,
             )
         )
         if (
@@ -920,7 +949,7 @@ class GenerationOrchestrator:
                 raise ManifestError("manifest must be an object")
             manifest = parse_manifest(
                 raw,
-                approved_source_roots=(stored.manifest_path.parent,),
+                approved_source_roots=stored.approved_source_roots,
                 catalogue=CapabilityCatalogue.load(self._catalogue_path),
             )
         except (OSError, json.JSONDecodeError, ManifestError) as error:
@@ -941,7 +970,7 @@ class GenerationOrchestrator:
                 or output_dir.stat().st_mode & 0o777 != 0o700
             ):
                 raise GenerationInfrastructureError("knowledge review output must be private")
-            builder = self._knowledge_builder_factory(stored.manifest_path.parent)
+            builder = self._knowledge_builder_factory(stored.approved_source_roots)
             review = builder.build(manifest.knowledge_sources, output_dir)
             if type(review) is not KnowledgeReview:
                 raise KnowledgeError("knowledge builder returned an invalid review")
@@ -982,6 +1011,42 @@ class GenerationOrchestrator:
         if not isinstance(value, Path) or not value.is_file():
             raise GenerationBlockedError("manifest path must name an existing file")
         return value.resolve()
+
+    def _validate_approved_source_roots(self, roots: tuple[Path, ...] | object) -> tuple[Path, ...]:
+        if not isinstance(roots, tuple) or not roots:
+            raise GenerationInfrastructureError("approved source roots must be a non-empty immutable tuple")
+        canonical: list[Path] = []
+        for root in roots:
+            if not isinstance(root, Path) or not root.is_absolute():
+                raise GenerationInfrastructureError("approved source roots must be absolute paths")
+            self._reject_symlink_traversal(root)
+            if root.is_symlink() or not root.is_dir():
+                raise GenerationInfrastructureError("approved source roots must be existing real directories")
+            resolved = root.resolve(strict=True)
+            if resolved != root:
+                raise GenerationInfrastructureError("approved source roots must be canonical real paths")
+            canonical.append(resolved)
+        result = tuple(sorted(set(canonical), key=lambda item: item.as_posix()))
+        if len(result) != len(canonical):
+            raise GenerationInfrastructureError("approved source roots must not contain duplicates")
+        return result
+
+    def _roots_for_plan(self, manifest_path: Path) -> tuple[Path, ...]:
+        if self._configured_approved_source_roots is not None:
+            return self._configured_approved_source_roots
+        # This compatibility path is available only to direct library callers.
+        # Every CLI operation obtains roots from FactoryConfig instead.
+        return self._validate_approved_source_roots((manifest_path.parent.resolve(),))
+
+    def _assert_approved_source_roots_binding(self, stored: _StoredGeneration) -> None:
+        roots = self._validate_approved_source_roots(stored.approved_source_roots)
+        if roots != stored.approved_source_roots or _approved_source_roots_digest(roots) != stored.approved_source_roots_digest:
+            raise GenerationBlockedError("persisted approved source roots binding is invalid")
+        if (
+            self._configured_approved_source_roots is not None
+            and self._configured_approved_source_roots != roots
+        ):
+            raise GenerationBlockedError("configured approved source roots differ from the generation binding")
 
     def _state_path(self, generation_id: str) -> Path:
         if not generation_id or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in generation_id):
@@ -1097,11 +1162,19 @@ class GenerationOrchestrator:
     def _save(self, stored: _StoredGeneration) -> None:
         temporary_path: Path | None = None
         try:
+            if (
+                not isinstance(stored.plan_artifact, Mapping)
+                or stored.plan_artifact.get("approved_source_roots_digest")
+                != stored.approved_source_roots_digest
+            ):
+                raise GenerationInfrastructureError(
+                    "generation lacks an immutable approved source roots binding"
+                )
             self._ensure_state_root(create=True)
             path = self._state_path(stored.state.generation_id)
             self._require_private_state_file(path)
             payload = {
-                "version": 7,
+                "version": 8,
                 "state": stored.state.to_dict(),
                 "manifest_path": str(stored.manifest_path),
                 "resources": asdict(stored.resources),
@@ -1113,6 +1186,9 @@ class GenerationOrchestrator:
                 "plan_artifact": dict(stored.plan_artifact or {}),
                 "binding": dict(stored.binding or {}),
                 "sealed_secret": _serialize_sealed_secret(stored.sealed_secret),
+                "approved_source_roots": _serialize_approved_source_roots(
+                    stored.approved_source_roots, stored.approved_source_roots_digest
+                ),
             }
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{stored.state.generation_id}.", dir=self._state_root, text=True
@@ -1146,7 +1222,7 @@ class GenerationOrchestrator:
             path = self._state_path(generation_id)
             self._require_private_state_file(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2, 3, 4, 5, 6, 7}:
+            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2, 3, 4, 5, 6, 7, 8}:
                 raise ValueError("state document is invalid")
             state = GenerationState.from_dict(dict(raw["state"]))
             resources = DerivedResources(**dict(raw["resources"]))
@@ -1159,19 +1235,32 @@ class GenerationOrchestrator:
                 for value in digests
             ):
                 raise ValueError("state document is invalid")
-            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory")) if raw["version"] in {4, 5, 6, 7} else None
-            review = _parse_knowledge_review(raw.get("knowledge_review")) if raw["version"] in {5, 6, 7} else None
-            artifact = raw.get("plan_artifact") if raw["version"] in {6, 7} else None
-            binding = raw.get("binding") if raw["version"] in {6, 7} else None
-            sealed = _parse_sealed_secret(raw.get("sealed_secret")) if raw["version"] == 7 else None
-            if raw["version"] in {6, 7} and (not isinstance(artifact, Mapping) or artifact.get("digest") != state.plan_digest or not isinstance(binding, Mapping)):
+            if raw["version"] == 8:
+                roots, roots_digest = _parse_approved_source_roots(raw.get("approved_source_roots"))
+                roots = self._validate_approved_source_roots(roots)
+                if _approved_source_roots_digest(roots) != roots_digest:
+                    raise ValueError("state approved source roots digest is invalid")
+            else:
+                roots = self._validate_approved_source_roots((manifest_path.parent.resolve(),))
+                roots_digest = _approved_source_roots_digest(roots)
+            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory")) if raw["version"] in {4, 5, 6, 7, 8} else None
+            review = _parse_knowledge_review(raw.get("knowledge_review")) if raw["version"] in {5, 6, 7, 8} else None
+            artifact = raw.get("plan_artifact") if raw["version"] in {6, 7, 8} else None
+            binding = raw.get("binding") if raw["version"] in {6, 7, 8} else None
+            sealed = _parse_sealed_secret(raw.get("sealed_secret")) if raw["version"] in {7, 8} else None
+            if raw["version"] in {6, 7, 8} and (not isinstance(artifact, Mapping) or artifact.get("digest") != state.plan_digest or not isinstance(binding, Mapping)):
                 raise ValueError("state document is missing canonical transaction artifacts")
+            if raw["version"] == 8 and artifact.get("approved_source_roots_digest") != roots_digest:
+                raise ValueError("state document is missing its approved source roots binding")
             if state.stage in {Stage.KNOWLEDGE_REVIEW_REQUIRED, Stage.PLAN_REVIEW_REQUIRED, Stage.GENERATED, Stage.VERIFIED, Stage.THREE_PRS_OPENED}:
                 if review is None or review.digest != state.knowledge_review_digest:
                     raise ValueError("state document is missing its canonical knowledge review")
             if state.stage in {Stage.KNOWLEDGE_REVIEW_REQUIRED, Stage.PLAN_REVIEW_REQUIRED, Stage.GENERATED, Stage.VERIFIED, Stage.THREE_PRS_OPENED} and sealed is None:
                 raise ValueError("state document is missing its sealed secret bundle")
-            return _StoredGeneration(state, manifest_path, resources, *digests, inventory, review, artifact, binding, sealed)
+            return _StoredGeneration(
+                state, manifest_path, resources, *digests, inventory, review, artifact, binding,
+                sealed, roots, roots_digest,
+            )
         except (OSError, KeyError, TypeError, ValueError, StateError) as error:
             raise GenerationInfrastructureError("cannot load generation state") from error
 
@@ -1331,6 +1420,32 @@ def _git_clean_check(root: Path) -> str:
     return _check(not result.stdout.strip(), "source repository is dirty")
 
 
+def _approved_source_roots_digest(roots: tuple[Path, ...]) -> str:
+    return _digest_payload({"roots": [root.as_posix() for root in roots]})
+
+
+def _serialize_approved_source_roots(roots: tuple[Path, ...], digest: str) -> object:
+    if not roots or _approved_source_roots_digest(roots) != digest:
+        raise GenerationInfrastructureError("approved source roots binding cannot be persisted")
+    return {"roots": [str(root) for root in roots], "digest": digest}
+
+
+def _parse_approved_source_roots(raw: object) -> tuple[tuple[Path, ...], str]:
+    if not isinstance(raw, Mapping) or set(raw) != {"roots", "digest"}:
+        raise ValueError("state approved source roots binding is invalid")
+    roots, digest = raw["roots"], raw["digest"]
+    if (
+        not isinstance(roots, list)
+        or not roots
+        or not all(isinstance(root, str) for root in roots)
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or set(digest) - set("0123456789abcdef")
+    ):
+        raise ValueError("state approved source roots binding is invalid")
+    return tuple(Path(root) for root in roots), digest
+
+
 def _serialize_cleanup_inventory(inventory: CleanupInventory | None) -> object:
     if inventory is None:
         return None
@@ -1448,6 +1563,8 @@ def _replace_cleanup_inventory(stored: _StoredGeneration, inventory: CleanupInve
         stored.plan_artifact,
         stored.binding,
         stored.sealed_secret,
+        stored.approved_source_roots,
+        stored.approved_source_roots_digest,
     )
 
 
@@ -1466,6 +1583,8 @@ def _replace_knowledge_review(
         stored.plan_artifact,
         stored.binding,
         sealed_secret if sealed_secret is not None else stored.sealed_secret,
+        stored.approved_source_roots,
+        stored.approved_source_roots_digest,
     )
 
 
@@ -1557,6 +1676,7 @@ def _redacted_plan(
     knowledge_digest: str,
     resource_digest: str,
     plan_digest: str,
+    approved_source_roots_digest: str,
 ) -> str:
     return "\n".join(
         (
@@ -1567,6 +1687,7 @@ def _redacted_plan(
             f"manifest_digest={manifest_digest_value}",
             f"knowledge_digest={knowledge_digest}",
             f"resource_digest={resource_digest}",
+            f"approved_source_roots_digest={approved_source_roots_digest}",
             f"plan_digest={plan_digest}",
             "secret_resolution=required",
             "knowledge_review=not-started",
@@ -1580,10 +1701,11 @@ def _canonical_plan_artifact(
     manifest_digest_value: str,
     knowledge_digest: str,
     resource_digest: str,
+    approved_source_roots_digest: str,
 ) -> dict[str, object]:
     """The exact redacted object whose digest an approval binds."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "release_allowed": False,
         "slug": slug,
         "resources": {
@@ -1596,6 +1718,7 @@ def _canonical_plan_artifact(
         "manifest_digest": manifest_digest_value,
         "knowledge_digest": knowledge_digest,
         "resource_digest": resource_digest,
+        "approved_source_roots_digest": approved_source_roots_digest,
     }
 
 

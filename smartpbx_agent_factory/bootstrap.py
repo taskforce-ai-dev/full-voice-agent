@@ -119,6 +119,7 @@ class FactoryConfig:
     path: Path
     state_root: Path
     catalogue: Path
+    approved_source_roots: tuple[Path, ...]
     lanes: Mapping[str, LaneConfig]
     age: AgeConfig
     ci: CIConfig
@@ -130,9 +131,15 @@ class FactoryConfig:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise FactoryConfigError("config must be readable strict JSON") from error
-        root = _object(raw, "config", {"version", "state_root", "catalogue", "lanes", "age", "ci"})
+        root = _object(raw, "config", {"version", "state_root", "catalogue", "approved_source_roots", "lanes", "age", "ci"})
         if root["version"] != 1:
             raise FactoryConfigError("config version must be 1")
+        roots_raw = root["approved_source_roots"]
+        if not isinstance(roots_raw, list) or not roots_raw:
+            raise FactoryConfigError("approved_source_roots must be a non-empty list")
+        approved_source_roots = tuple(_absolute_path(value, "approved source root") for value in roots_raw)
+        if len(set(approved_source_roots)) != len(approved_source_roots):
+            raise FactoryConfigError("approved_source_roots must be distinct")
         lanes_raw = _object(root["lanes"], "lanes", set(_ROLES))
         lanes: dict[str, LaneConfig] = {}
         for role in _ROLES:
@@ -193,6 +200,7 @@ class FactoryConfig:
             path=path,
             state_root=_absolute_path(root["state_root"], "state_root"),
             catalogue=_absolute_path(root["catalogue"], "catalogue"),
+            approved_source_roots=approved_source_roots,
             lanes=lanes,
             age=AgeConfig(
                 recipient_file=_absolute_path(age_raw["recipient_file"], "age.recipient_file"),
@@ -492,6 +500,7 @@ class FactoryBootstrap:
         provider = GitHubCommandAdapter(self.config)
         return GenerationOrchestrator(
             self.config.state_root, catalogue_path=self.config.catalogue,
+            approved_source_roots=self.config.approved_source_roots,
             verification_coordinator=RepositoryOwnedCIVerificationCoordinator(GitHubCIResultAdapter(self.config)),
             pr_coordinator=ConfiguredPRCoordinator(self.config, provider),
         )

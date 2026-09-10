@@ -11,10 +11,13 @@ from types import SimpleNamespace
 
 class FactoryBootstrapContractTests(unittest.TestCase):
     def _config(self, root: Path) -> Path:
+        approved_root = root / "approved-knowledge"
+        approved_root.mkdir()
         payload = {
             "version": 1,
             "state_root": str(root / "state"),
             "catalogue": str(root / "catalogue.json"),
+            "approved_source_roots": [str(approved_root)],
             "age": {
                 "recipient_file": str(root / "age-recipients.txt"),
                 "approved_recipient_fingerprints": ["age1qqqqqqqqqqqqqqqqqqqqqqqq"],
@@ -62,6 +65,33 @@ class FactoryBootstrapContractTests(unittest.TestCase):
             (root / "factory.json").write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaises(FactoryConfigError):
                 FactoryConfig.load(root / "factory.json")
+
+    def test_config_requires_and_persists_explicit_approved_source_roots(self) -> None:
+        from smartpbx_agent_factory.bootstrap import FactoryConfig, FactoryConfigError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = self._config(root)
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            payload.pop("approved_source_roots")
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(FactoryConfigError):
+                FactoryConfig.load(config_path)
+
+            approved_root = root / "approved-knowledge"
+            payload["approved_source_roots"] = [str(approved_root)]
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+            config = FactoryConfig.load(config_path)
+            self.assertEqual(config.approved_source_roots, (approved_root.resolve(),))
+
+    def test_new_uses_the_same_config_handoff_as_later_operations(self) -> None:
+        from smartpbx_agent_factory.cli import _parser
+
+        parser = _parser()
+        arguments = parser.parse_args([
+            "new", "--output", "/tmp/manifest.json", "--config", "/tmp/factory.json",
+        ])
+        self.assertEqual(arguments.config, Path("/tmp/factory.json"))
 
     def test_config_rejects_secret_keys_and_unknown_fields(self) -> None:
         from smartpbx_agent_factory.bootstrap import FactoryConfig, FactoryConfigError
@@ -148,12 +178,14 @@ class FactoryBootstrapContractTests(unittest.TestCase):
 
     def test_wizard_writes_private_non_secret_review_manifest(self) -> None:
         from smartpbx_agent_factory.cli import create_manifest_wizard
+        from smartpbx_agent_factory.tests.test_wizard_unittest import ManifestWizardTests
+
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "manifest.json"
-            answers = iter(("Acme Review", "acme-review", "en", "azure-claude-elevenlabs", "/tmp/approved-faq.txt", "Welcome to Acme Review."))
-            create_manifest_wizard(output, input_fn=lambda prompt: next(answers))
+            answers = ManifestWizardTests()._answers(output.parent)
+            create_manifest_wizard(output, input_fn=lambda prompt: next(answers), approved_source_roots=(output.parent,))
             self.assertEqual(oct(output.stat().st_mode & 0o777), "0o600")
-            self.assertEqual(json.loads(output.read_text())["slug"], "acme-review")
+            self.assertEqual(json.loads(output.read_text())["slug"], "acme-inquiry")
 
 
 if __name__ == "__main__":

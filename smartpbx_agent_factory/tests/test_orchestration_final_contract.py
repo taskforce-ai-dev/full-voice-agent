@@ -186,4 +186,5 @@ def test_orchestrator_binds_canonical_approved_source_roots_without_public_paths
     assert "approved_source_roots_digest" in orchestrator
     assert "approved_source_roots=stored.approved_source_roots" in orchestrator
     assert '"approved_source_roots": _serialize_approved_source_roots' in orchestrator
-    assert "--approved-source-root" in cli
+    assert "--config" in cli
+    assert "config.approved_source_roots" in cli
