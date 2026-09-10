@@ -288,6 +288,9 @@ class ConversationTurnEngine:
             text = result.text.strip()
             if not text:
                 return
+            language = self._language
+            if language is not None and self._is_echo(text, language):
+                return
             if self._turn_task is not None and not self._turn_task.done():
                 if self._should_barge_in(text):
                     await self._cancel_active_turn(clear_audio=True)
