@@ -393,6 +393,15 @@ def test_gateway_status_and_protocol_export_have_no_unknown_event_counter_or_ali
     assert not hasattr(smartpbx_protocol, "UnknownEvent")
 
 
+def test_status_exports_the_v07_internal_compatibility_marker():
+    import smartpbx_gateway
+
+    gateway = SmartPBXGateway(settings(), SmartPBXSessionRegistry(4))
+
+    assert smartpbx_gateway.SMARTPBX_PROTOCOL_VERSION == "smartpbx-ai-provider-v07"
+    assert gateway.snapshot()["protocol_version"] == "smartpbx-ai-provider-v07"
+
+
 def test_unknown_counter_removal_is_independent_from_alias_removal():
     gateway = SmartPBXGateway(settings(), SmartPBXSessionRegistry(4))
     assert "unknown_events_total" not in gateway.snapshot()
