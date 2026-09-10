@@ -368,11 +368,8 @@ class GitHubCIResultAdapter:
                 checks = json.loads(str(getattr(result, "stdout", ""))).get("check_runs", [])
             except (TypeError, ValueError) as error:
                 raise GenerationBlockedError("external CI result is malformed") from error
-            matches = [check for check in checks if isinstance(check, dict) and check.get("name") == lane.ci_check and check.get("conclusion") == "success" and check.get("head_sha", sha) == sha]
-            required_markers = (sha, artifact)
-            if lane.ci_policy == "lifecycle-attestation":
-                required_markers += ("smartpbx-ci-lifecycle-attestations",)
-            if not matches or not any(all(marker in json.dumps(check, sort_keys=True) for marker in required_markers) for check in matches):
+            matches = [check for check in checks if isinstance(check, dict) and check.get("name") == lane.ci_check and check.get("conclusion") == "success" and check.get("head_sha") == sha and isinstance(check.get("details_url"), str)]
+            if len(matches) != 1:
                 raise GenerationBlockedError("external CI result is pending or lacks exact lane provenance")
             if lane.ci_policy == "lifecycle-attestation":
                 details = str(matches[0].get("details_url", ""))
