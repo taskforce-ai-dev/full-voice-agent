@@ -1,0 +1,7 @@
+[
+  {"event": "connected", "fields": []},
+  {"event": "start", "fields": ["accountId"]},
+  {"event": "media", "fields": ["payload"]},
+  {"event": "stop", "fields": []},
+  {"event": "hangup", "fields": []}
+]
