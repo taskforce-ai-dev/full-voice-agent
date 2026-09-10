@@ -129,7 +129,11 @@ def test_generate_fails_closed_before_any_artifact_without_both_approvals(tmp_pa
 
 
 def test_generate_partial_runtime_creates_no_worktree_or_factory_state_artifact(tmp_path):
-    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    orchestrator = GenerationOrchestrator(
+        tmp_path,
+        catalogue_path=CATALOGUE,
+        approved_source_roots=(FIXTURE.parents[3].resolve(),),
+    )
     report = orchestrator.plan(FIXTURE)
     state = orchestrator.record_secrets_resolved(report.generation_id, provider=FakeSecretProvider())
     state = orchestrator.resume(report.generation_id, knowledge_approval=state.knowledge_review_digest)
@@ -299,7 +303,11 @@ def test_plaintext_registration_persists_owned_path_without_constructor_error(tm
 
 def test_secret_resolution_requires_a_validated_provider_audit_and_binds_digest(tmp_path):
     provider = FakeSecretProvider()
-    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    orchestrator = GenerationOrchestrator(
+        tmp_path,
+        catalogue_path=CATALOGUE,
+        approved_source_roots=(FIXTURE.parents[3].resolve(),),
+    )
     report = orchestrator.plan(FIXTURE)
     state = orchestrator.record_secrets_resolved(
         report.generation_id,
