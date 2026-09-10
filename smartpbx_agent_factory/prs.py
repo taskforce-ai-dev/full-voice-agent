@@ -180,7 +180,9 @@ class PRJournal:
     """
 
     _VERSION = 1
-    _ENTRY_STATES = frozenset({"intent", "opened", "backlink-pending", "backlinked", "body-updated"})
+    _ENTRY_STATES = frozenset({
+        "intent", "opened", "backlink-pending", "backlinked", "body-pending", "body-updated"
+    })
 
     def __init__(self, state_root: Path) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
@@ -238,7 +240,7 @@ class PRJournal:
         return entry
 
     def record_backlink_state(self, state: GenerationState, role: str, checkpoint: str) -> PRJournalEntry:
-        if checkpoint not in {"backlink-pending", "backlinked", "body-updated"}:
+        if checkpoint not in {"backlink-pending", "backlinked", "body-pending", "body-updated"}:
             raise PRJournalError("PR backlink checkpoint is invalid")
         existing = self.load(state).get(role)
         if existing is None or existing.url is None or existing.state not in self._ENTRY_STATES - {"intent"}:
@@ -460,7 +462,7 @@ def _reserve_or_reuse_journaled_pr(
         raise PRJournalError("journaled PR identity differs from published review branch")
     if existing.state == "intent":
         if not candidates:
-            return None
+            raise PRJournalError("journaled PR creation outcome is indeterminate")
         exact = [candidate for candidate in candidates if _remote_pr_matches(existing, candidate, require_url=False)]
         if len(exact) != 1 or len(candidates) != 1:
             raise PRJournalError("remote PR discovery is ambiguous or does not match its intent")
@@ -546,6 +548,16 @@ def open_linked_prs(
             )
             urls[role] = url
             if journal is not None:
+                intent = journal.load(state).get(role)
+                if intent is None or intent.state != "intent":
+                    raise PRJournalError("provider-created PR has no durable creation intent")
+                journal.record_opened(
+                    state,
+                    PRJournalEntry(
+                        intent.role, intent.repository, intent.base_branch, intent.branch,
+                        intent.remote_head_sha, url, "opened",
+                    ),
+                )
                 discovered = _reserve_or_reuse_journaled_pr(
                     journal, provider, state, worktree=by_role[role], base_branch=base_branches[role]
                 )
@@ -562,8 +574,10 @@ def open_linked_prs(
                 entry = journal.load(state).get(role)
                 if entry is None:
                     raise PRJournalError("opened PR is missing from the recovery journal")
-                if entry.state in {"backlinked", "body-updated"}:
+                if entry.state in {"backlinked", "body-pending", "body-updated"}:
                     continue
+                if entry.state == "backlink-pending":
+                    raise PRJournalError("PR backlink outcome is indeterminate")
                 journal.record_backlink_state(state, role, "backlink-pending")
             provider.comment_pull_request(pull_request_url=urls[role], body=backlinks)
             if journal is not None:
@@ -572,6 +586,10 @@ def open_linked_prs(
             for role in _ROLES:
                 if journal is not None and journal.load(state)[role].state == "body-updated":
                     continue
+                if journal is not None and journal.load(state)[role].state == "body-pending":
+                    raise PRJournalError("PR body update outcome is indeterminate")
+                if journal is not None:
+                    journal.record_backlink_state(state, role, "body-pending")
                 provider.update_pull_request_body(
                     pull_request_url=urls[role],
                     body=_redact(_initial_body(role, state, readiness, by_role[role], urls), normalized_redactions),
