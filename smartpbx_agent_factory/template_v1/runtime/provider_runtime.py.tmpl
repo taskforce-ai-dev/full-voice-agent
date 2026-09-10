@@ -29,7 +29,11 @@ def load_provider_profile(path: str) -> ProviderProfile:
 
 
 def bind_provider_adapter(profile: ProviderProfile, environ: Mapping[str, str]):
-    missing = [name for name in profile.required_environment if not environ.get(name)]
+    synthetic = (
+        environ.get("SMARTPBX_RUNTIME_MODE") == "synthetic"
+        and environ.get("SMARTPBX_ALLOW_SYNTHETIC_FOR_CI") == "1"
+    )
+    missing = [] if synthetic else [name for name in profile.required_environment if not environ.get(name)]
     if missing:
         raise ProviderCompositionError("missing provider configuration: " + ", ".join(missing))
     _validate_exact_provider_selection(profile)
@@ -93,3 +97,11 @@ class _ComposedProviderAdapter:
 
     async def synthesize_audio(self, response: str, language: str):
         return await self._tts.synthesize_audio(response, language)
+
+    async def close(self) -> None:
+        for adapter in (self._stt, self._llm, self._tts):
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result

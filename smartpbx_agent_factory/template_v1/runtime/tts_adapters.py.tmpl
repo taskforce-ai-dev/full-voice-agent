@@ -101,7 +101,7 @@ class TTSLanguageRoute:
     provider: str
 
     def __post_init__(self) -> None:
-        if self.provider not in {"elevenlabs", "sinhala"}:
+        if self.provider not in {"elevenlabs", "gemini", "rime"}:
             raise TTSConfigurationError("unsupported TTS language route")
 
 
@@ -109,17 +109,12 @@ class TTSLanguageRoute:
 class TTSStartupConfig:
     """Immutable startup-only credentials and provider choices, never tenant data."""
 
-    english: ElevenLabsSettings
-    sinhala_gemini: SinhalaGeminiSettings
+    english: ElevenLabsSettings | None
+    sinhala_gemini: SinhalaGeminiSettings | None
     language_routes: Mapping[str, TTSLanguageRoute]
-    sinhala_provider: str = "gemini"
     sinhala_rime: SinhalaRimeSettings | None = None
 
     def __post_init__(self) -> None:
-        if self.sinhala_provider not in {"gemini", "rime"}:
-            raise TTSConfigurationError("Sinhala provider must be gemini or rime")
-        if self.sinhala_provider == "rime" and self.sinhala_rime is None:
-            raise TTSConfigurationError("Rime settings are required when Rime is selected")
         routes = dict(self.language_routes)
         if not routes or any(
             not isinstance(code, str) or not code or not isinstance(route, TTSLanguageRoute)
@@ -127,6 +122,13 @@ class TTSStartupConfig:
         ):
             raise TTSConfigurationError("language routes must use explicit profile codes")
         object.__setattr__(self, "language_routes", MappingProxyType(routes))
+        selected = {route.provider for route in routes.values()}
+        if "elevenlabs" in selected and self.english is None:
+            raise TTSConfigurationError("ElevenLabs settings are required")
+        if "gemini" in selected and self.sinhala_gemini is None:
+            raise TTSConfigurationError("Gemini settings are required")
+        if "rime" in selected and self.sinhala_rime is None:
+            raise TTSConfigurationError("Rime settings are required")
 
 
 class HTTPResponse(Protocol):
@@ -158,8 +160,8 @@ class GeminiStreamingClient(Protocol):
 
 @dataclass(frozen=True)
 class TTSProviderClients:
-    http: HTTPStreamingClient
-    gemini: GeminiStreamingClient
+    http: HTTPStreamingClient | None
+    gemini: GeminiStreamingClient | None
 
 
 def _elevenlabs_url(settings: ElevenLabsSettings) -> str:
@@ -209,6 +211,14 @@ class SmartPBXTTSAdapter:
         self._config = config
         self._clients = clients
 
+    async def close(self) -> None:
+        for client in (self._clients.http, self._clients.gemini):
+            close = getattr(client, "aclose", None)
+            if callable(close):
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+
     async def synthesize_audio(self, response: str, language: str) -> AsyncIterable[bytes]:
         """ConversationProviderAdapter-compatible stream for a non-interrupted call."""
         return self.synthesize_for_generation(response, language, generation=0, generation_is_current=lambda _: True)
@@ -228,12 +238,16 @@ class SmartPBXTTSAdapter:
             return _frame_ulaw(
                 self._stream_elevenlabs(text), generation=generation, generation_is_current=generation_is_current
             )
-        if route.provider == "sinhala":
-            return self._stream_sinhala(text, generation=generation, generation_is_current=generation_is_current)
+        if route.provider == "gemini":
+            return self._stream_gemini(text, generation=generation, generation_is_current=generation_is_current)
+        if route.provider == "rime":
+            return _frame_ulaw(self._stream_rime(text), generation=generation, generation_is_current=generation_is_current)
         raise TTSConfigurationError("unsupported TTS language route")
 
     async def _stream_elevenlabs(self, text: str) -> AsyncIterator[bytes]:
         settings = self._config.english
+        if settings is None or self._clients.http is None:
+            raise TTSConfigurationError("ElevenLabs startup client is unavailable")
         headers = {"xi-api-key": settings.api_key, "Content-Type": "application/json"}
         payload = {
             "text": text,
@@ -251,28 +265,9 @@ class SmartPBXTTSAdapter:
                 if chunk:
                     yield chunk
 
-    async def _stream_sinhala(
-        self, text: str, *, generation: int, generation_is_current: Callable[[int], bool]
-    ) -> AsyncIterator[bytes]:
-        if self._config.sinhala_provider == "rime":
-            emitted = False
-            try:
-                async for frame in _frame_ulaw(
-                    self._stream_rime(text), generation=generation, generation_is_current=generation_is_current
-                ):
-                    emitted = True
-                    yield frame
-                return
-            except TTSProviderError:
-                if emitted or not generation_is_current(generation):
-                    raise
-                # A silent Rime failure may fall back once; never replay spoken audio.
-        async for frame in self._stream_gemini(text, generation=generation, generation_is_current=generation_is_current):
-            yield frame
-
     async def _stream_rime(self, text: str) -> AsyncIterator[bytes]:
         settings = self._config.sinhala_rime
-        if settings is None:
+        if settings is None or self._clients.http is None:
             raise TTSConfigurationError("Rime settings are unavailable")
         headers = {
             "Accept": "audio/PCMU",
@@ -302,6 +297,8 @@ class SmartPBXTTSAdapter:
         self, text: str, *, generation: int, generation_is_current: Callable[[int], bool]
     ) -> AsyncIterator[bytes]:
         settings = self._config.sinhala_gemini
+        if settings is None or self._clients.gemini is None:
+            raise TTSConfigurationError("Gemini startup client is unavailable")
         emitted = False
         for model in settings.models:
             try:

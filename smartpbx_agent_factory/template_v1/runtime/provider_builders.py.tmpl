@@ -10,7 +10,7 @@ import asyncio
 import audioop
 import base64
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -93,8 +93,27 @@ class _ClaudeNativeClient:
     def __init__(self, client: Any) -> None:
         self._client = client
 
-    def open_stream(self, request: Mapping[str, object]) -> Any:
-        return self._client.messages.stream(**request)
+    def open_stream(self, request: Mapping[str, object]) -> AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]]:
+        return _ClaudeMappingContext(self._client.messages.stream(**request))
+
+
+class _ClaudeMappingContext(AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]]):
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    async def __aenter__(self) -> AsyncIterator[Mapping[str, object]]:
+        raw = await self._stream.__aenter__()
+
+        async def mapped() -> AsyncIterator[Mapping[str, object]]:
+            async for event in raw:
+                value = event.model_dump() if callable(getattr(event, "model_dump", None)) else event.to_dict()
+                if not isinstance(value, Mapping):
+                    raise ProviderBuildError("Anthropic event normalization failed")
+                yield value
+        return mapped()
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> bool | None:
+        return await self._stream.__aexit__(exc_type, exc, traceback)
 
 
 class _GeminiNativeClient:
@@ -122,8 +141,8 @@ class _UnavailableLLMClient:
 class _RoutedLLM:
     active = True
 
-    def __init__(self, adapter: InquiryOnlyLLMAdapter, providers: Mapping[str, str]) -> None:
-        self._adapter, self._providers = adapter, dict(providers)
+    def __init__(self, adapter: InquiryOnlyLLMAdapter, providers: Mapping[str, str], closers: tuple[Any, ...]) -> None:
+        self._adapter, self._providers, self._closers = adapter, dict(providers), closers
 
     async def stream_response(self, transcript: str, language: str, prompt: str) -> AsyncIterator[Any]:
         provider = self._providers.get(language)
@@ -132,6 +151,14 @@ class _RoutedLLM:
         request = InquiryRequest(provider=provider, system_prompt=prompt, messages=(InquiryMessage("user", transcript),))
         async for event in self._adapter.stream_response(request):
             yield event
+
+    async def close(self) -> None:
+        for client in self._closers:
+            close = getattr(client, "close", None) or getattr(client, "aclose", None)
+            if callable(close):
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
 
 
 def build_llm_adapter(profile: Any, environ: Mapping[str, str]) -> Any:
@@ -151,23 +178,28 @@ def build_llm_adapter(profile: Any, environ: Mapping[str, str]) -> Any:
             gemini_model = model
     claude: Any = _UnavailableLLMClient()
     gemini: Any = _UnavailableLLMClient()
+    closers: list[Any] = []
     if claude_model:
         try:
             from anthropic import AsyncAnthropic
         except ImportError as error:
             raise ProviderBuildError("anthropic is unavailable") from error
-        claude = _ClaudeNativeClient(AsyncAnthropic(api_key=_required(environ, "ANTHROPIC_API_KEY")))
+        raw_claude = AsyncAnthropic(api_key=_required(environ, "ANTHROPIC_API_KEY"))
+        claude = _ClaudeNativeClient(raw_claude)
+        closers.append(raw_claude)
     if gemini_model:
         try:
             from google import genai
         except ImportError as error:
             raise ProviderBuildError("google-genai is unavailable") from error
-        gemini = _GeminiNativeClient(genai.Client(api_key=_required(environ, "GEMINI_API_KEY")))
+        raw_gemini = genai.Client(api_key=_required(environ, "GEMINI_API_KEY"))
+        gemini = _GeminiNativeClient(raw_gemini)
+        closers.append(raw_gemini)
     return _RoutedLLM(InquiryOnlyLLMAdapter(
         claude_client=claude, gemini_client=gemini,
         config=LLMRuntimeConfig(claude_model=claude_model, gemini_model=gemini_model, max_output_tokens=1024,
             timeouts=StreamTimeouts(), thinking=ThinkingConfig(enabled=True, gemini_level="low")),
-    ), providers)
+    ), providers, tuple(closers))
 
 
 class _GeminiTTSClient:
@@ -180,39 +212,62 @@ class _GeminiTTSClient:
             generation_config={"speech_config": [{"voice": voice}]},
         ), timeout=timeout)
         async for event in stream:
-            audio = getattr(event, "audio", None)
-            data = getattr(audio, "data", None) if audio is not None else None
-            if isinstance(data, str):
-                data = base64.b64decode(data, validate=True)
-            if isinstance(data, bytes) and data:
-                yield PCM24kChunk(data=data)
+            event_type = getattr(event, "event_type", None)
+            error = getattr(event, "error", None)
+            if event_type == "error" or (isinstance(event_type, str) and event_type.startswith("interaction.") and error is not None):
+                raise ProviderBuildError("Gemini TTS provider returned an error")
+            if event_type != "step.delta":
+                continue
+            delta = getattr(event, "delta", None)
+            if getattr(delta, "type", None) != "audio":
+                continue
+            if any(getattr(delta, name, None) not in (None, expected) for name, expected in (("mime_type", "audio/l16"), ("channels", 1), ("sample_rate", 24_000))):
+                raise ProviderBuildError("Gemini TTS audio metadata is invalid")
+            data = getattr(delta, "data", None)
+            if not isinstance(data, str) or not data:
+                continue
+            try:
+                decoded = base64.b64decode(data, validate=True)
+            except (ValueError, TypeError) as error:
+                raise ProviderBuildError("Gemini TTS audio is invalid") from error
+            if decoded:
+                yield PCM24kChunk(data=decoded, mime_type=getattr(delta, "mime_type", None) or "audio/l16", channels=getattr(delta, "channels", None) or 1, sample_rate=getattr(delta, "sample_rate", None) or 24_000)
 
 
 def build_tts_adapter(profile: Any, environ: Mapping[str, str]) -> Any:
     if _synthetic_enabled(environ):
         return _SyntheticTTS()
-    try:
-        import httpx
-        from google import genai
-    except ImportError as error:
-        raise ProviderBuildError("source-pinned TTS SDK is unavailable") from error
     routes: dict[str, TTSLanguageRoute] = {}
     for language, lanes in profile.languages.items():
         provider = lanes.get("tts")
         if provider == "elevenlabs":
             routes[language] = TTSLanguageRoute("elevenlabs")
         elif provider in {"gemini", "rime"}:
-            routes[language] = TTSLanguageRoute("sinhala")
+            routes[language] = TTSLanguageRoute(provider)
         else:
             raise ProviderBuildError(f"unsupported TTS provider for {language}")
-    sinhala_provider = "rime" if any(lanes.get("tts") == "rime" for lanes in profile.languages.values()) else "gemini"
+    selected = {route.provider for route in routes.values()}
+    http: Any = None
+    if selected & {"elevenlabs", "rime"}:
+        try:
+            import httpx
+        except ImportError as error:
+            raise ProviderBuildError("httpx is unavailable") from error
+        http = httpx.AsyncClient()
+    gemini: Any = None
+    if "gemini" in selected:
+        try:
+            from google import genai
+        except ImportError as error:
+            raise ProviderBuildError("google-genai is unavailable") from error
+        gemini = _GeminiTTSClient(genai.Client(api_key=_required(environ, "GEMINI_API_KEY")))
     config = TTSStartupConfig(
-        english=ElevenLabsSettings(api_key=_required(environ, "ELEVENLABS_API_KEY"), voice_id=_required(environ, "ELEVENLABS_VOICE_ID")),
-        sinhala_gemini=SinhalaGeminiSettings(api_key=_required(environ, "GEMINI_API_KEY")),
-        language_routes=routes, sinhala_provider=sinhala_provider,
-        sinhala_rime=SinhalaRimeSettings(api_key=_required(environ, "RIME_API_KEY")) if sinhala_provider == "rime" else None,
+        english=ElevenLabsSettings(api_key=_required(environ, "ELEVENLABS_API_KEY"), voice_id=_required(environ, "ELEVENLABS_VOICE_ID")) if "elevenlabs" in selected else None,
+        sinhala_gemini=SinhalaGeminiSettings(api_key=_required(environ, "GEMINI_API_KEY")) if "gemini" in selected else None,
+        language_routes=routes,
+        sinhala_rime=SinhalaRimeSettings(api_key=_required(environ, "RIME_API_KEY")) if "rime" in selected else None,
     )
-    return SmartPBXTTSAdapter(config, TTSProviderClients(http=httpx.AsyncClient(), gemini=_GeminiTTSClient(genai.Client(api_key=_required(environ, "GEMINI_API_KEY")))))
+    return SmartPBXTTSAdapter(config, TTSProviderClients(http=http, gemini=gemini))
 
 
 class _SyntheticRecognizer:

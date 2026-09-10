@@ -47,6 +47,16 @@ def test_startup_wires_concrete_provider_methods_once_and_hot_path_reads_no_envi
     assert "genai.Client" in builders
     assert "httpx.AsyncClient" in builders
     assert "SMARTPBX_ALLOW_SYNTHETIC_FOR_CI" in builders
+    assert "model_dump" in builders
+    assert "to_dict" in builders
+    assert "event_type != \"step.delta\"" in builders
+    assert "getattr(delta, \"type\", None) != \"audio\"" in builders
+    assert "getattr(event, \"audio\"" not in builders
+    assert "base64.b64decode(data, validate=True)" in builders
+    assert "missing = [] if synthetic" in runtime
+    assert "if \"gemini\" in selected" in builders
+    assert "if selected & {\"elevenlabs\", \"rime\"}" in builders
+    assert "sinhala_provider" not in source("tts_adapters.py.tmpl")
     for name in ("provider_adapters.py.tmpl", "stt_adapters.py.tmpl", "llm_adapters.py.tmpl", "tts_adapters.py.tmpl", "turn_engine.py.tmpl"):
         assert "os.environ" not in source(name)
 
@@ -65,6 +75,7 @@ def test_runtime_entrypoint_exposes_health_authenticated_status_and_full_carrier
     assert "active_sessions" in gateway
     for counter in ("admitted_total", "released_total", "connected_total", "started_total", "media_frames_total", "stopped_total", "hung_up_total"):
         assert counter in gateway
+    assert "shutdown_runtime" in server
 
 
 def test_deepgram_is_not_an_approved_generated_runtime_provider():

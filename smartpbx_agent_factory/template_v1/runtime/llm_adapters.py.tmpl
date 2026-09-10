@@ -93,15 +93,15 @@ class StreamTimeouts:
 
 @dataclass(frozen=True)
 class LLMRuntimeConfig:
-    claude_model: str
-    gemini_model: str
+    claude_model: str | None
+    gemini_model: str | None
     max_output_tokens: int
     timeouts: StreamTimeouts = field(default_factory=StreamTimeouts)
     thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
 
     def __post_init__(self) -> None:
-        if not self.claude_model or not self.gemini_model:
-            raise ValueError("configured model names are required")
+        if not self.claude_model and not self.gemini_model:
+            raise ValueError("at least one configured model name is required")
         if not isinstance(self.max_output_tokens, int) or isinstance(self.max_output_tokens, bool):
             raise ValueError("max output tokens must be an integer")
         if not 1 <= self.max_output_tokens <= 16_384:
@@ -409,6 +409,8 @@ def _classify_round(state: _AttemptState) -> RoundOutcome:
 
 
 def _claude_request(request: InquiryRequest, config: LLMRuntimeConfig) -> Mapping[str, object]:
+    if not config.claude_model:
+        raise LLMProtocolError("Claude is not configured")
     payload: dict[str, object] = {
         "model": config.claude_model,
         "max_tokens": config.max_output_tokens,
@@ -421,6 +423,8 @@ def _claude_request(request: InquiryRequest, config: LLMRuntimeConfig) -> Mappin
 
 
 def _gemini_request(request: InquiryRequest, config: LLMRuntimeConfig) -> Mapping[str, object]:
+    if not config.gemini_model:
+        raise LLMProtocolError("Gemini is not configured")
     generation: dict[str, object] = {
         "system_instruction": request.system_prompt,
         "max_output_tokens": config.max_output_tokens,

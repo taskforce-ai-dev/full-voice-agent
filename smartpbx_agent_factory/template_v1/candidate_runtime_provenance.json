@@ -32,7 +32,7 @@
     },
     {
       "template_path": "runtime/llm_adapters.py.tmpl",
-      "template_sha256": "sha256:a8a3fff79823436de37d93dd6e148bbb684781adf4073b3372825017729a2ccf",
+      "template_sha256": "sha256:876ef5420b7de25528b3b0c86dbfc784b1556011057dc509ce14571b09eeab83",
       "source_path": "Kavya/server.py",
       "source_ranges": ["950-1095", "1567-1708", "8437-8522", "11702-12051", "12488-12845"],
       "extraction": "startup-injected Claude and Gemini stream adapters: closed terminal outcomes, generation-scoped provisional sentence delivery, atomic fencing, bounded acquisition and stalls, one retry, and inquiry-only recovery"
@@ -46,7 +46,7 @@
     },
     {
       "template_path": "runtime/server.py.tmpl",
-      "template_sha256": "sha256:3d1e1b3cc9685e959abc8a4e9e9de7d801e78991b5f6ed31ac0d4265a9c98638",
+      "template_sha256": "sha256:664939c76b1e08831b68a0eecccb503cb4551b4ba16a342c2b9276dc9f543bce",
       "source_path": "Kavya/server.py",
       "source_ranges": ["15617-15625"],
       "extraction": "isolated health, authenticated status, and media route construction"
@@ -67,14 +67,14 @@
     },
     {
       "template_path": "runtime/provider_runtime.py.tmpl",
-      "template_sha256": "sha256:1d5962ed2a03e204aab8f5f3617f63947a84311c7b08e7fe22a1e50a90829d8d",
+      "template_sha256": "sha256:93a2b87866e0bc3e7a9fba5c9a5b6dc6fb566610fe3c4806bb3c9b9c672b9d7c",
       "source_path": null,
       "source_ranges": [],
       "extraction": "startup-only exact-provider selection and concrete-builder injection seam; provider SDK construction is isolated from call paths"
     },
     {
       "template_path": "runtime/provider_builders.py.tmpl",
-      "template_sha256": "sha256:757b47d5011325b2e06b8ad9bf4265a92cabbf7f0ac81e03c8481dbcf8011400",
+      "template_sha256": "sha256:d70330a476dbd3a0986b95e2a66cd0fec2fbfa6c064136193a2e7aef40a0516a",
       "source_path": "Kavya/server.py",
       "source_ranges": ["4700-4805", "6500-7135", "12495-12620", "13496-13512"],
       "extraction": "startup-only concrete Google/Azure STT, Claude/Gemini LLM, and ElevenLabs/Gemini/Rime TTS construction; synthetic mode is CI-gated and production refuses it"
@@ -95,7 +95,7 @@
     },
     {
       "template_path": "runtime/tts_adapters.py.tmpl",
-      "template_sha256": "sha256:16aa737d2a39fcb14b88b1b7e33552b06d4fed4dbda59457c007b3939d76c642",
+      "template_sha256": "sha256:4baea4122f98261b7ee84e3acad65ac911e3110d2bb8eb442634793a14fdde06",
       "source_path": "Kavya/server.py",
       "source_ranges": ["3075-3090", "2092-2310", "13112-13152", "13407-13848"],
       "source_evidence": [

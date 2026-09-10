@@ -72,5 +72,13 @@ def build_service_app(runtime: RuntimeDependencies) -> FastAPI:
 
         await gateway.handle(websocket, create_session)
 
+    @app.on_event("shutdown")
+    async def shutdown_runtime() -> None:
+        close = getattr(runtime.provider_adapter, "close", None)
+        if callable(close):
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
     app.state.smartpbx_gateway = gateway
     return app
