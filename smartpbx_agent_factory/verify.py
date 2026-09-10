@@ -33,6 +33,8 @@ _SLUG = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62})$")
 _CI_IDENTIFIER = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62})$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 _SHA256_REF = re.compile(r"^sha256:[0-9a-f]{64}$")
+_REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
+_RUN_ID = re.compile(r"^[1-9][0-9]{0,19}$")
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$")
 _REQUIRED_EVENTS = ("connected", "start", "media", "stop", "hangup")
 _TERMINAL_PATHS = ("stop", "hangup")
@@ -203,8 +205,10 @@ _ATTESTATION_CASES = (
 class LifecycleAttestation:
     """Repository-owned, redacted CI observation bound to one exact artifact."""
 
+    repository: str
     lane: str
-    source_sha: str
+    head_sha: str
+    run_id: str
     artifact_digest: str
     source_revision: str
     template_version: str
@@ -214,12 +218,14 @@ class LifecycleAttestation:
     observed_cases: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        _safe_report_text(self.repository, "attestation repository", _REPOSITORY, limit=201)
         _safe_report_text(self.lane, "attestation lane", _CI_IDENTIFIER, limit=63)
-        _safe_report_text(self.source_sha, "attestation source_sha", _REVISION, limit=40)
+        _safe_report_text(self.head_sha, "attestation head_sha", _REVISION, limit=40)
+        _safe_report_text(self.run_id, "attestation run_id", _RUN_ID, limit=20)
         _safe_report_text(self.artifact_digest, "attestation artifact_digest", _SHA256, limit=64)
         _safe_report_text(self.source_revision, "attestation source_revision", _REVISION, limit=40)
         _safe_report_text(self.template_version, "attestation template_version", _VERSION)
-        if self.fixture_kind not in {"generated-agent", "canonical-review-only"} or self.observed_cases != _ATTESTATION_CASES:
+        if self.lane != "backend" or self.fixture_kind not in {"generated-agent", "canonical-review-only"} or self.observed_cases != _ATTESTATION_CASES:
             raise VerificationError("lifecycle attestation has an invalid fixed contract")
         if self.fixture_kind == "generated-agent":
             _safe_report_text(self.template_allowlist_digest, "attestation template_allowlist_digest", _SHA256, limit=64)
@@ -231,23 +237,29 @@ class LifecycleAttestation:
                 raise VerificationError("canonical lifecycle attestation has invalid template evidence")
 
 
-def load_lifecycle_attestation(path: Path, *, agent_dir: Path, lane: str, source_sha: str) -> LifecycleAttestation:
+def load_lifecycle_attestation(
+    path: Path, *, agent_dir: Path, repository: str, lane: str, head_sha: str, run_id: str,
+) -> LifecycleAttestation:
     """Load only a repository-produced lifecycle observation, never caller booleans."""
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise VerificationError("lifecycle attestation is unavailable") from exc
     expected_keys = {
-        "schema_version", "lane", "source_sha", "artifact_digest", "source_revision", "template_version",
+        "schema_version", "repository", "lane", "head_sha", "run_id", "artifact_digest", "source_revision", "template_version",
         "template_allowlist_digest", "candidate_provenance_digest", "fixture_kind", "observed_cases",
     }
-    if not isinstance(raw, dict) or set(raw) != expected_keys or raw.get("schema_version") != 1 or raw.get("lane") != lane or raw.get("source_sha") != source_sha:
+    if (
+        not isinstance(raw, dict) or set(raw) != expected_keys or raw.get("schema_version") != 1
+        or raw.get("repository") != repository or raw.get("lane") != lane
+        or raw.get("head_sha") != head_sha or raw.get("run_id") != run_id
+    ):
         raise VerificationError("lifecycle attestation has an invalid repository schema")
     observed = raw.get("observed_cases")
     if not isinstance(observed, list) or not all(isinstance(item, str) for item in observed):
         raise VerificationError("lifecycle attestation observed cases are invalid")
     attestation = LifecycleAttestation(
-        lane=raw["lane"], source_sha=raw["source_sha"], artifact_digest=raw["artifact_digest"],
+        repository=raw["repository"], lane=raw["lane"], head_sha=raw["head_sha"], run_id=raw["run_id"], artifact_digest=raw["artifact_digest"],
         source_revision=raw["source_revision"], template_version=raw["template_version"],
         template_allowlist_digest=raw["template_allowlist_digest"],
         candidate_provenance_digest=raw["candidate_provenance_digest"], fixture_kind=raw["fixture_kind"],

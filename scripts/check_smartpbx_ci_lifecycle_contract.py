@@ -43,7 +43,7 @@ def main() -> int:
         "SMARTPBX_KNOWLEDGE_DIR=/app/knowledge_docs",
         "SMARTPBX_PROVIDER_PROFILE_PATH=/app/config/provider_profile.json",
         "validate_allowlist_metadata", "CANDIDATE_PROVENANCE", "_normal_runtime_binding", "_canonical_fixture_binding",
-        "rejected_status", "status authentication", "--attestation", "--lane", "--source-sha", "observed_cases",
+        "rejected_status", "status authentication", "--attestation", "--lane", "--repository", "--head-sha", "--run-id", "observed_cases",
     ):
         require(required in runner_source, f"runner missing {required!r}")
     for forbidden in (
@@ -70,11 +70,14 @@ def main() -> int:
     require("SmartPBX Agents/**" in workflow, "workflow must cover generated-tree changes")
     require("scripts/check_smartpbx_ci_lifecycle_contract.py" in workflow and "scripts/run_smartpbx_ci_lifecycle.py" in workflow, "workflow paths must cover both lifecycle scripts")
     require("timeout-minutes: 10" in workflow, "workflow lifecycle job must be bounded")
+    require('branches: [main, "smartpbx-agent-factory/**"]' in workflow, "workflow must allow only main and exact factory review branches")
+    require('branches: ["**"]' not in workflow, "workflow must not run lifecycle proof on arbitrary branches")
     require("github.event_name" in workflow and "github.event.before" in workflow and "github.event.pull_request.base.sha" in workflow, "workflow must select a robust diff base")
     require("canonical_fixture=\"SmartPBX Agents/.ci-lifecycle-canonical\"" in workflow, "workflow must name the canonical review-only fixture")
     require("canonical review-only CI fixture is required" in workflow, "workflow must fail rather than pass lifecycle-relevant changes without the fixture")
     require("--canonical-fixture" in workflow and "relevant_changed" in workflow, "workflow must run the canonical fixture on every lifecycle-relevant change")
     require("--attestation" in workflow and "actions/upload-artifact@v4" in workflow, "workflow must publish redacted lifecycle attestation evidence")
+    require("--lane backend" in workflow and "--repository" in workflow and "--head-sha" in workflow and "--run-id" in workflow, "workflow attestations must bind the backend repository, head, and run")
     return 0
 
 

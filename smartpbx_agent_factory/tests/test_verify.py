@@ -149,7 +149,7 @@ def test_ci_lifecycle_runner_requires_the_runtime_integration_contract():
         "active_sessions", "active_tasks", "active_resources", "admitted_total", "released_total",
         "canonical_ci_fixture", "template_allowlist_digest", "candidate_provenance_digest", "--canonical-fixture",
         "validate_allowlist_metadata", "_normal_runtime_binding", "_canonical_fixture_binding",
-        "rejected_status", "--attestation", "observed_cases",
+        "rejected_status", "--attestation", "--repository", "--head-sha", "--run-id", "observed_cases",
     ):
         assert required in runner
     assert "ANTHROPIC_API_KEY" not in runner
@@ -166,13 +166,17 @@ def test_ci_workflow_cannot_pass_without_the_canonical_review_only_fixture():
     assert "--canonical-fixture" in workflow
     assert "--attestation" in workflow
     assert "actions/upload-artifact@v4" in workflow
+    assert 'branches: [main, "smartpbx-agent-factory/**"]' in workflow
+    assert "--lane backend" in workflow
 
 
 def test_verifier_exposes_a_redacted_attestation_reader_without_caller_booleans():
     source = inspect.getsource(__import__("smartpbx_agent_factory.verify", fromlist=["load_lifecycle_attestation"]))
+    attestation_source = inspect.getsource(__import__("smartpbx_agent_factory.verify", fromlist=["LifecycleAttestation"]).LifecycleAttestation)
     assert "def load_lifecycle_attestation" in source
     assert "observed_cases" in source
     assert "lifecycle_succeeded" not in source
+    assert 'self.lane != "backend"' in attestation_source
 
 
 def test_provenance_cannot_be_rewritten_to_match_a_modified_artifact(tmp_path):

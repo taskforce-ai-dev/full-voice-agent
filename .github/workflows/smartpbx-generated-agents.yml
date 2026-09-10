@@ -4,7 +4,7 @@ on:
   pull_request:
     paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", "scripts/check_smartpbx_ci_lifecycle_contract.py", "scripts/materialize_smartpbx_ci_fixture.py", "scripts/run_smartpbx_ci_lifecycle.py", ".github/workflows/smartpbx-generated-agents.yml"]
   push:
-    branches: [main]
+    branches: [main, "smartpbx-agent-factory/**"]
     paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", "scripts/check_smartpbx_ci_lifecycle_contract.py", "scripts/materialize_smartpbx_ci_fixture.py", "scripts/run_smartpbx_ci_lifecycle.py", ".github/workflows/smartpbx-generated-agents.yml"]
 
 permissions:
@@ -63,7 +63,7 @@ jobs:
               exit 1
             fi
             python scripts/materialize_smartpbx_ci_fixture.py --fixture "$canonical_fixture" --output "$RUNNER_TEMP/smartpbx-ci-canonical-materialization.json"
-            python scripts/run_smartpbx_ci_lifecycle.py --canonical-fixture "$canonical_fixture" --attestation "$attestation_dir/canonical.json" --lane smartpbx-generated-agent --source-sha "${{ github.sha }}"
+            python scripts/run_smartpbx_ci_lifecycle.py --canonical-fixture "$canonical_fixture" --attestation "$attestation_dir/canonical.json" --lane backend --repository "${{ github.repository }}" --head-sha "${{ github.event.pull_request.head.sha || github.sha }}" --run-id "${{ github.run_id }}"
           fi
           found=false
           while IFS= read -r -d '' agent_dir; do
@@ -73,7 +73,7 @@ jobs:
             fi
             found=true
             python -m pytest "$agent_dir/tests"
-            python scripts/run_smartpbx_ci_lifecycle.py "$agent_dir" --attestation "$attestation_dir/$(basename "$agent_dir").json" --lane smartpbx-generated-agent --source-sha "${{ github.sha }}"
+            python scripts/run_smartpbx_ci_lifecycle.py "$agent_dir" --attestation "$attestation_dir/$(basename "$agent_dir").json" --lane backend --repository "${{ github.repository }}" --head-sha "${{ github.event.pull_request.head.sha || github.sha }}" --run-id "${{ github.run_id }}"
           done < /tmp/smartpbx-agent-dirs
           if [ "$generated_changed" = true ] && [ "$found" = false ]; then
             echo "no generated agent directory for a generated-tree change" >&2

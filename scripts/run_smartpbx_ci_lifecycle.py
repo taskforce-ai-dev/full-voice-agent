@@ -39,6 +39,7 @@ AUTH_HEADER = re.compile(r"^\s*SMARTPBX_AUTH_HEADER_NAME:\s*['\"]([^'\"]+)['\"]\
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 LANE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 HEALTH_WAIT_SECONDS = 20
 HEALTH_POLL_SECONDS = 0.25
 WEBSOCKET_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -412,9 +413,14 @@ def inspect_image(image: str, provenance: dict[str, object]) -> None:
         raise LifecycleError("built image provenance differs from the generated tree")
 
 
-def write_attestation(path: Path, *, provenance: dict[str, object], lane: str, source_sha: str, canonical_fixture: bool) -> None:
-    if not LANE.fullmatch(lane) or not SHA.fullmatch(source_sha):
-        raise LifecycleError("CI attestation lane or source SHA is invalid")
+def write_attestation(
+    path: Path, *, provenance: dict[str, object], lane: str, repository: str, head_sha: str, run_id: str,
+    canonical_fixture: bool,
+) -> None:
+    if lane != "backend":
+        raise LifecycleError("runtime lifecycle attestations are valid only for the backend lane")
+    if not LANE.fullmatch(lane) or not REPOSITORY.fullmatch(repository) or not SHA.fullmatch(head_sha) or not re.fullmatch(r"[1-9][0-9]{0,19}", run_id):
+        raise LifecycleError("CI attestation repository, lane, head SHA, or run ID is invalid")
     artifact = provenance.get("artifact_digest")
     source_revision = provenance.get("source_revision")
     template_version = provenance.get("template_version")
@@ -422,8 +428,10 @@ def write_attestation(path: Path, *, provenance: dict[str, object], lane: str, s
         raise LifecycleError("CI attestation provenance is incomplete")
     document = {
         "schema_version": 1,
+        "repository": repository,
         "lane": lane,
-        "source_sha": source_sha,
+        "head_sha": head_sha,
+        "run_id": run_id,
         "artifact_digest": artifact,
         "source_revision": source_revision,
         "template_version": template_version,
@@ -448,7 +456,9 @@ def main() -> int:
     parser.add_argument("--canonical-fixture", action="store_true")
     parser.add_argument("--attestation", type=Path, required=True)
     parser.add_argument("--lane", required=True)
-    parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--head-sha", required=True)
+    parser.add_argument("--run-id", required=True)
     args = parser.parse_args()
     agent_dir = args.agent_dir.resolve()
     if not agent_dir.is_dir():
@@ -508,7 +518,10 @@ def main() -> int:
         command(["docker", "rm", "--force", container], allow_failure=True)
         command(["docker", "image", "rm", "--force", image], allow_failure=True)
         command(["docker", "network", "rm", network], allow_failure=True)
-    write_attestation(args.attestation, provenance=provenance, lane=args.lane, source_sha=args.source_sha, canonical_fixture=args.canonical_fixture)
+    write_attestation(
+        args.attestation, provenance=provenance, lane=args.lane, repository=args.repository,
+        head_sha=args.head_sha, run_id=args.run_id, canonical_fixture=args.canonical_fixture,
+    )
     print("smartpbx lifecycle: verified cases=5")
     return 0
 

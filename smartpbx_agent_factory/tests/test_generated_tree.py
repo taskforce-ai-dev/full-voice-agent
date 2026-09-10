@@ -68,8 +68,11 @@ def test_generated_tree_contains_non_deploy_ci_gate_and_pending_activation_check
 
 def test_root_generated_agent_workflow_has_exact_safe_triggers_and_stable_check_name():
     workflow = Path(".github/workflows/smartpbx-generated-agents.yml").read_text(encoding="utf-8")
-    assert 'paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", ".github/workflows/smartpbx-generated-agents.yml"]' in workflow
-    assert "branches: [main]" in workflow
+    assert '"SmartPBX Agents/**"' in workflow
+    assert '"smartpbx_agent_factory/**"' in workflow
+    assert '".github/workflows/smartpbx-generated-agents.yml"' in workflow
+    assert 'branches: [main, "smartpbx-agent-factory/**"]' in workflow
+    assert 'branches: ["**"]' not in workflow
     assert "smartpbx-generated-agent:" in workflow
     assert "python -m pytest smartpbx_agent_factory/tests" in workflow
     assert 'if [ -d "SmartPBX Agents" ]; then' in workflow
