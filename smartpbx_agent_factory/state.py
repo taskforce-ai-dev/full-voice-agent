@@ -48,6 +48,7 @@ class GenerationState:
     knowledge_approval_digest: str | None = None
     plan_approval_digest: str | None = None
     stage_digests: dict[str, str] = field(default_factory=dict)
+    lane_records: dict[str, dict[str, str]] = field(default_factory=dict)
     blocked_reason: str | None = None
 
     @classmethod
@@ -105,6 +106,24 @@ class GenerationState:
             raise StateError("stage digest name and value are required")
         self.stage_digests[name] = digest
 
+    def record_lane(self, lane: str, *, output_digest: str, head_sha: str, artifact_digest: str, ciphertext_reference: str = "") -> None:
+        """Persist only bounded non-secret resume evidence for one owned lane."""
+        if lane not in {"backend", "operations", "website"}:
+            raise StateError("lane is invalid")
+        values = (output_digest, artifact_digest)
+        if any(not isinstance(value, str) or len(value) != 64 or set(value) - set("0123456789abcdef") for value in values) or (
+            not isinstance(head_sha, str) or len(head_sha) != 40 or set(head_sha) - set("0123456789abcdef")
+        ):
+            raise StateError("lane digest is invalid")
+        if ciphertext_reference and (not isinstance(ciphertext_reference, str) or len(ciphertext_reference) > 240 or "\x00" in ciphertext_reference):
+            raise StateError("ciphertext reference is invalid")
+        self.lane_records[lane] = {
+            "output_digest": output_digest,
+            "head_sha": head_sha,
+            "artifact_digest": artifact_digest,
+            "ciphertext_reference": ciphertext_reference,
+        }
+
     def block(self, reason: str) -> None:
         if self.stage is Stage.THREE_PRS_OPENED:
             raise StateError("cannot block a generation after three PRs opened")
@@ -128,6 +147,7 @@ class GenerationState:
             "knowledge_approval_digest": self.knowledge_approval_digest,
             "plan_approval_digest": self.plan_approval_digest,
             "stage_digests": dict(self.stage_digests),
+            "lane_records": {name: dict(value) for name, value in self.lane_records.items()},
             "blocked_reason": self.blocked_reason,
         }
 
@@ -143,11 +163,16 @@ class GenerationState:
                 knowledge_approval_digest=raw.get("knowledge_approval_digest"),
                 plan_approval_digest=raw.get("plan_approval_digest"),
                 stage_digests=dict(raw.get("stage_digests", {})),
+                lane_records={str(name): dict(value) for name, value in dict(raw.get("lane_records", {})).items()},
                 blocked_reason=raw.get("blocked_reason"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise StateError("invalid serialized generation state") from exc
         _require_stage_artifacts(state)
+        for lane, record in state.lane_records.items():
+            if not isinstance(record, dict):
+                raise StateError("serialized lane record is invalid")
+            state.record_lane(lane, **record)
         if (
             state.knowledge_approval_digest is not None
             and state.knowledge_approval_digest != state.knowledge_review_digest

@@ -11,7 +11,7 @@ from typing import Iterable
 from .gitops import WorktreeHandle, WorktreeManager, WorktreeConflictError, manager_owned_worktree_target
 from .model import AgentManifest
 from .resources import DerivedResources
-from .secrets import SecretAudit, SecretError, SecretProvider
+from .secrets import SecretAudit, SecretError, SecretPlan, SecretProvider, derive_secret_plan
 
 
 class SecretLeakError(SecretError):
@@ -86,6 +86,7 @@ def render_operations_artifacts(
     *,
     worktree: WorktreeHandle,
     worktree_manager: WorktreeManager,
+    secret_plan: SecretPlan | None = None,
 ) -> SecretAudit:
     """Write non-secret metadata and a single SOPS ciphertext document.
 
@@ -110,7 +111,7 @@ def render_operations_artifacts(
         raise SecretError("operations artifact target already exists")
     secret_path = agent_dir / "secrets.sops.yaml"
     metadata_path = agent_dir / "metadata.yaml"
-    secret_name = f"{resources.slug}/wss_token"
+    plan = secret_plan or derive_secret_plan(manifest, resources)
     created_agent_dir = False
     try:
         agents.mkdir(mode=0o700, exist_ok=True)
@@ -118,26 +119,36 @@ def render_operations_artifacts(
             raise SecretError("operations artifact directory is unsafe")
         agent_dir.mkdir(exist_ok=False, mode=0o700)
         created_agent_dir = True
-        value = provider.generate(secret_name, length=32)
-        if not isinstance(value, str) or not value:
-            raise SecretError("secret provider returned an invalid generated value")
-        ciphertext = provider.encrypt_yaml(_plaintext_secret_document({"wss_token": value}), path=secret_path)
+        values: dict[str, str] = {}
+        for requirement in plan.requirements:
+            value = (
+                provider.generate(requirement.record_id, length=32)
+                if requirement.generated
+                else provider.fetch(requirement.record_id)
+            )
+            if not isinstance(value, str) or not value:
+                raise SecretError("secret provider returned an invalid secret value")
+            values[requirement.runtime_env] = value
+        ciphertext = provider.encrypt_yaml(_plaintext_secret_document(values), path=secret_path)
         if not isinstance(ciphertext, bytes) or not ciphertext:
             raise SecretError("secret provider returned invalid ciphertext")
         metadata_path.write_bytes(_metadata(manifest, resources))
         secret_path.write_bytes(ciphertext)
         metadata_path.chmod(0o600)
         secret_path.chmod(0o600)
-        _scan_artifact_tree(agent_dir, (value,))
+        _scan_artifact_tree(agent_dir, values.values())
     except Exception:
         if created_agent_dir:
             _remove_generation_artifacts(root, agent_dir)
         raise
     audit = provider.audit_report() if hasattr(provider, "audit_report") else None
     fetched_names = getattr(audit, "fetched_names", ()) if audit is not None else ()
-    generated_names = getattr(audit, "generated_names", (secret_name,)) if audit is not None else (secret_name,)
-    if not generated_names:
-        generated_names = (secret_name,)
+    generated_names = getattr(audit, "generated_names", ()) if audit is not None else ()
+    fetched_names = getattr(audit, "fetched_names", ()) if audit is not None else ()
+    expected_fetched = tuple(item.record_id for item in plan.requirements if not item.generated)
+    expected_generated = tuple(item.record_id for item in plan.requirements if item.generated)
+    if tuple(sorted(set(fetched_names))) != tuple(sorted(expected_fetched)) or tuple(sorted(set(generated_names))) != tuple(sorted(expected_generated)):
+        raise SecretError("secret provider audit does not exactly cover the secret plan")
     return SecretAudit(
         fetched_names=fetched_names,
         generated_names=generated_names,

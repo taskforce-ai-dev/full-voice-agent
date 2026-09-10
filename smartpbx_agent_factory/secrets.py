@@ -17,6 +17,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, MutableMapping, Protocol, Sequence
 
+from .model import AgentManifest
+from .resources import DerivedResources
+
 
 class SecretError(RuntimeError):
     """Raised when secret material cannot be safely resolved or encrypted."""
@@ -39,6 +42,99 @@ class CredentialSourcePolicy:
     provider: str
     path: str
     rotation_owner: str
+
+
+@dataclass(frozen=True)
+class SecretRequirement:
+    """One internal record and its distinct runtime environment name.
+
+    The record id is the only identifier passed to a credential reader.  The
+    environment name is rendered only into the private operations ciphertext;
+    neither is a secret value.
+    """
+
+    record_id: str
+    runtime_env: str
+    generated: bool = False
+
+    def __post_init__(self) -> None:
+        if not _SECRET_NAME_RE.fullmatch(self.record_id):
+            raise SecretError("invalid secret record id")
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", self.runtime_env):
+            raise SecretError("invalid secret runtime environment name")
+        if not isinstance(self.generated, bool):
+            raise SecretError("secret generation flag is invalid")
+
+
+@dataclass(frozen=True)
+class SecretPlan:
+    """Exact secret surface selected by immutable manifest language pipelines."""
+
+    requirements: tuple[SecretRequirement, ...]
+
+    def __post_init__(self) -> None:
+        if not self.requirements:
+            raise SecretError("secret plan must not be empty")
+        if len({item.record_id for item in self.requirements}) != len(self.requirements):
+            raise SecretError("secret plan record ids must be distinct")
+        if len({item.runtime_env for item in self.requirements}) != len(self.requirements):
+            raise SecretError("secret plan runtime environment names must be distinct")
+
+    @property
+    def operations_env_names(self) -> tuple[str, ...]:
+        return tuple(item.runtime_env for item in self.requirements)
+
+    @property
+    def website_env_names(self) -> tuple[str, ...]:
+        return ()
+
+    def requirement_for_env(self, runtime_env: str) -> SecretRequirement:
+        for item in self.requirements:
+            if item.runtime_env == runtime_env:
+                return item
+        raise SecretError("secret plan does not contain runtime environment name")
+
+    def digest_payload(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            {"record_id": item.record_id, "runtime_env": item.runtime_env, "generated": item.generated}
+            for item in self.requirements
+        )
+
+
+_PROVIDER_ENV = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "azure": "AZURE_SPEECH_KEY",
+    "deepgram": "DEEPGRAM_API_KEY",
+    "elevenlabs": "ELEVENLABS_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+
+
+def derive_secret_plan(manifest: AgentManifest, resources: DerivedResources) -> SecretPlan:
+    """Select shared provider records once plus the per-agent WSS credential.
+
+    This function is deterministic and deliberately has no secret-provider
+    dependency.  A provider occurring in multiple language roles therefore
+    maps to one shared record and one runtime environment variable.
+    """
+    if not isinstance(manifest, AgentManifest) or not isinstance(resources, DerivedResources):
+        raise SecretError("secret plan requires manifest and derived resources")
+    if manifest.slug != resources.slug:
+        raise SecretError("secret plan resources do not match manifest")
+    providers = sorted({provider.lower() for language in manifest.languages for provider in (language.stt, language.llm, language.tts)})
+    requirements: list[SecretRequirement] = []
+    for provider in providers:
+        env = _PROVIDER_ENV.get(provider)
+        if env is None:
+            normalized = re.sub(r"[^a-z0-9]+", "_", provider).strip("_").upper()
+            if not normalized:
+                raise SecretError("provider cannot form a secret environment name")
+            env = f"SMARTPBX_PROVIDER_{normalized}_CREDENTIAL"
+        requirements.append(SecretRequirement(f"providers/{provider}", env))
+    requirements.append(SecretRequirement(f"agents/{resources.slug}/wss_token", "SMARTPBX_WS_TOKEN", generated=True))
+    return SecretPlan(tuple(requirements))
 
 
 @dataclass(frozen=True)

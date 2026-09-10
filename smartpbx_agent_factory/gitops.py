@@ -113,6 +113,28 @@ class WorktreeManager:
         """Expose the narrow ownership proof needed by transaction cleanup."""
         return isinstance(handle, WorktreeHandle) and self._handles.get(id(handle)) is handle
 
+    def reuse_recorded(self, handle: WorktreeHandle) -> WorktreeHandle:
+        """Re-adopt one persisted, exact owned worktree after Git revalidation.
+
+        This is intentionally narrower than ``create``: it never fetches,
+        recreates, resets, cleans, or follows a caller path.  It proves the
+        target is still the recorded worktree at the immutable revision.
+        """
+        if not isinstance(handle, WorktreeHandle) or not _OWNERSHIP_TOKEN_RE.fullmatch(handle.ownership_token):
+            raise WorktreeConflictError("recorded worktree ownership evidence is invalid")
+        if handle.temporary_root != self._temporary_root:
+            raise WorktreeConflictError("recorded worktree temporary root does not match manager")
+        primary = self._validate_primary(handle.primary)
+        target = self._validate_target(handle.target, must_not_exist=False)
+        if primary != handle.primary or target != handle.target or not _SHA_RE.fullmatch(handle.revision):
+            raise WorktreeConflictError("recorded worktree ownership changed")
+        matching = self._worktree_entries(primary).get(target)
+        expected_branch = f"refs/heads/{handle.branch}" if handle.branch else None
+        if matching != (handle.revision, expected_branch):
+            raise WorktreeConflictError("recorded worktree does not match immutable binding")
+        self._handles[id(handle)] = handle
+        return handle
+
     def remove_recorded(self, handle: WorktreeHandle) -> None:
         """Remove a state-root-protected handle after authoritative Git validation.
 

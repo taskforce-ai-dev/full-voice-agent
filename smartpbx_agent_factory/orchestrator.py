@@ -11,7 +11,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol
 
 from .catalogue import CapabilityCatalogue
 from .gitops import DirtyWorktreeError, WorktreeConflictError, WorktreeHandle, WorktreeManager
@@ -28,9 +28,11 @@ from .knowledge import (
 from .provenance import ProvenanceError, validate_allowlist_metadata
 from .readiness import ReadinessAuthority, ReadinessError, ReadinessEvidence
 from .render import IncompleteTemplateError, render_backend
+from .operations import render_operations_artifacts
+from .website import render_website_artifacts
 from .resources import AllocationRegistry, DerivedResources, ResourceConflict, derive_resources
 from .schema import ManifestError, manifest_digest, parse_manifest
-from .secrets import SecretAudit, SecretProvider
+from .secrets import SecretAudit, SecretPlan, SecretProvider, derive_secret_plan
 from .state import GenerationState, Stage, StateError
 from .verify import VerificationReport
 
@@ -58,6 +60,54 @@ class PlanReport:
     rendered_plan: str
 
 
+class InventoryProvider(Protocol):
+    """Read-only external collision inventory seam; it never allocates."""
+
+    def snapshot(self) -> Mapping[str, object]: ...
+
+
+class VerificationCoordinator(Protocol):
+    """Coordinator-owned verification seam; callers cannot submit booleans."""
+
+    def verify(self, *, generation_id: str, resources: DerivedResources, lane_records: Mapping[str, Mapping[str, str]]) -> tuple[ReadinessEvidence, Mapping[str, VerificationReport]]: ...
+
+
+@dataclass(frozen=True)
+class LaneBinding:
+    """One immutable remote/revision/target plus its owning manager."""
+
+    manager: object
+    primary: Path
+    remote: str
+    revision: str
+    target: Path
+
+    def __post_init__(self) -> None:
+        if self.manager is None or not all(isinstance(item, Path) and item.is_absolute() for item in (self.primary, self.target)):
+            raise ValueError("lane binding requires manager and absolute paths")
+        if not isinstance(self.remote, str) or not self.remote or not isinstance(self.revision, str) or len(self.revision) != 40 or set(self.revision) - set("0123456789abcdef"):
+            raise ValueError("lane binding requires immutable remote revision")
+
+
+@dataclass(frozen=True)
+class GenerationBinding:
+    """The sole transaction config for backend, private operations and website."""
+
+    backend: LaneBinding
+    operations: LaneBinding
+    website: LaneBinding
+    release_allowed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.release_allowed is not False:
+            raise ValueError("factory generation is review-only")
+        lanes = (self.backend, self.operations, self.website)
+        if not all(isinstance(lane, LaneBinding) for lane in lanes):
+            raise ValueError("three lane bindings are required")
+        if len({lane.target for lane in lanes}) != 3:
+            raise ValueError("lane targets must be distinct")
+
+
 @dataclass(frozen=True)
 class _StoredGeneration:
     state: GenerationState
@@ -68,6 +118,8 @@ class _StoredGeneration:
     plan_digest: str
     cleanup_inventory: "CleanupInventory | None"
     knowledge_review: KnowledgeReview | None = None
+    plan_artifact: Mapping[str, object] | None = None
+    binding: Mapping[str, Mapping[str, str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +154,8 @@ class GenerationOrchestrator:
         catalogue_path: Path | None = None,
         worktree_manager_factory: Callable[[Path], WorktreeManager] = WorktreeManager,
         knowledge_builder_factory: Callable[[Path], KnowledgeBuilder] | None = None,
+        inventory_provider: InventoryProvider | None = None,
+        verification_coordinator: VerificationCoordinator | None = None,
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise GenerationInfrastructureError("state root must be an absolute path")
@@ -114,6 +168,8 @@ class GenerationOrchestrator:
         self._knowledge_builder_factory = knowledge_builder_factory or (
             lambda approved_root: KnowledgeBuilderImpl(approved_source_roots=(approved_root,))
         )
+        self._inventory_provider = inventory_provider
+        self._verification_coordinator = verification_coordinator
 
     def inspect(self, manifest_path: Path) -> Mapping[str, object]:
         """Report non-mutating prerequisite status; no target checkout is touched."""
@@ -157,13 +213,13 @@ class GenerationOrchestrator:
             except ResourceConflict as error:
                 raise GenerationBlockedError(f"resource allocation conflict: {error}") from error
             resource_digest = _digest_payload(asdict(resources))
-            plan_digest = _digest_payload(
-                {"manifest": digest, "knowledge": knowledge_digest, "resources": resource_digest}
-            )
+            artifact = _canonical_plan_artifact(manifest.slug, resources, digest, knowledge_digest, resource_digest)
+            plan_digest = _digest_payload(artifact)
+            artifact = {**artifact, "digest": plan_digest}
             state = GenerationState.start(f"gen-{uuid.uuid4().hex}", digest)
             state.transition(Stage.INPUT_COLLECTED)
             stored = _StoredGeneration(
-                state, manifest_path, resources, knowledge_digest, resource_digest, plan_digest, CleanupInventory()
+                state, manifest_path, resources, knowledge_digest, resource_digest, plan_digest, CleanupInventory(), None, artifact
             )
             self._save(stored)
         return PlanReport(
@@ -173,11 +229,16 @@ class GenerationOrchestrator:
             knowledge_digest=knowledge_digest,
             resource_digest=resource_digest,
             plan_digest=plan_digest,
-            rendered_plan=_redacted_plan(state.generation_id, manifest.slug, resources, digest, knowledge_digest, resource_digest),
+            rendered_plan=_redacted_plan(state.generation_id, manifest.slug, resources, digest, knowledge_digest, resource_digest, plan_digest),
         )
 
     def generate(
-        self, generation_id: str, *, backend_worktree: BackendWorktreeBinding | None = None
+        self,
+        generation_id: str,
+        *,
+        binding: GenerationBinding | None = None,
+        secret_provider: SecretProvider | None = None,
+        backend_worktree: BackendWorktreeBinding | None = None,
     ) -> GenerationState:
         stored = self._load_verified(generation_id)
         if stored.state.stage is Stage.INPUT_COLLECTED:
@@ -191,33 +252,70 @@ class GenerationOrchestrator:
         manifest = self._current_manifest(stored)
         review = self._approved_knowledge_review(stored)
         self._require_complete_runtime_template()
-        if not isinstance(backend_worktree, BackendWorktreeBinding):
-            raise GenerationBlockedError("a manager-owned backend worktree binding is required")
-        try:
-            handle = backend_worktree.manager.create(
-                primary=backend_worktree.primary,
-                remote=backend_worktree.remote,
-                revision=backend_worktree.revision,
-                target=backend_worktree.target,
-                branch=f"smartpbx-agent-factory/{stored.state.generation_id}",
+        if binding is None:
+            if not isinstance(backend_worktree, BackendWorktreeBinding):
+                raise GenerationBlockedError("a single generation binding is required")
+            # Legacy single-lane callers remain explicitly unable to render.
+            raise GenerationBlockedError("backend-only generation is not a complete review transaction")
+        # Protocols cannot be used reliably with isinstance for injected fakes.
+        if secret_provider is None or not all(hasattr(secret_provider, name) for name in ("validate", "fetch", "generate", "encrypt_yaml", "audit_report")):
+            raise GenerationBlockedError("a validated secret provider is required for all lanes")
+        serialized_binding = _serialize_generation_binding(binding)
+        if stored.binding and stored.binding != serialized_binding:
+            raise GenerationBlockedError("generation binding differs from its persisted immutable binding")
+        if not stored.binding:
+            stored = _StoredGeneration(
+                stored.state, stored.manifest_path, stored.resources, stored.knowledge_digest,
+                stored.resource_digest, stored.plan_digest, stored.cleanup_inventory,
+                stored.knowledge_review, stored.plan_artifact, serialized_binding,
             )
-            self.record_owned_worktree(generation_id, backend_worktree.manager, handle)
-        except (DirtyWorktreeError, WorktreeConflictError) as error:
-            raise GenerationBlockedError("backend worktree creation failed") from error
-        # Never render below the factory state directory.  The target is the
-        # exact handle just created and recorded by WorktreeManager.
+            self._save(stored)
         try:
-            render_backend(
+            handles = {
+                role: self._create_or_reuse_lane(generation_id, lane)
+                for role, lane in (("backend", binding.backend), ("operations", binding.operations), ("website", binding.website))
+            }
+        except (DirtyWorktreeError, WorktreeConflictError) as error:
+            raise GenerationBlockedError("generation worktree creation failed") from error
+        # All targets now exist and are manager-owned before any renderer can write.
+        try:
+            backend_report = render_backend(
                 manifest,
                 review,
                 stored.resources,
-                handle,
-                worktree_manager=backend_worktree.manager,
+                handles["backend"],
+                worktree_manager=binding.backend.manager,
                 state=stored.state,
+            )
+            secret_plan = derive_secret_plan(manifest, stored.resources)
+            operations_audit = render_operations_artifacts(
+                manifest, stored.resources, secret_provider,
+                worktree=handles["operations"], worktree_manager=binding.operations.manager,
+                secret_plan=secret_plan,
+            )
+            backend_digest = _tree_digest(handles["backend"].target)
+            render_website_artifacts(
+                manifest, stored.resources, backend_artifact_digest=backend_digest,
+                backend_branch_sha=handles["backend"].revision,
+                worktree=handles["website"], worktree_manager=binding.website.manager,
             )
         except IncompleteTemplateError as error:
             raise GenerationBlockedError(str(error)) from error
-        raise GenerationBlockedError("generated backend requires configured operations, website, verification, and PR bindings")
+        except Exception as error:
+            raise GenerationBlockedError("review transaction renderer failed") from error
+        stored = self._load_verified(generation_id)
+        ciphertext_reference = ",".join(operations_audit.ciphertext_paths)
+        for role, handle in handles.items():
+            output_digest = _tree_digest(handle.target)
+            stored.state.record_lane(
+                role,
+                output_digest=output_digest,
+                head_sha=handle.revision,
+                artifact_digest=backend_digest if role == "backend" else output_digest,
+                ciphertext_reference=ciphertext_reference if role == "operations" else "",
+            )
+        self._save(stored)
+        return stored.state
 
     def resume(
         self,
@@ -225,6 +323,8 @@ class GenerationOrchestrator:
         *,
         knowledge_approval: str | None = None,
         plan_approval: str | None = None,
+        binding: GenerationBinding | None = None,
+        secret_provider: SecretProvider | None = None,
     ) -> GenerationState:
         stored = self._load_verified(generation_id)
         state = stored.state
@@ -237,7 +337,35 @@ class GenerationOrchestrator:
         except StateError as error:
             raise GenerationBlockedError(str(error)) from error
         self._save(stored)
+        if state.stage is Stage.GENERATED and binding is not None:
+            return self.generate(generation_id, binding=binding, secret_provider=secret_provider)
         return state
+
+    def _create_or_reuse_lane(self, generation_id: str, lane: LaneBinding) -> WorktreeHandle:
+        """Create once, then revalidate the recorded exact target on resume."""
+        stored = self._load_verified(generation_id)
+        inventory = stored.cleanup_inventory
+        if inventory is None:
+            raise GenerationBlockedError("generation cleanup inventory is unavailable")
+        existing = next((item for item in inventory.worktrees if item.target == lane.target), None)
+        if existing is not None:
+            if (existing.primary, existing.revision, existing.target) != (lane.primary.resolve(), lane.revision, lane.target.resolve()):
+                raise GenerationBlockedError("recorded lane binding does not match immutable generation binding")
+            revalidate = getattr(lane.manager, "reuse_recorded", None)
+            if not callable(revalidate):
+                raise GenerationBlockedError("recorded worktree requires manager revalidation")
+            return revalidate(existing)
+        create = getattr(lane.manager, "create", None)
+        if not callable(create):
+            raise GenerationBlockedError("lane manager cannot create worktrees")
+        handle = create(
+            primary=lane.primary, remote=lane.remote, revision=lane.revision, target=lane.target,
+            branch=f"smartpbx-agent-factory/{generation_id}",
+        )
+        if not isinstance(handle, WorktreeHandle):
+            raise GenerationBlockedError("lane manager returned an invalid worktree handle")
+        self.record_owned_worktree(generation_id, lane.manager, handle)
+        return handle
 
     def record_secrets_resolved(
         self, generation_id: str, *, provider: SecretProvider
@@ -256,11 +384,12 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("SecretProvider validation or audit retrieval failed") from error
         if not isinstance(audit, SecretAudit):
             raise GenerationBlockedError("SecretProvider audit is invalid")
-        expected_names = {f"{stored.resources.slug}/wss_token"}
+        manifest = self._current_manifest(stored)
+        secret_plan = derive_secret_plan(manifest, stored.resources)
+        expected_names = {item.record_id for item in secret_plan.requirements}
         audited_names = audit.fetched_names + audit.generated_names
         if len(audited_names) != len(set(audited_names)) or set(audited_names) != expected_names:
             raise GenerationBlockedError("secret audit names do not exactly match manifest requirements")
-        manifest = self._current_manifest(stored)
         review = self._build_knowledge_review(stored, manifest)
         stored = _replace_knowledge_review(stored, review)
         audit_digest = _digest_payload(
@@ -268,6 +397,7 @@ class GenerationOrchestrator:
                 "fetched_names": audit.fetched_names,
                 "generated_names": audit.generated_names,
                 "ciphertext_paths": audit.ciphertext_paths,
+                "secret_plan": secret_plan.digest_payload(),
             }
         )
         try:
@@ -311,6 +441,9 @@ class GenerationOrchestrator:
                     final_inventory.completed_plaintext_paths,
                     completed=True,
                 ),
+                stored.knowledge_review,
+                stored.plan_artifact,
+                stored.binding,
             )
         )
         return stored.state
@@ -345,6 +478,9 @@ class GenerationOrchestrator:
                     inventory.completed_worktree_targets,
                     inventory.completed_plaintext_paths,
                 ),
+                stored.knowledge_review,
+                stored.plan_artifact,
+                stored.binding,
             )
         )
 
@@ -391,6 +527,24 @@ class GenerationOrchestrator:
         produced by the verification seam and writes durable evidence before
         recording the state transition.
         """
+        raise GenerationBlockedError("verification reports are coordinator-owned; call verify_generation")
+
+    def verify_generation(self, generation_id: str) -> Path:
+        """Persist readiness only from the injected, authority-owning coordinator."""
+        if self._verification_coordinator is None:
+            raise GenerationBlockedError("verification is library-only until a coordinator is configured")
+        stored = self._load_verified(generation_id)
+        try:
+            readiness, reports = self._verification_coordinator.verify(
+                generation_id=generation_id, resources=stored.resources, lane_records=stored.state.lane_records
+            )
+        except Exception as error:
+            raise GenerationBlockedError("coordinator verification failed") from error
+        return self._persist_verified_pr_readiness(generation_id, readiness, tuple(stored.cleanup_inventory.worktrees if stored.cleanup_inventory else ()), reports)
+
+    def _persist_verified_pr_readiness(
+        self, generation_id: str, readiness: ReadinessEvidence, worktrees: tuple[object, ...], verification_reports: Mapping[str, VerificationReport]
+    ) -> Path:
         stored = self._load_verified(generation_id)
         state = stored.state
         if state.stage is not Stage.GENERATED:
@@ -453,14 +607,17 @@ class GenerationOrchestrator:
         if manifest_digest(manifest) != stored.state.manifest_digest:
             raise GenerationBlockedError("manifest digest changed; create a new generation")
         knowledge_digest = _digest_payload({"sources": [asdict(source) for source in manifest.knowledge_sources]})
-        resources = derive_resources(manifest, AllocationRegistry())
+        try:
+            resources = derive_resources(
+                manifest, self._reserved_resources(exclude_generation_id=generation_id)
+            )
+        except ResourceConflict as error:
+            raise GenerationBlockedError("persisted allocation now conflicts with registry") from error
         resource_digest = _digest_payload(asdict(resources))
         plan_digest = _digest_payload(
-            {
-                "manifest": stored.state.manifest_digest,
-                "knowledge": knowledge_digest,
-                "resources": resource_digest,
-            }
+            _canonical_plan_artifact(
+                manifest.slug, resources, stored.state.manifest_digest, knowledge_digest, resource_digest
+            )
         )
         if (
             knowledge_digest != stored.knowledge_digest
@@ -592,13 +749,15 @@ class GenerationOrchestrator:
         except OSError as error:
             raise GenerationInfrastructureError("cannot lock resource allocations") from error
 
-    def _reserved_resources(self) -> AllocationRegistry:
+    def _reserved_resources(self, *, exclude_generation_id: str | None = None) -> AllocationRegistry:
         allocations: dict[str, list[object]] = {
             "ports": [], "hostnames": [], "services": [], "containers": [], "slugs": [],
             "folders": [], "wss_headers": [], "ghcr_repositories": [], "ci_identifiers": [],
             "secret_record_keys": [],
         }
         for path in self._state_root.glob("gen-*.json"):
+            if exclude_generation_id is not None and path.name == f"{exclude_generation_id}.json":
+                continue
             if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
                 raise GenerationInfrastructureError("reserved generation state is unsafe")
             try:
@@ -616,6 +775,26 @@ class GenerationOrchestrator:
             allocations["ghcr_repositories"].append(resources.ghcr_repository)
             allocations["ci_identifiers"].append(resources.ci_identifier)
             allocations["secret_record_keys"].append(resources.secret_record_key)
+        if self._inventory_provider is not None:
+            try:
+                try:
+                    external = self._inventory_provider.snapshot(exclude_generation_id=exclude_generation_id)
+                except TypeError:
+                    external = self._inventory_provider.snapshot()
+            except Exception as error:
+                raise GenerationInfrastructureError("external allocation inventory is unavailable") from error
+            if not isinstance(external, Mapping):
+                raise GenerationInfrastructureError("external allocation inventory is invalid")
+            allowed = set(allocations) | {"repositories"}
+            if set(external) - allowed:
+                raise GenerationInfrastructureError("external allocation inventory is invalid")
+            for name, values in external.items():
+                if name == "repositories":
+                    allocations["folders"].extend(str(value) for value in values if isinstance(values, (list, tuple, set)))
+                    continue
+                if not isinstance(values, (list, tuple, set)):
+                    raise GenerationInfrastructureError("external allocation inventory is invalid")
+                allocations[name].extend(values)
         return AllocationRegistry(allocations)
 
     @staticmethod
@@ -632,7 +811,7 @@ class GenerationOrchestrator:
             path = self._state_path(stored.state.generation_id)
             self._require_private_state_file(path)
             payload = {
-                "version": 5,
+                "version": 6,
                 "state": stored.state.to_dict(),
                 "manifest_path": str(stored.manifest_path),
                 "resources": asdict(stored.resources),
@@ -641,6 +820,8 @@ class GenerationOrchestrator:
                 "plan_digest": stored.plan_digest,
                 "cleanup_inventory": _serialize_cleanup_inventory(stored.cleanup_inventory),
                 "knowledge_review": _serialize_knowledge_review(stored.knowledge_review),
+                "plan_artifact": dict(stored.plan_artifact or {}),
+                "binding": dict(stored.binding or {}),
             }
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{stored.state.generation_id}.", dir=self._state_root, text=True
@@ -674,7 +855,7 @@ class GenerationOrchestrator:
             path = self._state_path(generation_id)
             self._require_private_state_file(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2, 3, 4, 5}:
+            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2, 3, 4, 5, 6}:
                 raise ValueError("state document is invalid")
             state = GenerationState.from_dict(dict(raw["state"]))
             resources = DerivedResources(**dict(raw["resources"]))
@@ -687,12 +868,16 @@ class GenerationOrchestrator:
                 for value in digests
             ):
                 raise ValueError("state document is invalid")
-            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory")) if raw["version"] in {4, 5} else None
-            review = _parse_knowledge_review(raw.get("knowledge_review")) if raw["version"] == 5 else None
+            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory")) if raw["version"] in {4, 5, 6} else None
+            review = _parse_knowledge_review(raw.get("knowledge_review")) if raw["version"] in {5, 6} else None
+            artifact = raw.get("plan_artifact") if raw["version"] == 6 else None
+            binding = raw.get("binding") if raw["version"] == 6 else None
+            if raw["version"] == 6 and (not isinstance(artifact, Mapping) or artifact.get("digest") != state.plan_digest or not isinstance(binding, Mapping)):
+                raise ValueError("state document is missing canonical transaction artifacts")
             if state.stage in {Stage.KNOWLEDGE_REVIEW_REQUIRED, Stage.PLAN_REVIEW_REQUIRED, Stage.GENERATED, Stage.VERIFIED, Stage.THREE_PRS_OPENED}:
                 if review is None or review.digest != state.knowledge_review_digest:
                     raise ValueError("state document is missing its canonical knowledge review")
-            return _StoredGeneration(state, manifest_path, resources, *digests, inventory, review)
+            return _StoredGeneration(state, manifest_path, resources, *digests, inventory, review, artifact, binding)
         except (OSError, KeyError, TypeError, ValueError, StateError) as error:
             raise GenerationInfrastructureError("cannot load generation state") from error
 
@@ -781,6 +966,23 @@ class GenerationOrchestrator:
 def _digest_payload(payload: object) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _tree_digest(root: Path) -> str:
+    """Hash a generated lane without recording contents or following links."""
+    if not isinstance(root, Path) or root.is_symlink() or not root.is_dir():
+        raise GenerationBlockedError("owned worktree output is unavailable")
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise GenerationBlockedError("owned worktree output may not traverse a symlink")
+        if not path.is_file() or ".git" in path.parts:
+            continue
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def _available_binary(name: str) -> bool:
@@ -913,6 +1115,8 @@ def _replace_cleanup_inventory(stored: _StoredGeneration, inventory: CleanupInve
         stored.plan_digest,
         inventory,
         stored.knowledge_review,
+        stored.plan_artifact,
+        stored.binding,
     )
 
 
@@ -926,6 +1130,8 @@ def _replace_knowledge_review(stored: _StoredGeneration, review: KnowledgeReview
         stored.plan_digest,
         stored.cleanup_inventory,
         review,
+        stored.plan_artifact,
+        stored.binding,
     )
 
 
@@ -1016,6 +1222,7 @@ def _redacted_plan(
     manifest_digest_value: str,
     knowledge_digest: str,
     resource_digest: str,
+    plan_digest: str,
 ) -> str:
     return "\n".join(
         (
@@ -1026,7 +1233,44 @@ def _redacted_plan(
             f"manifest_digest={manifest_digest_value}",
             f"knowledge_digest={knowledge_digest}",
             f"resource_digest={resource_digest}",
+            f"plan_digest={plan_digest}",
             "secret_resolution=required",
             "knowledge_review=not-started",
         )
     )
+
+
+def _canonical_plan_artifact(
+    slug: str,
+    resources: DerivedResources,
+    manifest_digest_value: str,
+    knowledge_digest: str,
+    resource_digest: str,
+) -> dict[str, object]:
+    """The exact redacted object whose digest an approval binds."""
+    return {
+        "schema_version": 1,
+        "release_allowed": False,
+        "slug": slug,
+        "resources": {
+            "smartpbx_hostname": resources.smartpbx_hostname,
+            "website_hostname": resources.website_hostname,
+            "smartpbx_port": resources.smartpbx_port,
+            "website_port": resources.website_port,
+            "secret_record_key": resources.secret_record_key,
+        },
+        "manifest_digest": manifest_digest_value,
+        "knowledge_digest": knowledge_digest,
+        "resource_digest": resource_digest,
+    }
+
+
+def _serialize_generation_binding(binding: GenerationBinding) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = {}
+    for name, lane in (("backend", binding.backend), ("operations", binding.operations), ("website", binding.website)):
+        result[name] = {
+            "primary": str(lane.primary.resolve()), "remote": lane.remote,
+            "revision": lane.revision, "target": str(lane.target.resolve()),
+            "manager_type": f"{type(lane.manager).__module__}.{type(lane.manager).__qualname__}",
+        }
+    return result
