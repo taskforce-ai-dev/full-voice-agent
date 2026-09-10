@@ -15,17 +15,28 @@ class RecognizerResult:
 
     text: str
     is_final: bool
-    result_id: int
+    result_id: str | int | None = None
 
     def __post_init__(self) -> None:
         if (
             not isinstance(self.text, str)
             or not isinstance(self.is_final, bool)
-            or not isinstance(self.result_id, int)
-            or isinstance(self.result_id, bool)
-            or self.result_id < 0
+            or (
+                self.result_id is not None
+                and (
+                    not isinstance(self.result_id, str | int)
+                    or isinstance(self.result_id, bool)
+                    or isinstance(self.result_id, str) and len(self.result_id) > 256
+                )
+            )
         ):
             raise ValueError("invalid recognizer result")
+
+    def duplicate_identity(self) -> tuple[str | int, bool, str] | None:
+        """Return an optional exact-dedup key, never a provider ordering token."""
+        if self.result_id is None:
+            return None
+        return (self.result_id, self.is_final, self.text)
 
 
 RecognizerCallback = Callable[[RecognizerResult], None]
@@ -55,8 +66,24 @@ class LLMAdapter(Protocol):
 
     async def generate_response(
         self, transcript: str, language: str, prompt: str
-    ) -> str | AsyncIterable[str]:
-        """Return one response or a streaming sequence of response fragments."""
+    ) -> str | AsyncIterable["ProvisionalSentence | TerminalCommit"]:
+        """Return one atomic response or a terminal-committed streaming response."""
+
+
+@dataclass(frozen=True)
+class ProvisionalSentence:
+    """A generation-local sentence that is unsafe to speak until committed."""
+
+    text: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise ValueError("provisional sentence must be text")
+
+
+@dataclass(frozen=True)
+class TerminalCommit:
+    """The provider completed the current response; provisional text is durable."""
 
 
 class TTSAdapter(Protocol):

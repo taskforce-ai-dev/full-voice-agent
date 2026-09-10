@@ -7,15 +7,19 @@ endpointing, generation, and teardown decision on its event loop.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterable
+from collections import deque
+from collections.abc import AsyncIterable, Callable
+from time import monotonic
 from typing import Any
 
 from product_profile import LanguageProfile, ProductProfile
 from provider_adapters import (
     ContinuousRecognizer,
     ConversationProviderAdapter,
+    ProvisionalSentence,
     RecognizerResult,
     Retriever,
+    TerminalCommit,
 )
 
 
@@ -31,15 +35,50 @@ class ConversationTurnEngine:
         retriever: Retriever | None = None,
         endpointing_silence_seconds: float = 1.0,
         final_grace_seconds: float = 0.5,
+        barge_in_min_chars: int = 12,
+        barge_in_debounce_seconds: float = 0.6,
+        pre_audio_min_events: int = 2,
+        pre_audio_min_seconds: float = 0.25,
+        duplicate_identity_window_seconds: float = 2.0,
+        clock: Callable[[], float] = monotonic,
     ) -> None:
-        if endpointing_silence_seconds < 0 or final_grace_seconds < 0:
-            raise ValueError("endpointing delays must be non-negative")
+        if (
+            not isinstance(endpointing_silence_seconds, (int, float))
+            or isinstance(endpointing_silence_seconds, bool)
+            or endpointing_silence_seconds < 0
+            or not isinstance(final_grace_seconds, (int, float))
+            or isinstance(final_grace_seconds, bool)
+            or final_grace_seconds < 0
+            or not isinstance(barge_in_min_chars, int)
+            or isinstance(barge_in_min_chars, bool)
+            or not 0 <= barge_in_min_chars <= 200
+            or not isinstance(barge_in_debounce_seconds, (int, float))
+            or isinstance(barge_in_debounce_seconds, bool)
+            or not 0 <= barge_in_debounce_seconds <= 5.0
+            or not isinstance(pre_audio_min_events, int)
+            or isinstance(pre_audio_min_events, bool)
+            or not 1 <= pre_audio_min_events <= 8
+            or not isinstance(pre_audio_min_seconds, (int, float))
+            or isinstance(pre_audio_min_seconds, bool)
+            or not 0 <= pre_audio_min_seconds <= 5.0
+            or not isinstance(duplicate_identity_window_seconds, (int, float))
+            or isinstance(duplicate_identity_window_seconds, bool)
+            or not 0 < duplicate_identity_window_seconds <= 10.0
+            or not callable(clock)
+        ):
+            raise ValueError("invalid conversation turn timing")
         self._provider_adapter = provider_adapter
         self._transport = transport
         self._product_profile = product_profile
         self._retriever = retriever
         self._endpointing_silence_seconds = endpointing_silence_seconds
         self._final_grace_seconds = final_grace_seconds
+        self._barge_in_min_chars = barge_in_min_chars
+        self._barge_in_debounce_seconds = barge_in_debounce_seconds
+        self._pre_audio_min_events = pre_audio_min_events
+        self._pre_audio_min_seconds = pre_audio_min_seconds
+        self._duplicate_identity_window_seconds = duplicate_identity_window_seconds
+        self._clock = clock
         self.turns_completed = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._recognizer: ContinuousRecognizer | None = None
@@ -47,10 +86,16 @@ class ConversationTurnEngine:
         self._recognizer_epoch = 0
         self._generation = 0
         self._endpoint_token = 0
-        self._last_result_id = -1
+        self._recent_result_identities: deque[tuple[tuple[str | int, bool, str], float]] = deque(maxlen=32)
         self._pending_transcript = ""
         self._endpoint_handle: asyncio.TimerHandle | None = None
         self._turn_task: asyncio.Task[None] | None = None
+        self._deferred_endpoint_due = False
+        self._audible_generation: int | None = None
+        self._audible_since: float | None = None
+        self._pre_audio_generation: int | None = None
+        self._pre_audio_first_result_at: float | None = None
+        self._pre_audio_result_count = 0
         self._tasks: set[asyncio.Task[Any]] = set()
         self._callback_lock = asyncio.Lock()
         self._closed = False
@@ -85,7 +130,7 @@ class ConversationTurnEngine:
         await self._cancel_active_turn(clear_audio=True)
         await self._close_recognizer()
         self._pending_transcript = ""
-        self._last_result_id = -1
+        self._recent_result_identities.clear()
         self._invalidate_endpointing()
         await self._start_recognizer(language)
 
@@ -111,6 +156,7 @@ class ConversationTurnEngine:
         self._recognizer_epoch += 1
         self._invalidate_endpointing()
         self._pending_transcript = ""
+        self._deferred_endpoint_due = False
         await self._cancel_active_turn(clear_audio=True)
         await self._close_recognizer()
 
@@ -159,15 +205,16 @@ class ConversationTurnEngine:
             if (
                 self._closed
                 or epoch != self._recognizer_epoch
-                or result.result_id <= self._last_result_id
             ):
                 return
-            self._last_result_id = result.result_id
+            if self._is_duplicate(result):
+                return
             text = result.text.strip()
             if not text:
                 return
             if self._turn_task is not None and not self._turn_task.done():
-                await self._cancel_active_turn(clear_audio=True)
+                if self._should_barge_in(text):
+                    await self._cancel_active_turn(clear_audio=True)
             self._pending_transcript = text
             self._arm_endpointing(
                 self._final_grace_seconds if result.is_final else self._endpointing_silence_seconds
@@ -192,8 +239,10 @@ class ConversationTurnEngine:
             self._closed
             or token != self._endpoint_token
             or epoch != self._recognizer_epoch
-            or self._turn_task is not None and not self._turn_task.done()
         ):
+            return
+        if self._turn_task is not None and not self._turn_task.done():
+            self._deferred_endpoint_due = bool(self._pending_transcript.strip())
             return
         transcript = self._pending_transcript.strip()
         self._pending_transcript = ""
@@ -209,6 +258,12 @@ class ConversationTurnEngine:
     async def _cancel_active_turn(self, *, clear_audio: bool) -> None:
         self._invalidate_endpointing()
         self._generation += 1
+        self._deferred_endpoint_due = False
+        self._audible_generation = None
+        self._audible_since = None
+        self._pre_audio_generation = None
+        self._pre_audio_first_result_at = None
+        self._pre_audio_result_count = 0
         task, self._turn_task = self._turn_task, None
         if task is not None and not task.done():
             task.cancel()
@@ -221,8 +276,56 @@ class ConversationTurnEngine:
     def _owns_generation(self, generation: int) -> bool:
         return not self._closed and generation == self._generation
 
+    def _is_duplicate(self, result: RecognizerResult) -> bool:
+        """Suppress only an immediate exact callback replay with an explicit ID."""
+        identity = result.duplicate_identity()
+        if identity is None:
+            return False
+        now = self._clock()
+        while (
+            self._recent_result_identities
+            and now - self._recent_result_identities[0][1] > self._duplicate_identity_window_seconds
+        ):
+            self._recent_result_identities.popleft()
+        if any(previous == identity for previous, _seen_at in self._recent_result_identities):
+            return True
+        self._recent_result_identities.append((identity, now))
+        return False
+
+    def _should_barge_in(self, text: str) -> bool:
+        """Apply Kavya's speaking-time material, debounce, and echo policy."""
+        language = self._language
+        if language is None or len(text.strip()) < self._barge_in_min_chars or self._is_echo(text, language):
+            return False
+        generation = self._generation
+        now = self._clock()
+        if self._audible_generation == generation and self._audible_since is not None:
+            return now - self._audible_since >= self._barge_in_debounce_seconds
+        if self._pre_audio_generation != generation:
+            return False
+        self._pre_audio_result_count += 1
+        if self._pre_audio_first_result_at is None:
+            self._pre_audio_first_result_at = now
+        return (
+            self._pre_audio_result_count >= self._pre_audio_min_events
+            and now - self._pre_audio_first_result_at >= self._pre_audio_min_seconds
+        )
+
+    def _is_echo(self, text: str, language: LanguageProfile) -> bool:
+        """Use optional provider self-audio classification without making it required."""
+        classifier = getattr(self._provider_adapter, "is_echo", None)
+        if not callable(classifier):
+            return False
+        try:
+            return bool(classifier(text, language.code))
+        except Exception:
+            return False
+
     async def _run_turn(self, transcript: str, language: LanguageProfile, generation: int) -> None:
         try:
+            self._pre_audio_generation = generation
+            self._pre_audio_first_result_at = None
+            self._pre_audio_result_count = 0
             context = ""
             if self._retriever is not None:
                 context = await self._retriever.retrieve(transcript, self._product_profile)
@@ -231,7 +334,7 @@ class ConversationTurnEngine:
             prompt = _build_prompt(self._product_profile, language, context)
             emitted = False
             response = await self._provider_adapter.generate_response(transcript, language.code, prompt)
-            async for response_chunk in _iterate_text(response):
+            async for response_chunk in _iterate_committed_text(response):
                 if not self._owns_generation(generation):
                     return
                 if not response_chunk:
@@ -242,6 +345,10 @@ class ConversationTurnEngine:
                         return
                     if audio_chunk:
                         await self._transport.send_audio(audio_chunk)
+                        if self._owns_generation(generation) and self._audible_generation != generation:
+                            self._audible_generation = generation
+                            self._audible_since = self._clock()
+                            self._pre_audio_generation = None
                         emitted = True
             if not self._owns_generation(generation):
                 return
@@ -254,6 +361,12 @@ class ConversationTurnEngine:
         finally:
             if self._turn_task is asyncio.current_task():
                 self._turn_task = None
+                self._pre_audio_generation = None
+                self._pre_audio_first_result_at = None
+                self._pre_audio_result_count = 0
+                if self._deferred_endpoint_due and self._pending_transcript.strip() and not self._closed:
+                    self._deferred_endpoint_due = False
+                    self._arm_endpointing(0.0)
 
     def _track(self, task: asyncio.Task[Any]) -> None:
         self._tasks.add(task)
@@ -271,14 +384,24 @@ def _build_prompt(profile: ProductProfile, language: LanguageProfile, context: s
     return "\n\n".join(piece for piece in pieces if piece)
 
 
-async def _iterate_text(value: str | AsyncIterable[str]) -> AsyncIterable[str]:
+async def _iterate_committed_text(
+    value: str | AsyncIterable[ProvisionalSentence | TerminalCommit],
+) -> AsyncIterable[str]:
     if isinstance(value, str):
         yield value
         return
+    provisional: list[str] = []
     async for item in value:
-        if not isinstance(item, str):
-            raise TypeError("LLM adapter yielded non-text content")
-        yield item
+        if isinstance(item, ProvisionalSentence):
+            provisional.append(item.text)
+            continue
+        if isinstance(item, TerminalCommit):
+            for sentence in provisional:
+                if sentence:
+                    yield sentence
+            return
+        raise TypeError("LLM adapter yielded an unsupported stream event")
+    raise RuntimeError("LLM stream ended before terminal commit")
 
 
 async def _iterate_audio(value: bytes | AsyncIterable[bytes]) -> AsyncIterable[bytes]:
