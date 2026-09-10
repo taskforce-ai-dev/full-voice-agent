@@ -10,6 +10,7 @@ from smartpbx_agent_factory.prs import (
     GenerationWorktree,
     PRCreationFailure,
     PRReadiness,
+    WorktreeInspection,
     open_linked_prs,
 )
 from smartpbx_agent_factory.state import GenerationState, Stage, StateError
@@ -32,7 +33,7 @@ class FakePRProvider:
         if role == self.fail_role:
             raise RuntimeError("provider rejected private request")
         url = self.returned_urls.get(
-            role, f"https://example.test/{repository}/pull/{len(self.open_order) + 1}"
+            role, f"https://github.com/{repository}/pull/{len(self.open_order) + 1}"
         )
         self.open_order.append(role)
         self.calls.append(f"open:{role}")
@@ -55,6 +56,19 @@ class FakePRProvider:
 @pytest.fixture
 def fake_provider() -> FakePRProvider:
     return FakePRProvider()
+
+
+@dataclass
+class FakeWorktreeInspector:
+    snapshots: dict[Path, WorktreeInspection]
+    inspected: list[Path] = field(default_factory=list)
+
+    def inspect_worktree(self, *, path: Path, ownership_handle: str) -> WorktreeInspection:
+        self.inspected.append(path)
+        snapshot = self.snapshots.get(path)
+        if snapshot is None or snapshot.ownership_handle != ownership_handle:
+            raise RuntimeError("unverified worktree handle")
+        return snapshot
 
 
 def fixture_state(stage: Stage = Stage.VERIFIED) -> GenerationState:
@@ -85,6 +99,7 @@ def fixture_readiness() -> PRReadiness:
         artifact_digests={"backend": "c" * 64, "operations": "d" * 64, "website": "e" * 64},
         review_label="Acme inquiry review",
         wss_url="wss://smartpbx-acme.example.test/ws/v1/smartpbx/media",
+        expected_wss_hostname="smartpbx-acme.example.test",
         allowed_wss_paths=("/ws/v1/smartpbx/media",),
         readiness_digest="f" * 64,
         secret_scan_digest="1" * 64,
@@ -133,6 +148,25 @@ def fixture_worktrees() -> tuple[GenerationWorktree, ...]:
     )
 
 
+def fixture_inspector(
+    worktrees: tuple[GenerationWorktree, ...] | None = None,
+) -> FakeWorktreeInspector:
+    worktrees = fixture_worktrees() if worktrees is None else worktrees
+    return FakeWorktreeInspector(
+        {
+            worktree.path: WorktreeInspection(
+                path=worktree.path,
+                repository=worktree.repository,
+                branch=worktree.branch,
+                head_sha=worktree.branch_sha,
+                clean=True,
+                ownership_handle=worktree.ownership.handle,
+            )
+            for worktree in worktrees
+        }
+    )
+
+
 def test_pr_creation_requires_verified_state(fake_provider: FakePRProvider) -> None:
     with pytest.raises(StateError, match="VERIFIED"):
         open_linked_prs(
@@ -140,6 +174,7 @@ def test_pr_creation_requires_verified_state(fake_provider: FakePRProvider) -> N
             state=fixture_state(Stage.GENERATED),
             readiness=fixture_readiness(),
             worktrees=fixture_worktrees(),
+            inspector=fixture_inspector(),
         )
 
 
@@ -150,6 +185,7 @@ def test_three_prs_are_opened_sequentially_with_immutable_digests(fake_provider:
         state=state,
         readiness=fixture_readiness(),
         worktrees=fixture_worktrees(),
+        inspector=fixture_inspector(),
     )
 
     assert result.backend_url
@@ -180,6 +216,7 @@ def test_initial_bodies_link_only_previously_opened_prs(fake_provider: FakePRPro
         state=fixture_state(),
         readiness=fixture_readiness(),
         worktrees=fixture_worktrees(),
+        inspector=fixture_inspector(),
     )
 
     assert result.operations_url not in fake_provider.bodies[result.backend_url]
@@ -198,6 +235,7 @@ def test_pr_body_is_redacted_without_losing_public_wss_metadata(fake_provider: F
         state=fixture_state(),
         readiness=readiness,
         worktrees=fixture_worktrees(),
+        inspector=fixture_inspector(),
         redactions=(secret,),
     )
 
@@ -212,6 +250,7 @@ def test_website_pr_is_review_only_until_routing_activation(fake_provider: FakeP
         state=fixture_state(),
         readiness=fixture_readiness(),
         worktrees=fixture_worktrees(),
+        inspector=fixture_inspector(),
     )
 
     body = fake_provider.bodies[result.website_url]
@@ -232,7 +271,7 @@ def test_missing_readiness_gate_fails_closed_and_blocks_generation(field: str, f
     state = fixture_state()
 
     with pytest.raises(StateError, match="prerequisite"):
-        open_linked_prs(fake_provider, state=state, readiness=readiness, worktrees=fixture_worktrees())
+        open_linked_prs(fake_provider, state=state, readiness=readiness, worktrees=fixture_worktrees(), inspector=fixture_inspector())
 
     assert state.stage is Stage.BLOCKED
     assert fake_provider.open_order == []
@@ -246,7 +285,7 @@ def test_dirty_or_non_owned_worktree_fails_closed_before_provider_call(fake_prov
     state = fixture_state()
 
     with pytest.raises(StateError, match="worktree"):
-        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=tuple(worktrees))
+        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=tuple(worktrees), inspector=fixture_inspector())
 
     assert state.stage is Stage.BLOCKED
     assert fake_provider.open_order == []
@@ -260,6 +299,9 @@ def test_dirty_or_non_owned_worktree_fails_closed_before_provider_call(fake_prov
         "https://example.test/pull/1?token=leak",
         "https://example.test/pull/1#fragment",
         "https://example.test/pull/1\nnext",
+        "https://github.com/taskforce/operations/pull/1",
+        "https://github.com/taskforce/backend/issues/1",
+        "https://github.com/taskforce/backend/pull/not-a-number",
     ),
 )
 def test_provider_url_must_be_bounded_credential_free_https_before_storage(
@@ -269,7 +311,7 @@ def test_provider_url_must_be_bounded_credential_free_https_before_storage(
     state = fixture_state()
 
     with pytest.raises(PRCreationFailure) as raised:
-        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=fixture_worktrees())
+        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=fixture_worktrees(), inspector=fixture_inspector())
 
     assert raised.value.failed_role == "backend"
     assert dict(raised.value.opened_urls) == {}
@@ -285,6 +327,8 @@ def test_provider_url_must_be_bounded_credential_free_https_before_storage(
         "wss://smartpbx-acme.example.test/ws/v1/smartpbx/media?api_key=leak",
         "wss://smartpbx-acme.example.test/other",
         "wss://smartpbx-acme.example.test/ws/v1/smartpbx/media#fragment",
+        "wss://127.0.0.1/ws/v1/smartpbx/media",
+        "wss://smartpbx-other.example.test/ws/v1/smartpbx/media",
     ),
 )
 def test_public_wss_url_must_match_allowed_media_path_without_credentials_or_parameters(
@@ -298,6 +342,7 @@ def test_public_wss_url_must_match_allowed_media_path_without_credentials_or_par
             state=state,
             readiness=replace(fixture_readiness(), wss_url=wss_url),
             worktrees=fixture_worktrees(),
+            inspector=fixture_inspector(),
         )
 
     assert state.stage is Stage.BLOCKED
@@ -313,6 +358,7 @@ def test_non_string_redaction_fails_closed_without_provider_call(fake_provider: 
             state=state,
             readiness=fixture_readiness(),
             worktrees=fixture_worktrees(),
+            inspector=fixture_inspector(),
             redactions=(object(),),
         )
 
@@ -329,10 +375,92 @@ def test_readiness_report_must_be_generation_owned_repo_relative_metadata(fake_p
             state=state,
             readiness=replace(fixture_readiness(), readiness_report_path=Path("/tmp/private/readiness.json")),
             worktrees=fixture_worktrees(),
+            inspector=fixture_inspector(),
         )
 
     assert state.stage is Stage.BLOCKED
     assert fake_provider.open_order == []
+
+
+def test_readiness_report_path_must_be_the_exact_generation_metadata_filename(fake_provider: FakePRProvider) -> None:
+    state = fixture_state()
+
+    with pytest.raises(StateError, match="readiness report"):
+        open_linked_prs(
+            fake_provider,
+            state=state,
+            readiness=replace(
+                fixture_readiness(),
+                readiness_report_path=Path(".smartpbx-generations/gen-001/other.json"),
+            ),
+            worktrees=fixture_worktrees(),
+            inspector=fixture_inspector(),
+        )
+
+    assert state.stage is Stage.BLOCKED
+    assert fake_provider.open_order == []
+
+
+@pytest.mark.parametrize("field, value", (("repository", "taskforce/backend/extra"), ("branch", "backend\nunsafe")))
+def test_repository_and_branch_must_be_bounded_safe_git_identifiers(
+    field: str, value: str, fake_provider: FakePRProvider
+) -> None:
+    state = fixture_state()
+    worktrees = list(fixture_worktrees())
+    worktrees[0] = GenerationWorktree(**{**worktrees[0].__dict__, field: value})
+
+    with pytest.raises(StateError, match="worktree"):
+        open_linked_prs(
+            fake_provider,
+            state=state,
+            readiness=fixture_readiness(),
+            worktrees=tuple(worktrees),
+            inspector=fixture_inspector(),
+        )
+
+    assert state.stage is Stage.BLOCKED
+    assert fake_provider.open_order == []
+
+
+def test_review_label_rejects_control_characters_before_provider_call(fake_provider: FakePRProvider) -> None:
+    state = fixture_state()
+
+    with pytest.raises(StateError, match="review label"):
+        open_linked_prs(
+            fake_provider,
+            state=state,
+            readiness=replace(fixture_readiness(), review_label="Acme\nunsafe"),
+            worktrees=fixture_worktrees(),
+            inspector=fixture_inspector(),
+        )
+
+    assert state.stage is Stage.BLOCKED
+    assert fake_provider.open_order == []
+
+
+def test_inspector_rechecks_actual_head_cleanliness_and_handle_before_each_pr(fake_provider: FakePRProvider) -> None:
+    state = fixture_state()
+    worktrees = fixture_worktrees()
+    inspector = fixture_inspector(worktrees)
+    operations = worktrees[1]
+    inspector.snapshots[operations.path] = replace(
+        inspector.snapshots[operations.path], clean=False, head_sha="0" * 40
+    )
+
+    with pytest.raises(PRCreationFailure) as raised:
+        open_linked_prs(
+            fake_provider,
+            state=state,
+            readiness=fixture_readiness(),
+            worktrees=worktrees,
+            inspector=inspector,
+        )
+
+    assert raised.value.failed_role == "operations"
+    assert tuple(raised.value.opened_urls) == ("backend",)
+    assert fake_provider.open_order == ["backend"]
+    assert inspector.inspected == [worktrees[0].path, operations.path]
+    assert state.stage is Stage.BLOCKED
 
 
 def test_worktree_must_be_contained_by_bound_generation_ownership_evidence(fake_provider: FakePRProvider) -> None:
@@ -343,7 +471,7 @@ def test_worktree_must_be_contained_by_bound_generation_ownership_evidence(fake_
     )
 
     with pytest.raises(StateError, match="worktree"):
-        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=tuple(worktrees))
+        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=tuple(worktrees), inspector=fixture_inspector())
 
     assert state.stage is Stage.BLOCKED
     assert fake_provider.open_order == []
@@ -354,7 +482,7 @@ def test_verified_state_requires_bound_readiness_and_ownership_digests(fake_prov
     state.stage_digests.pop("worktree_ownership")
 
     with pytest.raises(StateError, match="state digest"):
-        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=fixture_worktrees())
+        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=fixture_worktrees(), inspector=fixture_inspector())
 
     assert state.stage is Stage.BLOCKED
     assert fake_provider.open_order == []
@@ -365,7 +493,7 @@ def test_missing_provenance_record_fails_closed_before_provider_call(fake_provid
     readiness = replace(fixture_readiness(), provenance_source_revision="main")
 
     with pytest.raises(StateError, match="provenance"):
-        open_linked_prs(fake_provider, state=state, readiness=readiness, worktrees=fixture_worktrees())
+        open_linked_prs(fake_provider, state=state, readiness=readiness, worktrees=fixture_worktrees(), inspector=fixture_inspector())
 
     assert state.stage is Stage.BLOCKED
     assert fake_provider.open_order == []
@@ -376,7 +504,7 @@ def test_later_pr_failure_preserves_earlier_pr_and_reports_partial_state(fake_pr
     state = fixture_state()
 
     with pytest.raises(PRCreationFailure) as raised:
-        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=fixture_worktrees())
+        open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=fixture_worktrees(), inspector=fixture_inspector())
 
     failure = raised.value
     assert failure.failed_role == "operations"
