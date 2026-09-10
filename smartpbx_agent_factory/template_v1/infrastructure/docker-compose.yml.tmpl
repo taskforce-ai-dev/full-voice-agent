@@ -16,15 +16,11 @@ services:
       SMARTPBX_MAX_OUTBOUND_FRAMES: "${SMARTPBX_MAX_OUTBOUND_FRAMES:-512}"
       SMARTPBX_PRODUCT_PROFILE_PATH: "/app/config/product_profile.json"
       SMARTPBX_KNOWLEDGE_DIR: "/app/knowledge_docs"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      RIME_API_KEY: "${RIME_API_KEY:-}"
-      GOOGLE_APPLICATION_CREDENTIALS: "/app/gcp-credentials.json"
-      LLM_PROVIDER: "${LLM_PROVIDER:-anthropic}"
-      STT_PROVIDER: "${STT_PROVIDER:-google}"
-      TTS_PROVIDER: "${TTS_PROVIDER:-rime}"
+      SMARTPBX_PROVIDER_PROFILE_PATH: "/app/config/provider_profile.json"
+{{provider_environment}}
     volumes:
       - ./knowledge_docs:/app/knowledge_docs:ro
-      - ./gcp-credentials.json:/app/gcp-credentials.json:ro
+{{provider_volumes}}
     mem_limit: {{smartpbx_memory_limit}}
     cpus: {{smartpbx_cpus}}
     pids_limit: {{smartpbx_pids_limit}}
@@ -44,8 +40,8 @@ services:
       retries: 3
       start_period: 40s
     networks:
-      - runtime_internal
+      - {{smartpbx_service}}_bridge
 
 networks:
-  runtime_internal:
-    internal: true
+  {{smartpbx_service}}_bridge:
+    internal: false

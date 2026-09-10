@@ -75,6 +75,43 @@ _SECRET_PATTERNS = tuple(
     )
 )
 _BUSINESS_TOOLS = ("create_booking", "transfer_to_human", "hangup_call")
+_PROVIDER_RUNTIME = {
+    "azure": {"requirements": ("azure-cognitiveservices-speech==1.51.1",), "environment": ("AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION")},
+    "claude": {"requirements": ("anthropic==0.120.2",), "environment": ("ANTHROPIC_API_KEY",)},
+    "deepgram": {"requirements": ("httpx==0.28.1",), "environment": ("DEEPGRAM_API_KEY",)},
+    "elevenlabs": {"requirements": ("httpx==0.28.1",), "environment": ("ELEVENLABS_API_KEY",)},
+    "gemini": {"requirements": ("google-genai==2.16.0",), "environment": ("GEMINI_API_KEY",)},
+    "google": {"requirements": ("google-cloud-speech==2.40.0",), "environment": ("GOOGLE_APPLICATION_CREDENTIALS",)},
+    "rime": {"requirements": ("httpx==0.28.1",), "environment": ("RIME_API_KEY",)},
+}
+
+
+def _provider_runtime_contract(manifest: AgentManifest) -> tuple[dict[str, object], tuple[str, ...], str, str]:
+    """Derive only the dependencies, secrets, and mounts selected by language profiles."""
+    selected: set[str] = set()
+    languages: dict[str, dict[str, str]] = {}
+    for language in manifest.languages:
+        lanes = {"stt": language.stt, "llm": language.llm, "tts": language.tts}
+        unknown = sorted(set(lanes.values()) - set(_PROVIDER_RUNTIME))
+        if unknown:
+            raise RenderError(f"provider runtime is not approved: {unknown[0]}")
+        selected.update(lanes.values())
+        languages[language.code] = {
+            "stt": language.stt, "stt_model": language.stt_model,
+            "llm": language.llm, "llm_model": language.llm_model,
+            "tts": language.tts, "tts_model": language.tts_model,
+        }
+    requirements = sorted({item for provider in selected for item in _PROVIDER_RUNTIME[provider]["requirements"]})
+    environment = sorted({item for provider in selected for item in _PROVIDER_RUNTIME[provider]["environment"]})
+    environment_lines = []
+    for name in environment:
+        if name == "GOOGLE_APPLICATION_CREDENTIALS":
+            environment_lines.append(f'      {name}: "/app/gcp-credentials.json"')
+        else:
+            environment_lines.append(f'      {name}: "${{{name}:-}}"')
+    volume_lines = ["      - ./gcp-credentials.json:/app/gcp-credentials.json:ro"] if "GOOGLE_APPLICATION_CREDENTIALS" in environment else []
+    profile: dict[str, object] = {"languages": languages, "required_environment": environment}
+    return profile, tuple(requirements), "\n".join(environment_lines), "\n".join(volume_lines)
 
 
 def _load_default_allowlist() -> TemplateAllowlist:
@@ -286,6 +323,7 @@ def _files(
     if not isinstance(manifest.smartpbx.capacity, int) or isinstance(manifest.smartpbx.capacity, bool) or not 1 <= manifest.smartpbx.capacity <= 4:
         raise RenderError("SmartPBX max calls must be between 1 and 4")
     title = manifest.display_name
+    provider_profile, provider_requirements, provider_environment, provider_volumes = _provider_runtime_contract(manifest)
     compose = f'''services:
   {resources.smartpbx_service}:
     profiles: ["smartpbx"]
@@ -330,6 +368,9 @@ activation_state: pending
         "smartpbx_memory_limit": "1536m",
         "smartpbx_cpus": "2.0",
         "smartpbx_pids_limit": 256,
+        "provider_requirements": "\n".join(provider_requirements),
+        "provider_environment": provider_environment,
+        "provider_volumes": provider_volumes,
         "tls_certificate_path": "/run/secrets/smartpbx-tls-fullchain.pem",
         "tls_certificate_key_path": "/run/secrets/smartpbx-tls-private-key.pem",
     }
@@ -354,6 +395,10 @@ activation_state: pending
         "room_catalogue": {}, "room_aliases": {}, "transliterations": {}, "rates": {},
         "post_call_vocabulary": [], "knowledge_paths": ["/app/knowledge_docs/approved-facts.md"],
     }
+    provider_lanes = ("provider_stt.py", "provider_llm.py", "provider_tts.py")
+    missing_lanes = [name for name in provider_lanes if f"runtime/{name}.tmpl" not in templates]
+    if missing_lanes:
+        raise IncompleteTemplateError(f"INCOMPLETE_TEMPLATE: missing concrete provider lane: {missing_lanes[0]}")
     return {
         "AGENTS.md": "# Generated SmartPBX agent\n\nNo production provisioning or release is authorized by this tree.\n",
         "CLAUDE.md": "# Generated SmartPBX agent\n\nInquiry-only capability policy.\n",
@@ -373,8 +418,13 @@ activation_state: pending
         "smartpbx_transport.py": templates.get("runtime/smartpbx_transport.py.tmpl", "class SmartPBXMediaTransport: pass\n"),
         "product_profile.py": templates.get("runtime/product_profile.py.tmpl", "def load_product_profile(path): return object()\n"),
         "provider_adapters.py": templates.get("runtime/provider_adapters.py.tmpl", "class ConversationProviderAdapter: pass\n"),
+        "provider_runtime.py": templates.get("runtime/provider_runtime.py.tmpl", "def bind_provider_adapter(*_args): raise RuntimeError('provider lane unavailable')\n"),
+        "provider_stt.py": templates["runtime/provider_stt.py.tmpl"],
+        "provider_llm.py": templates["runtime/provider_llm.py.tmpl"],
+        "provider_tts.py": templates["runtime/provider_tts.py.tmpl"],
         "turn_engine.py": templates.get("runtime/turn_engine.py.tmpl", "class ConversationTurnEngine: pass\n"),
         "config/product_profile.json": json.dumps(product_profile, sort_keys=True, indent=2) + "\n",
+        "config/provider_profile.json": json.dumps(provider_profile, sort_keys=True, indent=2) + "\n",
         "tools.py": "TOOL_REGISTRY = {}\n",
         "website_demo.py": "ROUTES = ('/voice/demo-incoming',)\n# Browser tokens are issued only by the shared approved issuer.\n",
         "nginx-smartpbx.conf": infrastructure_template("nginx-smartpbx.conf.tmpl", "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n"),

@@ -14,8 +14,11 @@
     "product_profile.py",
     "provider_adapters.py",
     "turn_engine.py",
-    "config/product_profile.json"
+    "provider_runtime.py",
+    "config/product_profile.json",
+    "config/provider_profile.json"
   ],
+  "required_provider_adapter_outputs": ["provider_stt.py", "provider_llm.py", "provider_tts.py"],
   "approval": {
     "rendering": "blocked",
     "release": "blocked",

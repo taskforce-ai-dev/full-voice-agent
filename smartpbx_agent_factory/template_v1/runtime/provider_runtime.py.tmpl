@@ -1,0 +1,58 @@
+"""Fail-closed composition seam for separately approved provider lane classes."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
+
+
+class ProviderCompositionError(RuntimeError):
+    """Raised when a rendered provider profile cannot bind concrete lane classes."""
+
+
+@dataclass(frozen=True)
+class ProviderProfile:
+    languages: Mapping[str, Mapping[str, str]]
+    required_environment: tuple[str, ...]
+
+
+def load_provider_profile(path: str) -> ProviderProfile:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get("languages"), dict):
+        raise ProviderCompositionError("provider profile is invalid")
+    required = raw.get("required_environment", [])
+    if not isinstance(required, list) or not all(isinstance(name, str) for name in required):
+        raise ProviderCompositionError("provider profile environment is invalid")
+    return ProviderProfile(languages=raw["languages"], required_environment=tuple(required))
+
+
+def bind_provider_adapter(profile: ProviderProfile, environ: Mapping[str, str]):
+    missing = [name for name in profile.required_environment if not environ.get(name)]
+    if missing:
+        raise ProviderCompositionError("missing provider configuration: " + ", ".join(missing))
+    try:
+        from provider_llm import build_llm_adapter
+        from provider_stt import build_stt_adapter
+        from provider_tts import build_tts_adapter
+    except ImportError as error:
+        raise ProviderCompositionError("concrete provider lane files are not approved") from error
+    return _ComposedProviderAdapter(
+        build_stt_adapter(profile, environ), build_llm_adapter(profile, environ), build_tts_adapter(profile, environ)
+    )
+
+
+class _ComposedProviderAdapter:
+    def __init__(self, stt: object, llm: object, tts: object) -> None:
+        self._stt, self._llm, self._tts = stt, llm, tts
+        self.active = all(bool(getattr(adapter, "active", False)) for adapter in (stt, llm, tts))
+
+    async def transcribe_audio(self, audio: bytes, language: str):
+        return await self._stt.transcribe_audio(audio, language)
+
+    async def generate_response(self, transcript: str, language: str, prompt: str):
+        return await self._llm.generate_response(transcript, language, prompt)
+
+    async def synthesize_audio(self, response: str, language: str):
+        return await self._tts.synthesize_audio(response, language)
