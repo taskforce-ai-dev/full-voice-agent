@@ -1,0 +1,68 @@
+{
+  "status": "partial-candidate-not-approved-for-rendering",
+  "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
+  "source_hashes": {
+    "Kavya/server.py": "sha256:27e58046ce3b4c32eb0331bdafe4c0d300d7e7596ebea9dc680d7de4febee28b",
+    "Kavya/smartpbx_gateway.py": "sha256:901c41c42b774cb12248719d3e5469599619a5eba8c82e447bb507d4772a18ee",
+    "Kavya/smartpbx_session.py": "sha256:18695c13c0174f3c3c45a53d7de76cc76c6d76984e998ddb4c6265fe5f19c76e",
+    "Kavya/smartpbx_transport.py": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e"
+  },
+  "components": [
+    {
+      "template_path": "runtime/smartpbx_gateway.py.tmpl",
+      "template_sha256": "sha256:a8da16fa5abb6a03309200b1d5caa633dd0961ff6a3cdbaaf7b8ade49dff9f5f",
+      "source_path": "Kavya/smartpbx_gateway.py",
+      "source_ranges": ["258-410", "571-675"],
+      "extraction": "carrier ingress, bounded admission, strict protocol handoff, terminal and transport lifecycle"
+    },
+    {
+      "template_path": "runtime/smartpbx_session.py.tmpl",
+      "template_sha256": "sha256:04eb70193d8515dea06b0403fed091ae5989072b19873ace9ed95a801d0b4c8d",
+      "source_path": "Kavya/smartpbx_session.py",
+      "source_ranges": ["121-220", "261-650", "1005-1048"],
+      "extraction": "call-local start, language selection, STT feeding, and injected pipeline seam"
+    },
+    {
+      "template_path": "runtime/turn_engine.py.tmpl",
+      "template_sha256": "sha256:906e0469409f9a39940b0cc491a15310ef69727ef543052d664e90015c015fe0",
+      "source_path": "Kavya/server.py",
+      "source_ranges": ["9359-9404", "11031-11320", "13112-13190"],
+      "extraction": "endpointed STT callback, streamed LLM response, TTS media emission"
+    },
+    {
+      "template_path": "runtime/smartpbx_transport.py.tmpl",
+      "template_sha256": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e",
+      "source_path": "Kavya/smartpbx_transport.py",
+      "source_ranges": ["1-999"],
+      "extraction": "verbatim paced outbound media transport"
+    },
+    {
+      "template_path": "runtime/server.py.tmpl",
+      "template_sha256": "sha256:3d1e1b3cc9685e959abc8a4e9e9de7d801e78991b5f6ed31ac0d4265a9c98638",
+      "source_path": "Kavya/server.py",
+      "source_ranges": ["15617-15625"],
+      "extraction": "isolated health, authenticated status, and media route construction"
+    },
+    {
+      "template_path": "runtime/product_profile.py.tmpl",
+      "template_sha256": "sha256:1f5dfeb35b2fab5111dd4d2e7c82d0c9b8f6482a5ae4412ff701730e90a9beaa",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "approved product-data seam; no tenant source file is copied"
+    },
+    {
+      "template_path": "runtime/provider_adapters.py.tmpl",
+      "template_sha256": "sha256:ff1ba45b08bf48ae4885603d36bb2631e5c0c5bae326504a3e67acf191694b6f",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "inversion boundary for separately approved STT, LLM, and TTS implementations"
+    },
+    {
+      "template_path": "runtime/stt_adapters.py.tmpl",
+      "template_sha256": "sha256:e5aaa1be56ff2078f9aa15f473e0820f108294d1fe1d2584d4c5a2be244fca74",
+      "source_path": "Kavya/server.py",
+      "source_ranges": ["575-582", "1855-1863", "6549-6881", "6884-6980", "6983-7252", "9359-9443"],
+      "extraction": "startup-injected Google mu-law and Azure PCM streaming adapters; SDK callbacks cross only through the session-owned event-loop bridge"
+    }
+  ]
+}
