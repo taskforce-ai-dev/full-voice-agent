@@ -16,7 +16,7 @@ from smartpbx_agent_factory.prs import (
 )
 from smartpbx_agent_factory.readiness import ReadinessAuthority, ReadinessError
 from smartpbx_agent_factory.state import GenerationState, Stage, StateError
-from smartpbx_agent_factory.verify import VerificationReport
+from smartpbx_agent_factory.verify import VerificationError, VerificationReport
 
 
 @dataclass
@@ -406,7 +406,7 @@ def test_public_wss_url_must_match_allowed_media_path_without_credentials_or_par
 ) -> None:
     state = fixture_state()
 
-    with pytest.raises(StateError, match="public WSS URL"):
+    with pytest.raises(StateError, match="authoritative readiness record is invalid"):
         open_linked_prs(
             fake_provider,
             state=state,
@@ -439,7 +439,7 @@ def test_non_string_redaction_fails_closed_without_provider_call(fake_provider: 
 def test_readiness_report_must_be_generation_owned_repo_relative_metadata(fake_provider: FakePRProvider) -> None:
     state = fixture_state()
 
-    with pytest.raises(StateError, match="readiness report"):
+    with pytest.raises(StateError, match="authoritative readiness record is invalid"):
         open_linked_prs(
             fake_provider,
             state=state,
@@ -455,7 +455,7 @@ def test_readiness_report_must_be_generation_owned_repo_relative_metadata(fake_p
 def test_readiness_report_path_must_be_the_exact_generation_metadata_filename(fake_provider: FakePRProvider) -> None:
     state = fixture_state()
 
-    with pytest.raises(StateError, match="readiness report"):
+    with pytest.raises(StateError, match="authoritative readiness record is invalid"):
         open_linked_prs(
             fake_provider,
             state=state,
@@ -502,7 +502,7 @@ def test_repository_and_branch_must_be_bounded_safe_git_identifiers(
 def test_review_label_rejects_control_characters_before_provider_call(fake_provider: FakePRProvider) -> None:
     state = fixture_state()
 
-    with pytest.raises(StateError, match="review label"):
+    with pytest.raises(StateError, match="authoritative readiness record is invalid"):
         open_linked_prs(
             fake_provider,
             state=state,
@@ -524,7 +524,7 @@ def test_review_label_rejects_credential_like_values_before_provider_call(
 ) -> None:
     state = fixture_state()
 
-    with pytest.raises(StateError, match="review label"):
+    with pytest.raises(StateError, match="authoritative readiness record is invalid"):
         open_linked_prs(
             fake_provider,
             state=state,
@@ -540,7 +540,7 @@ def test_review_label_rejects_credential_like_values_before_provider_call(
 def test_expected_wss_hostname_rejects_numeric_alternate_ipv4_form(fake_provider: FakePRProvider) -> None:
     state = fixture_state()
 
-    with pytest.raises(StateError, match="public WSS URL"):
+    with pytest.raises(StateError, match="authoritative readiness record is invalid"):
         open_linked_prs(
             fake_provider,
             state=state,
@@ -600,7 +600,7 @@ def test_verified_state_requires_bound_readiness_and_ownership_digests(fake_prov
     state = fixture_state()
     state.stage_digests.pop("worktree_ownership")
 
-    with pytest.raises(StateError, match="state digest"):
+    with pytest.raises(StateError, match="authoritative readiness record is invalid"):
         open_linked_prs(fake_provider, state=state, readiness=fixture_readiness(), worktrees=fixture_worktrees(), inspector=fixture_inspector())
 
     assert state.stage is Stage.BLOCKED
@@ -611,10 +611,10 @@ def test_missing_provenance_record_fails_closed_before_provider_call(fake_provid
     state = fixture_state()
     readiness = replace(fixture_readiness(), provenance_source_revision="main")
 
-    with pytest.raises(StateError, match="provenance"):
+    with pytest.raises(VerificationError, match="source_revision"):
         open_linked_prs(fake_provider, state=state, readiness=readiness, worktrees=fixture_worktrees(), inspector=fixture_inspector())
 
-    assert state.stage is Stage.BLOCKED
+    assert state.stage is Stage.VERIFIED
     assert fake_provider.open_order == []
 
 

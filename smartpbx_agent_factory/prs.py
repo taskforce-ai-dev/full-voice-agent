@@ -494,6 +494,8 @@ def open_linked_prs(
     ``redactions`` is transient scrub data: values are removed from every body
     before any provider call and are never returned or persisted by this module.
     """
+    if not isinstance(state, GenerationState) or state.stage is not Stage.VERIFIED:
+        raise StateError("linked PR creation requires generation state VERIFIED")
     normalized_redactions = _validate_redactions(state, redactions)
     if not isinstance(readiness_authority, ReadinessAuthority):
         _block(state, "authoritative readiness record is required")

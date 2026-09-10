@@ -327,17 +327,6 @@ class SopsAgeSecretProvider:
         if not (repository / ".git").exists():
             raise OperationsPrerequisiteError("repository_path")
         canonical_remote = self._require_text(prerequisites.canonical_remote, "canonical_remote")
-        if self._visibility_verifier is None:
-            raise OperationsPrerequisiteError("private_repository")
-        self._verify_origin_remote(repository, canonical_remote)
-        try:
-            private = self._visibility_verifier.is_private(
-                repository=repository, canonical_remote=canonical_remote
-            )
-        except Exception as error:
-            raise OperationsPrerequisiteError("private_repository") from error
-        if private is not True:
-            raise OperationsPrerequisiteError("private_repository")
         self._require_text(prerequisites.owner, "owner")
         recipient_file = self._require_absolute_file(prerequisites.recipient_file, "recipient_file")
         self._require_text(prerequisites.recipient_review_source, "recipient_review_source")
@@ -356,6 +345,17 @@ class SopsAgeSecretProvider:
             self._require_text(policy.rotation_owner, "credential_source_policy")
         sops = self._require_binary(prerequisites.sops_binary, "sops_binary")
         age = self._require_binary(prerequisites.age_binary, "age_binary")
+        if self._visibility_verifier is None:
+            raise OperationsPrerequisiteError("private_repository")
+        self._verify_origin_remote(repository, canonical_remote)
+        try:
+            private = self._visibility_verifier.is_private(
+                repository=repository, canonical_remote=canonical_remote
+            )
+        except Exception as error:
+            raise OperationsPrerequisiteError("private_repository") from error
+        if private is not True:
+            raise OperationsPrerequisiteError("private_repository")
         self._run_version(sops, "sops_binary")
         self._run_version(age, "age_binary")
         self._recipients = recipients

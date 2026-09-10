@@ -22,7 +22,7 @@ class FakeRunner:
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
-        if argv[:5] == ["git", "-C", argv[2], "config", "--get"]:
+        if len(argv) >= 5 and argv[:2] == ["git", "-C"] and argv[3:5] == ["config", "--get"]:
             return type("Completed", (), {"returncode": 0, "stdout": self.remote.encode(), "stderr": b""})()
         return type("Completed", (), {"returncode": 0, "stdout": b"sops:\n  age: encrypted", "stderr": b""})()
 
