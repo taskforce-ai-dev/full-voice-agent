@@ -1,5 +1,6 @@
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,12 @@ from smartpbx_agent_factory.orchestrator import (
     GenerationOrchestrator,
 )
 from smartpbx_agent_factory.gitops import WorktreeManager
-from smartpbx_agent_factory.knowledge import KnowledgeDocument, KnowledgeFact, KnowledgeReview
+from smartpbx_agent_factory.knowledge import (
+    KnowledgeDocument,
+    KnowledgeFact,
+    KnowledgeReview,
+    recompute_knowledge_review_digest,
+)
 from smartpbx_agent_factory.secrets import SecretAudit
 from smartpbx_agent_factory.state import Stage
 
@@ -276,10 +282,11 @@ def test_secret_resolution_binds_the_concrete_knowledge_review_not_manifest_sour
     class Builder:
         def __init__(self):
             self.calls = []
+            self.review_digest = ""
 
         def build(self, sources, output_dir):
             self.calls.append((sources, output_dir))
-            return KnowledgeReview(
+            review = KnowledgeReview(
                 facts=(KnowledgeFact("Approved local fact.", "file:///fixture", "document"),),
                 conflicts=(),
                 missing_facts=(),
@@ -287,9 +294,11 @@ def test_secret_resolution_binds_the_concrete_knowledge_review_not_manifest_sour
                 inaccessible_sources=(),
                 duplicate_facts=(),
                 instruction_findings=(),
-                digest="a" * 64,
+                digest="",
                 documents=(KnowledgeDocument("file:///fixture", "owner", "2026-01-01", "public", "Approved local fact."),),
             )
+            self.review_digest = recompute_knowledge_review_digest(review)
+            return replace(review, digest=self.review_digest)
 
     builder = Builder()
     orchestrator = GenerationOrchestrator(
@@ -301,7 +310,7 @@ def test_secret_resolution_binds_the_concrete_knowledge_review_not_manifest_sour
     state = orchestrator.record_secrets_resolved(report.generation_id, provider=Provider())
 
     assert state.stage is Stage.KNOWLEDGE_REVIEW_REQUIRED
-    assert state.knowledge_review_digest == "a" * 64
+    assert state.knowledge_review_digest == builder.review_digest
     assert builder.calls and builder.calls[0][0]
     assert builder.calls[0][1] == tmp_path / "knowledge-reviews" / report.generation_id
 
