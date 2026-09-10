@@ -43,17 +43,77 @@ REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9
 HEALTH_WAIT_SECONDS = 20
 HEALTH_POLL_SECONDS = 0.25
 WEBSOCKET_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+DOCKER_OPERATION_LABELS = frozenset({
+    "network-create",
+    "image-build",
+    "image-inspect",
+    "container-run",
+    "port-discover",
+    "container-cleanup",
+    "image-cleanup",
+    "network-cleanup",
+})
+IMAGE_BUILD_SUBPHASES = frozenset({
+    "dependency-install",
+    "smartpbx-import",
+    "website-import",
+    "unknown",
+})
+_IMAGE_BUILD_SUBPHASE_MARKERS = (
+    (b"pip install --no-cache-dir -r requirements-prod.lock.txt", "dependency-install"),
+    (b'python -c "import startup"', "smartpbx-import"),
+    (b'python -c "import website_demo"', "website-import"),
+)
 
 
 class LifecycleError(RuntimeError):
     """A local lifecycle observation did not meet the CI contract."""
 
 
-def command(argv: list[str], *, capture: bool = False, allow_failure: bool = False) -> str:
-    result = subprocess.run(argv, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def _output_bytes(value: object) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace")
+    return b""
+
+
+def classify_image_build_subphase(stdout: bytes, stderr: bytes) -> str:
+    """Return only a fixed Dockerfile-step label; never expose captured output."""
+    observed = stdout + b"\n" + stderr
+    for marker, subphase in _IMAGE_BUILD_SUBPHASE_MARKERS:
+        if marker in observed:
+            return subphase
+    return "unknown"
+
+
+def command(operation: str, argv: list[str], *, capture: bool = False, allow_failure: bool = False) -> str:
+    if operation not in DOCKER_OPERATION_LABELS:
+        raise LifecycleError("invalid Docker operation label")
+    result = subprocess.run(
+        argv,
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
+    stdout = _output_bytes(result.stdout)
+    stderr = _output_bytes(result.stderr)
     if result.returncode and not allow_failure:
-        raise LifecycleError("owned Docker operation failed")
-    return result.stdout if capture else ""
+        fields = [
+            "owned Docker operation failed",
+            f"operation={operation}",
+            f"exit_code={result.returncode}",
+            f"stdout_bytes={len(stdout)}",
+            f"stderr_bytes={len(stderr)}",
+            f"stdout_sha256={hashlib.sha256(stdout).hexdigest()}",
+            f"stderr_sha256={hashlib.sha256(stderr).hexdigest()}",
+        ]
+        if operation == "image-build":
+            fields.append(f"build_subphase={classify_image_build_subphase(stdout, stderr)}")
+        raise LifecycleError(" ".join(fields))
+    return stdout.decode("utf-8", errors="replace") if capture else ""
 
 
 def artifact_digest(agent_dir: Path) -> str:
@@ -396,7 +456,7 @@ def valid_lifecycle(host: str, port: int, header: str, token: str, messages: tup
 
 
 def mapped_port(container: str) -> int:
-    raw = command(["docker", "port", container, "8000/tcp"], capture=True).strip()
+    raw = command("port-discover", ["docker", "port", container, "8000/tcp"], capture=True).strip()
     host, separator, port = raw.rpartition(":")
     if not separator or host not in {"127.0.0.1", "[::1]"} or not port.isdecimal():
         raise LifecycleError("container did not receive an ephemeral loopback-only port")
@@ -404,7 +464,7 @@ def mapped_port(container: str) -> int:
 
 
 def inspect_image(image: str, provenance: dict[str, object]) -> None:
-    raw = command(["docker", "image", "inspect", image], capture=True)
+    raw = command("image-inspect", ["docker", "image", "inspect", image], capture=True)
     try:
         labels = json.loads(raw)[0]["Config"]["Labels"]
     except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -473,13 +533,13 @@ def main() -> int:
     network = f"smartpbx-ci-{run_id}"
     token = secrets.token_urlsafe(32)
     try:
-        command(["docker", "network", "create", "--internal", "--label", f"com.taskforce.smartpbx.lifecycle={run_id}", network])
-        command([
+        command("network-create", ["docker", "network", "create", "--internal", "--label", f"com.taskforce.smartpbx.lifecycle={run_id}", network])
+        command("image-build", [
             "docker", "build", "--label", f"org.taskforce.smartpbx.artifact={provenance['artifact_digest']}",
             "--label", f"org.opencontainers.image.revision={provenance['source_revision']}", "--tag", image, str(agent_dir),
         ])
         inspect_image(image, provenance)
-        command([
+        command("container-run", [
             "docker", "run", "--detach", "--name", container, "--network", network,
             "--label", f"com.taskforce.smartpbx.lifecycle={run_id}", "--publish", "127.0.0.1::8000",
             "--env", f"SMARTPBX_WS_TOKEN={token}", "--env", "SMARTPBX_ACCOUNT_ID=account-synthetic",
@@ -515,9 +575,9 @@ def main() -> int:
                 raise LifecycleError("valid terminal path did not admit and release exactly one session")
             admitted, released = observed
     finally:
-        command(["docker", "rm", "--force", container], allow_failure=True)
-        command(["docker", "image", "rm", "--force", image], allow_failure=True)
-        command(["docker", "network", "rm", network], allow_failure=True)
+        command("container-cleanup", ["docker", "rm", "--force", container], allow_failure=True)
+        command("image-cleanup", ["docker", "image", "rm", "--force", image], allow_failure=True)
+        command("network-cleanup", ["docker", "network", "rm", network], allow_failure=True)
     write_attestation(
         args.attestation, provenance=provenance, lane=args.lane, repository=args.repository,
         head_sha=args.head_sha, run_id=args.run_id, canonical_fixture=args.canonical_fixture,
