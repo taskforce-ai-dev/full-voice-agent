@@ -423,6 +423,7 @@ def _recover_transaction(output_dir: Path) -> None:
         else:
             target.unlink(missing_ok=True)
     marker_path.unlink()
+    _fsync_directory(output_dir)
     for index, record in enumerate(files):
         if record["existed"]:
             (stage_path / f"backup-{index}.bin").unlink(missing_ok=True)
@@ -443,6 +444,7 @@ def _finish_transaction(output_dir: Path) -> None:
         return
     marker_path, stage_path, files, _ = transaction
     marker_path.unlink()
+    _fsync_directory(output_dir)
     for index, record in enumerate(files):
         if record["existed"]:
             (stage_path / f"backup-{index}.bin").unlink(missing_ok=True)
@@ -488,9 +490,12 @@ def _atomic(output_dir: Path, contents: Mapping[Path, bytes], scope: str) -> Non
             descriptor, temporary_name = tempfile.mkstemp(prefix="." + scope + ".", suffix=".tmp", dir=path.parent)
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(value)
+                handle.flush()
+                os.fsync(handle.fileno())
             staged[path] = Path(temporary_name)
         for path, temporary in staged.items():
             os.replace(temporary, path)
+            _fsync_directory(path.parent)
     except Exception:
         for temporary in staged.values():
             temporary.unlink(missing_ok=True)
