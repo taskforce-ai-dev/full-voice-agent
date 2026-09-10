@@ -48,6 +48,7 @@ class InquirySmartPBXSession:
             raise RuntimeError("conversation provider adapter is inactive")
         self._started = True
         self._selected_language = self._product_profile.default_language
+        await self._turn_engine.start(self._product_profile.language(self._selected_language))
 
     async def feed_dtmf(self, digit: str) -> None:
         if not self._started or self._finished:
@@ -55,6 +56,7 @@ class InquirySmartPBXSession:
         selected = {"1": "en", "2": "si"}.get(digit)
         if selected in self._product_profile.language_profiles:
             self._selected_language = selected
+            await self._turn_engine.set_language(self._product_profile.language(selected))
 
     async def feed_audio(self, audio: bytes) -> None:
         if not self._started:
@@ -68,10 +70,13 @@ class InquirySmartPBXSession:
         if self._finished:
             return
         self._finished = True
-        if self._after_call_hook is not None and self._selected_language is not None:
-            await self._after_call_hook.complete(
-                language=self._product_profile.language(self._selected_language),
-                turns=self._turn_engine.turns_completed,
-            )
-        if not self.terminal_future.done():
-            self.terminal_future.set_result(None)
+        try:
+            await self._turn_engine.close()
+            if self._after_call_hook is not None and self._selected_language is not None:
+                await self._after_call_hook.complete(
+                    language=self._product_profile.language(self._selected_language),
+                    turns=self._turn_engine.turns_completed,
+                )
+        finally:
+            if not self.terminal_future.done():
+                self.terminal_future.set_result(None)

@@ -1,4 +1,8 @@
-"""Streaming endpoint-to-media turn orchestration with injected providers."""
+"""Continuous-recognizer endpoint-to-media turn orchestration.
+
+The recognizer owns streaming audio.  This engine owns every mutable turn,
+endpointing, generation, and teardown decision on its event loop.
+"""
 
 from __future__ import annotations
 
@@ -7,11 +11,16 @@ from collections.abc import AsyncIterable
 from typing import Any
 
 from product_profile import LanguageProfile, ProductProfile
-from provider_adapters import ConversationProviderAdapter, Retriever
+from provider_adapters import (
+    ContinuousRecognizer,
+    ConversationProviderAdapter,
+    RecognizerResult,
+    Retriever,
+)
 
 
 class ConversationTurnEngine:
-    """Preserves the audio -> endpoint -> LLM stream -> TTS -> transport path."""
+    """One continuous recognizer and at most one active conversation turn."""
 
     def __init__(
         self,
@@ -20,49 +29,235 @@ class ConversationTurnEngine:
         product_profile: ProductProfile,
         *,
         retriever: Retriever | None = None,
+        endpointing_silence_seconds: float = 1.0,
+        final_grace_seconds: float = 0.5,
     ) -> None:
+        if endpointing_silence_seconds < 0 or final_grace_seconds < 0:
+            raise ValueError("endpointing delays must be non-negative")
         self._provider_adapter = provider_adapter
         self._transport = transport
         self._product_profile = product_profile
         self._retriever = retriever
+        self._endpointing_silence_seconds = endpointing_silence_seconds
+        self._final_grace_seconds = final_grace_seconds
         self.turns_completed = 0
-        self._turn_lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._recognizer: ContinuousRecognizer | None = None
+        self._language: LanguageProfile | None = None
+        self._recognizer_epoch = 0
+        self._generation = 0
+        self._endpoint_token = 0
+        self._last_result_id = -1
+        self._pending_transcript = ""
+        self._endpoint_handle: asyncio.TimerHandle | None = None
+        self._turn_task: asyncio.Task[None] | None = None
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._callback_lock = asyncio.Lock()
+        self._closed = False
 
     @property
     def active(self) -> bool:
         return bool(getattr(self._provider_adapter, "active", False))
 
-    async def accept_audio(self, audio: bytes, language: LanguageProfile) -> bool:
-        """Feed audio and emit only after the STT adapter reports an endpoint."""
-        async with self._turn_lock:
-            return await self._accept_audio(audio, language)
-
-    async def _accept_audio(self, audio: bytes, language: LanguageProfile) -> bool:
+    async def start(self, language: LanguageProfile) -> None:
+        """Bind a recognizer before audio can enter this call-local engine."""
+        if self._closed:
+            raise RuntimeError("conversation turn engine is closed")
         if not self.active:
             raise RuntimeError("conversation provider adapter is inactive")
-        transcript = await self._provider_adapter.transcribe_audio(bytes(audio), language.code)
-        if not transcript:
+        if self._recognizer is not None:
+            if self._language == language:
+                return
+            await self.set_language(language)
+            return
+        self._loop = asyncio.get_running_loop()
+        await self._start_recognizer(language)
+
+    async def set_language(self, language: LanguageProfile) -> None:
+        """Restart the recognizer only at this explicit session-owned boundary."""
+        if self._closed:
+            return
+        if self._recognizer is None:
+            await self.start(language)
+            return
+        if self._language == language:
+            return
+        await self._cancel_active_turn(clear_audio=True)
+        await self._close_recognizer()
+        self._pending_transcript = ""
+        self._last_result_id = -1
+        self._invalidate_endpointing()
+        await self._start_recognizer(language)
+
+    async def accept_audio(self, audio: bytes, language: LanguageProfile) -> bool:
+        """Feed the already-started recognizer; never transcribe per frame."""
+        if self._closed:
             return False
-        context = ""
-        if self._retriever is not None:
-            context = await self._retriever.retrieve(transcript, self._product_profile)
-        prompt = _build_prompt(self._product_profile, language, context)
-        emitted = False
-        response = await self._provider_adapter.generate_response(transcript, language.code, prompt)
-        async for response_chunk in _iterate_text(response):
-            if not response_chunk:
+        if self._recognizer is None:
+            await self.start(language)
+        if self._language != language:
+            await self.set_language(language)
+        recognizer = self._recognizer
+        if recognizer is None:
+            return False
+        await recognizer.feed_audio(bytes(audio))
+        return True
+
+    async def close(self) -> None:
+        """Fence callbacks first, then cancel media/turn work and close STT."""
+        if self._closed:
+            return
+        self._closed = True
+        self._recognizer_epoch += 1
+        self._invalidate_endpointing()
+        self._pending_transcript = ""
+        await self._cancel_active_turn(clear_audio=True)
+        await self._close_recognizer()
+
+    async def drain(self) -> None:
+        """Testing/teardown barrier for tracked endpoint and turn tasks."""
+        while True:
+            pending = tuple(task for task in self._tasks if task is not asyncio.current_task())
+            if not pending:
+                await asyncio.sleep(0)
+                if not self._tasks:
+                    return
                 continue
-            audio_result = await self._provider_adapter.synthesize_audio(response_chunk, language.code)
-            async for audio_chunk in _iterate_audio(audio_result):
-                if audio_chunk:
-                    await self._transport.send_audio(audio_chunk)
-                    emitted = True
-        if emitted:
-            send_mark = getattr(self._transport, "send_mark", None)
-            if callable(send_mark):
-                await send_mark("conversation-turn")
-        self.turns_completed += 1
-        return emitted
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _start_recognizer(self, language: LanguageProfile) -> None:
+        self._recognizer_epoch += 1
+        epoch = self._recognizer_epoch
+        self._language = language
+        self._recognizer = await self._provider_adapter.start_recognizer(
+            language.code,
+            lambda result: self._on_recognizer_result(epoch, result),
+        )
+
+    async def _close_recognizer(self) -> None:
+        recognizer, self._recognizer = self._recognizer, None
+        if recognizer is not None:
+            await recognizer.close()
+
+    def _on_recognizer_result(self, epoch: int, result: RecognizerResult) -> None:
+        """Provider callbacks may be threaded; mutation always returns to our loop."""
+        loop = self._loop
+        if self._closed or loop is None or not isinstance(result, RecognizerResult):
+            return
+        try:
+            loop.call_soon_threadsafe(self._schedule_recognizer_result, epoch, result)
+        except RuntimeError:
+            return
+
+    def _schedule_recognizer_result(self, epoch: int, result: RecognizerResult) -> None:
+        if self._closed or epoch != self._recognizer_epoch:
+            return
+        self._track(asyncio.create_task(self._handle_recognizer_result(epoch, result)))
+
+    async def _handle_recognizer_result(self, epoch: int, result: RecognizerResult) -> None:
+        async with self._callback_lock:
+            if (
+                self._closed
+                or epoch != self._recognizer_epoch
+                or result.result_id <= self._last_result_id
+            ):
+                return
+            self._last_result_id = result.result_id
+            text = result.text.strip()
+            if not text:
+                return
+            if self._turn_task is not None and not self._turn_task.done():
+                await self._cancel_active_turn(clear_audio=True)
+            self._pending_transcript = text
+            self._arm_endpointing(
+                self._final_grace_seconds if result.is_final else self._endpointing_silence_seconds
+            )
+
+    def _invalidate_endpointing(self) -> None:
+        self._endpoint_token += 1
+        if self._endpoint_handle is not None:
+            self._endpoint_handle.cancel()
+            self._endpoint_handle = None
+
+    def _arm_endpointing(self, delay: float) -> None:
+        self._invalidate_endpointing()
+        if self._closed or self._loop is None:
+            return
+        token = self._endpoint_token
+        epoch = self._recognizer_epoch
+        self._endpoint_handle = self._loop.call_later(delay, self._launch_turn, token, epoch)
+
+    def _launch_turn(self, token: int, epoch: int) -> None:
+        if (
+            self._closed
+            or token != self._endpoint_token
+            or epoch != self._recognizer_epoch
+            or self._turn_task is not None and not self._turn_task.done()
+        ):
+            return
+        transcript = self._pending_transcript.strip()
+        self._pending_transcript = ""
+        self._endpoint_handle = None
+        if not transcript or self._language is None:
+            return
+        self._generation += 1
+        generation = self._generation
+        task = asyncio.create_task(self._run_turn(transcript, self._language, generation))
+        self._turn_task = task
+        self._track(task)
+
+    async def _cancel_active_turn(self, *, clear_audio: bool) -> None:
+        self._invalidate_endpointing()
+        self._generation += 1
+        task, self._turn_task = self._turn_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if clear_audio:
+            clear_audio_method = getattr(self._transport, "clear_audio", None)
+            if callable(clear_audio_method):
+                await clear_audio_method()
+
+    def _owns_generation(self, generation: int) -> bool:
+        return not self._closed and generation == self._generation
+
+    async def _run_turn(self, transcript: str, language: LanguageProfile, generation: int) -> None:
+        try:
+            context = ""
+            if self._retriever is not None:
+                context = await self._retriever.retrieve(transcript, self._product_profile)
+            if not self._owns_generation(generation):
+                return
+            prompt = _build_prompt(self._product_profile, language, context)
+            emitted = False
+            response = await self._provider_adapter.generate_response(transcript, language.code, prompt)
+            async for response_chunk in _iterate_text(response):
+                if not self._owns_generation(generation):
+                    return
+                if not response_chunk:
+                    continue
+                audio_result = await self._provider_adapter.synthesize_audio(response_chunk, language.code)
+                async for audio_chunk in _iterate_audio(audio_result):
+                    if not self._owns_generation(generation):
+                        return
+                    if audio_chunk:
+                        await self._transport.send_audio(audio_chunk)
+                        emitted = True
+            if not self._owns_generation(generation):
+                return
+            if emitted:
+                send_mark = getattr(self._transport, "send_mark", None)
+                if callable(send_mark):
+                    await send_mark("conversation-turn")
+            if self._owns_generation(generation):
+                self.turns_completed += 1
+        finally:
+            if self._turn_task is asyncio.current_task():
+                self._turn_task = None
+
+    def _track(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
 
 def _build_prompt(profile: ProductProfile, language: LanguageProfile, context: str) -> str:

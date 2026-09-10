@@ -2,17 +2,52 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 from product_profile import LanguageProfile, ProductProfile
 
 
+@dataclass(frozen=True)
+class RecognizerResult:
+    """One ordered recognizer observation delivered to a call-local callback."""
+
+    text: str
+    is_final: bool
+    result_id: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.text, str)
+            or not isinstance(self.is_final, bool)
+            or not isinstance(self.result_id, int)
+            or isinstance(self.result_id, bool)
+            or self.result_id < 0
+        ):
+            raise ValueError("invalid recognizer result")
+
+
+RecognizerCallback = Callable[[RecognizerResult], None]
+
+
+class ContinuousRecognizer(Protocol):
+    """Provider-owned streaming recognizer for exactly one session/language."""
+
+    async def feed_audio(self, audio: bytes) -> None:
+        """Accept one audio frame without creating a new recognition request."""
+
+    async def close(self) -> None:
+        """Stop callbacks and release provider resources exactly once."""
+
+
 class STTAdapter(Protocol):
     active: bool
 
-    async def transcribe_audio(self, audio: bytes, language: str) -> str | None:
-        """Return a final endpointed transcript, or None while speech continues."""
+    async def start_recognizer(
+        self, language: str, on_result: RecognizerCallback
+    ) -> ContinuousRecognizer:
+        """Start one continuous recognizer; callbacks may arrive off-loop."""
 
 
 class LLMAdapter(Protocol):

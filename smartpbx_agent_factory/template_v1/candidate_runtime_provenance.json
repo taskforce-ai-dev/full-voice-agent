@@ -18,17 +18,17 @@
     },
     {
       "template_path": "runtime/smartpbx_session.py.tmpl",
-      "template_sha256": "sha256:04eb70193d8515dea06b0403fed091ae5989072b19873ace9ed95a801d0b4c8d",
+      "template_sha256": "sha256:eea154317c23d2da66ec96f4af10854ed3491be4d5527741dbc0a5e58b7a198a",
       "source_path": "Kavya/smartpbx_session.py",
       "source_ranges": ["121-220", "261-650", "1005-1048"],
       "extraction": "call-local start, language selection, STT feeding, and injected pipeline seam"
     },
     {
       "template_path": "runtime/turn_engine.py.tmpl",
-      "template_sha256": "sha256:906e0469409f9a39940b0cc491a15310ef69727ef543052d664e90015c015fe0",
+      "template_sha256": "sha256:35b29144aaec7553ac692670099bebc256a0cbc278b1f4e2f97e6a154b215838",
       "source_path": "Kavya/server.py",
-      "source_ranges": ["9359-9404", "11031-11320", "13112-13190"],
-      "extraction": "endpointed STT callback, streamed LLM response, TTS media emission"
+      "source_ranges": ["9359-9468", "9502-9635", "9703-9728", "10835-11027", "13112-13190"],
+      "extraction": "continuous STT callback admission, loop-owned interim/final endpointing, exactly-once turn ownership, generation-fenced barge-in, and delivered-media mark barrier"
     },
     {
       "template_path": "runtime/llm_adapters.py.tmpl",
@@ -60,10 +60,10 @@
     },
     {
       "template_path": "runtime/provider_adapters.py.tmpl",
-      "template_sha256": "sha256:ff1ba45b08bf48ae4885603d36bb2631e5c0c5bae326504a3e67acf191694b6f",
+      "template_sha256": "sha256:38967b73e1b38dc1292275852ca4cdc4ca99907ff9fa90874fd1bcd2ab1e5f16",
       "source_path": null,
       "source_ranges": [],
-      "extraction": "inversion boundary for separately approved STT, LLM, and TTS implementations"
+      "extraction": "inversion boundary for separately approved continuous STT, LLM, and TTS implementations"
     },
     {
       "template_path": "runtime/stt_adapters.py.tmpl",
