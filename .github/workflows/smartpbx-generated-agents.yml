@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Check CI lifecycle contract
+        run: python scripts/check_smartpbx_ci_lifecycle_contract.py
       - name: Install generated test dependency
         run: python -m pip install "pytest==9.1.1"
       - name: Run SmartPBX factory contracts
@@ -31,8 +33,18 @@ jobs:
           fi
       - name: Run disposable generated-agent contracts
         run: |
+          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha || github.event.before }}" "${{ github.sha }}")"
+          generated_changed=false
+          if printf '%s\n' "$changed" | grep -q '^SmartPBX Agents/'; then
+            generated_changed=true
+          fi
+          found=false
           while IFS= read -r -d '' agent_dir; do
+            found=true
             python -m pytest "$agent_dir/tests"
-            docker build -f "$agent_dir/Dockerfile" -t smartpbx-generated-contract "$agent_dir"
-            docker run --rm --entrypoint python smartpbx-generated-contract -c "import server, smartpbx_gateway, smartpbx_protocol"
+            python scripts/run_smartpbx_ci_lifecycle.py "$agent_dir"
           done < /tmp/smartpbx-agent-dirs
+          if [ "$generated_changed" = true ] && [ "$found" = false ]; then
+            echo "no generated agent directory for a generated-tree change" >&2
+            exit 1
+          fi

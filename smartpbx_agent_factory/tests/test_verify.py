@@ -1,29 +1,18 @@
-"""Disposable lifecycle verification contracts are enforced in CI.
-
-These tests use an in-process fixture adapter only.  They never use Docker,
-network services, customer data, or credentials.
-"""
+"""Static verification contracts; Docker lifecycle proof belongs to CI only."""
 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 
 import pytest
 
 from smartpbx_agent_factory.provenance import TemplateAllowlist, TemplateFile
-from smartpbx_agent_factory.resources import AllocationRegistry, DerivedResources, derive_resources
+from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
 from smartpbx_agent_factory.schema import parse_manifest
-from smartpbx_agent_factory.verify import (
-    DisposableClientResult,
-    VerificationBinding,
-    VerificationError,
-    VerificationReport,
-    readiness_report,
-    run_disposable_client,
-    verify_generated_backend,
-)
+from smartpbx_agent_factory.verify import VerificationBinding, VerificationError, VerificationReport, readiness_report, verify_generated_backend
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -103,35 +92,6 @@ def fixture_backend(root: Path, *, ci: bool = True) -> tuple[Path, VerificationB
     return root, binding
 
 
-class FixtureLifecycleAdapter:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str | None, tuple[dict[str, object], ...]]] = []
-
-    def exercise(
-        self,
-        *,
-        agent_dir: Path,
-        resources: DerivedResources,
-        auth_case: str,
-        terminal_path: str | None,
-        messages: tuple[dict[str, object], ...],
-    ) -> DisposableClientResult:
-        self.calls.append((auth_case, terminal_path, messages))
-        wrong = auth_case != "valid"
-        return DisposableClientResult(
-            connected=not wrong,
-            start_sent=not wrong and any(item["event"] == "start" for item in messages),
-            start_accepted=not wrong,
-            media_sent=not wrong and any(item["event"] == "media" for item in messages),
-            media_accepted=not wrong,
-            invalid_auth_rejected=wrong,
-            terminal_event_observed=not wrong,
-            close_code=1008 if wrong else 1000,
-            active_tasks_after_close=0,
-            resources_after_close=0,
-        )
-
-
 def test_readiness_report_contains_provenance_and_no_secret_values(tmp_path):
     agent, binding = fixture_backend(tmp_path / "agent")
     report = verify_generated_backend(agent, fixture_resources(), binding=binding)
@@ -156,13 +116,8 @@ def test_contract_verifier_requires_agent_specific_ci_job(tmp_path):
         verify_generated_backend(agent, fixture_resources(), binding=binding)
 
 
-def test_protocol_fixture_rejects_wrong_auth_before_start():
-    result = run_disposable_client(
-        FixtureLifecycleAdapter(), agent_dir=Path("/synthetic"), resources=fixture_resources(), auth_case="wrong"
-    )
-    assert result.close_code == 1008
-    assert result.start_sent is False
-    assert result.invalid_auth_rejected is True
+def test_verifier_has_no_caller_injectable_lifecycle_success_seam():
+    assert "lifecycle_adapter" not in inspect.signature(verify_generated_backend).parameters
 
 
 def test_verifier_requires_preaccept_constant_time_wss_authentication(tmp_path):
@@ -191,23 +146,17 @@ def test_provenance_cannot_be_rewritten_to_match_a_modified_artifact(tmp_path):
         verify_generated_backend(agent, fixture_resources(), binding=binding)
 
 
-def test_verifier_invokes_adapter_for_all_authentication_cases(tmp_path):
+def test_static_verifier_never_self_attests_runtime_lifecycle(tmp_path):
     agent, binding = fixture_backend(tmp_path / "agent")
-    adapter = FixtureLifecycleAdapter()
-    report = verify_generated_backend(agent, fixture_resources(), binding=binding, lifecycle_adapter=adapter)
-    assert [(auth_case, terminal_path) for auth_case, terminal_path, _ in adapter.calls] == [
-        ("missing", None), ("wrong", None), ("cross-agent", None), ("valid", "stop"), ("valid", "hangup")
-    ]
-    assert all(not messages for auth_case, _, messages in adapter.calls[:3] if auth_case != "valid")
-    assert report.ready_for_pr is True
-    assert report.runtime_lifecycle_verified is True
+    report = verify_generated_backend(agent, fixture_resources(), binding=binding)
+    assert report.ready_for_pr is False
+    assert report.runtime_lifecycle_verified is False
 
 
 def test_verifier_rejects_arbitrary_lifecycle_result_argument(tmp_path):
     agent, binding = fixture_backend(tmp_path / "agent")
-    forged = DisposableClientResult(True, True, True, True, True, False, True, 1000, 0, 0)
     with pytest.raises(TypeError):
-        verify_generated_backend(agent, fixture_resources(), binding=binding, lifecycle=forged)
+        verify_generated_backend(agent, fixture_resources(), binding=binding, lifecycle=object())
 
 
 def test_report_metadata_rejects_control_characters_and_secret_like_values():

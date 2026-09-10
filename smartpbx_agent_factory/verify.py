@@ -1,9 +1,8 @@
 """Fail-closed, privacy-safe generated SmartPBX verification contracts.
 
-The verifier never starts Docker, binds a socket, or contacts a hostname.  A
-CI-owned loopback adapter performs lifecycle work when supplied.  This module
-only receives bounded booleans/counters from that adapter and never accepts a
-caller-provided successful lifecycle result.
+The verifier never starts Docker, binds a socket, or contacts a hostname.  The
+repository-owned CI lifecycle runner performs those observations directly;
+this module has no caller-injectable lifecycle-success seam.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
 
 from .provenance import TemplateAllowlist
 from .resources import DerivedResources
@@ -35,7 +33,6 @@ _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 _SHA256_REF = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$")
 _REQUIRED_EVENTS = ("connected", "start", "media", "stop", "hangup")
-_AUTH_CASES = ("missing", "wrong", "cross-agent", "valid")
 _TERMINAL_PATHS = ("stop", "hangup")
 _REQUIRED_FILES = (
     "Dockerfile",
@@ -160,45 +157,6 @@ class VerificationBinding:
 
 
 @dataclass(frozen=True)
-class DisposableClientResult:
-    """The only non-sensitive result shape accepted from a lifecycle adapter."""
-
-    connected: bool
-    start_sent: bool
-    start_accepted: bool
-    media_sent: bool
-    media_accepted: bool
-    invalid_auth_rejected: bool
-    terminal_event_observed: bool
-    close_code: int
-    active_tasks_after_close: int
-    resources_after_close: int
-
-    def __post_init__(self) -> None:
-        if not all(isinstance(value, bool) for value in (self.connected, self.start_sent, self.start_accepted, self.media_sent, self.media_accepted, self.invalid_auth_rejected, self.terminal_event_observed)):
-            raise VerificationError("disposable client evidence must contain booleans")
-        for value in (self.active_tasks_after_close, self.resources_after_close):
-            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1_000:
-                raise VerificationError("disposable client counters must be bounded integers")
-        if self.close_code not in {1000, 1008}:
-            raise VerificationError("disposable client returned an unsupported close code")
-
-
-class DisposableLifecycleAdapter(Protocol):
-    """CI seam for a temporary loopback-only generated-backend lifecycle."""
-
-    def exercise(
-        self,
-        *,
-        agent_dir: Path,
-        resources: DerivedResources,
-        auth_case: Literal["missing", "wrong", "cross-agent", "valid"],
-        terminal_path: Literal["stop", "hangup"] | None,
-        messages: tuple[dict[str, object], ...],
-    ) -> DisposableClientResult: ...
-
-
-@dataclass(frozen=True)
 class VerificationReport:
     agent_slug: str
     artifact_digest: str
@@ -266,50 +224,6 @@ def _read_protocol_scenarios(path: Path = _PROTOCOL_FIXTURE) -> Mapping[str, tup
             raise VerificationError("protocol fixture media must be synthetic silence only")
         scenarios[terminal_path] = tuple(messages)
     return scenarios
-
-
-def _validate_lifecycle_result(result: object, auth_case: str) -> DisposableClientResult:
-    if not isinstance(result, DisposableClientResult):
-        raise VerificationError("lifecycle adapter returned invalid bounded evidence")
-    if auth_case == "valid":
-        if not (result.connected and result.start_sent and result.start_accepted and result.media_sent and result.media_accepted):
-            raise VerificationError("disposable lifecycle did not accept connected/start/media")
-        if result.invalid_auth_rejected or not result.terminal_event_observed or result.close_code != 1000:
-            raise VerificationError("disposable lifecycle did not observe clean termination")
-    elif not result.invalid_auth_rejected or result.close_code != 1008 or result.connected or result.start_sent or result.start_accepted or result.media_sent or result.media_accepted:
-        raise VerificationError("invalid authentication must close before connected/start/media")
-    if result.active_tasks_after_close or result.resources_after_close:
-        raise VerificationError("disposable lifecycle leaked tasks or resources")
-    return result
-
-
-def run_disposable_client(
-    adapter: DisposableLifecycleAdapter,
-    *,
-    agent_dir: Path,
-    resources: DerivedResources,
-    auth_case: Literal["missing", "wrong", "cross-agent", "valid"],
-    terminal_path: Literal["stop", "hangup"] | None = None,
-    protocol_fixture: Path = _PROTOCOL_FIXTURE,
-) -> DisposableClientResult:
-    """Invoke the CI adapter with privacy-safe protocol shapes and validate it."""
-    if auth_case not in _AUTH_CASES:
-        raise VerificationError("unknown disposable authentication case")
-    if auth_case == "valid" and terminal_path not in _TERMINAL_PATHS:
-        raise VerificationError("valid lifecycle requires stop or hangup terminal path")
-    if auth_case != "valid" and terminal_path is not None:
-        raise VerificationError("rejected authentication must remain pre-start")
-    messages = _read_protocol_scenarios(protocol_fixture)[terminal_path] if terminal_path else ()
-    try:
-        result = adapter.exercise(
-            agent_dir=Path(agent_dir), resources=resources, auth_case=auth_case,
-            terminal_path=terminal_path, messages=messages,
-        )
-    except VerificationError:
-        raise
-    except Exception as exc:
-        raise VerificationError(f"lifecycle adapter failed for {auth_case}") from exc
-    return _validate_lifecycle_result(result, auth_case)
 
 
 def _artifact_digest(agent_dir: Path) -> str:
@@ -396,9 +310,8 @@ def verify_generated_backend(
     resources: DerivedResources,
     *,
     binding: VerificationBinding,
-    lifecycle_adapter: DisposableLifecycleAdapter | None = None,
 ) -> VerificationReport:
-    """Verify static contracts and invoke a CI lifecycle adapter when provided.
+    """Verify static contracts; CI lifecycle proof is owned by a fixed runner.
 
     ``binding`` must come from the approved manifest/template/render transaction.
     It is deliberately required: a generated artifact cannot self-authorize by
@@ -410,16 +323,6 @@ def verify_generated_backend(
     agent_dir = Path(agent_dir)
     contracts = _require_static_contracts(agent_dir, resources)
     template_version, source_revision, artifact_digest = _provenance(agent_dir, binding, resources)
-    runtime_verified = False
-    if lifecycle_adapter is not None:
-        for auth_case in _AUTH_CASES[:-1]:
-            run_disposable_client(lifecycle_adapter, agent_dir=agent_dir, resources=resources, auth_case=auth_case)
-        for terminal_path in _TERMINAL_PATHS:
-            run_disposable_client(
-                lifecycle_adapter, agent_dir=agent_dir, resources=resources,
-                auth_case="valid", terminal_path=terminal_path,
-            )
-        runtime_verified = True
     return VerificationReport(
         agent_slug=resources.slug,
         artifact_digest=artifact_digest,
@@ -428,9 +331,9 @@ def verify_generated_backend(
         ci_identifier=resources.ci_identifier,
         protocol_events=_REQUIRED_EVENTS,
         static_contracts_passed=True,
-        runtime_lifecycle_verified=runtime_verified,
-        ready_for_pr=runtime_verified,
-        runtime_status="CI_LIFECYCLE_VERIFIED" if runtime_verified else "CI_LIFECYCLE_REQUIRED",
+        runtime_lifecycle_verified=False,
+        ready_for_pr=False,
+        runtime_status="CI_LIFECYCLE_REQUIRED",
         evidence=contracts,
     )
 
