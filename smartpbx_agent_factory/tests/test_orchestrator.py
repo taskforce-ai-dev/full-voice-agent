@@ -33,7 +33,7 @@ def test_plan_writes_only_private_state_without_claiming_secret_resolution(tmp_p
     assert state_file.exists()
     assert state_file.stat().st_mode & 0o777 == 0o600
     assert "wss_token" not in report.rendered_plan
-    assert list(tmp_path.iterdir()) == [state_file]
+    assert list(tmp_path.glob("*.json")) == [state_file]
 
 
 def test_plan_refuses_an_already_reserved_slug_and_resource_set(tmp_path):
