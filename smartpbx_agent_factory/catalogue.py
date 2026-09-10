@@ -51,9 +51,13 @@ class CapabilityCatalogue:
         status = raw.get("catalogue_status", "")
         if not isinstance(status, str):
             raise CatalogueError("catalogue_status must be a string")
+        if status != "approved":
+            raise CatalogueError("catalogue is not approved for operational use")
         return cls(1, parsed, status)
 
     def validate_pipeline(self, language: str, pipeline: Mapping[str, object]) -> None:
+        if self.status != "approved":
+            raise CatalogueError("catalogue is not approved for operational use")
         if language not in self.languages:
             raise CatalogueError(f"language/provider pipeline is not verified: {language}")
         if not isinstance(pipeline, Mapping):

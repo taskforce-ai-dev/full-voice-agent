@@ -21,6 +21,17 @@ class ProvenanceEvidence:
     oci_revision: str
 
 
+@dataclass(frozen=True)
+class TemplateAllowlist:
+    template_version: str
+    source_revision: str
+    image_digest: str
+    oci_revision: str
+    protocol_version: str
+    environment_schema_version: str
+    files: Mapping[str, str]
+
+
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VARIABLE_RE = re.compile(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}")
@@ -82,8 +93,43 @@ def verify_deployed_image_source(
     return ProvenanceEvidence(ref, expected_revision, expected_digest, actual_revision)
 
 
+def validate_allowlist_metadata(allowlist: Mapping[str, object]) -> TemplateAllowlist:
+    if not isinstance(allowlist, Mapping):
+        raise ProvenanceError("template allowlist metadata must be an object")
+    status = allowlist.get("status")
+    if status != "approved":
+        raise ProvenanceError("template allowlist provenance is blocked or not approved")
+    template_version = allowlist.get("template_version")
+    if not isinstance(template_version, str) or not template_version:
+        raise ProvenanceError("template allowlist template_version is required")
+    source_revision = validate_source_revision(allowlist.get("source_revision"))
+    oci_revision = validate_source_revision(allowlist.get("oci_revision"))
+    if oci_revision != source_revision:
+        raise ProvenanceError("OCI revision does not match source revision")
+    image_digest = validate_image_digest(allowlist.get("image_digest"))
+    protocol_version = allowlist.get("protocol_version")
+    if protocol_version != "smartpbx-ai-provider-v07":
+        raise ProvenanceError("template allowlist protocol version is not verified")
+    environment_schema_version = allowlist.get("environment_schema_version")
+    if (
+        not isinstance(environment_schema_version, str)
+        or not environment_schema_version
+        or environment_schema_version.lower() == "unverified"
+    ):
+        raise ProvenanceError("template allowlist environment schema is not verified")
+    return TemplateAllowlist(
+        template_version=template_version,
+        source_revision=source_revision,
+        image_digest=image_digest,
+        oci_revision=oci_revision,
+        protocol_version=protocol_version,
+        environment_schema_version=environment_schema_version,
+        files=_allowlisted_files(allowlist),
+    )
+
+
 def _allowlisted_files(allowlist: Mapping[str, object]) -> Mapping[str, str]:
-    raw_files = allowlist.get("files", allowlist) if isinstance(allowlist, Mapping) else None
+    raw_files = allowlist.get("files") if isinstance(allowlist, Mapping) else None
     if not isinstance(raw_files, Mapping):
         raise ProvenanceError("template allowlist files must be an object")
     normalized: dict[str, str] = {}
@@ -97,12 +143,13 @@ def _allowlisted_files(allowlist: Mapping[str, object]) -> Mapping[str, str]:
 
 
 def verify_template_files(path: Path, allowlist: Mapping[str, object]) -> dict[str, str]:
+    metadata = validate_allowlist_metadata(allowlist)
     root = Path(path)
     if not root.is_dir():
         raise ProvenanceError("template root must be a directory")
     if root.is_symlink():
         raise ProvenanceError("template root may not be a symlink")
-    expected = dict(_allowlisted_files(allowlist))
+    expected = dict(metadata.files)
     actual: dict[str, Path] = {}
     for candidate in root.rglob("*"):
         relative = candidate.relative_to(root).as_posix()
