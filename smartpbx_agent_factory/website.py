@@ -24,7 +24,8 @@ _CREDENTIAL = re.compile(
     rf"(?:{_PRIVATE_MARKER}|eyJ[A-Za-z0-9_-]{{6,}}\.[A-Za-z0-9_-]{{6,}}\.[A-Za-z0-9_-]{{3,}}|"
     r"(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|"
     r"gh[pous]_[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|"
-    r"(?:api[_ -]?key|token|secret|password|credential)\s*[:=]\s*\S+)",
+    r"(?:api[_ -]?key|token|secret|password|credential)\s*[:=]\s*\S+|"
+    r"authorization\s*:\s*bearer\s+\S+|bearer\s+[A-Za-z0-9._~-]{8,})",
     re.I,
 )
 _RESERVED_FIELD = re.compile(r"(?:token|secret|credential|password|api[_-]?key|backendhost|demohost|wss|host|url)", re.I)
@@ -33,6 +34,14 @@ _IMPORT = "import { SMARTPBX_AGENT_CARDS } from '../../data/smartpbx-agents.gene
 _ACTIVE_FILTER = 'SMARTPBX_AGENT_CARDS.filter((card) => card.releaseState === "active")'
 _MARKER_START = "/* smartpbx-agent-factory-data-v1\n"
 _MARKER_END = "\n*/"
+_TRANSACTION_MARKER = ".smartpbx-agent-factory-website-transaction.json"
+_TRANSACTION_ROOT = ".smartpbx-agent-factory-website-txn"
+_TRANSACTION_TARGETS = (
+    "data/smartpbx-agents.generated.mjs",
+    "scripts/validate-smartpbx-card.mjs",
+    "components/pages/BookDemo.tsx",
+    "package.json",
+)
 _CARD_KEYS = {
     "id", "releaseState", "brand", "agentName", "role", "location", "description",
     "images", "trainedOn", "langs", "callLabel", "askHint", "steps",
@@ -273,47 +282,149 @@ def _package(source: str) -> str:
     return json.dumps(value, ensure_ascii=True, indent=2) + "\n"
 
 
-def _atomic(contents: Mapping[Path, bytes], scope: str) -> None:
+def _transaction_paths(output_dir: Path) -> tuple[Path, Path]:
+    return output_dir / _TRANSACTION_MARKER, output_dir / _TRANSACTION_ROOT
+
+
+def _atomic_bytes(path: Path, value: bytes, *, scope: str) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix="." + scope + ".", suffix=".tmp", dir=path.parent)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(value)
+    os.replace(temporary_name, path)
+
+
+def _load_transaction(output_dir: Path) -> tuple[Path, Path, list[dict[str, object]], list[str]] | None:
+    marker_path, transaction_root = _transaction_paths(output_dir)
+    if not marker_path.exists():
+        return None
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("transaction marker is unreadable") from exc
+    required = {"version", "stage", "files"}
+    if not isinstance(marker, dict) or set(marker) not in {required, required | {"created_dirs"}} or marker.get("version") != 1:
+        raise ValueError("transaction marker has an invalid shape")
+    stage = marker["stage"]
+    files = marker["files"]
+    created_dirs = marker.get("created_dirs", [])
+    if not isinstance(stage, str) or not re.fullmatch(r"[a-z0-9.-]+", stage):
+        raise ValueError("transaction marker has an unsafe stage")
+    if not isinstance(files, list) or not isinstance(created_dirs, list):
+        raise ValueError("transaction marker has invalid collections")
+    if {item.get("target") for item in files if isinstance(item, dict)} != set(_TRANSACTION_TARGETS):
+        raise ValueError("transaction marker has unsafe targets")
+    if len(files) != len(_TRANSACTION_TARGETS):
+        raise ValueError("transaction marker has duplicate targets")
+    if any(item not in {"data", "scripts"} for item in created_dirs):
+        raise ValueError("transaction marker has unsafe created directories")
+    stage_path = transaction_root / stage
+    if not stage_path.is_dir():
+        raise ValueError("transaction marker staging directory is unavailable")
+    validated: list[dict[str, object]] = []
+    for index, record in enumerate(files):
+        if not isinstance(record, dict) or set(record) != {"target", "existed", "backup"}:
+            raise ValueError("transaction marker file record is invalid")
+        existed, backup = record["existed"], record["backup"]
+        if not isinstance(existed, bool):
+            raise ValueError("transaction marker file record has invalid existence")
+        expected_backup = f"backup-{index}.bin"
+        if existed and backup != expected_backup:
+            raise ValueError("transaction marker file record has an unsafe backup")
+        if not existed and backup is not None:
+            raise ValueError("transaction marker file record has an unexpected backup")
+        if existed and not (stage_path / expected_backup).is_file():
+            raise ValueError("transaction marker backup is unavailable")
+        validated.append(record)
+    return marker_path, stage_path, validated, created_dirs
+
+
+def _recover_transaction(output_dir: Path) -> None:
+    transaction = _load_transaction(output_dir)
+    if transaction is None:
+        return
+    marker_path, stage_path, files, created_dirs = transaction
+    for index, record in enumerate(files):
+        target = output_dir / str(record["target"])
+        if record["existed"]:
+            _atomic_bytes(target, (stage_path / f"backup-{index}.bin").read_bytes(), scope="smartpbx-recover")
+        else:
+            target.unlink(missing_ok=True)
+    marker_path.unlink()
+    for index, record in enumerate(files):
+        if record["existed"]:
+            (stage_path / f"backup-{index}.bin").unlink(missing_ok=True)
+    stage_path.rmdir()
+    transaction_root = stage_path.parent
+    if not any(transaction_root.iterdir()):
+        transaction_root.rmdir()
+    for relative in reversed(created_dirs):
+        try:
+            (output_dir / relative).rmdir()
+        except OSError:
+            pass
+
+
+def _finish_transaction(output_dir: Path) -> None:
+    transaction = _load_transaction(output_dir)
+    if transaction is None:
+        return
+    marker_path, stage_path, files, _ = transaction
+    marker_path.unlink()
+    for index, record in enumerate(files):
+        if record["existed"]:
+            (stage_path / f"backup-{index}.bin").unlink(missing_ok=True)
+    stage_path.rmdir()
+    transaction_root = stage_path.parent
+    if not any(transaction_root.iterdir()):
+        transaction_root.rmdir()
+
+
+def _begin_transaction(output_dir: Path, originals: Mapping[Path, bytes | None], created_dirs: list[str], *, scope: str) -> None:
+    marker_path, transaction_root = _transaction_paths(output_dir)
+    transaction_root.mkdir(exist_ok=True)
+    stage_path = Path(tempfile.mkdtemp(prefix=scope + ".", dir=transaction_root))
+    files: list[dict[str, object]] = []
+    for index, relative in enumerate(_TRANSACTION_TARGETS):
+        original = originals[output_dir / relative]
+        backup = None
+        if original is not None:
+            backup = f"backup-{index}.bin"
+            (stage_path / backup).write_bytes(original)
+        files.append({"target": relative, "existed": original is not None, "backup": backup})
+    marker = {"version": 1, "stage": stage_path.name, "files": files, "created_dirs": created_dirs}
+    _atomic_bytes(marker_path, json.dumps(marker, sort_keys=True).encode("utf-8"), scope="smartpbx-transaction")
+
+
+def _atomic(output_dir: Path, contents: Mapping[Path, bytes], scope: str) -> None:
     originals = {path: path.read_bytes() if path.exists() else None for path in contents}
     changed = {path: value for path, value in contents.items() if originals[path] != value}
     if not changed:
         return
-    created, staged, replaced = [], {}, []
+    created_dirs = [relative for relative in ("data", "scripts") if not (output_dir / relative).exists()]
+    _begin_transaction(output_dir, originals, created_dirs, scope=scope)
+    staged: dict[Path, Path] = {}
     try:
         for path, value in changed.items():
-            if not path.parent.exists():
-                path.parent.mkdir(parents=True)
-                created.append(path.parent)
-            fd, name = tempfile.mkstemp(prefix="." + scope + ".", suffix=".tmp", dir=path.parent)
-            with os.fdopen(fd, "wb") as handle:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(prefix="." + scope + ".", suffix=".tmp", dir=path.parent)
+            with os.fdopen(descriptor, "wb") as handle:
                 handle.write(value)
-            staged[path] = Path(name)
+            staged[path] = Path(temporary_name)
         for path, temporary in staged.items():
             os.replace(temporary, path)
-            replaced.append(path)
     except Exception:
         for temporary in staged.values():
             temporary.unlink(missing_ok=True)
-        for path in reversed(replaced):
-            if originals[path] is None:
-                path.unlink(missing_ok=True)
-            else:
-                fd, name = tempfile.mkstemp(prefix="." + scope + ".restore.", suffix=".tmp", dir=path.parent)
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(originals[path])
-                os.replace(name, path)
-        for path in reversed(created):
-            try:
-                path.rmdir()
-            except OSError:
-                pass
+        _recover_transaction(output_dir)
         raise
+    _finish_transaction(output_dir)
 
 
 def render_website_artifacts(manifest: AgentManifest, resources: DerivedResources, *, backend_artifact_digest: str, backend_branch_sha: str, output_dir: Path) -> WebsiteRenderReport:
     """Write review-only artifacts to an isolated website worktree."""
     dependency = _dependency(backend_artifact_digest, backend_branch_sha)
     output_dir = Path(output_dir)
+    _recover_transaction(output_dir)
     page, package = output_dir / "components/pages/BookDemo.tsx", output_dir / "package.json"
     data, validator = output_dir / "data/smartpbx-agents.generated.mjs", output_dir / "scripts/validate-smartpbx-card.mjs"
     if not page.is_file() or not package.is_file():
@@ -326,5 +437,5 @@ def render_website_artifacts(manifest: AgentManifest, resources: DerivedResource
         page: _book_demo(page.read_text(encoding="utf-8")).encode(),
         package: _package(package.read_text(encoding="utf-8")).encode(),
     }
-    _atomic(contents, "smartpbx-" + manifest.slug + "-" + backend_artifact_digest[:12])
+    _atomic(output_dir, contents, "smartpbx-" + manifest.slug + "-" + backend_artifact_digest[:12])
     return WebsiteRenderReport(dependency, tuple(str(item["id"]) for item in cards), (Path("data/smartpbx-agents.generated.mjs"), Path("scripts/validate-smartpbx-card.mjs"), Path("components/pages/BookDemo.tsx"), Path("package.json")))
