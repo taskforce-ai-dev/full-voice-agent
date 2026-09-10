@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Thread
 
 import pytest
 
@@ -10,7 +9,7 @@ from smartpbx_agent_factory.knowledge import (
     KnowledgeApprovalRequired,
     KnowledgeBuilderImpl,
     KnowledgeError,
-    LocalFixtureNetworkPolicy,
+    URLFetchResponse,
 )
 from smartpbx_agent_factory.model import KnowledgeSource
 from smartpbx_agent_factory.state import GenerationState, Stage
@@ -48,37 +47,37 @@ def url_source(url: str, origins: tuple[str, ...], **overrides: object) -> Knowl
     return KnowledgeSource(**values)
 
 
-@pytest.fixture
-def http_server():
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802 - stdlib handler contract
-            if self.path == "/redirect":
-                self.send_response(302)
-                self.send_header("Location", f"http://localhost:{self.server.server_port}/escaped")
-                self.end_headers()
-                return
-            if self.path.split("?", 1)[0] == "/allowed/page":
-                body = b"Hours: Monday to Friday, 09:00-17:00 UTC."
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            self.send_error(404)
+@dataclass
+class FakeResolver:
+    answers: dict[str, tuple[str, ...]]
+    calls: list[tuple[str, int]] = field(default_factory=list)
 
-        def log_message(self, format, *args):  # noqa: A002 - stdlib signature
-            return
+    def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
+        self.calls.append((hostname, port))
+        return self.answers[hostname]
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_port}"
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()
+
+@dataclass
+class FakeTransport:
+    responses: dict[str, URLFetchResponse]
+    calls: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+
+    def fetch(self, url: str, addresses: tuple[str, ...], timeout_seconds: float) -> URLFetchResponse:
+        self.calls.append((url, addresses))
+        return self.responses[url]
+
+
+def response(status: int, *, headers: dict[str, str], body: bytes = b"") -> URLFetchResponse:
+    return URLFetchResponse(status=status, headers=headers, body=body)
+
+
+def fake_url_builder(
+    responses: dict[str, URLFetchResponse],
+    addresses: dict[str, tuple[str, ...]] | None = None,
+) -> tuple[KnowledgeBuilderImpl, FakeResolver, FakeTransport]:
+    resolver = FakeResolver(addresses or {"allowed.example": ("8.8.8.8",), "other.example": ("1.1.1.1",)})
+    transport = FakeTransport(responses)
+    return KnowledgeBuilderImpl(resolver=resolver, transport=transport), resolver, transport
 
 
 def test_path_traversal_and_symlink_sources_are_rejected(tmp_path):
@@ -110,21 +109,31 @@ def test_absolute_local_source_outside_explicit_root_is_rejected(tmp_path):
         )
 
 
-def test_url_redirect_cannot_escape_allowlisted_origin(http_server, tmp_path):
-    source = url_source(f"{http_server}/redirect", origins=(http_server,))
+def test_url_redirect_cannot_escape_allowlisted_origin(tmp_path):
+    source = url_source("https://allowed.example/redirect", origins=("https://allowed.example",))
+    builder, _, _ = fake_url_builder(
+        {source.url: response(302, headers={"Location": "https://other.example/escaped"})}
+    )
     with pytest.raises(KnowledgeError, match="origin"):
-        KnowledgeBuilderImpl(network_policy=LocalFixtureNetworkPolicy()).build(
-            (source,), output_dir=tmp_path / "out"
-        )
+        builder.build((source,), output_dir=tmp_path / "out")
 
 
-def test_url_path_prefix_and_content_type_are_enforced_with_local_http_fixture(http_server, tmp_path):
+def test_url_path_prefix_and_content_type_are_enforced_with_fake_transport(tmp_path):
     source = url_source(
-        f"{http_server}/allowed/page", origins=(http_server,), path_prefixes=("/allowed",)
+        "https://allowed.example/allowed/page",
+        origins=("https://allowed.example",),
+        path_prefixes=("/allowed",),
     )
-    review = KnowledgeBuilderImpl(network_policy=LocalFixtureNetworkPolicy()).build(
-        (source,), output_dir=tmp_path / "out"
+    builder, _, _ = fake_url_builder(
+        {
+            source.url: response(
+                200,
+                headers={"Content-Type": "text/plain; charset=utf-8", "Content-Length": "42"},
+                body=b"Hours: Monday to Friday, 09:00-17:00 UTC.",
+            )
+        }
     )
+    review = builder.build((source,), output_dir=tmp_path / "out")
     assert review.facts[0].source_uri == source.url
     assert (tmp_path / "out" / "knowledge_docs" / "source-001.md").is_file()
 
@@ -145,11 +154,78 @@ def test_default_network_policy_rejects_non_public_ip_literals_without_network_a
         KnowledgeBuilderImpl().build((source,), output_dir=tmp_path / "out")
 
 
-def test_url_query_is_not_persisted_in_review_or_source_document(http_server, tmp_path):
-    source = url_source(f"{http_server}/allowed/page?ticket=benign-query-value", origins=(http_server,))
-    review = KnowledgeBuilderImpl(network_policy=LocalFixtureNetworkPolicy()).build(
-        (source,), output_dir=tmp_path / "out"
+def test_resolver_rejects_alternate_loopback_literal_before_transport(tmp_path):
+    source = url_source("https://127.1/faq", origins=("https://127.1",))
+    builder, _, transport = fake_url_builder({}, {"127.1": ("127.0.0.1",)})
+    with pytest.raises(KnowledgeError, match="non-global"):
+        builder.build((source,), output_dir=tmp_path / "out")
+    assert transport.calls == []
+
+
+def test_resolver_rejects_any_private_record_before_transport(tmp_path):
+    source = url_source("https://allowed.example/faq", origins=("https://allowed.example",))
+    builder, _, transport = fake_url_builder(
+        {}, {"allowed.example": ("8.8.8.8", "169.254.169.254")}
     )
+    with pytest.raises(KnowledgeError, match="non-global"):
+        builder.build((source,), output_dir=tmp_path / "out")
+    assert transport.calls == []
+
+
+def test_transport_receives_only_validated_pinned_addresses(tmp_path):
+    source = url_source("https://allowed.example/faq", origins=("https://allowed.example",))
+    builder, resolver, transport = fake_url_builder(
+        {
+            source.url: response(
+                200,
+                headers={"Content-Type": "text/plain", "Content-Length": "13"},
+                body=b"Approved fact",
+            )
+        },
+        {"allowed.example": ("8.8.8.8", "2001:4860:4860::8888")},
+    )
+    builder.build((source,), output_dir=tmp_path / "out")
+    assert resolver.calls == [("allowed.example", 443)]
+    assert transport.calls == [(source.url, ("8.8.8.8", "2001:4860:4860::8888"))]
+
+
+def test_redirect_re_resolves_and_blocks_rebinding_before_second_transport(tmp_path):
+    source = url_source("https://allowed.example/start", origins=("https://allowed.example",))
+
+    @dataclass
+    class RebindingResolver:
+        calls: int = 0
+
+        def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
+            self.calls += 1
+            return ("8.8.8.8",) if self.calls == 1 else ("169.254.169.254",)
+
+    resolver = RebindingResolver()
+    transport = FakeTransport(
+        {source.url: response(302, headers={"Location": "https://allowed.example/next"})}
+    )
+    builder = KnowledgeBuilderImpl(resolver=resolver, transport=transport)
+    with pytest.raises(KnowledgeError, match="non-global"):
+        builder.build((source,), output_dir=tmp_path / "out")
+    assert resolver.calls == 2
+    assert transport.calls == [(source.url, ("8.8.8.8",))]
+
+
+def test_url_query_is_not_persisted_in_review_or_source_document(tmp_path):
+    source = url_source(
+        "https://allowed.example/allowed/page?ticket=benign-query-value",
+        origins=("https://allowed.example",),
+    )
+    builder, _, _ = fake_url_builder(
+        {
+            source.url: response(
+                200,
+                headers={"Content-Type": "text/plain", "Content-Length": "42"},
+                body=b"Hours: Monday to Friday, 09:00-17:00 UTC.",
+            )
+        }
+    )
+    review = builder.build((source,), output_dir=tmp_path / "out")
     document = (tmp_path / "out" / "knowledge_docs" / "source-001.md").read_text(encoding="utf-8")
     report = (tmp_path / "out" / "knowledge_docs" / "review.md").read_text(encoding="utf-8")
     assert "benign-query-value" not in review.facts[0].source_uri
