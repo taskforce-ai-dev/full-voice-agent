@@ -123,6 +123,7 @@ def test_conflict_requires_digest_bound_approval(tmp_path):
     state.transition(Stage.SECRETS_RESOLVED)
     state.transition(Stage.KNOWLEDGE_REVIEW_REQUIRED)
     state.record_knowledge_review_digest(review.digest)
+    state.approve_knowledge(review.digest)
     review.require_approved(state)
 
 
