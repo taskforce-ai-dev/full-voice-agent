@@ -63,11 +63,13 @@ def test_template_allowlist_files_are_deeply_immutable():
         "image_digest": "sha256:" + "b" * 64,
         "protocol_version": "smartpbx-ai-provider-v07",
         "environment_schema_version": "v1",
-        "files": {"server.py": "sha256:" + "c" * 64},
+        "files": {"Kavya/server.py": {"template_path": "runtime/server.py", "sha256": "sha256:" + "c" * 64}},
     }
     allowlist = validate_allowlist_metadata(metadata)
     with pytest.raises(TypeError):
-        allowlist.files["other.py"] = "sha256:" + "d" * 64
+        allowlist.files["other.py"] = object()
+    with pytest.raises((AttributeError, TypeError)):
+        allowlist.files["Kavya/server.py"].template_path = "other.py"
 
 
 def test_template_substitution_rejects_unresolved_braces_and_nul():

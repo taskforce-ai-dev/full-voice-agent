@@ -3,10 +3,14 @@
   "catalogue_status": "approved",
   "languages": {
     "en-US": {
-      "stt": ["deepgram"],
-      "llm": ["claude"],
-      "tts": ["elevenlabs"],
-      "fallback": []
+      "locales": {
+        "en-US": {
+          "stt": [{"provider": "deepgram", "model": "nova-3"}],
+          "llm": [{"provider": "claude", "model": "claude-sonnet-4-6"}],
+          "tts": [{"provider": "elevenlabs", "model": "eleven_turbo_v2_5"}],
+          "fallback": []
+        }
+      }
     }
   }
 }

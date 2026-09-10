@@ -99,6 +99,22 @@ def test_parser_rejects_unknown_provider_mapping_and_capability_detail_keys():
         parse(raw)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("locale", "en-GB"),
+        ("stt", {"provider": "deepgram", "model": "unapproved"}),
+        ("llm", {"provider": "claude", "model": "unapproved"}),
+        ("tts", {"provider": "elevenlabs", "model": "unapproved"}),
+    ),
+)
+def test_parser_rejects_unapproved_language_locale_or_provider_model_pair(field, value):
+    raw = load_raw()
+    raw["languages"][0][field] = value
+    with pytest.raises(ManifestError, match="not verified"):
+        parse(raw)
+
+
 def test_manifest_is_deeply_immutable_and_uses_v07_defaults():
     raw = load_raw()
     raw["smartpbx"].pop("protocol_profile")
