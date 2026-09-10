@@ -66,10 +66,19 @@ class InventoryProvider(Protocol):
     def snapshot(self) -> Mapping[str, object]: ...
 
 
-class VerificationCoordinator(Protocol):
-    """Coordinator-owned verification seam; callers cannot submit booleans."""
+@dataclass(frozen=True)
+class RepositoryOwnedCIVerificationCoordinator:
+    """Concrete capability reserved for the repository-owned CI result adapter.
 
-    def verify(self, *, generation_id: str, resources: DerivedResources, lane_records: Mapping[str, Mapping[str, str]]) -> tuple[ReadinessEvidence, Mapping[str, VerificationReport]]: ...
+    It intentionally cannot accept readiness booleans or caller-built reports.
+    Until a CI result adapter is installed, verification is pending and the
+    generation remains in ``GENERATED``.
+    """
+
+    ci_result_adapter: object | None = None
+
+    def verify(self, *, generation_id: str, resources: DerivedResources, lane_records: Mapping[str, Mapping[str, str]]) -> tuple[ReadinessEvidence, Mapping[str, VerificationReport]]:
+        raise GenerationBlockedError("repository-owned CI lifecycle result is pending")
 
 
 @dataclass(frozen=True)
@@ -133,17 +142,6 @@ class CleanupInventory:
     completed: bool = False
 
 
-@dataclass(frozen=True)
-class BackendWorktreeBinding:
-    """One caller-supplied, manager-owned destination for backend rendering."""
-
-    manager: WorktreeManager
-    primary: Path
-    remote: str
-    revision: str
-    target: Path
-
-
 class GenerationOrchestrator:
     """Own state transitions; rendering and PR creation stay separate lanes."""
 
@@ -155,7 +153,7 @@ class GenerationOrchestrator:
         worktree_manager_factory: Callable[[Path], WorktreeManager] = WorktreeManager,
         knowledge_builder_factory: Callable[[Path], KnowledgeBuilder] | None = None,
         inventory_provider: InventoryProvider | None = None,
-        verification_coordinator: VerificationCoordinator | None = None,
+        verification_coordinator: RepositoryOwnedCIVerificationCoordinator | None = None,
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise GenerationInfrastructureError("state root must be an absolute path")
@@ -238,8 +236,8 @@ class GenerationOrchestrator:
         *,
         binding: GenerationBinding | None = None,
         secret_provider: SecretProvider | None = None,
-        backend_worktree: BackendWorktreeBinding | None = None,
     ) -> GenerationState:
+        """Render/commit/checkpoint each lane; resumed runs skip valid checkpoints."""
         stored = self._load_verified(generation_id)
         if stored.state.stage is Stage.INPUT_COLLECTED:
             raise GenerationBlockedError("secret resolution is required before knowledge review")
@@ -253,10 +251,7 @@ class GenerationOrchestrator:
         review = self._approved_knowledge_review(stored)
         self._require_complete_runtime_template()
         if binding is None:
-            if not isinstance(backend_worktree, BackendWorktreeBinding):
-                raise GenerationBlockedError("a single generation binding is required")
-            # Legacy single-lane callers remain explicitly unable to render.
-            raise GenerationBlockedError("backend-only generation is not a complete review transaction")
+            raise GenerationBlockedError("an immutable three-lane generation binding is required")
         # Protocols cannot be used reliably with isinstance for injected fakes.
         if secret_provider is None or not all(hasattr(secret_provider, name) for name in ("validate", "fetch", "generate", "encrypt_yaml", "audit_report")):
             raise GenerationBlockedError("a validated secret provider is required for all lanes")
@@ -279,43 +274,44 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("generation worktree creation failed") from error
         # All targets now exist and are manager-owned before any renderer can write.
         try:
-            backend_report = render_backend(
-                manifest,
-                review,
-                stored.resources,
-                handles["backend"],
-                worktree_manager=binding.backend.manager,
-                state=stored.state,
-            )
-            secret_plan = derive_secret_plan(manifest, stored.resources)
-            operations_audit = render_operations_artifacts(
-                manifest, stored.resources, secret_provider,
-                worktree=handles["operations"], worktree_manager=binding.operations.manager,
-                secret_plan=secret_plan,
-            )
-            backend_digest = _tree_digest(handles["backend"].target)
-            render_website_artifacts(
-                manifest, stored.resources, backend_artifact_digest=backend_digest,
-                backend_branch_sha=handles["backend"].revision,
-                worktree=handles["website"], worktree_manager=binding.website.manager,
-            )
+            stored = self._load_verified(generation_id)
+            if not self._checkpoint_is_valid(stored, "backend", handles["backend"]):
+                render_backend(manifest, review, stored.resources, handles["backend"], worktree_manager=binding.backend.manager, state=stored.state)
+                handles["backend"] = self._commit_and_checkpoint(
+                    generation_id, "backend", binding.backend.manager, handles["backend"],
+                    (Path("SmartPBX Agents") / stored.resources.slug,),
+                )
+            stored = self._load_verified(generation_id)
+            backend_digest = stored.state.lane_records["backend"]["artifact_digest"]
+            if not self._checkpoint_is_valid(stored, "operations", handles["operations"]):
+                secret_plan = derive_secret_plan(manifest, stored.resources, CapabilityCatalogue.load(self._catalogue_path))
+                audit = render_operations_artifacts(
+                    manifest, stored.resources, secret_provider,
+                    worktree=handles["operations"], worktree_manager=binding.operations.manager,
+                    secret_plan=secret_plan,
+                )
+                handles["operations"] = self._commit_and_checkpoint(
+                    generation_id, "operations", binding.operations.manager, handles["operations"],
+                    (Path("agents") / stored.resources.slug,), ciphertext_reference=",".join(audit.ciphertext_paths),
+                )
+            stored = self._load_verified(generation_id)
+            if not self._checkpoint_is_valid(stored, "website", handles["website"]):
+                render_website_artifacts(
+                    manifest, stored.resources, backend_artifact_digest=backend_digest,
+                    backend_branch_sha=handles["backend"].revision,
+                    worktree=handles["website"], worktree_manager=binding.website.manager,
+                )
+                handles["website"] = self._commit_and_checkpoint(
+                    generation_id, "website", binding.website.manager, handles["website"],
+                    (Path("data") / "smartpbx-agents.generated.mjs", Path("scripts") / "validate-smartpbx-card.mjs", Path("components") / "pages" / "BookDemo.tsx", Path("package.json")),
+                )
         except IncompleteTemplateError as error:
             raise GenerationBlockedError(str(error)) from error
+        except GenerationBlockedError:
+            raise
         except Exception as error:
             raise GenerationBlockedError("review transaction renderer failed") from error
-        stored = self._load_verified(generation_id)
-        ciphertext_reference = ",".join(operations_audit.ciphertext_paths)
-        for role, handle in handles.items():
-            output_digest = _tree_digest(handle.target)
-            stored.state.record_lane(
-                role,
-                output_digest=output_digest,
-                head_sha=handle.revision,
-                artifact_digest=backend_digest if role == "backend" else output_digest,
-                ciphertext_reference=ciphertext_reference if role == "operations" else "",
-            )
-        self._save(stored)
-        return stored.state
+        return self._load_verified(generation_id).state
 
     def resume(
         self,
@@ -349,7 +345,7 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("generation cleanup inventory is unavailable")
         existing = next((item for item in inventory.worktrees if item.target == lane.target), None)
         if existing is not None:
-            if (existing.primary, existing.revision, existing.target) != (lane.primary.resolve(), lane.revision, lane.target.resolve()):
+            if (existing.primary, existing.target) != (lane.primary.resolve(), lane.target.resolve()):
                 raise GenerationBlockedError("recorded lane binding does not match immutable generation binding")
             revalidate = getattr(lane.manager, "reuse_recorded", None)
             if not callable(revalidate):
@@ -366,6 +362,31 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("lane manager returned an invalid worktree handle")
         self.record_owned_worktree(generation_id, lane.manager, handle)
         return handle
+
+    def _checkpoint_is_valid(self, stored: _StoredGeneration, role: str, handle: WorktreeHandle) -> bool:
+        record = stored.state.lane_records.get(role)
+        if record is None:
+            return False
+        if record.get("head_sha") != handle.revision or record.get("output_digest") != _tree_digest(handle.target):
+            raise GenerationBlockedError("recorded lane checkpoint no longer matches owned worktree")
+        return True
+
+    def _commit_and_checkpoint(
+        self, generation_id: str, role: str, manager: object, handle: WorktreeHandle,
+        allowed_paths: tuple[Path, ...], *, ciphertext_reference: str = "",
+    ) -> WorktreeHandle:
+        commit = getattr(manager, "stage_and_commit", None)
+        if not callable(commit):
+            raise GenerationBlockedError("lane manager cannot create a review commit")
+        updated = commit(handle, allowed_paths=allowed_paths, message=f"factory({role}): review generation {generation_id}")
+        if not isinstance(updated, WorktreeHandle):
+            raise GenerationBlockedError("lane manager did not return an authoritative committed handle")
+        self.record_owned_worktree(generation_id, manager, updated)
+        stored = self._load_verified(generation_id)
+        digest = _tree_digest(updated.target)
+        stored.state.record_lane(role, output_digest=digest, head_sha=updated.revision, artifact_digest=digest, ciphertext_reference=ciphertext_reference)
+        self._save(stored)
+        return updated
 
     def record_secrets_resolved(
         self, generation_id: str, *, provider: SecretProvider
@@ -385,7 +406,9 @@ class GenerationOrchestrator:
         if not isinstance(audit, SecretAudit):
             raise GenerationBlockedError("SecretProvider audit is invalid")
         manifest = self._current_manifest(stored)
-        secret_plan = derive_secret_plan(manifest, stored.resources)
+        secret_plan = derive_secret_plan(
+            manifest, stored.resources, CapabilityCatalogue.load(self._catalogue_path)
+        )
         expected_names = {item.record_id for item in secret_plan.requirements}
         audited_names = audit.fetched_names + audit.generated_names
         if len(audited_names) != len(set(audited_names)) or set(audited_names) != expected_names:
@@ -531,7 +554,7 @@ class GenerationOrchestrator:
 
     def verify_generation(self, generation_id: str) -> Path:
         """Persist readiness only from the injected, authority-owning coordinator."""
-        if self._verification_coordinator is None:
+        if not isinstance(self._verification_coordinator, RepositoryOwnedCIVerificationCoordinator):
             raise GenerationBlockedError("verification is library-only until a coordinator is configured")
         stored = self._load_verified(generation_id)
         try:

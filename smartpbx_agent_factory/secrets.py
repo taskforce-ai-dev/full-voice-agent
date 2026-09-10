@@ -19,6 +19,7 @@ from typing import Callable, Mapping, MutableMapping, Protocol, Sequence
 
 from .model import AgentManifest
 from .resources import DerivedResources
+from .catalogue import CapabilityCatalogue, CatalogueError
 
 
 class SecretError(RuntimeError):
@@ -71,6 +72,7 @@ class SecretPlan:
     """Exact secret surface selected by immutable manifest language pipelines."""
 
     requirements: tuple[SecretRequirement, ...]
+    metadata_identifiers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.requirements:
@@ -79,6 +81,10 @@ class SecretPlan:
             raise SecretError("secret plan record ids must be distinct")
         if len({item.runtime_env for item in self.requirements}) != len(self.requirements):
             raise SecretError("secret plan runtime environment names must be distinct")
+        if any(not re.fullmatch(r"[A-Z][A-Z0-9_]*", value) for value in self.metadata_identifiers):
+            raise SecretError("secret plan metadata identifiers are invalid")
+        if set(self.metadata_identifiers) & set(self.operations_env_names):
+            raise SecretError("secret plan metadata must not be treated as secret")
 
     @property
     def operations_env_names(self) -> tuple[str, ...]:
@@ -101,40 +107,39 @@ class SecretPlan:
         )
 
 
-_PROVIDER_ENV = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "azure": "AZURE_SPEECH_KEY",
-    "deepgram": "DEEPGRAM_API_KEY",
-    "elevenlabs": "ELEVENLABS_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "google": "GOOGLE_API_KEY",
-    "openai": "OPENAI_API_KEY",
-}
-
-
-def derive_secret_plan(manifest: AgentManifest, resources: DerivedResources) -> SecretPlan:
+def derive_secret_plan(
+    manifest: AgentManifest, resources: DerivedResources, catalogue: CapabilityCatalogue
+) -> SecretPlan:
     """Select shared provider records once plus the per-agent WSS credential.
 
     This function is deterministic and deliberately has no secret-provider
     dependency.  A provider occurring in multiple language roles therefore
     maps to one shared record and one runtime environment variable.
     """
-    if not isinstance(manifest, AgentManifest) or not isinstance(resources, DerivedResources):
-        raise SecretError("secret plan requires manifest and derived resources")
+    if not isinstance(manifest, AgentManifest) or not isinstance(resources, DerivedResources) or not isinstance(catalogue, CapabilityCatalogue):
+        raise SecretError("secret plan requires manifest, derived resources, and an approved catalogue")
     if manifest.slug != resources.slug:
         raise SecretError("secret plan resources do not match manifest")
-    providers = sorted({provider.lower() for language in manifest.languages for provider in (language.stt, language.llm, language.tts)})
-    requirements: list[SecretRequirement] = []
-    for provider in providers:
-        env = _PROVIDER_ENV.get(provider)
-        if env is None:
-            normalized = re.sub(r"[^a-z0-9]+", "_", provider).strip("_").upper()
-            if not normalized:
-                raise SecretError("provider cannot form a secret environment name")
-            env = f"SMARTPBX_PROVIDER_{normalized}_CREDENTIAL"
-        requirements.append(SecretRequirement(f"providers/{provider}", env))
-    requirements.append(SecretRequirement(f"agents/{resources.slug}/wss_token", "SMARTPBX_WS_TOKEN", generated=True))
-    return SecretPlan(tuple(requirements))
+    identifiers: set[str] = set()
+    metadata: set[str] = set()
+    try:
+        for language in manifest.languages:
+            catalogue.validate_generated_pipeline(language.code, language.pipeline)
+            identifiers.update(catalogue.required_secret_identifiers_for_pipeline(language.code, language.pipeline))
+            metadata.update(catalogue.required_metadata_identifiers_for_pipeline(language.code, language.pipeline))
+    except CatalogueError as error:
+        raise SecretError("secret plan has no approved provider pipeline") from error
+    if "SMARTPBX_WS_TOKEN" not in identifiers:
+        raise SecretError("approved catalogue must require SMARTPBX_WS_TOKEN")
+    requirements = [
+        SecretRequirement(
+            f"agents/{resources.slug}/smartpbx_ws_token" if identifier == "SMARTPBX_WS_TOKEN" else f"providers/{identifier.lower()}",
+            identifier,
+            generated=identifier == "SMARTPBX_WS_TOKEN",
+        )
+        for identifier in sorted(identifiers)
+    ]
+    return SecretPlan(tuple(requirements), tuple(sorted(metadata)))
 
 
 @dataclass(frozen=True)

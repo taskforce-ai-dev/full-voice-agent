@@ -11,7 +11,7 @@ from typing import Iterable
 from .gitops import WorktreeHandle, WorktreeManager, WorktreeConflictError, manager_owned_worktree_target
 from .model import AgentManifest
 from .resources import DerivedResources
-from .secrets import SecretAudit, SecretError, SecretPlan, SecretProvider, derive_secret_plan
+from .secrets import SecretAudit, SecretError, SecretPlan, SecretProvider
 
 
 class SecretLeakError(SecretError):
@@ -86,7 +86,7 @@ def render_operations_artifacts(
     *,
     worktree: WorktreeHandle,
     worktree_manager: WorktreeManager,
-    secret_plan: SecretPlan | None = None,
+    secret_plan: SecretPlan,
 ) -> SecretAudit:
     """Write non-secret metadata and a single SOPS ciphertext document.
 
@@ -111,7 +111,9 @@ def render_operations_artifacts(
         raise SecretError("operations artifact target already exists")
     secret_path = agent_dir / "secrets.sops.yaml"
     metadata_path = agent_dir / "metadata.yaml"
-    plan = secret_plan or derive_secret_plan(manifest, resources)
+    if not isinstance(secret_plan, SecretPlan):
+        raise SecretError("operations renderer requires an exact approved secret plan")
+    plan = secret_plan
     created_agent_dir = False
     try:
         agents.mkdir(mode=0o700, exist_ok=True)

@@ -66,17 +66,17 @@ def invoke_cli(argv: Sequence[str] | None = None) -> CLIResult:
         return CLIResult(EXIT_INVALID_INPUT if error.code else EXIT_SUCCESS)
     state_root = args.state_root if args.state_root.is_absolute() else (Path.cwd() / args.state_root)
     catalogue = args.catalogue.resolve() if args.catalogue else None
+    if args.command in {"generate", "open-pr"}:
+        return CLIResult(
+            EXIT_BLOCKED_GATE,
+            stderr=(
+                f"{args.command} is library-only: configure non-secret lane adapters, "
+                "an injected secret provider, and a coordinator-owned verifier in Python; "
+                "the CLI never guesses repositories, credentials, or readiness.\n"
+            ),
+        )
     orchestrator = GenerationOrchestrator(state_root.resolve(), catalogue_path=catalogue)
     try:
-        if args.command in {"generate", "open-pr"}:
-            return CLIResult(
-                EXIT_BLOCKED_GATE,
-                stderr=(
-                    f"{args.command} is library-only: configure non-secret lane adapters, "
-                    "an injected secret provider, and a coordinator-owned verifier in Python; "
-                    "the CLI never guesses repositories, credentials, or readiness.\n"
-                ),
-            )
         if args.command == "inspect":
             report = orchestrator.inspect(args.manifest)
             return CLIResult(EXIT_SUCCESS if report["ok"] else EXIT_BLOCKED_GATE, f"{report}\n")

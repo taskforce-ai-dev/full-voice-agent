@@ -190,6 +190,60 @@ class WorktreeManager:
         self._handles[id(updated)] = updated
         return updated
 
+    def stage_and_commit(
+        self, handle: WorktreeHandle, *, allowed_paths: Sequence[Path], message: str
+    ) -> WorktreeHandle:
+        """Commit only expected factory paths, then return an authoritative clean head.
+
+        It is deliberately incapable of pushing.  Any pre-existing or
+        renderer-unowned modification is a hard stop rather than collateral
+        staging.  The commit identity is fixed to the factory review author.
+        """
+        if self._handles.get(id(handle)) is not handle or handle.branch is None:
+            raise WorktreeConflictError("only a manager-owned generation branch may be committed")
+        if not isinstance(message, str) or not re.fullmatch(r"factory\([a-z-]+\): review generation [a-z0-9-]+", message):
+            raise WorktreeConflictError("factory review commit message is invalid")
+        target = self._validate_target(handle.target, must_not_exist=False)
+        safe_paths = tuple(self._relative_commit_path(path) for path in allowed_paths)
+        if not safe_paths:
+            raise WorktreeConflictError("factory review commit paths are required")
+        changed = self._changed_paths(target)
+        if not changed:
+            raise WorktreeConflictError("factory review lane has no renderer output to commit")
+        if any(not any(path == allowed or path.startswith(allowed + "/") for allowed in safe_paths) for path in changed):
+            raise WorktreeConflictError("generation worktree has unexpected preexisting changes")
+        self._run(("git", "-C", str(target), "add", "--", *safe_paths))
+        staged = self._run(("git", "-C", str(target), "diff", "--cached", "--name-only")).splitlines()
+        if not staged or set(staged) != set(changed):
+            raise WorktreeConflictError("factory review staging does not exactly match renderer output")
+        self._run((
+            "git", "-C", str(target), "-c", "user.name=thiva2k",
+            "-c", "user.email=178917250+thiva2k@users.noreply.github.com",
+            "commit", "--author=thiva2k <178917250+thiva2k@users.noreply.github.com>", "-m", message,
+        ))
+        updated = self.record_current_head(handle)
+        if self._run(("git", "-C", str(target), "status", "--porcelain")).strip():
+            raise WorktreeConflictError("factory review branch is not clean after commit")
+        return updated
+
+    @staticmethod
+    def _relative_commit_path(path: Path) -> str:
+        if not isinstance(path, Path) or path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+            raise WorktreeConflictError("factory review path is invalid")
+        return path.as_posix()
+
+    def _changed_paths(self, target: Path) -> tuple[str, ...]:
+        raw = self._run(("git", "-C", str(target), "status", "--porcelain", "--untracked-files=all"))
+        paths: list[str] = []
+        for line in raw.splitlines():
+            if len(line) < 4 or line[2] != " " or line[0] == "?" and line[1] != "?":
+                raise WorktreeConflictError("generation worktree status is invalid")
+            path = line[3:]
+            if not path or " -> " in path or path.startswith('"') or "\x00" in path:
+                raise WorktreeConflictError("generation worktree status is invalid")
+            paths.append(path)
+        return tuple(paths)
+
     @staticmethod
     def _validate_remote(remote: str) -> str:
         if not isinstance(remote, str) or not _REMOTE_RE.fullmatch(remote):
