@@ -14,8 +14,8 @@ RUN pip install --no-cache-dir -r requirements-prod.lock.txt
 # Explicit rendered-output allowlist: no source-tree wildcard is permitted.
 COPY startup.py server.py smartpbx_gateway.py smartpbx_protocol.py ./
 COPY smartpbx_session.py smartpbx_transport.py smartpbx_diagnostics.py ./
-COPY product_profile.py provider_adapters.py provider_runtime.py turn_engine.py ./
-COPY provider_stt.py provider_llm.py provider_tts.py ./
+COPY product_profile.py provider_adapters.py provider_runtime.py provider_builders.py turn_engine.py ./
+COPY stt_adapters.py llm_adapters.py tts_adapters.py ./
 COPY config/product_profile.json config/provider_profile.json ./config/
 COPY knowledge_docs/ ./knowledge_docs/
 
@@ -24,6 +24,7 @@ COPY knowledge_docs/ ./knowledge_docs/
 RUN SMARTPBX_WS_TOKEN=build-check-token SMARTPBX_ACCOUNT_ID=build-check-account \
     SMARTPBX_AUTH_HEADER_NAME=X-Build-Check-Token SMARTPBX_PRODUCT_PROFILE_PATH=/app/config/product_profile.json \
     SMARTPBX_KNOWLEDGE_DIR=/app/knowledge_docs SMARTPBX_PROVIDER_PROFILE_PATH=/app/config/provider_profile.json \
+    SMARTPBX_RUNTIME_MODE=synthetic SMARTPBX_ALLOW_SYNTHETIC_FOR_CI=1 \
     python -c "import startup"
 
 EXPOSE 8000

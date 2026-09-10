@@ -46,6 +46,9 @@ class ConversationTurnEngine:
         pre_audio_min_events: int = 2,
         pre_audio_min_seconds: float = 0.25,
         duplicate_identity_window_seconds: float = 2.0,
+        silence_reprompt_seconds: float = 20.0,
+        max_reprompts: int = 2,
+        filler_delay_seconds: float = 0.75,
         clock: Callable[[], float] = monotonic,
         on_terminal_failure: Callable[[RecognizerFatal], Awaitable[None] | None] | None = None,
     ) -> None:
@@ -72,6 +75,15 @@ class ConversationTurnEngine:
             or isinstance(duplicate_identity_window_seconds, bool)
             or not 0 < duplicate_identity_window_seconds <= 10.0
             or not callable(clock)
+            or not isinstance(silence_reprompt_seconds, (int, float))
+            or isinstance(silence_reprompt_seconds, bool)
+            or not 5 <= silence_reprompt_seconds <= 120
+            or not isinstance(max_reprompts, int)
+            or isinstance(max_reprompts, bool)
+            or not 0 <= max_reprompts <= 3
+            or not isinstance(filler_delay_seconds, (int, float))
+            or isinstance(filler_delay_seconds, bool)
+            or not 0 <= filler_delay_seconds <= 5
         ):
             raise ValueError("invalid conversation turn timing")
         self._provider_adapter = provider_adapter
@@ -86,6 +98,9 @@ class ConversationTurnEngine:
         self._pre_audio_min_seconds = pre_audio_min_seconds
         self._duplicate_identity_window_seconds = duplicate_identity_window_seconds
         self._clock = clock
+        self._silence_reprompt_seconds = silence_reprompt_seconds
+        self._max_reprompts = max_reprompts
+        self._filler_delay_seconds = filler_delay_seconds
         self._on_terminal_failure = on_terminal_failure
         self.turns_completed = 0
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -96,9 +111,15 @@ class ConversationTurnEngine:
         self._endpoint_token = 0
         self._recent_result_identities: deque[tuple[tuple[str | int, bool, str], float]] = deque(maxlen=32)
         self._pending_transcript = ""
+        self._committed_finals: list[str] = []
+        self._latest_interim = ""
         self._endpoint_handle: asyncio.TimerHandle | None = None
         self._turn_task: asyncio.Task[None] | None = None
         self._sentence_tts_task: asyncio.Task[None] | None = None
+        self._filler_task: asyncio.Task[None] | None = None
+        self._reprompt_task: asyncio.Task[None] | None = None
+        self._reprompt_count = 0
+        self._filler_index = 0
         self._delivery_epoch = 0
         self._deferred_endpoint_due = False
         self._audible_generation: int | None = None
@@ -111,6 +132,7 @@ class ConversationTurnEngine:
         self._closed = False
         self.terminal_failure: RecognizerFatal | None = None
         self.committed_responses: list[str] = []
+        self._history: deque[tuple[str, str]] = deque(maxlen=12)
 
     @property
     def active(self) -> bool:
@@ -142,6 +164,8 @@ class ConversationTurnEngine:
         await self._cancel_active_turn(clear_audio=True)
         await self._close_recognizer()
         self._pending_transcript = ""
+        self._committed_finals.clear()
+        self._latest_interim = ""
         self._recent_result_identities.clear()
         self._invalidate_endpointing()
         await self._start_recognizer(language)
@@ -158,6 +182,7 @@ class ConversationTurnEngine:
         if recognizer is None:
             return False
         await recognizer.feed_audio(bytes(audio))
+        self._cancel_reprompt()
         return True
 
     async def close(self) -> None:
@@ -170,6 +195,8 @@ class ConversationTurnEngine:
         self._pending_transcript = ""
         self._deferred_endpoint_due = False
         await self._cancel_active_turn(clear_audio=True)
+        self._cancel_reprompt()
+        await self._cancel_filler()
         await self._close_recognizer()
 
     async def drain(self) -> None:
@@ -250,7 +277,7 @@ class ConversationTurnEngine:
             if self._turn_task is not None and not self._turn_task.done():
                 if self._should_barge_in(text):
                     await self._cancel_active_turn(clear_audio=True)
-            self._pending_transcript = text
+            self._reconcile_recognizer_text(text, result.is_final)
             self._arm_endpointing(
                 self._final_grace_seconds if result.is_final else self._endpointing_silence_seconds
             )
@@ -281,9 +308,14 @@ class ConversationTurnEngine:
             return
         transcript = self._pending_transcript.strip()
         self._pending_transcript = ""
+        self._committed_finals.clear()
+        self._latest_interim = ""
         self._endpoint_handle = None
         if not transcript or self._language is None:
             return
+        # Endpoint ownership, rather than raw interim recognition, is the
+        # sole boundary at which user text enters bounded call-local history.
+        self._history.append(("user", transcript))
         self._generation += 1
         generation = self._generation
         task = asyncio.create_task(self._run_turn(transcript, self._language, generation))
@@ -302,6 +334,7 @@ class ConversationTurnEngine:
         self._pre_audio_result_count = 0
         task, self._turn_task = self._turn_task, None
         await self._cancel_sentence_tts()
+        await self._cancel_filler()
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -328,6 +361,31 @@ class ConversationTurnEngine:
             return True
         self._recent_result_identities.append((identity, now))
         return False
+
+    def _reconcile_recognizer_text(self, text: str, is_final: bool) -> None:
+        """Keep committed finals plus one interim overlay, never regress final text.
+
+        Google may report cumulative finals while Azure reports segmented ones;
+        both forms are deduplicated before endpointing. A late interim that
+        merely repeats a committed final is ignored instead of overwriting it.
+        """
+        if is_final:
+            committed = " ".join(self._committed_finals).strip()
+            if text == committed or text in self._committed_finals:
+                self._latest_interim = ""
+            elif committed and text.startswith(committed):
+                self._committed_finals = [text]
+                self._latest_interim = ""
+            else:
+                self._committed_finals.append(text)
+                self._latest_interim = ""
+        else:
+            committed = " ".join(self._committed_finals).strip()
+            if committed and (text == committed or committed.startswith(text)):
+                return
+            self._latest_interim = text
+        parts = [" ".join(self._committed_finals).strip(), self._latest_interim]
+        self._pending_transcript = " ".join(part for part in parts if part).strip()
 
     def _should_barge_in(self, text: str) -> bool:
         """Apply Kavya's speaking-time material, debounce, and echo policy."""
@@ -369,7 +427,12 @@ class ConversationTurnEngine:
             if not self._owns_generation(generation):
                 return
             prompt = _build_prompt(self._product_profile, language, context)
-            response = await self._provider_adapter.generate_response(transcript, language.code, prompt)
+            self._start_filler(language, generation)
+            generate_with_history = getattr(self._provider_adapter, "generate_response_with_history", None)
+            if callable(generate_with_history):
+                response = await generate_with_history(transcript, language.code, prompt, tuple(self._history))
+            else:
+                response = await self._provider_adapter.generate_response(transcript, language.code, prompt)
             committed_sentences = await self._speak_response(response, language, generation)
             if committed_sentences is None:
                 return
@@ -379,14 +442,20 @@ class ConversationTurnEngine:
                 send_mark = getattr(self._transport, "send_mark", None)
                 if callable(send_mark):
                     await send_mark("conversation-turn")
+                self._arm_reprompt()
             if self._owns_generation(generation):
                 committed_response = " ".join(
                     sentence.strip() for sentence in committed_sentences if sentence.strip()
                 )
                 if committed_response:
                     self.committed_responses.append(committed_response)
+                    # Only a terminal commit followed by the transport mark is
+                    # durable assistant history; provisional/fenced media is not.
+                    if not isinstance(response, str):
+                        self._history.append(("assistant", committed_response))
                 self.turns_completed += 1
         finally:
+            await self._cancel_filler()
             if self._turn_task is asyncio.current_task():
                 self._turn_task = None
                 self._pre_audio_generation = None
@@ -426,6 +495,7 @@ class ConversationTurnEngine:
                 if isinstance(item, ThinkingProgress):
                     continue
                 if isinstance(item, ProvisionalSentence):
+                    await self._cancel_filler()
                     if item.generation in fenced_attempts:
                         continue
                     if active_attempt is None:
@@ -440,6 +510,7 @@ class ConversationTurnEngine:
                         provisional_sentences.append(item.text)
                     continue
                 if isinstance(item, TerminalCommit):
+                    await self._cancel_filler()
                     if active_attempt is None:
                         active_attempt = item.generation
                     if item.generation != active_attempt or item.generation in fenced_attempts:
@@ -447,6 +518,7 @@ class ConversationTurnEngine:
                         return None
                     return provisional_sentences
                 if isinstance(item, GenerationFence):
+                    await self._cancel_filler()
                     if item.generation in fenced_attempts:
                         continue
                     if active_attempt is not None and item.generation != active_attempt:
@@ -460,10 +532,14 @@ class ConversationTurnEngine:
                     retry_used = True
                     continue
                 if isinstance(item, RecoveryBoundary):
+                    await self._cancel_filler()
                     if active_attempt is None or item.generation == active_attempt:
                         if item.generation not in fenced_attempts:
                             fenced_attempts.add(item.generation)
                             await self._fence_provisional_media()
+                        # Exhaustion has one profile-owned, delivered recovery
+                        # sentence. It is never placed in assistant history.
+                        await self._speak_profile_text(language.recovery_line, language, turn_generation, "recovery")
                         return None
                     continue
                 raise TypeError("LLM adapter yielded an unsupported stream event")
@@ -522,9 +598,73 @@ class ConversationTurnEngine:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    async def speak_profile_message(self, text: str, mark_name: str) -> None:
+        """Deliver a profile-owned greeting/menu through TTS and a transport mark."""
+        language = self._language
+        if self._closed or language is None or not text.strip():
+            return
+        await self._speak_profile_text(text, language, self._generation, mark_name)
+
+    async def _speak_profile_text(self, text: str, language: LanguageProfile, generation: int, mark_name: str) -> None:
+        if not text.strip() or not self._owns_generation(generation):
+            return
+        await self._speak_sentence(text, language, generation)
+        if self._owns_generation(generation):
+            send_mark = getattr(self._transport, "send_mark", None)
+            if callable(send_mark):
+                await send_mark(mark_name)
+        if mark_name in {"conversation-turn", "initial-greeting", "recovery"}:
+            self._arm_reprompt()
+
+    def _start_filler(self, language: LanguageProfile, generation: int) -> None:
+        if not language.filler_phrases or self._closed:
+            return
+        self._filler_task = asyncio.create_task(self._delayed_filler(language, generation))
+        self._track(self._filler_task)
+
+    async def _delayed_filler(self, language: LanguageProfile, generation: int) -> None:
+        try:
+            await asyncio.sleep(self._filler_delay_seconds)
+            if not self._owns_generation(generation):
+                return
+            text = language.filler_phrases[self._filler_index % len(language.filler_phrases)]
+            self._filler_index += 1
+            await self._speak_profile_text(text, language, generation, "thinking-filler")
+        except asyncio.CancelledError:
+            return
+
+    async def _cancel_filler(self) -> None:
+        task, self._filler_task = self._filler_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def _cancel_reprompt(self) -> None:
+        task, self._reprompt_task = self._reprompt_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _arm_reprompt(self) -> None:
+        self._cancel_reprompt()
+        if self._closed or self._max_reprompts == 0 or self._reprompt_count >= self._max_reprompts:
+            return
+        self._reprompt_task = asyncio.create_task(self._reprompt_after_silence())
+        self._track(self._reprompt_task)
+
+    async def _reprompt_after_silence(self) -> None:
+        try:
+            await asyncio.sleep(self._silence_reprompt_seconds)
+            if self._closed or self._turn_task is not None or self._deferred_endpoint_due or self._language is None:
+                return
+            self._reprompt_count += 1
+            await self._speak_profile_text(self._language.reprompt, self._language, self._generation, "silence-reprompt")
+        except asyncio.CancelledError:
+            return
+
     async def _fence_provisional_media(self) -> None:
         """Atomically fence sentence synthesis before discarding queued media."""
         self._delivery_epoch += 1
+        await self._cancel_filler()
         await self._cancel_sentence_tts()
         clear_audio = getattr(self._transport, "clear_audio", None)
         if callable(clear_audio):

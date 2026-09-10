@@ -2,33 +2,62 @@
   "status": "partial-candidate-not-approved-for-rendering",
   "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
   "source_hashes": {
-    "Kavya/server.py": "sha256:27e58046ce3b4c32eb0331bdafe4c0d300d7e7596ebea9dc680d7de4febee28b",
+    "Kavya/docker-compose.yml": "sha256:f14ce9896c526943386cfc94e158d8bc452936a2342f172a6f6e27121d22ceec",
     "Kavya/english_voice_profile.py": "sha256:7d694df737dcdcf6382b416467bde7269bc16edb654bc6e13aed94fc032c0274",
+    "Kavya/server.py": "sha256:27e58046ce3b4c32eb0331bdafe4c0d300d7e7596ebea9dc680d7de4febee28b",
     "Kavya/smartpbx_gateway.py": "sha256:901c41c42b774cb12248719d3e5469599619a5eba8c82e447bb507d4772a18ee",
     "Kavya/smartpbx_session.py": "sha256:18695c13c0174f3c3c45a53d7de76cc76c6d76984e998ddb4c6265fe5f19c76e",
     "Kavya/smartpbx_transport.py": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e"
   },
   "components": [
     {
+      "template_path": "provider_catalogue.json",
+      "template_sha256": "sha256:8c05c321be8327def94338de7e4ac6f21e9ec34beceb1ca9b46cf21db6cf39f0",
+      "source_path": "Kavya/docker-compose.yml",
+      "source_ranges": ["100-250"],
+      "extraction": "supported SmartPBX environment selections and named credential identifiers; not deployment-default evidence"
+    },
+    {
+      "template_path": "provider_catalogue.json",
+      "template_sha256": "sha256:8c05c321be8327def94338de7e4ac6f21e9ec34beceb1ca9b46cf21db6cf39f0",
+      "source_path": "Kavya/english_voice_profile.py",
+      "source_ranges": ["1-60"],
+      "extraction": "canonical English ElevenLabs model; generated agents use a neutral voice identifier"
+    },
+    {
+      "template_path": "provider_catalogue.json",
+      "template_sha256": "sha256:8c05c321be8327def94338de7e4ac6f21e9ec34beceb1ca9b46cf21db6cf39f0",
+      "source_path": "Kavya/server.py",
+      "source_ranges": ["575-810", "2092-2160", "13112-13147"],
+      "extraction": "source-default Google STT, Azure alternative, exact LLM, Gemini TTS, and optional Rime Arcana TTS"
+    },
+    {
+      "template_path": "provider_catalogue.json",
+      "template_sha256": "sha256:8c05c321be8327def94338de7e4ac6f21e9ec34beceb1ca9b46cf21db6cf39f0",
+      "source_path": "Kavya/smartpbx_session.py",
+      "source_ranges": ["457-540"],
+      "extraction": "English Google-or-Azure selection and explicit Sinhala Gemini-to-Claude language-profile fallback"
+    },
+    {
       "template_path": "runtime/smartpbx_gateway.py.tmpl",
-      "template_sha256": "sha256:ecf098694121cb1a4e3f2d69909ec6872724787c0dbab0fbadd21cfe3d809cbc",
+      "template_sha256": "sha256:4aefe8a9863f549507175cb2429ef28084a9f5cfdde2e791aee0a4eed2f5f772",
       "source_path": "Kavya/smartpbx_gateway.py",
       "source_ranges": ["258-410", "571-675"],
       "extraction": "carrier ingress, bounded admission, strict protocol handoff, terminal and transport lifecycle"
     },
     {
       "template_path": "runtime/smartpbx_session.py.tmpl",
-      "template_sha256": "sha256:ce7cc6921160b7af1605ea550a831089ca97c84746ae189465c407c44873a402",
+      "template_sha256": "sha256:ebcbd290620c704b7ad2d13bc82b36634da4f088f51e7502e1cb7e2057f60abe",
       "source_path": "Kavya/smartpbx_session.py",
-      "source_ranges": ["121-220", "261-650", "1005-1048", "6591-6746", "7017-7200"],
-      "extraction": "call-local start, language selection, STT feeding, injected pipeline seam, and once-only transcript-free STT fatal completion"
+      "source_ranges": ["261-455", "457-540", "1005-1048", "6591-6746", "7017-7200"],
+      "extraction": "call-local delivered menu/greeting selection, STT feeding, injected pipeline seam, and once-only transcript-free STT fatal completion"
     },
     {
       "template_path": "runtime/turn_engine.py.tmpl",
-      "template_sha256": "sha256:983ac160a3bf6cf1fd78cd721f3d45b161cf84590a05d86bb8468a5636db75d3",
+      "template_sha256": "sha256:891a6c6aa9815772017d6028863178bbf89890ea1a2bf96e2d42bd8f8a2c923e",
       "source_path": "Kavya/server.py",
-      "source_ranges": ["2992-3016", "6591-6746", "7017-7200", "8540-8567", "9189-9206", "9359-9555", "9703-9728", "10835-11027", "13112-13190"],
-      "extraction": "continuous STT callback/fatal admission, loop-owned interim/final endpointing, speaking-time material/debounce/echo barge-in policy, exactly-once turn ownership, immediate generation-scoped provisional TTS, failure fencing, and terminal-only delivered-media/history commit"
+      "source_ranges": ["1414-1526", "8245-8283", "10351-10415", "10690-10910", "11150-11174", "11242-11315", "13112-13190"],
+      "extraction": "loop-owned interim/final reconciliation, bounded delivered-only history, profile recovery, silence reprompt, generation-fenced filler, and terminal-only delivered-media commit"
     },
     {
       "template_path": "runtime/llm_adapters.py.tmpl",
@@ -53,10 +82,10 @@
     },
     {
       "template_path": "runtime/product_profile.py.tmpl",
-      "template_sha256": "sha256:1f5dfeb35b2fab5111dd4d2e7c82d0c9b8f6482a5ae4412ff701730e90a9beaa",
+      "template_sha256": "sha256:131e2b7888354d861511bb9c3d18710996b05384a6253ceed09e1dccd644ed7d",
       "source_path": null,
       "source_ranges": [],
-      "extraction": "approved product-data seam; no tenant source file is copied"
+      "extraction": "reviewed manifest identity, language, topic, greeting, and knowledge startup seam; no tenant source file is copied"
     },
     {
       "template_path": "runtime/provider_adapters.py.tmpl",
@@ -67,17 +96,17 @@
     },
     {
       "template_path": "runtime/provider_runtime.py.tmpl",
-      "template_sha256": "sha256:93a2b87866e0bc3e7a9fba5c9a5b6dc6fb566610fe3c4806bb3c9b9c672b9d7c",
+      "template_sha256": "sha256:75e6975121b4da477d56812f2326569c6f8b346029918613e49088bc93f82f32",
       "source_path": null,
       "source_ranges": [],
       "extraction": "startup-only exact-provider selection and concrete-builder injection seam; provider SDK construction is isolated from call paths"
     },
     {
       "template_path": "runtime/provider_builders.py.tmpl",
-      "template_sha256": "sha256:d70330a476dbd3a0986b95e2a66cd0fec2fbfa6c064136193a2e7aef40a0516a",
+      "template_sha256": "sha256:0575d7b3966a6f55f65a7e8a4a77a9874ca01bc2eb08b06f0bd0e6f1a8fabd82",
       "source_path": "Kavya/server.py",
-      "source_ranges": ["4700-4805", "6500-7135", "12495-12620", "13496-13512"],
-      "extraction": "startup-only concrete Google/Azure STT, Claude/Gemini LLM, and ElevenLabs/Gemini/Rime TTS construction; synthetic mode is CI-gated and production refuses it"
+      "source_ranges": ["4700-4879", "5427-5446", "6500-7135", "12495-12620", "13496-13612"],
+      "extraction": "startup-only concrete Google/Azure STT, Claude/Gemini LLM candidate-part normalization, and ElevenLabs/Gemini/Rime TTS construction; synthetic mode is CI-gated and production refuses it"
     },
     {
       "template_path": "runtime/startup.py.tmpl",
@@ -95,7 +124,7 @@
     },
     {
       "template_path": "runtime/tts_adapters.py.tmpl",
-      "template_sha256": "sha256:4baea4122f98261b7ee84e3acad65ac911e3110d2bb8eb442634793a14fdde06",
+      "template_sha256": "sha256:94f3925c8c56ae4e3f028dfb8dc75a8b79c7201f85cb003b25113f6d044935f5",
       "source_path": "Kavya/server.py",
       "source_ranges": ["3075-3090", "2092-2310", "13112-13152", "13407-13848"],
       "source_evidence": [

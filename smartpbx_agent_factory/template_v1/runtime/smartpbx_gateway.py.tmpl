@@ -87,6 +87,10 @@ class SessionRegistry:
     def __init__(self, max_sessions: int) -> None:
         self._max_sessions = max_sessions
         self._active_sessions = 0
+        # Each admitted call owns exactly one gateway receive task and one
+        # session resource until its lease is released; these are live gauges.
+        self._active_tasks = 0
+        self._active_resources = 0
         self._rejected_capacity_total = 0
         self._admitted_total = 0
         self._released_total = 0
@@ -103,12 +107,16 @@ class SessionRegistry:
                 self._rejected_capacity_total += 1
                 return None
             self._active_sessions += 1
+            self._active_tasks += 1
+            self._active_resources += 1
             self._admitted_total += 1
             return _Lease(self)
 
     async def _release(self) -> None:
         async with self._lock:
             self._active_sessions = max(0, self._active_sessions - 1)
+            self._active_tasks = max(0, self._active_tasks - 1)
+            self._active_resources = max(0, self._active_resources - 1)
             self._released_total += 1
 
     async def record(self, name: str) -> None:
@@ -127,6 +135,8 @@ class SessionRegistry:
     def snapshot(self) -> dict[str, int]:
         return {
             "active_sessions": self._active_sessions,
+            "active_tasks": self._active_tasks,
+            "active_resources": self._active_resources,
             "max_sessions": self._max_sessions,
             "rejected_capacity_total": self._rejected_capacity_total,
             "admitted_total": self._admitted_total,

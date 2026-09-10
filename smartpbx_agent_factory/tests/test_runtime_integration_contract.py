@@ -57,6 +57,12 @@ def test_startup_wires_concrete_provider_methods_once_and_hot_path_reads_no_envi
     assert "if \"gemini\" in selected" in builders
     assert "if selected & {\"elevenlabs\", \"rime\"}" in builders
     assert "sinhala_provider" not in source("tts_adapters.py.tmpl")
+    assert "getattr(part, \"thought\", False)" in builders
+    assert "prompt_feedback" in builders
+    assert "usage_metadata" in builders
+    assert "TTSProviderError(_classify_gemini_tts_provider_error(error))" in builders
+    assert "async def aclose" in builders
+    assert 'raise TTSProviderError("empty_audio")' in source("tts_adapters.py.tmpl")
     for name in ("provider_adapters.py.tmpl", "stt_adapters.py.tmpl", "llm_adapters.py.tmpl", "tts_adapters.py.tmpl", "turn_engine.py.tmpl"):
         assert "os.environ" not in source(name)
 
@@ -73,9 +79,28 @@ def test_runtime_entrypoint_exposes_health_authenticated_status_and_full_carrier
     assert "await lease.release()" in gateway
     assert "rejected_capacity_total" in gateway
     assert "active_sessions" in gateway
+    assert "active_tasks" in gateway
+    assert "active_resources" in gateway
     for counter in ("admitted_total", "released_total", "connected_total", "started_total", "media_frames_total", "stopped_total", "hung_up_total"):
         assert counter in gateway
     assert "shutdown_runtime" in server
+
+
+def test_profile_driven_conversation_contract_preserves_delivery_and_fencing_boundaries():
+    session = source("smartpbx_session.py.tmpl")
+    engine = source("turn_engine.py.tmpl")
+    profile = source("product_profile.py.tmpl")
+    assert 'str(index): code for index, code in enumerate(self._product_profile.language_profiles, start=1)' in session
+    assert "language-menu" in session and "initial-greeting" in session
+    assert "self._language_timeout" in session
+    assert "_history: deque[tuple[str, str]] = deque(maxlen=12)" in engine
+    assert 'self._history.append(("user", transcript))' in engine
+    assert 'self._history.append(("assistant", committed_response))' in engine
+    assert "RecoveryBoundary" in engine and "language.recovery_line" in engine
+    assert "_reconcile_recognizer_text" in engine
+    assert "_latest_interim" in engine and "_committed_finals" in engine
+    assert "_reprompt_after_silence" in engine and "_delayed_filler" in engine
+    assert "filler_phrases" in profile and "recovery_line" in profile
 
 
 def test_deepgram_is_not_an_approved_generated_runtime_provider():

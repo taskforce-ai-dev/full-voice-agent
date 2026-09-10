@@ -38,6 +38,10 @@ class InquirySmartPBXSession:
         self.terminal_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self.close_reason: str | None = None
         self._selected_language: str | None = None
+        self._dtmf_map = {
+            str(index): code for index, code in enumerate(self._product_profile.language_profiles, start=1)
+        }
+        self._language_timeout: asyncio.TimerHandle | None = None
         self._started = False
         self._finished = False
 
@@ -51,22 +55,50 @@ class InquirySmartPBXSession:
         if not self._turn_engine.active:
             raise RuntimeError("conversation provider adapter is inactive")
         self._started = True
-        self._selected_language = self._product_profile.default_language
-        await self._turn_engine.start(self._product_profile.language(self._selected_language))
+        default = self._product_profile.default_language
+        await self._turn_engine.start(self._product_profile.language(default))
+        if len(self._product_profile.language_profiles) == 1:
+            self._selected_language = default
+            await self._turn_engine.speak_profile_message(
+                self._product_profile.language(default).greeting, "initial-greeting"
+            )
+            return
+        # Selection remains call-local.  The menu is delivered and marked
+        # before its timeout begins, matching the carrier pacing boundary.
+        await self._turn_engine.speak_profile_message(
+            self._product_profile.language(default).menu_prompt, "language-menu"
+        )
+        self._language_timeout = asyncio.get_running_loop().call_later(
+            8.0, lambda: asyncio.create_task(self._select_language(default))
+        )
 
     async def feed_dtmf(self, digit: str) -> None:
         if not self._started or self._finished:
             return
-        selected = {"1": "en", "2": "si"}.get(digit)
-        if selected in self._product_profile.language_profiles:
-            self._selected_language = selected
-            await self._turn_engine.set_language(self._product_profile.language(selected))
+        selected = self._dtmf_map.get(digit)
+        if selected is not None:
+            await self._select_language(selected)
+
+    async def _select_language(self, selected: str) -> None:
+        if self._finished or self._selected_language is not None:
+            return
+        timeout, self._language_timeout = self._language_timeout, None
+        if timeout is not None:
+            timeout.cancel()
+        self._selected_language = selected
+        language = self._product_profile.language(selected)
+        await self._turn_engine.set_language(language)
+        await self._turn_engine.speak_profile_message(language.greeting, "initial-greeting")
 
     async def feed_audio(self, audio: bytes) -> None:
         if not self._started:
             raise RuntimeError("SmartPBX session is not started")
         if self._finished:
             return
+        if self._selected_language is None:
+            # Speech before a digit selects the profile default; no static
+            # en/si branch or process-global language choice exists.
+            await self._select_language(self._product_profile.default_language)
         language = self._product_profile.language(self._selected_language or self._product_profile.default_language)
         await self._turn_engine.accept_audio(audio, language)
 
@@ -75,6 +107,9 @@ class InquirySmartPBXSession:
         if self._finished:
             return
         self._finished = True
+        if self._language_timeout is not None:
+            self._language_timeout.cancel()
+            self._language_timeout = None
         self.close_reason = "stt_fatal"
         if not self.terminal_future.done():
             self.terminal_future.set_result(None)
@@ -83,6 +118,9 @@ class InquirySmartPBXSession:
         if self._finished:
             return
         self._finished = True
+        if self._language_timeout is not None:
+            self._language_timeout.cancel()
+            self._language_timeout = None
         try:
             await self._turn_engine.close()
             if self._after_call_hook is not None and self._selected_language is not None:

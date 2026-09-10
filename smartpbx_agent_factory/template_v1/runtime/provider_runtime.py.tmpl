@@ -95,6 +95,9 @@ class _ComposedProviderAdapter:
     async def generate_response(self, transcript: str, language: str, prompt: str):
         return self._llm.stream_response(transcript, language, prompt)
 
+    async def generate_response_with_history(self, transcript: str, language: str, prompt: str, history):
+        return self._llm.stream_response_with_history(transcript, language, prompt, history)
+
     async def synthesize_audio(self, response: str, language: str):
         return await self._tts.synthesize_audio(response, language)
 

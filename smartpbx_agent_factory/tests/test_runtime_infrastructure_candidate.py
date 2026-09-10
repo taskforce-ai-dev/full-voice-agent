@@ -29,12 +29,16 @@ def test_review_only_runtime_infrastructure_candidate_is_complete_but_not_approv
         "smartpbx_diagnostics.py",
         "product_profile.py",
         "provider_adapters.py",
+        "provider_builders.py",
+        "stt_adapters.py",
+        "llm_adapters.py",
+        "tts_adapters.py",
         "turn_engine.py",
         "provider_runtime.py",
         "config/product_profile.json",
         "config/provider_profile.json",
     ]
-    assert candidate["required_provider_adapter_outputs"] == ["provider_stt.py", "provider_llm.py", "provider_tts.py"]
+    assert candidate["required_provider_adapter_outputs"] == ["provider_builders.py", "stt_adapters.py", "llm_adapters.py", "tts_adapters.py"]
     assert {entry["template_path"] for entry in candidate["artifacts"]} == {
         "infrastructure/Dockerfile.tmpl",
         "infrastructure/requirements-prod.txt.tmpl",
@@ -64,15 +68,18 @@ def test_container_template_has_explicit_runtime_copy_and_import_guard():
         "smartpbx_diagnostics.py",
         "product_profile.py",
         "provider_adapters.py",
+        "provider_builders.py",
+        "stt_adapters.py",
+        "llm_adapters.py",
+        "tts_adapters.py",
         "turn_engine.py",
         "provider_runtime.py",
-        "provider_stt.py",
-        "provider_llm.py",
-        "provider_tts.py",
         "startup.py",
     ):
         assert filename in dockerfile
     assert 'python -c "import startup"' in dockerfile
+    assert "SMARTPBX_RUNTIME_MODE=synthetic" in dockerfile
+    assert "SMARTPBX_ALLOW_SYNTHETIC_FOR_CI=1" in dockerfile
     assert 'CMD ["uvicorn", "startup:app"' in dockerfile
 
 
@@ -135,6 +142,9 @@ def test_review_artifacts_cannot_publish_deploy_or_activate_routing():
     assert "docker compose" not in deploy
     assert "docker push" not in ci
     assert "deploy" not in ci.lower()
+    assert "if: false" not in ci
+    assert "SMARTPBX_RUNTIME_MODE: synthetic" in ci
+    assert "SMARTPBX_ALLOW_SYNTHETIC_FOR_CI" in ci
     for text in (runbook, client_connect):
         assert "REVIEW-ONLY" in text
         assert "activation: blocked" in text

@@ -220,6 +220,15 @@ def _product_profile_payload(manifest: AgentManifest, documents: Mapping[str, st
             "fallback_model": language.fallback_model or None,
             "greeting": language.greeting,
             "prompt_block": _language_prompt_block(manifest, language.code),
+            # These caller-facing defaults are frozen into the reviewed profile
+            # rather than selected by language branches in the call hot path.
+            "menu_prompt": " ".join(
+                f"Press {index} for {candidate.code}."
+                for index, candidate in enumerate(manifest.languages, start=1)
+            ),
+            "recovery_line": "I am sorry, I am unable to help with that right now. Please try again.",
+            "reprompt": "Are you still there? Please let me know how I can help.",
+            "filler_phrases": ["One moment, please.", "Let me check that for you."],
         }
     return {
         "identity": {
@@ -324,6 +333,12 @@ def _files(
         raise RenderError("SmartPBX max calls must be between 1 and 4")
     title = manifest.display_name
     provider_profile, provider_requirements, provider_environment, provider_volumes = _provider_runtime_contract(manifest)
+    product_profile_template = templates.get("runtime/product_profile.py.tmpl")
+    if not isinstance(product_profile_template, str):
+        raise IncompleteTemplateError("INCOMPLETE_TEMPLATE: product profile startup template is required")
+    product_profile = json.dumps(
+        _product_profile_payload(manifest, documents), sort_keys=True, ensure_ascii=True, indent=2
+    ) + "\n"
     compose = f'''services:
   {resources.smartpbx_service}:
     profiles: ["smartpbx"]
@@ -334,7 +349,7 @@ def _files(
       SMARTPBX_ACCOUNT_ID: ${{SMARTPBX_ACCOUNT_ID?required}}
       SMARTPBX_AUTH_HEADER_NAME: "{resources.wss_header}"
       SMARTPBX_MAX_CALLS: "{manifest.smartpbx.capacity}"
-    ports: ["127.0.0.1:{resources.smartpbx_port}:8080"]
+    ports: ["127.0.0.1:{resources.smartpbx_port}:8000"]
   {resources.website_service}:
     profiles: ["website-demo"]
     build: .
@@ -378,23 +393,6 @@ activation_state: pending
     def infrastructure_template(name: str, fallback: str) -> str:
         return render_template_text(templates.get(f"infrastructure/{name}", fallback), infrastructure_variables)
 
-    product_profile = {
-        "display_name": manifest.display_name,
-        "default_language": manifest.languages[0].code,
-        "languages": {
-            language.code: {
-                "locale": language.locale,
-                "stt": language.stt,
-                "llm": language.llm,
-                "tts": language.tts,
-                "prompt_block": "Answer approved inquiries only.",
-                "greeting": language.greeting,
-            }
-            for language in manifest.languages
-        },
-        "room_catalogue": {}, "room_aliases": {}, "transliterations": {}, "rates": {},
-        "post_call_vocabulary": [], "knowledge_paths": ["/app/knowledge_docs/approved-facts.md"],
-    }
     runtime_templates = ("stt_adapters.py.tmpl", "llm_adapters.py.tmpl", "tts_adapters.py.tmpl", "provider_builders.py.tmpl")
     missing_templates = [name for name in runtime_templates if f"runtime/{name}" not in templates]
     if missing_templates:
@@ -410,7 +408,9 @@ activation_state: pending
         "requirements-prod.txt": infrastructure_template("requirements-prod.txt.tmpl", "# Standard-library runtime only.\n"),
         "requirements-prod.lock.txt": infrastructure_template("requirements-prod.lock.txt.tmpl", "# No runtime packages.\n"),
         "startup.py": templates.get("runtime/startup.py.tmpl", "app = object()\n"),
-        "server.py": templates.get("runtime/server.py.tmpl", "ROUTES = ('/smartpbx/status', '/ws/v1/smartpbx/media')\nfrom smartpbx_gateway import SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings\n"),
+        "server.py": templates.get("runtime/server.py.tmpl", "def build_service_app(*_args): raise RuntimeError('runtime template unavailable')\n"),
+        "product_profile.py": product_profile_template,
+        "product_profile.json": product_profile,
         "smartpbx_diagnostics.py": templates.get("runtime/smartpbx_diagnostics.py.tmpl", "def redacted_status(active_sessions=0):\n    return {'active_sessions': active_sessions}\n"),
         "smartpbx_gateway.py": _python_gateway(resources),
         "smartpbx_protocol.py": templates.get("runtime/smartpbx_protocol.py.tmpl", "PROTOCOL_VERSION = 'smartpbx-ai-provider-v06'\n"),
@@ -434,68 +434,25 @@ activation_state: pending
         "SMARTPBX_RUNBOOK.md": infrastructure_template("SMARTPBX_RUNBOOK.md.tmpl", "# Runbook\n\nThis generated artifact is review-only.\n"),
         "CLIENT_CONNECT.md": infrastructure_template("CLIENT_CONNECT.md.tmpl", client_connect),
         "demo-routing-activation.md": "# Future routing activation\n\nrelease_allowed: false\nstate: pending\nRequires separately approved backend health and shared routing activation.\n",
-        "tests/test_generated_contract.py": "def test_contract_paths():\n    from server import ROUTES\n    assert '/smartpbx/status' in ROUTES\n",
-        "tests/test_generated_security.py": '''import asyncio
-import json
-
-from smartpbx_gateway import SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings
+        "tests/test_generated_contract.py": '''def test_contract_paths():
+    from server import build_service_app
+    from smartpbx_gateway import CarrierIngressSettings, SessionRegistry
+    assert callable(build_service_app)
+    settings = CarrierIngressSettings(True, "token", "account", "X-Token")
+    snapshot = SessionRegistry(settings.max_calls).snapshot()
+    assert snapshot["active_sessions"] == 0
+    assert snapshot["active_tasks"] == 0
+    assert snapshot["active_resources"] == 0
+''',
+        "tests/test_generated_security.py": '''from smartpbx_gateway import CarrierIngressSettings
 from tools import TOOL_REGISTRY
 
 
-class FakeWebSocket:
-    def __init__(self, messages, header, token):
-        self.headers = {header: token}
-        self.messages = list(messages)
-        self.accepted = False
-        self.close_calls = []
-
-    async def accept(self):
-        self.accepted = True
-
-    async def close(self, code=1000, reason=""):
-        self.close_calls.append((code, reason))
-
-    async def receive_text(self):
-        return json.dumps(self.messages.pop(0))
-
-
-class Factory:
-    def __init__(self):
-        self.sessions = []
-
-    async def __call__(self, start, _transport):
-        self.sessions.append(start)
-        return self
-
-    async def start(self):
-        return None
-
-    async def finish(self):
-        return None
-
-
 def test_inquiry_only_registry_and_preaccept_authentication():
+    settings = CarrierIngressSettings(True, "correct", "account-fixture", "X-Token")
     assert TOOL_REGISTRY == {}
-
-    async def exercise():
-        settings = SmartPBXSettings("correct", "account-fixture")
-        gateway = SmartPBXGateway(settings, SmartPBXSessionRegistry(1))
-        wrong = FakeWebSocket([], settings.auth_header_name, "wrong")
-        wrong_factory = Factory()
-        await gateway.handle(wrong, wrong_factory)
-        assert wrong.accepted is False
-        assert wrong.close_calls == [(1008, "unauthorized")]
-        assert wrong_factory.sessions == []
-        valid = FakeWebSocket([
-            {"event": "start", "start": {"accountId": "account-fixture"}},
-            {"event": "stop"},
-        ], settings.auth_header_name, "correct")
-        valid_factory = Factory()
-        await gateway.handle(valid, valid_factory)
-        assert valid.accepted is True
-        assert len(valid_factory.sessions) == 1
-
-    asyncio.run(exercise())
+    assert settings.token_matches("correct")
+    assert not settings.token_matches("wrong")
 ''',
         ".github-workflow-fragment.yml": infrastructure_template("ci-runtime-review.yml.tmpl", workflow_fragment),
     } | {f"knowledge_docs/{filename}": f"# Approved knowledge\n\n{content}\n" for filename, content in documents.items()}

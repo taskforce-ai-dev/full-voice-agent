@@ -287,11 +287,15 @@ class SmartPBXTTSAdapter:
                 raise TTSProviderError("http_status")
             if media_type not in {"audio/pcmu", "audio/basic"}:
                 raise TTSProviderError("invalid_audio_metadata")
+            emitted = False
             async for chunk in _bounded_provider_audio(
                 response.aiter_bytes(chunk_size=640), settings.max_response_bytes
             ):
                 if chunk:
+                    emitted = True
                     yield chunk
+            if not emitted:
+                raise TTSProviderError("empty_audio")
 
     async def _stream_gemini(
         self, text: str, *, generation: int, generation_is_current: Callable[[int], bool]
