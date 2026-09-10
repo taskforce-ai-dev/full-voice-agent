@@ -4,6 +4,7 @@ import pytest
 
 from smartpbx_agent_factory.gitops import (
     DirtyWorktreeError,
+    WorktreeHandle,
     WorktreeConflictError,
     WorktreeManager,
 )
@@ -62,3 +63,32 @@ def test_worktree_manager_pins_fetched_full_remote_sha(tmp_path):
     handle = manager.create(primary=primary, remote="origin", revision="a" * 40, target=target)
     assert handle.revision == "a" * 40
     assert calls[-1] == ("git", "-C", str(primary), "worktree", "add", "--detach", str(target), "a" * 40)
+
+
+@pytest.mark.parametrize("remote", ("--upload-pack=evil", "https://example.invalid/repo.git", "origin/main"))
+def test_worktree_manager_rejects_non_name_remote_before_any_git_call(tmp_path, remote):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    calls: list[tuple[str, ...]] = []
+    manager = WorktreeManager(tmp_path / "generated", run=lambda args: calls.append(tuple(args)) or "")
+    with pytest.raises(WorktreeConflictError, match="remote name"):
+        manager.create(
+            primary=primary,
+            remote=remote,
+            revision="a" * 40,
+            target=tmp_path / "generated" / "site",
+        )
+    assert calls == []
+
+
+def test_worktree_manager_rejects_constructed_handle_on_remove(tmp_path):
+    primary = tmp_path / "primary"
+    target = tmp_path / "generated" / "site"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    target.mkdir(parents=True)
+    manager = WorktreeManager(tmp_path / "generated", run=lambda args: "")
+    constructed = WorktreeHandle(primary=primary, target=target, revision="a" * 40)
+    with pytest.raises(WorktreeConflictError, match="created by this manager"):
+        manager.remove(constructed)
