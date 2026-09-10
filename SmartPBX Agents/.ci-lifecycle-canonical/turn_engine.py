@@ -266,6 +266,7 @@ class ConversationTurnEngine:
             self._pending_transcript = ""
             self._deferred_endpoint_due = False
             await self._cancel_active_turn(clear_audio=True)
+            await self._cancel_reprompt()
             await self._close_recognizer()
             if self._on_terminal_failure is not None:
                 try:
