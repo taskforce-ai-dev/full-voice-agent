@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import tempfile
@@ -282,27 +283,82 @@ def _package(source: str) -> str:
     return json.dumps(value, ensure_ascii=True, indent=2) + "\n"
 
 
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _require_real_output_root(output_dir: Path) -> Path:
+    output_dir = output_dir.absolute()
+    if output_dir.is_symlink() or not output_dir.is_dir():
+        raise ValueError("output_dir must be a real non-symlink directory")
+    for parent in (output_dir, *output_dir.parents):
+        if parent.is_symlink():
+            raise ValueError("output_dir must not be beneath a symlink")
+    return output_dir.resolve(strict=True)
+
+
+def _owned_path(output_dir: Path, relative: str) -> Path:
+    candidate = output_dir / relative
+    try:
+        candidate.relative_to(output_dir)
+    except ValueError as exc:
+        raise ValueError("owned path is outside output_dir") from exc
+    current = output_dir
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("owned path must not be a symlink")
+        if current.exists() and not current.resolve(strict=True).is_relative_to(output_dir):
+            raise ValueError("owned path escapes output_dir")
+    if not candidate.resolve(strict=False).is_relative_to(output_dir):
+        raise ValueError("owned path escapes output_dir")
+    return candidate
+
+
 def _transaction_paths(output_dir: Path) -> tuple[Path, Path]:
-    return output_dir / _TRANSACTION_MARKER, output_dir / _TRANSACTION_ROOT
+    return _owned_path(output_dir, _TRANSACTION_MARKER), _owned_path(output_dir, _TRANSACTION_ROOT)
 
 
 def _atomic_bytes(path: Path, value: bytes, *, scope: str) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix="." + scope + ".", suffix=".tmp", dir=path.parent)
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(value)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary_name, path)
+    _fsync_directory(path.parent)
+
+
+def _durable_backup(path: Path, value: bytes) -> tuple[int, str]:
+    with path.open("wb") as handle:
+        handle.write(value)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(path.parent)
+    return len(value), hashlib.sha256(value).hexdigest()
 
 
 def _load_transaction(output_dir: Path) -> tuple[Path, Path, list[dict[str, object]], list[str]] | None:
     marker_path, transaction_root = _transaction_paths(output_dir)
+    if marker_path.is_symlink() or transaction_root.is_symlink():
+        raise ValueError("transaction marker paths must not be symlinks")
     if not marker_path.exists():
         return None
     try:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("transaction marker is unreadable") from exc
-    required = {"version", "stage", "files"}
-    if not isinstance(marker, dict) or set(marker) not in {required, required | {"created_dirs"}} or marker.get("version") != 1:
+    required = {"version", "stage", "files", "created_dirs"}
+    if not isinstance(marker, dict) or set(marker) != required or marker.get("version") != 1:
         raise ValueError("transaction marker has an invalid shape")
     stage = marker["stage"]
     files = marker["files"]
@@ -317,24 +373,35 @@ def _load_transaction(output_dir: Path) -> tuple[Path, Path, list[dict[str, obje
         raise ValueError("transaction marker has duplicate targets")
     if any(item not in {"data", "scripts"} for item in created_dirs):
         raise ValueError("transaction marker has unsafe created directories")
-    stage_path = transaction_root / stage
-    if not stage_path.is_dir():
+    stage_path = _owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage}")
+    if stage_path.is_symlink() or not stage_path.is_dir():
         raise ValueError("transaction marker staging directory is unavailable")
+    if {item.name for item in transaction_root.iterdir()} != {stage}:
+        raise ValueError("transaction marker staging root has unexpected contents")
     validated: list[dict[str, object]] = []
+    expected_backups: set[str] = set()
     for index, record in enumerate(files):
-        if not isinstance(record, dict) or set(record) != {"target", "existed", "backup"}:
+        if not isinstance(record, dict) or set(record) != {"target", "existed", "backup", "size", "sha256"}:
             raise ValueError("transaction marker file record is invalid")
-        existed, backup = record["existed"], record["backup"]
+        existed, backup, size, digest = record["existed"], record["backup"], record["size"], record["sha256"]
         if not isinstance(existed, bool):
             raise ValueError("transaction marker file record has invalid existence")
         expected_backup = f"backup-{index}.bin"
-        if existed and backup != expected_backup:
+        if existed and (backup != expected_backup or not isinstance(size, int) or size < 0 or not isinstance(digest, str) or not _DIGEST.fullmatch(digest)):
             raise ValueError("transaction marker file record has an unsafe backup")
-        if not existed and backup is not None:
+        if not existed and (backup is not None or size is not None or digest is not None):
             raise ValueError("transaction marker file record has an unexpected backup")
-        if existed and not (stage_path / expected_backup).is_file():
-            raise ValueError("transaction marker backup is unavailable")
+        if existed:
+            backup_path = _owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage}/{expected_backup}")
+            if backup_path.is_symlink() or not backup_path.is_file():
+                raise ValueError("transaction marker backup must not be a symlink")
+            payload = backup_path.read_bytes()
+            if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+                raise ValueError("transaction marker backup integrity check failed")
+            expected_backups.add(expected_backup)
         validated.append(record)
+    if {item.name for item in stage_path.iterdir()} != expected_backups:
+        raise ValueError("transaction marker staging directory has unexpected contents")
     return marker_path, stage_path, validated, created_dirs
 
 
@@ -344,9 +411,15 @@ def _recover_transaction(output_dir: Path) -> None:
         return
     marker_path, stage_path, files, created_dirs = transaction
     for index, record in enumerate(files):
-        target = output_dir / str(record["target"])
+        target = _owned_path(output_dir, str(record["target"]))
         if record["existed"]:
-            _atomic_bytes(target, (stage_path / f"backup-{index}.bin").read_bytes(), scope="smartpbx-recover")
+            backup_path = _owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage_path.name}/backup-{index}.bin")
+            if backup_path.is_symlink():
+                raise ValueError("transaction marker backup must not be a symlink")
+            payload = backup_path.read_bytes()
+            if len(payload) != record["size"] or hashlib.sha256(payload).hexdigest() != record["sha256"]:
+                raise ValueError("transaction marker backup integrity check failed")
+            _atomic_bytes(target, payload, scope="smartpbx-recover")
         else:
             target.unlink(missing_ok=True)
     marker_path.unlink()
@@ -381,21 +454,27 @@ def _finish_transaction(output_dir: Path) -> None:
 
 def _begin_transaction(output_dir: Path, originals: Mapping[Path, bytes | None], created_dirs: list[str], *, scope: str) -> None:
     marker_path, transaction_root = _transaction_paths(output_dir)
+    if transaction_root.exists() and (transaction_root.is_symlink() or not transaction_root.is_dir() or any(transaction_root.iterdir())):
+        raise ValueError("transaction staging root must be an empty real directory")
     transaction_root.mkdir(exist_ok=True)
+    _fsync_directory(output_dir)
     stage_path = Path(tempfile.mkdtemp(prefix=scope + ".", dir=transaction_root))
+    _fsync_directory(transaction_root)
     files: list[dict[str, object]] = []
     for index, relative in enumerate(_TRANSACTION_TARGETS):
         original = originals[output_dir / relative]
-        backup = None
+        backup, size, digest = None, None, None
         if original is not None:
             backup = f"backup-{index}.bin"
-            (stage_path / backup).write_bytes(original)
-        files.append({"target": relative, "existed": original is not None, "backup": backup})
+            size, digest = _durable_backup(_owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage_path.name}/{backup}"), original)
+        files.append({"target": relative, "existed": original is not None, "backup": backup, "size": size, "sha256": digest})
     marker = {"version": 1, "stage": stage_path.name, "files": files, "created_dirs": created_dirs}
     _atomic_bytes(marker_path, json.dumps(marker, sort_keys=True).encode("utf-8"), scope="smartpbx-transaction")
 
 
 def _atomic(output_dir: Path, contents: Mapping[Path, bytes], scope: str) -> None:
+    for relative in _TRANSACTION_TARGETS:
+        _owned_path(output_dir, relative)
     originals = {path: path.read_bytes() if path.exists() else None for path in contents}
     changed = {path: value for path, value in contents.items() if originals[path] != value}
     if not changed:
@@ -423,10 +502,10 @@ def _atomic(output_dir: Path, contents: Mapping[Path, bytes], scope: str) -> Non
 def render_website_artifacts(manifest: AgentManifest, resources: DerivedResources, *, backend_artifact_digest: str, backend_branch_sha: str, output_dir: Path) -> WebsiteRenderReport:
     """Write review-only artifacts to an isolated website worktree."""
     dependency = _dependency(backend_artifact_digest, backend_branch_sha)
-    output_dir = Path(output_dir)
+    output_dir = _require_real_output_root(Path(output_dir))
     _recover_transaction(output_dir)
-    page, package = output_dir / "components/pages/BookDemo.tsx", output_dir / "package.json"
-    data, validator = output_dir / "data/smartpbx-agents.generated.mjs", output_dir / "scripts/validate-smartpbx-card.mjs"
+    page, package = _owned_path(output_dir, "components/pages/BookDemo.tsx"), _owned_path(output_dir, "package.json")
+    data, validator = _owned_path(output_dir, "data/smartpbx-agents.generated.mjs"), _owned_path(output_dir, "scripts/validate-smartpbx-card.mjs")
     if not page.is_file() or not package.is_file():
         raise ValueError("output_dir must be an isolated website worktree with BookDemo.tsx and package.json")
     card = _card(manifest, resources)
