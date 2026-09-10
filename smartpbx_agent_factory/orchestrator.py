@@ -10,7 +10,7 @@ import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .catalogue import CapabilityCatalogue
 from .gitops import WorktreeHandle, WorktreeManager
@@ -60,20 +60,29 @@ class CleanupInventory:
 
     worktrees: tuple[WorktreeHandle, ...] = ()
     plaintext_paths: tuple[Path, ...] = ()
+    completed_worktree_targets: tuple[Path, ...] = ()
+    completed_plaintext_paths: tuple[Path, ...] = ()
     completed: bool = False
 
 
 class GenerationOrchestrator:
     """Own state transitions; rendering and PR creation stay separate lanes."""
 
-    def __init__(self, state_root: Path, *, catalogue_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        state_root: Path,
+        *,
+        catalogue_path: Path | None = None,
+        worktree_manager_factory: Callable[[Path], WorktreeManager] = WorktreeManager,
+    ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise GenerationInfrastructureError("state root must be an absolute path")
-        self._state_root = state_root
+        self._state_root_input = state_root
+        self._reject_symlink_traversal(state_root)
+        self._state_root = state_root.resolve()
         root = Path(__file__).parent
         self._catalogue_path = (catalogue_path or root / "template_v1" / "provider_catalogue.json").resolve()
-        self._live_worktrees: dict[tuple[str, Path], tuple[WorktreeManager, WorktreeHandle]] = {}
-        self._live_plaintext_paths: set[tuple[str, Path]] = set()
+        self._worktree_manager_factory = worktree_manager_factory
 
     def inspect(self, manifest_path: Path) -> Mapping[str, object]:
         """Report non-mutating prerequisite status; no target checkout is touched."""
@@ -173,15 +182,15 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("cleanup inventory is unavailable; refusing to abandon")
         if inventory.completed:
             raise GenerationBlockedError("generation cleanup was already completed")
-        cleanup = self._preflight_cleanup(stored.state.generation_id, inventory)
-        for manager, handle in cleanup[0]:
-            manager.remove(handle)
-        for path in cleanup[1]:
-            path.unlink()
+        stored = self._cleanup_worktrees(stored, inventory)
+        stored = self._cleanup_plaintext_paths(stored, stored.cleanup_inventory)
         try:
             stored.state.abandon()
         except StateError as error:
             raise GenerationBlockedError(str(error)) from error
+        final_inventory = stored.cleanup_inventory
+        if final_inventory is None:
+            raise GenerationBlockedError("cleanup inventory is unavailable; refusing to abandon")
         self._save(
             _StoredGeneration(
                 stored.state,
@@ -190,7 +199,13 @@ class GenerationOrchestrator:
                 stored.knowledge_digest,
                 stored.resource_digest,
                 stored.plan_digest,
-                CleanupInventory(inventory.worktrees, inventory.plaintext_paths, completed=True),
+                CleanupInventory(
+                    final_inventory.worktrees,
+                    final_inventory.plaintext_paths,
+                    final_inventory.completed_worktree_targets,
+                    final_inventory.completed_plaintext_paths,
+                    completed=True,
+                ),
             )
         )
         return stored.state
@@ -205,7 +220,6 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("generation worktree ownership cannot be recorded")
         if handle in inventory.worktrees:
             return
-        self._live_worktrees[(generation_id, handle.target)] = (manager, handle)
         self._save(
             _StoredGeneration(
                 stored.state,
@@ -214,7 +228,12 @@ class GenerationOrchestrator:
                 stored.knowledge_digest,
                 stored.resource_digest,
                 stored.plan_digest,
-                CleanupInventory(inventory.worktrees + (handle,), inventory.plaintext_paths),
+                CleanupInventory(
+                    inventory.worktrees + (handle,),
+                    inventory.plaintext_paths,
+                    inventory.completed_worktree_targets,
+                    inventory.completed_plaintext_paths,
+                ),
             )
         )
 
@@ -234,7 +253,6 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("generation plaintext path escapes its owned root") from error
         if owned_path in inventory.plaintext_paths:
             return
-        self._live_plaintext_paths.add((generation_id, owned_path))
         self._save(
             _StoredGeneration(
                 stored.state,
@@ -243,7 +261,12 @@ class GenerationOrchestrator:
                 stored.knowledge_digest,
                 stored.resource_digest,
                 stored.plan_digest,
-                CleanupInventory(inventory.worktrees, inventory.plaintext_paths + (owned_path,)),
+                CleanupInventory(
+                    inventory.worktrees,
+                    inventory.plaintext_paths + (owned_path,),
+                    inventory.completed_worktree_targets,
+                    inventory.completed_plaintext_paths,
+                ),
             )
         )
 
@@ -299,20 +322,40 @@ class GenerationOrchestrator:
             raise GenerationInfrastructureError("generation state file may not be a symlink")
         return path
 
-    def _ensure_state_root(self) -> None:
-        self._state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if self._state_root.is_symlink() or not self._state_root.is_dir():
+    @staticmethod
+    def _reject_symlink_traversal(path: Path) -> None:
+        current = path
+        while True:
+            if current.is_symlink():
+                raise GenerationInfrastructureError("state root may not traverse a symlink")
+            if current == current.parent:
+                return
+            current = current.parent
+
+    def _ensure_state_root(self, *, create: bool) -> None:
+        self._reject_symlink_traversal(self._state_root_input)
+        if create:
+            self._state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not self._state_root.is_dir() or self._state_root.is_symlink():
             raise GenerationInfrastructureError("state root may not be a symlink")
-        if self._state_root.stat().st_mode & 0o077:
+        if self._state_root.stat().st_mode & 0o777 != 0o700:
             raise GenerationInfrastructureError("state root must not be group or world accessible")
+
+    @staticmethod
+    def _require_private_state_file(path: Path) -> None:
+        if path.is_symlink():
+            raise GenerationInfrastructureError("generation state file may not be a symlink")
+        if path.exists() and path.stat().st_mode & 0o777 != 0o600:
+            raise GenerationInfrastructureError("generation state file must have mode 0600")
 
     def _save(self, stored: _StoredGeneration) -> None:
         temporary_path: Path | None = None
         try:
-            self._ensure_state_root()
+            self._ensure_state_root(create=True)
             path = self._state_path(stored.state.generation_id)
+            self._require_private_state_file(path)
             payload = {
-                "version": 2,
+                "version": 3,
                 "state": stored.state.to_dict(),
                 "manifest_path": str(stored.manifest_path),
                 "resources": asdict(stored.resources),
@@ -335,6 +378,7 @@ class GenerationOrchestrator:
                 raise GenerationInfrastructureError("generation state file may not be a symlink")
             os.replace(temporary_path, path)
             path.chmod(0o600)
+            self._require_private_state_file(path)
             directory_descriptor = os.open(self._state_root, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(directory_descriptor)
@@ -348,9 +392,11 @@ class GenerationOrchestrator:
 
     def _load(self, generation_id: str) -> _StoredGeneration:
         try:
+            self._ensure_state_root(create=False)
             path = self._state_path(generation_id)
+            self._require_private_state_file(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2}:
+            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2, 3}:
                 raise ValueError("state document is invalid")
             state = GenerationState.from_dict(dict(raw["state"]))
             resources = DerivedResources(**dict(raw["resources"]))
@@ -363,30 +409,66 @@ class GenerationOrchestrator:
                 for value in digests
             ):
                 raise ValueError("state document is invalid")
-            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory"))
+            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory")) if raw["version"] == 3 else None
             return _StoredGeneration(state, manifest_path, resources, *digests, inventory)
         except (OSError, KeyError, TypeError, ValueError, StateError) as error:
             raise GenerationInfrastructureError("cannot load generation state") from error
 
-    def _preflight_cleanup(
-        self, generation_id: str, inventory: CleanupInventory
-    ) -> tuple[tuple[tuple[WorktreeManager, WorktreeHandle], ...], tuple[Path, ...]]:
-        live_worktrees: list[tuple[WorktreeManager, WorktreeHandle]] = []
-        for recorded in inventory.worktrees:
-            active = self._live_worktrees.get((generation_id, recorded.target))
-            if active is None or active[1] != recorded or not active[0].owns(active[1]):
-                raise GenerationBlockedError("recorded worktree cleanup lacks active manager ownership")
-            live_worktrees.append(active)
-        plaintext_paths: list[Path] = []
+    def _cleanup_worktrees(
+        self, stored: _StoredGeneration, inventory: CleanupInventory | None
+    ) -> _StoredGeneration:
+        if inventory is None:
+            raise GenerationBlockedError("cleanup inventory is unavailable; refusing to abandon")
+        completed = set(inventory.completed_worktree_targets)
+        for handle in inventory.worktrees:
+            if handle.target in completed:
+                continue
+            manager = self._worktree_manager_factory(handle.temporary_root)
+            try:
+                manager.remove_recorded(handle)
+            except Exception as error:
+                raise GenerationBlockedError("recorded worktree cleanup failed authoritative validation") from error
+            completed.add(handle.target)
+            inventory = CleanupInventory(
+                inventory.worktrees,
+                inventory.plaintext_paths,
+                tuple(sorted(completed, key=str)),
+                inventory.completed_plaintext_paths,
+            )
+            stored = _replace_cleanup_inventory(stored, inventory)
+            self._save(stored)
+        return stored
+
+    def _cleanup_plaintext_paths(
+        self, stored: _StoredGeneration, inventory: CleanupInventory | None
+    ) -> _StoredGeneration:
+        if inventory is None:
+            raise GenerationBlockedError("cleanup inventory is unavailable; refusing to abandon")
+        completed = set(inventory.completed_plaintext_paths)
+        root = self._state_root / "plaintext" / stored.state.generation_id
         for path in inventory.plaintext_paths:
-            if (
-                (generation_id, path) not in self._live_plaintext_paths
-                or path.is_symlink()
-                or not path.is_file()
-            ):
-                raise GenerationBlockedError("recorded plaintext cleanup lacks active ownership")
-            plaintext_paths.append(path)
-        return tuple(live_worktrees), tuple(plaintext_paths)
+            if path in completed:
+                continue
+            if root.is_symlink() or path.is_symlink():
+                raise GenerationBlockedError("recorded plaintext cleanup is unsafe")
+            try:
+                path.relative_to(root.resolve())
+            except ValueError as error:
+                raise GenerationBlockedError("recorded plaintext path escapes its owned root") from error
+            if path.exists() and not path.is_file():
+                raise GenerationBlockedError("recorded plaintext cleanup target is not a file")
+            if path.exists():
+                path.unlink()
+            completed.add(path)
+            inventory = CleanupInventory(
+                inventory.worktrees,
+                inventory.plaintext_paths,
+                inventory.completed_worktree_targets,
+                tuple(sorted(completed, key=str)),
+            )
+            stored = _replace_cleanup_inventory(stored, inventory)
+            self._save(stored)
+        return stored
 
     def _inspect_provenance(self) -> str:
         path = Path(__file__).parent / "template_v1" / "file_allowlist.json"
@@ -472,10 +554,18 @@ def _serialize_cleanup_inventory(inventory: CleanupInventory | None) -> object:
         return None
     return {
         "worktrees": [
-            {"primary": str(handle.primary), "target": str(handle.target), "revision": handle.revision}
+            {
+                "primary": str(handle.primary),
+                "target": str(handle.target),
+                "revision": handle.revision,
+                "temporary_root": str(handle.temporary_root),
+                "ownership_token": handle.ownership_token,
+            }
             for handle in inventory.worktrees
         ],
         "plaintext_paths": [str(path) for path in inventory.plaintext_paths],
+        "completed_worktree_targets": [str(path) for path in inventory.completed_worktree_targets],
+        "completed_plaintext_paths": [str(path) for path in inventory.completed_plaintext_paths],
         "completed": inventory.completed,
     }
 
@@ -483,25 +573,61 @@ def _serialize_cleanup_inventory(inventory: CleanupInventory | None) -> object:
 def _parse_cleanup_inventory(raw: object) -> CleanupInventory | None:
     if raw is None:
         return None
-    if not isinstance(raw, Mapping) or set(raw) != {"worktrees", "plaintext_paths", "completed"}:
+    if not isinstance(raw, Mapping) or set(raw) != {
+        "worktrees",
+        "plaintext_paths",
+        "completed_worktree_targets",
+        "completed_plaintext_paths",
+        "completed",
+    }:
         raise ValueError("generation cleanup inventory is invalid")
     worktrees = raw["worktrees"]
     plaintext_paths = raw["plaintext_paths"]
+    completed_worktree_targets = raw["completed_worktree_targets"]
+    completed_plaintext_paths = raw["completed_plaintext_paths"]
     completed = raw["completed"]
-    if not isinstance(worktrees, list) or not isinstance(plaintext_paths, list) or not isinstance(completed, bool):
+    if not all(
+        isinstance(value, list)
+        for value in (worktrees, plaintext_paths, completed_worktree_targets, completed_plaintext_paths)
+    ) or not isinstance(completed, bool):
         raise ValueError("generation cleanup inventory is invalid")
     parsed_worktrees: list[WorktreeHandle] = []
     for item in worktrees:
-        if not isinstance(item, Mapping) or set(item) != {"primary", "target", "revision"}:
+        if not isinstance(item, Mapping) or set(item) != {
+            "primary", "target", "revision", "temporary_root", "ownership_token"
+        }:
             raise ValueError("generation cleanup inventory is invalid")
-        primary, target, revision = item["primary"], item["target"], item["revision"]
-        if not all(isinstance(value, str) for value in (primary, target, revision)):
+        primary, target, revision, temporary_root, ownership_token = (
+            item["primary"], item["target"], item["revision"], item["temporary_root"], item["ownership_token"]
+        )
+        if not all(isinstance(value, str) for value in (primary, target, revision, temporary_root, ownership_token)):
             raise ValueError("generation cleanup inventory is invalid")
-        parsed_worktrees.append(WorktreeHandle(Path(primary), Path(target), revision))
+        parsed_worktrees.append(
+            WorktreeHandle(Path(primary), Path(target), revision, Path(temporary_root), ownership_token)
+        )
     parsed_paths = tuple(Path(value) for value in plaintext_paths if isinstance(value, str))
-    if len(parsed_paths) != len(plaintext_paths) or any(not path.is_absolute() for path in parsed_paths):
+    completed_targets = tuple(Path(value) for value in completed_worktree_targets if isinstance(value, str))
+    completed_paths = tuple(Path(value) for value in completed_plaintext_paths if isinstance(value, str))
+    if (
+        len(parsed_paths) != len(plaintext_paths)
+        or len(completed_targets) != len(completed_worktree_targets)
+        or len(completed_paths) != len(completed_plaintext_paths)
+        or any(not path.is_absolute() for path in (*parsed_paths, *completed_targets, *completed_paths))
+    ):
         raise ValueError("generation cleanup inventory is invalid")
-    return CleanupInventory(tuple(parsed_worktrees), parsed_paths, completed)
+    return CleanupInventory(tuple(parsed_worktrees), parsed_paths, completed_targets, completed_paths, completed)
+
+
+def _replace_cleanup_inventory(stored: _StoredGeneration, inventory: CleanupInventory) -> _StoredGeneration:
+    return _StoredGeneration(
+        stored.state,
+        stored.manifest_path,
+        stored.resources,
+        stored.knowledge_digest,
+        stored.resource_digest,
+        stored.plan_digest,
+        inventory,
+    )
 
 
 def _redacted_plan(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,11 +27,14 @@ class WorktreeHandle:
     primary: Path
     target: Path
     revision: str
+    temporary_root: Path = Path("/")
+    ownership_token: str = ""
 
 
 Runner = Callable[[Sequence[str]], str]
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REMOTE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*$")
+_OWNERSHIP_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _subprocess_runner(args: Sequence[str]) -> str:
@@ -72,7 +76,13 @@ class WorktreeManager:
         if resolved != revision:
             raise WorktreeConflictError("requested revision does not match fetched remote main")
         self._run(("git", "-C", str(primary), "worktree", "add", "--detach", str(target), resolved))
-        handle = WorktreeHandle(primary=primary, target=target, revision=resolved)
+        handle = WorktreeHandle(
+            primary=primary,
+            target=target,
+            revision=resolved,
+            temporary_root=self._temporary_root,
+            ownership_token=secrets.token_hex(32),
+        )
         self._handles[id(handle)] = handle
         return handle
 
@@ -94,6 +104,32 @@ class WorktreeManager:
     def owns(self, handle: WorktreeHandle) -> bool:
         """Expose the narrow ownership proof needed by transaction cleanup."""
         return isinstance(handle, WorktreeHandle) and self._handles.get(id(handle)) is handle
+
+    def remove_recorded(self, handle: WorktreeHandle) -> None:
+        """Remove a state-root-protected handle after authoritative Git validation.
+
+        This recovery path deliberately does not accept a normal constructed
+        handle: the caller must supply the opaque token recorded in a 0600
+        generation state file, and Git must independently confirm the exact
+        primary, target, and detached revision before removal.
+        """
+        if not isinstance(handle, WorktreeHandle) or not _OWNERSHIP_TOKEN_RE.fullmatch(handle.ownership_token):
+            raise WorktreeConflictError("recorded worktree ownership evidence is invalid")
+        if handle.temporary_root != self._temporary_root:
+            raise WorktreeConflictError("recorded worktree temporary root does not match manager")
+        primary = self._validate_primary(handle.primary)
+        target = self._validate_target(handle.target, must_not_exist=False)
+        if primary != handle.primary or target != handle.target or not _SHA_RE.fullmatch(handle.revision):
+            raise WorktreeConflictError("recorded worktree ownership changed")
+        entries = self._worktree_entries(primary)
+        matching_revision = entries.get(target)
+        if matching_revision is None:
+            if target.exists():
+                raise WorktreeConflictError("recorded target is not an authoritative Git worktree")
+            return
+        if matching_revision != handle.revision:
+            raise WorktreeConflictError("recorded worktree revision does not match authoritative Git state")
+        self._run(("git", "-C", str(primary), "worktree", "remove", str(target)))
 
     @staticmethod
     def _validate_remote(remote: str) -> str:
@@ -120,3 +156,21 @@ class WorktreeManager:
         if must_not_exist and resolved.exists():
             raise WorktreeConflictError("worktree target already exists")
         return resolved
+
+    def _worktree_entries(self, primary: Path) -> dict[Path, str]:
+        raw = self._run(("git", "-C", str(primary), "worktree", "list", "--porcelain"))
+        entries: dict[Path, str] = {}
+        current_path: Path | None = None
+        current_head: str | None = None
+        for line in raw.splitlines() + [""]:
+            if not line:
+                if current_path is not None and current_head is not None:
+                    entries[current_path.resolve()] = current_head
+                current_path = None
+                current_head = None
+                continue
+            if line.startswith("worktree "):
+                current_path = Path(line.removeprefix("worktree "))
+            elif line.startswith("HEAD "):
+                current_head = line.removeprefix("HEAD ")
+        return entries

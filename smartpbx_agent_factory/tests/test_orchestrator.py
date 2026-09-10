@@ -152,10 +152,15 @@ def test_abandon_can_recover_a_recorded_worktree_after_orchestrator_restart(tmp_
 
     manager = WorktreeManager(worktree_root, run=run)
     handle = manager.create(primary=primary, remote="origin", revision="a" * 40, target=target)
-    first = GenerationOrchestrator(tmp_path / "state", catalogue_path=CATALOGUE)
+    factory = lambda temporary_root: WorktreeManager(temporary_root, run=run)
+    first = GenerationOrchestrator(
+        tmp_path / "state", catalogue_path=CATALOGUE, worktree_manager_factory=factory
+    )
     report = first.plan(FIXTURE)
     first.record_owned_worktree(report.generation_id, manager, handle)
-    restarted = GenerationOrchestrator(tmp_path / "state", catalogue_path=CATALOGUE)
+    restarted = GenerationOrchestrator(
+        tmp_path / "state", catalogue_path=CATALOGUE, worktree_manager_factory=factory
+    )
     restarted.abandon(report.generation_id)
     assert removed
 

@@ -109,7 +109,13 @@ def test_worktree_manager_rejects_a_value_equal_constructed_handle(tmp_path):
 
     manager = WorktreeManager(tmp_path / "generated", run=run)
     handle = manager.create(primary=primary, remote="origin", revision="a" * 40, target=target)
-    equal_but_constructed = WorktreeHandle(handle.primary, handle.target, handle.revision)
+    equal_but_constructed = WorktreeHandle(
+        handle.primary,
+        handle.target,
+        handle.revision,
+        handle.temporary_root,
+        handle.ownership_token,
+    )
     assert equal_but_constructed == handle
     with pytest.raises(WorktreeConflictError, match="created by this manager"):
         manager.remove(equal_but_constructed)
