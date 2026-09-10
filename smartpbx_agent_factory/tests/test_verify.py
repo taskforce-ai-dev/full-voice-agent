@@ -105,7 +105,7 @@ def fixture_backend(root: Path, *, ci: bool = True) -> tuple[Path, VerificationB
 
 class FixtureLifecycleAdapter:
     def __init__(self) -> None:
-        self.auth_cases: list[str] = []
+        self.calls: list[tuple[str, str | None, tuple[dict[str, object], ...]]] = []
 
     def exercise(
         self,
@@ -113,9 +113,10 @@ class FixtureLifecycleAdapter:
         agent_dir: Path,
         resources: DerivedResources,
         auth_case: str,
+        terminal_path: str | None,
         messages: tuple[dict[str, object], ...],
     ) -> DisposableClientResult:
-        self.auth_cases.append(auth_case)
+        self.calls.append((auth_case, terminal_path, messages))
         wrong = auth_case != "valid"
         return DisposableClientResult(
             connected=not wrong,
@@ -139,6 +140,14 @@ def test_readiness_report_contains_provenance_and_no_secret_values(tmp_path):
     assert "source_revision" in rendered
     assert "marker" not in rendered
     assert "transcript" not in rendered
+
+
+def test_readiness_report_allows_canonical_lf_separators(tmp_path):
+    agent, binding = fixture_backend(tmp_path / "agent")
+    rendered = readiness_report({"backend": verify_generated_backend(agent, fixture_resources(), binding=binding)})
+    assert rendered.endswith("\n")
+    assert "\r" not in rendered
+    assert all(ord(character) >= 32 or character == "\n" for character in rendered)
 
 
 def test_contract_verifier_requires_agent_specific_ci_job(tmp_path):
@@ -166,9 +175,11 @@ def test_verifier_requires_preaccept_constant_time_wss_authentication(tmp_path):
 
 def test_protocol_fixture_has_no_customer_or_media_content():
     fixture = json.loads((FIXTURES / "protocol_messages.json").read_text(encoding="utf-8"))
-    assert [item["event"] for item in fixture] == ["connected", "start", "media", "stop", "hangup"]
-    assert fixture[2]["media"]["payload"] == "<synthetic-silence>"
-    assert all("fields" not in item for item in fixture)
+    assert set(fixture) == {"stop", "hangup"}
+    assert [item["event"] for item in fixture["stop"]] == ["connected", "start", "media", "stop"]
+    assert [item["event"] for item in fixture["hangup"]] == ["connected", "start", "media", "hangup"]
+    assert fixture["stop"][2]["media"]["payload"] == "<synthetic-silence>"
+    assert all("fields" not in item for scenario in fixture.values() for item in scenario)
 
 
 def test_provenance_cannot_be_rewritten_to_match_a_modified_artifact(tmp_path):
@@ -184,7 +195,10 @@ def test_verifier_invokes_adapter_for_all_authentication_cases(tmp_path):
     agent, binding = fixture_backend(tmp_path / "agent")
     adapter = FixtureLifecycleAdapter()
     report = verify_generated_backend(agent, fixture_resources(), binding=binding, lifecycle_adapter=adapter)
-    assert adapter.auth_cases == ["missing", "wrong", "cross-agent", "valid"]
+    assert [(auth_case, terminal_path) for auth_case, terminal_path, _ in adapter.calls] == [
+        ("missing", None), ("wrong", None), ("cross-agent", None), ("valid", "stop"), ("valid", "hangup")
+    ]
+    assert all(not messages for auth_case, _, messages in adapter.calls[:3] if auth_case != "valid")
     assert report.ready_for_pr is True
     assert report.runtime_lifecycle_verified is True
 
