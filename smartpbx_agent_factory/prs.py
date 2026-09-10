@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence
+from urllib.parse import urlsplit
 
 from .state import GenerationState, Stage, StateError
 
@@ -19,6 +20,17 @@ from .state import GenerationState, Stage, StateError
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _ROLES = ("backend", "operations", "website")
+_MAX_URL_LENGTH = 2048
+_MAX_REDACTION_LENGTH = 4096
+_HANDLE = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
+
+
+def _is_digest(value: object) -> bool:
+    return isinstance(value, str) and _DIGEST.fullmatch(value) is not None
+
+
+def _is_sha(value: object) -> bool:
+    return isinstance(value, str) and _SHA.fullmatch(value) is not None
 
 
 class PRProvider(Protocol):
@@ -32,6 +44,19 @@ class PRProvider(Protocol):
 
 
 @dataclass(frozen=True)
+class GenerationOwnershipEvidence:
+    """Task 8's externally verified handle for a generation-owned worktree root."""
+
+    generation_id: str
+    generation_root: Path
+    handle: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "generation_root", Path(self.generation_root))
+
+
+@dataclass(frozen=True)
 class GenerationWorktree:
     """Read-only evidence that a PR source belongs to this generation."""
 
@@ -40,9 +65,11 @@ class GenerationWorktree:
     branch: str
     branch_sha: str
     path: Path
-    generation_id: str
     clean: bool
-    generation_owned: bool
+    ownership: GenerationOwnershipEvidence
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", Path(self.path))
 
 
 @dataclass(frozen=True)
@@ -58,10 +85,17 @@ class PRReadiness:
     artifact_digests: Mapping[str, str]
     review_label: str
     wss_url: str
+    allowed_wss_paths: tuple[str, ...]
+    readiness_digest: str
+    secret_scan_digest: str
+    ci_registration_digest: str
+    provenance_digest: str
+    worktree_ownership_digest: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "readiness_report_path", Path(self.readiness_report_path))
         object.__setattr__(self, "artifact_digests", MappingProxyType(dict(self.artifact_digests)))
+        object.__setattr__(self, "allowed_wss_paths", tuple(self.allowed_wss_paths))
 
 
 @dataclass(frozen=True)
@@ -101,9 +135,10 @@ def open_linked_prs(
     ``redactions`` is transient scrub data: values are removed from every body
     before any provider call and are never returned or persisted by this module.
     """
-    _require_verified(state)
+    normalized_redactions = _validate_redactions(state, redactions)
+    _require_verified(state, readiness)
     _validate_readiness(state, readiness)
-    by_role = _validate_worktrees(state, worktrees)
+    by_role = _validate_worktrees(state, readiness, worktrees)
     urls: dict[str, str] = {}
 
     try:
@@ -112,18 +147,16 @@ def open_linked_prs(
             url = provider.open_pull_request(
                 repository=by_role[role].repository,
                 branch=by_role[role].branch,
-                title=_redact(_title(role, readiness.review_label), redactions),
-                body=_redact(body, redactions),
+                title=_redact(_title(role, readiness.review_label), normalized_redactions),
+                body=_redact(body, normalized_redactions),
             )
-            if not url:
-                raise ValueError("provider returned an empty pull request URL")
-            urls[role] = url
+            urls[role] = _validate_provider_url(url)
     except Exception as exc:
         failed_role = next(role for role in _ROLES if role not in urls)
         _block(state, f"PR creation failed for {failed_role}")
         raise PRCreationFailure(failed_role, urls) from exc
 
-    backlinks = _redact(_backlinks_body(state, readiness, urls), redactions)
+    backlinks = _redact(_backlinks_body(state, readiness, urls), normalized_redactions)
     try:
         for role in _ROLES:
             provider.comment_pull_request(pull_request_url=urls[role], body=backlinks)
@@ -131,7 +164,7 @@ def open_linked_prs(
             for role in _ROLES:
                 provider.update_pull_request_body(
                     pull_request_url=urls[role],
-                    body=_redact(_initial_body(role, state, readiness, by_role[role], urls), redactions),
+                    body=_redact(_initial_body(role, state, readiness, by_role[role], urls), normalized_redactions),
                 )
     except Exception as exc:
         _block(state, "PR backlink update failed")
@@ -148,35 +181,65 @@ def open_linked_prs(
     )
 
 
-def _require_verified(state: GenerationState) -> None:
+def _require_verified(state: GenerationState, readiness: PRReadiness) -> None:
     if state.stage is not Stage.VERIFIED:
         raise StateError("linked PR creation requires generation state VERIFIED")
-    if not _DIGEST.fullmatch(state.manifest_digest):
+    if (
+        not _is_digest(state.knowledge_review_digest)
+        or state.knowledge_approval_digest != state.knowledge_review_digest
+        or not _is_digest(state.plan_digest)
+        or state.plan_approval_digest != state.plan_digest
+    ):
+        _block(state, "invalid approved knowledge or plan digest")
+        raise StateError("PR prerequisite failed: VERIFIED state requires bound approval digests")
+    if not _is_digest(state.manifest_digest):
         _block(state, "invalid manifest digest")
         raise StateError("PR prerequisite failed: manifest digest must be a SHA-256 digest")
+    expected = {
+        "readiness": readiness.readiness_digest,
+        "secret_scan": readiness.secret_scan_digest,
+        "ci_registration": readiness.ci_registration_digest,
+        "provenance": readiness.provenance_digest,
+        "worktree_ownership": readiness.worktree_ownership_digest,
+        "artifact_backend": readiness.artifact_digests.get("backend"),
+        "artifact_operations": readiness.artifact_digests.get("operations"),
+        "artifact_website": readiness.artifact_digests.get("website"),
+    }
+    if any(state.stage_digests.get(name) != digest for name, digest in expected.items()):
+        _block(state, "state digest is missing or does not match immutable readiness evidence")
+        raise StateError("PR prerequisite failed: state digest is missing or does not match readiness evidence")
 
 
 def _validate_readiness(state: GenerationState, readiness: PRReadiness) -> None:
     failures: list[str] = []
-    if not readiness.readiness_verified or not readiness.readiness_report_path.name:
+    if not readiness.readiness_verified or not _generation_metadata_path(state, readiness.readiness_report_path):
         failures.append("readiness report")
     if not readiness.secret_scan_passed:
         failures.append("secret scan")
     if not readiness.ci_registered:
         failures.append("CI registration")
-    if not _SHA.fullmatch(readiness.provenance_source_revision):
+    if not _is_sha(readiness.provenance_source_revision):
         failures.append("provenance source revision")
-    if not _SHA.fullmatch(readiness.template_revision):
+    if not _is_sha(readiness.template_revision):
         failures.append("template revision")
     if set(readiness.artifact_digests) != set(_ROLES) or any(
-        not _DIGEST.fullmatch(value) for value in readiness.artifact_digests.values()
+        not _is_digest(value) for value in readiness.artifact_digests.values()
     ):
         failures.append("artifact digests")
-    if not readiness.review_label.strip():
-        failures.append("review label")
-    if not readiness.wss_url.startswith("wss://") or any(
-        marker in readiness.wss_url.lower() for marker in ("token", "secret", "password", "@")
+    if any(
+        not _is_digest(digest)
+        for digest in (
+            readiness.readiness_digest,
+            readiness.secret_scan_digest,
+            readiness.ci_registration_digest,
+            readiness.provenance_digest,
+            readiness.worktree_ownership_digest,
+        )
     ):
+        failures.append("readiness evidence digests")
+    if not isinstance(readiness.review_label, str) or not readiness.review_label.strip():
+        failures.append("review label")
+    if not _valid_wss_url(readiness.wss_url, readiness.allowed_wss_paths):
         failures.append("public WSS URL")
     if failures:
         reason = "PR prerequisite failed: " + ", ".join(failures)
@@ -184,27 +247,140 @@ def _validate_readiness(state: GenerationState, readiness: PRReadiness) -> None:
         raise StateError(reason)
 
 
+def _contains_control(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _generation_metadata_path(state: GenerationState, path: Path) -> bool:
+    if path.is_absolute() or ".." in path.parts:
+        return False
+    return len(path.parts) >= 3 and path.parts[:2] == (".smartpbx-generations", state.generation_id)
+
+
+def _valid_wss_url(value: object, allowed_paths: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_URL_LENGTH
+        or _contains_control(value)
+        or not isinstance(allowed_paths, tuple)
+        or not allowed_paths
+        or any(
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or _contains_control(path)
+            or "?" in path
+            or "#" in path
+            for path in allowed_paths
+        )
+    ):
+        return False
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "wss"
+        and bool(parsed.hostname)
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path in allowed_paths
+    )
+
+
+def _validate_provider_url(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > _MAX_URL_LENGTH or _contains_control(value):
+        raise ValueError("provider returned an invalid pull request URL")
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("provider returned an invalid pull request URL") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or not parsed.path.startswith("/")
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("provider returned an invalid pull request URL")
+    return value
+
+
+def _validate_redactions(state: GenerationState, values: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        _block(state, "invalid PR redaction input")
+        raise StateError("PR prerequisite failed: redactions must be a sequence of strings")
+    if any(
+        not isinstance(value, str)
+        or len(value) > _MAX_REDACTION_LENGTH
+        or _contains_control(value)
+        for value in values
+    ):
+        _block(state, "invalid PR redaction input")
+        raise StateError("PR prerequisite failed: redactions must be bounded strings")
+    return tuple(value for value in values if value)
+
+
 def _validate_worktrees(
-    state: GenerationState, worktrees: Sequence[GenerationWorktree]
+    state: GenerationState, readiness: PRReadiness, worktrees: Sequence[GenerationWorktree]
 ) -> Mapping[str, GenerationWorktree]:
-    by_role = {worktree.role: worktree for worktree in worktrees}
+    try:
+        by_role = {worktree.role: worktree for worktree in worktrees}
+    except (AttributeError, TypeError):
+        _block(state, "PR prerequisite failed: invalid generation worktree evidence")
+        raise StateError("PR prerequisite failed: generation worktree evidence is required")
     if len(by_role) != len(worktrees) or set(by_role) != set(_ROLES):
         _block(state, "PR prerequisite failed: three generation worktrees are required")
         raise StateError("PR prerequisite failed: backend, operations, and website worktrees are required")
+    root: Path | None = None
+    ownership: GenerationOwnershipEvidence | None = None
+    resolved_paths: set[Path] = set()
     for role in _ROLES:
         worktree = by_role[role]
+        if not isinstance(worktree, GenerationWorktree) or not isinstance(
+            worktree.ownership, GenerationOwnershipEvidence
+        ):
+            _reject_worktree(state, role)
+        evidence = worktree.ownership
+        try:
+            candidate_root = evidence.generation_root.resolve(strict=False)
+            candidate_path = worktree.path.resolve(strict=False)
+            candidate_path.relative_to(candidate_root)
+        except (AttributeError, OSError, ValueError):
+            _reject_worktree(state, role)
         if (
             not worktree.clean
-            or not worktree.generation_owned
-            or worktree.generation_id != state.generation_id
             or not worktree.repository
             or not worktree.branch
-            or not _SHA.fullmatch(worktree.branch_sha)
-            or not str(worktree.path)
+            or not _is_sha(worktree.branch_sha)
+            or not worktree.path.is_absolute()
+            or not candidate_root.is_absolute()
+            or candidate_root.name != state.generation_id
+            or evidence.generation_id != state.generation_id
+            or not _HANDLE.fullmatch(evidence.handle)
+            or not _is_digest(evidence.digest)
+            or evidence.digest != readiness.worktree_ownership_digest
+            or candidate_path == candidate_root
+            or candidate_path in resolved_paths
         ):
-            _block(state, f"PR prerequisite failed: {role} worktree is not clean and generation-owned")
-            raise StateError(f"PR prerequisite failed: {role} worktree must be clean and generation-owned")
+            _reject_worktree(state, role)
+        if ownership is None:
+            ownership, root = evidence, candidate_root
+        elif evidence != ownership or candidate_root != root:
+            _reject_worktree(state, role)
+        resolved_paths.add(candidate_path)
     return MappingProxyType(by_role)
+
+
+def _reject_worktree(state: GenerationState, role: str) -> None:
+    _block(state, f"PR prerequisite failed: {role} worktree is not clean and generation-owned")
+    raise StateError(f"PR prerequisite failed: {role} worktree must be clean and generation-owned")
 
 
 def _title(role: str, review_label: str) -> str:
