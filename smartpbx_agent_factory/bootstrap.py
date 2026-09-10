@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import tempfile
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -143,7 +144,8 @@ class FactoryConfig:
             if revision.lower() != revision or revision == "0" * 40:
                 raise FactoryConfigError(f"{role}.revision must be an immutable full SHA")
             canonical_remote = _text(item["canonical_remote"], f"{role}.canonical_remote")
-            if not (canonical_remote.startswith("https://") or canonical_remote.startswith("ssh://") or canonical_remote.startswith("git@")):
+            parsed_remote = urlsplit(canonical_remote)
+            if (canonical_remote.startswith("https://") and (not parsed_remote.hostname or parsed_remote.username or parsed_remote.password or parsed_remote.query or parsed_remote.fragment)) or (not canonical_remote.startswith("https://") and not (canonical_remote.startswith("ssh://") or canonical_remote.startswith("git@"))):
                 raise FactoryConfigError(f"{role}.canonical_remote must be an exact Git remote URL")
             lanes[role] = LaneConfig(
                 _absolute_path(item["primary"], f"{role}.primary"),
@@ -251,6 +253,9 @@ def inspect_config(config: FactoryConfig, *, runner: Callable[[Sequence[str]], o
             checks[f"{role}.repository"] = "ready"
     checks["catalogue"] = "ready" if config.catalogue.is_file() else "blocked: catalogue unavailable"
     checks["age_recipients"] = "ready" if config.age.recipient_file.is_file() else "blocked: age recipient file unavailable"
+    checks["gh"] = "ready" if config.ci.gh_binary.is_file() and os.access(config.ci.gh_binary, os.X_OK) else "blocked: gh binary unavailable"
+    checks["sops"] = "ready" if config.age.sops_binary.is_file() and os.access(config.age.sops_binary, os.X_OK) else "blocked: sops binary unavailable"
+    checks["age"] = "ready" if config.age.age_binary.is_file() and os.access(config.age.age_binary, os.X_OK) else "blocked: age binary unavailable"
     return checks
 
 
@@ -405,7 +410,7 @@ class GitHubCIResultAdapter:
             provenance_source_revision=allowlist.source_revision, template_revision=allowlist.source_revision,
             artifact_digests=artifact_digests, review_label=f"SmartPBX {getattr(resources, 'slug')}",
             wss_url=getattr(resources, "wss_url"), expected_wss_hostname=getattr(resources, "smartpbx_hostname"),
-            allowed_wss_paths=("/smartpbx",), readiness_digest=digest(lane_records),
+            allowed_wss_paths=("/ws/v1/smartpbx/media",), readiness_digest=digest(lane_records),
             secret_scan_digest=digest({"artifacts": artifact_digests}), ci_registration_digest=digest({"repository": self._config.ci.repository, "workflow": self._config.ci.workflow}),
             provenance_digest=digest({"source_revision": allowlist.source_revision}), worktree_ownership_digest=ownership,
         )

@@ -150,7 +150,7 @@ class FactoryBootstrapContractTests(unittest.TestCase):
         from smartpbx_agent_factory.cli import create_manifest_wizard
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "manifest.json"
-            answers = iter(("Acme Review", "acme-review", "en", "azure-claude-elevenlabs", "/tmp/approved-faq.txt"))
+            answers = iter(("Acme Review", "acme-review", "en", "azure-claude-elevenlabs", "/tmp/approved-faq.txt", "Welcome to Acme Review."))
             create_manifest_wizard(output, input_fn=lambda prompt: next(answers))
             self.assertEqual(oct(output.stat().st_mode & 0o777), "0o600")
             self.assertEqual(json.loads(output.read_text())["slug"], "acme-review")

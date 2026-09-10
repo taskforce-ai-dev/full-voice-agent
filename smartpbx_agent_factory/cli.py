@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import date
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -162,15 +163,19 @@ def create_manifest_wizard(output: Path, *, input_fn=input) -> Path:
     knowledge = ask("Approved local knowledge path: ", r"/[A-Za-z0-9._/-]{1,220}")
     if "secret" in knowledge.lower() or "token" in knowledge.lower():
         raise ValueError("knowledge path may not identify secret material")
+    locale = {"en": "en-US", "si": "si-LK"}
+    if any(code not in locale for code in languages):
+        raise ValueError("only configured en and si locales are available to the wizard")
+    greetings = {code: ask(f"{code} native greeting: ", r"[^\x00]{1,180}") for code in languages}
     document = {
         "schema_version": 1, "display_name": company, "public_name": company, "slug": slug,
         "agent_name": f"{company} Guide", "industry": "general information", "purpose": "Answer approved company questions",
         "audience": "prospective customers", "profile": "demo", "timezone": "UTC", "operating_hours": {"mon-fri": "09:00-17:00"},
         "technical_owner": "review-required@example.invalid",
-        "languages": [{"code": code, "locale": f"{code}-{code.upper()}", "stt": {"provider": "azure"}, "llm": {"provider": "claude", "model": "claude-sonnet-4-5-20250929"}, "tts": {"provider": "elevenlabs", "model": "eleven_flash_v2_5"}, "greeting": f"Welcome to {company}."} for code in languages],
+        "languages": [{"code": code, "locale": locale[code], "stt": {"provider": "azure"}, "llm": {"provider": "claude", "model": "claude-sonnet-4-5-20250929"}, "tts": {"provider": "elevenlabs", "model": "eleven_flash_v2_5"}, "greeting": greetings[code]} for code in languages],
         "allowed_topics": ["company information"], "refused_topics": ["account changes"],
         "pii_policy": {"explicit_consent": False, "collect_name": False, "collect_phone": False}, "capabilities": {},
-        "knowledge_sources": [{"kind": "local", "path": knowledge, "owner": company, "effective_date": "2026-09-10", "classification": "public"}],
+        "knowledge_sources": [{"kind": "local", "path": knowledge, "owner": company, "effective_date": date.today().isoformat(), "classification": "public"}],
         "smartpbx": {"account_id": "review-required", "capacity": 1, "protocol_profile": "smartpbx-ai-provider-v07", "status_authentication": True},
         "operations": {"alert_owner": "review-required@example.invalid", "support_contact": "review-required@example.invalid"}, "website_demo": {"enabled": True, "visibility": "pending"},
     }
