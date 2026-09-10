@@ -19,6 +19,19 @@ def test_review_only_runtime_infrastructure_candidate_is_complete_but_not_approv
     assert candidate["source_revision"] == "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e"
     assert candidate["oci_revision"] == candidate["source_revision"]
     assert candidate["approval"] == {"rendering": "blocked", "release": "blocked", "routing": "blocked"}
+    assert candidate["runtime_outputs"] == [
+        "startup.py",
+        "server.py",
+        "smartpbx_gateway.py",
+        "smartpbx_protocol.py",
+        "smartpbx_session.py",
+        "smartpbx_transport.py",
+        "smartpbx_diagnostics.py",
+        "product_profile.py",
+        "provider_adapters.py",
+        "turn_engine.py",
+        "config/product_profile.json",
+    ]
     assert {entry["template_path"] for entry in candidate["artifacts"]} == {
         "infrastructure/Dockerfile.tmpl",
         "infrastructure/requirements-prod.txt.tmpl",
@@ -37,6 +50,7 @@ def test_container_template_has_explicit_runtime_copy_and_import_guard():
     dockerfile = _text("Dockerfile.tmpl")
     assert "COPY . ." not in dockerfile
     assert "COPY runtime/ ./" not in dockerfile
+    assert "COPY runtime/" not in dockerfile
     assert "COPY requirements-prod.lock.txt ./" in dockerfile
     for filename in (
         "server.py",
@@ -48,9 +62,11 @@ def test_container_template_has_explicit_runtime_copy_and_import_guard():
         "product_profile.py",
         "provider_adapters.py",
         "turn_engine.py",
+        "startup.py",
     ):
         assert filename in dockerfile
-    assert 'RUN python -c "import server"' in dockerfile
+    assert 'python -c "import startup"' in dockerfile
+    assert 'CMD ["uvicorn", "startup:app"' in dockerfile
 
 
 def test_requirements_are_exactly_pinned_and_lock_covers_input():
@@ -60,22 +76,38 @@ def test_requirements_are_exactly_pinned_and_lock_covers_input():
     assert requirement_lines
     assert all(re.fullmatch(r"[A-Za-z0-9_.-]+(?:\[[A-Za-z0-9_,.-]+\])?==[A-Za-z0-9_.!+-]+", line) for line in requirement_lines)
     assert all(line in lock for line in requirement_lines)
-    for provider in ("anthropic", "openai", "google-genai", "google-cloud-speech", "azure-cognitiveservices-speech"):
+    for provider in ("anthropic", "google-cloud-speech"):
         assert re.search(rf"^{provider}==", requirements, re.MULTILINE)
+    assert "openai" not in requirements.lower()
 
 
 def test_compose_and_proxy_are_loopback_limited_and_status_is_authenticated():
     compose = _text("docker-compose.yml.tmpl")
     nginx = _text("nginx-smartpbx.conf.tmpl")
     assert "env_file:" not in compose
-    assert '"127.0.0.1:8006:8000"' in compose
+    assert '"127.0.0.1:{{smartpbx_port}}:8000"' in compose
+    assert "{{smartpbx_service}}:" in compose
+    assert "{{ghcr_repository}}@${SMARTPBX_IMAGE_DIGEST:?immutable digest required}" in compose
+    assert "container_name: {{smartpbx_service}}" in compose
     assert "mem_limit:" in compose and "cpus:" in compose and "pids_limit:" in compose
+    assert "read_only: true" in compose
+    assert "cap_drop:" in compose and "- ALL" in compose
+    assert "no-new-privileges:true" in compose
+    assert "tmpfs:" in compose
+    assert "healthcheck:" in compose and "/health" in compose
+    assert "stop_grace_period:" in compose
+    assert "internal: true" in compose
+    assert "./knowledge_docs:/app/knowledge_docs:ro" in compose
+    assert "./gcp-credentials.json:/app/gcp-credentials.json:ro" in compose
     assert "SMARTPBX_WS_TOKEN:" in compose
     assert "ANTHROPIC_API_KEY:" in compose
+    assert "RIME_API_KEY:" in compose
+    assert "OPENAI_API_KEY:" not in compose
     assert "location = /ws/v1/smartpbx/media" in nginx
     assert "proxy_set_header Upgrade $http_upgrade;" in nginx
     assert "location = /smartpbx/status" in nginx
-    assert "proxy_set_header X-SmartPBX-Token $http_x_smartpbx_token;" in nginx
+    assert "server_name {{smartpbx_hostname}};" in nginx
+    assert "proxy_set_header {{wss_header}} $http_x_smartpbx_token;" in nginx
     assert "location / { return 404; }" in nginx
 
 
@@ -99,3 +131,24 @@ def test_candidate_artifacts_are_client_neutral_and_exclude_legacy_integrations(
     artifacts.append(ROOT / "runtime_infrastructure_candidate.json")
     combined = "\n".join(path.read_text(encoding="utf-8").lower() for path in artifacts)
     assert all(term not in combined for term in terms)
+
+
+def test_startup_composition_validates_named_environment_once_and_exports_the_asgi_app():
+    startup = (ROOT / "runtime" / "startup.py.tmpl").read_text(encoding="utf-8")
+    for name in (
+        "SMARTPBX_WS_TOKEN",
+        "SMARTPBX_ACCOUNT_ID",
+        "SMARTPBX_AUTH_HEADER_NAME",
+        "SMARTPBX_PRODUCT_PROFILE_PATH",
+        "SMARTPBX_KNOWLEDGE_DIR",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "STT_PROVIDER",
+        "LLM_PROVIDER",
+        "TTS_PROVIDER",
+        "ANTHROPIC_API_KEY",
+        "RIME_API_KEY",
+    ):
+        assert name in startup
+    assert "def create_app" in startup
+    assert "app = create_app()" in startup
+    assert "build_service_app(load_runtime(" in startup
