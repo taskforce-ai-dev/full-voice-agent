@@ -4,6 +4,7 @@ import pytest
 
 from smartpbx_agent_factory.gitops import (
     DirtyWorktreeError,
+    GitWorktreeInspector,
     WorktreeHandle,
     WorktreeConflictError,
     WorktreeManager,
@@ -182,3 +183,44 @@ def test_recorded_worktree_refuses_unknown_head_drift(tmp_path):
     )
     with pytest.raises(WorktreeConflictError, match="revision"):
         manager.remove_recorded(handle)
+
+
+def test_real_inspector_requires_the_exact_recorded_handle_and_rechecks_git_state(tmp_path):
+    primary = tmp_path / "primary"
+    target = tmp_path / "generated" / "backend"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    target.mkdir(parents=True)
+
+    def run(args):
+        if args[-2:] == ("status", "--porcelain"):
+            return ""
+        if args[-1] == "origin/main":
+            return "a" * 40
+        if args[-2:] == ("get-url", "origin"):
+            return "https://github.com/taskforce-ai-dev/full-voice-agent.git\n"
+        if args[-2:] == ("branch", "--show-current"):
+            return "smartpbx-agent-factory/gen-001\n"
+        if args[-2:] == ("rev-parse", "HEAD"):
+            return "b" * 40 + "\n"
+        return ""
+
+    manager = WorktreeManager(tmp_path / "generated", run=run)
+    handle = manager.create(
+        primary=primary,
+        remote="origin",
+        revision="a" * 40,
+        target=target,
+        branch="smartpbx-agent-factory/gen-001",
+    )
+    inspection = GitWorktreeInspector((handle,), run=run).inspect_worktree(
+        path=target,
+        ownership_handle=handle.ownership_token,
+    )
+    assert inspection.repository == "taskforce-ai-dev/full-voice-agent"
+    assert inspection.branch == "smartpbx-agent-factory/gen-001"
+    assert inspection.head_sha == "b" * 40
+    assert inspection.clean is True
+
+    with pytest.raises(WorktreeConflictError, match="ownership"):
+        GitWorktreeInspector((handle,), run=run).inspect_worktree(path=target, ownership_handle="c" * 64)
