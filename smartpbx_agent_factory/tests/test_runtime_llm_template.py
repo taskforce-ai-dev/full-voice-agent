@@ -35,7 +35,7 @@ def test_candidate_llm_template_has_pinned_server_ranges_and_remains_partial() -
 
     assert candidate["status"] == "partial-candidate-not-approved-for-rendering"
     assert component["source_path"] == "Kavya/server.py"
-    assert component["source_ranges"] == ["1567-1708", "8437-8522", "11702-12051", "12488-12845"]
+    assert component["source_ranges"] == ["950-1095", "1567-1708", "8437-8522", "11702-12051", "12488-12845"]
     assert component["template_sha256"] == "sha256:" + sha256(TEMPLATE.read_bytes()).hexdigest()
 
 
