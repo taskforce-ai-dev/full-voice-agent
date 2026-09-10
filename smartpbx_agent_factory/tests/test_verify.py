@@ -211,3 +211,17 @@ def test_report_metadata_rejects_control_characters_and_secret_like_values():
             runtime_status="CI_LIFECYCLE_REQUIRED",
             evidence=("Dockerfile",),
         )
+    with pytest.raises(VerificationError, match="safe report"):
+        VerificationReport(
+            agent_slug="acme",
+            artifact_digest="a" * 64,
+            template_version="api_key=marker",
+            source_revision="b" * 40,
+            ci_identifier="smartpbx-acme",
+            protocol_events=("connected", "start", "media", "stop", "hangup"),
+            static_contracts_passed=True,
+            runtime_lifecycle_verified=False,
+            ready_for_pr=False,
+            runtime_status="CI_LIFECYCLE_REQUIRED",
+            evidence=("Dockerfile",),
+        )
