@@ -85,11 +85,22 @@ def fixture_backend(root: Path, *, ci: bool = True) -> tuple[Path, VerificationB
         "      SMARTPBX_STATUS_TOKEN: ${SMARTPBX_STATUS_TOKEN?required}\n",
         encoding="utf-8",
     )
-    if ci:
-        (root / ".github-workflow-fragment.yml").write_text(
-            "jobs:\n  smartpbx-acme-inquiry:\n    runs-on: ubuntu-latest\n",
-            encoding="utf-8",
-        )
+    (root / ".github-workflow-fragment.yml").write_text(
+        (
+            "jobs:\n"
+            "  runtime-infrastructure-static:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Verify exact dependency pins\n"
+            "        run: test -f requirements-prod.lock.txt\n"
+            "      - name: Verify runtime import contract\n"
+            "        run: python -c \"import startup\"\n"
+            "      - name: Verify isolated website-demo import contract\n"
+            "        run: python -c \"import website_demo\"\n"
+            if ci else "jobs:\n  unrelated-check:\n    runs-on: ubuntu-latest\n"
+        ),
+        encoding="utf-8",
+    )
     binding = VerificationBinding(
         template_allowlist=fixture_allowlist(),
         manifest_digest="d" * 64,
@@ -119,7 +130,7 @@ def test_readiness_report_allows_canonical_lf_separators(tmp_path):
     assert all(ord(character) >= 32 or character == "\n" for character in rendered)
 
 
-def test_contract_verifier_requires_agent_specific_ci_job(tmp_path):
+def test_contract_verifier_requires_the_fixed_review_ci_contract(tmp_path):
     agent, binding = fixture_backend(tmp_path / "agent", ci=False)
     with pytest.raises(VerificationError, match="blocking CI"):
         verify_generated_backend(agent, fixture_resources(), binding=binding)

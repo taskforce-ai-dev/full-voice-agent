@@ -37,6 +37,13 @@ _SHA256_REF = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 _RUN_ID = re.compile(r"^[1-9][0-9]{0,19}$")
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$")
+_REVIEW_CI_JOBS = re.compile(r"^jobs:[ \t]*\n  runtime-infrastructure-static:[ \t]*$", re.MULTILINE)
+_REVIEW_CI_NEXT_JOB = re.compile(r"^  [A-Za-z0-9][A-Za-z0-9_-]*:\s*$", re.MULTILINE)
+_REVIEW_CI_REQUIRED_RUNS = (
+    re.compile(r"^        run: test -f requirements-prod\.lock\.txt$", re.MULTILINE),
+    re.compile(r'^        run: python -c "import startup"$', re.MULTILINE),
+    re.compile(r'^        run: python -c "import website_demo"$', re.MULTILINE),
+)
 _REQUIRED_EVENTS = ("connected", "start", "media", "stop", "hangup")
 _STATIC_CI_ROLES = ("operations", "website")
 _TERMINAL_PATHS = ("stop", "hangup")
@@ -435,6 +442,18 @@ def _diagnostics_contract(source: str) -> None:
         raise VerificationError("generated diagnostics return unsafe evidence")
 
 
+def _review_ci_contract(source: str) -> None:
+    """Require the fixed review-only job emitted by the current V07 template."""
+    jobs = tuple(_REVIEW_CI_JOBS.finditer(source))
+    if len(jobs) != 1:
+        raise VerificationError("generated backend is missing required blocking CI review contract")
+    start = jobs[0].end()
+    next_job = _REVIEW_CI_NEXT_JOB.search(source, start)
+    block = source[start:next_job.start() if next_job is not None else len(source)]
+    if not all(required.search(block) for required in _REVIEW_CI_REQUIRED_RUNS):
+        raise VerificationError("generated backend is missing required blocking CI review contract")
+
+
 def _require_static_contracts(agent_dir: Path, resources: DerivedResources) -> tuple[str, ...]:
     if not isinstance(resources, DerivedResources):
         raise VerificationError("verification requires derived resources")
@@ -456,8 +475,7 @@ def _require_static_contracts(agent_dir: Path, resources: DerivedResources) -> t
         raise VerificationError("generated WSS authentication must be constant-time before accept")
     if "1008" not in gateway:
         raise VerificationError("generated WSS authentication must reject invalid credentials")
-    if resources.ci_identifier not in contents[".github-workflow-fragment.yml"]:
-        raise VerificationError("generated backend is missing agent-specific blocking CI")
+    _review_ci_contract(contents[".github-workflow-fragment.yml"])
     _diagnostics_contract(contents["smartpbx_diagnostics.py"])
     return tuple(sorted(_REQUIRED_FILES))
 

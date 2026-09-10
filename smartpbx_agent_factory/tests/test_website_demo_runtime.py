@@ -1,5 +1,6 @@
 """Static contract for the isolated, fail-closed website demo candidate."""
 
+import ast
 import json
 from pathlib import Path
 
@@ -30,6 +31,7 @@ def test_website_demo_has_a_separate_loopback_profile_without_smartpbx_credentia
 
 def test_website_demo_uses_the_shared_issuer_response_shape_and_bounded_relay_transport():
     source = (RUNTIME / "website_demo.py.tmpl").read_text(encoding="utf-8")
+    module = ast.parse(source)
     assert '@app.get("/api/voice-token")' in source
     assert 'serialized_token = token.to_jwt()' in source
     assert 'return {"token": serialized_token, "identity": identity}' in source
@@ -41,9 +43,36 @@ def test_website_demo_uses_the_shared_issuer_response_shape_and_bounded_relay_tr
     assert "SessionTickets" in source
     assert "WEBSITE_DEMO_MAX_SESSIONS" in source
     assert "ttl=300" in source
-    assert "create_booking" not in source
-    assert "handover" not in source.lower()
-    assert "post_call" not in source.lower()
+    constants = {
+        target.id: value.value
+        for node in module.body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(target := node.targets[0], ast.Name)
+        and isinstance(value := node.value, ast.Constant)
+    }
+    assert constants["_MAX_RELAY_MESSAGE_CHARS"] == 8_192
+    assert constants["_MAX_PROMPT_CHARS"] == 4_000
+    imported_roots: set[str] = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            imported_roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_roots.add(node.module.split(".", 1)[0])
+    assert imported_roots.isdisjoint({"handover", "post_call", "booking_api"})
+    assert not any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "create_booking"
+        for node in ast.walk(module)
+    )
+    assert any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "deque"
+        and any(keyword.arg == "maxlen" and isinstance(keyword.value, ast.Constant) and keyword.value.value == 12 for keyword in node.keywords)
+        for node in ast.walk(module)
+    )
+    assert any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "consume"
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "tickets"
+        and {keyword.arg for keyword in node.keywords} >= {"agent", "language"}
+        for node in ast.walk(module)
+    )
 
 
 def test_candidate_records_the_website_demo_boundary_and_its_source_evidence():
