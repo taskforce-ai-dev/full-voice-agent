@@ -79,7 +79,24 @@ class RepositoryOwnedCIVerificationCoordinator:
     ci_result_adapter: object | None = None
 
     def verify(self, *, generation_id: str, resources: DerivedResources, lane_records: Mapping[str, Mapping[str, str]]) -> tuple[ReadinessEvidence, Mapping[str, VerificationReport]]:
-        raise GenerationBlockedError("repository-owned CI lifecycle result is pending")
+        adapter = self.ci_result_adapter
+        verify = getattr(adapter, "verify", None)
+        if not callable(verify):
+            raise GenerationBlockedError("repository-owned CI lifecycle result is pending")
+        result = verify(generation_id=generation_id, resources=resources, lane_records=lane_records)
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise GenerationBlockedError("repository-owned CI result is invalid")
+        return result
+
+    def worktrees_for(self, *, generation_id: str, inventory: object, readiness: ReadinessEvidence) -> tuple[object, ...]:
+        """Ask the same repository-owned adapter to bind CI proof to PR sources."""
+        build = getattr(self.ci_result_adapter, "worktrees_for", None)
+        if not callable(build):
+            raise GenerationBlockedError("repository-owned CI worktree binding is pending")
+        worktrees = build(generation_id=generation_id, inventory=inventory, readiness=readiness)
+        if not isinstance(worktrees, tuple):
+            raise GenerationBlockedError("repository-owned CI worktree binding is invalid")
+        return worktrees
 
 
 @dataclass(frozen=True)
@@ -174,6 +191,7 @@ class GenerationOrchestrator:
         knowledge_builder_factory: Callable[[Path], KnowledgeBuilder] | None = None,
         inventory_provider: InventoryProvider | None = None,
         verification_coordinator: RepositoryOwnedCIVerificationCoordinator | None = None,
+        pr_coordinator: object | None = None,
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise GenerationInfrastructureError("state root must be an absolute path")
@@ -188,6 +206,7 @@ class GenerationOrchestrator:
         )
         self._inventory_provider = inventory_provider
         self._verification_coordinator = verification_coordinator
+        self._pr_coordinator = pr_coordinator
 
     def inspect(self, manifest_path: Path) -> Mapping[str, object]:
         """Report non-mutating prerequisite status; no target checkout is touched."""
@@ -255,11 +274,15 @@ class GenerationOrchestrator:
         generation_id: str,
         *,
         binding: GenerationBinding | None = None,
+        secret_provider: SecretProvider | None = None,
     ) -> GenerationState:
         """Render/commit/checkpoint each lane; resumed runs skip valid checkpoints."""
         stored = self._load_verified(generation_id)
         if stored.state.stage is Stage.INPUT_COLLECTED:
-            raise GenerationBlockedError("secret resolution is required before knowledge review")
+            if secret_provider is None:
+                raise GenerationBlockedError("secret resolution is required before knowledge review")
+            self.record_secrets_resolved(generation_id, provider=secret_provider)
+            stored = self._load_verified(generation_id)
         if stored.state.stage is Stage.KNOWLEDGE_REVIEW_REQUIRED:
             raise GenerationBlockedError("knowledge approval is required before generation")
         if stored.state.stage is Stage.PLAN_REVIEW_REQUIRED:
@@ -344,10 +367,17 @@ class GenerationOrchestrator:
         knowledge_approval: str | None = None,
         plan_approval: str | None = None,
         binding: GenerationBinding | None = None,
+        secret_provider: SecretProvider | None = None,
     ) -> GenerationState:
         stored = self._load_verified(generation_id)
         state = stored.state
         try:
+            if state.stage is Stage.INPUT_COLLECTED:
+                if secret_provider is None:
+                    raise GenerationBlockedError("secret resolution is required before knowledge review")
+                self.record_secrets_resolved(generation_id, provider=secret_provider)
+                stored = self._load_verified(generation_id)
+                state = stored.state
             if knowledge_approval is not None:
                 state.approve_knowledge(knowledge_approval)
                 state.record_plan_digest(stored.plan_digest)
@@ -357,7 +387,7 @@ class GenerationOrchestrator:
             raise GenerationBlockedError(str(error)) from error
         self._save(stored)
         if state.stage is Stage.GENERATED and binding is not None:
-            return self.generate(generation_id, binding=binding)
+            return self.generate(generation_id, binding=binding, secret_provider=secret_provider)
         return state
 
     def _create_or_reuse_lane(self, generation_id: str, lane: LaneBinding) -> WorktreeHandle:
@@ -762,13 +792,18 @@ class GenerationOrchestrator:
         if not isinstance(self._verification_coordinator, RepositoryOwnedCIVerificationCoordinator):
             raise GenerationBlockedError("verification is library-only until a coordinator is configured")
         stored = self._load_verified(generation_id)
+        if stored.state.stage is not Stage.GENERATED:
+            raise GenerationBlockedError("verification requires exact committed generation lanes")
         try:
             readiness, reports = self._verification_coordinator.verify(
                 generation_id=generation_id, resources=stored.resources, lane_records=stored.state.lane_records
             )
         except Exception as error:
             raise GenerationBlockedError("coordinator verification failed") from error
-        return self._persist_verified_pr_readiness(generation_id, readiness, tuple(stored.cleanup_inventory.worktrees if stored.cleanup_inventory else ()), reports)
+        worktrees = self._verification_coordinator.worktrees_for(
+            generation_id=generation_id, inventory=stored.cleanup_inventory, readiness=readiness
+        )
+        return self._persist_verified_pr_readiness(generation_id, readiness, worktrees, reports)
 
     def _persist_verified_pr_readiness(
         self, generation_id: str, readiness: ReadinessEvidence, worktrees: tuple[object, ...], verification_reports: Mapping[str, VerificationReport]
@@ -819,15 +854,18 @@ class GenerationOrchestrator:
         stored = self._load_verified(generation_id)
         if stored.state.stage is not Stage.VERIFIED:
             raise GenerationBlockedError("VERIFIED state is required before opening review requests")
+        coordinator = self._pr_coordinator
+        open_requests = getattr(coordinator, "open", None)
+        if not callable(open_requests):
+            raise GenerationBlockedError("review request coordinator is unavailable until the PR lane is configured")
         try:
-            ReadinessAuthority(self._state_root).load(stored.state)
-        except ReadinessError as error:
-            raise GenerationBlockedError("authoritative readiness record is unavailable or invalid") from error
-        # The actual provider lane receives its authority below through
-        # open_linked_prs(), which always invokes ReadinessAuthority.load().
-        # This CLI-only placeholder has no provider or worktree seams and can
-        # therefore never turn caller-provided flags into a provider action.
-        raise GenerationBlockedError("review request coordinator is unavailable until the PR lane is configured")
+            open_requests(generation_id=generation_id, state=stored.state, inventory=stored.cleanup_inventory)
+        except GenerationBlockedError:
+            raise
+        except Exception as error:
+            raise GenerationBlockedError("review request coordinator failed") from error
+        self._save(stored)
+        return stored.state
 
     def _load_verified(self, generation_id: str) -> _StoredGeneration:
         stored = self._load(generation_id)
