@@ -67,7 +67,11 @@ def test_root_generated_agent_workflow_has_exact_safe_triggers_and_stable_check_
     assert 'paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", ".github/workflows/smartpbx-generated-agents.yml"]' in workflow
     assert "branches: [main]" in workflow
     assert "smartpbx-generated-agent:" in workflow
+    assert "python -m pytest smartpbx_agent_factory/tests" in workflow
+    assert 'if [ -d "SmartPBX Agents" ]; then' in workflow
+    assert 'find "SmartPBX Agents" -mindepth 1 -maxdepth 1 -type d -print0' in workflow
+    assert "while IFS= read -r -d '' agent_dir; do" in workflow
     assert "workflow_call" not in workflow
     assert "gh workflow run" not in workflow
     assert "docker push" not in workflow
-    assert "test -s /tmp/smartpbx-agent-dirs" in workflow
+    assert "test -s /tmp/smartpbx-agent-dirs" not in workflow
