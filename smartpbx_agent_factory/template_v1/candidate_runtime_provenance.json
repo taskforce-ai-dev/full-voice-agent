@@ -19,6 +19,27 @@
   },
   "components": [
     {
+      "template_path": "infrastructure/docker-compose.yml.tmpl",
+      "template_sha256": "sha256:4cc2a944bf3970169dd69b3cdd86cacb5b49ac5986b230c67bc7b7d31c29a02e",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "review-only isolated website-demo process profile; Uvicorn access logging is disabled because relay admission tickets are query parameters"
+    },
+    {
+      "template_path": "infrastructure/nginx-website-demo.conf.tmpl",
+      "template_sha256": "sha256:a0c7ff0060468f706ee1fb5d5026437ff91aaa66c9c6c9e5803390827e07c50f",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "review-only isolated website-demo proxy; the exact relay location disables access logging for query-ticket privacy"
+    },
+    {
+      "template_path": "infrastructure/SMARTPBX_RUNBOOK.md.tmpl",
+      "template_sha256": "sha256:09a8e3a957929d950807e5eaf1382034920a0fac77262c54c68771eba7a84d7d",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "review-only operational privacy contract for the website-demo proxy and Uvicorn process"
+    },
+    {
       "template_path": "runtime/website_demo_core.py.tmpl",
       "template_sha256": "sha256:31df2c40331735e701e5f8086b51b9e1f7cce86d8057bf6cd367a37a5c82ad8e",
       "source_path": "Flico Agent/server.py",

@@ -22,6 +22,7 @@ _TEMPLATE = (
 _WEBSITE_TEMPLATE = _TEMPLATE.with_name("website_demo.py.tmpl")
 _PROVIDER_TEMPLATE = _TEMPLATE.with_name("provider_builders.py.tmpl")
 _WEBSITE_PROXY_TEMPLATE = _TEMPLATE.parents[1] / "infrastructure" / "nginx-website-demo.conf.tmpl"
+_WEBSITE_COMPOSE_TEMPLATE = _TEMPLATE.parents[1] / "infrastructure" / "docker-compose.yml.tmpl"
 _RUNBOOK_TEMPLATE = _TEMPLATE.parents[1] / "infrastructure" / "SMARTPBX_RUNBOOK.md.tmpl"
 
 
@@ -123,11 +124,16 @@ class WebsiteDemoTransportContractTests(unittest.TestCase):
 
     def test_relay_ticket_is_not_written_to_nginx_access_logs(self) -> None:
         proxy = _WEBSITE_PROXY_TEMPLATE.read_text(encoding="utf-8")
+        compose = _WEBSITE_COMPOSE_TEMPLATE.read_text(encoding="utf-8")
         runbook = _RUNBOOK_TEMPLATE.read_text(encoding="utf-8")
         location = proxy.split("location = /ws/v1/website-demo/conversation {", 1)[1].split("\n    }", 1)[0]
+        service = compose.split("  {{website_service}}:", 1)[1].split("\nnetworks:", 1)[0]
         self.assertIn("access_log off;", location)
+        self.assertIn('"--no-access-log"', service)
+        self.assertIn("http://127.0.0.1:8081/health", service)
         self.assertIn("relay ticket", runbook)
         self.assertIn("access_log off", runbook)
+        self.assertIn("--no-access-log", runbook)
 
 
 if __name__ == "__main__":

@@ -46,7 +46,7 @@ services:
     profiles: ["website-demo"]
     image: "{{ghcr_repository}}@${SMARTPBX_IMAGE_DIGEST:?immutable digest required}"
     container_name: {{website_service}}
-    command: ["uvicorn", "website_demo:app", "--host", "0.0.0.0", "--port", "8081", "--workers", "1", "--ws-max-size", "65536"]
+    command: ["uvicorn", "website_demo:app", "--host", "0.0.0.0", "--port", "8081", "--workers", "1", "--ws-max-size", "65536", "--no-access-log"]
     ports:
       - "127.0.0.1:{{website_port}}:8081"
     environment:
