@@ -30,6 +30,7 @@ class WorktreeHandle:
 
 Runner = Callable[[Sequence[str]], str]
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_REMOTE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*$")
 
 
 def _subprocess_runner(args: Sequence[str]) -> str:
@@ -50,14 +51,14 @@ class WorktreeManager:
             raise WorktreeConflictError("temporary root must be an absolute path")
         self._temporary_root = temporary_root.resolve()
         self._run = run
+        self._handles: dict[int, WorktreeHandle] = {}
 
     def create(
         self, *, primary: Path, remote: str, revision: str, target: Path
     ) -> WorktreeHandle:
+        remote = self._validate_remote(remote)
         primary = self._validate_primary(primary)
         target = self._validate_target(target)
-        if not isinstance(remote, str) or not remote:
-            raise WorktreeConflictError("remote is required")
         if not isinstance(revision, str) or not _SHA_RE.fullmatch(revision):
             raise WorktreeConflictError("revision must be a full 40-hex SHA")
 
@@ -71,15 +72,34 @@ class WorktreeManager:
         if resolved != revision:
             raise WorktreeConflictError("requested revision does not match fetched remote main")
         self._run(("git", "-C", str(primary), "worktree", "add", "--detach", str(target), resolved))
-        return WorktreeHandle(primary=primary, target=target, revision=resolved)
+        handle = WorktreeHandle(primary=primary, target=target, revision=resolved)
+        self._handles[id(handle)] = handle
+        return handle
 
     def remove(self, handle: WorktreeHandle) -> None:
         if not isinstance(handle, WorktreeHandle):
             raise WorktreeConflictError("worktree handle is invalid")
+        if self._handles.get(id(handle)) is not handle:
+            raise WorktreeConflictError("worktree handle was not created by this manager")
+        primary = self._validate_primary(handle.primary)
         target = self._validate_target(handle.target, must_not_exist=False)
+        if primary != handle.primary or target != handle.target:
+            raise WorktreeConflictError("worktree handle ownership changed")
         if not target.exists():
+            del self._handles[id(handle)]
             return
-        self._run(("git", "-C", str(handle.primary), "worktree", "remove", str(target)))
+        self._run(("git", "-C", str(primary), "worktree", "remove", str(target)))
+        del self._handles[id(handle)]
+
+    def owns(self, handle: WorktreeHandle) -> bool:
+        """Expose the narrow ownership proof needed by transaction cleanup."""
+        return isinstance(handle, WorktreeHandle) and self._handles.get(id(handle)) is handle
+
+    @staticmethod
+    def _validate_remote(remote: str) -> str:
+        if not isinstance(remote, str) or not _REMOTE_RE.fullmatch(remote):
+            raise WorktreeConflictError("remote must be a safe remote name")
+        return remote
 
     def _validate_primary(self, primary: Path) -> Path:
         if not isinstance(primary, Path) or not primary.is_absolute() or not primary.is_dir():

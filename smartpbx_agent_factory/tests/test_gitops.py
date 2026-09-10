@@ -92,3 +92,24 @@ def test_worktree_manager_rejects_constructed_handle_on_remove(tmp_path):
     constructed = WorktreeHandle(primary=primary, target=target, revision="a" * 40)
     with pytest.raises(WorktreeConflictError, match="created by this manager"):
         manager.remove(constructed)
+
+
+def test_worktree_manager_rejects_a_value_equal_constructed_handle(tmp_path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    target = tmp_path / "generated" / "site"
+
+    def run(args):
+        if args[-2:] == ("status", "--porcelain"):
+            return ""
+        if args[-1] == "origin/main":
+            return "a" * 40
+        return ""
+
+    manager = WorktreeManager(tmp_path / "generated", run=run)
+    handle = manager.create(primary=primary, remote="origin", revision="a" * 40, target=target)
+    equal_but_constructed = WorktreeHandle(handle.primary, handle.target, handle.revision)
+    assert equal_but_constructed == handle
+    with pytest.raises(WorktreeConflictError, match="created by this manager"):
+        manager.remove(equal_but_constructed)

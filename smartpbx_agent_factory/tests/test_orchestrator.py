@@ -85,7 +85,9 @@ def test_state_loader_rejects_symlinked_state_file(tmp_path):
 def test_plan_rejects_knowledge_path_authorized_only_by_process_cwd(tmp_path):
     manifest = tmp_path / "manifest.json"
     raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    raw["knowledge_sources"][0]["path"] = "smartpbx_agent_factory/tests/fixtures/acme-faq.txt"
+    raw["knowledge_sources"][0]["path"] = str(
+        Path.cwd() / "smartpbx_agent_factory/tests/fixtures/acme-faq.txt"
+    )
     manifest.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(GenerationBlockedError, match="approved root"):
         GenerationOrchestrator(tmp_path / "state", catalogue_path=CATALOGUE).plan(manifest)
