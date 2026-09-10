@@ -14,7 +14,7 @@ import os
 import re
 import subprocess
 import tempfile
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -31,7 +31,9 @@ from .provenance import validate_allowlist_metadata
 from .prs import (
     GenerationOwnershipEvidence,
     GenerationWorktree,
+    PRJournal,
     PRProvider,
+    RemotePullRequest,
     WorktreeInspection,
     WorktreeInspector,
     open_linked_prs,
@@ -315,6 +317,42 @@ class GitHubCommandAdapter(RepositoryVisibilityVerifier, PRProvider, WorktreeIns
         finally:
             body_path.unlink(missing_ok=True)
 
+    def remote_branch_head(self, *, repository: str, branch: str) -> str:
+        if repository not in {lane.repository for lane in self._config.lanes.values()} or not re.fullmatch(
+            r"smartpbx-agent-factory/[a-z0-9][a-z0-9-]{0,63}", branch
+        ):
+            raise GenerationBlockedError("generated review branch is not configured")
+        return self._call((
+            str(self._config.ci.gh_binary), "api", f"repos/{repository}/git/ref/heads/{quote(branch, safe='')}",
+            "--jq", ".object.sha",
+        ))
+
+    def find_pull_requests(self, *, repository: str, branch: str) -> tuple[RemotePullRequest, ...]:
+        if repository not in {lane.repository for lane in self._config.lanes.values()} or not re.fullmatch(
+            r"smartpbx-agent-factory/[a-z0-9][a-z0-9-]{0,63}", branch
+        ):
+            raise GenerationBlockedError("generated review branch is not configured")
+        raw = self._call((
+            str(self._config.ci.gh_binary), "pr", "list", "--repo", repository, "--head", branch,
+            "--state", "all", "--json", "url,state,headRefName,headRefOid,baseRefName",
+        ))
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise GenerationBlockedError("GitHub PR discovery result is invalid") from error
+        if not isinstance(payload, list):
+            raise GenerationBlockedError("GitHub PR discovery result is invalid")
+        result: list[RemotePullRequest] = []
+        for item in payload:
+            if not isinstance(item, dict) or set(item) != {
+                "url", "state", "headRefName", "headRefOid", "baseRefName"
+            }:
+                raise GenerationBlockedError("GitHub PR discovery result is invalid")
+            result.append(RemotePullRequest(
+                item["url"], item["state"], item["baseRefName"], item["headRefName"], item["headRefOid"]
+            ))
+        return tuple(result)
+
     def comment_pull_request(self, *, pull_request_url: str, body: str) -> None:
         self._call((str(self._config.ci.gh_binary), "pr", "comment", pull_request_url, "--body", body))
 
@@ -464,7 +502,15 @@ class ConfiguredPRCoordinator:
         for worktree in worktrees:
             role, lane = _lane_for_path(self._config, worktree.path)
             self._provider.push_generated_branch(role=role, path=worktree.path, remote=lane.remote, branch=worktree.branch)
-        return open_linked_prs(self._provider, state=state, readiness_authority=ReadinessAuthority(self._config.state_root), worktrees=worktrees, inspector=self._provider)
+        return open_linked_prs(
+            self._provider,
+            state=state,
+            readiness_authority=ReadinessAuthority(self._config.state_root),
+            worktrees=worktrees,
+            inspector=self._provider,
+            journal=PRJournal(self._config.state_root),
+            base_branches={role: lane.base_branch for role, lane in self._config.lanes.items()},
+        )
 
 
 @dataclass(frozen=True)

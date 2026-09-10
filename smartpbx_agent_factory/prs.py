@@ -9,8 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ipaddress
+import json
+import os
 from pathlib import Path
 import re
+import stat
+import tempfile
 from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
@@ -53,6 +57,25 @@ class PRProvider(Protocol):
     def comment_pull_request(self, *, pull_request_url: str, body: str) -> None: ...
 
     def update_pull_request_body(self, *, pull_request_url: str, body: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class RemotePullRequest:
+    """The minimal remote identity used when resuming a journaled PR."""
+
+    url: str
+    state: str
+    base_branch: str
+    head_branch: str
+    head_sha: str
+
+
+class PRRecoveryProvider(PRProvider, Protocol):
+    """Provider reads required before a persisted PR may be reused."""
+
+    def remote_branch_head(self, *, repository: str, branch: str) -> str: ...
+
+    def find_pull_requests(self, *, repository: str, branch: str) -> Sequence[RemotePullRequest]: ...
 
 
 @dataclass(frozen=True)
@@ -133,6 +156,325 @@ class PRCreationFailure(RuntimeError):
         super().__init__(f"PR creation failed for {failed_role}; earlier PRs remain open")
 
 
+class PRJournalError(ValueError):
+    """A private PR journal is malformed, missing, or does not match the generation."""
+
+
+@dataclass(frozen=True)
+class PRJournalEntry:
+    role: str
+    repository: str
+    base_branch: str
+    branch: str
+    remote_head_sha: str
+    url: str | None
+    state: str
+
+
+class PRJournal:
+    """Private, fsync-safe recovery journal for the three review PRs.
+
+    The journal deliberately records only public GitHub references and immutable
+    commit identities.  An intent is sealed before every provider create call;
+    a retry must query GitHub and prove the exact recorded PR before reusing it.
+    """
+
+    _VERSION = 1
+    _ENTRY_STATES = frozenset({"intent", "opened", "backlink-pending", "backlinked", "body-updated"})
+
+    def __init__(self, state_root: Path) -> None:
+        if not isinstance(state_root, Path) or not state_root.is_absolute():
+            raise PRJournalError("PR journal state root must be absolute")
+        self._root_input = state_root
+        self._reject_symlinks(state_root)
+        self._root = state_root.resolve()
+
+    def load(self, state: GenerationState) -> Mapping[str, PRJournalEntry]:
+        path = self._path(state.generation_id)
+        if path.is_symlink():
+            raise PRJournalError("PR journal may not be a symlink")
+        if not path.exists():
+            return MappingProxyType({})
+        document = self._read(path)
+        if (
+            document.get("version") != self._VERSION
+            or document.get("generation_id") != state.generation_id
+            or document.get("manifest_digest") != state.manifest_digest
+            or set(document) != {"version", "generation_id", "manifest_digest", "entries", "record_digest"}
+        ):
+            raise PRJournalError("PR journal does not match its generation")
+        expected = _journal_digest({key: value for key, value in document.items() if key != "record_digest"})
+        if document.get("record_digest") != expected:
+            raise PRJournalError("PR journal digest does not match its contents")
+        raw_entries = document.get("entries")
+        if not isinstance(raw_entries, dict) or set(raw_entries) - set(_ROLES):
+            raise PRJournalError("PR journal entries are invalid")
+        entries: dict[str, PRJournalEntry] = {}
+        for role, raw in raw_entries.items():
+            entry = _journal_entry(raw)
+            if entry.role != role:
+                raise PRJournalError("PR journal role is invalid")
+            entries[role] = entry
+        return MappingProxyType(entries)
+
+    def record_intent(
+        self,
+        state: GenerationState,
+        *,
+        role: str,
+        repository: str,
+        base_branch: str,
+        branch: str,
+        remote_head_sha: str,
+    ) -> PRJournalEntry:
+        entry = PRJournalEntry(role, repository, base_branch, branch, remote_head_sha, None, "intent")
+        self._write_entry(state, entry)
+        return entry
+
+    def record_opened(self, state: GenerationState, entry: PRJournalEntry) -> PRJournalEntry:
+        if entry.url is None or entry.state != "opened":
+            raise PRJournalError("opened PR journal entry is invalid")
+        self._write_entry(state, entry, permitted_previous={"intent", "opened"})
+        return entry
+
+    def record_backlink_state(self, state: GenerationState, role: str, checkpoint: str) -> PRJournalEntry:
+        if checkpoint not in {"backlink-pending", "backlinked", "body-updated"}:
+            raise PRJournalError("PR backlink checkpoint is invalid")
+        existing = self.load(state).get(role)
+        if existing is None or existing.url is None or existing.state not in self._ENTRY_STATES - {"intent"}:
+            raise PRJournalError("PR backlink has no opened review request")
+        entry = PRJournalEntry(
+            existing.role, existing.repository, existing.base_branch, existing.branch,
+            existing.remote_head_sha, existing.url, checkpoint,
+        )
+        self._write_entry(state, entry)
+        return entry
+
+    def _write_entry(
+        self, state: GenerationState, entry: PRJournalEntry, *, permitted_previous: set[str] | None = None
+    ) -> None:
+        _validate_journal_entry(entry)
+        entries = dict(self.load(state))
+        previous = entries.get(entry.role)
+        if previous is not None:
+            if previous.repository != entry.repository or previous.base_branch != entry.base_branch or previous.branch != entry.branch or previous.remote_head_sha != entry.remote_head_sha:
+                raise PRJournalError("PR journal identity drift is not recoverable")
+            if permitted_previous is not None and previous.state not in permitted_previous:
+                raise PRJournalError("PR journal checkpoint is not recoverable")
+        elif permitted_previous is not None:
+            raise PRJournalError("opened PR journal entry requires an intent")
+        entries[entry.role] = entry
+        self._atomic_write(state, entries)
+
+    def _path(self, generation_id: str) -> Path:
+        if not isinstance(generation_id, str) or not re.fullmatch(r"gen-[a-f0-9]{32}|gen-[a-z0-9-]+", generation_id):
+            raise PRJournalError("PR journal generation id is invalid")
+        return self._root / generation_id / "pull-requests.json"
+
+    def _atomic_write(self, state: GenerationState, entries: Mapping[str, PRJournalEntry]) -> None:
+        self._ensure_root()
+        path = self._path(state.generation_id)
+        directory = path.parent
+        if directory.is_symlink():
+            raise PRJournalError("PR journal directory may not be a symlink")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir() or directory.stat().st_mode & 0o777 != 0o700:
+            raise PRJournalError("PR journal directory must be private")
+        document: dict[str, object] = {
+            "version": self._VERSION,
+            "generation_id": state.generation_id,
+            "manifest_digest": state.manifest_digest,
+            "entries": {role: _journal_entry_payload(entry) for role, entry in sorted(entries.items())},
+        }
+        document["record_digest"] = _journal_digest(document)
+        temporary: Path | None = None
+        try:
+            descriptor, name = tempfile.mkstemp(prefix=".pull-requests.", dir=directory)
+            temporary = Path(name)
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(document, handle, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            if path.is_symlink():
+                raise PRJournalError("PR journal may not be a symlink")
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+            self._require_private_file(path)
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise PRJournalError("cannot persist PR journal") from error
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _read(self, path: Path) -> dict[str, object]:
+        self._ensure_root()
+        self._require_private_file(path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                details = os.fstat(descriptor)
+                if not stat.S_ISREG(details.st_mode) or details.st_mode & 0o777 != 0o600:
+                    raise PRJournalError("PR journal must be a mode-0600 regular file")
+                raw = json.load(handle)
+        except PRJournalError:
+            raise
+        except (OSError, json.JSONDecodeError) as error:
+            raise PRJournalError("cannot read PR journal") from error
+        if not isinstance(raw, dict):
+            raise PRJournalError("PR journal schema is invalid")
+        return raw
+
+    def _ensure_root(self) -> None:
+        self._reject_symlinks(self._root_input)
+        self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self._root.is_symlink() or not self._root.is_dir() or self._root.stat().st_mode & 0o777 != 0o700:
+            raise PRJournalError("PR journal state root must be private")
+
+    @staticmethod
+    def _require_private_file(path: Path) -> None:
+        if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
+            raise PRJournalError("PR journal must be a mode-0600 regular file")
+
+    @staticmethod
+    def _reject_symlinks(path: Path) -> None:
+        current = path
+        while current != current.parent:
+            if current.is_symlink():
+                raise PRJournalError("PR journal state root may not traverse a symlink")
+            current = current.parent
+
+
+def _journal_digest(value: Mapping[str, object]) -> str:
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _journal_entry_payload(entry: PRJournalEntry) -> dict[str, object]:
+    return {
+        "role": entry.role,
+        "repository": entry.repository,
+        "base_branch": entry.base_branch,
+        "branch": entry.branch,
+        "remote_head_sha": entry.remote_head_sha,
+        "url": entry.url,
+        "state": entry.state,
+    }
+
+
+def _journal_entry(raw: object) -> PRJournalEntry:
+    if not isinstance(raw, dict) or set(raw) != {
+        "role", "repository", "base_branch", "branch", "remote_head_sha", "url", "state"
+    }:
+        raise PRJournalError("PR journal entry schema is invalid")
+    entry = PRJournalEntry(
+        raw["role"], raw["repository"], raw["base_branch"], raw["branch"],
+        raw["remote_head_sha"], raw["url"], raw["state"],
+    )
+    _validate_journal_entry(entry)
+    return entry
+
+
+def _validate_journal_entry(entry: PRJournalEntry) -> None:
+    if (
+        entry.role not in _ROLES
+        or not _valid_repository(entry.repository)
+        or not _valid_branch(entry.base_branch)
+        or not _valid_branch(entry.branch)
+        or not _is_sha(entry.remote_head_sha)
+        or entry.state not in PRJournal._ENTRY_STATES
+        or (entry.url is not None and _validate_provider_url(entry.url, entry.repository) != entry.url)
+        or (entry.state == "intent") != (entry.url is None)
+        or (entry.state != "intent" and not isinstance(entry.url, str))
+    ):
+        raise PRJournalError("PR journal entry is invalid")
+
+
+def _remote_pr_matches(
+    entry: PRJournalEntry, remote: RemotePullRequest, *, require_url: bool = True
+) -> bool:
+    return (
+        (not require_url or remote.url == entry.url)
+        and remote.state == "OPEN"
+        and remote.base_branch == entry.base_branch
+        and remote.head_branch == entry.branch
+        and remote.head_sha == entry.remote_head_sha
+    )
+
+
+def _require_recovery_provider(provider: PRProvider) -> PRRecoveryProvider:
+    if not all(callable(getattr(provider, name, None)) for name in ("remote_branch_head", "find_pull_requests")):
+        raise PRJournalError("PR recovery provider cannot validate remote state")
+    return provider  # type: ignore[return-value]
+
+
+def _reserve_or_reuse_journaled_pr(
+    journal: PRJournal,
+    provider: PRProvider,
+    state: GenerationState,
+    *,
+    worktree: GenerationWorktree,
+    base_branch: str,
+) -> str | None:
+    recovery_provider = _require_recovery_provider(provider)
+    remote_head = recovery_provider.remote_branch_head(
+        repository=worktree.repository, branch=worktree.branch
+    )
+    if not _is_sha(remote_head) or remote_head != worktree.branch_sha:
+        raise PRJournalError("published review branch head differs from the verified worktree")
+    entries = journal.load(state)
+    existing = entries.get(worktree.role)
+    candidates = tuple(recovery_provider.find_pull_requests(
+        repository=worktree.repository, branch=worktree.branch
+    ))
+    if not all(isinstance(candidate, RemotePullRequest) for candidate in candidates):
+        raise PRJournalError("remote PR discovery result is invalid")
+    if existing is None:
+        if candidates:
+            raise PRJournalError("unjournaled PR exists for the generated review branch")
+        journal.record_intent(
+            state,
+            role=worktree.role,
+            repository=worktree.repository,
+            base_branch=base_branch,
+            branch=worktree.branch,
+            remote_head_sha=remote_head,
+        )
+        return None
+    if (
+        existing.repository != worktree.repository
+        or existing.base_branch != base_branch
+        or existing.branch != worktree.branch
+        or existing.remote_head_sha != remote_head
+    ):
+        raise PRJournalError("journaled PR identity differs from published review branch")
+    if existing.state == "intent":
+        if not candidates:
+            return None
+        exact = [candidate for candidate in candidates if _remote_pr_matches(existing, candidate, require_url=False)]
+        if len(exact) != 1 or len(candidates) != 1:
+            raise PRJournalError("remote PR discovery is ambiguous or does not match its intent")
+        opened = PRJournalEntry(
+            existing.role, existing.repository, existing.base_branch, existing.branch,
+            existing.remote_head_sha, exact[0].url, "opened",
+        )
+        journal.record_opened(state, opened)
+        return opened.url
+    if len(candidates) != 1 or not _remote_pr_matches(existing, candidates[0]):
+        raise PRJournalError("journaled PR is closed, ambiguous, or has drifted")
+    return existing.url
+
+
 def open_linked_prs(
     provider: PRProvider,
     *,
@@ -142,6 +484,8 @@ def open_linked_prs(
     inspector: WorktreeInspector,
     redactions: Sequence[str] = (),
     replace_bodies: bool = False,
+    journal: PRJournal | None = None,
+    base_branches: Mapping[str, str] | None = None,
 ) -> PRSet:
     """Open backend, operations, then website review PRs and add final back-links.
 
@@ -163,36 +507,79 @@ def open_linked_prs(
     _require_verified(state, readiness)
     _validate_readiness(state, readiness)
     by_role = _validate_worktrees(state, readiness, worktrees)
+    if (journal is None) != (base_branches is None):
+        _block(state, "PR journal configuration is incomplete")
+        raise StateError("PR prerequisite failed: PR journal configuration is incomplete")
+    if base_branches is not None and (
+        set(base_branches) != set(_ROLES) or not all(_valid_branch(base_branches[role]) for role in _ROLES)
+    ):
+        _block(state, "PR journal base branches are invalid")
+        raise StateError("PR prerequisite failed: PR journal base branches are invalid")
     urls: dict[str, str] = {}
 
-    try:
-        for role in _ROLES:
+    for role in _ROLES:
+        try:
             _inspect_worktree(state, readiness, by_role[role], inspector)
-            body = _initial_body(role, state, readiness, by_role[role], urls)
-            url = provider.open_pull_request(
-                repository=by_role[role].repository,
-                branch=by_role[role].branch,
-                title=_redact(_title(role, readiness.review_label), normalized_redactions),
-                body=_redact(body, normalized_redactions),
+            reused = (
+                _reserve_or_reuse_journaled_pr(
+                    journal, provider, state, worktree=by_role[role], base_branch=base_branches[role]
+                )
+                if journal is not None and base_branches is not None
+                else None
             )
-            urls[role] = _validate_provider_url(url, by_role[role].repository)
-    except Exception as exc:
-        failed_role = next(role for role in _ROLES if role not in urls)
-        _block(state, f"PR creation failed for {failed_role}")
-        raise PRCreationFailure(failed_role, urls) from exc
+        except Exception as exc:
+            _block(state, f"PR prerequisite failed for {role}")
+            raise PRCreationFailure(role, urls) from exc
+        if reused is not None:
+            urls[role] = reused
+            continue
+        try:
+            body = _initial_body(role, state, readiness, by_role[role], urls)
+            url = _validate_provider_url(
+                provider.open_pull_request(
+                    repository=by_role[role].repository,
+                    branch=by_role[role].branch,
+                    title=_redact(_title(role, readiness.review_label), normalized_redactions),
+                    body=_redact(body, normalized_redactions),
+                ),
+                by_role[role].repository,
+            )
+            urls[role] = url
+            if journal is not None:
+                discovered = _reserve_or_reuse_journaled_pr(
+                    journal, provider, state, worktree=by_role[role], base_branch=base_branches[role]
+                )
+                if discovered != url:
+                    raise PRJournalError("provider-created PR does not match its published review branch")
+        except Exception as exc:
+            _block_provider(state, f"PR provider failed for {role}")
+            raise PRCreationFailure(role, urls) from exc
 
     backlinks = _redact(_backlinks_body(state, readiness, urls), normalized_redactions)
     try:
         for role in _ROLES:
+            if journal is not None:
+                entry = journal.load(state).get(role)
+                if entry is None:
+                    raise PRJournalError("opened PR is missing from the recovery journal")
+                if entry.state in {"backlinked", "body-updated"}:
+                    continue
+                journal.record_backlink_state(state, role, "backlink-pending")
             provider.comment_pull_request(pull_request_url=urls[role], body=backlinks)
+            if journal is not None:
+                journal.record_backlink_state(state, role, "backlinked")
         if replace_bodies:
             for role in _ROLES:
+                if journal is not None and journal.load(state)[role].state == "body-updated":
+                    continue
                 provider.update_pull_request_body(
                     pull_request_url=urls[role],
                     body=_redact(_initial_body(role, state, readiness, by_role[role], urls), normalized_redactions),
                 )
+                if journal is not None:
+                    journal.record_backlink_state(state, role, "body-updated")
     except Exception as exc:
-        _block(state, "PR backlink update failed")
+        _block_provider(state, "PR provider backlink update failed")
         raise PRCreationFailure("backlinks", urls) from exc
 
     state.transition(Stage.THREE_PRS_OPENED)
@@ -575,4 +962,11 @@ def _redact(body: str, values: Sequence[str]) -> str:
 
 def _block(state: GenerationState, reason: str) -> None:
     if state.stage is not Stage.THREE_PRS_OPENED:
+        state.block(reason)
+
+
+def _block_provider(state: GenerationState, reason: str) -> None:
+    if state.stage is Stage.VERIFIED:
+        state.block_pr_provider(reason)
+    elif state.stage is not Stage.THREE_PRS_OPENED:
         state.block(reason)

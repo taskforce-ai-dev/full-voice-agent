@@ -50,6 +50,7 @@ class GenerationState:
     stage_digests: dict[str, str] = field(default_factory=dict)
     lane_records: dict[str, dict[str, str]] = field(default_factory=dict)
     blocked_reason: str | None = None
+    pr_provider_recovery: bool = False
 
     @classmethod
     def start(cls, generation_id: str, manifest_digest: str) -> "GenerationState":
@@ -130,7 +131,26 @@ class GenerationState:
         if not reason or "\x00" in reason:
             raise StateError("blocked reason is required")
         self.blocked_reason = reason
+        self.pr_provider_recovery = False
         self.stage = Stage.BLOCKED
+
+    def block_pr_provider(self, reason: str) -> None:
+        """Block a provider-side PR interruption, preserving the sole retry path."""
+        if self.stage is not Stage.VERIFIED:
+            raise StateError("PR provider failure requires stage VERIFIED")
+        if not reason or "\x00" in reason:
+            raise StateError("blocked reason is required")
+        self.blocked_reason = reason
+        self.pr_provider_recovery = True
+        self.stage = Stage.BLOCKED
+
+    def recover_pr_provider_block(self) -> None:
+        """Re-open only a durably recorded PR-provider interruption for validation."""
+        if self.stage is not Stage.BLOCKED or not self.pr_provider_recovery:
+            raise StateError("only a PR-provider-blocked generation may recover")
+        self.stage = Stage.VERIFIED
+        self.blocked_reason = None
+        self.pr_provider_recovery = False
 
     def abandon(self) -> None:
         if self.stage is Stage.THREE_PRS_OPENED:
@@ -149,6 +169,7 @@ class GenerationState:
             "stage_digests": dict(self.stage_digests),
             "lane_records": {name: dict(value) for name, value in self.lane_records.items()},
             "blocked_reason": self.blocked_reason,
+            "pr_provider_recovery": self.pr_provider_recovery,
         }
 
     @classmethod
@@ -165,6 +186,7 @@ class GenerationState:
                 stage_digests=dict(raw.get("stage_digests", {})),
                 lane_records={str(name): dict(value) for name, value in dict(raw.get("lane_records", {})).items()},
                 blocked_reason=raw.get("blocked_reason"),
+                pr_provider_recovery=raw.get("pr_provider_recovery", False),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise StateError("invalid serialized generation state") from exc
@@ -180,6 +202,10 @@ class GenerationState:
             raise StateError("knowledge approval digest does not match expected review digest")
         if state.plan_approval_digest is not None and state.plan_approval_digest != state.plan_digest:
             raise StateError("plan approval digest does not match expected review digest")
+        if not isinstance(state.pr_provider_recovery, bool):
+            raise StateError("serialized PR recovery marker is invalid")
+        if state.pr_provider_recovery and state.stage is not Stage.BLOCKED:
+            raise StateError("serialized PR recovery marker requires stage BLOCKED")
         return state
 
 

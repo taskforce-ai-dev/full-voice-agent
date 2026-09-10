@@ -163,6 +163,38 @@ class FactoryBootstrapContractTests(unittest.TestCase):
             with self.assertRaises(GenerationBlockedError):
                 adapter.push_generated_branch(role="backend", path=config.lanes["backend"].target_root / "gen-test", remote="origin", branch="main")
 
+    def test_pr_recovery_adapter_reads_exact_remote_head_and_all_pr_states_without_network(self) -> None:
+        from smartpbx_agent_factory.bootstrap import FactoryConfig, GitHubCommandAdapter
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = FactoryConfig.load(self._config(root))
+            calls: list[tuple[str, ...]] = []
+
+            def runner(argv):
+                calls.append(tuple(argv))
+                if "api" in argv:
+                    return SimpleNamespace(returncode=0, stdout="b" * 40 + "\n")
+                if "list" in argv:
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                        "url": "https://github.com/acme/backend/pull/42",
+                        "state": "OPEN",
+                        "headRefName": "smartpbx-agent-factory/gen-001",
+                        "headRefOid": "b" * 40,
+                        "baseRefName": "main",
+                    }]))
+                self.fail(f"unexpected command: {argv}")
+
+            adapter = GitHubCommandAdapter(config, runner=runner)
+            branch = "smartpbx-agent-factory/gen-001"
+            self.assertEqual(adapter.remote_branch_head(repository="acme/backend", branch=branch), "b" * 40)
+            pulls = adapter.find_pull_requests(repository="acme/backend", branch=branch)
+
+            self.assertEqual(len(pulls), 1)
+            self.assertEqual(pulls[0].head_sha, "b" * 40)
+            self.assertTrue(any("--state" in call and "all" in call for call in calls))
+            self.assertTrue(any("smartpbx-agent-factory%2Fgen-001" in argument for call in calls for argument in call))
+
     def test_ci_adapter_stays_blocked_without_approved_provenance_or_result(self) -> None:
         from smartpbx_agent_factory.bootstrap import FactoryConfig, GitHubCIResultAdapter
         from smartpbx_agent_factory.orchestrator import GenerationBlockedError

@@ -27,6 +27,7 @@ from .knowledge import (
     recompute_knowledge_review_digest,
 )
 from .provenance import ProvenanceError, validate_allowlist_metadata
+from .prs import PRCreationFailure
 from .readiness import ReadinessAuthority, ReadinessError, ReadinessEvidence
 from .render import IncompleteTemplateError, render_backend
 from .operations import render_operations_artifacts
@@ -892,6 +893,12 @@ class GenerationOrchestrator:
 
     def open_pr(self, generation_id: str) -> GenerationState:
         stored = self._load_verified(generation_id)
+        recovering = stored.state.stage is Stage.BLOCKED
+        if recovering:
+            try:
+                stored.state.recover_pr_provider_block()
+            except StateError as error:
+                raise GenerationBlockedError("only a PR-provider-blocked generation may recover") from error
         if stored.state.stage is not Stage.VERIFIED:
             raise GenerationBlockedError("VERIFIED state is required before opening review requests")
         coordinator = self._pr_coordinator
@@ -899,12 +906,23 @@ class GenerationOrchestrator:
         if not callable(open_requests):
             raise GenerationBlockedError("review request coordinator is unavailable until the PR lane is configured")
         try:
-            result = open_requests(
-                generation_id=generation_id, state=stored.state, inventory=stored.cleanup_inventory
-            )
+            result = open_requests(generation_id=generation_id, state=stored.state, inventory=stored.cleanup_inventory)
+        except PRCreationFailure:
+            self._save(stored)
+            if stored.state.pr_provider_recovery:
+                raise GenerationBlockedError("review request provider failed; durable recovery is required") from None
+            raise GenerationBlockedError("review request opening failed") from None
         except GenerationBlockedError:
+            if recovering and stored.state.stage is Stage.VERIFIED:
+                stored.state.block("PR recovery validation failed")
+            if stored.state.stage is Stage.BLOCKED:
+                self._save(stored)
             raise
         except Exception as error:
+            if recovering and stored.state.stage is Stage.VERIFIED:
+                stored.state.block("PR recovery validation failed")
+            if stored.state.stage is Stage.BLOCKED:
+                self._save(stored)
             raise GenerationBlockedError("review request coordinator failed") from error
         self._save(stored)
         self._last_pr_set = result
