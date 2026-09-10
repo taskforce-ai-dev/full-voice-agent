@@ -38,6 +38,23 @@ def test_catalogue_accepts_only_source_proven_english_and_sinhala_profiles():
             "tts_model": "eleven_flash_v2_5",
         },
     )
+
+
+def test_source_observed_google_stt_is_not_a_generated_runnable_choice_without_materialization_contract():
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    google_pipeline = {
+        "locale": "en-US",
+        "stt": "google",
+        "llm": "claude",
+        "llm_model": "claude-sonnet-4-5-20250929",
+        "tts": "elevenlabs",
+        "tts_model": "eleven_flash_v2_5",
+    }
+    catalogue.validate_pipeline("en", google_pipeline)
+    with pytest.raises(CatalogueError, match="not generated-runnable"):
+        catalogue.validate_generated_pipeline("en", google_pipeline)
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in catalogue.required_secret_identifiers_for_pipeline("en", google_pipeline)
+    assert catalogue.required_metadata_identifiers_for_pipeline("en", google_pipeline) == frozenset({"GOOGLE_APPLICATION_CREDENTIALS", "SMARTPBX_ACCOUNT_ID"})
     catalogue.validate_pipeline(
         "en",
         {
@@ -64,9 +81,9 @@ def test_catalogue_accepts_only_source_proven_english_and_sinhala_profiles():
     )
 
 
-def test_catalogue_keeps_source_defaults_separate_from_supported_environment_selections():
+def test_catalogue_keeps_source_defaults_non_runnable_and_requires_manifest_selection():
     catalogue = CapabilityCatalogue.load(CATALOGUE)
-    assert catalogue.generated_default("en") == {
+    assert catalogue.source_default("en") == {
         "evidence": "source-default",
         "locale": "en-US",
         "stt": "google",
@@ -75,6 +92,7 @@ def test_catalogue_keeps_source_defaults_separate_from_supported_environment_sel
         "tts": "elevenlabs",
         "tts_model": "eleven_flash_v2_5",
     }
+    assert catalogue.manifest_selection_required is True
     catalogue.validate_pipeline(
         "si",
         {
@@ -120,6 +138,7 @@ def test_catalogue_rejects_malformed_or_unknown_provider_data(tmp_path):
                 "source_hashes": {"Kavya/server.py": "sha256:" + "b" * 64},
                 "runtime_required_secret_identifiers": [],
                 "runtime_required_metadata_identifiers": [],
+                "manifest_selection_required": True,
             }
         ),
         encoding="utf-8",

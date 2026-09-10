@@ -10,7 +10,8 @@
   },
   "runtime_required_secret_identifiers": ["SMARTPBX_WS_TOKEN"],
   "runtime_required_metadata_identifiers": ["SMARTPBX_ACCOUNT_ID"],
-  "generated_defaults": {
+  "manifest_selection_required": true,
+  "source_defaults": {
     "en": {"evidence": "source-default", "locale": "en-US", "stt": "google", "llm": "claude", "llm_model": "claude-sonnet-4-5-20250929", "tts": "elevenlabs", "tts_model": "eleven_flash_v2_5"},
     "si": {"evidence": "source-default", "locale": "si-LK", "stt": "azure", "llm": "gemini", "llm_model": "gemini-3.7-flash", "tts": "gemini", "tts_model": "gemini-3.1-flash-tts-preview", "fallback": "claude", "fallback_model": "claude-sonnet-4-5-20250929"}
   },
@@ -18,9 +19,9 @@
     "en": {
       "locales": {
         "en-US": {
-          "stt": [{"provider": "google", "model": null, "required_secret_identifiers": ["GOOGLE_APPLICATION_CREDENTIALS"]}, {"provider": "azure", "model": null, "required_secret_identifiers": ["AZURE_SPEECH_KEY"]}],
-          "llm": [{"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"]}],
-          "tts": [{"provider": "elevenlabs", "model": "eleven_flash_v2_5", "required_secret_identifiers": ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"]}],
+          "stt": [{"provider": "google", "model": null, "required_secret_identifiers": [], "required_metadata_identifiers": ["GOOGLE_APPLICATION_CREDENTIALS"], "generated_runnable": false}, {"provider": "azure", "model": null, "required_secret_identifiers": ["AZURE_SPEECH_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}],
+          "llm": [{"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}],
+          "tts": [{"provider": "elevenlabs", "model": "eleven_flash_v2_5", "required_secret_identifiers": ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"], "required_metadata_identifiers": [], "generated_runnable": true}],
           "fallback": []
         }
       }
@@ -28,13 +29,13 @@
     "si": {
       "locales": {
         "si-LK": {
-          "stt": [{"provider": "azure", "model": null, "required_secret_identifiers": ["AZURE_SPEECH_KEY"]}],
+          "stt": [{"provider": "azure", "model": null, "required_secret_identifiers": ["AZURE_SPEECH_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}],
           "llm": [
-            {"provider": "gemini", "model": "gemini-3.7-flash", "required_secret_identifiers": ["GEMINI_API_KEY"]},
-            {"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"]}
+            {"provider": "gemini", "model": "gemini-3.7-flash", "required_secret_identifiers": ["GEMINI_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true},
+            {"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}
           ],
-          "tts": [{"provider": "gemini", "model": "gemini-3.1-flash-tts-preview", "required_secret_identifiers": ["GEMINI_API_KEY"]}, {"provider": "rime", "model": "arcana", "required_secret_identifiers": ["RIME_API_KEY"]}],
-          "fallback": [{"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"]}]
+          "tts": [{"provider": "gemini", "model": "gemini-3.1-flash-tts-preview", "required_secret_identifiers": ["GEMINI_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}, {"provider": "rime", "model": "arcana", "required_secret_identifiers": ["RIME_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}],
+          "fallback": [{"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}]
         }
       }
     }

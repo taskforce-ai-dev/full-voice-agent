@@ -301,7 +301,7 @@ def parse_manifest(
         raise ManifestError("reviewed capability catalogue is required")
     for language in languages:
         try:
-            catalogue.validate_pipeline(language.code, language.pipeline)
+            catalogue.validate_generated_pipeline(language.code, language.pipeline)
         except CatalogueError as exc:
             raise ManifestError(str(exc)) from exc
     pii_raw = _mapping(raw["pii_policy"], "pii_policy")

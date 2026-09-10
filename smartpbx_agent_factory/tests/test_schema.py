@@ -115,6 +115,13 @@ def test_parser_rejects_unapproved_language_locale_or_provider_model_pair(field,
         parse(raw)
 
 
+def test_parser_rejects_source_observed_google_without_generated_materialization_contract():
+    raw = load_raw()
+    raw["languages"][0]["stt"] = {"provider": "google"}
+    with pytest.raises(ManifestError, match="not generated-runnable"):
+        parse(raw)
+
+
 def test_manifest_is_deeply_immutable_and_uses_v07_defaults():
     raw = load_raw()
     raw["smartpbx"].pop("protocol_profile")
