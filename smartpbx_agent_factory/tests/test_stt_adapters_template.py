@@ -48,6 +48,7 @@ def test_stt_template_adapts_to_the_shared_continuous_recognizer_contract() -> N
     assert "result_id=event.metadata.result_id" in text
     assert "profile.code != language" in text
     assert "profile.locale != config.language_code" in text
+    assert 'if self.provider not in {"google", "azure"}:' in text
     assert "start_continuous_recognition_async().get()" in text
     assert "MAX_AZURE_METADATA_JSON_BYTES" in text
 

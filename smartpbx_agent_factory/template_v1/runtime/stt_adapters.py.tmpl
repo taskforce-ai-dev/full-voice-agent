@@ -422,6 +422,8 @@ class STTProfile:
     def __post_init__(self) -> None:
         if not self.code or not self.locale:
             raise ValueError("STT profile code and locale are required")
+        if self.provider not in {"google", "azure"}:
+            raise ValueError("STT profile provider is not supported")
         if self.provider == "google" and (self.google is None or self.azure is not None):
             raise ValueError("Google STT profile must contain only Google configuration")
         if self.provider == "azure" and (self.azure is None or self.google is not None):
