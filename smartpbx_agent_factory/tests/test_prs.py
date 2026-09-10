@@ -142,7 +142,7 @@ def fixture_worktrees() -> tuple[GenerationWorktree, ...]:
             branch_sha=letter * 40,
             path=ownership.generation_root / role,
             clean=True,
-            ownership=ownership,
+            ownership=replace(ownership, handle=f"{role}-handle-gen-001"),
         )
         for role, letter in (("backend", "f"), ("operations", "1"), ("website", "2"))
     )

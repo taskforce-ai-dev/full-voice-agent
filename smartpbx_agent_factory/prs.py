@@ -441,9 +441,8 @@ def _validate_worktrees(
     if len(by_role) != len(worktrees) or set(by_role) != set(_ROLES):
         _block(state, "PR prerequisite failed: three generation worktrees are required")
         raise StateError("PR prerequisite failed: backend, operations, and website worktrees are required")
-    root: Path | None = None
-    ownership: GenerationOwnershipEvidence | None = None
     resolved_paths: set[Path] = set()
+    ownership_handles: set[str] = set()
     for role in _ROLES:
         worktree = by_role[role]
         if not isinstance(worktree, GenerationWorktree) or not isinstance(
@@ -464,20 +463,17 @@ def _validate_worktrees(
             or not _is_sha(worktree.branch_sha)
             or not worktree.path.is_absolute()
             or not candidate_root.is_absolute()
-            or candidate_root.name != state.generation_id
             or evidence.generation_id != state.generation_id
             or not _HANDLE.fullmatch(evidence.handle)
             or not _is_digest(evidence.digest)
             or evidence.digest != readiness.worktree_ownership_digest
             or candidate_path == candidate_root
             or candidate_path in resolved_paths
+            or evidence.handle in ownership_handles
         ):
             _reject_worktree(state, role)
-        if ownership is None:
-            ownership, root = evidence, candidate_root
-        elif evidence != ownership or candidate_root != root:
-            _reject_worktree(state, role)
         resolved_paths.add(candidate_path)
+        ownership_handles.add(evidence.handle)
     return MappingProxyType(by_role)
 
 
