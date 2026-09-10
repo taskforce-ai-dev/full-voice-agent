@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -141,6 +142,8 @@ class CleanupInventory:
     completed_worktree_targets: tuple[Path, ...] = ()
     completed_plaintext_paths: tuple[Path, ...] = ()
     completed: bool = False
+    sealed_ciphertext_paths: tuple[Path, ...] = ()
+    completed_sealed_ciphertext_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -310,7 +313,10 @@ class GenerationOrchestrator:
                 )
                 handles["operations"] = self._commit_and_checkpoint(
                     generation_id, "operations", binding.operations.manager, handles["operations"],
-                    (Path("agents") / stored.resources.slug,), ciphertext_reference=",".join(audit.ciphertext_paths),
+                    (Path("agents") / stored.resources.slug,),
+                    ciphertext_reference=",".join(
+                        sorted(Path(item).as_posix() for item in audit.ciphertext_paths)
+                    ),
                 )
             stored = self._load_verified(generation_id)
             if not self._checkpoint_is_valid(stored, "website", handles["website"]):
@@ -422,68 +428,117 @@ class GenerationOrchestrator:
         secret_plan = derive_secret_plan(
             manifest, stored.resources, CapabilityCatalogue.load(self._catalogue_path)
         )
-        bundle, audit = self._seal_secret_bundle(stored, secret_plan, provider)
-        expected_names = {item.record_id for item in secret_plan.requirements}
-        audited_names = audit.fetched_names + audit.generated_names
-        if len(audited_names) != len(set(audited_names)) or set(audited_names) != expected_names:
-            raise GenerationBlockedError("secret audit names do not exactly match manifest requirements")
-        review = self._build_knowledge_review(stored, manifest)
-        stored = _replace_knowledge_review(stored, review, sealed_secret=bundle)
-        audit_digest = _digest_payload(
-            {
-                "fetched_names": audit.fetched_names,
-                "generated_names": audit.generated_names,
-                "ciphertext_paths": audit.ciphertext_paths,
-                "secret_plan": secret_plan.digest_payload(),
-                "sealed_ciphertext_digest": bundle.digest,
-            }
-        )
         try:
+            bundle, audit = self._seal_secret_bundle(stored, secret_plan, provider)
+            expected_names = {item.record_id for item in secret_plan.requirements}
+            audited_names = audit.fetched_names + audit.generated_names
+            if len(audited_names) != len(set(audited_names)) or set(audited_names) != expected_names:
+                raise GenerationBlockedError("secret audit names do not exactly match manifest requirements")
+            inventory = stored.cleanup_inventory
+            if inventory is None or inventory.completed:
+                raise GenerationBlockedError("sealed ciphertext cleanup ownership is unavailable")
+            stored = _replace_cleanup_inventory(
+                stored,
+                CleanupInventory(
+                    inventory.worktrees,
+                    inventory.plaintext_paths,
+                    inventory.completed_worktree_targets,
+                    inventory.completed_plaintext_paths,
+                    sealed_ciphertext_paths=inventory.sealed_ciphertext_paths + (bundle.path,),
+                    completed_sealed_ciphertext_paths=inventory.completed_sealed_ciphertext_paths,
+                ),
+            )
+            review = self._build_knowledge_review(stored, manifest)
+            stored = _replace_knowledge_review(stored, review, sealed_secret=bundle)
+            audit_digest = _digest_payload(
+                {
+                    "fetched_names": audit.fetched_names,
+                    "generated_names": audit.generated_names,
+                    "ciphertext_paths": tuple(sorted(Path(item).as_posix() for item in audit.ciphertext_paths)),
+                    "secret_plan": secret_plan.digest_payload(),
+                    "sealed_ciphertext_digest": bundle.digest,
+                }
+            )
             state.record_stage_digest("secrets", audit_digest)
             state.transition(Stage.SECRETS_RESOLVED)
             state.transition(Stage.KNOWLEDGE_REVIEW_REQUIRED)
             state.record_knowledge_review_digest(review.digest)
-        except StateError as error:
+            self._save(stored)
+        except (GenerationError, StateError) as error:
+            if "bundle" in locals():
+                self._rollback_unrecorded_sealed_bundle(generation_id, bundle)
             raise GenerationBlockedError(str(error)) from error
-        self._save(stored)
+        except Exception as error:
+            if "bundle" in locals():
+                self._rollback_unrecorded_sealed_bundle(generation_id, bundle)
+            raise GenerationBlockedError("secret resolution checkpoint failed") from error
         return state
 
     def _seal_secret_bundle(
         self, stored: _StoredGeneration, secret_plan: SecretPlan, provider: SecretProvider
     ) -> tuple[SealedSecretBundle, SecretAudit]:
         """Fetch/generate exactly once, immediately encrypt, then drop plaintext."""
-        root = self._state_root / "sealed-secrets" / stored.state.generation_id
+        root = self._sealed_root(stored.state.generation_id)
         path = root / "secrets.sops.yaml"
-        if root.is_symlink() or path.is_symlink() or path.exists():
-            raise GenerationBlockedError("sealed secret bundle already exists or is unsafe; create a new generation for rotation")
+        temporary_path: Path | None = None
+        created_root = False
+        values: dict[str, str] = {}
         try:
-            root.mkdir(parents=True, mode=0o700)
+            self._ensure_state_root(create=True)
+            base = root.parent
+            if base.is_symlink():
+                raise GenerationInfrastructureError("sealed secret bundle root may not be a symlink")
+            base.mkdir(mode=0o700, exist_ok=True)
+            if base.is_symlink() or not base.is_dir() or base.stat().st_mode & 0o777 != 0o700:
+                raise GenerationInfrastructureError("sealed secret bundle parent must be private")
+            if root.exists():
+                self._remove_exact_sealed_bundle(stored.state.generation_id, path)
+            root.mkdir(mode=0o700)
+            created_root = True
             if root.is_symlink() or root.stat().st_mode & 0o777 != 0o700:
                 raise GenerationInfrastructureError("sealed secret bundle directory must be private")
             provider.validate()
-            values: dict[str, str] = {}
             for requirement in secret_plan.requirements:
                 value = provider.generate(requirement.record_id, length=32) if requirement.generated else provider.fetch(requirement.record_id)
                 if not isinstance(value, str) or not value:
                     raise GenerationBlockedError("secret provider returned no value")
                 values[requirement.runtime_env] = value
             plaintext = ("".join(f"{name}: {json.dumps(value, ensure_ascii=True)}\n" for name, value in sorted(values.items()))).encode("utf-8")
-            ciphertext = provider.encrypt_yaml(plaintext, path=path)
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".sealed-", dir=root)
+            temporary_path = Path(temporary_name)
+            os.fchmod(descriptor, 0o600)
+            os.close(descriptor)
+            ciphertext = provider.encrypt_yaml(plaintext, path=temporary_path)
             values.clear()
             del plaintext
-            del value
             if not isinstance(ciphertext, bytes) or not ciphertext or b"sops:" not in ciphertext:
                 raise GenerationBlockedError("secret provider did not return SOPS ciphertext")
-            path.write_bytes(ciphertext)
-            path.chmod(0o600)
+            with temporary_path.open("wb") as sealed_file:
+                sealed_file.write(ciphertext)
+                sealed_file.flush()
+                os.fsync(sealed_file.fileno())
+            if temporary_path.is_symlink() or temporary_path.stat().st_mode & 0o777 != 0o600:
+                raise GenerationInfrastructureError("sealed secret bundle temporary file must be private")
+            os.replace(temporary_path, path)
+            temporary_path = None
+            self._fsync_directory(root)
             if path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
                 raise GenerationInfrastructureError("sealed secret bundle must be private")
             audit = provider.audit_report()
         except GenerationError:
+            if created_root:
+                self._remove_exact_sealed_bundle(stored.state.generation_id, path)
             raise
         except Exception as error:
+            if created_root:
+                self._remove_exact_sealed_bundle(stored.state.generation_id, path)
             raise GenerationBlockedError("secret resolution and sealing failed") from error
+        finally:
+            values.clear()
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         if not isinstance(audit, SecretAudit):
+            self._remove_exact_sealed_bundle(stored.state.generation_id, path)
             raise GenerationBlockedError("SecretProvider audit is invalid")
         return (
             SealedSecretBundle(
@@ -508,6 +563,72 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("sealed secret bundle digest changed")
         return ciphertext
 
+    def _sealed_root(self, generation_id: str) -> Path:
+        return self._state_root / "sealed-secrets" / generation_id
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _remove_exact_sealed_bundle(self, generation_id: str, path: Path) -> None:
+        """Remove only the recorded ciphertext file and an empty owned root."""
+        root = self._sealed_root(generation_id)
+        base = root.parent
+        expected = root / "secrets.sops.yaml"
+        if path != expected or base.is_symlink() or root.is_symlink() or path.is_symlink():
+            raise GenerationBlockedError("recorded sealed ciphertext cleanup is unsafe")
+        if not root.exists():
+            return
+        if not root.is_dir() or root.stat().st_mode & 0o777 != 0o700:
+            raise GenerationBlockedError("recorded sealed ciphertext root is unsafe")
+        entries = tuple(root.iterdir())
+        if any(entry != path or entry.is_symlink() or not entry.is_file() for entry in entries):
+            raise GenerationBlockedError("recorded sealed ciphertext root contains an unexpected entry")
+        if path.exists():
+            if path.stat().st_mode & 0o777 != 0o600:
+                raise GenerationBlockedError("recorded sealed ciphertext is not private")
+            path.unlink()
+            self._fsync_directory(root)
+        root.rmdir()
+        self._fsync_directory(base)
+
+    def _rollback_unrecorded_sealed_bundle(self, generation_id: str, bundle: SealedSecretBundle) -> None:
+        """Keep a bundle only if the state file durably records this exact one."""
+        try:
+            persisted = self._load(generation_id)
+        except GenerationInfrastructureError:
+            persisted = None
+        if persisted is not None and persisted.sealed_secret == bundle:
+            return
+        self._remove_exact_sealed_bundle(generation_id, bundle.path)
+
+    def _cleanup_sealed_ciphertext(
+        self, stored: _StoredGeneration, inventory: CleanupInventory | None
+    ) -> _StoredGeneration:
+        if inventory is None:
+            raise GenerationBlockedError("cleanup inventory is unavailable; refusing to abandon")
+        completed = set(inventory.completed_sealed_ciphertext_paths)
+        for path in inventory.sealed_ciphertext_paths:
+            if path in completed:
+                continue
+            self._remove_exact_sealed_bundle(stored.state.generation_id, path)
+            completed.add(path)
+            inventory = CleanupInventory(
+                inventory.worktrees,
+                inventory.plaintext_paths,
+                inventory.completed_worktree_targets,
+                inventory.completed_plaintext_paths,
+                sealed_ciphertext_paths=inventory.sealed_ciphertext_paths,
+                completed_sealed_ciphertext_paths=tuple(sorted(completed, key=str)),
+            )
+            stored = _replace_cleanup_inventory(stored, inventory)
+            self._save(stored)
+        return stored
+
     def abandon(self, generation_id: str) -> GenerationState:
         stored = self._load(generation_id)
         inventory = stored.cleanup_inventory
@@ -517,6 +638,7 @@ class GenerationOrchestrator:
             raise GenerationBlockedError("generation cleanup was already completed")
         stored = self._cleanup_worktrees(stored, inventory)
         stored = self._cleanup_plaintext_paths(stored, stored.cleanup_inventory)
+        stored = self._cleanup_sealed_ciphertext(stored, stored.cleanup_inventory)
         try:
             stored.state.abandon()
         except StateError as error:
@@ -538,6 +660,8 @@ class GenerationOrchestrator:
                     final_inventory.completed_worktree_targets,
                     final_inventory.completed_plaintext_paths,
                     completed=True,
+                    sealed_ciphertext_paths=final_inventory.sealed_ciphertext_paths,
+                    completed_sealed_ciphertext_paths=final_inventory.completed_sealed_ciphertext_paths,
                 ),
                 stored.knowledge_review,
                 stored.plan_artifact,
@@ -576,6 +700,8 @@ class GenerationOrchestrator:
                     inventory.plaintext_paths,
                     inventory.completed_worktree_targets,
                     inventory.completed_plaintext_paths,
+                    sealed_ciphertext_paths=inventory.sealed_ciphertext_paths,
+                    completed_sealed_ciphertext_paths=inventory.completed_sealed_ciphertext_paths,
                 ),
                 stored.knowledge_review,
                 stored.plan_artifact,
@@ -608,6 +734,8 @@ class GenerationOrchestrator:
                     inventory.plaintext_paths + (owned_path,),
                     inventory.completed_worktree_targets,
                     inventory.completed_plaintext_paths,
+                    sealed_ciphertext_paths=inventory.sealed_ciphertext_paths,
+                    completed_sealed_ciphertext_paths=inventory.completed_sealed_ciphertext_paths,
                 ),
             )
         )
@@ -877,10 +1005,14 @@ class GenerationOrchestrator:
             allocations["secret_record_keys"].append(resources.secret_record_key)
         if self._inventory_provider is not None:
             try:
-                try:
-                    external = self._inventory_provider.snapshot(exclude_generation_id=exclude_generation_id)
-                except TypeError:
-                    external = self._inventory_provider.snapshot()
+                snapshot = self._inventory_provider.snapshot
+                parameters = inspect.signature(snapshot).parameters.values()
+                accepts_exclusion = any(
+                    parameter.name == "exclude_generation_id"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+                external = snapshot(exclude_generation_id=exclude_generation_id) if accepts_exclusion else snapshot()
             except Exception as error:
                 raise GenerationInfrastructureError("external allocation inventory is unavailable") from error
             if not isinstance(external, Mapping):
@@ -1005,6 +1137,8 @@ class GenerationOrchestrator:
                 inventory.plaintext_paths,
                 tuple(sorted(completed, key=str)),
                 inventory.completed_plaintext_paths,
+                sealed_ciphertext_paths=inventory.sealed_ciphertext_paths,
+                completed_sealed_ciphertext_paths=inventory.completed_sealed_ciphertext_paths,
             )
             stored = _replace_cleanup_inventory(stored, inventory)
             self._save(stored)
@@ -1036,6 +1170,8 @@ class GenerationOrchestrator:
                 inventory.plaintext_paths,
                 inventory.completed_worktree_targets,
                 tuple(sorted(completed, key=str)),
+                sealed_ciphertext_paths=inventory.sealed_ciphertext_paths,
+                completed_sealed_ciphertext_paths=inventory.completed_sealed_ciphertext_paths,
             )
             stored = _replace_cleanup_inventory(stored, inventory)
             self._save(stored)
@@ -1156,6 +1292,8 @@ def _serialize_cleanup_inventory(inventory: CleanupInventory | None) -> object:
         "completed_worktree_targets": [str(path) for path in inventory.completed_worktree_targets],
         "completed_plaintext_paths": [str(path) for path in inventory.completed_plaintext_paths],
         "completed": inventory.completed,
+        "sealed_ciphertext_paths": [str(path) for path in inventory.sealed_ciphertext_paths],
+        "completed_sealed_ciphertext_paths": [str(path) for path in inventory.completed_sealed_ciphertext_paths],
     }
 
 
@@ -1184,22 +1322,26 @@ def _parse_sealed_secret(raw: object) -> SealedSecretBundle | None:
 def _parse_cleanup_inventory(raw: object) -> CleanupInventory | None:
     if raw is None:
         return None
-    if not isinstance(raw, Mapping) or set(raw) != {
+    legacy_keys = {
         "worktrees",
         "plaintext_paths",
         "completed_worktree_targets",
         "completed_plaintext_paths",
         "completed",
-    }:
+    }
+    keys = legacy_keys | {"sealed_ciphertext_paths", "completed_sealed_ciphertext_paths"}
+    if not isinstance(raw, Mapping) or set(raw) not in {legacy_keys, keys}:
         raise ValueError("generation cleanup inventory is invalid")
     worktrees = raw["worktrees"]
     plaintext_paths = raw["plaintext_paths"]
     completed_worktree_targets = raw["completed_worktree_targets"]
     completed_plaintext_paths = raw["completed_plaintext_paths"]
     completed = raw["completed"]
+    sealed_ciphertext_paths = raw.get("sealed_ciphertext_paths", [])
+    completed_sealed_ciphertext_paths = raw.get("completed_sealed_ciphertext_paths", [])
     if not all(
         isinstance(value, list)
-        for value in (worktrees, plaintext_paths, completed_worktree_targets, completed_plaintext_paths)
+        for value in (worktrees, plaintext_paths, completed_worktree_targets, completed_plaintext_paths, sealed_ciphertext_paths, completed_sealed_ciphertext_paths)
     ) or not isinstance(completed, bool):
         raise ValueError("generation cleanup inventory is invalid")
     parsed_worktrees: list[WorktreeHandle] = []
@@ -1221,14 +1363,18 @@ def _parse_cleanup_inventory(raw: object) -> CleanupInventory | None:
     parsed_paths = tuple(Path(value) for value in plaintext_paths if isinstance(value, str))
     completed_targets = tuple(Path(value) for value in completed_worktree_targets if isinstance(value, str))
     completed_paths = tuple(Path(value) for value in completed_plaintext_paths if isinstance(value, str))
+    sealed_paths = tuple(Path(value) for value in sealed_ciphertext_paths if isinstance(value, str))
+    completed_sealed_paths = tuple(Path(value) for value in completed_sealed_ciphertext_paths if isinstance(value, str))
     if (
         len(parsed_paths) != len(plaintext_paths)
         or len(completed_targets) != len(completed_worktree_targets)
         or len(completed_paths) != len(completed_plaintext_paths)
-        or any(not path.is_absolute() for path in (*parsed_paths, *completed_targets, *completed_paths))
+        or len(sealed_paths) != len(sealed_ciphertext_paths)
+        or len(completed_sealed_paths) != len(completed_sealed_ciphertext_paths)
+        or any(not path.is_absolute() for path in (*parsed_paths, *completed_targets, *completed_paths, *sealed_paths, *completed_sealed_paths))
     ):
         raise ValueError("generation cleanup inventory is invalid")
-    return CleanupInventory(tuple(parsed_worktrees), parsed_paths, completed_targets, completed_paths, completed)
+    return CleanupInventory(tuple(parsed_worktrees), parsed_paths, completed_targets, completed_paths, completed, sealed_paths, completed_sealed_paths)
 
 
 def _replace_cleanup_inventory(stored: _StoredGeneration, inventory: CleanupInventory) -> _StoredGeneration:

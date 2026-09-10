@@ -158,3 +158,23 @@ def test_operations_renderer_accepts_only_sealed_ciphertext_not_a_secret_provide
     parameters = inspect.signature(render_operations_artifacts).parameters
     assert "sealed_ciphertext" in parameters
     assert "provider" not in parameters
+
+
+def test_sealed_bundle_contract_is_atomic_and_has_distinct_ciphertext_cleanup():
+    source = (Path(__file__).parents[1] / "orchestrator.py").read_text(encoding="utf-8")
+    assert "sealed_ciphertext_paths" in source
+    assert "os.replace(temporary_path, path)" in source
+    assert "os.fsync(sealed_file.fileno())" in source
+    assert "self._fsync_directory(root)" in source
+    assert "_rollback_unrecorded_sealed_bundle" in source
+    assert "root.rmdir()" in source
+    assert "_cleanup_sealed_ciphertext" in source
+
+
+def test_sealed_bundle_contract_normalizes_paths_and_does_not_mask_inventory_typeerror():
+    source = (Path(__file__).parents[1] / "orchestrator.py").read_text(encoding="utf-8")
+    assert 'sorted(Path(item).as_posix() for item in audit.ciphertext_paths)' in source
+    assert "del value" not in source
+    reserved_resources = source[source.index("    def _reserved_resources"):source.index("    @staticmethod\n    def _require_private_state_file")]
+    assert "inspect.signature(snapshot)" in reserved_resources
+    assert "except TypeError" not in reserved_resources
