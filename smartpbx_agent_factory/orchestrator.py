@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .catalogue import CapabilityCatalogue
-from .gitops import WorktreeHandle, WorktreeManager
+from .gitops import DirtyWorktreeError, WorktreeConflictError, WorktreeHandle, WorktreeManager
 from .knowledge import (
     KnowledgeBuilder,
     KnowledgeBuilderImpl,
@@ -77,6 +77,17 @@ class CleanupInventory:
     completed_worktree_targets: tuple[Path, ...] = ()
     completed_plaintext_paths: tuple[Path, ...] = ()
     completed: bool = False
+
+
+@dataclass(frozen=True)
+class BackendWorktreeBinding:
+    """One caller-supplied, manager-owned destination for backend rendering."""
+
+    manager: WorktreeManager
+    primary: Path
+    remote: str
+    revision: str
+    target: Path
 
 
 class GenerationOrchestrator:
@@ -163,7 +174,9 @@ class GenerationOrchestrator:
             rendered_plan=_redacted_plan(state.generation_id, manifest.slug, resources, digest, knowledge_digest, resource_digest),
         )
 
-    def generate(self, generation_id: str) -> GenerationState:
+    def generate(
+        self, generation_id: str, *, backend_worktree: BackendWorktreeBinding | None = None
+    ) -> GenerationState:
         stored = self._load_verified(generation_id)
         if stored.state.stage is Stage.INPUT_COLLECTED:
             raise GenerationBlockedError("secret resolution is required before knowledge review")
@@ -175,12 +188,24 @@ class GenerationOrchestrator:
             raise GenerationBlockedError(f"generation cannot start from {stored.state.stage.value}")
         manifest = self._current_manifest(stored)
         review = self._approved_knowledge_review(stored)
-        # The checked-in runtime provenance is intentionally partial.  Calling
-        # the renderer keeps that boundary authoritative: it rejects before any
-        # generated-tree write, instead of allowing this coordinator to claim a
-        # backend, verification, or PR is ready.
+        self._require_complete_runtime_template()
+        if not isinstance(backend_worktree, BackendWorktreeBinding):
+            raise GenerationBlockedError("a manager-owned backend worktree binding is required")
         try:
-            render_backend(manifest, review, stored.resources, self._state_root / "generated", state=stored.state)
+            handle = backend_worktree.manager.create(
+                primary=backend_worktree.primary,
+                remote=backend_worktree.remote,
+                revision=backend_worktree.revision,
+                target=backend_worktree.target,
+                branch=f"smartpbx-agent-factory/{stored.state.generation_id}",
+            )
+            self.record_owned_worktree(generation_id, backend_worktree.manager, handle)
+        except (DirtyWorktreeError, WorktreeConflictError) as error:
+            raise GenerationBlockedError("backend worktree creation failed") from error
+        # Never render below the factory state directory.  The target is the
+        # exact handle just created and recorded by WorktreeManager.
+        try:
+            render_backend(manifest, review, stored.resources, handle.target, state=stored.state)
         except IncompleteTemplateError as error:
             raise GenerationBlockedError(str(error)) from error
         raise GenerationBlockedError("generated backend requires configured operations, website, verification, and PR bindings")
@@ -408,6 +433,16 @@ class GenerationOrchestrator:
         except (KnowledgeError, OSError, TypeError, ValueError) as error:
             raise GenerationBlockedError(f"knowledge review digest is invalid: {error}") from error
         return review
+
+    @staticmethod
+    def _require_complete_runtime_template() -> None:
+        path = Path(__file__).parent / "template_v1" / "file_allowlist.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise GenerationBlockedError("INCOMPLETE_TEMPLATE: template provenance is unavailable") from error
+        if not isinstance(raw, Mapping) or raw.get("status") != "approved":
+            raise GenerationBlockedError("INCOMPLETE_TEMPLATE: a complete client-neutral runtime extraction is required")
 
     @staticmethod
     def _approved_knowledge_review(stored: _StoredGeneration) -> KnowledgeReview:
