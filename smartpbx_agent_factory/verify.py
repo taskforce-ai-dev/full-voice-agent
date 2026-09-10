@@ -36,6 +36,7 @@ _SHA256_REF = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$")
 _REQUIRED_EVENTS = ("connected", "start", "media", "stop", "hangup")
 _AUTH_CASES = ("missing", "wrong", "cross-agent", "valid")
+_TERMINAL_PATHS = ("stop", "hangup")
 _REQUIRED_FILES = (
     "Dockerfile",
     "server.py",
@@ -56,7 +57,7 @@ _SAFE_DIAGNOSTIC_KEYS = {
     "protocol",
 }
 _SECRET_OR_CONTROL = re.compile(
-    r"[\x00-\x1f\x7f]|(?:secret|password|credential|api[_-]?key|private[ _-]?key|token\s*[:=]|-----begin|\bsk-[A-Za-z0-9_-]{8,}|\bAKIA[0-9A-Z]{16}|\beyJ[A-Za-z0-9_-]{8,})",
+    r"[\x00-\x09\x0b-\x1f\x7f]|(?:secret|password|credential|api[_-]?key|private[ _-]?key|token\s*[:=]|-----begin|\bsk-[A-Za-z0-9_-]{8,}|\bAKIA[0-9A-Z]{16}|\beyJ[A-Za-z0-9_-]{8,})",
     re.IGNORECASE,
 )
 
@@ -192,6 +193,7 @@ class DisposableLifecycleAdapter(Protocol):
         agent_dir: Path,
         resources: DerivedResources,
         auth_case: Literal["missing", "wrong", "cross-agent", "valid"],
+        terminal_path: Literal["stop", "hangup"] | None,
         messages: tuple[dict[str, object], ...],
     ) -> DisposableClientResult: ...
 
@@ -241,23 +243,29 @@ def _safe_protocol_value(value: object, *, depth: int = 0) -> None:
         raise VerificationError("protocol fixture values are unsafe")
 
 
-def _read_protocol_messages(path: Path = _PROTOCOL_FIXTURE) -> tuple[dict[str, object], ...]:
+def _read_protocol_scenarios(path: Path = _PROTOCOL_FIXTURE) -> Mapping[str, tuple[dict[str, object], ...]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise VerificationError("protocol fixture is unavailable") from exc
-    if not isinstance(raw, list) or len(raw) != len(_REQUIRED_EVENTS):
-        raise VerificationError("protocol fixture must be a five-event list")
-    messages: list[dict[str, object]] = []
-    for event, item in zip(_REQUIRED_EVENTS, raw):
-        if not isinstance(item, dict) or set(item) != {"event", event} or item.get("event") != event or not isinstance(item[event], dict):
-            raise VerificationError("protocol fixture has an invalid production-shaped message")
-        _safe_protocol_value(item[event])
-        messages.append({"event": event, event: dict(item[event])})
-    media = messages[2]["media"]
-    if media != {"track": "inbound", "payload": "<synthetic-silence>"}:
-        raise VerificationError("protocol fixture media must be synthetic silence only")
-    return tuple(messages)
+    if not isinstance(raw, dict) or set(raw) != set(_TERMINAL_PATHS):
+        raise VerificationError("protocol fixture must define stop and hangup scenarios")
+    scenarios: dict[str, tuple[dict[str, object], ...]] = {}
+    for terminal_path in _TERMINAL_PATHS:
+        items = raw[terminal_path]
+        expected_events = ("connected", "start", "media", terminal_path)
+        if not isinstance(items, list) or len(items) != len(expected_events):
+            raise VerificationError("protocol fixture terminal scenario has an invalid length")
+        messages: list[dict[str, object]] = []
+        for event, item in zip(expected_events, items):
+            if not isinstance(item, dict) or set(item) != {"event", event} or item.get("event") != event or not isinstance(item[event], dict):
+                raise VerificationError("protocol fixture has an invalid production-shaped message")
+            _safe_protocol_value(item[event])
+            messages.append({"event": event, event: dict(item[event])})
+        if messages[2]["media"] != {"track": "inbound", "payload": "<synthetic-silence>"}:
+            raise VerificationError("protocol fixture media must be synthetic silence only")
+        scenarios[terminal_path] = tuple(messages)
+    return scenarios
 
 
 def _validate_lifecycle_result(result: object, auth_case: str) -> DisposableClientResult:
@@ -281,13 +289,22 @@ def run_disposable_client(
     agent_dir: Path,
     resources: DerivedResources,
     auth_case: Literal["missing", "wrong", "cross-agent", "valid"],
+    terminal_path: Literal["stop", "hangup"] | None = None,
     protocol_fixture: Path = _PROTOCOL_FIXTURE,
 ) -> DisposableClientResult:
     """Invoke the CI adapter with privacy-safe protocol shapes and validate it."""
     if auth_case not in _AUTH_CASES:
         raise VerificationError("unknown disposable authentication case")
+    if auth_case == "valid" and terminal_path not in _TERMINAL_PATHS:
+        raise VerificationError("valid lifecycle requires stop or hangup terminal path")
+    if auth_case != "valid" and terminal_path is not None:
+        raise VerificationError("rejected authentication must remain pre-start")
+    messages = _read_protocol_scenarios(protocol_fixture)[terminal_path] if terminal_path else ()
     try:
-        result = adapter.exercise(agent_dir=Path(agent_dir), resources=resources, auth_case=auth_case, messages=_read_protocol_messages(protocol_fixture))
+        result = adapter.exercise(
+            agent_dir=Path(agent_dir), resources=resources, auth_case=auth_case,
+            terminal_path=terminal_path, messages=messages,
+        )
     except VerificationError:
         raise
     except Exception as exc:
@@ -395,8 +412,13 @@ def verify_generated_backend(
     template_version, source_revision, artifact_digest = _provenance(agent_dir, binding, resources)
     runtime_verified = False
     if lifecycle_adapter is not None:
-        for auth_case in _AUTH_CASES:
+        for auth_case in _AUTH_CASES[:-1]:
             run_disposable_client(lifecycle_adapter, agent_dir=agent_dir, resources=resources, auth_case=auth_case)
+        for terminal_path in _TERMINAL_PATHS:
+            run_disposable_client(
+                lifecycle_adapter, agent_dir=agent_dir, resources=resources,
+                auth_case="valid", terminal_path=terminal_path,
+            )
         runtime_verified = True
     return VerificationReport(
         agent_slug=resources.slug,
@@ -444,6 +466,6 @@ def readiness_report(
     for value in secret_values:
         if isinstance(value, str) and value:
             rendered = rendered.replace(value, "[REDACTED]")
-    if _SECRET_OR_CONTROL.search(rendered):
+    if not rendered.endswith("\n") or "\n\n" in rendered or _SECRET_OR_CONTROL.search(rendered):
         raise VerificationError("safe report rendering failed")
     return rendered
