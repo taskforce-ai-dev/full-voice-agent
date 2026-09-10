@@ -6,7 +6,7 @@ review; it never interprets source text as instructions or executes it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from html.parser import HTMLParser
 import http.client
@@ -77,6 +77,17 @@ class KnowledgeConflict:
 
 
 @dataclass(frozen=True)
+class KnowledgeDocument:
+    """Canonical, immutable source material covered by a knowledge review digest."""
+
+    uri: str
+    owner: str
+    effective_date: str
+    classification: str
+    text: str
+
+
+@dataclass(frozen=True)
 class KnowledgeReview:
     facts: tuple[KnowledgeFact, ...]
     conflicts: tuple[KnowledgeConflict, ...]
@@ -86,6 +97,7 @@ class KnowledgeReview:
     duplicate_facts: tuple[str, ...]
     instruction_findings: tuple[str, ...]
     digest: str
+    documents: tuple[KnowledgeDocument, ...] = ()
     executed_instructions: bool = False
 
     def approval_status(self, state: GenerationState | None = None) -> str:
@@ -102,6 +114,67 @@ class KnowledgeReview:
             return
         if approval != self.digest:
             raise KnowledgeApprovalRequired("knowledge approval digest does not match this review")
+
+
+def recompute_knowledge_review_digest(review: KnowledgeReview) -> str:
+    """Recompute the canonical digest of one concrete immutable knowledge review."""
+    if type(review) is not KnowledgeReview:
+        raise KnowledgeError("knowledge review must be a concrete KnowledgeReview")
+    documents = _require_tuple_of(review.documents, KnowledgeDocument, "knowledge review documents")
+    facts = _require_tuple_of(review.facts, KnowledgeFact, "knowledge review facts")
+    conflicts = _require_tuple_of(review.conflicts, KnowledgeConflict, "knowledge review conflicts")
+    missing = _require_string_tuple(review.missing_facts, "knowledge review missing facts")
+    sensitive = _require_string_tuple(review.sensitive_findings, "knowledge review sensitive findings")
+    inaccessible = _require_string_tuple(review.inaccessible_sources, "knowledge review inaccessible sources")
+    duplicates = _require_string_tuple(review.duplicate_facts, "knowledge review duplicate facts")
+    instructions = _require_string_tuple(review.instruction_findings, "knowledge review instruction findings")
+    for document in documents:
+        _require_dataclass_strings(document, "knowledge document")
+    for fact in facts:
+        _require_dataclass_strings(fact, "knowledge fact")
+    for conflict in conflicts:
+        if not isinstance(conflict.subject, str):
+            raise KnowledgeError("knowledge conflict subject must be text")
+        _require_string_tuple(conflict.values, "knowledge conflict values")
+        _require_string_tuple(conflict.source_locations, "knowledge conflict source locations")
+    payload = {
+        "sources": [
+            {
+                "uri": document.uri,
+                "owner": document.owner,
+                "effective_date": document.effective_date,
+                "classification": document.classification,
+                "text": document.text,
+            }
+            for document in documents
+        ],
+        "facts": [fact.__dict__ for fact in facts],
+        "conflicts": [conflict.__dict__ for conflict in conflicts],
+        "missing_facts": missing,
+        "sensitive_findings": sensitive,
+        "inaccessible_sources": inaccessible,
+        "duplicate_facts": duplicates,
+        "instruction_findings": instructions,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _require_tuple_of(value: object, expected: type[object], field_name: str) -> tuple[object, ...]:
+    if not isinstance(value, tuple) or any(type(item) is not expected for item in value):
+        raise KnowledgeError(f"{field_name} must be an immutable tuple of {expected.__name__} values")
+    return value
+
+
+def _require_string_tuple(value: object, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, tuple) or not all(isinstance(item, str) for item in value):
+        raise KnowledgeError(f"{field_name} must be an immutable tuple of text values")
+    return value
+
+
+def _require_dataclass_strings(value: object, field_name: str) -> None:
+    if not all(isinstance(item, str) for item in value.__dict__.values()):
+        raise KnowledgeError(f"{field_name} fields must be text")
 
 
 class KnowledgeBuilder(Protocol):
@@ -298,7 +371,6 @@ class KnowledgeBuilderImpl:
             if any(_INSTRUCTION.search(item.text) for item in extracted)
             else ()
         )
-        digest = self._digest(extracted, facts, conflicts, missing, sensitive, inaccessible, duplicates, instructions)
         review = KnowledgeReview(
             facts=tuple(facts),
             conflicts=tuple(conflicts),
@@ -307,8 +379,19 @@ class KnowledgeBuilderImpl:
             inaccessible_sources=tuple(inaccessible),
             duplicate_facts=tuple(duplicates),
             instruction_findings=instructions,
-            digest=digest,
+            digest="",
+            documents=tuple(
+                KnowledgeDocument(
+                    uri=item.uri,
+                    owner=item.source.owner,
+                    effective_date=item.source.effective_date,
+                    classification=item.source.classification,
+                    text=item.text,
+                )
+                for item in extracted
+            ),
         )
+        review = replace(review, digest=recompute_knowledge_review_digest(review))
         self._write_review(extracted, review, Path(output_dir))
         return review
 
@@ -678,39 +761,6 @@ class KnowledgeBuilderImpl:
         if _PHONE.search(text):
             findings.append("phone number")
         return tuple(findings)
-
-    @staticmethod
-    def _digest(
-        sources: list[_ExtractedSource],
-        facts: list[KnowledgeFact],
-        conflicts: list[KnowledgeConflict],
-        missing: tuple[str, ...],
-        sensitive: tuple[str, ...],
-        inaccessible: list[str],
-        duplicates: list[str],
-        instructions: tuple[str, ...],
-    ) -> str:
-        payload = {
-            "sources": [
-                {
-                    "uri": item.uri,
-                    "owner": item.source.owner,
-                    "effective_date": item.source.effective_date,
-                    "classification": item.source.classification,
-                    "text": item.text,
-                }
-                for item in sources
-            ],
-            "facts": [fact.__dict__ for fact in facts],
-            "conflicts": [conflict.__dict__ for conflict in conflicts],
-            "missing_facts": missing,
-            "sensitive_findings": sensitive,
-            "inaccessible_sources": inaccessible,
-            "duplicate_facts": duplicates,
-            "instruction_findings": instructions,
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        return sha256(encoded.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _write_review(sources: list[_ExtractedSource], review: KnowledgeReview, output_dir: Path) -> None:

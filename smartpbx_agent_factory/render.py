@@ -11,10 +11,11 @@ import hashlib
 import json
 import re
 import shutil
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import Mapping
 
+from .knowledge import KnowledgeError, KnowledgeReview, recompute_knowledge_review_digest
 from .model import AgentManifest
 from .provenance import ProvenanceError, TemplateAllowlist, validate_allowlist_metadata
 from .resources import DerivedResources
@@ -40,11 +41,6 @@ class IdentityLeakError(RenderError):
 
 class ReviewNotApprovedError(RenderError):
     """Raised when knowledge review has not been approved for this render."""
-
-
-class KnowledgeReviewLike(Protocol):
-    digest: str
-    facts: tuple[object, ...]
 
 
 @dataclass(frozen=True)
@@ -124,9 +120,8 @@ def _verify_supplied_templates(root: Path, allowlist: TemplateAllowlist) -> Mapp
     return verified
 
 
-def _review_facts(review: KnowledgeReviewLike, state: GenerationState | None, manifest: AgentManifest) -> tuple[str, ...]:
-    dataclass_parameters = getattr(review, "__dataclass_params__", None)
-    if not is_dataclass(review) or not getattr(dataclass_parameters, "frozen", False):
+def _review_facts(review: KnowledgeReview, state: GenerationState | None, manifest: AgentManifest) -> tuple[str, ...]:
+    if type(review) is not KnowledgeReview:
         raise ReviewNotApprovedError("knowledge review must be a concrete immutable KnowledgeReview dataclass")
     if not isinstance(state, GenerationState):
         raise ReviewNotApprovedError("knowledge review requires GenerationState approval")
@@ -136,68 +131,31 @@ def _review_facts(review: KnowledgeReviewLike, state: GenerationState | None, ma
         raise ReviewNotApprovedError("generation state requires matching plan approval before rendering")
     if not state.plan_digest or state.plan_approval_digest != state.plan_digest:
         raise ReviewNotApprovedError("generation state requires matching plan approval before rendering")
-    digest = getattr(review, "digest", "")
-    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+    if not isinstance(review.digest, str) or not _SHA256_RE.fullmatch(review.digest):
         raise ReviewNotApprovedError("knowledge review digest must be a sha256 hex digest")
     if (
-        state.knowledge_review_digest != digest
-        or state.knowledge_approval_digest != digest
+        state.knowledge_review_digest != review.digest
+        or state.knowledge_approval_digest != review.digest
         or state.stage not in {Stage.PLAN_REVIEW_REQUIRED, Stage.GENERATED, Stage.VERIFIED, Stage.THREE_PRS_OPENED}
     ):
         raise ReviewNotApprovedError("knowledge review digest is not approved by GenerationState")
-    facts = getattr(review, "facts", ())
-    if not isinstance(facts, tuple):
-        raise ReviewNotApprovedError("knowledge review facts must be an immutable tuple of KnowledgeFact values")
-    rendered: list[str] = []
-    for fact in facts:
-        text = getattr(fact, "text", getattr(fact, "statement", None))
-        if not isinstance(text, str):
-            raise ReviewNotApprovedError("knowledge review facts must be KnowledgeFact values with text or statement")
-        rendered.append(text)
-    normalized = tuple(rendered)
-    if digest != _canonical_review_digest(normalized, getattr(review, "documents", None)):
+    try:
+        expected_digest = recompute_knowledge_review_digest(review)
+    except KnowledgeError as exc:
+        raise ReviewNotApprovedError("knowledge review content is not canonical") from exc
+    if review.digest != expected_digest:
         raise ReviewNotApprovedError("knowledge review canonical digest does not match reviewed content")
-    return normalized
+    return tuple(fact.text for fact in review.facts)
 
 
-def _canonical_review_digest(facts: tuple[str, ...], documents: object) -> str:
-    """Synthetic-contract digest; real rendering awaits the Lane B concrete type."""
-    payload = "\n".join(facts)
-    if documents is not None:
-        if not isinstance(documents, Mapping):
-            raise ReviewNotApprovedError("knowledge review documents must be a mapping")
-        rows: list[str] = []
-        for filename in sorted(documents):
-            content = documents[filename]
-            if not isinstance(filename, str) or not isinstance(content, str):
-                raise ReviewNotApprovedError("knowledge review documents must contain text names and content")
-            rows.append(f"{filename}\0{content}")
-        if rows:
-            payload += "\n" + "\n".join(rows)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _knowledge_documents(review: KnowledgeReviewLike, facts: tuple[str, ...]) -> Mapping[str, str]:
-    """Accept only renderer-owned, basename-only review document names."""
-    raw = getattr(review, "documents", None)
-    if raw is None:
+def _knowledge_documents(review: KnowledgeReview, facts: tuple[str, ...]) -> Mapping[str, str]:
+    """Render source documents only under renderer-owned names after review validation."""
+    if not review.documents:
         return {"approved-facts.md": "\n\n".join(facts) or "No approved facts were supplied."}
-    if not isinstance(raw, Mapping) or not raw:
-        raise ReviewNotApprovedError("knowledge review documents must be a non-empty mapping")
-    documents: dict[str, str] = {}
-    for filename, content in raw.items():
-        if (
-            not isinstance(filename, str)
-            or not filename
-            or "/" in filename
-            or "\\" in filename
-            or filename in {".", ".."}
-        ):
-            raise RenderError("knowledge source filename contains a path separator")
-        if not isinstance(content, str):
-            raise ReviewNotApprovedError("knowledge review document content must be text")
-        documents[filename] = content
-    return {filename: documents[filename] for filename in sorted(documents)}
+    return {
+        f"source-{index:03d}.md": document.text
+        for index, document in enumerate(review.documents, start=1)
+    }
 
 
 def _python_gateway(resources: DerivedResources) -> str:
@@ -433,7 +391,7 @@ def _write_files(root: Path, files: Mapping[str, str]) -> tuple[str, ...]:
 
 def render_backend(
     manifest: AgentManifest,
-    review: KnowledgeReviewLike,
+    review: KnowledgeReview,
     resources: DerivedResources,
     output_dir: Path,
     *,
