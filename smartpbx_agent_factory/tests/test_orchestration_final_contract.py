@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from smartpbx_agent_factory.catalogue import CapabilityCatalogue
 from smartpbx_agent_factory.orchestrator import (
     GenerationBinding,
     GenerationBlockedError,
@@ -149,7 +150,7 @@ def test_secret_resolution_contract_requires_a_sealed_ciphertext_bundle_not_audi
 
     source = GenerationOrchestrator.record_secrets_resolved.__doc__ or ""
     assert "sealed" in source.lower()
-    assert "audit" in source.lower()
+    assert "audit" not in source.lower()
 
 
 def test_operations_renderer_accepts_only_sealed_ciphertext_not_a_secret_provider():

@@ -326,7 +326,7 @@ def test_review_is_deterministic_and_reports_pii_and_missing_metadata(tmp_path):
     second = builder.build((source,), output_dir=tmp_path / "second")
     assert first.digest == second.digest
     assert first.sensitive_findings == ("email address", "phone number")
-    assert first.missing_facts == ("source owner is missing", "source effective date is missing")
+    assert first.missing_facts == ("source effective date is missing", "source owner is missing")
 
 
 def test_document_byte_and_normalized_text_limits_are_enforced(tmp_path):

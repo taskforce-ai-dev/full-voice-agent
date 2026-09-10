@@ -25,6 +25,37 @@ FIXTURE = Path(__file__).parent / "fixtures" / "acme-minimal.json"
 CATALOGUE = Path(__file__).parent / "fixtures" / "approved-provider-catalogue.json"
 
 
+class FakeSecretProvider:
+    """Exercise the sealed-bundle boundary without using real credentials."""
+
+    def __init__(self, *, audit: SecretAudit | None = None) -> None:
+        self.audit = audit
+        self.validated = False
+        self.fetched: list[str] = []
+        self.generated: list[str] = []
+
+    def validate(self) -> None:
+        self.validated = True
+
+    def fetch(self, name: str) -> str:
+        self.fetched.append(name)
+        return f"fixture-fetched-{len(self.fetched)}"
+
+    def generate(self, name: str, *, length: int = 32) -> str:
+        assert length == 32
+        self.generated.append(name)
+        return f"fixture-generated-{len(self.generated)}"
+
+    def encrypt_yaml(self, plaintext: bytes, *, path: Path) -> bytes:
+        assert plaintext and path.name.startswith(".sealed-")
+        return b"sops:\n  age: encrypted"
+
+    def audit_report(self) -> SecretAudit:
+        return self.audit or SecretAudit(
+            fetched_names=tuple(self.fetched), generated_names=tuple(self.generated)
+        )
+
+
 def test_plan_writes_only_private_state_without_claiming_secret_resolution(tmp_path):
     orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
     report = orchestrator.plan(FIXTURE)
@@ -83,16 +114,9 @@ def test_generate_fails_closed_before_any_artifact_without_both_approvals(tmp_pa
 
 
 def test_generate_partial_runtime_creates_no_worktree_or_factory_state_artifact(tmp_path):
-    class Provider:
-        def validate(self):
-            return None
-
-        def audit_report(self):
-            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
-
     orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
     report = orchestrator.plan(FIXTURE)
-    state = orchestrator.record_secrets_resolved(report.generation_id, provider=Provider())
+    state = orchestrator.record_secrets_resolved(report.generation_id, provider=FakeSecretProvider())
     state = orchestrator.resume(report.generation_id, knowledge_approval=state.knowledge_review_digest)
     orchestrator.resume(report.generation_id, plan_approval=state.plan_digest)
 
@@ -259,17 +283,7 @@ def test_plaintext_registration_persists_owned_path_without_constructor_error(tm
 
 
 def test_secret_resolution_requires_a_validated_provider_audit_and_binds_digest(tmp_path):
-    class Provider:
-        def __init__(self):
-            self.validated = False
-
-        def validate(self):
-            self.validated = True
-
-        def audit_report(self):
-            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
-
-    provider = Provider()
+    provider = FakeSecretProvider()
     orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
     report = orchestrator.plan(FIXTURE)
     state = orchestrator.record_secrets_resolved(
@@ -289,45 +303,24 @@ def test_secret_resolution_requires_a_validated_provider_audit_and_binds_digest(
     ),
 )
 def test_secret_resolution_rejects_missing_or_extra_provider_audit_names(tmp_path, audit):
-    class Provider:
-        def validate(self):
-            return None
-
-        def audit_report(self):
-            return audit
-
     orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
     report = orchestrator.plan(FIXTURE)
     with pytest.raises(GenerationBlockedError, match="secret audit names"):
-        orchestrator.record_secrets_resolved(report.generation_id, provider=Provider())
+        orchestrator.record_secrets_resolved(report.generation_id, provider=FakeSecretProvider(audit=audit))
 
 
 def test_secret_resolution_does_not_accept_a_caller_forged_audit_argument(tmp_path):
-    class Provider:
-        def validate(self):
-            return None
-
-        def audit_report(self):
-            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
-
     orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
     report = orchestrator.plan(FIXTURE)
     with pytest.raises(TypeError):
         orchestrator.record_secrets_resolved(
             report.generation_id,
-            provider=Provider(),
+            provider=FakeSecretProvider(),
             audit=SecretAudit(generated_names=("forged/wss_token",)),
         )
 
 
 def test_secret_resolution_binds_the_concrete_knowledge_review_not_manifest_source_metadata(tmp_path):
-    class Provider:
-        def validate(self):
-            return None
-
-        def audit_report(self):
-            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
-
     class Builder:
         def __init__(self):
             self.calls = []
@@ -357,7 +350,7 @@ def test_secret_resolution_binds_the_concrete_knowledge_review_not_manifest_sour
         knowledge_builder_factory=lambda _root: builder,
     )
     report = orchestrator.plan(FIXTURE)
-    state = orchestrator.record_secrets_resolved(report.generation_id, provider=Provider())
+    state = orchestrator.record_secrets_resolved(report.generation_id, provider=FakeSecretProvider())
 
     assert state.stage is Stage.KNOWLEDGE_REVIEW_REQUIRED
     assert state.knowledge_review_digest == builder.review_digest
@@ -371,13 +364,6 @@ def test_secret_resolution_binds_the_concrete_knowledge_review_not_manifest_sour
 
 
 def test_secret_resolution_rejects_a_noncanonical_knowledge_review_digest(tmp_path):
-    class Provider:
-        def validate(self):
-            return None
-
-        def audit_report(self):
-            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
-
     class Builder:
         def build(self, sources, output_dir):
             return KnowledgeReview(
@@ -393,4 +379,4 @@ def test_secret_resolution_rejects_a_noncanonical_knowledge_review_digest(tmp_pa
     )
     report = orchestrator.plan(FIXTURE)
     with pytest.raises(GenerationBlockedError, match="knowledge review digest"):
-        orchestrator.record_secrets_resolved(report.generation_id, provider=Provider())
+        orchestrator.record_secrets_resolved(report.generation_id, provider=FakeSecretProvider())
