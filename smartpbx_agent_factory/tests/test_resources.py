@@ -72,5 +72,10 @@ def test_registry_rejects_every_hard_conflict(kind):
         "ci_identifiers": resources.ci_identifier,
         "secret_record_keys": resources.secret_record_key,
     }[kind]
+    allocations = {kind: [value]}
+    if kind == "ports":
+        allocations = {
+            "ports": list(range(18080, 19000)) + list(range(19080, 20000)),
+        }
     with pytest.raises(ResourceConflict):
-        derive_resources(fixture_manifest(), AllocationRegistry({kind: [value]}))
+        derive_resources(fixture_manifest(), AllocationRegistry(allocations))
