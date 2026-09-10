@@ -30,6 +30,10 @@ DEFAULT_TOTAL_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_MAX_CHARS = 200_000
 DEFAULT_MAX_REDIRECTS = 8
 DEFAULT_TIMEOUT_SECONDS = 10.0
+MAX_RESPONSE_HEADERS = 64
+MAX_HEADER_NAME_CHARS = 128
+MAX_HEADER_VALUE_CHARS = 4096
+MAX_REDIRECT_LOCATION_CHARS = 4096
 
 _LOCAL_SUFFIXES = frozenset({".pdf", ".docx", ".txt", ".md", ".markdown"})
 _ALLOWED_CONTENT_TYPES = frozenset(
@@ -47,6 +51,7 @@ _INSTRUCTION = re.compile(
     r"(?im)^\s*(?:ignore|disregard|override|system\s+message|assistant\s*:|developer\s*:|"
     r"upload|exfiltrate)\b"
 )
+_ENCODED_SEPARATOR = re.compile(r"%(?:25)*(?:2f|5c)", re.IGNORECASE)
 
 
 class KnowledgeError(ValueError):
@@ -399,28 +404,56 @@ class KnowledgeBuilderImpl:
                 raise
             except (OSError, TimeoutError) as exc:
                 raise _SourceUnavailable from exc
-            if response.status in {301, 302, 303, 307, 308}:
-                headers = {key.lower(): value for key, value in response.headers.items()}
+            status, headers, body = self._validate_fetch_response(response)
+            if status in {301, 302, 303, 307, 308}:
                 location = headers.get("location")
                 if not location:
                     raise _SourceUnavailable
+                if len(location) > MAX_REDIRECT_LOCATION_CHARS:
+                    raise KnowledgeError("redirect location header is too large")
                 if redirects == self.max_redirects:
                     raise KnowledgeError("URL redirect limit exceeded")
                 current_url = urljoin(current_url, location)
                 continue
-            if response.status < 200 or response.status >= 300:
+            if status < 200 or status >= 300:
                 raise _SourceUnavailable
-            headers = {key.lower(): value for key, value in response.headers.items()}
             content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
             if content_type not in _ALLOWED_CONTENT_TYPES:
                 raise KnowledgeError("URL content type is not allowed")
             declared = headers.get("content-length")
             if declared is not None and (not declared.isdigit() or int(declared) > self.max_bytes):
                 raise KnowledgeError("source byte limit exceeded")
-            if len(response.body) > self.max_bytes:
-                raise KnowledgeError("source byte limit exceeded")
-            return response.body, content_type, current_url
+            return body, content_type, current_url
         raise KnowledgeError("URL redirect limit exceeded")
+
+    def _validate_fetch_response(self, response: object) -> tuple[int, dict[str, str], bytes]:
+        if not isinstance(response, URLFetchResponse):
+            raise KnowledgeError("transport returned an invalid response")
+        if type(response.status) is not int or not 100 <= response.status <= 599:
+            raise KnowledgeError("transport response status is invalid")
+        if not isinstance(response.headers, dict) or len(response.headers) > MAX_RESPONSE_HEADERS:
+            raise KnowledgeError("transport response headers are invalid")
+        headers: dict[str, str] = {}
+        for name, value in response.headers.items():
+            if (
+                not isinstance(name, str)
+                or not isinstance(value, str)
+                or not name
+                or len(name) > MAX_HEADER_NAME_CHARS
+                or len(value) > MAX_HEADER_VALUE_CHARS
+                or "\r" in name
+                or "\n" in name
+                or "\r" in value
+                or "\n" in value
+            ):
+                raise KnowledgeError("transport response header is invalid")
+            normalized = name.lower()
+            if normalized in headers:
+                raise KnowledgeError("transport response has duplicate headers")
+            headers[normalized] = value
+        if not isinstance(response.body, bytes) or len(response.body) > self.max_bytes:
+            raise KnowledgeError("transport response body is invalid or exceeds byte limit")
+        return response.status, headers, response.body
 
     def _resolve_global_addresses(self, value: str) -> tuple[str, ...]:
         parsed = urlsplit(value)
@@ -450,6 +483,24 @@ class KnowledgeBuilderImpl:
         path = unquote(value or "/")
         return "/" + posixpath.normpath("/" + path).lstrip("/")
 
+    @staticmethod
+    def _reject_ambiguous_encoded_path(value: str) -> None:
+        decoded = value
+        for _ in range(4):
+            if _ENCODED_SEPARATOR.search(decoded):
+                raise KnowledgeError("ambiguous percent-encoded URL separator")
+            next_value = unquote(decoded)
+            if "\x00" in next_value or "\\" in next_value:
+                raise KnowledgeError("ambiguous percent-encoded URL path")
+            if any(part in {".", ".."} for part in next_value.split("/")):
+                raise KnowledgeError("ambiguous percent-encoded URL traversal")
+            if next_value == decoded:
+                if "%" in decoded:
+                    raise KnowledgeError("ambiguous percent-encoded URL path")
+                return
+            decoded = next_value
+        raise KnowledgeError("ambiguous percent-encoded URL path")
+
     def _check_allowed_url(self, value: str, source: KnowledgeSource) -> None:
         parsed = urlsplit(value)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -461,6 +512,7 @@ class KnowledgeBuilderImpl:
         allowed_origins = {self._canonical_origin(item, approved=True) for item in source.approved_origins}
         if origin not in allowed_origins:
             raise KnowledgeError("URL origin is not allowlisted")
+        self._reject_ambiguous_encoded_path(parsed.path)
         path = self._normal_path(parsed.path)
         if source.path_prefixes and not any(self._path_matches(path, prefix) for prefix in source.path_prefixes):
             raise KnowledgeError("URL path is outside the allowlisted prefix")
