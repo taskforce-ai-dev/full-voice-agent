@@ -83,6 +83,17 @@ def test_parser_rejects_unknown_provider_mapping_and_capability_detail_keys():
         parse(raw)
 
     raw = load_raw()
+    raw["languages"][0]["code"] = "en-US"
+    raw["languages"][0]["language"] = "en-US"
+    with pytest.raises(ManifestError, match="code.*language|alias"):
+        parse(raw)
+
+    raw = load_raw()
+    raw["languages"][0]["stt"] = {"provider": "deepgram", "name": "other"}
+    with pytest.raises(ManifestError, match="provider.*name|alias"):
+        parse(raw)
+
+    raw = load_raw()
     raw["capabilities"] = {"booking": {"enabled": False, "details": {"unreviewed": True}}}
     with pytest.raises(ManifestError, match="unsupported capability detail"):
         parse(raw)
@@ -119,4 +130,19 @@ def test_parser_rejects_non_pending_website_visibility():
     raw = load_raw()
     raw["website_demo"]["visibility"] = "active"
     with pytest.raises(ManifestError, match="pending"):
+        parse(raw)
+
+
+@pytest.mark.parametrize("field", ["collect_name", "collect_phone"])
+def test_pii_collection_requires_explicit_consent_without_capabilities(field):
+    raw = load_raw()
+    raw["pii_policy"][field] = True
+    with pytest.raises(ManifestError, match="explicit_consent"):
+        parse(raw)
+
+
+def test_collect_other_pii_requires_explicit_consent_without_capabilities():
+    raw = load_raw()
+    raw["pii_policy"]["collect_other"] = ["email"]
+    with pytest.raises(ManifestError, match="explicit_consent"):
         parse(raw)

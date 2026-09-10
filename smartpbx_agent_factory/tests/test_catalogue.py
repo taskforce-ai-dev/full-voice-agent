@@ -38,3 +38,11 @@ def approved_catalogue(path):
 def test_checked_in_fixture_catalogue_is_blocked_until_reviewed():
     with pytest.raises(CatalogueError, match="approved"):
         CapabilityCatalogue.load(CATALOGUE)
+
+
+def test_catalogue_is_deeply_immutable_after_review():
+    catalogue = approved_catalogue(CATALOGUE)
+    with pytest.raises(TypeError):
+        catalogue.languages["fr-FR"] = {}
+    with pytest.raises(TypeError):
+        catalogue.languages["en-US"]["stt"] = ("other",)

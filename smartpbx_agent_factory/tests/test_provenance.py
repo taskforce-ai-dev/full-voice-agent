@@ -10,6 +10,7 @@ from smartpbx_agent_factory.provenance import (
     validate_source_revision,
     verify_deployed_image_source,
     verify_template_files,
+    validate_allowlist_metadata,
 )
 
 
@@ -51,6 +52,22 @@ def test_checked_in_blocked_allowlist_cannot_verify_templates(tmp_path):
     )
     with pytest.raises(ProvenanceError, match="approved|blocked"):
         verify_template_files(tmp_path, allowlist)
+
+
+def test_template_allowlist_files_are_deeply_immutable():
+    metadata = {
+        "template_version": "v1",
+        "status": "approved",
+        "source_revision": "a" * 40,
+        "oci_revision": "a" * 40,
+        "image_digest": "sha256:" + "b" * 64,
+        "protocol_version": "smartpbx-ai-provider-v07",
+        "environment_schema_version": "v1",
+        "files": {"server.py": "sha256:" + "c" * 64},
+    }
+    allowlist = validate_allowlist_metadata(metadata)
+    with pytest.raises(TypeError):
+        allowlist.files["other.py"] = "sha256:" + "d" * 64
 
 
 def test_template_substitution_rejects_unresolved_braces_and_nul():
