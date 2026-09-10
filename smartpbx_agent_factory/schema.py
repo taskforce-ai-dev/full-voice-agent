@@ -136,7 +136,7 @@ def validate_slug(slug: str) -> str:
 
 def _parse_language(raw: object, index: int) -> LanguageProfile:
     value = _mapping(raw, f"languages[{index}]")
-    _strict_keys(value, {"code", "language", "locale", "stt", "llm", "tts", "fallback", "greeting", "voice"}, f"languages[{index}]")
+    _strict_keys(value, {"code", "language", "locale", "stt", "llm", "tts", "fallback", "fallback_model", "greeting", "voice"}, f"languages[{index}]")
     if "code" in value and "language" in value:
         raise ManifestError(f"languages[{index}] cannot contain both code and language aliases")
     code = _text(value.get("code", value.get("language")), f"languages[{index}].code")
@@ -152,7 +152,21 @@ def _parse_language(raw: object, index: int) -> LanguageProfile:
             model = _optional_text(provider.get("model"), f"languages[{index}].{name}.model") or ""
             provider = provider.get("provider", provider.get("name"))
         providers[name] = (_text(provider, f"languages[{index}].{name}"), model)
-    fallback = _optional_text(value.get("fallback"), f"languages[{index}].fallback")
+    fallback_value = value.get("fallback")
+    fallback_model = ""
+    if isinstance(fallback_value, Mapping):
+        _strict_keys(fallback_value, {"provider", "name", "model"}, f"languages[{index}].fallback")
+        if "provider" in fallback_value and "name" in fallback_value:
+            raise ManifestError(f"languages[{index}].fallback cannot contain provider and name aliases")
+        fallback = _text(fallback_value.get("provider", fallback_value.get("name")), f"languages[{index}].fallback")
+        fallback_model = _optional_text(fallback_value.get("model"), f"languages[{index}].fallback.model") or ""
+        if "fallback_model" in value:
+            raise ManifestError(f"languages[{index}] cannot contain fallback model twice")
+    else:
+        fallback = _optional_text(fallback_value, f"languages[{index}].fallback")
+        fallback_model = _optional_text(value.get("fallback_model"), f"languages[{index}].fallback_model") or ""
+    if fallback_model and not fallback:
+        raise ManifestError(f"languages[{index}].fallback_model requires fallback")
     greeting = value.get("greeting", "")
     voice = value.get("voice", "")
     if greeting and not isinstance(greeting, str):
@@ -166,6 +180,7 @@ def _parse_language(raw: object, index: int) -> LanguageProfile:
         llm=providers["llm"][0],
         tts=providers["tts"][0],
         fallback=fallback,
+        fallback_model=fallback_model,
         greeting=greeting,
         voice=voice,
         stt_model=providers["stt"][1],

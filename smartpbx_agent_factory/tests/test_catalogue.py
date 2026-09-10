@@ -25,8 +25,19 @@ def test_catalogue_rejects_unverified_language_locale_provider_model_pair():
         )
 
 
-def test_catalogue_accepts_only_deployed_english_and_sinhala_profiles():
+def test_catalogue_accepts_only_source_proven_english_and_sinhala_profiles():
     catalogue = CapabilityCatalogue.load(CATALOGUE)
+    catalogue.validate_pipeline(
+        "en",
+        {
+            "locale": "en-US",
+            "stt": "google",
+            "llm": "claude",
+            "llm_model": "claude-sonnet-4-5-20250929",
+            "tts": "elevenlabs",
+            "tts_model": "eleven_flash_v2_5",
+        },
+    )
     catalogue.validate_pipeline(
         "en",
         {
@@ -45,8 +56,36 @@ def test_catalogue_accepts_only_deployed_english_and_sinhala_profiles():
             "stt": "azure",
             "llm": "gemini",
             "llm_model": "gemini-3.7-flash",
+            "tts": "rime",
+            "tts_model": "arcana",
+            "fallback": "claude",
+            "fallback_model": "claude-sonnet-4-5-20250929",
+        },
+    )
+
+
+def test_catalogue_keeps_source_defaults_separate_from_supported_environment_selections():
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    assert catalogue.generated_default("en") == {
+        "evidence": "source-default",
+        "locale": "en-US",
+        "stt": "google",
+        "llm": "claude",
+        "llm_model": "claude-sonnet-4-5-20250929",
+        "tts": "elevenlabs",
+        "tts_model": "eleven_flash_v2_5",
+    }
+    catalogue.validate_pipeline(
+        "si",
+        {
+            "locale": "si-LK",
+            "stt": "azure",
+            "llm": "gemini",
+            "llm_model": "gemini-3.7-flash",
             "tts": "gemini",
             "tts_model": "gemini-3.1-flash-tts-preview",
+            "fallback": "claude",
+            "fallback_model": "claude-sonnet-4-5-20250929",
         },
     )
 
@@ -80,6 +119,7 @@ def test_catalogue_rejects_malformed_or_unknown_provider_data(tmp_path):
                 "source_revision": "a" * 40,
                 "source_hashes": {"Kavya/server.py": "sha256:" + "b" * 64},
                 "runtime_required_secret_identifiers": [],
+                "runtime_required_metadata_identifiers": [],
             }
         ),
         encoding="utf-8",
@@ -110,10 +150,14 @@ def test_catalogue_exposes_named_secret_identifiers_without_secret_values():
             "llm_model": "gemini-3.7-flash",
             "tts": "gemini",
             "tts_model": "gemini-3.1-flash-tts-preview",
+            "fallback": "claude",
+            "fallback_model": "claude-sonnet-4-5-20250929",
         },
     )
-    assert english == frozenset({"ANTHROPIC_API_KEY", "AZURE_SPEECH_KEY", "ELEVENLABS_API_KEY", "KAVYA_EN_ELEVENLABS_VOICE_ID", "SMARTPBX_WS_TOKEN"})
-    assert sinhala == frozenset({"AZURE_SPEECH_KEY", "GEMINI_API_KEY", "SMARTPBX_WS_TOKEN"})
+    assert english == frozenset({"ANTHROPIC_API_KEY", "AZURE_SPEECH_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID", "SMARTPBX_WS_TOKEN"})
+    assert sinhala == frozenset({"ANTHROPIC_API_KEY", "AZURE_SPEECH_KEY", "GEMINI_API_KEY", "SMARTPBX_WS_TOKEN"})
+    assert catalogue.runtime_required_metadata_identifiers == ("SMARTPBX_ACCOUNT_ID",)
+    assert "SMARTPBX_ACCOUNT_ID" not in english
 
 
 def test_catalogue_is_deeply_immutable_after_review():

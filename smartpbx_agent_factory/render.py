@@ -179,6 +179,8 @@ def _product_profile_payload(manifest: AgentManifest, documents: Mapping[str, st
             "llm_model": language.llm_model or None,
             "tts": language.tts,
             "tts_model": language.tts_model or None,
+            "fallback": language.fallback,
+            "fallback_model": language.fallback_model or None,
             "greeting": language.greeting,
             "prompt_block": _language_prompt_block(manifest, language.code),
         }

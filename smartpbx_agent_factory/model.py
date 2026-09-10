@@ -23,6 +23,7 @@ class LanguageProfile:
     llm: str
     tts: str
     fallback: Optional[str] = None
+    fallback_model: str = ""
     greeting: str = ""
     voice: str = ""
     stt_model: str = ""
@@ -39,6 +40,8 @@ class LanguageProfile:
         }
         if self.fallback:
             result["fallback"] = self.fallback
+        if self.fallback_model:
+            result["fallback_model"] = self.fallback_model
         if self.stt_model:
             result["stt_model"] = self.stt_model
         if self.llm_model:

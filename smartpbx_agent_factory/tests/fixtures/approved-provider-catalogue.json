@@ -9,13 +9,18 @@
     "Kavya/smartpbx_session.py": "sha256:18695c13c0174f3c3c45a53d7de76cc76c6d76984e998ddb4c6265fe5f19c76e"
   },
   "runtime_required_secret_identifiers": ["SMARTPBX_WS_TOKEN"],
+  "runtime_required_metadata_identifiers": ["SMARTPBX_ACCOUNT_ID"],
+  "generated_defaults": {
+    "en": {"evidence": "source-default", "locale": "en-US", "stt": "google", "llm": "claude", "llm_model": "claude-sonnet-4-5-20250929", "tts": "elevenlabs", "tts_model": "eleven_flash_v2_5"},
+    "si": {"evidence": "source-default", "locale": "si-LK", "stt": "azure", "llm": "gemini", "llm_model": "gemini-3.7-flash", "tts": "gemini", "tts_model": "gemini-3.1-flash-tts-preview", "fallback": "claude", "fallback_model": "claude-sonnet-4-5-20250929"}
+  },
   "languages": {
     "en": {
       "locales": {
         "en-US": {
-          "stt": [{"provider": "azure", "model": null, "required_secret_identifiers": ["AZURE_SPEECH_KEY"]}],
+          "stt": [{"provider": "google", "model": null, "required_secret_identifiers": ["GOOGLE_APPLICATION_CREDENTIALS"]}, {"provider": "azure", "model": null, "required_secret_identifiers": ["AZURE_SPEECH_KEY"]}],
           "llm": [{"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"]}],
-          "tts": [{"provider": "elevenlabs", "model": "eleven_flash_v2_5", "required_secret_identifiers": ["ELEVENLABS_API_KEY", "KAVYA_EN_ELEVENLABS_VOICE_ID"]}],
+          "tts": [{"provider": "elevenlabs", "model": "eleven_flash_v2_5", "required_secret_identifiers": ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"]}],
           "fallback": []
         }
       }
@@ -28,8 +33,8 @@
             {"provider": "gemini", "model": "gemini-3.7-flash", "required_secret_identifiers": ["GEMINI_API_KEY"]},
             {"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"]}
           ],
-          "tts": [{"provider": "gemini", "model": "gemini-3.1-flash-tts-preview", "required_secret_identifiers": ["GEMINI_API_KEY"]}],
-          "fallback": []
+          "tts": [{"provider": "gemini", "model": "gemini-3.1-flash-tts-preview", "required_secret_identifiers": ["GEMINI_API_KEY"]}, {"provider": "rime", "model": "arcana", "required_secret_identifiers": ["RIME_API_KEY"]}],
+          "fallback": [{"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"]}]
         }
       }
     }

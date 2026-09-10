@@ -25,10 +25,14 @@ class ProviderModel:
 
 @dataclass(frozen=True)
 class CapabilityCatalogue:
+    """Reviewed capability data; account identifiers are non-secret metadata."""
+
     version: int
     source_revision: str
     source_hashes: Mapping[str, str]
     runtime_required_secret_identifiers: tuple[str, ...]
+    runtime_required_metadata_identifiers: tuple[str, ...]
+    generated_defaults: Mapping[str, Mapping[str, object]]
     languages: Mapping[str, Mapping[str, Mapping[str, tuple[ProviderModel, ...]]]]
     status: str = ""
 
@@ -46,6 +50,10 @@ class CapabilityCatalogue:
         }
         object.__setattr__(self, "source_hashes", MappingProxyType(dict(self.source_hashes)))
         object.__setattr__(self, "runtime_required_secret_identifiers", tuple(self.runtime_required_secret_identifiers))
+        object.__setattr__(self, "runtime_required_metadata_identifiers", tuple(self.runtime_required_metadata_identifiers))
+        object.__setattr__(self, "generated_defaults", MappingProxyType({
+            language: MappingProxyType(dict(value)) for language, value in self.generated_defaults.items()
+        }))
         object.__setattr__(self, "languages", MappingProxyType(frozen))
 
     @classmethod
@@ -62,6 +70,8 @@ class CapabilityCatalogue:
             "source_revision",
             "source_hashes",
             "runtime_required_secret_identifiers",
+            "runtime_required_metadata_identifiers",
+            "generated_defaults",
             "languages",
         }
         if unknown:
@@ -87,6 +97,11 @@ class CapabilityCatalogue:
         runtime_secret_identifiers = _parse_secret_identifiers(
             raw.get("runtime_required_secret_identifiers"), "catalogue runtime"
         )
+        runtime_metadata_identifiers = _parse_secret_identifiers(
+            raw.get("runtime_required_metadata_identifiers"), "catalogue runtime metadata"
+        )
+        if set(runtime_secret_identifiers) & set(runtime_metadata_identifiers):
+            raise CatalogueError("catalogue runtime identifiers cannot be both secret and metadata")
         languages = raw.get("languages")
         if not isinstance(languages, Mapping) or not languages:
             raise CatalogueError("catalogue languages must be a non-empty object")
@@ -122,7 +137,25 @@ class CapabilityCatalogue:
                 )
                 parsed_locales[locale] = parsed_pipeline
             parsed[language] = parsed_locales
-        return cls(1, source_revision, parsed_hashes, runtime_secret_identifiers, parsed, status)
+        defaults = raw.get("generated_defaults")
+        if not isinstance(defaults, Mapping) or set(defaults) != set(parsed):
+            raise CatalogueError("catalogue generated_defaults must cover exactly the supported languages")
+        temporary = cls(
+            1, source_revision, parsed_hashes, runtime_secret_identifiers,
+            runtime_metadata_identifiers, {}, parsed, status,
+        )
+        parsed_defaults: dict[str, Mapping[str, object]] = {}
+        for language, default in defaults.items():
+            if not isinstance(default, Mapping):
+                raise CatalogueError(f"catalogue generated default is invalid for {language}")
+            if default.get("evidence") != "source-default":
+                raise CatalogueError(f"catalogue generated default must be source-default for {language}")
+            temporary._pipeline_entries(language, default)
+            parsed_defaults[language] = dict(default)
+        return cls(
+            1, source_revision, parsed_hashes, runtime_secret_identifiers,
+            runtime_metadata_identifiers, parsed_defaults, parsed, status,
+        )
 
     def validate_pipeline(self, language: str, pipeline: Mapping[str, object]) -> None:
         self._pipeline_entries(language, pipeline)
@@ -133,6 +166,12 @@ class CapabilityCatalogue:
         return frozenset(self.runtime_required_secret_identifiers).union(
             identifier for entry in entries for identifier in entry.required_secret_identifiers
         )
+
+    def generated_default(self, language: str) -> Mapping[str, object]:
+        try:
+            return self.generated_defaults[language]
+        except KeyError as exc:
+            raise CatalogueError(f"generated default is not verified: {language}") from exc
 
     def _pipeline_entries(self, language: str, pipeline: Mapping[str, object]) -> tuple[ProviderModel, ...]:
         if self.status != "approved":
@@ -161,8 +200,25 @@ class CapabilityCatalogue:
                 raise CatalogueError(f"provider pipeline is not verified for {language}: {component}")
             selected.append(match)
         fallback = pipeline.get("fallback")
-        if fallback is not None and (not isinstance(fallback, str) or fallback not in {item.provider for item in approved["fallback"]}):
-            raise CatalogueError(f"provider pipeline is not verified for {language}: fallback")
+        fallback_model = pipeline.get("fallback_model")
+        requires_fallback = selected[1].provider == "gemini" and bool(approved["fallback"])
+        if fallback is None:
+            if fallback_model is not None:
+                raise CatalogueError(f"provider pipeline is not verified for {language}: fallback")
+            if requires_fallback:
+                raise CatalogueError(f"provider pipeline is not verified for {language}: fallback")
+        else:
+            match = next(
+                (
+                    entry
+                    for entry in approved["fallback"]
+                    if entry.provider == fallback and entry.model == (fallback_model if isinstance(fallback_model, str) else None)
+                ),
+                None,
+            )
+            if not isinstance(fallback, str) or match is None:
+                raise CatalogueError(f"provider pipeline is not verified for {language}: fallback")
+            selected.append(match)
         return tuple(selected)
 
 

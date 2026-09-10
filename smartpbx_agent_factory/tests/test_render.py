@@ -191,6 +191,27 @@ def test_generated_product_profile_binds_reviewed_manifest_identity_languages_to
     assert profile["knowledge_paths"] == ["knowledge_docs/approved-facts.md"]
 
 
+def test_generated_product_profile_carries_the_explicit_sinhala_gemini_to_claude_fallback_contract():
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw["languages"] = [{
+        "code": "si",
+        "locale": "si-LK",
+        "stt": {"provider": "azure"},
+        "llm": {"provider": "gemini", "model": "gemini-3.7-flash"},
+        "tts": {"provider": "gemini", "model": "gemini-3.1-flash-tts-preview"},
+        "fallback": {"provider": "claude", "model": "claude-sonnet-4-5-20250929"},
+        "greeting": "Acme welcomes Sinhala callers."
+    }]
+    manifest = parse_manifest(
+        raw,
+        approved_source_roots=(Path.cwd(),),
+        catalogue=CapabilityCatalogue.load(CATALOGUE),
+    )
+    profile = _product_profile_payload(manifest, {"approved-facts.md": "Approved."})
+    assert profile["languages"]["si"]["fallback"] == "claude"
+    assert profile["languages"]["si"]["fallback_model"] == "claude-sonnet-4-5-20250929"
+
+
 def test_runtime_template_loads_the_generated_product_profile_only_at_startup():
     template = (Path(__file__).parents[1] / "template_v1/runtime/server.py.tmpl").read_text(encoding="utf-8")
     assert template.count("product_profile=load_product_profile(") == 1
