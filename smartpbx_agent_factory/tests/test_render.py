@@ -226,6 +226,17 @@ def test_renderer_rejects_review_with_forged_digest_after_conflict_change(tmp_pa
     assert not (tmp_path / "SmartPBX Agents").exists()
 
 
+def test_renderer_rejects_review_with_executed_instructions_even_when_digest_is_unchanged(tmp_path):
+    original = fixture_review()
+    forged = replace(original, executed_instructions=True)
+    with pytest.raises(ReviewNotApprovedError, match="executed instructions"):
+        render_backend(
+            fixture_manifest(), forged, fixture_resources(), tmp_path, state=fixture_state(original),
+            template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
+        )
+    assert not (tmp_path / "SmartPBX Agents").exists()
+
+
 def test_scan_rejects_identity_leak_in_late_review_document(tmp_path):
     review = fixture_review(documents=(replace(fixture_review().documents[0], text="Hatton Hills"),))
     with pytest.raises(IdentityLeakError, match="identity leak"):
