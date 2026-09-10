@@ -210,6 +210,24 @@ def test_three_prs_are_opened_sequentially_with_immutable_digests(fake_provider:
             assert digest in comment
 
 
+def test_pr_creation_accepts_distinct_recorded_role_worktree_roots(fake_provider: FakePRProvider) -> None:
+    worktrees = []
+    for role, letter in (("backend", "f"), ("operations", "1"), ("website", "2")):
+        root = Path(f"/tmp/{role}-factory/gen-001")
+        ownership = GenerationOwnershipEvidence("gen-001", root, f"{role}-handle", "4" * 64)
+        worktrees.append(
+            GenerationWorktree(role, f"taskforce/{role}", f"{role}/gen-001", letter * 40, root / "checkout", True, ownership)
+        )
+    result = open_linked_prs(
+        fake_provider,
+        state=fixture_state(),
+        readiness=fixture_readiness(),
+        worktrees=tuple(worktrees),
+        inspector=fixture_inspector(tuple(worktrees)),
+    )
+    assert result.backend_url and result.operations_url and result.website_url
+
+
 def test_initial_bodies_link_only_previously_opened_prs(fake_provider: FakePRProvider) -> None:
     result = open_linked_prs(
         fake_provider,
