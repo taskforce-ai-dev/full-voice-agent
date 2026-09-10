@@ -67,7 +67,7 @@ def fixture_backend(root: Path, *, ci: bool = True) -> Path:
     )
     (root / "docker-compose.yml").write_text(
         "services:\n  smartpbx-acme-inquiry:\n    environment:\n"
-        "      SMARTPBX_AUTH_HEADER_NAME: X-Acme-SmartPBX-Token\n"
+        "      SMARTPBX_AUTH_HEADER_NAME: X-Acme-Guide-SmartPBX-Token\n"
         "      SMARTPBX_STATUS_TOKEN: ${SMARTPBX_STATUS_TOKEN?required}\n",
         encoding="utf-8",
     )
