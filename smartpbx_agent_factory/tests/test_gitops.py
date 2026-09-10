@@ -10,6 +10,9 @@ from smartpbx_agent_factory.gitops import (
 
 
 def test_worktree_manager_rejects_dirty_primary_without_fetching(tmp_path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    (primary / ".git").mkdir()
     calls: list[tuple[str, ...]] = []
 
     def run(args):
@@ -21,7 +24,7 @@ def test_worktree_manager_rejects_dirty_primary_without_fetching(tmp_path):
     manager = WorktreeManager(tmp_path / "generated", run=run)
     with pytest.raises(DirtyWorktreeError, match="dirty"):
         manager.create(
-            primary=tmp_path / "primary",
+            primary=primary,
             remote="origin",
             revision="a" * 40,
             target=tmp_path / "generated" / "site",
