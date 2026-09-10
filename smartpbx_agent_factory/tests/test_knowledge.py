@@ -62,7 +62,9 @@ class FakeTransport:
     responses: dict[str, URLFetchResponse]
     calls: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
 
-    def fetch(self, url: str, addresses: tuple[str, ...], timeout_seconds: float) -> URLFetchResponse:
+    def fetch(
+        self, url: str, addresses: tuple[str, ...], timeout_seconds: float, max_bytes: int
+    ) -> URLFetchResponse:
         self.calls.append((url, addresses))
         return self.responses[url]
 
