@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
@@ -17,6 +18,7 @@ from typing import Mapping, Protocol
 from .model import AgentManifest
 from .provenance import ProvenanceError, TemplateAllowlist, validate_allowlist_metadata
 from .resources import DerivedResources
+from .state import GenerationState, Stage
 
 
 class RenderError(ValueError):
@@ -25,6 +27,10 @@ class RenderError(ValueError):
 
 class TemplateUnavailableError(RenderError):
     """Raised when no approved, immutable template allowlist is available."""
+
+
+class IncompleteTemplateError(RenderError):
+    """Raised when provenance exists but no complete client-neutral runtime exists."""
 
 
 class IdentityLeakError(RenderError):
@@ -37,7 +43,7 @@ class ReviewNotApprovedError(RenderError):
 
 class KnowledgeReviewLike(Protocol):
     digest: str
-    approved: bool
+    facts: tuple[object, ...]
 
 
 @dataclass(frozen=True)
@@ -48,16 +54,19 @@ class RenderReport:
     enabled_capabilities: tuple[str, ...]
     template_version: str
     review_digest: str
+    synthetic: bool
+    deployable: bool
+    runtime_status: str
 
 
 _TEMPLATE_ROOT = Path(__file__).parent / "template_v1"
 _DEFAULT_ALLOWLIST = _TEMPLATE_ROOT / "file_allowlist.json"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_IDENTITY_PATTERNS = (
+_IDENTITY_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (r"hatton\s+hills", r"treehouse", r"mosvold", r"yanolja", r"kavya")
 )
-_SECRET_PATTERNS = (
+_SECRET_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"begin\s+private\s+key",
@@ -73,7 +82,13 @@ _BUSINESS_TOOLS = ("create_booking", "transfer_to_human", "hangup_call")
 def _load_default_allowlist() -> TemplateAllowlist:
     try:
         raw = json.loads(_DEFAULT_ALLOWLIST.read_text(encoding="utf-8"))
+        if raw.get("status") == "partial":
+            raise IncompleteTemplateError(
+                "INCOMPLETE_TEMPLATE: verified v06 provenance has no complete client-neutral runtime extraction"
+            )
         return validate_allowlist_metadata(raw)
+    except IncompleteTemplateError:
+        raise
     except (OSError, json.JSONDecodeError, ProvenanceError) as exc:
         raise TemplateUnavailableError(
             "TEMPLATE_ALLOWLIST_UNAVAILABLE: approved deployed template provenance is required"
@@ -108,16 +123,28 @@ def _verify_supplied_templates(root: Path, allowlist: TemplateAllowlist) -> Mapp
     return verified
 
 
-def _review_facts(review: KnowledgeReviewLike) -> tuple[str, ...]:
-    if not getattr(review, "approved", False):
-        raise ReviewNotApprovedError("knowledge review is not approved")
+def _review_facts(review: KnowledgeReviewLike, state: GenerationState | None) -> tuple[str, ...]:
+    if not isinstance(state, GenerationState):
+        raise ReviewNotApprovedError("knowledge review requires GenerationState approval")
     digest = getattr(review, "digest", "")
     if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
         raise ReviewNotApprovedError("knowledge review digest must be a sha256 hex digest")
+    if (
+        state.knowledge_review_digest != digest
+        or state.knowledge_approval_digest != digest
+        or state.stage not in {Stage.PLAN_REVIEW_REQUIRED, Stage.GENERATED, Stage.VERIFIED, Stage.THREE_PRS_OPENED}
+    ):
+        raise ReviewNotApprovedError("knowledge review digest is not approved by GenerationState")
     facts = getattr(review, "facts", ())
-    if not isinstance(facts, tuple) or any(not isinstance(fact, str) for fact in facts):
-        raise ReviewNotApprovedError("knowledge review facts must be an immutable tuple of strings")
-    return facts
+    if not isinstance(facts, tuple):
+        raise ReviewNotApprovedError("knowledge review facts must be an immutable tuple of KnowledgeFact values")
+    rendered: list[str] = []
+    for fact in facts:
+        text = getattr(fact, "text", getattr(fact, "statement", None))
+        if not isinstance(text, str):
+            raise ReviewNotApprovedError("knowledge review facts must be KnowledgeFact values with text or statement")
+        rendered.append(text)
+    return tuple(rendered)
 
 
 def _knowledge_documents(review: KnowledgeReviewLike, facts: tuple[str, ...]) -> Mapping[str, str]:
@@ -140,7 +167,7 @@ def _knowledge_documents(review: KnowledgeReviewLike, facts: tuple[str, ...]) ->
         if not isinstance(content, str):
             raise ReviewNotApprovedError("knowledge review document content must be text")
         documents[filename] = content
-    return documents
+    return {filename: documents[filename] for filename in sorted(documents)}
 
 
 def _python_gateway(resources: DerivedResources) -> str:
@@ -215,6 +242,8 @@ def _files(
     enabled = manifest.capabilities.enabled_names
     if enabled:
         raise RenderError("capability rendering is unavailable until an explicit capability module is approved")
+    if not isinstance(manifest.smartpbx.capacity, int) or isinstance(manifest.smartpbx.capacity, bool) or not 1 <= manifest.smartpbx.capacity <= 4:
+        raise RenderError("SmartPBX max calls must be between 1 and 4")
     title = manifest.display_name
     compose = f'''services:
   {resources.smartpbx_service}:
@@ -225,12 +254,16 @@ def _files(
       SMARTPBX_WS_TOKEN: ${{SMARTPBX_WS_TOKEN?required}}
       SMARTPBX_ACCOUNT_ID: ${{SMARTPBX_ACCOUNT_ID?required}}
       SMARTPBX_AUTH_HEADER_NAME: "{resources.wss_header}"
-    ports: ["{resources.smartpbx_port}:8080"]
+      SMARTPBX_MAX_CALLS: "{manifest.smartpbx.capacity}"
+    ports: ["127.0.0.1:{resources.smartpbx_port}:8080"]
   {resources.website_service}:
     profiles: ["website-demo"]
     build: .
     command: python website_demo.py
-    ports: ["{resources.website_port}:8081"]
+    environment:
+      WEBSITE_DEMO_ENABLED: "true"
+      WEBSITE_DEMO_AGENT_ID: "{resources.slug}"
+    ports: ["127.0.0.1:{resources.website_port}:8081"]
 '''
     workflow_fragment = '''name: generated-agent-contract
 jobs:
@@ -355,12 +388,16 @@ def _scan_outputs(files: Mapping[str, str]) -> None:
 def _write_files(root: Path, files: Mapping[str, str]) -> tuple[str, ...]:
     if root.exists():
         raise RenderError(f"generated backend target already exists: {root}")
-    for relative, content in files.items():
-        target = root / relative
-        if target.parent != root and root not in target.parents:
-            raise RenderError("generated file escapes output root")
-        target.parent.mkdir(parents=True, exist_ok=False) if not target.parent.exists() else None
-        target.write_text(content, encoding="utf-8")
+    try:
+        for relative, content in files.items():
+            target = root / relative
+            if target.parent != root and root not in target.parents:
+                raise RenderError("generated file escapes output root")
+            target.parent.mkdir(parents=True, exist_ok=False) if not target.parent.exists() else None
+            target.write_text(content, encoding="utf-8")
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
     return tuple(sorted(files))
 
 
@@ -370,20 +407,25 @@ def render_backend(
     resources: DerivedResources,
     output_dir: Path,
     *,
+    state: GenerationState | None = None,
     template_allowlist: TemplateAllowlist | None = None,
     template_root: Path | None = None,
 ) -> RenderReport:
     """Render a deterministic backend tree from exact, verified template evidence.
 
-    Omitting the explicit seam loads the checked-in allowlist, which currently
-    raises ``TEMPLATE_ALLOWLIST_UNAVAILABLE`` by design.
+    Omitting the explicit seam loads the checked-in partial allowlist, which
+    raises ``INCOMPLETE_TEMPLATE`` until an approved client-neutral extraction
+    provides a complete runtime.  Explicit templates are test-only synthetic
+    fixtures and reports label their output non-deployable.
     """
+    if template_allowlist is not None and not template_allowlist.template_version.startswith("synthetic-test-"):
+        raise IncompleteTemplateError("INCOMPLETE_TEMPLATE: only synthetic fixture rendering is available")
     allowlist = template_allowlist or _load_default_allowlist()
     root = Path(template_root) if template_root is not None else _TEMPLATE_ROOT
     templates = _verify_supplied_templates(root, allowlist)
     if resources.slug != manifest.slug or resources.folder_identity != f"SmartPBX Agents/{manifest.slug}":
         raise RenderError("derived resources do not match manifest identity")
-    facts = _review_facts(review)
+    facts = _review_facts(review, state)
     files = _files(manifest, resources, _knowledge_documents(review, facts), templates)
     _scan_outputs(files)
     rendered_root = Path(output_dir) / resources.folder_identity
@@ -396,4 +438,7 @@ def render_backend(
         enabled_capabilities=manifest.capabilities.enabled_names,
         template_version=allowlist.template_version,
         review_digest=review.digest,
+        synthetic=True,
+        deployable=False,
+        runtime_status="synthetic-structural-contract-only",
     )

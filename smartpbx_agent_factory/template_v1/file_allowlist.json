@@ -1,6 +1,7 @@
 {
   "template_version": "v1",
-  "status": "approved",
+  "status": "partial",
+  "block_reason": "verified v06 source provenance is partial evidence only; a complete client-neutral runtime extraction is required",
   "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
   "image_digest": "sha256:3d1cfce67574efd1c8bde484d26345c027713c4d169f37804114fecec5b81350",
   "oci_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",

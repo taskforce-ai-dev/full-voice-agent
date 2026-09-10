@@ -19,8 +19,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install generated test dependency
+        run: python -m pip install "pytest==9.1.1"
       - name: Discover generated agents
         run: find "SmartPBX Agents" -mindepth 1 -maxdepth 1 -type d -print0 > /tmp/smartpbx-agent-dirs || true
+      - name: Require generated agents
+        run: test -s /tmp/smartpbx-agent-dirs
       - name: Run disposable generated-agent contracts
         run: |
           while IFS= read -r -d '' agent_dir; do
