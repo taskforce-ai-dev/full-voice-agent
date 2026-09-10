@@ -205,7 +205,14 @@ class GenerationOrchestrator:
         # Never render below the factory state directory.  The target is the
         # exact handle just created and recorded by WorktreeManager.
         try:
-            render_backend(manifest, review, stored.resources, handle.target, state=stored.state)
+            render_backend(
+                manifest,
+                review,
+                stored.resources,
+                handle,
+                worktree_manager=backend_worktree.manager,
+                state=stored.state,
+            )
         except IncompleteTemplateError as error:
             raise GenerationBlockedError(str(error)) from error
         raise GenerationBlockedError("generated backend requires configured operations, website, verification, and PR bindings")

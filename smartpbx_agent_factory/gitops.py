@@ -217,6 +217,30 @@ class WorktreeManager:
         return entries
 
 
+def manager_owned_worktree_target(manager: WorktreeManager, handle: WorktreeHandle) -> Path:
+    """Return one live manager-owned target after rejecting path indirection.
+
+    Renderers use this narrow capability instead of accepting caller-controlled
+    output paths.  ``owns`` is identity based, so a value-equal constructed
+    handle cannot authorize writes.  The returned target is also required to be
+    a real directory whose complete path has no symbolic-link component.
+    """
+    if not isinstance(manager, WorktreeManager) or not isinstance(handle, WorktreeHandle):
+        raise WorktreeConflictError("a manager-owned worktree handle is required")
+    if not manager.owns(handle):
+        raise WorktreeConflictError("a manager-owned worktree handle is required")
+    target = handle.target
+    if not isinstance(target, Path) or not target.is_absolute() or not target.is_dir():
+        raise WorktreeConflictError("manager-owned worktree target is unavailable")
+    for component in (target, *target.parents):
+        if component.is_symlink():
+            raise WorktreeConflictError("manager-owned worktree target may not traverse a symlink")
+    resolved = target.resolve(strict=True)
+    if resolved != target:
+        raise WorktreeConflictError("manager-owned worktree target is not canonical")
+    return resolved
+
+
 class GitWorktreeInspector:
     """Re-read a manager-owned generation worktree immediately before PR use.
 

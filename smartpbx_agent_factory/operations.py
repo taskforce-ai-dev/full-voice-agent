@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Iterable
 
+from .gitops import WorktreeHandle, WorktreeManager, WorktreeConflictError, manager_owned_worktree_target
 from .model import AgentManifest
 from .resources import DerivedResources
 from .secrets import SecretAudit, SecretError, SecretProvider
@@ -53,6 +54,8 @@ def _plaintext_secret_document(values: dict[str, str]) -> bytes:
 def _scan_artifact_tree(root: Path, secret_values: Iterable[str]) -> None:
     encoded_values = tuple(value.encode("utf-8") for value in secret_values)
     for candidate in root.rglob("*"):
+        if candidate.is_symlink():
+            raise SecretError("operations artifact path may not traverse a symlink")
         if not candidate.is_file():
             continue
         data = candidate.read_bytes()
@@ -64,12 +67,15 @@ def _scan_artifact_tree(root: Path, secret_values: Iterable[str]) -> None:
             raise SecretLeakError("unencrypted SOPS artifact detected")
 
 
-def _remove_generation_artifacts(agent_dir: Path) -> None:
+def _remove_generation_artifacts(root: Path, agent_dir: Path) -> None:
     """Remove precisely one generated agent directory; never clean a parent tree."""
     agents = agent_dir.parent
-    if agents.is_symlink() or agent_dir.is_symlink():
+    if root.is_symlink() or agents.is_symlink() or agent_dir.is_symlink():
         raise SecretError("operations artifact path may not traverse a symlink")
     if agent_dir.exists() and agent_dir.is_dir():
+        for candidate in agent_dir.rglob("*"):
+            if candidate.is_symlink():
+                raise SecretError("operations artifact cleanup may not traverse a symlink")
         shutil.rmtree(agent_dir)
 
 
@@ -77,7 +83,9 @@ def render_operations_artifacts(
     manifest: AgentManifest,
     resources: DerivedResources,
     provider: SecretProvider,
-    output_dir: Path,
+    *,
+    worktree: WorktreeHandle,
+    worktree_manager: WorktreeManager,
 ) -> SecretAudit:
     """Write non-secret metadata and a single SOPS ciphertext document.
 
@@ -85,26 +93,31 @@ def render_operations_artifacts(
     failure removes only ``agents/<slug>`` and never touches a repository,
     worktree, or artifact outside this generation.
     """
-    provider.validate()
-    if not isinstance(output_dir, Path):
-        raise SecretError("output directory must be a Path")
-    root = output_dir.absolute()
+    try:
+        root = manager_owned_worktree_target(worktree_manager, worktree)
+    except WorktreeConflictError as exc:
+        raise SecretError(str(exc)) from exc
     if root.is_symlink() or not root.is_dir():
-        raise SecretError("operations output directory must be a real directory")
+        raise SecretError("operations worktree target must be a real directory")
+    provider.validate()
     agents = root / "agents"
     if agents.is_symlink() or (agents.exists() and not agents.is_dir()):
         raise SecretError("operations artifact path may not traverse a symlink")
     agent_dir = agents / resources.slug
     if agent_dir.is_symlink():
         raise SecretError("operations artifact path may not traverse a symlink")
+    if agent_dir.exists():
+        raise SecretError("operations artifact target already exists")
     secret_path = agent_dir / "secrets.sops.yaml"
     metadata_path = agent_dir / "metadata.yaml"
     secret_name = f"{resources.slug}/wss_token"
+    created_agent_dir = False
     try:
         agents.mkdir(mode=0o700, exist_ok=True)
         if agents.is_symlink() or not agents.is_dir():
             raise SecretError("operations artifact directory is unsafe")
         agent_dir.mkdir(exist_ok=False, mode=0o700)
+        created_agent_dir = True
         value = provider.generate(secret_name, length=32)
         if not isinstance(value, str) or not value:
             raise SecretError("secret provider returned an invalid generated value")
@@ -117,7 +130,8 @@ def render_operations_artifacts(
         secret_path.chmod(0o600)
         _scan_artifact_tree(agent_dir, (value,))
     except Exception:
-        _remove_generation_artifacts(agent_dir)
+        if created_agent_dir:
+            _remove_generation_artifacts(root, agent_dir)
         raise
     audit = provider.audit_report() if hasattr(provider, "audit_report") else None
     fetched_names = getattr(audit, "fetched_names", ()) if audit is not None else ()

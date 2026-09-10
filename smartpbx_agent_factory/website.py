@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from .gitops import WorktreeHandle, WorktreeManager, WorktreeConflictError, manager_owned_worktree_target
 from .model import AgentManifest
 from .resources import DerivedResources
 
@@ -296,13 +297,16 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _require_real_output_root(output_dir: Path) -> Path:
-    output_dir = output_dir.absolute()
+def _require_owned_output_root(worktree: WorktreeHandle, manager: WorktreeManager) -> Path:
+    try:
+        output_dir = manager_owned_worktree_target(manager, worktree)
+    except WorktreeConflictError as exc:
+        raise ValueError(str(exc)) from exc
     if output_dir.is_symlink() or not output_dir.is_dir():
-        raise ValueError("output_dir must be a real non-symlink directory")
+        raise ValueError("manager-owned website worktree target must be a real non-symlink directory")
     for parent in (output_dir, *output_dir.parents):
         if parent.is_symlink():
-            raise ValueError("output_dir must not be beneath a symlink")
+            raise ValueError("manager-owned website worktree target must not be beneath a symlink")
     return output_dir.resolve(strict=True)
 
 
@@ -504,10 +508,18 @@ def _atomic(output_dir: Path, contents: Mapping[Path, bytes], scope: str) -> Non
     _finish_transaction(output_dir)
 
 
-def render_website_artifacts(manifest: AgentManifest, resources: DerivedResources, *, backend_artifact_digest: str, backend_branch_sha: str, output_dir: Path) -> WebsiteRenderReport:
+def render_website_artifacts(
+    manifest: AgentManifest,
+    resources: DerivedResources,
+    *,
+    backend_artifact_digest: str,
+    backend_branch_sha: str,
+    worktree: WorktreeHandle,
+    worktree_manager: WorktreeManager,
+) -> WebsiteRenderReport:
     """Write review-only artifacts to an isolated website worktree."""
     dependency = _dependency(backend_artifact_digest, backend_branch_sha)
-    output_dir = _require_real_output_root(Path(output_dir))
+    output_dir = _require_owned_output_root(worktree, worktree_manager)
     _recover_transaction(output_dir)
     page, package = _owned_path(output_dir, "components/pages/BookDemo.tsx"), _owned_path(output_dir, "package.json")
     data, validator = _owned_path(output_dir, "data/smartpbx-agents.generated.mjs"), _owned_path(output_dir, "scripts/validate-smartpbx-card.mjs")

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from .gitops import WorktreeHandle, WorktreeManager, WorktreeConflictError, manager_owned_worktree_target
 from .knowledge import KnowledgeError, KnowledgeReview, recompute_knowledge_review_digest
 from .model import AgentManifest
 from .provenance import ProvenanceError, TemplateAllowlist, validate_allowlist_metadata
@@ -375,6 +376,32 @@ def _scan_outputs(files: Mapping[str, str]) -> None:
             raise IdentityLeakError(f"business tool leak in generated output: {relative}")
 
 
+def _derived_render_root(worktree: WorktreeHandle, manager: WorktreeManager, resources: DerivedResources) -> Path:
+    """Derive the only permissible backend root from verified worktree ownership."""
+    try:
+        target = manager_owned_worktree_target(manager, worktree)
+    except WorktreeConflictError as exc:
+        raise RenderError(str(exc)) from exc
+    root = target / resources.folder_identity
+    current = target
+    for component in Path(resources.folder_identity).parts:
+        current = current / component
+        if current.is_symlink():
+            raise RenderError("generated backend root may not traverse a symlink")
+        if current.exists() and not current.is_dir():
+            raise RenderError("generated backend root component is not a directory")
+    return root
+
+
+def _reject_symlinked_tree(root: Path) -> None:
+    if root.is_symlink():
+        raise RenderError("generated backend cleanup may not traverse a symlink")
+    if root.exists():
+        for candidate in root.rglob("*"):
+            if candidate.is_symlink():
+                raise RenderError("generated backend cleanup may not traverse a symlink")
+
+
 def _write_files(root: Path, files: Mapping[str, str]) -> tuple[str, ...]:
     if root.exists():
         raise RenderError(f"generated backend target already exists: {root}")
@@ -383,10 +410,21 @@ def _write_files(root: Path, files: Mapping[str, str]) -> tuple[str, ...]:
             target = root / relative
             if target.parent != root and root not in target.parents:
                 raise RenderError("generated file escapes output root")
+            current = root
+            for component in Path(relative).parent.parts:
+                current = current / component
+                if current.is_symlink():
+                    raise RenderError("generated backend path may not traverse a symlink")
+                if current.exists() and not current.is_dir():
+                    raise RenderError("generated backend path component is not a directory")
             target.parent.mkdir(parents=True, exist_ok=False) if not target.parent.exists() else None
+            if target.is_symlink():
+                raise RenderError("generated backend file may not be a symlink")
             target.write_text(content, encoding="utf-8")
     except BaseException:
-        shutil.rmtree(root, ignore_errors=True)
+        _reject_symlinked_tree(root)
+        if root.exists():
+            shutil.rmtree(root)
         raise
     return tuple(sorted(files))
 
@@ -395,8 +433,9 @@ def render_backend(
     manifest: AgentManifest,
     review: KnowledgeReview,
     resources: DerivedResources,
-    output_dir: Path,
+    worktree: WorktreeHandle,
     *,
+    worktree_manager: WorktreeManager,
     state: GenerationState | None = None,
     template_allowlist: TemplateAllowlist | None = None,
     template_root: Path | None = None,
@@ -418,7 +457,7 @@ def render_backend(
     facts = _review_facts(review, state, manifest)
     files = _files(manifest, resources, _knowledge_documents(review, facts), templates)
     _scan_outputs(files)
-    rendered_root = Path(output_dir) / resources.folder_identity
+    rendered_root = _derived_render_root(worktree, worktree_manager, resources)
     names = _write_files(rendered_root, files)
     digest_input = "".join(f"{name}\0{files[name]}\0" for name in names).encode("utf-8")
     return RenderReport(
