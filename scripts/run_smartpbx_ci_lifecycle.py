@@ -79,12 +79,17 @@ def _output_bytes(value: object) -> bytes:
 
 
 def classify_image_build_subphase(stdout: bytes, stderr: bytes) -> str:
-    """Return only a fixed Dockerfile-step label; never expose captured output."""
+    """Return the latest fixed Dockerfile-step label without exposing captured output.
+
+    Docker writes streams independently; stderr is intentionally appended after stdout
+    before selecting the final known marker, so it wins when both streams report steps.
+    """
     observed = stdout + b"\n" + stderr
-    for marker, subphase in _IMAGE_BUILD_SUBPHASE_MARKERS:
-        if marker in observed:
-            return subphase
-    return "unknown"
+    index, subphase = max(
+        ((observed.rfind(marker), known_subphase) for marker, known_subphase in _IMAGE_BUILD_SUBPHASE_MARKERS),
+        default=(-1, "unknown"),
+    )
+    return subphase if index >= 0 else "unknown"
 
 
 def command(operation: str, argv: list[str], *, capture: bool = False, allow_failure: bool = False) -> str:

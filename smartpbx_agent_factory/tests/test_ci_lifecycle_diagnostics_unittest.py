@@ -78,6 +78,16 @@ class LifecycleDockerDiagnosticsTests(unittest.TestCase):
             frozenset({"dependency-install", "smartpbx-import", "website-import", "unknown"}),
         )
 
+    def test_image_build_subphase_classifier_uses_the_latest_known_marker(self) -> None:
+        cumulative = (
+            b"RUN pip install --no-cache-dir -r requirements-prod.lock.txt\n"
+            b'RUN python -c "import startup"\n'
+            b'RUN python -c "import website_demo"'
+        )
+        self.assertEqual(self.runner.classify_image_build_subphase(cumulative, b""), "website-import")
+        repeated = b'RUN python -c "import website_demo"\nRUN python -c "import startup"'
+        self.assertEqual(self.runner.classify_image_build_subphase(repeated, b""), "smartpbx-import")
+
     def test_cleanup_failure_remains_allowed_and_never_returns_raw_output(self) -> None:
         result = subprocess.CompletedProcess(
             ["docker"], 1, stdout=b"cleanup " + b"x" * 1024, stderr=b"cleanup failure"
