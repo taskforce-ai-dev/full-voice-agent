@@ -36,6 +36,13 @@ def test_plan_writes_only_private_state_without_claiming_secret_resolution(tmp_p
     assert list(tmp_path.iterdir()) == [state_file]
 
 
+def test_plan_refuses_an_already_reserved_slug_and_resource_set(tmp_path):
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    orchestrator.plan(FIXTURE)
+    with pytest.raises(GenerationBlockedError, match="resource allocation conflict"):
+        orchestrator.plan(FIXTURE)
+
+
 def test_resume_refuses_changed_manifest_digest(tmp_path):
     fixture = tmp_path / "manifest.json"
     fixture.write_bytes(FIXTURE.read_bytes())
