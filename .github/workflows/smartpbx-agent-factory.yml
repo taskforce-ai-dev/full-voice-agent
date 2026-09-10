@@ -1,0 +1,27 @@
+name: SmartPBX agent factory
+
+on:
+  pull_request:
+    paths:
+      - "smartpbx_agent_factory/**"
+      - "create-smartpbx-agent"
+      - ".github/workflows/smartpbx-agent-factory.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  factory-tests:
+    name: Factory unit, security and golden tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pytest>=9.1.1" "pytest-asyncio>=1.4.0" pypdf python-docx
+      - name: Run factory tests
+        run: python -m pytest smartpbx_agent_factory/tests --timeout=300
