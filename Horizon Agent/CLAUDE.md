@@ -5,7 +5,7 @@ code in this repository directory.
 
 ## What This Is
 
-**Vidya** is a bilingual (English + Sinhala) AI voice agent for **Horizon
+**Vidya** is a multilingual (English, Sinhala, Arabic, Russian) AI voice agent for **Horizon
 Airline & Aviation Academy**, a **de-identified aviation-college INQUIRY demo**.
 She answers callers' questions about the academy — courses, course fees, entry
 requirements, course durations, class schedules, campus, and how to apply —
@@ -31,17 +31,33 @@ booking tool to call, and with no dashboard/n8n creds those paths never fire.
 
 ## The stack
 
-- **Brain (both languages):** Anthropic **Claude** (`CLAUDE_MODEL`, default
-  `claude-sonnet-4-6`), `LLM_PROVIDER=claude`. KB-grounded conversation; no tools
-  are wired in the inquiry-only configuration.
-- **English (Press 1 / web-demo `en`):** Twilio **ConversationRelay** — Twilio
-  owns STT + TTS; TTS voice is **ElevenLabs** (`CR_VOICE_EN`).
-- **Sinhala (web-demo `si`):** Twilio **Media Streams** — **OpenAI TTS**
-  (`gpt-4o-mini-tts`, voice `sage`) + **Azure Speech STT** (`si-LK`). Mirrors the
-  Flico Sinhala pipeline.
+Vidya offers **four demo languages — English, Sinhala, Arabic, Russian** — and
+mirrors **Kavya's Dialog (SmartPBX) line's language stack** where one exists
+(English + Sinhala): Claude+ElevenLabs for English, Gemini brain + Gemini TTS for
+Sinhala. The only difference from the Dialog line is transport — a website demo
+is a Twilio **browser** call, so audio rides Twilio (ConversationRelay for
+en/ru, Media Streams for ar/si) rather than Dialog SIP.
+
+- **English (`en`):** ConversationRelay — Claude brain (`LLM_PROVIDER=claude`) +
+  ElevenLabs voice (`CR_VOICE_EN`); Twilio owns STT.
+- **Russian (`ru`):** ConversationRelay — Claude brain + ElevenLabs voice
+  (`CR_VOICE_RU`, `ru-RU`); Twilio owns STT. (No Dialog equivalent; uses the
+  HattonHills base path.)
+- **Arabic (`ar`):** Media Streams — Claude brain + Azure STT (`ar-SA`) +
+  ElevenLabs Arabic voice (`ELEVENLABS_VOICE_ID_AR`). (No Dialog equivalent.)
+- **Sinhala (`si`):** Media Streams — **Gemini brain** (`SI_GEMINI_MODEL`
+  default `gemini-3.7-flash`, forced via `SI_LLM_PROVIDER=gemini` regardless of
+  the global `LLM_PROVIDER`; `_run_llm_gemini(model=SI_GEMINI_MODEL)`) + **Gemini
+  TTS** (`GEMINI_TTS_MODEL` `gemini-3.1-flash-tts-preview`, voice `Vindemiatrix`,
+  via `MediaStreamSession._tts_gemini` — Interactions API returns 24 kHz PCM,
+  downsampled to 8 kHz mulaw like `_tts_openai`) + Azure STT (`si-LK`). This is
+  the Kavya Dialog stack, ported over. **⚠ Preview-model quota:** ~100
+  Gemini-TTS requests/day; on any failure (quota/error/no audio, or a missing
+  `GEMINI_API_KEY`) Sinhala degrades to Claude brain + OpenAI TTS (`sage`) so the
+  call still works.
 - **Knowledge base:** ChromaDB RAG over `knowledge_docs/`.
-- `ar` / `ru` code paths from the HattonHills base remain present but are **not
-  offered** for this demo (en + si only).
+- `ta` code path from the HattonHills base remains present but is **not offered**
+  for this demo (en + si + ar + ru only).
 
 ## Runtime shape
 
@@ -63,22 +79,29 @@ booking tool to call, and with no dashboard/n8n creds those paths never fire.
 
 Real secrets live only in **`/opt/horizon/.env`** on the VPS (never committed).
 `.env.example` documents the full inquiry-only key list:
-- LLM: `LLM_PROVIDER=claude`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`
-- English voice: `ELEVENLABS_API_KEY`, `CR_VOICE_EN`, `ELEVENLABS_VOICE_ID`
-- Sinhala voice: `OPENAI_API_KEY`, `OPENAI_TTS_MODEL=gpt-4o-mini-tts`,
-  `OPENAI_TTS_VOICE=sage`, `OPENAI_TTS_INSTRUCTIONS`
-- Sinhala STT: `STT_PROVIDER=azure`, `AZURE_SPEECH_KEY`,
-  `AZURE_SPEECH_REGION=southeastasia`
+- English/Russian brain: `LLM_PROVIDER=claude`, `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`
+- English/Russian voice: `ELEVENLABS_API_KEY`, `CR_VOICE_EN`, `CR_VOICE_RU`,
+  `ELEVENLABS_VOICE_ID`
+- Arabic voice: `ELEVENLABS_VOICE_ID_AR`; Arabic STT via `STT_PROVIDER=azure`
+- Sinhala brain + voice (Gemini): `GEMINI_API_KEY`, `SI_LLM_PROVIDER=gemini`,
+  `SI_GEMINI_MODEL=gemini-3.7-flash`,
+  `GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview`,
+  `GEMINI_TTS_VOICE=Vindemiatrix`, `GEMINI_TTS_TIMEOUT_SECONDS`
+- Sinhala voice fallback (used only if Gemini TTS is unavailable):
+  `OPENAI_API_KEY`, `OPENAI_TTS_MODEL=gpt-4o-mini-tts`, `OPENAI_TTS_VOICE=sage`,
+  `OPENAI_TTS_INSTRUCTIONS`
+- STT: `STT_PROVIDER=azure`, `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION=southeastasia`
 - Telephony: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`
 - KB reload: `KB_RELOAD_SECRET`
 
-No PMS/booking keys, no Gemini key, no Google STT key are configured — that is
-what keeps the demo inquiry-only.
+`GEMINI_API_KEY` is **required** for the Sinhala Dialog stack. No PMS/booking
+keys and no Google STT key are configured — that is what keeps the demo
+inquiry-only.
 
 ## Caller-facing persona
 
 `_build_system_prompt(lang)` in `server.py` builds Vidya's inquiry persona
-(en + si language rules): answer only from the reference KB, never invent fees or
+(per-language rules): answer only from the reference KB, never invent fees or
 dates, no bookings/payments, phone-call voice rules. Greetings/re-prompts live in
 `LANGUAGE_CONFIGS`, `MEDIA_STREAM_WELCOME`, and `REPROMPT_MESSAGES`; the Sinhala
 TTS persona is `OPENAI_TTS_INSTRUCTIONS`.

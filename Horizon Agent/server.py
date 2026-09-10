@@ -1,5 +1,5 @@
 ﻿"""
-server.py â€” Main FastAPI server for Hatton Hills Voice Agent (Tanya).
+server.py — Main FastAPI server for Horizon Airline & Aviation Academy Voice Agent (Vidya).
 
 Handles:
   - IVR / DTMF language menu (POST /voice/incoming)
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import logging
 import os
@@ -42,7 +43,7 @@ if os.getenv("SENTRY_DSN"):
         send_default_pii=os.getenv("SENTRY_SEND_PII", "false").lower() == "true",
         enable_logs=os.getenv("SENTRY_ENABLE_LOGS", "true").lower() == "true",
     )
-    sentry_sdk.set_tag("agent", "hatton")
+    sentry_sdk.set_tag("agent", "horizon")
 import queue
 import re
 import threading
@@ -148,6 +149,28 @@ LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "claude")
 CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# ---------------------------------------------------------------------------
+# Sinhala stack = Kavya Dialog line's stack (Gemini brain + Gemini TTS voice).
+# English keeps Claude + ElevenLabs via ConversationRelay (LLM_PROVIDER above).
+# Only the Sinhala Media Streams path is overridden here, so English is
+# untouched. Set SI_LLM_PROVIDER=claude to fall the Sinhala brain back to the
+# global provider without touching TTS.
+# ---------------------------------------------------------------------------
+SI_LLM_PROVIDER: str = os.getenv("SI_LLM_PROVIDER", "gemini").lower()
+SI_GEMINI_MODEL: str = os.getenv("SI_GEMINI_MODEL", "gemini-3.7-flash")
+# Gemini TTS (Sinhala voice) â€” same model + voice the Kavya Dialog line uses.
+# Interactions API returns 24 kHz 16-bit mono PCM; downsampled to 8 kHz mulaw
+# on the fly, exactly like _tts_openai. NOTE: gemini-3.1-flash-tts-preview is a
+# PREVIEW model with a ~100 requests/day cap â€” see CLAUDE.md.
+GEMINI_TTS_MODEL: str = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+GEMINI_TTS_VOICE: str = os.getenv("GEMINI_TTS_VOICE", "Vindemiatrix")
+try:
+    GEMINI_TTS_TIMEOUT_SECONDS: float = float(
+        os.getenv("GEMINI_TTS_TIMEOUT_SECONDS", "30")
+    )
+except ValueError:
+    GEMINI_TTS_TIMEOUT_SECONDS = 30.0
 
 # ---------------------------------------------------------------------------
 # Optional: Google Gemini native SDK
@@ -639,6 +662,26 @@ def _get_gemini_client():
     return _gemini_client
 
 
+async def _iter_gemini_tts_audio_deltas(stream: Any):
+    """Yield base64 audio payloads from the Gemini Interactions SSE stream.
+
+    The documented shape is a sequence of events; audio arrives on
+    `step.delta` events whose `delta.type == "audio"` and `delta.data` is a
+    base64 chunk (audio/l16, 24 kHz, mono). Everything else is skipped. Ported
+    from Kavya's Dialog Sinhala TTS path (server.py::_iter_gemini_tts_audio_deltas)
+    minus the pilot-only provider-error classification.
+    """
+    async for event in stream:
+        if getattr(event, "event_type", None) != "step.delta":
+            continue
+        delta = getattr(event, "delta", None)
+        if getattr(delta, "type", None) != "audio":
+            continue
+        data = getattr(delta, "data", None)
+        if isinstance(data, str) and data:
+            yield data
+
+
 def _history_to_gemini(history: list[dict]) -> list[dict]:
     """Convert OpenAI-format history to Gemini-native contents.
 
@@ -723,7 +766,7 @@ def _history_to_gemini(history: list[dict]) -> list[dict]:
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle for the FastAPI application."""
     # --- Startup ---
-    logger.info("Starting Hatton Hills Voice Agent server...")
+    logger.info("Starting Horizon Airline & Aviation Academy Voice Agent server...")
 
     # Initialize knowledge base
     logger.info("Initializing knowledge base from '%s'...", KB_DOCS_DIRECTORY)
@@ -785,7 +828,7 @@ async def lifespan(app: FastAPI):
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Hatton Hills Voice Agent (Tanya)",
+    title="Horizon Airline & Aviation Academy Voice Agent (Vidya)",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -890,6 +933,12 @@ async def health() -> dict[str, Any]:
         "stt_provider": STT_PROVIDER,
         "azure_stt": AZURE_STT_AVAILABLE,
         "azure_tts": bool(AZURE_SPEECH_KEY),
+        # Sinhala stack (Kavya Dialog line parity): Gemini brain + Gemini TTS.
+        "sinhala_llm_provider": SI_LLM_PROVIDER,
+        "sinhala_gemini_model": SI_GEMINI_MODEL,
+        "sinhala_tts": "gemini" if (GOOGLE_GENAI_AVAILABLE and GEMINI_API_KEY) else "openai_fallback",
+        "gemini_tts_model": GEMINI_TTS_MODEL,
+        "gemini_configured": bool(GEMINI_API_KEY),
     }
 
 
@@ -1612,10 +1661,20 @@ class MediaStreamSession:
         self.gemini_client = gemini_client
         self.lang = lang
         self.system_prompt = _build_system_prompt(lang)
-        if LLM_PROVIDER == "claude":
-            self.tools = get_tools()
-        elif LLM_PROVIDER == "gemini":
+        # Sinhala runs on the Gemini brain (Kavya Dialog stack) regardless of the
+        # global provider, so it needs Gemini-format tools. (Inquiry-only builds
+        # have no tools, so this is defensive/future-proof.) Requires a live
+        # Gemini client â€” without one (missing key) it falls back to the global
+        # provider so the call still works.
+        self._si_gemini_brain = (
+            lang == "si"
+            and SI_LLM_PROVIDER == "gemini"
+            and gemini_client is not None
+        )
+        if self._si_gemini_brain or LLM_PROVIDER == "gemini":
             self.tools = get_tools_gemini()
+        elif LLM_PROVIDER == "claude":
+            self.tools = get_tools()
         else:
             self.tools = get_tools_openai()
 
@@ -1907,7 +1966,11 @@ class MediaStreamSession:
         self.history = _trim_history(self.history)
 
         try:
-            if LLM_PROVIDER == "claude":
+            if self._si_gemini_brain:
+                # Sinhala uses the Gemini brain (Kavya Dialog stack) even when
+                # the global provider is Claude (English/ConversationRelay).
+                response_text = await self._run_llm_gemini(model=SI_GEMINI_MODEL)
+            elif LLM_PROVIDER == "claude":
                 response_text = await self._run_llm_claude()
             elif LLM_PROVIDER == "gemini":
                 response_text = await self._run_llm_gemini()
@@ -2054,8 +2117,13 @@ class MediaStreamSession:
 
     # â”€â”€ Gemini native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
 
-    async def _run_llm_gemini(self) -> str:
-        """Gemini-native streaming version of _run_llm for Media Streams."""
+    async def _run_llm_gemini(self, model: str | None = None) -> str:
+        """Gemini-native streaming version of _run_llm for Media Streams.
+
+        `model` overrides the global MODEL (used by the Sinhala path to pin the
+        Kavya Dialog line's Gemini LLM model).
+        """
+        gemini_model = model or MODEL
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
 
@@ -2078,7 +2146,7 @@ class MediaStreamSession:
                 config["tools"] = self.tools
 
             response = await self.gemini_client.aio.models.generate_content_stream(
-                model=MODEL,
+                model=gemini_model,
                 contents=gemini_contents,
                 config=config,
             )
@@ -2342,7 +2410,14 @@ class MediaStreamSession:
             if generation >= 0 and generation != self._speak_generation:
                 return
             if self.lang == "si":
-                await self._tts_openai(text)
+                # Sinhala voice = Kavya Dialog stack (Gemini TTS). Falls back to
+                # OpenAI TTS if the Gemini TTS client/key is unavailable, so a
+                # missing GEMINI_API_KEY degrades to a working voice instead of
+                # silence.
+                if self.gemini_client is not None:
+                    await self._tts_gemini(text)
+                else:
+                    await self._tts_openai(text)
             elif self.lang in ("ta", "ar"):
                 await self._tts_elevenlabs(text)
             else:
@@ -2525,6 +2600,115 @@ class MediaStreamSession:
         except Exception:
             logger.exception("OpenAI TTS failed for: %s", text[:80])
             self._is_speaking = False
+
+    # â”€â”€ Gemini TTS (Sinhala â€” Kavya Dialog stack) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    async def _tts_gemini(self, text: str):
+        """Stream Gemini TTS as mulaw 8 kHz to Twilio (Sinhala).
+
+        Uses the same model + voice the Kavya Dialog line uses
+        (gemini-3.1-flash-tts-preview / Vindemiatrix). The Interactions API
+        returns raw 24 kHz 16-bit mono LE PCM in base64 audio deltas; we
+        downsample to 8 kHz and mulaw-encode on the fly, dropping straight into
+        the same Twilio media framing the OpenAI/Azure paths use.
+        Must only be called from _speak (lock already held).
+
+        NOTE: gemini-3.1-flash-tts-preview is a PREVIEW model with a ~100
+        requests/day cap. On a failure it degrades to OpenAI TTS so the caller
+        still hears a reply instead of silence.
+        """
+        if audioop is None or self.gemini_client is None:
+            logger.warning("Gemini TTS unavailable â€” falling back to OpenAI TTS")
+            await self._tts_openai(text)
+            return
+
+        self._is_speaking = True
+        ratecv_state = None   # audioop.ratecv carry-over state (24k -> 8k)
+        pcm_tail = b""        # holds a stray odd byte across chunk boundaries
+        mulaw_buf = b""       # accumulates mulaw output, flushed in 640-byte frames
+        got_audio = False
+
+        try:
+            stream = await self.gemini_client.aio.interactions.create(
+                model=GEMINI_TTS_MODEL,
+                input=text,
+                stream=True,
+                response_format={"type": "audio"},
+                generation_config={
+                    "speech_config": [{"voice": GEMINI_TTS_VOICE}],
+                },
+                timeout=GEMINI_TTS_TIMEOUT_SECONDS,
+            )
+
+            async for audio_b64 in _iter_gemini_tts_audio_deltas(stream):
+                if not self._is_speaking:
+                    break
+                try:
+                    chunk = base64.b64decode(audio_b64, validate=True)
+                except (binascii.Error, ValueError, TypeError):
+                    continue
+                if not chunk:
+                    continue
+                got_audio = True
+                # PCM is 2 bytes/sample -- keep sample alignment.
+                data = pcm_tail + chunk
+                if len(data) % 2:
+                    data, pcm_tail = data[:-1], data[-1:]
+                else:
+                    pcm_tail = b""
+                if not data:
+                    continue
+                pcm8k, ratecv_state = audioop.ratecv(
+                    data, 2, 1, 24000, 8000, ratecv_state)
+                mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+
+                while len(mulaw_buf) >= 640:
+                    if not self._is_speaking:
+                        break
+                    frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
+                    b64 = base64.b64encode(frame).decode("ascii")
+                    async with self._ws_lock:
+                        await self.ws.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": self.stream_sid,
+                            "media": {"payload": b64},
+                        }))
+
+            # Nothing came back at all -- treat as a provider failure and fall
+            # back so the caller is not left in silence (e.g. quota exhausted).
+            if not got_audio:
+                logger.error("Gemini TTS returned no audio â€” falling back to OpenAI TTS")
+                await self._tts_openai(text)
+                return
+
+            # Flush any remaining tail of mulaw audio.
+            if self._is_speaking and mulaw_buf:
+                b64 = base64.b64encode(mulaw_buf).decode("ascii")
+                async with self._ws_lock:
+                    await self.ws.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": b64},
+                    }))
+
+            if self._is_speaking:
+                async with self._ws_lock:
+                    await self.ws.send_text(json.dumps({
+                        "event": "mark",
+                        "streamSid": self.stream_sid,
+                        "mark": {"name": "tts_done"},
+                    }))
+            else:
+                logger.info("Gemini TTS interrupted by barge-in [%s]", self.call_sid)
+
+        except Exception:
+            logger.exception("Gemini TTS failed for: %s", text[:80])
+            # Degrade to OpenAI TTS rather than dropping the turn. If we already
+            # streamed some frames, _is_speaking guards against double audio.
+            if not got_audio:
+                await self._tts_openai(text)
+            else:
+                self._is_speaking = False
 
     # â”€â”€ Azure TTS (Sinhala) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -3558,6 +3742,19 @@ async def ws_media_stream(websocket: WebSocket, lang: str):
         await websocket.accept()
         await websocket.close(code=1011, reason="Server configuration error")
         return
+
+    # Sinhala rides the Kavya Dialog stack: Gemini brain + Gemini TTS. Ensure a
+    # Gemini client exists for it regardless of the global provider (English is
+    # Claude/ConversationRelay). If the key is missing we still start the call â€”
+    # the LLM/TTS paths degrade gracefully â€” rather than dropping the socket.
+    if lang == "si" and gemini_client is None:
+        try:
+            gemini_client = _get_gemini_client()
+        except RuntimeError:
+            logger.error(
+                "Sinhala requested but GEMINI_API_KEY/SDK unavailable â€” "
+                "Sinhala brain falls back to global provider, voice to OpenAI TTS"
+            )
 
     session = MediaStreamSession(
         websocket=websocket, lang=lang,
