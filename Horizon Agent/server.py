@@ -28,6 +28,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -65,7 +67,7 @@ from twilio.rest import Client as TwilioRestClient
 from knowledge_base import retrieve_context, initialize_kb, prewarm, reload_kb_from_content
 from tools import get_tools, get_tools_openai, get_tools_gemini, execute_tool
 from booking_api import close_session, is_configured
-from post_call import process_post_call_data
+from post_call import process_post_call_data, egress_enabled
 
 try:
     import dashboard_client
@@ -75,6 +77,11 @@ except ImportError:
 
 def _dashboard_call_started(call_sid, caller_phone, lang, started_at):
     if dashboard_client is None:
+        return
+    # FAIL-CLOSED: call-started carries caller metadata (phone), so it is egress.
+    # Suppress it unless post-call egress is explicitly enabled — an inherited
+    # dashboard credential must not leak caller metadata in the demo.
+    if not egress_enabled():
         return
     import asyncio
     logger.info(
@@ -118,6 +125,66 @@ TWILIO_ACCOUNT_SID: str = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN: str = os.getenv("TWILIO_AUTH_TOKEN", "")
 HUMAN_AGENT_PHONE: str = os.getenv("HUMAN_AGENT_PHONE", "").strip()
 PUBLIC_HOSTNAME: str = os.getenv("PUBLIC_HOSTNAME", "voice.taskforceai.tech").strip()
+
+# ---------------------------------------------------------------------------
+# WebSocket ingress authentication (short-lived signed ticket)
+# ---------------------------------------------------------------------------
+# nginx exposes /ws/ publicly, so /ws/conversation and /ws/media-stream/{lang}
+# would otherwise accept ANY client and burn LLM/STT/TTS capacity. Twilio does
+# not sign the media WebSocket the way it signs HTTP webhooks, so we mint a
+# short-lived HMAC ticket into the wss URL at TwiML-generation time (only WE
+# produce those URLs) and require it on connect. Secret: WS_TICKET_SECRET, else
+# the Twilio auth token (a server-only secret). If NEITHER is set (local dev),
+# enforcement is skipped so `python server.py` still works.
+WS_TICKET_TTL_SECONDS: int = int(os.getenv("WS_TICKET_TTL_SECONDS", "300"))
+
+
+def _ws_ticket_secret() -> str:
+    return (os.getenv("WS_TICKET_SECRET", "") or TWILIO_AUTH_TOKEN or "").strip()
+
+
+def _mint_ws_ticket() -> str:
+    """Return a signed `<exp>.<hexsig>` ticket, or "" when no secret is set."""
+    secret = _ws_ticket_secret()
+    if not secret:
+        return ""
+    exp = int(_now_ts()) + WS_TICKET_TTL_SECONDS
+    sig = hmac.new(secret.encode(), str(exp).encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _verify_ws_ticket(ticket: str) -> bool:
+    """Validate a ticket. When no secret is configured, enforcement is disabled
+    (returns True) so local dev works; in production the Twilio token is always
+    present, so a missing/expired/forged ticket is rejected."""
+    secret = _ws_ticket_secret()
+    if not secret:
+        return True
+    if not ticket or "." not in ticket:
+        return False
+    exp_str, _, sig = ticket.partition(".")
+    try:
+        exp = int(exp_str)
+    except ValueError:
+        return False
+    if exp < int(_now_ts()):
+        return False
+    expected = hmac.new(secret.encode(), exp_str.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _ws_query_suffix(existing: bool = False) -> str:
+    """`&t=<ticket>` / `?t=<ticket>` (or "") for embedding in a wss URL.
+    `existing=True` when the URL already has a query string."""
+    ticket = _mint_ws_ticket()
+    if not ticket:
+        return ""
+    return f"{'&' if existing else '?'}t={ticket}"
+
+
+def _now_ts() -> float:
+    import time as _t
+    return _t.time()
 
 # Twilio REST client singleton â€” used for Path B human handoff
 # (client.calls(sid).update(twiml=...)) to bypass the unreliable
@@ -895,10 +962,15 @@ async def voice_token(request: Request):
     Tokens are short-lived (300s TTL) and outgoing-only (incoming disabled).
     """
     # Per-IP rate limit + concurrency cap (lightweight, in-process).
+    # Use the RIGHTMOST X-Forwarded-For entry — the one appended by our own
+    # trusted nginx (`proxy_add_x_forwarded_for`) — not the leftmost, which is
+    # fully client-controlled and trivially spoofed to dodge the per-IP limit.
     client_ip = request.client.host if request.client else "unknown"
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
-        client_ip = fwd.split(",")[0].strip()
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if parts:
+            client_ip = parts[-1]
     _voice_token_rate_check(client_ip)
 
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -946,6 +1018,48 @@ async def health() -> dict[str, Any]:
 # Admin: hot-reload knowledge base without container restart
 # ---------------------------------------------------------------------------
 
+_KB_ALLOWED_EXTENSIONS = (".txt", ".md")
+
+
+def _safe_kb_filename(filename: str) -> str:
+    """Validate a caller-supplied KB filename and return it, or raise 400.
+
+    `/kb-reload` writes `KB_DOCS_DIRECTORY / filename`, so an unvalidated name is
+    a path-traversal / arbitrary-write primitive. Accept ONLY a bare basename
+    with an allowed text extension that resolves strictly inside the KB dir, and
+    never through a symlink. Rejects absolute paths, separators, `..`, empty/dot
+    names, disallowed extensions, and symlinked targets.
+    """
+    from pathlib import Path
+    from fastapi import HTTPException
+
+    def _reject(why: str):
+        logger.warning("Rejected /kb-reload filename %r: %s", filename, why)
+        raise HTTPException(status_code=400, detail=f"Invalid filename: {why}")
+
+    if not filename or not filename.strip():
+        _reject("empty")
+    # Must be a bare basename — no directory components, no traversal, no NUL.
+    if filename != os.path.basename(filename):
+        _reject("must be a bare filename")
+    if "/" in filename or "\\" in filename or "\x00" in filename or ".." in filename:
+        _reject("path separators or traversal not allowed")
+    if filename in (".", ".."):
+        _reject("reserved name")
+    if not filename.lower().endswith(_KB_ALLOWED_EXTENSIONS):
+        _reject(f"extension must be one of {_KB_ALLOWED_EXTENSIONS}")
+
+    kb_dir = Path(KB_DOCS_DIRECTORY).resolve()
+    target = (kb_dir / filename).resolve()
+    # Containment: the resolved target's parent must be exactly the KB dir.
+    if target.parent != kb_dir:
+        _reject("resolves outside the knowledge-base directory")
+    # Never follow a symlink at the target path.
+    if target.is_symlink() or (kb_dir / filename).is_symlink():
+        _reject("symlinked target not allowed")
+    return filename
+
+
 @app.post("/kb-reload")
 async def kb_reload(request: Request) -> dict:
     """Receive new KB content from the admin portal and rebuild the vector store.
@@ -959,7 +1073,7 @@ async def kb_reload(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Unauthorized")
     body = await request.json()
     content: str = body.get("content", "")
-    filename: str = body.get("filename", "horizon_info.txt")
+    filename: str = _safe_kb_filename(body.get("filename", "horizon_info.txt"))
     if not content:
         return {"ok": False, "error": "Empty content"}
     import asyncio, concurrent.futures
@@ -1099,7 +1213,7 @@ async def voice_demo_incoming(request: Request) -> Response:
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
             "  <Connect>\n"
-            f'    <Stream url="wss://{host}/ws/media-stream/{lang}" />\n'
+            f'    <Stream url="wss://{host}/ws/media-stream/{lang}{_ws_query_suffix()}" />\n'
             "  </Connect>\n"
             "</Response>"
         )
@@ -1166,7 +1280,7 @@ async def voice_language_selected(request: Request) -> Response:
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
             "  <Connect>\n"
-            f'    <Stream url="wss://{host}/ws/media-stream/{lang}" />\n'
+            f'    <Stream url="wss://{host}/ws/media-stream/{lang}{_ws_query_suffix()}" />\n'
             "  </Connect>\n"
             "</Response>"
         )
@@ -1326,8 +1440,13 @@ def _build_conversation_relay_twiml(
     transcription_provider = config.get("transcription_provider", "google")
     speech_model = config.get("speech_model", "telephony")
 
+    # WS auth ticket — XML-escape the query separator (& -> &amp;) or Twilio
+    # rejects the TwiML. Empty when no signing secret is configured (local dev).
+    _cr_ticket = _mint_ws_ticket()
+    ticket_attr = f"&amp;t={_cr_ticket}" if _cr_ticket else ""
+
     return (
-        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}"\n'
+        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}{ticket_attr}"\n'
         f'        ttsProvider="{config["tts_provider"]}"\n'
         f'        voice="{config["voice"]}"\n'
         f'{extra}'
@@ -3293,7 +3412,7 @@ async def _run_llm_streaming_claude(
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/conversation")
-async def ws_conversation(websocket: WebSocket, lang: str = "en"):
+async def ws_conversation(websocket: WebSocket, lang: str = "en", t: str = ""):
     """Handle a Twilio ConversationRelay WebSocket session.
 
     The ``lang`` query parameter is set by the IVR routing and determines
@@ -3306,6 +3425,13 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
       - "interrupt": User interrupted the agent mid-speech.
       - Others    : Logged and ignored.
     """
+    # Authenticated ingress: reject anything without a valid short-lived ticket
+    # BEFORE accepting the socket (closing pre-accept sends an HTTP 403).
+    if not _verify_ws_ticket(t):
+        logger.warning("Rejected /ws/conversation — missing/invalid ticket")
+        await websocket.close(code=1008)
+        return
+
     # Validate lang param
     if lang not in LANGUAGE_CONFIGS:
         lang = "en"
@@ -3557,7 +3683,9 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
 
                         # Dispatch dashboard event SYNCHRONOUSLY here so it
                         # doesn't get cancelled when the WS goes away.
-                        if dashboard_client is not None:
+                        # (Unreachable on the inquiry-only demo — no transfer
+                        # tool — but fail-closed on egress regardless.)
+                        if dashboard_client is not None and egress_enabled():
                             try:
                                 await dashboard_client.send_call_transferred(
                                     call_sid=call_sid,
@@ -3715,15 +3843,22 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/media-stream/{lang}")
-async def ws_media_stream(websocket: WebSocket, lang: str):
+async def ws_media_stream(websocket: WebSocket, lang: str, t: str = ""):
     """Handle a Twilio Media Streams WebSocket session for Sinhala or Tamil.
 
     Language is encoded in the URL path (e.g. /ws/media-stream/si) so it
     is always present â€” avoids unreliable query-string passing by Twilio.
+    The `t` query param is the short-lived HMAC ingress ticket.
 
-    Receives raw mulaw 8 kHz audio from Twilio, runs Google Cloud STT,
-    sends Claude responses through Azure TTS back as mulaw audio.
+    Receives raw mulaw 8 kHz audio from Twilio, runs Azure STT, sends the
+    LLM's responses back through the per-language TTS as mulaw audio.
     """
+    # Authenticated ingress: reject anything without a valid ticket pre-accept.
+    if not _verify_ws_ticket(t):
+        logger.warning("Rejected /ws/media-stream — missing/invalid ticket")
+        await websocket.close(code=1008)
+        return
+
     if lang not in ("si", "ta", "ar"):
         lang = "si"
 

@@ -1,5 +1,5 @@
 ﻿"""
-knowledge_base.py â€” Optimized RAG / Knowledge-Base module for the Winrich Hotel Voice Agent.
+knowledge_base.py â€” Optimized RAG / Knowledge-Base module for the Horizon (Vidya) Voice Agent.
 
 Provides semantic search over hotel documentation using ChromaDB for vector
 storage and sentence-transformers for embeddings.
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"
-COLLECTION_NAME: str = "winrich_kb"
+COLLECTION_NAME: str = "horizon_kb"
 PERSIST_DIRECTORY: str = "./chroma_db"
 SUPPORTED_EXTENSIONS: set = {".txt", ".md", ".pdf"}
 DEFAULT_DOCS_DIRECTORY: str = "knowledge_docs"
@@ -542,17 +542,17 @@ if __name__ == "__main__":
     # Add a sample document
     print("\n>> Adding sample document...")
     add_document(
-        "The Winrich Hotel offers complimentary breakfast from 6:30 AM to 10:00 AM "
-        "in the Grand Dining Hall on the second floor. Guests can enjoy a wide "
-        "selection of continental and local dishes.",
+        "Horizon Airline & Aviation Academy offers a Diploma in Airline Cabin "
+        "Crew that covers passenger safety, in-flight service, and grooming. "
+        "Classes run on weekday and weekend schedules at the Colombo campus.",
         metadata={"source": "self-test"},
     )
 
     # Run a few sample queries
     sample_queries = [
-        "What time is breakfast served?",
-        "Where is the dining area?",
-        "Tell me about the hotel amenities.",
+        "What does the cabin crew course cover?",
+        "Where is the campus?",
+        "Tell me about the academy's diplomas.",
     ]
 
     for q in sample_queries:

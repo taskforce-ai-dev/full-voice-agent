@@ -79,3 +79,22 @@ def test_openai_tts_fallback_configured():
     """The graceful-degradation path uses OpenAI TTS; its voice must be set."""
     assert server.OPENAI_TTS_VOICE  # non-empty (e.g. 'sage')
     assert server.OPENAI_TTS_MODEL.startswith("gpt-")
+
+
+# --- No legacy runtime content (Winrich/Hatton hotel) -------------------------
+
+def test_kb_collection_is_horizon_not_winrich():
+    import knowledge_base
+    assert knowledge_base.COLLECTION_NAME == "horizon_kb"
+
+
+def test_no_winrich_hotel_branding_in_runtime_modules():
+    for name in ("server.py", "knowledge_base.py", "post_call.py", "tools.py"):
+        text = (HORIZON / name).read_text(encoding="utf-8", errors="ignore")
+        assert "Winrich" not in text, f"Winrich branding left in {name}"
+        assert "winrich" not in text, f"winrich branding left in {name}"
+
+
+def test_legacy_reference_files_removed():
+    for gone in ("media_stream_server.py", "test_voice.py", "test_voice_elevenlabs.py"):
+        assert not (HORIZON / gone).exists(), f"{gone} should have been removed"

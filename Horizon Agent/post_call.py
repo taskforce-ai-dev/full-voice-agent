@@ -39,7 +39,7 @@ EXTRACTION_MAX_TOKENS: int = 2000
 # ---------------------------------------------------------------------------
 # Extraction prompt
 # ---------------------------------------------------------------------------
-EXTRACTION_SYSTEM_PROMPT: str = """You are a data extraction assistant for a hotel called Hatton Hills in Sri Lanka. Analyze a phone call transcript between the hotel's reservations agent (Tanya) and a caller. The call may be in English, Sinhala, or Tamil.
+EXTRACTION_SYSTEM_PROMPT: str = """You are a data extraction assistant for Horizon Airline & Aviation Academy in Sri Lanka. Analyze a phone call transcript between the academy's inquiry assistant (Vidya) and a caller. The call may be in English, Sinhala, Arabic, or Russian.
 
 Extract ALL available information and return ONLY a valid JSON object. No markdown code fences, no explanation — just the raw JSON.
 
@@ -289,10 +289,9 @@ async def _retry_extraction(
 
 async def _post_to_n8n(payload: dict[str, Any]) -> None:
     """POST the call data payload to the n8n webhook. Fire-and-forget."""
-    # DEMO-SAFE: in the demo build, do NOT ship transcripts to the real n8n /
-    # Google Sheets pipeline. Enabled by default; set DEMO_SAFE_BOOKINGS=false
-    # to wire the real post-call webhook.
-    if os.getenv("DEMO_SAFE_BOOKINGS", "true").lower() in ("1", "true", "yes"):
+    # Belt-and-suspenders: process_post_call_data already returns early when
+    # egress is disabled, but re-check here so a direct call still fails closed.
+    if not egress_enabled():
         logger.info("DEMO-SAFE: skipping n8n post-call webhook (no transcript shipped).")
         return
 
@@ -317,12 +316,21 @@ async def _post_to_n8n(payload: dict[str, Any]) -> None:
 # Orchestrator — entry point called from server.py
 # ---------------------------------------------------------------------------
 
+def egress_enabled() -> bool:
+    """Whether post-call egress (LLM extraction, n8n, dashboard) is allowed.
+
+    FAIL-CLOSED: egress is off unless HORIZON_POST_CALL_EGRESS is set to EXACTLY
+    'enabled'. Every other value — 'false', '0', 'true', 'yes', a typo, an empty
+    string, or the var being unset — means NO egress. So a shared/inherited
+    environment, or a fat-fingered flag, can never start shipping caller
+    transcripts; turning egress on is a single deliberate, exact opt-in.
+    """
+    return os.getenv("HORIZON_POST_CALL_EGRESS", "").strip().lower() == "enabled"
+
+
 def _demo_safe() -> bool:
-    """True (default) means NO post-call egress of any kind: no LLM extraction,
-    no n8n webhook, no dashboard dispatch. Fail-closed by construction so a
-    shared/inherited environment cannot start shipping caller transcripts. Set
-    DEMO_SAFE_BOOKINGS=false to enable the real post-call pipeline."""
-    return os.getenv("DEMO_SAFE_BOOKINGS", "true").strip().lower() in ("1", "true", "yes")
+    """Inverse of egress_enabled(): True (default) means the demo ships nothing."""
+    return not egress_enabled()
 
 
 def _format_transcript(full_transcript: list[dict[str, str]]) -> str:

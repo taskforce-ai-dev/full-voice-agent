@@ -1,10 +1,9 @@
-"""Post-call is FAIL-CLOSED by default: no LLM extraction, no n8n webhook, no
-dashboard dispatch.
+"""Post-call egress is FAIL-CLOSED: nothing leaves the process unless
+HORIZON_POST_CALL_EGRESS is set to EXACTLY 'enabled'.
 
-The HattonHills base only skipped the n8n POST under DEMO_SAFE_BOOKINGS; LLM
-extraction still ran and a configured dashboard client could still dispatch.
-Horizon gates ALL post-call egress on the single demo-safe switch (default on),
-so an inherited DASHBOARD/N8N config can never ship a caller transcript.
+Covers the whole pipeline (LLM extraction + n8n + dashboard) being suppressed
+by default, and the fail-closed semantics of the flag (false/0/typos/unknown
+values must NOT enable egress).
 """
 from __future__ import annotations
 
@@ -12,6 +11,8 @@ import asyncio
 import importlib
 import sys
 from pathlib import Path
+
+import pytest
 
 HORIZON = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HORIZON))
@@ -36,10 +37,8 @@ def _call_process(pc):
     ))
 
 
-def test_demo_safe_default_blocks_all_egress(monkeypatch):
-    """Default env (DEMO_SAFE_BOOKINGS unset -> treated as true): extraction,
-    n8n POST and dashboard dispatch must ALL be skipped."""
-    monkeypatch.delenv("DEMO_SAFE_BOOKINGS", raising=False)
+def test_default_blocks_all_egress(monkeypatch):
+    monkeypatch.delenv("HORIZON_POST_CALL_EGRESS", raising=False)
     pc = importlib.reload(post_call)
 
     calls = {"extract": 0, "n8n": 0}
@@ -65,21 +64,29 @@ def test_demo_safe_default_blocks_all_egress(monkeypatch):
 
     _call_process(pc)
 
-    assert calls["extract"] == 0, "LLM extraction must not run in demo-safe mode"
-    assert calls["n8n"] == 0, "n8n POST must not run in demo-safe mode"
-    assert spy_dash.sent == 0, "dashboard dispatch must not run in demo-safe mode"
+    assert calls["extract"] == 0
+    assert calls["n8n"] == 0
+    assert spy_dash.sent == 0
 
 
-def test_demo_safe_helper_defaults_true(monkeypatch):
-    monkeypatch.delenv("DEMO_SAFE_BOOKINGS", raising=False)
+@pytest.mark.parametrize("value", ["false", "0", "no", "true", "1", "yes",
+                                   "ENABLED ", "enable", "enabledx", "", "disabled", "TRUE"])
+def test_fail_closed_for_non_exact_values(monkeypatch, value):
+    """Only the exact token 'enabled' (case-insensitive, trimmed) turns egress
+    on. Everything else — including 'true'/'1' and typos — stays closed."""
+    monkeypatch.setenv("HORIZON_POST_CALL_EGRESS", value)
     pc = importlib.reload(post_call)
-    assert pc._demo_safe() is True
+    # "ENABLED " trims+lowercases to "enabled" -> enabled; that is the ONE
+    # affirmative case in this list.
+    expected = value.strip().lower() == "enabled"
+    assert pc.egress_enabled() is expected
+    assert pc._demo_safe() is (not expected)
 
 
-def test_demo_safe_can_be_disabled_explicitly(monkeypatch):
-    monkeypatch.setenv("DEMO_SAFE_BOOKINGS", "false")
+def test_exact_enabled_opens_egress(monkeypatch):
+    monkeypatch.setenv("HORIZON_POST_CALL_EGRESS", "enabled")
     pc = importlib.reload(post_call)
+    assert pc.egress_enabled() is True
     assert pc._demo_safe() is False
-    # restore default for later modules
-    monkeypatch.delenv("DEMO_SAFE_BOOKINGS", raising=False)
+    monkeypatch.delenv("HORIZON_POST_CALL_EGRESS", raising=False)
     importlib.reload(post_call)

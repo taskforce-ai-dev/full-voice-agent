@@ -20,14 +20,25 @@ agent's own `/voice/demo-incoming`. That routing depends on a
 `DEMO_AGENT_HOSTS["horizon"]` entry in HattonHills (added separately) and on
 DNS/TLS for **horizon.taskforceai.tech**.
 
-**INQUIRY-ONLY.** Vidya takes NO bookings, enrolments, payments, or student
-registrations, and cannot look up individual student records. This is enforced
-**by configuration, not by deleting code** (same pattern as the Hutch agent): the
-cloned booking/PMS modules (`booking_api.py`, `yanolja_client.py`,
-`yanolja_service.py`, `kpms_client.py`, `kpms_service.py`, `post_call.py`,
-`dashboard_client.py`) are still present for fleet consistency, but are **inert**
-— with no PMS/Yanolja credentials `get_tools()` returns `[]`, so the model has no
-booking tool to call, and with no dashboard/n8n creds those paths never fire.
+**INQUIRY-ONLY — a hard invariant, not a config state.** Vidya takes NO
+bookings, enrolments, payments, or student registrations, and cannot look up
+individual student records. The cloned booking/PMS modules (`booking_api.py`,
+`yanolja_client.py`, `yanolja_service.py`, `kpms_client.py`, `kpms_service.py`,
+`post_call.py`, `dashboard_client.py`) are retained present-but-inert for fleet
+consistency, but the enforcement does NOT rely on a credential being absent:
+- **Tools:** `tools.py` `get_tools*()` are hard-wired to return `[]`. There is no
+  env var or PMS credential that can expose the (hotel-shaped) booking tools — an
+  inherited Yanolja key changes nothing. Re-enabling tools needs a code change.
+- **Egress fail-closed:** all post-call egress (LLM extraction, n8n, dashboard —
+  including the caller-metadata `call.started` event) ships nothing unless
+  `HORIZON_POST_CALL_EGRESS` is set to EXACTLY `enabled`. Any other value, a typo,
+  or an inherited dashboard/n8n config stays silent.
+- **WS ingress auth:** `/ws/conversation` and `/ws/media-stream/{lang}` require a
+  short-lived HMAC ticket minted into the TwiML wss URL (secret: `WS_TICKET_SECRET`
+  or the Twilio auth token), so a public `/ws/` cannot be driven by arbitrary
+  clients to burn LLM/STT/TTS.
+- **KB reload** validates the caller-supplied `filename` (bare basename, allowed
+  extension, contained in `knowledge_docs/`, no symlink/traversal).
 
 ## The stack
 
@@ -95,9 +106,11 @@ Real secrets live only in **`/opt/horizon/.env`** on the VPS (never committed).
 - Telephony: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`
 - KB reload: `KB_RELOAD_SECRET`
 
-`GEMINI_API_KEY` is **required** for the Sinhala Dialog stack. No PMS/booking
-keys and no Google STT key are configured — that is what keeps the demo
-inquiry-only.
+`GEMINI_API_KEY` is **required** for the Sinhala Dialog stack. No PMS/booking or
+Google STT keys are configured, but note inquiry-only does NOT depend on that —
+it is enforced in code (see the invariant list above). To enable real post-call
+egress in a production instance, set `HORIZON_POST_CALL_EGRESS=enabled`
+(fail-closed: any other value ships nothing).
 
 ## Caller-facing persona
 

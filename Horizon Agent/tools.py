@@ -1,17 +1,18 @@
 """
 Tool definitions for the Horizon (Vidya) inquiry-only voice agent.
 
-Horizon is an INQUIRY-ONLY demo: it must never expose booking/availability/
-cancellation/transfer tools. Unlike the HattonHills base — which gates tools on
-whether the booking API is configured — Horizon returns NO tools BY
-CONSTRUCTION, so inheriting a Yanolja/PMS credential from a shared .env can
-never turn booking tools on. Enabling them requires the explicit opt-in env
-`HORIZON_ENABLE_BOOKING_TOOLS=true`, which the demo never sets.
+Horizon is an INQUIRY-ONLY demo: it exposes NO tools, ever. The booking/
+availability/cancellation modules are retained (present-but-inert) only for
+fleet consistency with the other agents, but the exporters below are hard-wired
+to return an empty list — there is NO environment variable, PMS credential, or
+other runtime state that can turn them on. Making inquiry-only an invariant
+(rather than a toggle that could expose these hotel-shaped booking tools on an
+aviation-academy line) is deliberate; enabling tools here would require a code
+change and review, not a config flip.
 """
 
 import json
 import logging
-import os
 import uuid
 from datetime import datetime
 from typing import Any
@@ -21,24 +22,9 @@ from booking_api import (
     create_booking,
     retrieve_booking,
     cancel_booking,
-    is_configured,
 )
 
 logger = logging.getLogger(__name__)
-
-# Inquiry-only is the invariant. Tools are OFF unless a human deliberately opts
-# in via this env var — never merely because a PMS key leaked in from a shared
-# environment. `is_configured()` alone must NEVER be sufficient to expose tools.
-_BOOKING_TOOLS_OPT_IN = os.getenv("HORIZON_ENABLE_BOOKING_TOOLS", "false").strip().lower() in (
-    "1", "true", "yes",
-)
-
-
-def _tools_enabled() -> bool:
-    """True only when booking tools are BOTH explicitly opted in AND configured."""
-    if not _BOOKING_TOOLS_OPT_IN:
-        return False
-    return is_configured()
 
 # ---------------------------------------------------------------------------
 # Tool definitions (Claude function-calling schema)
@@ -228,52 +214,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 def get_tools() -> list[dict[str, Any]]:
-    """Return tool definitions (Anthropic format). Inquiry-only: [] by construction."""
-    if not _tools_enabled():
-        logger.info("Horizon is inquiry-only — no tools exposed (booking tools not opted in).")
-        return []
-    return TOOL_DEFINITIONS
+    """Inquiry-only invariant: Horizon exposes NO tools. Always []."""
+    return []
 
 
 def get_tools_openai() -> list[dict[str, Any]]:
-    """Return tool definitions in OpenAI function-calling format. Inquiry-only: [] by construction."""
-    if not _tools_enabled():
-        logger.info("Horizon is inquiry-only — no tools exposed (booking tools not opted in).")
-        return []
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool["name"],
-                "description": tool["description"],
-                "parameters": tool["input_schema"],
-            },
-        }
-        for tool in TOOL_DEFINITIONS
-    ]
+    """Inquiry-only invariant: Horizon exposes NO tools. Always []."""
+    return []
 
 
 def get_tools_gemini() -> list[dict[str, Any]]:
-    """Return tool definitions in Google Gemini native format.
-
-    Returns a list with a single Tool dict containing all function declarations.
-    Inquiry-only: [] by construction.
-    """
-    if not _tools_enabled():
-        logger.info("Horizon is inquiry-only — no tools exposed (booking tools not opted in).")
-        return []
-    return [
-        {
-            "function_declarations": [
-                {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["input_schema"],
-                }
-                for tool in TOOL_DEFINITIONS
-            ]
-        }
-    ]
+    """Inquiry-only invariant: Horizon exposes NO tools. Always []."""
+    return []
 
 
 async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
