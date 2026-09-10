@@ -88,6 +88,13 @@ class SessionRegistry:
         self._max_sessions = max_sessions
         self._active_sessions = 0
         self._rejected_capacity_total = 0
+        self._admitted_total = 0
+        self._released_total = 0
+        self._connected_total = 0
+        self._started_total = 0
+        self._media_frames_total = 0
+        self._stopped_total = 0
+        self._hung_up_total = 0
         self._lock = asyncio.Lock()
 
     async def try_acquire(self) -> _Lease | None:
@@ -96,17 +103,39 @@ class SessionRegistry:
                 self._rejected_capacity_total += 1
                 return None
             self._active_sessions += 1
+            self._admitted_total += 1
             return _Lease(self)
 
     async def _release(self) -> None:
         async with self._lock:
             self._active_sessions = max(0, self._active_sessions - 1)
+            self._released_total += 1
+
+    async def record(self, name: str) -> None:
+        async with self._lock:
+            if name == "connected":
+                self._connected_total += 1
+            elif name == "start":
+                self._started_total += 1
+            elif name == "media":
+                self._media_frames_total += 1
+            elif name == "stop":
+                self._stopped_total += 1
+            elif name == "hangup":
+                self._hung_up_total += 1
 
     def snapshot(self) -> dict[str, int]:
         return {
             "active_sessions": self._active_sessions,
             "max_sessions": self._max_sessions,
             "rejected_capacity_total": self._rejected_capacity_total,
+            "admitted_total": self._admitted_total,
+            "released_total": self._released_total,
+            "connected_total": self._connected_total,
+            "started_total": self._started_total,
+            "media_frames_total": self._media_frames_total,
+            "stopped_total": self._stopped_total,
+            "hung_up_total": self._hung_up_total,
         }
 
 
@@ -138,6 +167,7 @@ class SmartPBXGateway:
         try:
             await websocket.accept()
             context = await self._receive_start(websocket)
+            await self._registry.record("start")
             if context.account_id != self._settings.account_id:
                 raise ProtocolViolation(POLICY_VIOLATION, "account mismatch", "account_mismatch")
             transport = SmartPBXMediaTransport(
@@ -159,16 +189,20 @@ class SmartPBXGateway:
                     validate_event_context(event, context)
                     raise ProtocolViolation(POLICY_VIOLATION, "duplicate start", "duplicate_start")
                 if isinstance(event, MediaEvent):
+                    await self._registry.record("media")
                     await session.feed_audio(event.audio)
                 elif isinstance(event, DtmfEvent):
                     validate_event_context(event, context)
                     await session.feed_dtmf(event.digit)
                 elif isinstance(event, HangupEvent):
                     validate_event_context(event, context)
+                    await self._registry.record("hangup")
                     break
                 elif isinstance(event, StopEvent):
+                    await self._registry.record("stop")
                     break
                 elif isinstance(event, ConnectedEvent):
+                    await self._registry.record("connected")
                     continue
         except asyncio.TimeoutError:
             close = (POLICY_VIOLATION, "idle timeout")
@@ -201,6 +235,9 @@ class SmartPBXGateway:
             )
             if isinstance(event, StartEvent):
                 return event.context
+            if isinstance(event, ConnectedEvent):
+                await self._registry.record("connected")
+                continue
             if not isinstance(event, ConnectedEvent):
                 raise ProtocolViolation(POLICY_VIOLATION, "start required", "start_required")
 

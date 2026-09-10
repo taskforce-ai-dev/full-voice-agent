@@ -36,11 +36,17 @@ def test_shared_provider_events_are_the_only_runtime_event_definitions():
 def test_startup_wires_concrete_provider_methods_once_and_hot_path_reads_no_environment():
     startup = source("startup.py.tmpl")
     runtime = source("provider_runtime.py.tmpl")
+    builders = source("provider_builders.py.tmpl")
     assert "RuntimeConfiguration.from_environ(os.environ)" in startup
     assert "bind_provider_adapter(provider_profile, os.environ)" in startup
     assert "start_recognizer" in runtime
     assert "stream_response" in runtime
     assert "build_tts_adapter" in runtime
+    assert "GOOGLE_APPLICATION_CREDENTIALS" in builders
+    assert "AsyncAnthropic" in builders
+    assert "genai.Client" in builders
+    assert "httpx.AsyncClient" in builders
+    assert "SMARTPBX_ALLOW_SYNTHETIC_FOR_CI" in builders
     for name in ("provider_adapters.py.tmpl", "stt_adapters.py.tmpl", "llm_adapters.py.tmpl", "tts_adapters.py.tmpl", "turn_engine.py.tmpl"):
         assert "os.environ" not in source(name)
 
@@ -57,6 +63,8 @@ def test_runtime_entrypoint_exposes_health_authenticated_status_and_full_carrier
     assert "await lease.release()" in gateway
     assert "rejected_capacity_total" in gateway
     assert "active_sessions" in gateway
+    for counter in ("admitted_total", "released_total", "connected_total", "started_total", "media_frames_total", "stopped_total", "hung_up_total"):
+        assert counter in gateway
 
 
 def test_deepgram_is_not_an_approved_generated_runtime_provider():

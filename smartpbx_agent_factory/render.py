@@ -78,7 +78,7 @@ _BUSINESS_TOOLS = ("create_booking", "transfer_to_human", "hangup_call")
 _PROVIDER_RUNTIME = {
     "azure": {"requirements": ("azure-cognitiveservices-speech==1.51.1",), "environment": ("AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION")},
     "claude": {"requirements": ("anthropic==0.120.2",), "environment": ("ANTHROPIC_API_KEY",)},
-    "elevenlabs": {"requirements": ("httpx==0.28.1",), "environment": ("ELEVENLABS_API_KEY",)},
+    "elevenlabs": {"requirements": ("httpx==0.28.1",), "environment": ("ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID")},
     "gemini": {"requirements": ("google-genai==2.16.0",), "environment": ("GEMINI_API_KEY",)},
     "google": {"requirements": ("google-cloud-speech==2.40.0",), "environment": ("GOOGLE_APPLICATION_CREDENTIALS",)},
     "rime": {"requirements": ("httpx==0.28.1",), "environment": ("RIME_API_KEY",)},
@@ -96,6 +96,7 @@ def _provider_runtime_contract(manifest: AgentManifest) -> tuple[dict[str, objec
             raise RenderError(f"provider runtime is not approved: {unknown[0]}")
         selected.update(lanes.values())
         languages[language.code] = {
+            "locale": language.locale,
             "stt": language.stt, "stt_model": language.stt_model,
             "llm": language.llm, "llm_model": language.llm_model,
             "tts": language.tts, "tts_model": language.tts_model,
@@ -394,7 +395,7 @@ activation_state: pending
         "room_catalogue": {}, "room_aliases": {}, "transliterations": {}, "rates": {},
         "post_call_vocabulary": [], "knowledge_paths": ["/app/knowledge_docs/approved-facts.md"],
     }
-    runtime_templates = ("stt_adapters.py.tmpl", "llm_adapters.py.tmpl", "tts_adapters.py.tmpl")
+    runtime_templates = ("stt_adapters.py.tmpl", "llm_adapters.py.tmpl", "tts_adapters.py.tmpl", "provider_builders.py.tmpl")
     missing_templates = [name for name in runtime_templates if f"runtime/{name}" not in templates]
     if missing_templates:
         raise IncompleteTemplateError(f"INCOMPLETE_TEMPLATE: missing runtime template: {missing_templates[0]}")
@@ -418,6 +419,7 @@ activation_state: pending
         "product_profile.py": templates.get("runtime/product_profile.py.tmpl", "def load_product_profile(path): return object()\n"),
         "provider_adapters.py": templates.get("runtime/provider_adapters.py.tmpl", "class ConversationProviderAdapter: pass\n"),
         "provider_runtime.py": templates.get("runtime/provider_runtime.py.tmpl", "def bind_provider_adapter(*_args): raise RuntimeError('provider lane unavailable')\n"),
+        "provider_builders.py": templates["runtime/provider_builders.py.tmpl"],
         "stt_adapters.py": templates["runtime/stt_adapters.py.tmpl"],
         "llm_adapters.py": templates["runtime/llm_adapters.py.tmpl"],
         "tts_adapters.py": templates["runtime/tts_adapters.py.tmpl"],

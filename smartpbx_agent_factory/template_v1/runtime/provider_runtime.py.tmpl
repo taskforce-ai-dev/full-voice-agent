@@ -55,17 +55,29 @@ def _validate_exact_provider_selection(profile: ProviderProfile) -> None:
 
 def build_stt_adapter(profile: ProviderProfile, environ: Mapping[str, str]):
     """Startup-only STT builder; it never performs a hot-path environment read."""
-    raise ProviderCompositionError("source-approved STT SDK builder is not yet available")
+    from provider_builders import ProviderBuildError, build_stt_adapter as build
+    try:
+        return build(profile, environ)
+    except ProviderBuildError as error:
+        raise ProviderCompositionError(str(error)) from error
 
 
 def build_llm_adapter(profile: ProviderProfile, environ: Mapping[str, str]):
     """Startup-only LLM builder; its result must expose stream_response()."""
-    raise ProviderCompositionError("source-approved LLM SDK builder is not yet available")
+    from provider_builders import ProviderBuildError, build_llm_adapter as build
+    try:
+        return build(profile, environ)
+    except ProviderBuildError as error:
+        raise ProviderCompositionError(str(error)) from error
 
 
 def build_tts_adapter(profile: ProviderProfile, environ: Mapping[str, str]):
     """Startup-only TTS builder; its result must expose synthesize_audio()."""
-    raise ProviderCompositionError("source-approved TTS SDK builder is not yet available")
+    from provider_builders import ProviderBuildError, build_tts_adapter as build
+    try:
+        return build(profile, environ)
+    except ProviderBuildError as error:
+        raise ProviderCompositionError(str(error)) from error
 
 
 class _ComposedProviderAdapter:

@@ -113,6 +113,7 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
         "runtime/provider_adapters.py.tmpl": "class ConversationProviderAdapter: pass\n",
         "runtime/turn_engine.py.tmpl": "class ConversationTurnEngine: pass\n",
         "runtime/provider_runtime.py.tmpl": "def bind_provider_adapter(*_args): return object()\n",
+        "runtime/provider_builders.py.tmpl": "def build_stt_adapter(*_args): return object()\n",
         "runtime/stt_adapters.py.tmpl": "class SmartPBXSTTAdapter: pass\n",
         "runtime/llm_adapters.py.tmpl": "class InquiryOnlyLLMAdapter: pass\n",
         "runtime/tts_adapters.py.tmpl": "class SmartPBXTTSAdapter: pass\n",
