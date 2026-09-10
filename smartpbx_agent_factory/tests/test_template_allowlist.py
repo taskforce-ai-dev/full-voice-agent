@@ -39,6 +39,22 @@ def test_file_allowlist_accepts_metadata_wrapper(tmp_path):
     assert result["Kavya/server.py"] == digest
 
 
+def test_frozen_template_allowlist_records_approved_v06_source_and_immutable_image():
+    import json
+
+    allowlist = json.loads((__import__("pathlib").Path("smartpbx_agent_factory/template_v1/file_allowlist.json")).read_text())
+    assert allowlist["status"] == "approved"
+    assert allowlist["source_revision"] == "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e"
+    assert allowlist["oci_revision"] == allowlist["source_revision"]
+    assert allowlist["image_digest"] == "sha256:3d1cfce67574efd1c8bde484d26345c027713c4d169f37804114fecec5b81350"
+    assert allowlist["protocol_version"] == "smartpbx-ai-provider-v06"
+    assert set(allowlist["files"]) == {
+        "Kavya/smartpbx_protocol.py",
+        "Kavya/smartpbx_diagnostics.py",
+        "Kavya/smartpbx_transport.py",
+    }
+
+
 @pytest.mark.parametrize("unsafe", ("../server.py", "/server.py", "runtime/../server.py", "runtime\\server.py"))
 def test_file_allowlist_rejects_unsafe_source_or_template_paths(unsafe):
     with pytest.raises(ProvenanceError, match="unsafe path"):

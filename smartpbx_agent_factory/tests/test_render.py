@@ -71,9 +71,12 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
     )
 
 
-def test_real_template_path_fails_closed_until_approved_allowlist_exists(tmp_path):
-    with pytest.raises(TemplateUnavailableError, match="TEMPLATE_ALLOWLIST_UNAVAILABLE"):
-        render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path)
+def test_real_template_path_uses_the_approved_v06_source_bound_allowlist(tmp_path):
+    report = render_backend(fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path)
+    protocol = (tmp_path / "SmartPBX Agents/acme-inquiry/smartpbx_protocol.py").read_text(encoding="utf-8")
+    assert report.template_version == "v1"
+    assert "SMARTPBX_PROTOCOL_VERSION" not in protocol
+    assert "POLICY_VIOLATION = 1008" in protocol
 
 
 def test_inquiry_only_render_has_no_business_tools(tmp_path):
