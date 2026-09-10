@@ -140,6 +140,65 @@ def test_url_path_prefix_and_content_type_are_enforced_with_fake_transport(tmp_p
     assert (tmp_path / "out" / "knowledge_docs" / "source-001.md").is_file()
 
 
+@pytest.mark.parametrize("escaped_path", ("/public/%252e%252e/private", "/public%252fprivate"))
+def test_ambiguous_double_encoded_path_is_rejected_before_transport(escaped_path, tmp_path):
+    source = url_source(
+        f"https://allowed.example{escaped_path}",
+        origins=("https://allowed.example",),
+        path_prefixes=("/public/",),
+    )
+    builder, _, transport = fake_url_builder({}, {"allowed.example": ("8.8.8.8",)})
+    with pytest.raises(KnowledgeError, match="encoded|ambiguous"):
+        builder.build((source,), output_dir=tmp_path / "out")
+    assert transport.calls == []
+
+
+def test_ambiguous_double_encoded_redirect_is_rejected_before_second_transport(tmp_path):
+    source = url_source(
+        "https://allowed.example/public/start",
+        origins=("https://allowed.example",),
+        path_prefixes=("/public/",),
+    )
+    builder, _, transport = fake_url_builder(
+        {source.url: response(302, headers={"Location": "/public/%252e%252e/private"})}
+    )
+    with pytest.raises(KnowledgeError, match="encoded|ambiguous"):
+        builder.build((source,), output_dir=tmp_path / "out")
+    assert transport.calls == [(source.url, ("8.8.8.8",))]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        URLFetchResponse(status="200", headers={}, body=b""),
+        URLFetchResponse(status=200, headers=[], body=b""),
+        URLFetchResponse(status=200, headers={}, body="not-bytes"),
+        object(),
+    ),
+)
+def test_malformed_transport_response_is_rejected_as_knowledge_error(malformed, tmp_path):
+    source = url_source("https://allowed.example/faq", origins=("https://allowed.example",))
+
+    class MalformedTransport:
+        def fetch(self, url, addresses, timeout_seconds, max_bytes):
+            return malformed
+
+    builder = KnowledgeBuilderImpl(
+        resolver=FakeResolver({"allowed.example": ("8.8.8.8",)}), transport=MalformedTransport()
+    )
+    with pytest.raises(KnowledgeError, match="response"):
+        builder.build((source,), output_dir=tmp_path / "out")
+
+
+def test_oversized_redirect_location_is_rejected_as_knowledge_error(tmp_path):
+    source = url_source("https://allowed.example/start", origins=("https://allowed.example",))
+    builder, _, _ = fake_url_builder(
+        {source.url: response(302, headers={"Location": "/" + ("a" * 8192)})}
+    )
+    with pytest.raises(KnowledgeError, match="header|location"):
+        builder.build((source,), output_dir=tmp_path / "out")
+
+
 def test_url_origin_requires_exact_scheme_and_port_without_network_access(tmp_path):
     source = url_source("http://allowed.example:8443/faq", origins=("http://allowed.example:443",))
     with pytest.raises(KnowledgeError, match="origin"):
