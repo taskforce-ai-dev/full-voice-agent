@@ -98,6 +98,18 @@ class RepositoryOwnedCIVerificationCoordinator:
             raise GenerationBlockedError("repository-owned CI worktree binding is invalid")
         return worktrees
 
+    def publish_for_ci(self, *, generation_id: str, inventory: object) -> None:
+        publish = getattr(self.ci_result_adapter, "publish_for_ci", None)
+        if not callable(publish):
+            raise GenerationBlockedError("repository-owned CI publication is unavailable")
+        publish(generation_id=generation_id, inventory=inventory)
+
+    def preflight(self) -> None:
+        check = getattr(self.ci_result_adapter, "preflight", None)
+        if not callable(check):
+            raise GenerationBlockedError("repository-owned CI preflight is unavailable")
+        check()
+
 
 @dataclass(frozen=True)
 class LaneBinding:
@@ -207,6 +219,7 @@ class GenerationOrchestrator:
         self._inventory_provider = inventory_provider
         self._verification_coordinator = verification_coordinator
         self._pr_coordinator = pr_coordinator
+        self._last_pr_set: object | None = None
 
     def inspect(self, manifest_path: Path) -> Mapping[str, object]:
         """Report non-mutating prerequisite status; no target checkout is touched."""
@@ -795,6 +808,8 @@ class GenerationOrchestrator:
         if stored.state.stage is not Stage.GENERATED:
             raise GenerationBlockedError("verification requires exact committed generation lanes")
         try:
+            self._verification_coordinator.preflight()
+            self._verification_coordinator.publish_for_ci(generation_id=generation_id, inventory=stored.cleanup_inventory)
             readiness, reports = self._verification_coordinator.verify(
                 generation_id=generation_id, resources=stored.resources, lane_records=stored.state.lane_records
             )
@@ -859,13 +874,18 @@ class GenerationOrchestrator:
         if not callable(open_requests):
             raise GenerationBlockedError("review request coordinator is unavailable until the PR lane is configured")
         try:
-            open_requests(generation_id=generation_id, state=stored.state, inventory=stored.cleanup_inventory)
+            result = open_requests(generation_id=generation_id, state=stored.state, inventory=stored.cleanup_inventory)
         except GenerationBlockedError:
             raise
         except Exception as error:
             raise GenerationBlockedError("review request coordinator failed") from error
         self._save(stored)
+        self._last_pr_set = result
         return stored.state
+
+    @property
+    def last_pr_set(self) -> object | None:
+        return self._last_pr_set
 
     def _load_verified(self, generation_id: str) -> _StoredGeneration:
         stored = self._load(generation_id)

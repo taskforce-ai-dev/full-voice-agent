@@ -38,6 +38,9 @@ class FactoryBootstrapContractTests(unittest.TestCase):
                     "revision": "a" * 40,
                     "target_root": str(root / "worktrees" / role),
                     "repository": f"acme/{role}",
+                    "base_branch": "main",
+                    "ci_check": f"{role}-gate",
+                    "ci_policy": "lifecycle-attestation" if role == "backend" else ("secret-static" if role == "operations" else "website-build"),
                 }
                 for role in ("backend", "operations", "website")
             },
@@ -142,6 +145,15 @@ class FactoryBootstrapContractTests(unittest.TestCase):
             records = {role: {"head_sha": "a" * 40, "artifact_digest": "b" * 64} for role in ("backend", "operations", "website")}
             with self.assertRaises(GenerationBlockedError):
                 adapter.verify(generation_id="gen-" + "a" * 32, resources=resources, lane_records=records)
+
+    def test_wizard_writes_private_non_secret_review_manifest(self) -> None:
+        from smartpbx_agent_factory.cli import create_manifest_wizard
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "manifest.json"
+            answers = iter(("Acme Review", "acme-review", "en", "azure-claude-elevenlabs", "/tmp/approved-faq.txt"))
+            create_manifest_wizard(output, input_fn=lambda prompt: next(answers))
+            self.assertEqual(oct(output.stat().st_mode & 0o777), "0o600")
+            self.assertEqual(json.loads(output.read_text())["slug"], "acme-review")
 
 
 if __name__ == "__main__":

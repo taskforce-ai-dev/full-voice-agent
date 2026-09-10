@@ -42,7 +42,7 @@ from .secrets import (
     RepositoryVisibilityVerifier,
     SopsAgeSecretProvider,
 )
-from .verify import VerificationReport
+from .verify import VerificationReport, load_lifecycle_attestation
 
 
 class FactoryConfigError(ValueError):
@@ -89,6 +89,9 @@ class LaneConfig:
     revision: str
     target_root: Path
     repository: str
+    base_branch: str
+    ci_check: str
+    ci_policy: str
 
 
 @dataclass(frozen=True)
@@ -134,7 +137,7 @@ class FactoryConfig:
         for role in _ROLES:
             item = _object(
                 lanes_raw[role], role,
-                {"primary", "remote", "canonical_remote", "revision", "target_root", "repository"},
+                {"primary", "remote", "canonical_remote", "revision", "target_root", "repository", "base_branch", "ci_check", "ci_policy"},
             )
             revision = _text(item["revision"], f"{role}.revision", pattern=_SHA)
             if revision.lower() != revision or revision == "0" * 40:
@@ -149,7 +152,12 @@ class FactoryConfig:
                 revision,
                 _absolute_path(item["target_root"], f"{role}.target_root"),
                 _text(item["repository"], f"{role}.repository", pattern=_REPOSITORY),
+                _text(item["base_branch"], f"{role}.base_branch", pattern=_REMOTE),
+                _text(item["ci_check"], f"{role}.ci_check"),
+                _text(item["ci_policy"], f"{role}.ci_policy"),
             )
+            if lanes[role].ci_policy not in {"lifecycle-attestation", "secret-static", "website-build"} or (role == "backend") != (lanes[role].ci_policy == "lifecycle-attestation"):
+                raise FactoryConfigError(f"{role}.ci_policy is not approved")
         roots = [lane.target_root for lane in lanes.values()]
         if len(set(roots)) != len(roots):
             raise FactoryConfigError("lane target roots must be distinct")
@@ -289,7 +297,8 @@ class GitHubCommandAdapter(RepositoryVisibilityVerifier, PRProvider, WorktreeIns
             handle.write(body)
             body_path = Path(handle.name)
         try:
-            return self._call((str(self._config.ci.gh_binary), "pr", "create", "--repo", repository, "--head", branch, "--title", title, "--body-file", str(body_path)))
+            lane = next(lane for lane in self._config.lanes.values() if lane.repository == repository)
+            return self._call((str(self._config.ci.gh_binary), "pr", "create", "--repo", repository, "--head", branch, "--base", lane.base_branch, "--title", title, "--body-file", str(body_path)))
         finally:
             body_path.unlink(missing_ok=True)
 
@@ -317,11 +326,28 @@ class GitHubCIResultAdapter:
     def __init__(self, config: FactoryConfig, *, runner: Callable[[Sequence[str]], object] = _run) -> None:
         self._config, self._runner = config, runner
 
-    def verify(self, *, generation_id: str, resources: object, lane_records: Mapping[str, Mapping[str, str]]) -> tuple[ReadinessEvidence, Mapping[str, VerificationReport]]:
+    def preflight(self) -> None:
         try:
-            allowlist = validate_allowlist_metadata(json.loads((Path(__file__).parent / "template_v1" / "file_allowlist.json").read_text(encoding="utf-8")))
+            validate_allowlist_metadata(json.loads((Path(__file__).parent / "template_v1" / "file_allowlist.json").read_text(encoding="utf-8")))
         except Exception as error:
             raise GenerationBlockedError("approved template provenance is unavailable") from error
+
+    def publish_for_ci(self, *, generation_id: str, inventory: object) -> None:
+        """Publish only exact, clean factory branches so repository CI can attest them."""
+        handles = getattr(inventory, "worktrees", ())
+        publisher = GitHubCommandAdapter(self._config, runner=self._runner)
+        for role, lane in self._config.lanes.items():
+            matches = [item for item in handles if getattr(item, "target", None) == lane.target_root / generation_id]
+            if len(matches) != 1:
+                raise GenerationBlockedError("CI publication requires exact generated worktrees")
+            handle = WorktreeManager(lane.target_root).reuse_recorded(matches[0])
+            if handle.branch is None:
+                raise GenerationBlockedError("CI publication requires generated review branches")
+            publisher.push_generated_branch(role=role, path=handle.target, remote=lane.remote, branch=handle.branch)
+
+    def verify(self, *, generation_id: str, resources: object, lane_records: Mapping[str, Mapping[str, str]]) -> tuple[ReadinessEvidence, Mapping[str, VerificationReport]]:
+        self.preflight()
+        allowlist = validate_allowlist_metadata(json.loads((Path(__file__).parent / "template_v1" / "file_allowlist.json").read_text(encoding="utf-8")))
         if set(lane_records) != set(_ROLES):
             raise GenerationBlockedError("CI requires exact committed records for all lanes")
         for role in _ROLES:
@@ -337,10 +363,28 @@ class GitHubCIResultAdapter:
                 checks = json.loads(str(getattr(result, "stdout", ""))).get("check_runs", [])
             except (TypeError, ValueError) as error:
                 raise GenerationBlockedError("external CI result is malformed") from error
-            matches = [check for check in checks if isinstance(check, dict) and check.get("name") == self._config.ci.workflow and check.get("conclusion") == "success"]
-            required_markers = (sha, artifact, "secret_scan_passed=true", "runtime_lifecycle_verified=true")
+            matches = [check for check in checks if isinstance(check, dict) and check.get("name") == lane.ci_check and check.get("conclusion") == "success" and check.get("head_sha", sha) == sha]
+            required_markers = (sha, artifact)
+            if lane.ci_policy == "lifecycle-attestation":
+                required_markers += ("smartpbx-ci-lifecycle-attestations",)
             if not matches or not any(all(marker in json.dumps(check, sort_keys=True) for marker in required_markers) for check in matches):
                 raise GenerationBlockedError("external CI result is pending or lacks exact lane provenance")
+            if lane.ci_policy == "lifecycle-attestation":
+                details = str(matches[0].get("details_url", ""))
+                run_match = re.search(r"/actions/runs/([1-9][0-9]*)", details)
+                if run_match is None:
+                    raise GenerationBlockedError("repository-owned lifecycle attestation is unavailable")
+                with tempfile.TemporaryDirectory(prefix=".smartpbx-ci-", dir=str(lane.target_root)) as directory:
+                    os.chmod(directory, 0o700)
+                    downloaded = self._runner((str(self._config.ci.gh_binary), "run", "download", run_match.group(1), "--repo", lane.repository, "-n", "smartpbx-ci-lifecycle-attestations", "-D", directory))
+                    if getattr(downloaded, "returncode", 1) != 0:
+                        raise GenerationBlockedError("repository-owned lifecycle attestation is unavailable")
+                    files = tuple(Path(directory).glob("*.json"))
+                    if len(files) != 1:
+                        raise GenerationBlockedError("repository-owned lifecycle attestation is unavailable")
+                    attestation = load_lifecycle_attestation(files[0], agent_dir=lane.target_root / generation_id / "SmartPBX Agents" / getattr(resources, "slug"), lane=self._config.ci.workflow, source_sha=sha)
+                    if attestation.artifact_digest != artifact:
+                        raise GenerationBlockedError("lifecycle attestation artifact digest differs from lane record")
         artifact_digests = {role: lane_records[role]["artifact_digest"] for role in _ROLES}
         reports = {
             role: VerificationReport(

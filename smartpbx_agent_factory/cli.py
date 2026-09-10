@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -35,6 +37,8 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     bootstrap = commands.add_parser("bootstrap", help="validate strict non-secret factory configuration")
     _add_runtime_arguments(bootstrap)
+    wizard = commands.add_parser("new", help="interactively write a reviewable non-secret manifest")
+    wizard.add_argument("--output", required=True, type=Path)
     for name in ("inspect", "plan"):
         command = commands.add_parser(name)
         command.add_argument("--manifest", required=True, type=Path)
@@ -69,6 +73,12 @@ def invoke_cli(argv: Sequence[str] | None = None) -> CLIResult:
         args = parser.parse_args(argv)
     except SystemExit as error:
         return CLIResult(EXIT_INVALID_INPUT if error.code else EXIT_SUCCESS)
+    if args.command == "new":
+        try:
+            path = create_manifest_wizard(args.output.resolve())
+            return CLIResult(EXIT_SUCCESS, f"manifest={path}\nnext: inspect --config <factory.json> --manifest {path}\n")
+        except (ValueError, OSError) as error:
+            return CLIResult(EXIT_INVALID_INPUT, stderr=f"manifest wizard blocked: {error}\n")
     if not args.config:
         return CLIResult(EXIT_INVALID_INPUT, stderr="--config is required; the factory will not guess repositories, revisions, or credential sources\n")
     try:
@@ -107,6 +117,11 @@ def invoke_cli(argv: Sequence[str] | None = None) -> CLIResult:
             state = orchestrator.abandon(args.generation_id)
         elif args.command == "open-pr":
             state = orchestrator.open_pr(args.generation_id)
+            result = orchestrator.last_pr_set
+            urls = (getattr(result, "backend_url", None), getattr(result, "operations_url", None), getattr(result, "website_url", None))
+            if not all(isinstance(url, str) for url in urls):
+                raise GenerationBlockedError("PR coordinator returned no validated URLs")
+            return CLIResult(EXIT_SUCCESS, "backend_pr=" + urls[0] + "\noperations_pr=" + urls[1] + "\nwebsite_pr=" + urls[2] + "\nreview_order=backend,operations,website\nstage=THREE_PRS_OPENED\n")
         else:
             raise GenerationBlockedError("unsupported CLI command")
         return CLIResult(EXIT_SUCCESS, f"generation_id={state.generation_id}\nstage={state.stage.value}\n")
@@ -129,3 +144,39 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(result.stderr, end="", file=sys.stderr)
     return result.exit_code
+
+
+def create_manifest_wizard(output: Path, *, input_fn=input) -> Path:
+    """Ask only non-secret generation inputs and atomically write mode-0600 JSON."""
+    if not output.is_absolute() or output.exists() or output.is_symlink():
+        raise ValueError("manifest output must be a new non-symlink absolute path")
+    def ask(label: str, pattern: str) -> str:
+        value = input_fn(label).strip()
+        if not __import__("re").fullmatch(pattern, value):
+            raise ValueError(f"invalid {label.rstrip(': ')}")
+        return value
+    company = ask("Company display name: ", r"[A-Za-z0-9][A-Za-z0-9 .,'&()-]{1,79}")
+    slug = ask("Company slug: ", r"[a-z0-9]+(?:-[a-z0-9]+){0,10}")
+    languages = ask("Languages (comma-separated ISO codes): ", r"[a-z]{2}(?:,[a-z]{2}){0,5}").split(",")
+    provider = ask("Approved provider set (azure-claude-elevenlabs): ", r"azure-claude-elevenlabs")
+    knowledge = ask("Approved local knowledge path: ", r"/[A-Za-z0-9._/-]{1,220}")
+    if "secret" in knowledge.lower() or "token" in knowledge.lower():
+        raise ValueError("knowledge path may not identify secret material")
+    document = {
+        "schema_version": 1, "display_name": company, "public_name": company, "slug": slug,
+        "agent_name": f"{company} Guide", "industry": "general information", "purpose": "Answer approved company questions",
+        "audience": "prospective customers", "profile": "demo", "timezone": "UTC", "operating_hours": {"mon-fri": "09:00-17:00"},
+        "technical_owner": "review-required@example.invalid",
+        "languages": [{"code": code, "locale": f"{code}-{code.upper()}", "stt": {"provider": "azure"}, "llm": {"provider": "claude", "model": "claude-sonnet-4-5-20250929"}, "tts": {"provider": "elevenlabs", "model": "eleven_flash_v2_5"}, "greeting": f"Welcome to {company}."} for code in languages],
+        "allowed_topics": ["company information"], "refused_topics": ["account changes"],
+        "pii_policy": {"explicit_consent": False, "collect_name": False, "collect_phone": False}, "capabilities": {},
+        "knowledge_sources": [{"kind": "local", "path": knowledge, "owner": company, "effective_date": "2026-09-10", "classification": "public"}],
+        "smartpbx": {"account_id": "review-required", "capacity": 1, "protocol_profile": "smartpbx-ai-provider-v07", "status_authentication": True},
+        "operations": {"alert_owner": "review-required@example.invalid", "support_contact": "review-required@example.invalid"}, "website_demo": {"enabled": True, "visibility": "pending"},
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, sort_keys=True, indent=2)
+        handle.write("\n")
+    return output

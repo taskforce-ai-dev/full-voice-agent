@@ -389,11 +389,10 @@ class SopsAgeSecretProvider:
     def generate(self, name: str, *, length: int = 32) -> str:
         """Generate once per stable name and retain it only in generation state."""
         self._validate_secret_name(name)
-        # Generated per-agent material has no external credential source.  The
-        # complete SOPS/age policy was already validated by ``validate()``;
-        # requiring a config entry for an as-yet-unknown agent slug would force
-        # either wildcard policy matching or a secret-plan workaround.
-        self.validate()
+        # Even generated per-agent material requires an exact reviewed record
+        # identifier.  Wildcards would let a mismatched manifest mint a secret
+        # outside the approved catalogue surface.
+        self._policy_for(name)
         if not isinstance(length, int) or length < 16 or length > 256:
             raise SecretError("secret length must be between 16 and 256")
         existing = self._generation_state.get(name)
