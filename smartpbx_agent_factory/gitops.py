@@ -215,3 +215,65 @@ class WorktreeManager:
             elif line.startswith("branch "):
                 current_branch = line.removeprefix("branch ")
         return entries
+
+
+class GitWorktreeInspector:
+    """Re-read a manager-owned generation worktree immediately before PR use.
+
+    A caller supplies the opaque token from a ``WorktreeHandle``; this adapter
+    never treats a path alone as evidence of generation ownership.
+    """
+
+    def __init__(self, handles: Sequence[WorktreeHandle], *, run: Runner = _subprocess_runner) -> None:
+        self._run = run
+        self._handles = {
+            handle.ownership_token: handle
+            for handle in handles
+            if isinstance(handle, WorktreeHandle)
+            and _OWNERSHIP_TOKEN_RE.fullmatch(handle.ownership_token)
+        }
+
+    def inspect_worktree(self, *, path: Path, ownership_handle: str):
+        """Return bounded Git evidence only for one exact recorded worktree."""
+        if not isinstance(path, Path) or not isinstance(ownership_handle, str):
+            raise WorktreeConflictError("worktree ownership evidence is invalid")
+        handle = self._handles.get(ownership_handle)
+        if handle is None or handle.target.resolve() != path.resolve():
+            raise WorktreeConflictError("worktree ownership evidence is invalid")
+        if handle.branch is None or not _GENERATION_BRANCH_RE.fullmatch(handle.branch):
+            raise WorktreeConflictError("generation branch is invalid")
+        target = path.resolve()
+        if not target.is_dir() or not (target / ".git").exists():
+            raise WorktreeConflictError("generation worktree is unavailable")
+        remote = self._run(("git", "-C", str(target), "remote", "get-url", "origin")).strip()
+        repository = self._github_repository(remote)
+        branch = self._run(("git", "-C", str(target), "branch", "--show-current")).strip()
+        head = self._run(("git", "-C", str(target), "rev-parse", "HEAD")).strip()
+        clean = not self._run(("git", "-C", str(target), "status", "--porcelain")).strip()
+        if branch != handle.branch or not _SHA_RE.fullmatch(head):
+            raise WorktreeConflictError("generation worktree Git state is invalid")
+        # Import locally so the PR contract remains an adapter boundary rather
+        # than making gitops a PR coordinator.
+        from .prs import WorktreeInspection
+
+        return WorktreeInspection(
+            path=target,
+            repository=repository,
+            branch=branch,
+            head_sha=head,
+            clean=clean,
+            ownership_handle=ownership_handle,
+        )
+
+    @staticmethod
+    def _github_repository(remote: str) -> str:
+        patterns = (
+            re.compile(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?"),
+            re.compile(r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?"),
+            re.compile(r"ssh://git@github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?"),
+        )
+        for pattern in patterns:
+            match = pattern.fullmatch(remote)
+            if match:
+                return f"{match.group(1)}/{match.group(2)}"
+        raise WorktreeConflictError("generation worktree origin is not an exact GitHub repository")
