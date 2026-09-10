@@ -1,0 +1,76 @@
+"""ASGI construction from injected runtime dependencies, with no environment reads."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+
+from product_profile import ProductProfile, load_product_profile
+from provider_adapters import AfterCallHook, ConversationProviderAdapter, Retriever
+from smartpbx_gateway import CarrierIngressSettings, SessionRegistry, SmartPBXGateway
+from smartpbx_session import InquirySmartPBXSession
+
+
+@dataclass(frozen=True)
+class RuntimeDependencies:
+    ingress: CarrierIngressSettings
+    product_profile: ProductProfile
+    provider_adapter: ConversationProviderAdapter
+    retriever: Retriever | None = None
+    after_call_hook: AfterCallHook | None = None
+
+
+def load_runtime(
+    *,
+    ingress: CarrierIngressSettings,
+    product_profile_path: str,
+    provider_adapter: ConversationProviderAdapter,
+    retriever: Retriever | None = None,
+    after_call_hook: AfterCallHook | None = None,
+) -> RuntimeDependencies:
+    """Startup-only wiring; the profile is frozen before a call can begin."""
+    from pathlib import Path
+
+    return RuntimeDependencies(
+        ingress=ingress,
+        product_profile=load_product_profile(Path(product_profile_path)),
+        provider_adapter=provider_adapter,
+        retriever=retriever,
+        after_call_hook=after_call_hook,
+    )
+
+
+def build_service_app(runtime: RuntimeDependencies) -> FastAPI:
+    registry = SessionRegistry(runtime.ingress.max_calls)
+    gateway = SmartPBXGateway(runtime.ingress, registry)
+    app = FastAPI(title=runtime.product_profile.display_name, docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok", "service_mode": "smartpbx"}
+
+    @app.get("/smartpbx/status")
+    def status(request: Request) -> dict[str, bool | int]:
+        if not runtime.ingress.token_matches(request.headers.get(runtime.ingress.auth_header_name, "")):
+            raise HTTPException(status_code=401)
+        return gateway.snapshot()
+
+    @app.websocket("/ws/v1/smartpbx/media")
+    async def media(websocket: WebSocket) -> None:
+        async def create_session(context: Any, transport: Any) -> InquirySmartPBXSession:
+            return InquirySmartPBXSession(
+                context,
+                transport,
+                lambda *_args: None,
+                provider_adapter=runtime.provider_adapter,
+                product_profile=runtime.product_profile,
+                retriever=runtime.retriever,
+                after_call_hook=runtime.after_call_hook,
+            )
+
+        await gateway.handle(websocket, create_session)
+
+    app.state.smartpbx_gateway = gateway
+    return app

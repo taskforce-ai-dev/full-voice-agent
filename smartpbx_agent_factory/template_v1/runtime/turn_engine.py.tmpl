@@ -1,0 +1,96 @@
+"""Streaming endpoint-to-media turn orchestration with injected providers."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterable
+from typing import Any
+
+from product_profile import LanguageProfile, ProductProfile
+from provider_adapters import ConversationProviderAdapter, Retriever
+
+
+class ConversationTurnEngine:
+    """Preserves the audio -> endpoint -> LLM stream -> TTS -> transport path."""
+
+    def __init__(
+        self,
+        provider_adapter: ConversationProviderAdapter,
+        transport: Any,
+        product_profile: ProductProfile,
+        *,
+        retriever: Retriever | None = None,
+    ) -> None:
+        self._provider_adapter = provider_adapter
+        self._transport = transport
+        self._product_profile = product_profile
+        self._retriever = retriever
+        self.turns_completed = 0
+        self._turn_lock = asyncio.Lock()
+
+    @property
+    def active(self) -> bool:
+        return bool(getattr(self._provider_adapter, "active", False))
+
+    async def accept_audio(self, audio: bytes, language: LanguageProfile) -> bool:
+        """Feed audio and emit only after the STT adapter reports an endpoint."""
+        async with self._turn_lock:
+            return await self._accept_audio(audio, language)
+
+    async def _accept_audio(self, audio: bytes, language: LanguageProfile) -> bool:
+        if not self.active:
+            raise RuntimeError("conversation provider adapter is inactive")
+        transcript = await self._provider_adapter.transcribe_audio(bytes(audio), language.code)
+        if not transcript:
+            return False
+        context = ""
+        if self._retriever is not None:
+            context = await self._retriever.retrieve(transcript, self._product_profile)
+        prompt = _build_prompt(self._product_profile, language, context)
+        emitted = False
+        response = await self._provider_adapter.generate_response(transcript, language.code, prompt)
+        async for response_chunk in _iterate_text(response):
+            if not response_chunk:
+                continue
+            audio_result = await self._provider_adapter.synthesize_audio(response_chunk, language.code)
+            async for audio_chunk in _iterate_audio(audio_result):
+                if audio_chunk:
+                    await self._transport.send_audio(audio_chunk)
+                    emitted = True
+        if emitted:
+            send_mark = getattr(self._transport, "send_mark", None)
+            if callable(send_mark):
+                await send_mark("conversation-turn")
+        self.turns_completed += 1
+        return emitted
+
+
+def _build_prompt(profile: ProductProfile, language: LanguageProfile, context: str) -> str:
+    pieces = [
+        "You are an inquiry assistant.",
+        language.prompt_block,
+        "Use only reviewed knowledge. Do not perform business actions.",
+    ]
+    if context:
+        pieces.append(context)
+    return "\n\n".join(piece for piece in pieces if piece)
+
+
+async def _iterate_text(value: str | AsyncIterable[str]) -> AsyncIterable[str]:
+    if isinstance(value, str):
+        yield value
+        return
+    async for item in value:
+        if not isinstance(item, str):
+            raise TypeError("LLM adapter yielded non-text content")
+        yield item
+
+
+async def _iterate_audio(value: bytes | AsyncIterable[bytes]) -> AsyncIterable[bytes]:
+    if isinstance(value, bytes):
+        yield value
+        return
+    async for item in value:
+        if not isinstance(item, bytes):
+            raise TypeError("TTS adapter yielded non-audio content")
+        yield item

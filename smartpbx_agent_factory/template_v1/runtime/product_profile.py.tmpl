@@ -1,0 +1,113 @@
+"""Reviewed product configuration loaded once before a call is admitted.
+
+This module deliberately does not parse an agent manifest on a turn path.  A
+renderer writes the reviewed profile data and the application loads it once at
+startup, before constructing any ConversationSession.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
+
+
+@dataclass(frozen=True)
+class LanguageProfile:
+    code: str
+    locale: str
+    stt: str
+    llm: str
+    tts: str
+    prompt_block: str
+    greeting: str = ""
+
+
+@dataclass(frozen=True)
+class ProductProfile:
+    """Tenant-owned reviewed data, isolated from the conversational mechanics."""
+
+    display_name: str
+    language_profiles: Mapping[str, LanguageProfile]
+    default_language: str
+    room_catalogue: Mapping[str, object]
+    room_aliases: Mapping[str, str]
+    transliterations: Mapping[str, str]
+    rates: Mapping[str, object]
+    post_call_vocabulary: tuple[str, ...]
+    knowledge_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "language_profiles", MappingProxyType(dict(self.language_profiles)))
+        object.__setattr__(self, "room_catalogue", MappingProxyType(dict(self.room_catalogue)))
+        object.__setattr__(self, "room_aliases", MappingProxyType(dict(self.room_aliases)))
+        object.__setattr__(self, "transliterations", MappingProxyType(dict(self.transliterations)))
+        object.__setattr__(self, "rates", MappingProxyType(dict(self.rates)))
+
+    def language(self, code: str) -> LanguageProfile:
+        try:
+            return self.language_profiles[code]
+        except KeyError as exc:
+            raise ValueError("requested language is not configured") from exc
+
+
+def load_product_profile(path: Path) -> ProductProfile:
+    """Load generated reviewed configuration once during service construction."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping):
+        raise ValueError("product profile must be an object")
+    languages = raw.get("languages")
+    if not isinstance(languages, Mapping) or not languages:
+        raise ValueError("product profile requires language profiles")
+    parsed_languages: dict[str, LanguageProfile] = {}
+    for code, value in languages.items():
+        if not isinstance(code, str) or not isinstance(value, Mapping):
+            raise ValueError("invalid language profile")
+        values = {name: value.get(name, "") for name in ("locale", "stt", "llm", "tts", "prompt_block", "greeting")}
+        if not all(isinstance(item, str) for item in values.values()):
+            raise ValueError("invalid language profile")
+        parsed_languages[code] = LanguageProfile(code=code, **values)
+    default_language = raw.get("default_language")
+    if not isinstance(default_language, str) or default_language not in parsed_languages:
+        raise ValueError("product profile default language is invalid")
+    display_name = raw.get("display_name")
+    if not isinstance(display_name, str) or not display_name:
+        raise ValueError("product profile display name is invalid")
+    return ProductProfile(
+        display_name=display_name,
+        language_profiles=parsed_languages,
+        default_language=default_language,
+        room_catalogue=_mapping(raw.get("room_catalogue", {}), "room_catalogue"),
+        room_aliases=_string_mapping(raw.get("room_aliases", {}), "room_aliases"),
+        transliterations=_string_mapping(raw.get("transliterations", {}), "transliterations"),
+        rates=_mapping(raw.get("rates", {}), "rates"),
+        post_call_vocabulary=_strings(raw.get("post_call_vocabulary", ()), "post_call_vocabulary"),
+        knowledge_paths=_strings(raw.get("knowledge_paths", ()), "knowledge_paths"),
+    )
+
+
+def test_product_profile() -> ProductProfile:
+    """A content-free profile used only by the disposable lifecycle contract."""
+    language = LanguageProfile("en", "en-US", "synthetic", "synthetic", "synthetic", "Answer approved inquiries.")
+    return ProductProfile("Inquiry Agent", {"en": language}, "en", {}, {}, {}, {}, (), ())
+
+
+def _mapping(value: object, label: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
+        raise ValueError(f"product profile {label} is invalid")
+    return dict(value)
+
+
+def _string_mapping(value: object, label: str) -> Mapping[str, str]:
+    mapping = _mapping(value, label)
+    if not all(isinstance(item, str) for item in mapping.values()):
+        raise ValueError(f"product profile {label} is invalid")
+    return {key: value for key, value in mapping.items() if isinstance(value, str)}
+
+
+def _strings(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"product profile {label} is invalid")
+    return tuple(value)

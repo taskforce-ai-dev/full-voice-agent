@@ -1,0 +1,77 @@
+"""Client-neutral SmartPBX conversation session with no tenant business tools."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+from product_profile import ProductProfile, test_product_profile
+from provider_adapters import AfterCallHook, ConversationProviderAdapter, Retriever
+from turn_engine import ConversationTurnEngine
+
+
+class InquirySmartPBXSession:
+    """A call-local language session that delegates only to injected providers."""
+
+    def __init__(
+        self,
+        _context: Any,
+        transport: Any,
+        _diagnostic_sink: Any,
+        *,
+        provider_adapter: ConversationProviderAdapter,
+        product_profile: ProductProfile | None = None,
+        retriever: Retriever | None = None,
+        after_call_hook: AfterCallHook | None = None,
+    ) -> None:
+        self._transport = transport
+        self._provider_adapter = provider_adapter
+        self._product_profile = product_profile or test_product_profile()
+        self._after_call_hook = after_call_hook
+        self._turn_engine = ConversationTurnEngine(
+            provider_adapter, transport, self._product_profile, retriever=retriever
+        )
+        self.terminal_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.close_reason: str | None = None
+        self._selected_language: str | None = None
+        self._started = False
+        self._finished = False
+
+    @property
+    def supported_languages(self) -> tuple[str, ...]:
+        return tuple(self._product_profile.language_profiles)
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        if not self._turn_engine.active:
+            raise RuntimeError("conversation provider adapter is inactive")
+        self._started = True
+        self._selected_language = self._product_profile.default_language
+
+    async def feed_dtmf(self, digit: str) -> None:
+        if not self._started or self._finished:
+            return
+        selected = {"1": "en", "2": "si"}.get(digit)
+        if selected in self._product_profile.language_profiles:
+            self._selected_language = selected
+
+    async def feed_audio(self, audio: bytes) -> None:
+        if not self._started:
+            raise RuntimeError("SmartPBX session is not started")
+        if self._finished:
+            return
+        language = self._product_profile.language(self._selected_language or self._product_profile.default_language)
+        await self._turn_engine.accept_audio(audio, language)
+
+    async def finish(self, **_kwargs: object) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if self._after_call_hook is not None and self._selected_language is not None:
+            await self._after_call_hook.complete(
+                language=self._product_profile.language(self._selected_language),
+                turns=self._turn_engine.turns_completed,
+            )
+        if not self.terminal_future.done():
+            self.terminal_future.set_result(None)

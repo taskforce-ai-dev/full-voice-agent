@@ -1,0 +1,56 @@
+"""Provider-neutral STT, LLM, and TTS boundaries for the conversation core."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterable
+from typing import Protocol
+
+from product_profile import LanguageProfile, ProductProfile
+
+
+class STTAdapter(Protocol):
+    active: bool
+
+    async def transcribe_audio(self, audio: bytes, language: str) -> str | None:
+        """Return a final endpointed transcript, or None while speech continues."""
+
+
+class LLMAdapter(Protocol):
+    active: bool
+
+    async def generate_response(
+        self, transcript: str, language: str, prompt: str
+    ) -> str | AsyncIterable[str]:
+        """Return one response or a streaming sequence of response fragments."""
+
+
+class TTSAdapter(Protocol):
+    active: bool
+
+    async def synthesize_audio(
+        self, response: str, language: str
+    ) -> bytes | AsyncIterable[bytes]:
+        """Return encoded SmartPBX audio or a streaming sequence of chunks."""
+
+
+class ConversationProviderAdapter(STTAdapter, LLMAdapter, TTSAdapter, Protocol):
+    """One injected provider bundle; no key, model, or environment lookup lives here."""
+
+
+class Retriever(Protocol):
+    async def retrieve(self, transcript: str, profile: ProductProfile) -> str:
+        """Return reviewed knowledge context for an inquiry, without side effects."""
+
+
+class Toolset(Protocol):
+    """Reserved explicit seam; inquiry-only generated profiles pass no toolset."""
+
+
+class HandoffHook(Protocol):
+    async def handoff(self, reason: str) -> None:
+        """Reserved explicit seam; inquiry-only generated profiles pass no hook."""
+
+
+class AfterCallHook(Protocol):
+    async def complete(self, *, language: LanguageProfile, turns: int) -> None:
+        """Optional metadata-only hook; it receives no transcript or audio payload."""
