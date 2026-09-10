@@ -133,6 +133,8 @@ def _review_facts(review: KnowledgeReview, state: GenerationState | None, manife
         raise ReviewNotApprovedError("generation state requires matching plan approval before rendering")
     if not isinstance(review.digest, str) or not _SHA256_RE.fullmatch(review.digest):
         raise ReviewNotApprovedError("knowledge review digest must be a sha256 hex digest")
+    if review.executed_instructions is not False:
+        raise ReviewNotApprovedError("knowledge review must not contain executed instructions")
     if (
         state.knowledge_review_digest != review.digest
         or state.knowledge_approval_digest != review.digest

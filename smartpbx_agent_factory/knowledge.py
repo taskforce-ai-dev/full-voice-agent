@@ -107,6 +107,8 @@ class KnowledgeReview:
 
     def require_approved(self, approval: str | GenerationState) -> None:
         """Require the immutable review digest, optionally from generation state."""
+        if self.executed_instructions is not False:
+            raise KnowledgeApprovalRequired("knowledge review must not contain executed instructions")
         if isinstance(approval, GenerationState):
             expected = approval.knowledge_approval_digest
             if expected != self.digest:
@@ -128,6 +130,8 @@ def recompute_knowledge_review_digest(review: KnowledgeReview) -> str:
     inaccessible = _require_string_tuple(review.inaccessible_sources, "knowledge review inaccessible sources")
     duplicates = _require_string_tuple(review.duplicate_facts, "knowledge review duplicate facts")
     instructions = _require_string_tuple(review.instruction_findings, "knowledge review instruction findings")
+    if type(review.executed_instructions) is not bool:
+        raise KnowledgeError("knowledge review executed instructions flag must be boolean")
     for document in documents:
         _require_dataclass_strings(document, "knowledge document")
     for fact in facts:
@@ -155,6 +159,7 @@ def recompute_knowledge_review_digest(review: KnowledgeReview) -> str:
         "inaccessible_sources": inaccessible,
         "duplicate_facts": duplicates,
         "instruction_findings": instructions,
+        "executed_instructions": review.executed_instructions,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return sha256(encoded.encode("utf-8")).hexdigest()
