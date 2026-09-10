@@ -30,8 +30,11 @@ def test_review_only_runtime_infrastructure_candidate_is_complete_but_not_approv
         "product_profile.py",
         "provider_adapters.py",
         "turn_engine.py",
+        "provider_runtime.py",
         "config/product_profile.json",
+        "config/provider_profile.json",
     ]
+    assert candidate["required_provider_adapter_outputs"] == ["provider_stt.py", "provider_llm.py", "provider_tts.py"]
     assert {entry["template_path"] for entry in candidate["artifacts"]} == {
         "infrastructure/Dockerfile.tmpl",
         "infrastructure/requirements-prod.txt.tmpl",
@@ -62,6 +65,10 @@ def test_container_template_has_explicit_runtime_copy_and_import_guard():
         "product_profile.py",
         "provider_adapters.py",
         "turn_engine.py",
+        "provider_runtime.py",
+        "provider_stt.py",
+        "provider_llm.py",
+        "provider_tts.py",
         "startup.py",
     ):
         assert filename in dockerfile
@@ -72,12 +79,16 @@ def test_container_template_has_explicit_runtime_copy_and_import_guard():
 def test_requirements_are_exactly_pinned_and_lock_covers_input():
     requirements = _text("requirements-prod.txt.tmpl")
     lock = _text("requirements-prod.lock.txt.tmpl")
-    requirement_lines = [line for line in requirements.splitlines() if line and not line.startswith("#")]
+    requirement_lines = [
+        line for line in requirements.splitlines()
+        if line and not line.startswith("#") and line != "{{provider_requirements}}"
+    ]
     assert requirement_lines
     assert all(re.fullmatch(r"[A-Za-z0-9_.-]+(?:\[[A-Za-z0-9_,.-]+\])?==[A-Za-z0-9_.!+-]+", line) for line in requirement_lines)
     assert all(line in lock for line in requirement_lines)
-    for provider in ("anthropic", "google-cloud-speech"):
-        assert re.search(rf"^{provider}==", requirements, re.MULTILINE)
+    assert "{{provider_requirements}}" in requirements
+    assert "anthropic==" not in requirements
+    assert "google-cloud-speech==" not in requirements
     assert "openai" not in requirements.lower()
 
 
@@ -90,18 +101,22 @@ def test_compose_and_proxy_are_loopback_limited_and_status_is_authenticated():
     assert "{{ghcr_repository}}@${SMARTPBX_IMAGE_DIGEST:?immutable digest required}" in compose
     assert "container_name: {{smartpbx_service}}" in compose
     assert "mem_limit:" in compose and "cpus:" in compose and "pids_limit:" in compose
+    assert "{{provider_environment}}" in compose
+    assert "{{provider_volumes}}" in compose
+    assert "STT_PROVIDER:" not in compose and "LLM_PROVIDER:" not in compose and "TTS_PROVIDER:" not in compose
+    assert "GOOGLE_APPLICATION_CREDENTIALS:" not in compose
+    assert "RIME_API_KEY:" not in compose
     assert "read_only: true" in compose
     assert "cap_drop:" in compose and "- ALL" in compose
     assert "no-new-privileges:true" in compose
     assert "tmpfs:" in compose
     assert "healthcheck:" in compose and "/health" in compose
     assert "stop_grace_period:" in compose
-    assert "internal: true" in compose
+    assert "{{smartpbx_service}}_bridge:" in compose
+    assert "internal: false" in compose
     assert "./knowledge_docs:/app/knowledge_docs:ro" in compose
-    assert "./gcp-credentials.json:/app/gcp-credentials.json:ro" in compose
     assert "SMARTPBX_WS_TOKEN:" in compose
-    assert "ANTHROPIC_API_KEY:" in compose
-    assert "RIME_API_KEY:" in compose
+    assert "ANTHROPIC_API_KEY:" not in compose
     assert "OPENAI_API_KEY:" not in compose
     assert "location = /ws/v1/smartpbx/media" in nginx
     assert "proxy_set_header Upgrade $http_upgrade;" in nginx
@@ -141,14 +156,19 @@ def test_startup_composition_validates_named_environment_once_and_exports_the_as
         "SMARTPBX_AUTH_HEADER_NAME",
         "SMARTPBX_PRODUCT_PROFILE_PATH",
         "SMARTPBX_KNOWLEDGE_DIR",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "STT_PROVIDER",
-        "LLM_PROVIDER",
-        "TTS_PROVIDER",
-        "ANTHROPIC_API_KEY",
-        "RIME_API_KEY",
+        "SMARTPBX_PROVIDER_PROFILE_PATH",
     ):
         assert name in startup
     assert "def create_app" in startup
     assert "app = create_app()" in startup
     assert "build_service_app(load_runtime(" in startup
+    assert "bind_provider_adapter" in startup
+    assert "ReviewOnlyProviderAdapter" not in startup
+
+
+def test_provider_requirements_and_secret_mounts_are_derived_at_render_time():
+    renderer = (Path(__file__).parents[1] / "render.py").read_text(encoding="utf-8")
+    assert "_provider_runtime_contract" in renderer
+    assert "provider_environment" in renderer
+    assert "provider_volumes" in renderer
+    assert "provider_profile.json" in renderer
