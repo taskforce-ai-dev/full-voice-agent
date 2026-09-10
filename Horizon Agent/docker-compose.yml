@@ -39,9 +39,10 @@ services:
     env_file:
       - .env
 
-    environment:
-      # Google Cloud STT service-account file, mounted below.
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json
+    # NOTE: no Google Cloud STT here. Horizon's Sinhala/Arabic Media Streams use
+    # Azure STT (STT_PROVIDER=azure), so there is deliberately NO
+    # GOOGLE_APPLICATION_CREDENTIALS env and NO gcp-credentials bind mount --
+    # nothing depends on a service-account JSON that isn't on the box.
 
     # -- Persistent volumes -------------------------------------
     volumes:
@@ -52,9 +53,6 @@ services:
       # Knowledge documents -- mount as a bind so new/updated
       # docs can be dropped in without rebuilding the image.
       - ./knowledge_docs:/app/knowledge_docs
-
-      # GCP service-account JSON for Google Cloud STT (read-only).
-      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
 
     # -- Restart policy -----------------------------------------
     # Always restart unless explicitly stopped with

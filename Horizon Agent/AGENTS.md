@@ -70,10 +70,11 @@ en/ru, Media Streams for ar/si) rather than Dialog SIP.
   `ghcr.io/taskforce-ai-dev/horizon:${IMAGE_TAG:-latest}`. CI builds and pushes
   the image on the GitHub runner; the VPS only pulls. Roll back by hand with
   `IMAGE_TAG=<sha> docker compose pull && IMAGE_TAG=<sha> docker compose up -d`.
-- **GCP creds:** `docker-compose.yml` mounts
-  `./full-voice-agent-a8a245fb37cb.json` → `/app/gcp-credentials.json:ro` and
-  sets `GOOGLE_APPLICATION_CREDENTIALS` (present for the shared STT plumbing;
-  Sinhala STT actually uses Azure).
+- **No GCP creds:** unlike the HattonHills base, `docker-compose.yml` has **no**
+  `GOOGLE_APPLICATION_CREDENTIALS` env and **no** gcp-credentials bind mount —
+  Horizon's Sinhala/Arabic STT is Azure (`STT_PROVIDER=azure`), so it never needs
+  a Google service-account JSON, and nothing depends on that file existing on the
+  VPS.
 
 ## Environment
 
