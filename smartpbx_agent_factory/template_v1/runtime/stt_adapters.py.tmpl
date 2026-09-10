@@ -471,6 +471,8 @@ class SmartPBXSTTAdapter:
                     text=event.text,
                     is_final=event.kind == "final",
                     result_id=event.metadata.result_id if event.metadata is not None else None,
+                    audio_offset=event.metadata.offset if event.metadata is not None else None,
+                    audio_duration=event.metadata.duration if event.metadata is not None else None,
                 )
             )
 

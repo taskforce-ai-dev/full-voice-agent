@@ -103,6 +103,30 @@ def test_profile_driven_conversation_contract_preserves_delivery_and_fencing_bou
     assert "filler_phrases" in profile and "recovery_line" in profile
 
 
+def test_source_shaped_history_recognition_and_selection_contracts_prevent_known_p0_regressions():
+    builders = source("provider_builders.py.tmpl")
+    events = source("provider_adapters.py.tmpl")
+    stt = source("stt_adapters.py.tmpl")
+    engine = source("turn_engine.py.tmpl")
+    session = source("smartpbx_session.py.tmpl")
+    renderer = (Path(__file__).parents[1] / "render.py").read_text(encoding="utf-8")
+    assert 'messages=messages' in builders
+    assert 'messages=(*messages, InquiryMessage("user", transcript))' not in builders
+    assert 'self._history.append(("user", transcript))' in engine
+    assert 'self._history.append(("assistant", committed_response))' in engine
+    assert "audio_offset" in events and "audio_duration" in events and "audio_interval" in events
+    assert "audio_offset=event.metadata.offset" in stt
+    assert "_intervals_cover" in engine and "_pending_audio_coverage" in engine
+    assert "text in self._committed_finals" not in engine
+    assert 'exact_prefix = f"{committed} "' in engine
+    assert "_normalized_tokens" in engine and "SequenceMatcher" in engine
+    assert "len(transcript_tokens) < 5" in engine
+    assert "set_recognizer_result_admission(False)" in session
+    assert "set_recognizer_result_admission(True)" in session
+    assert "_reviewed_language_ux" in renderer and "no reviewed caller UX catalogue entry" in renderer
+    assert "කරුණාකර රැඳෙන්න." in renderer
+
+
 def test_deepgram_is_not_an_approved_generated_runtime_provider():
     root = Path(__file__).parents[1]
     assert "deepgram" not in (root / "template_v1" / "provider_catalogue.json").read_text(encoding="utf-8").lower()

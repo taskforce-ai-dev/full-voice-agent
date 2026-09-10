@@ -57,11 +57,13 @@ class InquirySmartPBXSession:
         self._started = True
         default = self._product_profile.default_language
         await self._turn_engine.start(self._product_profile.language(default))
+        self._turn_engine.set_recognizer_result_admission(False)
         if len(self._product_profile.language_profiles) == 1:
             self._selected_language = default
             await self._turn_engine.speak_profile_message(
                 self._product_profile.language(default).greeting, "initial-greeting"
             )
+            self._turn_engine.set_recognizer_result_admission(True)
             return
         # Selection remains call-local.  The menu is delivered and marked
         # before its timeout begins, matching the carrier pacing boundary.
@@ -89,6 +91,7 @@ class InquirySmartPBXSession:
         language = self._product_profile.language(selected)
         await self._turn_engine.set_language(language)
         await self._turn_engine.speak_profile_message(language.greeting, "initial-greeting")
+        self._turn_engine.set_recognizer_result_admission(True)
 
     async def feed_audio(self, audio: bytes) -> None:
         if not self._started:

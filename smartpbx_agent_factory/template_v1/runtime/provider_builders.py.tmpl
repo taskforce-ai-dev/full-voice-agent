@@ -175,7 +175,10 @@ class _RoutedLLM:
             for role, content in history
             if role in {"user", "assistant"} and isinstance(content, str) and content
         )
-        request = InquiryRequest(provider=provider, system_prompt=prompt, messages=(*messages, InquiryMessage("user", transcript)))
+        # The endpoint owner inserted the current user exactly once before it
+        # invoked us.  `transcript` selects the request route; history is wire
+        # content and deliberately includes that current endpoint claim.
+        request = InquiryRequest(provider=provider, system_prompt=prompt, messages=messages)
         async for event in self._adapter.stream_response(request):
             yield event
 

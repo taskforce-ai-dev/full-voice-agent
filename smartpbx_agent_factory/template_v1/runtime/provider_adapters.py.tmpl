@@ -17,6 +17,8 @@ class RecognizerResult:
     text: str
     is_final: bool
     result_id: str | int | None = None
+    audio_offset: int | None = None
+    audio_duration: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -30,14 +32,22 @@ class RecognizerResult:
                     or isinstance(self.result_id, str) and len(self.result_id) > 256
                 )
             )
+            or self.audio_offset is not None and (not isinstance(self.audio_offset, int) or isinstance(self.audio_offset, bool) or self.audio_offset < 0)
+            or self.audio_duration is not None and (not isinstance(self.audio_duration, int) or isinstance(self.audio_duration, bool) or self.audio_duration < 0)
         ):
             raise ValueError("invalid recognizer result")
 
-    def duplicate_identity(self) -> tuple[str | int, bool, str] | None:
-        """Return an optional exact-dedup key, never a provider ordering token."""
+    def duplicate_identity(self) -> tuple[str | int, bool] | None:
+        """Return provider identity only; text is never a final dedupe basis."""
         if self.result_id is None:
             return None
-        return (self.result_id, self.is_final, self.text)
+        return (self.result_id, self.is_final)
+
+    @property
+    def audio_interval(self) -> tuple[int, int] | None:
+        if self.audio_offset is None or self.audio_duration is None or self.audio_duration <= 0:
+            return None
+        return self.audio_offset, self.audio_offset + self.audio_duration
 
 
 @dataclass(frozen=True)

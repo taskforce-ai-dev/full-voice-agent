@@ -207,7 +207,9 @@ def _product_profile_payload(manifest: AgentManifest, documents: Mapping[str, st
     identifiers in the reviewed catalogue, never by this product data.
     """
     languages: dict[str, dict[str, object]] = {}
+    menu_prompt = _reviewed_bilingual_menu(manifest)
     for language in manifest.languages:
+        ux = _reviewed_language_ux(language.code, language.locale)
         languages[language.code] = {
             "locale": language.locale,
             "stt": language.stt,
@@ -220,15 +222,8 @@ def _product_profile_payload(manifest: AgentManifest, documents: Mapping[str, st
             "fallback_model": language.fallback_model or None,
             "greeting": language.greeting,
             "prompt_block": _language_prompt_block(manifest, language.code),
-            # These caller-facing defaults are frozen into the reviewed profile
-            # rather than selected by language branches in the call hot path.
-            "menu_prompt": " ".join(
-                f"Press {index} for {candidate.code}."
-                for index, candidate in enumerate(manifest.languages, start=1)
-            ),
-            "recovery_line": "I am sorry, I am unable to help with that right now. Please try again.",
-            "reprompt": "Are you still there? Please let me know how I can help.",
-            "filler_phrases": ["One moment, please.", "Let me check that for you."],
+            "menu_prompt": menu_prompt,
+            **ux,
         }
     return {
         "identity": {
@@ -245,6 +240,40 @@ def _product_profile_payload(manifest: AgentManifest, documents: Mapping[str, st
         "refused_topics": list(manifest.refused_topics),
         "knowledge_paths": [f"knowledge_docs/{filename}" for filename in documents],
     }
+
+
+def _reviewed_language_ux(code: str, locale: str) -> dict[str, object]:
+    """Closed, reviewed caller phrases; unsupported locales cannot borrow English."""
+    defaults = {
+        ("en", "en-US"): {
+            "recovery_line": "I am sorry, I am unable to help with that right now. Please try again.",
+            "reprompt": "Hello, are you still there?",
+            "filler_phrases": ["One moment, please.", "Let me check that for you."],
+        },
+        ("si", "si-LK"): {
+            "recovery_line": "සමාවෙන්න, මට දැන් පිළිතුරු දෙන්න අපහසුයි. කරුණාකර නැවත කියන්න පුළුවන්ද?",
+            "reprompt": "ආයුබෝවන්, ඔබ තවමත් සිටින්නේද?",
+            "filler_phrases": ["කරුණාකර රැඳෙන්න.", "කරුණාකර ටිකක් ඉන්න."],
+        },
+    }
+    try:
+        return defaults[(code, locale)]
+    except KeyError as error:
+        raise RenderError(f"no reviewed caller UX catalogue entry for {code}/{locale}") from error
+
+
+def _reviewed_bilingual_menu(manifest: AgentManifest) -> str:
+    if len(manifest.languages) < 2:
+        return ""
+    entries: list[str] = []
+    for index, language in enumerate(manifest.languages, start=1):
+        if (language.code, language.locale) == ("en", "en-US"):
+            entries.append(f"For English, press {index}.")
+        elif (language.code, language.locale) == ("si", "si-LK"):
+            entries.append(f"සිංහල සඳහා {index} ඔබන්න.")
+        else:
+            raise RenderError(f"no reviewed bilingual-menu entry for {language.code}/{language.locale}")
+    return " ".join(entries)
 
 
 def _language_prompt_block(manifest: AgentManifest, language_code: str) -> str:
