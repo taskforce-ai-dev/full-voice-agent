@@ -22,6 +22,7 @@ from smartpbx_agent_factory.render import (
     RenderError,
     ReviewNotApprovedError,
     _product_profile_payload,
+    _scan_outputs,
     render_backend as _render_backend,
 )
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
@@ -242,6 +243,33 @@ def test_generated_product_profile_carries_the_explicit_sinhala_gemini_to_claude
 def test_runtime_template_loads_the_generated_product_profile_only_at_startup():
     template = (Path(__file__).parents[1] / "template_v1/runtime/server.py.tmpl").read_text(encoding="utf-8")
     assert template.count("product_profile=load_product_profile(") == 1
+
+
+@pytest.mark.parametrize("content", (
+    'ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"',
+    "ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}",
+))
+def test_output_scan_allows_quoted_and_unquoted_environment_key_placeholders(content):
+    _scan_outputs({"docker-compose.yml": content})
+
+
+@pytest.mark.parametrize("content", (
+    'ANTHROPIC_API_KEY: "literal-secret"',
+    "ANTHROPIC_API_KEY: literal-secret",
+    "BROKEN=${UNFINISHED\nANTHROPIC_API_KEY: literal-secret",
+))
+def test_output_scan_rejects_quoted_and_unquoted_literal_api_keys(content):
+    with pytest.raises(IdentityLeakError, match="secret leak"):
+        _scan_outputs({"docker-compose.yml": content})
+
+
+@pytest.mark.parametrize("content", (
+    "-----BEGIN PRIVATE KEY-----",
+    "sk-abcdefghijkl",
+))
+def test_output_scan_keeps_existing_pem_and_plaintext_secret_rejection(content):
+    with pytest.raises(IdentityLeakError, match="secret leak"):
+        _scan_outputs({"runtime.py": content})
 
 
 def test_renderer_rejects_identity_and_secret_leaks_from_review(tmp_path):

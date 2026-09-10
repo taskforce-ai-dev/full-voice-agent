@@ -69,11 +69,15 @@ _SECRET_PATTERNS = tuple(
     for pattern in (
         r"begin\s+private\s+key",
         r"smartpbx_ws_token\s*=",
-        r"(?:api[-_ ]?key)\s*[:=]\s*[^\s${]",
         r"\bsk-[a-z0-9_-]{12,}",
         r"\bAC[a-f0-9]{32}\b",
     )
 )
+_API_KEY_ASSIGNMENT = re.compile(
+    r"(?:api[-_ ]?key)\s*[:=]\s*[\"']?(?P<value>\S+)",
+    re.IGNORECASE,
+)
+_ENV_PLACEHOLDER = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}")
 _BUSINESS_TOOLS = ("create_booking", "transfer_to_human", "hangup_call")
 _PROVIDER_RUNTIME = {
     "azure": {"requirements": ("azure-cognitiveservices-speech==1.51.1",), "environment": ("AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION")},
@@ -452,6 +456,8 @@ def _scan_outputs(files: Mapping[str, str]) -> None:
         for pattern in _IDENTITY_PATTERNS:
             if pattern.search(content):
                 raise IdentityLeakError(f"identity leak in generated output: {relative}")
+        if _contains_literal_api_key_assignment(content):
+            raise IdentityLeakError(f"secret leak in generated output: {relative}")
         for pattern in _SECRET_PATTERNS:
             if pattern.search(content):
                 raise IdentityLeakError(f"secret leak in generated output: {relative}")
@@ -459,6 +465,19 @@ def _scan_outputs(files: Mapping[str, str]) -> None:
             raise IdentityLeakError(f"unresolved template marker in generated output: {relative}")
         if not relative.startswith("tools.py") and any(name in content for name in _BUSINESS_TOOLS):
             raise IdentityLeakError(f"business tool leak in generated output: {relative}")
+
+
+def _contains_literal_api_key_assignment(content: str) -> bool:
+    """Reject literal API-key assignments while permitting rendered env references."""
+    placeholders = tuple(_ENV_PLACEHOLDER.finditer(content))
+    for match in _API_KEY_ASSIGNMENT.finditer(content):
+        if match.group("value").startswith("${") or any(
+            placeholder.start() <= match.start() < placeholder.end()
+            for placeholder in placeholders
+        ):
+            continue
+        return True
+    return False
 
 
 def _derived_render_root(worktree: WorktreeHandle, manager: WorktreeManager, resources: DerivedResources) -> Path:
