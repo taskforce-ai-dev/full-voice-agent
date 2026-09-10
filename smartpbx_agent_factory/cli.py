@@ -5,18 +5,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import tempfile
 from datetime import date
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 from .bootstrap import FactoryBootstrap, FactoryConfig, FactoryConfigError, inspect_config
+from .catalogue import CapabilityCatalogue, ProviderModel
 from .orchestrator import (
     GenerationBlockedError,
     GenerationInfrastructureError,
     GenerationOrchestrator,
 )
 from .gitops import DirtyWorktreeError, WorktreeConflictError
+from .schema import ManifestError, parse_manifest
 
 
 EXIT_SUCCESS = 0
@@ -40,6 +44,13 @@ def _parser() -> argparse.ArgumentParser:
     _add_runtime_arguments(bootstrap)
     wizard = commands.add_parser("new", help="interactively write a reviewable non-secret manifest")
     wizard.add_argument("--output", required=True, type=Path)
+    wizard.add_argument(
+        "--approved-source-root",
+        required=True,
+        action="append",
+        type=Path,
+        help="absolute non-secret knowledge root; repeat for each approved root",
+    )
     for name in ("inspect", "plan"):
         command = commands.add_parser(name)
         command.add_argument("--manifest", required=True, type=Path)
@@ -76,7 +87,10 @@ def invoke_cli(argv: Sequence[str] | None = None) -> CLIResult:
         return CLIResult(EXIT_INVALID_INPUT if error.code else EXIT_SUCCESS)
     if args.command == "new":
         try:
-            path = create_manifest_wizard(args.output.resolve())
+            path = create_manifest_wizard(
+                args.output,
+                approved_source_roots=tuple(args.approved_source_root),
+            )
             return CLIResult(EXIT_SUCCESS, f"manifest={path}\nnext: inspect --config <factory.json> --manifest {path}\n")
         except (ValueError, OSError) as error:
             return CLIResult(EXIT_INVALID_INPUT, stderr=f"manifest wizard blocked: {error}\n")
@@ -147,41 +161,268 @@ def main(argv: Sequence[str] | None = None) -> int:
     return result.exit_code
 
 
-def create_manifest_wizard(output: Path, *, input_fn=input) -> Path:
-    """Ask only non-secret generation inputs and atomically write mode-0600 JSON."""
-    if not output.is_absolute() or output.exists() or output.is_symlink():
-        raise ValueError("manifest output must be a new non-symlink absolute path")
-    def ask(label: str, pattern: str) -> str:
-        value = input_fn(label).strip()
-        if not __import__("re").fullmatch(pattern, value):
-            raise ValueError(f"invalid {label.rstrip(': ')}")
-        return value
-    company = ask("Company display name: ", r"[A-Za-z0-9][A-Za-z0-9 .,'&()-]{1,79}")
-    slug = ask("Company slug: ", r"[a-z0-9]+(?:-[a-z0-9]+){0,10}")
-    languages = ask("Languages (comma-separated ISO codes): ", r"[a-z]{2}(?:,[a-z]{2}){0,5}").split(",")
-    provider = ask("Approved provider set (azure-claude-elevenlabs): ", r"azure-claude-elevenlabs")
-    knowledge = ask("Approved local knowledge path: ", r"/[A-Za-z0-9._/-]{1,220}")
-    if "secret" in knowledge.lower() or "token" in knowledge.lower():
-        raise ValueError("knowledge path may not identify secret material")
-    locale = {"en": "en-US", "si": "si-LK"}
-    if any(code not in locale for code in languages):
-        raise ValueError("only configured en and si locales are available to the wizard")
-    greetings = {code: ask(f"{code} native greeting: ", r"[^\x00]{1,180}") for code in languages}
-    document = {
-        "schema_version": 1, "display_name": company, "public_name": company, "slug": slug,
-        "agent_name": f"{company} Guide", "industry": "general information", "purpose": "Answer approved company questions",
-        "audience": "prospective customers", "profile": "demo", "timezone": "UTC", "operating_hours": {"mon-fri": "09:00-17:00"},
-        "technical_owner": "review-required@example.invalid",
-        "languages": [{"code": code, "locale": locale[code], "stt": {"provider": "azure"}, "llm": {"provider": "claude", "model": "claude-sonnet-4-5-20250929"}, "tts": {"provider": "elevenlabs", "model": "eleven_flash_v2_5"}, "greeting": greetings[code]} for code in languages],
-        "allowed_topics": ["company information"], "refused_topics": ["account changes"],
-        "pii_policy": {"explicit_consent": False, "collect_name": False, "collect_phone": False}, "capabilities": {},
-        "knowledge_sources": [{"kind": "local", "path": knowledge, "owner": company, "effective_date": date.today().isoformat(), "classification": "public"}],
-        "smartpbx": {"account_id": "review-required", "capacity": 1, "protocol_profile": "smartpbx-ai-provider-v07", "status_authentication": True},
-        "operations": {"alert_owner": "review-required@example.invalid", "support_contact": "review-required@example.invalid"}, "website_demo": {"enabled": True, "visibility": "pending"},
-    }
+_DEFAULT_CATALOGUE = Path(__file__).with_name("template_v1") / "provider_catalogue.json"
+_NATIVE_GREETING_DEFAULTS = {
+    "en": "Welcome to {company}. How may I help you?",
+    "si": "ආයුබෝවන්. {company} වෙත ඔබ සාදරයෙන් පිළිගනිමු. මට ඔබට උදව් කළ හැක්කේ කෙසේද?",
+}
+_LANGUAGE_MENU_LABELS = {"en": "English", "si": "සිංහල"}
+_CAPABILITY_NAMES = (
+    "booking", "handover", "whatsapp", "crm", "payment",
+    "post_call_reporting", "recording", "transcript_retention",
+)
+
+
+def _ask_wizard_text(input_fn, label: str, pattern: str, *, default: str | None = None) -> str:
+    value = input_fn(label).strip()
+    if not value and default is not None:
+        return default
+    if not re.fullmatch(pattern, value):
+        raise ValueError(f"invalid {label.rstrip(': ')}")
+    return value
+
+
+def _ask_wizard_bool(input_fn, label: str) -> bool:
+    value = input_fn(label).strip().lower()
+    if value not in {"yes", "no"}:
+        raise ValueError(f"invalid {label.rstrip(': ')}; answer yes or no")
+    return value == "yes"
+
+
+def _ask_wizard_list(input_fn, label: str, *, allow_empty: bool = False) -> list[str]:
+    value = input_fn(label).strip()
+    if not value and allow_empty:
+        return []
+    entries = [item.strip() for item in value.split(",") if item.strip()]
+    if not entries or any("\x00" in item for item in entries):
+        raise ValueError(f"invalid {label.rstrip(': ')}")
+    return entries
+
+
+def _ask_provider_choice(
+    input_fn,
+    *,
+    language: str,
+    component: str,
+    options: tuple[ProviderModel, ...],
+    optional: bool = False,
+) -> ProviderModel | None:
+    runnable = tuple(option for option in options if option.generated_runnable)
+    if not runnable:
+        if optional:
+            return None
+        raise ValueError(f"no generated-runnable {component} choices are approved for {language}")
+    rendered = ", ".join(
+        f"{index}={option.provider}{':' + option.model if option.model else ''}"
+        for index, option in enumerate(runnable, start=1)
+    )
+    none = "; 0=none" if optional else ""
+    selected = input_fn(f"{_LANGUAGE_MENU_LABELS.get(language, language)} {component} ({rendered}{none}): ").strip()
+    if optional and selected == "0":
+        return None
+    if not selected.isdigit() or not 1 <= int(selected) <= len(runnable):
+        raise ValueError(f"invalid selection for {language} {component}")
+    return runnable[int(selected) - 1]
+
+
+def _pipeline_field(document: dict[str, object], name: str, selection: ProviderModel) -> None:
+    document[name] = selection.provider
+    if selection.model is not None:
+        document[f"{name}_model"] = selection.model
+
+
+def _parse_operating_hours(value: str) -> dict[str, str]:
+    entries = [item.strip() for item in value.split(",") if item.strip()]
+    hours: dict[str, str] = {}
+    for entry in entries:
+        day, separator, period = entry.partition("=")
+        if not separator or not re.fullmatch(r"[a-z]{3}(?:-[a-z]{3})?", day) or not period.strip():
+            raise ValueError("invalid operating hours; use day=HH:MM-HH:MM")
+        hours[day] = period.strip()
+    if not hours:
+        raise ValueError("invalid operating hours; use day=HH:MM-HH:MM")
+    return hours
+
+
+def _atomic_manifest_write(output: Path, serialized: str) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(document, handle, sort_keys=True, indent=2)
-        handle.write("\n")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if output.exists() or output.is_symlink():
+            raise ValueError("manifest output must be a new non-symlink absolute path")
+        os.replace(temporary, output)
+        directory_descriptor = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except BaseException:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+
+
+def create_manifest_wizard(
+    output: Path,
+    *,
+    input_fn=input,
+    approved_source_roots: Sequence[Path],
+    catalogue_path: Path = _DEFAULT_CATALOGUE,
+) -> Path:
+    """Collect non-secret manifest inputs from an approved catalogue and write atomically.
+
+    The language prompts are native-language menu labels; the schema itself has only
+    a per-language greeting field, so no invented menu field is emitted.
+    """
+    if not output.is_absolute() or output.is_symlink():
+        raise ValueError("manifest output must be a new non-symlink absolute path")
+    output = output.resolve(strict=False)
+    if output.exists() or output.is_symlink():
+        raise ValueError("manifest output must be a new non-symlink absolute path")
+    catalogue = CapabilityCatalogue.load(catalogue_path)
+    source_roots: list[Path] = []
+    for root in approved_source_roots:
+        candidate = Path(root)
+        if not candidate.is_absolute():
+            raise ValueError("approved knowledge roots must be absolute")
+        source_roots.append(candidate.resolve(strict=False))
+    if not source_roots:
+        raise ValueError("at least one approved knowledge root is required")
+    company = _ask_wizard_text(input_fn, "Company display name: ", r"[^\x00]{2,80}")
+    public_name = _ask_wizard_text(input_fn, "Public company name: ", r"[^\x00]{2,80}")
+    slug = _ask_wizard_text(input_fn, "Company slug: ", r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*")
+    agent_name = _ask_wizard_text(input_fn, "Agent name: ", r"[^\x00]{2,80}")
+    industry = _ask_wizard_text(input_fn, "Industry: ", r"[^\x00]{2,120}")
+    purpose = _ask_wizard_text(input_fn, "Agent purpose: ", r"[^\x00]{2,240}")
+    audience = _ask_wizard_text(input_fn, "Target audience: ", r"[^\x00]{2,160}")
+    profile = _ask_wizard_text(input_fn, "Profile (demo or production-intent): ", r"demo|production-intent")
+    timezone = _ask_wizard_text(input_fn, "Timezone: ", r"[A-Za-z_+/-]{1,64}")
+    operating_hours = _parse_operating_hours(input_fn("Operating hours (day=HH:MM-HH:MM, comma-separated): ").strip())
+    technical_owner = _ask_wizard_text(input_fn, "Technical owner email: ", r"[^\s@]+@[^\s@]+")
+    languages = _ask_wizard_list(input_fn, "Languages (comma-separated catalogue codes): ")
+    if len(set(languages)) != len(languages) or any(language not in catalogue.languages for language in languages):
+        raise ValueError("languages must be unique approved catalogue codes")
+
+    profiles: list[dict[str, object]] = []
+    for language in languages:
+        locales = tuple(catalogue.languages[language])
+        rendered = ", ".join(f"{index}={locale}" for index, locale in enumerate(locales, start=1))
+        locale_selection = input_fn(f"{_LANGUAGE_MENU_LABELS.get(language, language)} locale ({rendered}): ").strip()
+        if not locale_selection.isdigit() or not 1 <= int(locale_selection) <= len(locales):
+            raise ValueError(f"invalid selection for {language} locale")
+        locale = locales[int(locale_selection) - 1]
+        pipeline = catalogue.languages[language][locale]
+        language_document: dict[str, object] = {"code": language, "locale": locale}
+        for component in ("stt", "llm", "tts"):
+            selection = _ask_provider_choice(
+                input_fn, language=language, component=component, options=pipeline[component]
+            )
+            assert selection is not None
+            _pipeline_field(language_document, component, selection)
+        fallback = _ask_provider_choice(
+            input_fn, language=language, component="fallback", options=pipeline["fallback"], optional=True
+        )
+        if fallback is not None:
+            _pipeline_field(language_document, "fallback", fallback)
+        greeting = _ask_wizard_text(
+            input_fn,
+            f"{_LANGUAGE_MENU_LABELS.get(language, language)} greeting (blank for native default): ",
+            r"[^\x00]{1,240}",
+            default=_NATIVE_GREETING_DEFAULTS.get(language, "Welcome to {company}. How may I help you?").format(company=public_name),
+        )
+        language_document["greeting"] = greeting
+        profiles.append(language_document)
+
+    allowed_topics = _ask_wizard_list(input_fn, "Allowed topics (comma-separated): ")
+    refused_topics = _ask_wizard_list(input_fn, "Refused topics (comma-separated): ")
+    explicit_consent = _ask_wizard_bool(input_fn, "Explicit PII consent available (yes/no): ")
+    collect_name = _ask_wizard_bool(input_fn, "Collect customer name (yes/no): ")
+    collect_phone = _ask_wizard_bool(input_fn, "Collect customer phone (yes/no): ")
+    collect_other = _ask_wizard_list(input_fn, "Other PII to collect (comma-separated; blank for none): ", allow_empty=True)
+    capabilities: dict[str, object] = {}
+    for capability in _CAPABILITY_NAMES:
+        enabled = _ask_wizard_bool(input_fn, f"Enable {capability} (yes/no): ")
+        capability_document: dict[str, object] = {"enabled": enabled}
+        if enabled and capability in {"booking", "handover"}:
+            capability_document["destination"] = _ask_wizard_text(
+                input_fn, f"{capability} destination: ", r"[^\x00]{1,180}"
+            )
+        capabilities[capability] = capability_document
+
+    knowledge_path = Path(_ask_wizard_text(input_fn, "Approved local knowledge path: ", r"/[^\x00]{1,220}")).resolve(strict=False)
+    if any(marker in str(knowledge_path).lower() for marker in ("secret", "token", "password", "api_key")):
+        raise ValueError("knowledge path may not identify secret material")
+    if not any(knowledge_path == root or root in knowledge_path.parents for root in source_roots):
+        raise ValueError("knowledge path must be under an approved knowledge root")
+    knowledge_owner = _ask_wizard_text(input_fn, "Knowledge owner: ", r"[^\x00]{2,120}")
+    effective_date = _ask_wizard_text(input_fn, "Knowledge effective date (YYYY-MM-DD): ", r"\d{4}-\d{2}-\d{2}")
+    try:
+        date.fromisoformat(effective_date)
+    except ValueError as error:
+        raise ValueError("invalid Knowledge effective date") from error
+    classification = _ask_wizard_text(input_fn, "Knowledge classification: ", r"[A-Za-z][A-Za-z _-]{0,80}")
+    account_id = _ask_wizard_text(input_fn, "SmartPBX account ID: ", r"[A-Za-z0-9._-]{1,120}")
+    capacity = int(_ask_wizard_text(input_fn, "SmartPBX capacity (1-4): ", r"[1-4]"))
+    alert_owner = _ask_wizard_text(input_fn, "Operations alert owner email: ", r"[^\s@]+@[^\s@]+")
+    support_contact = _ask_wizard_text(input_fn, "Operations support contact email: ", r"[^\s@]+@[^\s@]+")
+    website_enabled = _ask_wizard_bool(input_fn, "Enable review-only website demo (yes/no): ")
+
+    document: dict[str, object] = {
+        "schema_version": 1,
+        "display_name": company,
+        "public_name": public_name,
+        "slug": slug,
+        "agent_name": agent_name,
+        "industry": industry,
+        "purpose": purpose,
+        "audience": audience,
+        "profile": profile,
+        "timezone": timezone,
+        "operating_hours": operating_hours,
+        "technical_owner": technical_owner,
+        "languages": profiles,
+        "allowed_topics": allowed_topics,
+        "refused_topics": refused_topics,
+        "pii_policy": {
+            "explicit_consent": explicit_consent,
+            "collect_name": collect_name,
+            "collect_phone": collect_phone,
+            "collect_other": collect_other,
+            "confirmation_policy": "confirm-uncertain",
+        },
+        "capabilities": capabilities,
+        "knowledge_sources": [{
+            "kind": "local",
+            "path": str(knowledge_path),
+            "owner": knowledge_owner,
+            "effective_date": effective_date,
+            "classification": classification,
+        }],
+        "smartpbx": {
+            "account_id": account_id,
+            "capacity": capacity,
+            "protocol_profile": "smartpbx-ai-provider-v07",
+            "status_authentication": True,
+        },
+        "operations": {"alert_owner": alert_owner, "support_contact": support_contact},
+        "website_demo": {
+            "enabled": website_enabled,
+            "visibility": "pending",
+            "supported_languages": languages,
+        },
+    }
+    serialized = json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+    try:
+        parse_manifest(
+            json.loads(serialized), approved_source_roots=tuple(source_roots), catalogue=catalogue
+        )
+    except (ManifestError, json.JSONDecodeError) as error:
+        raise ValueError(f"manifest wizard blocked: {error}") from error
+    _atomic_manifest_write(output, serialized)
     return output

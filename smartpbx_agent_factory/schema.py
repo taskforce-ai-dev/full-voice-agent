@@ -136,7 +136,14 @@ def validate_slug(slug: str) -> str:
 
 def _parse_language(raw: object, index: int) -> LanguageProfile:
     value = _mapping(raw, f"languages[{index}]")
-    _strict_keys(value, {"code", "language", "locale", "stt", "llm", "tts", "fallback", "fallback_model", "greeting", "voice"}, f"languages[{index}]")
+    _strict_keys(
+        value,
+        {
+            "code", "language", "locale", "stt", "stt_model", "llm", "llm_model",
+            "tts", "tts_model", "fallback", "fallback_model", "greeting", "voice",
+        },
+        f"languages[{index}]",
+    )
     if "code" in value and "language" in value:
         raise ManifestError(f"languages[{index}] cannot contain both code and language aliases")
     code = _text(value.get("code", value.get("language")), f"languages[{index}].code")
@@ -149,8 +156,12 @@ def _parse_language(raw: object, index: int) -> LanguageProfile:
             _strict_keys(provider, {"provider", "name", "model"}, f"languages[{index}].{name}")
             if "provider" in provider and "name" in provider:
                 raise ManifestError(f"languages[{index}].{name} cannot contain provider and name aliases")
+            if f"{name}_model" in value:
+                raise ManifestError(f"languages[{index}] cannot contain {name} model twice")
             model = _optional_text(provider.get("model"), f"languages[{index}].{name}.model") or ""
             provider = provider.get("provider", provider.get("name"))
+        else:
+            model = _optional_text(value.get(f"{name}_model"), f"languages[{index}].{name}_model") or ""
         providers[name] = (_text(provider, f"languages[{index}].{name}"), model)
     fallback_value = value.get("fallback")
     fallback_model = ""
