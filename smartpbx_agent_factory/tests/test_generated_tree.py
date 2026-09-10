@@ -2,14 +2,14 @@
 
 from pathlib import Path
 
-from test_render import FixtureReview, fixture_manifest, fixture_resources, fixture_state, fixture_templates
+from test_render import fixture_manifest, fixture_resources, fixture_review, fixture_state, fixture_templates
 from smartpbx_agent_factory.render import render_backend
 
 
 def render_fixture(tmp_path: Path):
     template_root = tmp_path / "synthetic"
     return render_backend(
-        fixture_manifest(), FixtureReview(), fixture_resources(), tmp_path,
+        fixture_manifest(), fixture_review(), fixture_resources(), tmp_path,
         state=fixture_state(), template_allowlist=fixture_templates(template_root), template_root=template_root,
     )
 
