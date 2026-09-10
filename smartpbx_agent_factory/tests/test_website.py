@@ -10,11 +10,23 @@ import smartpbx_agent_factory.website as website
 from smartpbx_agent_factory.catalogue import CapabilityCatalogue
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
 from smartpbx_agent_factory.schema import parse_manifest
-from smartpbx_agent_factory.website import render_website_artifacts
+from smartpbx_agent_factory.website import render_website_artifacts as _render_website_artifacts
+from _owned_worktree_fixture import fixture_owned_worktree
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "acme-minimal.json"
 CATALOGUE = Path(__file__).parent / "fixtures" / "approved-provider-catalogue.json"
+
+
+def _render_website_fixture(manifest, resources, *, output_dir: Path, **kwargs):
+    """Private compatibility seam: synthetic handles only, never a checkout mutation."""
+    manager, worktree = fixture_owned_worktree(output_dir)
+    return _render_website_artifacts(
+        manifest, resources, worktree=worktree, worktree_manager=manager, **kwargs
+    )
+
+
+render_website_artifacts = _render_website_fixture
 
 
 def fixture_manifest(*, profile: str = "demo"):
@@ -87,6 +99,19 @@ def test_website_artifact_has_public_fields_only(tmp_path):
     assert "SMARTPBX_WS_TOKEN" not in source
     assert "api-key" not in source
     assert "acme-inquiry" in source
+
+
+def test_public_website_renderer_rejects_an_unowned_handle_before_writing(tmp_path):
+    write_website_target(tmp_path)
+    manager, worktree = fixture_owned_worktree(tmp_path)
+    manager._handles.clear()
+    with pytest.raises(ValueError, match="manager-owned"):
+        _render_website_artifacts(
+            fixture_manifest(), fixture_resources(), worktree=worktree,
+            worktree_manager=manager, backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+        )
+    assert not (tmp_path / "data").exists()
 
 
 def test_website_artifact_binds_only_immutable_backend_dependency(tmp_path):

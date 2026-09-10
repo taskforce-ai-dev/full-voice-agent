@@ -15,14 +15,26 @@ from smartpbx_agent_factory.knowledge import (
     recompute_knowledge_review_digest,
 )
 from smartpbx_agent_factory.provenance import TemplateAllowlist, TemplateFile
-from smartpbx_agent_factory.render import IncompleteTemplateError, IdentityLeakError, ReviewNotApprovedError, render_backend
+from smartpbx_agent_factory.render import IncompleteTemplateError, IdentityLeakError, RenderError, ReviewNotApprovedError, render_backend as _render_backend
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
 from smartpbx_agent_factory.schema import manifest_digest, parse_manifest
 from smartpbx_agent_factory.state import GenerationState, Stage
+from _owned_worktree_fixture import fixture_owned_worktree
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "acme-minimal.json"
 CATALOGUE = Path(__file__).parent / "fixtures" / "approved-provider-catalogue.json"
+
+
+def _render_backend_fixture(manifest, review, resources, output_dir: Path, **kwargs):
+    """Private compatibility seam: synthetic handles only, never a checkout mutation."""
+    manager, worktree = fixture_owned_worktree(output_dir)
+    return _render_backend(
+        manifest, review, resources, worktree, worktree_manager=manager, **kwargs
+    )
+
+
+render_backend = _render_backend_fixture
 
 
 def fixture_review(
@@ -119,6 +131,20 @@ def test_partial_v06_provenance_fails_closed_without_complete_runtime_template(t
     with pytest.raises(IncompleteTemplateError, match="INCOMPLETE_TEMPLATE"):
         review = fixture_review()
         render_backend(fixture_manifest(), review, fixture_resources(), tmp_path, state=fixture_state(review))
+
+
+def test_public_backend_renderer_rejects_an_unowned_handle_before_writing(tmp_path):
+    review = fixture_review()
+    manager, worktree = fixture_owned_worktree(tmp_path)
+    manager._handles.clear()
+    with pytest.raises(RenderError, match="manager-owned"):
+        _render_backend(
+            fixture_manifest(), review, fixture_resources(), worktree,
+            worktree_manager=manager, state=fixture_state(review),
+            template_allowlist=fixture_templates(tmp_path / "synthetic"),
+            template_root=tmp_path / "synthetic",
+        )
+    assert not (tmp_path / "SmartPBX Agents").exists()
 
 
 def test_inquiry_only_render_has_no_business_tools(tmp_path):

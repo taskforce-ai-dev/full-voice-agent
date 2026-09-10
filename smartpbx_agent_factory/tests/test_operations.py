@@ -5,9 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from smartpbx_agent_factory.operations import SecretLeakError, render_operations_artifacts
+from smartpbx_agent_factory.operations import SecretLeakError, render_operations_artifacts as _render_operations_artifacts
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
 from smartpbx_agent_factory.schema import parse_manifest
+from _owned_worktree_fixture import fixture_owned_worktree
 
 
 class FakeSecretProvider:
@@ -29,6 +30,17 @@ class FakeSecretProvider:
 
     def audit_report(self):
         return {"generated_names": tuple(self.generated), "plaintext_paths": ()}
+
+
+def _render_operations_fixture(manifest, resources, provider, output_dir: Path):
+    """Private compatibility seam: synthetic handles only, never a checkout mutation."""
+    manager, worktree = fixture_owned_worktree(output_dir)
+    return _render_operations_artifacts(
+        manifest, resources, provider, worktree=worktree, worktree_manager=manager
+    )
+
+
+render_operations_artifacts = _render_operations_fixture
 
 
 def fixture_manifest():
@@ -53,6 +65,17 @@ def test_operations_output_contains_ciphertext_only(tmp_path: Path):
     assert (agent_dir / "secrets.sops.yaml").read_bytes() == provider.ciphertext
     assert report.plaintext_paths == ()
     assert "fixture-only-generated-value" not in (agent_dir / "metadata.yaml").read_text(encoding="utf-8")
+
+
+def test_public_operations_renderer_rejects_an_unowned_handle_before_writing(tmp_path: Path):
+    manager, worktree = fixture_owned_worktree(tmp_path)
+    manager._handles.clear()
+    with pytest.raises(Exception, match="manager-owned"):
+        _render_operations_artifacts(
+            fixture_manifest(), fixture_resources(), FakeSecretProvider(),
+            worktree=worktree, worktree_manager=manager,
+        )
+    assert not (tmp_path / "agents").exists()
 
 
 def test_missing_age_recipient_blocks_before_output(tmp_path: Path):
