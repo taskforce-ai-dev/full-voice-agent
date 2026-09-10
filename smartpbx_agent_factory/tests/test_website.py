@@ -338,6 +338,33 @@ def test_atomic_write_failure_restores_every_website_artifact(tmp_path, monkeypa
     assert not (tmp_path / "scripts").exists()
 
 
+def test_transaction_recovery_accepts_factory_owned_underscore_stage(tmp_path):
+    """A safe tempfile-generated stage name must remain recoverable after restart."""
+    write_website_target(tmp_path)
+    transaction_root = tmp_path / ".smartpbx-agent-factory-website-txn"
+    stage = "smartpbx-acme-inquiry_abc123"
+    (transaction_root / stage).mkdir(parents=True)
+    files = [
+        {"target": target, "existed": False, "backup": None, "size": None, "sha256": None}
+        for target in website._TRANSACTION_TARGETS
+    ]
+    marker = {
+        "version": website._TRANSACTION_VERSION,
+        "stage": stage,
+        "files": files,
+        "applied": [],
+        "created_dirs": [],
+    }
+    (tmp_path / ".smartpbx-agent-factory-website-transaction.json").write_text(
+        json.dumps(marker), encoding="utf-8"
+    )
+
+    transaction = website._load_transaction(tmp_path)
+
+    assert transaction is not None
+    assert transaction[1].name == stage
+
+
 def test_generated_validator_has_one_reserved_declaration_and_parses_with_node(tmp_path):
     write_website_target(tmp_path)
     render_website_artifacts(
@@ -392,9 +419,10 @@ def write_interrupted_transaction(root: Path, originals: dict[str, bytes | None]
                 record["sha256"] = hashlib.sha256(original).hexdigest()
             records.append(record)
     marker = {
-        "version": 1,
+        "version": website._TRANSACTION_VERSION,
         "stage": "interrupted",
         "files": records,
+        "applied": [item["target"] for item in records if item.get("target") in website._TRANSACTION_TARGETS],
         "created_dirs": [],
     }
     (root / ".smartpbx-agent-factory-website-transaction.json").write_text(

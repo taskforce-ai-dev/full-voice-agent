@@ -19,26 +19,28 @@ def test_website_demo_has_a_separate_loopback_profile_without_smartpbx_credentia
     for forbidden in ("SMARTPBX_WS_TOKEN", "SMARTPBX_ACCOUNT_ID", "SMARTPBX_AUTH_HEADER_NAME"):
         assert forbidden not in website
     for required in (
-        "WEBSITE_DEMO_TWILIO_ACCOUNT_SID",
-        "WEBSITE_DEMO_TWILIO_API_KEY_SID",
-        "WEBSITE_DEMO_TWILIO_API_KEY_SECRET",
-        "WEBSITE_DEMO_TWILIO_AUTH_TOKEN",
-        "WEBSITE_DEMO_TWIML_APP_SID",
+        "TWILIO_ACCOUNT_SID",
+        "TWILIO_API_KEY_SID",
+        "TWILIO_API_KEY_SECRET",
+        "TWILIO_AUTH_TOKEN",
+        "TWILIO_TWIML_APP_SID",
     ):
         assert required in website
 
 
-def test_website_demo_uses_the_shared_issuer_response_shape_and_fails_closed_without_transport():
+def test_website_demo_uses_the_shared_issuer_response_shape_and_bounded_relay_transport():
     source = (RUNTIME / "website_demo.py.tmpl").read_text(encoding="utf-8")
     assert '@app.get("/api/voice-token")' in source
-    assert 'return {"token": token.to_jwt(), "identity": identity}' in source
-    assert '@app.api_route("/voice/demo-incoming", methods=["GET", "POST"])' in source
-    assert '@app.websocket("/ws/website-demo/media")' in source
+    assert 'serialized_token = token.to_jwt()' in source
+    assert 'return {"token": serialized_token, "identity": identity}' in source
+    assert '@app.post("/voice/demo-incoming")' in source
+    assert '@app.websocket("/ws/v1/website-demo/conversation")' in source
     assert "RequestValidator" in source
-    assert "WebsiteDemoTransportUnavailable" in source
-    assert "raise WebsiteDemoTransportUnavailable" in source
-    assert "WEBSITE_DEMO_MAX_ACTIVE_SESSIONS" in source
-    assert "WEBSITE_DEMO_TOKEN_TTL_SECONDS" in source
+    assert "WebsiteDemoConfigurationError" in source
+    assert "IssuedBrowserIdentities" in source
+    assert "SessionTickets" in source
+    assert "WEBSITE_DEMO_MAX_SESSIONS" in source
+    assert "ttl=300" in source
     assert "create_booking" not in source
     assert "handover" not in source.lower()
     assert "post_call" not in source.lower()
@@ -50,5 +52,13 @@ def test_candidate_records_the_website_demo_boundary_and_its_source_evidence():
     assert "website_demo.py" in candidate["runtime_outputs"]
     assert any(item["template_path"] == "runtime/website_demo.py.tmpl" for item in candidate["artifacts"])
     provenance = json.loads((ROOT / "candidate_runtime_provenance.json").read_text(encoding="utf-8"))
-    assert "website_demo_source" in provenance
-    assert provenance["website_demo_source"]["transport_status"] == "fail-closed-adapter-boundary"
+    assert set(provenance["website_transport_source_revisions"]) == {
+        "full-voice-agent",
+        "Taskforce_AI_Website",
+    }
+    website_component = next(
+        item for item in provenance["components"]
+        if item["template_path"] == "runtime/website_demo.py.tmpl"
+    )
+    assert website_component["source_path"] == "Flico Agent/server.py"
+    assert website_component["source_evidence"]

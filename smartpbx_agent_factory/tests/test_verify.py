@@ -10,17 +10,26 @@ from pathlib import Path
 import pytest
 
 from smartpbx_agent_factory.provenance import TemplateAllowlist, TemplateFile
+from smartpbx_agent_factory.catalogue import CapabilityCatalogue
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
 from smartpbx_agent_factory.schema import parse_manifest
 from smartpbx_agent_factory.verify import VerificationBinding, VerificationError, VerificationReport, readiness_report, verify_generated_backend
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+CATALOGUE = FIXTURES / "approved-provider-catalogue.json"
 
 
 def fixture_resources():
     raw = json.loads((FIXTURES / "acme-minimal.json").read_text(encoding="utf-8"))
-    return derive_resources(parse_manifest(raw, approved_source_roots=(Path.cwd(),)), AllocationRegistry())
+    return derive_resources(
+        parse_manifest(
+            raw,
+            approved_source_roots=(Path.cwd(),),
+            catalogue=CapabilityCatalogue.load(CATALOGUE),
+        ),
+        AllocationRegistry(),
+    )
 
 
 def _artifact_digest(root: Path) -> str:

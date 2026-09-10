@@ -59,23 +59,31 @@ def test_partial_candidate_runtime_records_only_pinned_source_lineage():
     root = Path(__file__).parents[1] / "template_v1"
     candidate = json.loads((root / "candidate_runtime_provenance.json").read_text(encoding="utf-8"))
     assert candidate["status"] == "partial-candidate-not-approved-for-rendering"
-    assert candidate["source_revision"] == "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e"
+    assert candidate["source_revision"] == "0f83ac662a34657f06d490a46dc1b773bfe021e7"
+    assert candidate["protocol_version"] == "smartpbx-ai-provider-v07"
     expected = {
+        "Kavya/docker-compose.yml",
         "Kavya/server.py",
         "Kavya/english_voice_profile.py",
         "Kavya/smartpbx_gateway.py",
         "Kavya/smartpbx_session.py",
         "Kavya/smartpbx_transport.py",
+        "Flico Agent/server.py",
+        "Kitchened/server.py",
+        "Kitchened/requirements-prod.txt",
+        "Taskforce_AI_Website/components/pages/BookDemo.tsx",
     }
     assert set(candidate["source_hashes"]) == expected
-    website_sources = set(candidate["website_demo_source"]["source_hashes"])
-    assert website_sources == {"HattonHills/server.py", "HattonHills/requirements-prod.lock.txt"}
+    assert set(candidate["website_transport_source_revisions"]) == {
+        "full-voice-agent",
+        "Taskforce_AI_Website",
+    }
     for component in candidate["components"]:
         template = root / component["template_path"]
         assert template.is_file()
         assert component["template_sha256"] == "sha256:" + sha256(template.read_bytes()).hexdigest()
         if component["source_path"] is not None:
-            assert component["source_path"] in expected | website_sources
+            assert component["source_path"] in expected
             assert component["source_ranges"]
 
 
