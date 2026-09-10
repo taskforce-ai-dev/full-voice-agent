@@ -329,3 +329,89 @@ def test_generated_validator_has_one_reserved_declaration_and_parses_with_node(t
     if node is not None:
         result = subprocess.run([node, "--check", str(validator)], capture_output=True, text=True, check=False)
         assert result.returncode == 0, result.stderr
+
+
+def test_manifest_derived_bearer_authorization_value_is_rejected_before_output(tmp_path):
+    write_website_target(tmp_path)
+    manifest = named_manifest("acme-inquiry", purpose="Authorization: Bearer opaque-session-value")
+    with pytest.raises(ValueError, match="credential-like"):
+        render_website_artifacts(
+            manifest,
+            derive_resources(manifest, AllocationRegistry()),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+    assert not (tmp_path / "data" / "smartpbx-agents.generated.mjs").exists()
+
+
+def write_interrupted_transaction(root: Path, originals: dict[str, bytes | None], records: list[dict[str, object]] | None = None):
+    stage = root / ".smartpbx-agent-factory-website-txn" / "interrupted"
+    stage.mkdir(parents=True)
+    if records is None:
+        records = []
+        for index, (target, original) in enumerate(originals.items()):
+            record = {"target": target, "existed": original is not None, "backup": None}
+            if original is not None:
+                backup = f"backup-{index}.bin"
+                (stage / backup).write_bytes(original)
+                record["backup"] = backup
+            records.append(record)
+    marker = {
+        "version": 1,
+        "stage": "interrupted",
+        "files": records,
+    }
+    (root / ".smartpbx-agent-factory-website-transaction.json").write_text(
+        json.dumps(marker), encoding="utf-8"
+    )
+
+
+def test_next_render_recovers_an_interrupted_owned_transaction_before_rejecting_new_input(tmp_path):
+    write_website_target(tmp_path)
+    paths = {
+        "data/smartpbx-agents.generated.mjs": None,
+        "scripts/validate-smartpbx-card.mjs": None,
+        "components/pages/BookDemo.tsx": (tmp_path / "components/pages/BookDemo.tsx").read_bytes(),
+        "package.json": (tmp_path / "package.json").read_bytes(),
+    }
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/smartpbx-agents.generated.mjs").write_text("partial generated data", encoding="utf-8")
+    page = tmp_path / "components/pages/BookDemo.tsx"
+    page.write_text("partial BookDemo", encoding="utf-8")
+    write_interrupted_transaction(tmp_path, paths)
+    invalid = named_manifest("acme-inquiry", purpose="Authorization: Bearer opaque-session-value")
+    with pytest.raises(ValueError, match="credential-like"):
+        render_website_artifacts(
+            invalid,
+            derive_resources(invalid, AllocationRegistry()),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+    assert not (tmp_path / "data/smartpbx-agents.generated.mjs").exists()
+    assert page.read_bytes() == paths["components/pages/BookDemo.tsx"]
+    assert (tmp_path / "package.json").read_bytes() == paths["package.json"]
+    assert not (tmp_path / ".smartpbx-agent-factory-website-transaction.json").exists()
+    assert not (tmp_path / ".smartpbx-agent-factory-website-txn" / "interrupted").exists()
+
+
+def test_malformed_recovery_marker_cannot_overwrite_outside_owned_targets(tmp_path):
+    write_website_target(tmp_path)
+    page = tmp_path / "components/pages/BookDemo.tsx"
+    before = page.read_bytes()
+    write_interrupted_transaction(
+        tmp_path,
+        {},
+        records=[{"target": "../outside", "existed": False, "backup": None}],
+    )
+    with pytest.raises(ValueError, match="transaction marker"):
+        render_website_artifacts(
+            fixture_manifest(),
+            fixture_resources(),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+    assert page.read_bytes() == before
+    assert not (tmp_path / "data").exists()
