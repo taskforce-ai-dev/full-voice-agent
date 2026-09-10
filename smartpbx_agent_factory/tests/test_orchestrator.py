@@ -316,6 +316,9 @@ def test_secret_resolution_binds_the_concrete_knowledge_review_not_manifest_sour
     assert builder.calls[0][1] == tmp_path / "knowledge-reviews" / report.generation_id
     assert (tmp_path / "knowledge-reviews").stat().st_mode & 0o777 == 0o700
     assert builder.calls[0][1].stat().st_mode & 0o777 == 0o700
+    persisted = json.loads((tmp_path / f"{report.generation_id}.json").read_text(encoding="utf-8"))
+    assert persisted["knowledge_review"]["digest"] == builder.review_digest
+    assert persisted["knowledge_review"]["documents"][0]["text"] == "Approved local fact."
 
 
 def test_secret_resolution_rejects_a_noncanonical_knowledge_review_digest(tmp_path):
