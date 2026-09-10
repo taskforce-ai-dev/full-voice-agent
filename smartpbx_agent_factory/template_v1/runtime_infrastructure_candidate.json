@@ -1,0 +1,23 @@
+{
+  "status": "partial-candidate-not-approved-for-rendering",
+  "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
+  "oci_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
+  "source_image_digest": "sha256:3d1cfce67574efd1c8bde484d26345c027713c4d169f37804114fecec5b81350",
+  "approval": {
+    "rendering": "blocked",
+    "release": "blocked",
+    "routing": "blocked"
+  },
+  "artifacts": [
+    {"template_path": "infrastructure/Dockerfile.tmpl", "role": "explicit runtime copy and import guard"},
+    {"template_path": "infrastructure/requirements-prod.txt.tmpl", "role": "exact direct dependency input"},
+    {"template_path": "infrastructure/requirements-prod.lock.txt.tmpl", "role": "exact dependency lock candidate"},
+    {"template_path": "infrastructure/docker-compose.yml.tmpl", "role": "loopback-only runtime candidate"},
+    {"template_path": "infrastructure/nginx-smartpbx.conf.tmpl", "role": "WSS ingress and authenticated status proxy"},
+    {"template_path": "infrastructure/env.example.tmpl", "role": "explicit environment contract"},
+    {"template_path": "infrastructure/SMARTPBX_RUNBOOK.md.tmpl", "role": "review boundary runbook"},
+    {"template_path": "infrastructure/CLIENT_CONNECT.md.tmpl", "role": "pending Client Connect contract"},
+    {"template_path": "infrastructure/ci-runtime-review.yml.tmpl", "role": "inert static CI fragment"},
+    {"template_path": "infrastructure/scripts/deploy_runtime_image.sh.tmpl", "role": "disabled provenance gate"}
+  ]
+}

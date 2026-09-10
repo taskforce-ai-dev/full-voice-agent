@@ -1,0 +1,28 @@
+# REVIEW-ONLY. This file is a static candidate, not an activation mechanism.
+services:
+  smartpbx-runtime:
+    image: "${SMARTPBX_IMAGE_REF:?immutable image reference required}"
+    ports:
+      - "127.0.0.1:8006:8000"
+    environment:
+      ENABLE_SMARTPBX_WSS: "true"
+      SMARTPBX_WS_TOKEN: "${SMARTPBX_WS_TOKEN:?required}"
+      SMARTPBX_ACCOUNT_ID: "${SMARTPBX_ACCOUNT_ID:?required}"
+      SMARTPBX_AUTH_HEADER_NAME: "X-SmartPBX-Token"
+      SMARTPBX_MAX_CALLS: "${SMARTPBX_MAX_CALLS:-4}"
+      SMARTPBX_MAX_MESSAGE_CHARS: "${SMARTPBX_MAX_MESSAGE_CHARS:-65536}"
+      SMARTPBX_MAX_AUDIO_BYTES: "${SMARTPBX_MAX_AUDIO_BYTES:-32768}"
+      SMARTPBX_MAX_OUTBOUND_FRAMES: "${SMARTPBX_MAX_OUTBOUND_FRAMES:-512}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      AZURE_SPEECH_KEY: "${AZURE_SPEECH_KEY:-}"
+      AZURE_SPEECH_REGION: "${AZURE_SPEECH_REGION:-}"
+      GOOGLE_APPLICATION_CREDENTIALS: "/app/gcp-credentials.json"
+      LLM_PROVIDER: "${LLM_PROVIDER:-}"
+      STT_PROVIDER: "${STT_PROVIDER:-}"
+      TTS_PROVIDER: "${TTS_PROVIDER:-}"
+    mem_limit: 1536m
+    cpus: 2.0
+    pids_limit: 256
+    restart: "no"

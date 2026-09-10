@@ -1,0 +1,10 @@
+# REVIEW-ONLY CI fragment. It is deliberately inert until separately incorporated.
+jobs:
+  runtime-infrastructure-static:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify exact dependency pins
+        run: test -f requirements-prod.lock.txt
+      - name: Verify runtime import contract
+        run: python -c "import server"

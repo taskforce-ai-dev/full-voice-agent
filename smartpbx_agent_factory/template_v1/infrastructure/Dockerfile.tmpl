@@ -1,0 +1,23 @@
+# REVIEW-ONLY runtime container candidate. Rendering and release remain blocked.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8000
+
+WORKDIR /app
+
+# The lock is the only dependency input consumed by the image build.
+COPY requirements-prod.lock.txt ./
+RUN pip install --no-cache-dir -r requirements-prod.lock.txt
+
+# Explicit runtime allowlist: no source-tree wildcard is permitted.
+COPY runtime/server.py runtime/smartpbx_gateway.py runtime/smartpbx_protocol.py ./
+COPY runtime/smartpbx_session.py runtime/smartpbx_transport.py runtime/smartpbx_diagnostics.py ./
+COPY runtime/product_profile.py runtime/provider_adapters.py runtime/turn_engine.py ./
+
+# Fail during image construction if an allowlisted runtime import is incomplete.
+RUN python -c "import server"
+
+EXPOSE 8000
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws-max-size", "65536"]
