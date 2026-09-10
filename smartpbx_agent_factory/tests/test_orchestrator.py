@@ -210,14 +210,55 @@ def test_secret_resolution_requires_a_validated_provider_audit_and_binds_digest(
         def validate(self):
             self.validated = True
 
+        def audit_report(self):
+            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
+
     provider = Provider()
     orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
     report = orchestrator.plan(FIXTURE)
     state = orchestrator.record_secrets_resolved(
         report.generation_id,
         provider=provider,
-        audit=SecretAudit(generated_names=("acme-inquiry/wss_token",), ciphertext_paths=("agents/acme/secrets.sops.yaml",)),
     )
     assert provider.validated is True
     assert state.stage is Stage.KNOWLEDGE_REVIEW_REQUIRED
     assert len(state.stage_digests["secrets"]) == 64
+
+
+@pytest.mark.parametrize(
+    "audit",
+    (
+        SecretAudit(generated_names=()),
+        SecretAudit(generated_names=("acme-inquiry/wss_token", "other/wss_token")),
+    ),
+)
+def test_secret_resolution_rejects_missing_or_extra_provider_audit_names(tmp_path, audit):
+    class Provider:
+        def validate(self):
+            return None
+
+        def audit_report(self):
+            return audit
+
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    report = orchestrator.plan(FIXTURE)
+    with pytest.raises(GenerationBlockedError, match="secret audit names"):
+        orchestrator.record_secrets_resolved(report.generation_id, provider=Provider())
+
+
+def test_secret_resolution_does_not_accept_a_caller_forged_audit_argument(tmp_path):
+    class Provider:
+        def validate(self):
+            return None
+
+        def audit_report(self):
+            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
+
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    report = orchestrator.plan(FIXTURE)
+    with pytest.raises(TypeError):
+        orchestrator.record_secrets_resolved(
+            report.generation_id,
+            provider=Provider(),
+            audit=SecretAudit(generated_names=("forged/wss_token",)),
+        )
