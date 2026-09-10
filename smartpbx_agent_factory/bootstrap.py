@@ -45,7 +45,7 @@ from .secrets import (
     RepositoryVisibilityVerifier,
     SopsAgeSecretProvider,
 )
-from .verify import VerificationReport, load_lifecycle_attestation
+from .verify import VerificationReport, load_lifecycle_attestation, template_allowlist_digest
 
 
 class FactoryConfigError(ValueError):
@@ -383,8 +383,10 @@ class GitHubCIResultAdapter:
         except Exception as error:
             raise GenerationBlockedError("approved template provenance is unavailable") from error
 
-    def publish_for_ci(self, *, generation_id: str, inventory: object) -> None:
+    def publish_for_ci(self, *, generation_id: str, inventory: object, lane_records: Mapping[str, Mapping[str, str]]) -> None:
         """Publish only exact, clean factory branches so repository CI can attest them."""
+        if set(lane_records) != set(_ROLES):
+            raise GenerationBlockedError("CI publication requires exact committed records for all lanes")
         handles = getattr(inventory, "worktrees", ())
         publisher = GitHubCommandAdapter(self._config, runner=self._runner)
         for role, lane in self._config.lanes.items():
@@ -395,18 +397,39 @@ class GitHubCIResultAdapter:
             if handle.branch is None:
                 raise GenerationBlockedError("CI publication requires generated review branches")
             publisher.push_generated_branch(role=role, path=handle.target, remote=lane.remote, branch=handle.branch)
+            remote_sha = publisher.remote_branch_head(repository=lane.repository, branch=handle.branch)
+            record = lane_records[role]
+            if (
+                not isinstance(record, dict)
+                or not _SHA.fullmatch(str(record.get("head_sha", "")))
+                or handle.revision != record["head_sha"]
+                or remote_sha != record["head_sha"]
+            ):
+                raise GenerationBlockedError("published review branch differs from its committed lane SHA")
+            record["published_remote_sha"] = remote_sha
 
     def verify(self, *, generation_id: str, resources: object, lane_records: Mapping[str, Mapping[str, str]]) -> tuple[ReadinessEvidence, Mapping[str, VerificationReport]]:
         self.preflight()
         allowlist = validate_allowlist_metadata(json.loads((Path(__file__).parent / "template_v1" / "file_allowlist.json").read_text(encoding="utf-8")))
+        slug = getattr(resources, "slug", None)
+        if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,62})", slug):
+            raise GenerationBlockedError("CI requires a safe generated agent slug")
         if set(lane_records) != set(_ROLES):
             raise GenerationBlockedError("CI requires exact committed records for all lanes")
         for role in _ROLES:
             record = lane_records[role]
-            sha, artifact = record.get("head_sha"), record.get("artifact_digest")
+            sha, artifact, remote_sha = record.get("head_sha"), record.get("artifact_digest"), record.get("published_remote_sha")
             if not isinstance(sha, str) or not _SHA.fullmatch(sha) or not isinstance(artifact, str) or not re.fullmatch(r"[0-9a-f]{64}", artifact):
                 raise GenerationBlockedError("CI requires immutable lane SHA and artifact digest")
             lane = self._config.lanes[role]
+            if not isinstance(remote_sha, str) or remote_sha != sha:
+                raise GenerationBlockedError("CI requires a persisted published remote lane SHA")
+            current_remote = GitHubCommandAdapter(self._config, runner=self._runner).remote_branch_head(
+                repository=lane.repository,
+                branch=f"smartpbx-agent-factory/{generation_id}",
+            )
+            if current_remote != remote_sha:
+                raise GenerationBlockedError("published review branch drifted before CI verification")
             result = self._runner((str(self._config.ci.gh_binary), "api", f"repos/{lane.repository}/commits/{sha}/check-runs"))
             if getattr(result, "returncode", 1) != 0:
                 raise GenerationBlockedError("external CI result is pending or cannot be authoritatively checked")
@@ -419,32 +442,80 @@ class GitHubCIResultAdapter:
                 raise GenerationBlockedError("external CI result is pending or lacks exact lane provenance")
             if lane.ci_policy == "lifecycle-attestation":
                 details = str(matches[0].get("details_url", ""))
-                run_match = re.search(r"/actions/runs/([1-9][0-9]*)", details)
+                parsed_details = urlsplit(details)
+                expected_prefix = f"/{lane.repository}/actions/runs/"
+                run_match = re.fullmatch(
+                    re.escape(expected_prefix) + r"([1-9][0-9]*)(?:/job/[1-9][0-9]*)?",
+                    parsed_details.path,
+                )
+                if (
+                    parsed_details.scheme != "https"
+                    or parsed_details.hostname != "github.com"
+                    or parsed_details.username is not None
+                    or parsed_details.password is not None
+                    or parsed_details.query
+                    or parsed_details.fragment
+                ):
+                    run_match = None
                 if run_match is None:
                     raise GenerationBlockedError("repository-owned lifecycle attestation is unavailable")
+                if not lane.target_root.is_dir() or lane.target_root.is_symlink():
+                    raise GenerationBlockedError("repository-owned lifecycle attestation target is unsafe")
                 with tempfile.TemporaryDirectory(prefix=".smartpbx-ci-", dir=str(lane.target_root)) as directory:
                     os.chmod(directory, 0o700)
                     downloaded = self._runner((str(self._config.ci.gh_binary), "run", "download", run_match.group(1), "--repo", lane.repository, "-n", "smartpbx-ci-lifecycle-attestations", "-D", directory))
                     if getattr(downloaded, "returncode", 1) != 0:
                         raise GenerationBlockedError("repository-owned lifecycle attestation is unavailable")
-                    files = tuple(Path(directory).glob("*.json"))
-                    if len(files) != 1:
+                    downloaded_root = Path(directory)
+                    expected_name = f"{slug}.json"
+                    files: list[Path] = []
+                    try:
+                        root = downloaded_root.resolve(strict=True)
+                        for path in downloaded_root.rglob("*"):
+                            if path.is_symlink() or not path.resolve().is_relative_to(root):
+                                raise GenerationBlockedError("repository-owned lifecycle attestation is unsafe")
+                            if path.is_file() and path.name == expected_name:
+                                files.append(path)
+                    except (OSError, ValueError) as error:
+                        raise GenerationBlockedError("repository-owned lifecycle attestation is unsafe") from error
+                    if len(files) != 1 or files[0].parent.resolve() != root:
                         raise GenerationBlockedError("repository-owned lifecycle attestation is unavailable")
-                    attestation = load_lifecycle_attestation(files[0], agent_dir=lane.target_root / generation_id / "SmartPBX Agents" / getattr(resources, "slug"), lane=self._config.ci.workflow, source_sha=sha)
-                    if attestation.artifact_digest != artifact:
+                    attestation = load_lifecycle_attestation(
+                        files[0], agent_dir=lane.target_root / generation_id / "SmartPBX Agents" / slug,
+                        repository=lane.repository, lane="backend", head_sha=sha, run_id=run_match.group(1),
+                    )
+                    if (
+                        attestation.fixture_kind != "generated-agent"
+                        or attestation.artifact_digest != artifact
+                        or attestation.source_revision != allowlist.source_revision
+                        or attestation.template_version != allowlist.template_version
+                        or attestation.template_allowlist_digest != template_allowlist_digest(allowlist)
+                    ):
                         raise GenerationBlockedError("lifecycle attestation artifact digest differs from lane record")
         artifact_digests = {role: lane_records[role]["artifact_digest"] for role in _ROLES}
-        reports = {
-            role: VerificationReport(
-                agent_slug=getattr(resources, "slug"), artifact_digest=artifact_digests[role],
+        reports: dict[str, VerificationReport] = {
+            "backend": VerificationReport(
+                agent_slug=getattr(resources, "slug"), artifact_digest=artifact_digests["backend"],
                 template_version=allowlist.template_version, source_revision=allowlist.source_revision,
                 ci_identifier=getattr(resources, "ci_identifier"), protocol_events=("connected", "start", "media", "stop", "hangup"),
                 static_contracts_passed=True, runtime_lifecycle_verified=True, ready_for_pr=True,
                 runtime_status="CI_LIFECYCLE_VERIFIED",
                 evidence=("Dockerfile", "server.py", "smartpbx_gateway.py", "smartpbx_protocol.py", "smartpbx_transport.py", "smartpbx_diagnostics.py", "docker-compose.yml", ".github-workflow-fragment.yml", ".smartpbx-factory-provenance.json"),
-            )
-            for role in _ROLES
+                role="backend", ci_policy="lifecycle-attestation", repository=self._config.lanes["backend"].repository,
+                ci_check=self._config.lanes["backend"].ci_check, head_sha=lane_records["backend"]["head_sha"],
+            ),
         }
+        for role in ("operations", "website"):
+            lane = self._config.lanes[role]
+            reports[role] = VerificationReport(
+                agent_slug=getattr(resources, "slug"), artifact_digest=artifact_digests[role],
+                template_version=allowlist.template_version, source_revision=allowlist.source_revision,
+                ci_identifier=getattr(resources, "ci_identifier"), protocol_events=(),
+                static_contracts_passed=True, runtime_lifecycle_verified=False, ready_for_pr=True,
+                runtime_status="CI_STATIC_VERIFIED", evidence=("github-ci-check",), role=role,
+                ci_policy=lane.ci_policy, repository=lane.repository, ci_check=lane.ci_check,
+                head_sha=lane_records[role]["head_sha"],
+            )
         digest = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         ownership = digest({role: lane_records[role]["head_sha"] for role in _ROLES})
         readiness = ReadinessEvidence(
@@ -454,7 +525,11 @@ class GitHubCIResultAdapter:
             artifact_digests=artifact_digests, review_label=f"SmartPBX {getattr(resources, 'slug')}",
             wss_url=getattr(resources, "wss_url"), expected_wss_hostname=getattr(resources, "smartpbx_hostname"),
             allowed_wss_paths=("/ws/v1/smartpbx/media",), readiness_digest=digest(lane_records),
-            secret_scan_digest=digest({"artifacts": artifact_digests}), ci_registration_digest=digest({"repository": self._config.ci.repository, "workflow": self._config.ci.workflow}),
+            secret_scan_digest=digest({"artifacts": artifact_digests}), ci_registration_digest=digest({
+                role: {"repository": self._config.lanes[role].repository, "check": self._config.lanes[role].ci_check,
+                       "policy": self._config.lanes[role].ci_policy, "head_sha": lane_records[role]["head_sha"]}
+                for role in _ROLES
+            }),
             provenance_digest=digest({"source_revision": allowlist.source_revision}), worktree_ownership_digest=ownership,
         )
         return readiness, reports

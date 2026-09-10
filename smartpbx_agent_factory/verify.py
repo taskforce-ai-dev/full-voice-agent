@@ -31,12 +31,14 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SLUG = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62})$")
 _CI_IDENTIFIER = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62})$")
+_CI_CHECK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,119}$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 _SHA256_REF = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 _RUN_ID = re.compile(r"^[1-9][0-9]{0,19}$")
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$")
 _REQUIRED_EVENTS = ("connected", "start", "media", "stop", "hangup")
+_STATIC_CI_ROLES = ("operations", "website")
 _TERMINAL_PATHS = ("stop", "hangup")
 _REQUIRED_FILES = (
     "Dockerfile",
@@ -109,6 +111,11 @@ def _allowlist_digest(allowlist: TemplateAllowlist) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def template_allowlist_digest(allowlist: TemplateAllowlist) -> str:
+    """Return the stable digest used by generated provenance and CI evidence."""
+    return _allowlist_digest(allowlist)
+
+
 @dataclass(frozen=True)
 class VerificationBinding:
     """Trusted coordinator inputs that a generated tree cannot self-assert."""
@@ -173,6 +180,11 @@ class VerificationReport:
     ready_for_pr: bool
     runtime_status: str
     evidence: tuple[str, ...]
+    role: str = "backend"
+    ci_policy: str = "lifecycle-attestation"
+    repository: str = ""
+    ci_check: str = ""
+    head_sha: str = ""
 
     def __post_init__(self) -> None:
         _safe_report_text(self.agent_slug, "agent_slug", _SLUG, limit=63)
@@ -180,16 +192,42 @@ class VerificationReport:
         _safe_report_text(self.template_version, "template_version", _VERSION)
         _safe_report_text(self.source_revision, "source_revision", _REVISION, limit=40)
         _safe_report_text(self.ci_identifier, "ci_identifier", _CI_IDENTIFIER, limit=63)
-        if self.protocol_events != _REQUIRED_EVENTS:
-            raise VerificationError("safe report protocol events are invalid")
+        if self.role not in {"backend", *_STATIC_CI_ROLES}:
+            raise VerificationError("safe report role is invalid")
+        expected_policy = "lifecycle-attestation" if self.role == "backend" else (
+            "secret-static" if self.role == "operations" else "website-build"
+        )
+        if self.ci_policy != expected_policy:
+            raise VerificationError("safe report CI policy is invalid")
+        if self.repository:
+            _safe_report_text(self.repository, "repository", _REPOSITORY, limit=201)
+        if self.ci_check:
+            _safe_report_text(self.ci_check, "ci_check", _CI_CHECK)
+        if self.head_sha:
+            _safe_report_text(self.head_sha, "head_sha", _REVISION, limit=40)
         if not all(isinstance(value, bool) for value in (self.static_contracts_passed, self.runtime_lifecycle_verified, self.ready_for_pr)):
             raise VerificationError("safe report booleans are required")
-        if self.runtime_status not in {"CI_LIFECYCLE_REQUIRED", "CI_LIFECYCLE_VERIFIED"}:
-            raise VerificationError("safe report runtime status is invalid")
-        if self.ready_for_pr != self.runtime_lifecycle_verified:
-            raise VerificationError("safe report readiness must match lifecycle evidence")
-        if not self.static_contracts_passed or not self.evidence or not all(isinstance(item, str) and item in _REQUIRED_FILES for item in self.evidence):
-            raise VerificationError("safe report evidence is invalid")
+        if self.role == "backend":
+            if self.protocol_events != _REQUIRED_EVENTS:
+                raise VerificationError("safe report protocol events are invalid")
+            if self.runtime_status not in {"CI_LIFECYCLE_REQUIRED", "CI_LIFECYCLE_VERIFIED"}:
+                raise VerificationError("safe report runtime status is invalid")
+            if self.ready_for_pr != self.runtime_lifecycle_verified:
+                raise VerificationError("safe report readiness must match lifecycle evidence")
+            if not self.static_contracts_passed or not self.evidence or not all(isinstance(item, str) and item in _REQUIRED_FILES for item in self.evidence):
+                raise VerificationError("safe report evidence is invalid")
+            return
+        if (
+            self.protocol_events
+            or self.runtime_lifecycle_verified
+            or not self.ready_for_pr
+            or self.runtime_status != "CI_STATIC_VERIFIED"
+            or self.evidence != ("github-ci-check",)
+            or not self.repository
+            or not self.ci_check
+            or not self.head_sha
+        ):
+            raise VerificationError("static CI report must not claim runtime lifecycle evidence")
 
 
 _ATTESTATION_CASES = (

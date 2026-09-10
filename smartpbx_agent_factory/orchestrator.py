@@ -98,11 +98,11 @@ class RepositoryOwnedCIVerificationCoordinator:
             raise GenerationBlockedError("repository-owned CI worktree binding is invalid")
         return worktrees
 
-    def publish_for_ci(self, *, generation_id: str, inventory: object) -> None:
+    def publish_for_ci(self, *, generation_id: str, inventory: object, lane_records: Mapping[str, Mapping[str, str]]) -> None:
         publish = getattr(self.ci_result_adapter, "publish_for_ci", None)
         if not callable(publish):
             raise GenerationBlockedError("repository-owned CI publication is unavailable")
-        publish(generation_id=generation_id, inventory=inventory)
+        publish(generation_id=generation_id, inventory=inventory, lane_records=lane_records)
 
     def preflight(self) -> None:
         check = getattr(self.ci_result_adapter, "preflight", None)
@@ -834,8 +834,10 @@ class GenerationOrchestrator:
         try:
             self._verification_coordinator.preflight()
             self._verification_coordinator.publish_for_ci(
-                generation_id=generation_id, inventory=stored.cleanup_inventory
+                generation_id=generation_id, inventory=stored.cleanup_inventory,
+                lane_records=stored.state.lane_records,
             )
+            self._save(stored)
             readiness, reports = self._verification_coordinator.verify(
                 generation_id=generation_id, resources=stored.resources, lane_records=stored.state.lane_records
             )

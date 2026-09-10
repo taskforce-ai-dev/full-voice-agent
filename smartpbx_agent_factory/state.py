@@ -107,7 +107,7 @@ class GenerationState:
             raise StateError("stage digest name and value are required")
         self.stage_digests[name] = digest
 
-    def record_lane(self, lane: str, *, output_digest: str, head_sha: str, artifact_digest: str, ciphertext_reference: str = "") -> None:
+    def record_lane(self, lane: str, *, output_digest: str, head_sha: str, artifact_digest: str, ciphertext_reference: str = "", published_remote_sha: str = "") -> None:
         """Persist only bounded non-secret resume evidence for one owned lane."""
         if lane not in {"backend", "operations", "website"}:
             raise StateError("lane is invalid")
@@ -118,11 +118,18 @@ class GenerationState:
             raise StateError("lane digest is invalid")
         if ciphertext_reference and (not isinstance(ciphertext_reference, str) or len(ciphertext_reference) > 240 or "\x00" in ciphertext_reference):
             raise StateError("ciphertext reference is invalid")
+        if published_remote_sha and (
+            not isinstance(published_remote_sha, str)
+            or len(published_remote_sha) != 40
+            or set(published_remote_sha) - set("0123456789abcdef")
+        ):
+            raise StateError("published remote SHA is invalid")
         self.lane_records[lane] = {
             "output_digest": output_digest,
             "head_sha": head_sha,
             "artifact_digest": artifact_digest,
             "ciphertext_reference": ciphertext_reference,
+            "published_remote_sha": published_remote_sha,
         }
 
     def block(self, reason: str) -> None:

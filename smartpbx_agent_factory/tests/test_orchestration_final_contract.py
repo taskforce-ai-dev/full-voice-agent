@@ -139,6 +139,7 @@ def test_checkpoint_keeps_canonical_backend_artifact_digest_separate_from_tree_o
         "head_sha": "c" * 40,
         "artifact_digest": "d" * 64,
         "ciphertext_reference": "",
+        "published_remote_sha": "",
     }
     assert restored.lane_records["backend"]["output_digest"] != restored.lane_records["backend"]["artifact_digest"]
 
