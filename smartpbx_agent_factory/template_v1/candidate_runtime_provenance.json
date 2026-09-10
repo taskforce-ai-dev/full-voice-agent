@@ -1,27 +1,48 @@
 {
   "status": "partial-candidate-not-approved-for-rendering",
-  "source_revision": "0f83ac662a34657f06d490a46dc1b773bfe021e7",
-  "protocol_version": "smartpbx-ai-provider-v07",
+  "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
+  "website_transport_source_revisions": {
+    "full-voice-agent": "22cc536ffb45f95f06159f6fe1c00332c85f3231",
+    "Taskforce_AI_Website": "7ca063c51feb9b001dbefccd2903ed871b1200e2"
+  },
   "source_hashes": {
     "Kavya/docker-compose.yml": "sha256:f14ce9896c526943386cfc94e158d8bc452936a2342f172a6f6e27121d22ceec",
     "Kavya/english_voice_profile.py": "sha256:7d694df737dcdcf6382b416467bde7269bc16edb654bc6e13aed94fc032c0274",
     "Kavya/server.py": "sha256:27e58046ce3b4c32eb0331bdafe4c0d300d7e7596ebea9dc680d7de4febee28b",
-    "Kavya/smartpbx_gateway.py": "sha256:1c1732b2a4db99600d4c107dd8753ec20992532ac84a54597eb9069bfb74eb28",
+    "Kavya/smartpbx_gateway.py": "sha256:901c41c42b774cb12248719d3e5469599619a5eba8c82e447bb507d4772a18ee",
     "Kavya/smartpbx_session.py": "sha256:18695c13c0174f3c3c45a53d7de76cc76c6d76984e998ddb4c6265fe5f19c76e",
-    "Kavya/smartpbx_transport.py": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e"
-  },
-  "website_demo_source": {
-    "source_revision": "22cc536ffb45f95f06159f6fe1c00332c85f3231",
-    "source_hashes": {
-      "HattonHills/server.py": "sha256:e4c94ac4be52613162b1e08cfa00939ab08bc64d363decb2c47cccac8513fb16",
-      "HattonHills/requirements-prod.lock.txt": "sha256:e1719b42ae685ace1fb61749bb7e11afb44cf5c7cae131b339566b3e75f2c6d0"
-    },
-    "source_ranges": ["1060-1140", "1253-1332"],
-    "extraction": "The isolated issuer preserves the short-lived browser Voice SDK token response shape and agent/lang webhook seam. Customer ConversationRelay and Media Streams orchestration is not extracted.",
-    "transport_status": "fail-closed-adapter-boundary",
-    "blocker": "No client-neutral, source-approved browser ConversationRelay or Media Streams adapter exists. The current transport is embedded in customer runtime code and cannot be copied without bringing customer policy, persona, or business behavior into generated agents."
+    "Kavya/smartpbx_transport.py": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e",
+    "Flico Agent/server.py": "sha256:1b79f1baa3926217da5d64e6dce02da236a6c2635248b2a8507dee271b3425c9",
+    "Kitchened/server.py": "sha256:045953e6a20775f0db6f6d94554ed8ea5cc8fda395073fc8412b7a10284ac03f",
+    "Kitchened/requirements-prod.txt": "sha256:ac7e9eda3d2d2ca8c97899b4786af59e8d661f033f0514c0b3786924c6adff4f",
+    "Taskforce_AI_Website/components/pages/BookDemo.tsx": "sha256:4c25317736a454a647abd22c0cef68d61948951f760f7cca72f44670000fedcc"
   },
   "components": [
+    {
+      "template_path": "runtime/website_demo_core.py.tmpl",
+      "template_sha256": "sha256:949c75680192968b2b8c95fa4e39da888ba6cc0b4b4de35935bcce1927efa7db",
+      "source_path": "Flico Agent/server.py",
+      "source_ranges": ["1095-1163", "2923-3140"],
+      "source_evidence": [
+        {"source_path": "Flico Agent/server.py", "source_ranges": ["1095-1163", "2923-3140"]},
+        {"source_path": "Kitchened/server.py", "source_ranges": ["828-906"]},
+        {"source_path": "Taskforce_AI_Website/components/pages/BookDemo.tsx", "source_ranges": ["28-40", "407-445"]}
+      ],
+      "extraction": "client-neutral browser token rate bound, one-time text-relay admission, callback URL construction, XML escaping, and no-transfer demo path; business identity, tools, transcripts, and customer routing are excluded"
+    },
+    {
+      "template_path": "runtime/website_demo.py.tmpl",
+      "template_sha256": "sha256:980edb602458aac9396c6347ac63cb65298ddbc21af7b0fb9fe9174817d382ea",
+      "source_path": "Flico Agent/server.py",
+      "source_ranges": ["1095-1163", "2923-3140"],
+      "source_evidence": [
+        {"source_path": "Flico Agent/server.py", "source_ranges": ["1095-1163", "2923-3140"]},
+        {"source_path": "Kitchened/server.py", "source_ranges": ["828-906"]},
+        {"source_path": "Kitchened/requirements-prod.txt", "source_ranges": ["10-12"]},
+        {"source_path": "Taskforce_AI_Website/components/pages/BookDemo.tsx", "source_ranges": ["28-40", "407-445"]}
+      ],
+      "extraction": "isolated signed Twilio webhook, browser access token, bounded ConversationRelay WebSocket lifecycle, generated-language selection, provider LLM history, and startup-loaded reviewed knowledge; no SmartPBX carrier credentials or business actions"
+    },
     {
       "template_path": "provider_catalogue.json",
       "template_sha256": "sha256:8c05c321be8327def94338de7e4ac6f21e9ec34beceb1ca9b46cf21db6cf39f0",
@@ -52,10 +73,10 @@
     },
     {
       "template_path": "runtime/smartpbx_gateway.py.tmpl",
-      "template_sha256": "sha256:a9a89aa967c833f649bc020de54769de9afaf58da96669312eb5505213176aef",
+      "template_sha256": "sha256:4aefe8a9863f549507175cb2429ef28084a9f5cfdde2e791aee0a4eed2f5f772",
       "source_path": "Kavya/smartpbx_gateway.py",
-      "source_ranges": ["26", "258-410", "571-675"],
-      "extraction": "V07 authenticated status marker, carrier ingress, bounded admission, strict protocol handoff, terminal and transport lifecycle"
+      "source_ranges": ["258-410", "571-675"],
+      "extraction": "carrier ingress, bounded admission, strict protocol handoff, terminal and transport lifecycle"
     },
     {
       "template_path": "runtime/smartpbx_session.py.tmpl",
@@ -144,62 +165,6 @@
         {"source_path": "Kavya/english_voice_profile.py", "source_ranges": ["1-59"]}
       ],
       "extraction": "startup-injected exact language-profile routes plus English ElevenLabs and Sinhala Gemini or approved Rime streaming TTS; bounded provider bodies, validated 8 kHz mu-law conversion, 20 ms framing, and generation-fenced transport handoff"
-    },
-    {
-      "template_path": "runtime/website_demo.py.tmpl",
-      "template_sha256": "sha256:4463df7eca84644fc5256ee7fc2c25374e29b33e8be38c4dfc4401397f4b88ae",
-      "source_path": "HattonHills/server.py",
-      "source_ranges": ["1060-1140", "1253-1332"],
-      "extraction": "isolated Voice SDK token response and agent/lang ingress contract with bounded issuance, signature verification, and an unavailable transport adapter; no customer conversation implementation is copied"
-    },
-    {
-      "template_path": "infrastructure/docker-compose.yml.tmpl",
-      "template_sha256": "sha256:243b7441d3df1ea54d52559b5979714a94a20a058a7d39d46b61cf9f93f386a9",
-      "source_path": null,
-      "source_ranges": [],
-      "extraction": "separate opt-in website-demo service, loopback port, credential boundary, and resource limits; review-only candidate"
-    },
-    {
-      "template_path": "infrastructure/Dockerfile.tmpl",
-      "template_sha256": "sha256:355f827d322c85e699c55c04247de4779170b6e59c10ec812092176eae3d90ea",
-      "source_path": null,
-      "source_ranges": [],
-      "extraction": "explicit website-demo module copy in the existing review-only image candidate"
-    },
-    {
-      "template_path": "infrastructure/requirements-prod.txt.tmpl",
-      "template_sha256": "sha256:ea3068d727c50d24f6057f77b1745569cc856404b106c53d782702317de0ad0d",
-      "source_path": "HattonHills/requirements-prod.lock.txt",
-      "source_ranges": ["96", "119"],
-      "extraction": "exact direct pins for form parsing and the Voice SDK issuer dependency"
-    },
-    {
-      "template_path": "infrastructure/requirements-prod.lock.txt.tmpl",
-      "template_sha256": "sha256:8fbd1ea0fcf81e1450646983b6f3c1ae0cf2388af337676863598b04c0a091b3",
-      "source_path": "HattonHills/requirements-prod.lock.txt",
-      "source_ranges": ["96", "119"],
-      "extraction": "exact review-only lock candidate for the isolated browser ingress"
-    },
-    {
-      "template_path": "infrastructure/env.example.tmpl",
-      "template_sha256": "sha256:46c0325db13c853649977d2a0946bcba5020e94dfa12eaac894de79234d2d9aa",
-      "source_path": null,
-      "source_ranges": [],
-      "extraction": "separate website-demo secret contract with no SmartPBX service propagation"
-    },
-    {
-      "template_path": "infrastructure/nginx-website-demo.conf.tmpl",
-      "template_sha256": "sha256:b785999510671b4141556a6c48a90d85367498a0f4562fac315a172a532284a8",
-      "source_path": null,
-      "source_ranges": [],
-      "extraction": "review-only loopback proxy surface for health, issuer, voice ingress, and unavailable media route"
-    },
-    {
-      "template_path": "infrastructure/WEBSITE_DEMO_RUNBOOK.md.tmpl",
-      "template_sha256": "sha256:80937363e65a92bceaecd7006b18c3de96b880a3c8a2e34fefa907abee72e538",
-      "source_path": null,
-      "source_ranges": [],
-      "extraction": "explicit no-routing/no-deploy operational boundary and transport approval blocker"
     }
   ]
 }

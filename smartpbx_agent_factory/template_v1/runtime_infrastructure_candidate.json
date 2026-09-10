@@ -20,6 +20,7 @@
     "turn_engine.py",
     "provider_runtime.py",
     "website_demo.py",
+    "website_demo_core.py",
     "config/product_profile.json",
     "config/provider_profile.json"
   ],
@@ -31,7 +32,7 @@
   },
   "unresolved_blockers": [
     "CI has not proved real provider startup or connected/start/media/stop/hangup cleanup.",
-    "A source-approved isolated website-demo/Twilio ingress profile is not yet extracted; no stub may satisfy this requirement."
+    "CI has not yet proved the isolated website-demo browser-token, signed-webhook, relay-session, disconnect, and release lifecycle."
   ],
   "artifacts": [
     {"template_path": "infrastructure/Dockerfile.tmpl", "role": "explicit runtime copy and import guard"},
@@ -39,13 +40,13 @@
     {"template_path": "infrastructure/requirements-prod.lock.txt.tmpl", "role": "exact dependency lock candidate"},
     {"template_path": "infrastructure/docker-compose.yml.tmpl", "role": "loopback-only runtime candidate"},
     {"template_path": "infrastructure/nginx-smartpbx.conf.tmpl", "role": "WSS ingress and authenticated status proxy"},
+    {"template_path": "infrastructure/nginx-website-demo.conf.tmpl", "role": "separate browser token, signed webhook, and relay ingress"},
     {"template_path": "infrastructure/env.example.tmpl", "role": "explicit environment contract"},
     {"template_path": "infrastructure/SMARTPBX_RUNBOOK.md.tmpl", "role": "review boundary runbook"},
     {"template_path": "infrastructure/CLIENT_CONNECT.md.tmpl", "role": "pending Client Connect contract"},
     {"template_path": "infrastructure/ci-runtime-review.yml.tmpl", "role": "inert static CI fragment"},
-    {"template_path": "infrastructure/scripts/deploy_runtime_image.sh.tmpl", "role": "disabled provenance gate"},
-    {"template_path": "runtime/website_demo.py.tmpl", "role": "isolated token issuer and fail-closed browser media adapter"},
-    {"template_path": "infrastructure/nginx-website-demo.conf.tmpl", "role": "loopback-only website-demo ingress proxy"},
-    {"template_path": "infrastructure/WEBSITE_DEMO_RUNBOOK.md.tmpl", "role": "blocked website-demo routing boundary"}
+    {"template_path": "runtime/website_demo.py.tmpl", "role": "isolated client-neutral Twilio browser token, signed webhook, and ConversationRelay profile"},
+    {"template_path": "runtime/website_demo_core.py.tmpl", "role": "dependency-free quota, one-time ticket, callback-origin, and TwiML safety contract"},
+    {"template_path": "infrastructure/scripts/deploy_runtime_image.sh.tmpl", "role": "disabled provenance gate"}
   ]
 }

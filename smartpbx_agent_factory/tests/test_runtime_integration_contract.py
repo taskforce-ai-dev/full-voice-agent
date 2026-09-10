@@ -128,7 +128,7 @@ def test_source_shaped_history_recognition_and_selection_contracts_prevent_known
     assert "කරුණාකර රැඳෙන්න." in renderer
 
 
-def test_renderer_uses_the_verified_gateway_template_and_keeps_partial_web_ingress_blocked():
+def test_renderer_uses_the_verified_gateway_template_and_keeps_web_ingress_review_only():
     root = Path(__file__).parents[1]
     renderer = (root / "render.py").read_text(encoding="utf-8")
     candidate = (root / "template_v1" / "runtime_infrastructure_candidate.json").read_text(encoding="utf-8")
@@ -136,11 +136,21 @@ def test_renderer_uses_the_verified_gateway_template_and_keeps_partial_web_ingre
     assert '"smartpbx_gateway.py": runtime_template("smartpbx_gateway.py.tmpl")' in renderer
     assert "def _python_gateway" not in renderer
     assert '"website_demo.py": runtime_template("website_demo.py.tmpl")' in renderer
+    assert '"website_demo_core.py": runtime_template("website_demo_core.py.tmpl")' in renderer
     assert "synthetic=synthetic" in renderer and "review-only-exact-template" in renderer
-    assert "website-demo/Twilio ingress" in candidate
-    assert "website-demo ingress" in allowlist
+    assert "signed-webhook" in candidate
+    assert "website-demo profile is source-extracted" in allowlist
     compose = (root / "template_v1" / "infrastructure" / "docker-compose.yml.tmpl").read_text(encoding="utf-8")
-    assert "website-demo" not in compose
+    website_proxy = (root / "template_v1" / "infrastructure" / "nginx-website-demo.conf.tmpl").read_text(encoding="utf-8")
+    website = source("website_demo.py.tmpl")
+    assert 'profiles: ["website-demo"]' in compose
+    assert "SMARTPBX_WS_TOKEN" not in website
+    assert "TWILIO_AUTH_TOKEN" in website
+    assert '"/ws/v1/website-demo/conversation"' in website
+    assert "server_name {{website_hostname}};" in website_proxy
+    assert "location = /api/voice-token" in website_proxy
+    assert "location = /voice/demo-incoming" in website_proxy
+    assert "location = /ws/v1/website-demo/conversation" in website_proxy
 
 
 def test_deepgram_is_not_an_approved_generated_runtime_provider():

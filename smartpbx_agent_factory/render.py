@@ -1,9 +1,8 @@
 """Fail-closed rendering for isolated, inquiry-only SmartPBX backend trees.
 
-This module deliberately has no fallback to a mutable source tree. The default
-allowlist is digest-bound to the approved V06 image baseline; the separately
-source-pinned V07 candidate remains blocked until it has immutable-image and
-lifecycle proof rather than being relabelled as that deployed source.
+This module deliberately has no fallback to a mutable source tree.  The default
+allowlist is digest-bound to an approved v06 source revision; a later protocol
+overlay must be separately approved rather than relabeling that deployed source.
 """
 
 from __future__ import annotations
@@ -115,12 +114,21 @@ def _provider_runtime_contract(manifest: AgentManifest) -> tuple[dict[str, objec
     return profile, tuple(requirements), "\n".join(environment_lines), "\n".join(volume_lines)
 
 
+def _website_llm_runtime_contract(manifest: AgentManifest) -> str:
+    """Select only LLM dependencies for the isolated text-relay profile."""
+    selected = {language.llm for language in manifest.languages}
+    if not selected <= {"claude", "gemini"}:
+        raise RenderError("website demo supports only reviewed Claude or Gemini LLM lanes")
+    environment = tuple(sorted({name for provider in selected for name in _PROVIDER_RUNTIME[provider]["environment"]}))
+    return "\n".join(f'      {name}: "${{{name}:-}}"' for name in environment)
+
+
 def _load_default_allowlist() -> TemplateAllowlist:
     try:
         raw = json.loads(_DEFAULT_ALLOWLIST.read_text(encoding="utf-8"))
         if raw.get("status") == "partial":
             raise IncompleteTemplateError(
-                "INCOMPLETE_TEMPLATE: the V06 image baseline cannot approve the partial V07 candidate runtime extraction"
+                "INCOMPLETE_TEMPLATE: verified v06 provenance has no complete client-neutral runtime extraction"
             )
         return validate_allowlist_metadata(raw)
     except IncompleteTemplateError:
@@ -297,6 +305,7 @@ def _files(
         raise RenderError("SmartPBX max calls must be between 1 and 4")
     title = manifest.display_name
     provider_profile, provider_requirements, provider_environment, provider_volumes = _provider_runtime_contract(manifest)
+    website_provider_environment = _website_llm_runtime_contract(manifest)
     product_profile_template = templates.get("runtime/product_profile.py.tmpl")
     if not isinstance(product_profile_template, str):
         raise IncompleteTemplateError("INCOMPLETE_TEMPLATE: product profile startup template is required")
@@ -340,12 +349,11 @@ activation_state: pending
 '''
     infrastructure_variables = {
         "smartpbx_service": resources.smartpbx_service,
-        "smartpbx_port": resources.smartpbx_port,
-        "smartpbx_hostname": resources.smartpbx_hostname,
         "website_service": resources.website_service,
+        "smartpbx_port": resources.smartpbx_port,
         "website_port": resources.website_port,
+        "smartpbx_hostname": resources.smartpbx_hostname,
         "website_hostname": resources.website_hostname,
-        "agent_slug": resources.slug,
         "wss_header": resources.wss_header,
         "ghcr_repository": resources.ghcr_repository,
         "smartpbx_memory_limit": "1536m",
@@ -354,6 +362,7 @@ activation_state: pending
         "provider_requirements": "\n".join(provider_requirements),
         "provider_environment": provider_environment,
         "provider_volumes": provider_volumes,
+        "website_provider_environment": website_provider_environment,
         "tls_certificate_path": "/run/secrets/smartpbx-tls-fullchain.pem",
         "tls_certificate_key_path": "/run/secrets/smartpbx-tls-private-key.pem",
     }
@@ -397,6 +406,8 @@ activation_state: pending
         "smartpbx_transport.py": runtime_template("smartpbx_transport.py.tmpl"),
         "provider_adapters.py": runtime_template("provider_adapters.py.tmpl"),
         "provider_runtime.py": runtime_template("provider_runtime.py.tmpl"),
+        "website_demo.py": runtime_template("website_demo.py.tmpl"),
+        "website_demo_core.py": runtime_template("website_demo_core.py.tmpl"),
         "provider_builders.py": templates["runtime/provider_builders.py.tmpl"],
         "stt_adapters.py": templates["runtime/stt_adapters.py.tmpl"],
         "llm_adapters.py": templates["runtime/llm_adapters.py.tmpl"],
@@ -405,13 +416,11 @@ activation_state: pending
         "config/product_profile.json": json.dumps(product_profile, sort_keys=True, indent=2) + "\n",
         "config/provider_profile.json": json.dumps(provider_profile, sort_keys=True, indent=2) + "\n",
         "tools.py": "TOOL_REGISTRY = {}\n",
-        "website_demo.py": runtime_template("website_demo.py.tmpl"),
         "nginx-smartpbx.conf": infrastructure_template("nginx-smartpbx.conf.tmpl", "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n"),
         f"nginx-{resources.smartpbx_service}.conf": infrastructure_template("nginx-smartpbx.conf.tmpl", "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n"),
-        f"nginx-{resources.website_service}.conf": infrastructure_template("nginx-website-demo.conf.tmpl", "location /health {}\nlocation /api/voice-token {}\n"),
+        "nginx-website-demo.conf": infrastructure_template("nginx-website-demo.conf.tmpl", "location / { return 404; }\n"),
         "scripts/deploy_smartpbx_image.sh": infrastructure_template("scripts/deploy_runtime_image.sh.tmpl", "#!/bin/sh\necho 'Manual release approval required.'\nexit 1\n"),
         "SMARTPBX_RUNBOOK.md": infrastructure_template("SMARTPBX_RUNBOOK.md.tmpl", "# Runbook\n\nThis generated artifact is review-only.\n"),
-        "WEBSITE_DEMO_RUNBOOK.md": infrastructure_template("WEBSITE_DEMO_RUNBOOK.md.tmpl", "# Website demo runbook\n\nThis generated artifact is review-only.\n"),
         "CLIENT_CONNECT.md": infrastructure_template("CLIENT_CONNECT.md.tmpl", client_connect),
         "demo-routing-activation.md": "# Future routing activation\n\nrelease_allowed: false\nstate: pending\nRequires separately approved backend health and shared routing activation.\n",
         "tests/test_generated_contract.py": '''def test_contract_paths():

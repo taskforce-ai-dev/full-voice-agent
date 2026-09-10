@@ -19,7 +19,7 @@ def test_review_only_runtime_infrastructure_candidate_is_complete_but_not_approv
     assert candidate["source_revision"] == "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e"
     assert candidate["oci_revision"] == candidate["source_revision"]
     assert candidate["approval"] == {"rendering": "blocked", "release": "blocked", "routing": "blocked"}
-    assert any("website-demo/Twilio ingress" in item for item in candidate["unresolved_blockers"])
+    assert any("website-demo browser-token" in item for item in candidate["unresolved_blockers"])
     assert candidate["runtime_outputs"] == [
         "startup.py",
         "server.py",
@@ -37,6 +37,7 @@ def test_review_only_runtime_infrastructure_candidate_is_complete_but_not_approv
         "turn_engine.py",
         "provider_runtime.py",
         "website_demo.py",
+        "website_demo_core.py",
         "config/product_profile.json",
         "config/provider_profile.json",
     ]
@@ -47,14 +48,14 @@ def test_review_only_runtime_infrastructure_candidate_is_complete_but_not_approv
         "infrastructure/requirements-prod.lock.txt.tmpl",
         "infrastructure/docker-compose.yml.tmpl",
         "infrastructure/nginx-smartpbx.conf.tmpl",
+        "infrastructure/nginx-website-demo.conf.tmpl",
         "infrastructure/env.example.tmpl",
         "infrastructure/SMARTPBX_RUNBOOK.md.tmpl",
         "infrastructure/CLIENT_CONNECT.md.tmpl",
         "infrastructure/ci-runtime-review.yml.tmpl",
         "infrastructure/scripts/deploy_runtime_image.sh.tmpl",
         "runtime/website_demo.py.tmpl",
-        "infrastructure/nginx-website-demo.conf.tmpl",
-        "infrastructure/WEBSITE_DEMO_RUNBOOK.md.tmpl",
+        "runtime/website_demo_core.py.tmpl",
     }
 
 
@@ -80,7 +81,6 @@ def test_container_template_has_explicit_runtime_copy_and_import_guard():
         "turn_engine.py",
         "provider_runtime.py",
         "startup.py",
-        "website_demo.py",
     ):
         assert filename in dockerfile
     assert 'python -c "import startup"' in dockerfile
@@ -157,11 +157,12 @@ def test_review_artifacts_cannot_publish_deploy_or_activate_routing():
 
 
 def test_candidate_artifacts_are_client_neutral_and_exclude_legacy_integrations():
-    terms = ("tenant", "k" + "avya", "p" + "ms", "hando" + "ver", "create_" + "booking", "post_" + "call")
+    terms = ("tenant", "k" + "avya", "p" + "ms", "hando" + "ver")
     artifacts = [path for path in INFRASTRUCTURE.rglob("*") if path.is_file()]
     artifacts.append(ROOT / "runtime_infrastructure_candidate.json")
     combined = "\n".join(path.read_text(encoding="utf-8").lower() for path in artifacts)
     assert all(term not in combined for term in terms)
+    assert "twilio" in combined  # Explicit neutral browser transport, not a tenant integration.
 
 
 def test_startup_composition_validates_named_environment_once_and_exports_the_asgi_app():

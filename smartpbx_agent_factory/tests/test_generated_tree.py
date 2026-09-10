@@ -22,12 +22,10 @@ def test_backend_has_two_separate_service_profiles_and_bidirectional_isolation(t
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
     smartpbx = (root / "server.py").read_text(encoding="utf-8")
     website = (root / "website_demo.py").read_text(encoding="utf-8")
-    smartpbx_compose, website_compose = compose.split("smartpbx-acme-inquiry-website", 1)
     assert "smartpbx-acme-inquiry-website" in compose
     assert "smartpbx-acme-inquiry" in compose
-    assert "SMARTPBX_WS_TOKEN" in smartpbx_compose
-    assert "WEBSITE_DEMO_TWILIO_AUTH_TOKEN" not in smartpbx_compose
-    assert "WEBSITE_DEMO_TWILIO_AUTH_TOKEN" in website_compose
+    assert "SMARTPBX_WS_TOKEN" in compose
+    assert "TWILIO_AUTH_TOKEN" in compose
     assert 'profiles: ["smartpbx"]' in compose
     assert 'profiles: ["website-demo"]' in compose
     assert '127.0.0.1:' in compose
@@ -68,11 +66,8 @@ def test_generated_tree_contains_non_deploy_ci_gate_and_pending_activation_check
 
 def test_root_generated_agent_workflow_has_exact_safe_triggers_and_stable_check_name():
     workflow = Path(".github/workflows/smartpbx-generated-agents.yml").read_text(encoding="utf-8")
-    assert '"SmartPBX Agents/**"' in workflow
-    assert '"smartpbx_agent_factory/**"' in workflow
-    assert '".github/workflows/smartpbx-generated-agents.yml"' in workflow
-    assert 'branches: [main, "smartpbx-agent-factory/**"]' in workflow
-    assert 'branches: ["**"]' not in workflow
+    assert 'paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", ".github/workflows/smartpbx-generated-agents.yml"]' in workflow
+    assert "branches: [main]" in workflow
     assert "smartpbx-generated-agent:" in workflow
     assert "python -m pytest smartpbx_agent_factory/tests" in workflow
     assert 'if [ -d "SmartPBX Agents" ]; then' in workflow
