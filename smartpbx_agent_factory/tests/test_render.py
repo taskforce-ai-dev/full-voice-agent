@@ -15,7 +15,14 @@ from smartpbx_agent_factory.knowledge import (
     recompute_knowledge_review_digest,
 )
 from smartpbx_agent_factory.provenance import TemplateAllowlist, TemplateFile
-from smartpbx_agent_factory.render import IncompleteTemplateError, IdentityLeakError, RenderError, ReviewNotApprovedError, render_backend as _render_backend
+from smartpbx_agent_factory.render import (
+    IncompleteTemplateError,
+    IdentityLeakError,
+    RenderError,
+    ReviewNotApprovedError,
+    _product_profile_payload,
+    render_backend as _render_backend,
+)
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
 from smartpbx_agent_factory.schema import manifest_digest, parse_manifest
 from smartpbx_agent_factory.state import GenerationState, Stage
@@ -23,7 +30,7 @@ from _owned_worktree_fixture import fixture_owned_worktree
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "acme-minimal.json"
-CATALOGUE = Path(__file__).parent / "fixtures" / "approved-provider-catalogue.json"
+CATALOGUE = Path(__file__).parents[1] / "template_v1" / "provider_catalogue.json"
 
 
 def _render_backend_fixture(manifest, review, resources, output_dir: Path, **kwargs):
@@ -160,6 +167,33 @@ def test_inquiry_only_render_has_no_business_tools(tmp_path):
     assert report.enabled_capabilities == ()
     assert report.synthetic is True
     assert report.deployable is False
+
+
+def test_generated_product_profile_binds_reviewed_manifest_identity_languages_topics_greetings_and_knowledge():
+    manifest = fixture_manifest()
+    profile = _product_profile_payload(
+        manifest,
+        {"approved-facts.md": "Acme provides approved information."},
+    )
+
+    assert profile["identity"] == {
+        "display_name": "Acme Inquiry",
+        "public_name": "Acme Inquiry",
+        "agent_name": "Acme Guide",
+        "industry": "general information",
+        "purpose": "Answer approved company questions",
+        "audience": "prospective customers",
+    }
+    assert profile["languages"]["en"]["greeting"] == "Welcome to Acme Inquiry."
+    assert profile["languages"]["en"]["stt_model"] is None
+    assert profile["allowed_topics"] == ["company information"]
+    assert profile["refused_topics"] == ["account changes"]
+    assert profile["knowledge_paths"] == ["knowledge_docs/approved-facts.md"]
+
+
+def test_runtime_template_loads_the_generated_product_profile_only_at_startup():
+    template = (Path(__file__).parents[1] / "template_v1/runtime/server.py.tmpl").read_text(encoding="utf-8")
+    assert template.count("product_profile=load_product_profile(") == 1
 
 
 def test_renderer_rejects_identity_and_secret_leaks_from_review(tmp_path):

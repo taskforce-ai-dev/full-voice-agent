@@ -161,6 +161,54 @@ def _knowledge_documents(review: KnowledgeReview, facts: tuple[str, ...]) -> Map
     }
 
 
+def _product_profile_payload(manifest: AgentManifest, documents: Mapping[str, str]) -> dict[str, object]:
+    """Serialize only reviewed manifest and renderer-owned knowledge metadata.
+
+    This stays separate from the call path: render-time data becomes one
+    immutable JSON file, and the runtime startup seam loads it before the first
+    session is admitted. Provider credentials are represented only by named
+    identifiers in the reviewed catalogue, never by this product data.
+    """
+    languages: dict[str, dict[str, object]] = {}
+    for language in manifest.languages:
+        languages[language.code] = {
+            "locale": language.locale,
+            "stt": language.stt,
+            "stt_model": language.stt_model or None,
+            "llm": language.llm,
+            "llm_model": language.llm_model or None,
+            "tts": language.tts,
+            "tts_model": language.tts_model or None,
+            "greeting": language.greeting,
+            "prompt_block": _language_prompt_block(manifest, language.code),
+        }
+    return {
+        "identity": {
+            "display_name": manifest.display_name,
+            "public_name": manifest.public_name,
+            "agent_name": manifest.agent_name,
+            "industry": manifest.industry,
+            "purpose": manifest.purpose,
+            "audience": manifest.audience,
+        },
+        "languages": languages,
+        "default_language": manifest.languages[0].code,
+        "allowed_topics": list(manifest.allowed_topics),
+        "refused_topics": list(manifest.refused_topics),
+        "knowledge_paths": [f"knowledge_docs/{filename}" for filename in documents],
+    }
+
+
+def _language_prompt_block(manifest: AgentManifest, language_code: str) -> str:
+    allowed = "; ".join(manifest.allowed_topics) or "approved information"
+    refused = "; ".join(manifest.refused_topics) or "unapproved requests"
+    return (
+        f"You are {manifest.agent_name} for {manifest.public_name}. "
+        f"Respond in {language_code}. Discuss only: {allowed}. "
+        f"Refuse: {refused}."
+    )
+
+
 def _python_gateway(resources: DerivedResources) -> str:
     return f'''"""Generated SmartPBX gateway. Authentication always precedes accept()."""
 from __future__ import annotations

@@ -15,11 +15,12 @@
   "technical_owner": "owner@example.invalid",
   "languages": [
     {
-      "code": "en-US",
+      "code": "en",
       "locale": "en-US",
-      "stt": {"provider": "deepgram", "model": "nova-3"},
-      "llm": {"provider": "claude", "model": "claude-sonnet-4-6"},
-      "tts": {"provider": "elevenlabs", "model": "eleven_turbo_v2_5"}
+      "stt": {"provider": "azure"},
+      "llm": {"provider": "claude", "model": "claude-sonnet-4-5-20250929"},
+      "tts": {"provider": "elevenlabs", "model": "eleven_flash_v2_5"},
+      "greeting": "Welcome to Acme Inquiry."
     }
   ],
   "allowed_topics": ["company information"],

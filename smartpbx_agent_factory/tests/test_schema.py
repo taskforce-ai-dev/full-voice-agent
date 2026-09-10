@@ -53,7 +53,7 @@ def test_booking_requires_explicit_destination_and_pii_policy():
 def test_parser_returns_frozen_typed_manifest():
     manifest = parse(load_raw())
     assert manifest.slug == "acme-inquiry"
-    assert manifest.languages[0].code == "en-US"
+    assert manifest.languages[0].code == "en"
     assert manifest.capabilities.any_enabled is False
     with pytest.raises(AttributeError):
         manifest.slug = "other"
@@ -83,8 +83,8 @@ def test_parser_rejects_unknown_provider_mapping_and_capability_detail_keys():
         parse(raw)
 
     raw = load_raw()
-    raw["languages"][0]["code"] = "en-US"
-    raw["languages"][0]["language"] = "en-US"
+    raw["languages"][0]["code"] = "en"
+    raw["languages"][0]["language"] = "en"
     with pytest.raises(ManifestError, match="code.*language|alias"):
         parse(raw)
 
