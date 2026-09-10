@@ -135,6 +135,14 @@ class WebsiteDemoTransportContractTests(unittest.TestCase):
         self.assertIn("access_log off", runbook)
         self.assertIn("--no-access-log", runbook)
 
+    def test_smartpbx_and_website_profiles_remain_independently_opt_in(self) -> None:
+        compose = _WEBSITE_COMPOSE_TEMPLATE.read_text(encoding="utf-8")
+        smartpbx = compose.split("  {{smartpbx_service}}:", 1)[1].split("  {{website_service}}:", 1)[0]
+        website = compose.split("  {{website_service}}:", 1)[1].split("\nnetworks:", 1)[0]
+
+        self.assertIn('profiles: ["smartpbx"]', smartpbx)
+        self.assertIn('profiles: ["website-demo"]', website)
+
 
 if __name__ == "__main__":
     unittest.main()

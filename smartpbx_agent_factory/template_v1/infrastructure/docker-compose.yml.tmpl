@@ -1,6 +1,7 @@
 # REVIEW-ONLY. This file is a static candidate, not an activation mechanism.
 services:
   {{smartpbx_service}}:
+    profiles: ["smartpbx"]
     image: "{{ghcr_repository}}@${SMARTPBX_IMAGE_DIGEST:?immutable digest required}"
     container_name: {{smartpbx_service}}
     ports:

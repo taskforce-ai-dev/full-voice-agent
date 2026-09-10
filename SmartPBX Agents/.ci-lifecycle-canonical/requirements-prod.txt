@@ -2,7 +2,6 @@
 fastapi==0.141.1
 uvicorn==0.52.1
 websockets==16.1.1
-python-multipart==0.0.32
 twilio==9.10.9
 azure-cognitiveservices-speech==1.51.1
 anthropic==0.120.2

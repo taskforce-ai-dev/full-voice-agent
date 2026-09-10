@@ -51,6 +51,7 @@ _FIXTURE_VARIABLES: dict[str, object] = {
     "website_hostname": "demo-canonical-ci-fixture.invalid",
     "website_port": 18999,
     "website_service": "smartpbx-canonical-ci-fixture-website",
+    "website_provider_environment": '      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"',
     "wss_header": "X-SmartPBX-Canonical-CI-Token",
 }
 

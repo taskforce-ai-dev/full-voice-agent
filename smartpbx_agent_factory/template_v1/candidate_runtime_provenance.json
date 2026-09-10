@@ -21,7 +21,7 @@
   "components": [
     {
       "template_path": "infrastructure/docker-compose.yml.tmpl",
-      "template_sha256": "sha256:4cc2a944bf3970169dd69b3cdd86cacb5b49ac5986b230c67bc7b7d31c29a02e",
+      "template_sha256": "sha256:1da674391a14779216378c62139f0ef8d751d57d3e090f30e8be8c30d02ef717",
       "source_path": null,
       "source_ranges": [],
       "extraction": "review-only isolated website-demo process profile; Uvicorn access logging is disabled because relay admission tickets are query parameters"
