@@ -35,6 +35,23 @@ def test_stt_template_has_startup_injection_and_no_client_identity() -> None:
     assert "tenant" not in text.lower()
 
 
+def test_stt_template_adapts_to_the_shared_continuous_recognizer_contract() -> None:
+    text = TEMPLATE.read_text(encoding="utf-8")
+
+    assert "from provider_adapters import ContinuousRecognizer, RecognizerCallback, RecognizerResult" in text
+    assert "class SmartPBXSTTAdapter" in text
+    assert "async def start_recognizer(" in text
+    assert "class _ContinuousRecognizer" in text
+    assert "async def feed_audio(self, audio: bytes)" in text
+    assert "async def close(self)" in text
+    assert "RecognizerResult(" in text
+    assert "result_id=event.metadata.result_id" in text
+    assert "profile.code != language" in text
+    assert "profile.locale != config.language_code" in text
+    assert "start_continuous_recognition_async().get()" in text
+    assert "MAX_AZURE_METADATA_JSON_BYTES" in text
+
+
 def test_candidate_provenance_records_exact_kavya_stt_ranges_without_approval() -> None:
     candidate = json.loads((ROOT / "candidate_runtime_provenance.json").read_text(encoding="utf-8"))
 

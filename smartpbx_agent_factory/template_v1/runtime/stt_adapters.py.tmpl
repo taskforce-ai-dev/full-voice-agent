@@ -16,7 +16,9 @@ import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Mapping, Protocol
+
+from provider_adapters import ContinuousRecognizer, RecognizerCallback, RecognizerResult
 
 
 EventKind = Literal["interim", "final", "fatal"]
@@ -306,7 +308,17 @@ class AzurePushStreamSTT:
             self._stop_requested = False
             self._fatal_notified = False
             self._running = True
-        self._recognizer.start_continuous_recognition_async()
+        try:
+            self._recognizer.start_continuous_recognition_async().get()
+        except Exception as exc:
+            with self._state_lock:
+                self._running = False
+            if self._push_stream is not None:
+                try:
+                    self._push_stream.close()
+                except Exception:
+                    pass
+            raise RuntimeError("Azure continuous recognition failed to start") from exc
 
     def stop(self) -> None:
         with self._state_lock:
@@ -368,9 +380,16 @@ def _bounded_nonnegative_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+MAX_AZURE_METADATA_JSON_BYTES = 16_384
+
+
 def _azure_confidence(result: Any) -> float | None:
     raw_json = getattr(result, "json", None)
-    if not isinstance(raw_json, str) or not raw_json:
+    if (
+        not isinstance(raw_json, str)
+        or not raw_json
+        or len(raw_json.encode("utf-8")) > MAX_AZURE_METADATA_JSON_BYTES
+    ):
         return None
     try:
         confidence = float(json.loads(raw_json)["NBest"][0]["Confidence"])
@@ -388,3 +407,103 @@ def _azure_final_metadata(result: Any) -> AzureFinalMetadata:
         duration=_bounded_nonnegative_int(getattr(result, "duration", None)),
         confidence=_azure_confidence(result),
     )
+
+
+@dataclass(frozen=True)
+class STTProfile:
+    """One exact generated language code, locale, and startup-selected provider."""
+
+    code: str
+    locale: str
+    provider: Literal["google", "azure"]
+    google: GoogleSTTConfig | None = None
+    azure: AzureSTTConfig | None = None
+
+    def __post_init__(self) -> None:
+        if not self.code or not self.locale:
+            raise ValueError("STT profile code and locale are required")
+        if self.provider == "google" and (self.google is None or self.azure is not None):
+            raise ValueError("Google STT profile must contain only Google configuration")
+        if self.provider == "azure" and (self.azure is None or self.google is not None):
+            raise ValueError("Azure STT profile must contain only Azure configuration")
+
+
+class SmartPBXSTTAdapter:
+    """Startup-composed factory for call-local shared continuous recognizers."""
+
+    def __init__(self, profiles: Mapping[str, STTProfile]) -> None:
+        copied = dict(profiles)
+        if not copied or any(key != profile.code for key, profile in copied.items()):
+            raise ValueError("STT profiles must be keyed by their exact language code")
+        self._profiles = copied
+
+    @property
+    def active(self) -> bool:
+        return bool(self._profiles)
+
+    async def start_recognizer(
+        self, language: str, on_result: RecognizerCallback
+    ) -> ContinuousRecognizer:
+        profile = self._profiles.get(language)
+        if profile is None or profile.code != language:
+            raise ValueError("requested STT language is not configured")
+        if not callable(on_result):
+            raise ValueError("recognizer callback is required")
+        loop = asyncio.get_running_loop()
+
+        async def on_event(event: STTEvent) -> None:
+            if event.kind not in {"interim", "final"}:
+                return
+            on_result(
+                RecognizerResult(
+                    text=event.text,
+                    is_final=event.kind == "final",
+                    result_id=event.metadata.result_id if event.metadata is not None else None,
+                )
+            )
+
+        bridge = LoopEventBridge(loop, on_event)
+        provider = self._provider_for(profile, bridge)
+        recognizer = _ContinuousRecognizer(provider, bridge)
+        try:
+            await asyncio.to_thread(provider.start)
+            if not provider.active:
+                raise RuntimeError("STT provider did not become active")
+        except Exception:
+            await recognizer.close()
+            raise
+        return recognizer
+
+    def _provider_for(self, profile: STTProfile, bridge: LoopEventBridge) -> StreamingSTTAdapter:
+        if profile.provider == "google":
+            config = profile.google
+            if config is None or profile.locale != config.language_code:
+                raise ValueError("Google STT profile locale does not match its configuration")
+            return GoogleStreamingSTT(config, bridge)
+        config = profile.azure
+        if config is None or profile.locale != config.language_code:
+            raise ValueError("Azure STT profile locale does not match its configuration")
+        return AzurePushStreamSTT(config, bridge)
+
+
+class _ContinuousRecognizer:
+    """Async shared-contract wrapper that owns one bridge and one provider stream."""
+
+    def __init__(self, provider: StreamingSTTAdapter, bridge: LoopEventBridge) -> None:
+        self._provider = provider
+        self._bridge = bridge
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+
+    async def feed_audio(self, audio: bytes) -> None:
+        if self._closed:
+            return
+        self._provider.feed(bytes(audio))
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            await self._bridge.close()
+            await asyncio.to_thread(self._provider.stop)

@@ -19,3 +19,15 @@ The template must receive provider modules, credentials, client factories, loop,
 and callbacks through startup configuration. It must not read an environment,
 contain customer identity, decide endpointing, or contain business/knowledge
 data.
+
+## Shared runtime integration contract
+
+The startup-injected `SmartPBXSTTAdapter` maps an exact generated language code
+to its exact configured locale and provider. It exposes only
+`start_recognizer(language, on_result)`, returning a call-local recognizer with
+async `feed_audio` and `close`. The factory owns the `LoopEventBridge` until
+that recognizer closes. Google and Azure events become `RecognizerResult` with
+only Azure's bounded exact `result_id` as optional identity; offsets and
+durations never become ordering inputs. Azure's startup future is awaited and
+any start failure leaves the provider inactive. Azure JSON metadata is size
+bounded before parsing.
