@@ -63,6 +63,11 @@ class LifecycleDockerDiagnosticsTests(unittest.TestCase):
                 self.runner.command("unbounded-operation", ["docker", "version"])
         execute.assert_not_called()
 
+    def test_port_discovery_operations_are_closed_to_structured_inspection(self) -> None:
+        self.assertIn("container-state-inspect", self.runner.DOCKER_OPERATION_LABELS)
+        self.assertIn("port-inspect", self.runner.DOCKER_OPERATION_LABELS)
+        self.assertNotIn("port-discover", self.runner.DOCKER_OPERATION_LABELS)
+
     def test_image_build_subphase_classifier_uses_only_the_fixed_vocabulary(self) -> None:
         cases = (
             (b"RUN pip install --no-cache-dir -r requirements-prod.lock.txt", "dependency-install"),
@@ -97,6 +102,72 @@ class LifecycleDockerDiagnosticsTests(unittest.TestCase):
                 self.runner.command("container-cleanup", ["docker", "rm", "unowned-value"], allow_failure=True),
                 "",
             )
+
+    def test_container_state_accepts_only_running_with_a_bounded_exit_code(self) -> None:
+        self.assertEqual(self.runner._container_state_from_inspect("running 0\n"), ("running", 0))
+        for raw in ("exited 17\n", "created 0\n", "paused 0\n", "restarting 1\n", "removing 0\n", "dead 137\n"):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(self.runner.LifecycleError, r"container is not running state=.* exit_code=[0-9]+") as raised:
+                    self.runner._container_state_from_inspect(raw)
+                self.assertNotIn(raw.strip(), str(raised.exception))
+
+    def test_container_state_rejects_unknown_or_unbounded_shapes_without_echoing_them(self) -> None:
+        for raw in ("unknown 0\n", "running nope\n", "running -1\n", "running 9223372036854775808\n", "running 0 extra\n", "\n"):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(self.runner.LifecycleError, "container state inspection was invalid") as raised:
+                    self.runner._container_state_from_inspect(raw)
+                if raw.strip():
+                    self.assertNotIn(raw.strip(), str(raised.exception))
+
+    def test_port_binding_accepts_only_exact_single_loopback_mapping(self) -> None:
+        self.assertEqual(
+            self.runner._mapped_port_from_inspect('{"8000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]}'),
+            49152,
+        )
+        self.assertEqual(
+            self.runner._mapped_port_from_inspect('{"8000/tcp":[{"HostIp":"::1","HostPort":"65535"}]}'),
+            65535,
+        )
+        self.assertEqual(
+            self.runner._mapped_port_from_inspect('{"8000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}],"8081/tcp":null}'),
+            49152,
+        )
+
+    def test_port_binding_rejects_every_unsafe_or_malformed_shape_without_echoing_it(self) -> None:
+        cases = (
+            "not-json",
+            "[]",
+            "{}",
+            '{"8000/tcp":null}',
+            '{"8000/tcp":[]}',
+            '{"8000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"},{"HostIp":"127.0.0.1","HostPort":"49153"}]}',
+            '{"8000/udp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]}',
+            '{"8000/tcp":[null]}',
+            '{"8000/tcp":[{"HostIp":127,"HostPort":"49152"}]}',
+            '{"8000/tcp":[{"HostPort":"49152"}]}',
+            '{"8000/tcp":[{"HostIp":"0.0.0.0","HostPort":"49152"}]}',
+            '{"8000/tcp":[{"HostIp":"localhost","HostPort":"49152"}]}',
+            '{"8000/tcp":[{"HostIp":"127.0.0.1","HostPort":49152}]}',
+            '{"8000/tcp":[{"HostIp":"127.0.0.1","HostPort":"nope"}]}',
+            '{"8000/tcp":[{"HostIp":"127.0.0.1","HostPort":"0"}]}',
+            '{"8000/tcp":[{"HostIp":"127.0.0.1","HostPort":"65536"}]}',
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(self.runner.LifecycleError, "container port binding was invalid") as raised:
+                    self.runner._mapped_port_from_inspect(raw)
+                self.assertNotIn(raw, str(raised.exception))
+
+    def test_mapped_port_uses_only_state_and_structured_port_inspection(self) -> None:
+        outputs = iter(("running 0\n", '{"8000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]}'))
+        with patch.object(self.runner, "command", side_effect=lambda operation, argv, **_kwargs: next(outputs)) as command:
+            self.assertEqual(self.runner.mapped_port("owned-container"), 49152)
+        self.assertEqual(
+            [call.args[0] for call in command.call_args_list],
+            ["container-state-inspect", "port-inspect"],
+        )
+        self.assertEqual(command.call_args_list[0].args[1], ["docker", "container", "inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", "owned-container"])
+        self.assertEqual(command.call_args_list[1].args[1], ["docker", "container", "inspect", "--format", "{{json .NetworkSettings.Ports}}", "owned-container"])
 
 
 if __name__ == "__main__":

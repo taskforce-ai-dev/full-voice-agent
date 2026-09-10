@@ -48,7 +48,8 @@ DOCKER_OPERATION_LABELS = frozenset({
     "image-build",
     "image-inspect",
     "container-run",
-    "port-discover",
+    "container-state-inspect",
+    "port-inspect",
     "container-cleanup",
     "image-cleanup",
     "network-cleanup",
@@ -58,6 +59,15 @@ IMAGE_BUILD_SUBPHASES = frozenset({
     "smartpbx-import",
     "website-import",
     "unknown",
+})
+CONTAINER_STATE_STATUSES = frozenset({
+    "created",
+    "running",
+    "paused",
+    "restarting",
+    "removing",
+    "exited",
+    "dead",
 })
 _IMAGE_BUILD_SUBPHASE_MARKERS = (
     (b"pip install --no-cache-dir -r requirements-prod.lock.txt", "dependency-install"),
@@ -460,12 +470,56 @@ def valid_lifecycle(host: str, port: int, header: str, token: str, messages: tup
         client.close()
 
 
+def _container_state_from_inspect(raw: str) -> tuple[str, int]:
+    """Parse only Docker's closed state and numeric exit-code format.
+
+    This deliberately never includes raw inspect output in a failure because
+    inspect data may contain sensitive runtime configuration elsewhere.
+    """
+    fields = raw.strip().split()
+    if len(fields) != 2 or fields[0] not in CONTAINER_STATE_STATUSES or not fields[1].isdecimal():
+        raise LifecycleError("container state inspection was invalid")
+    exit_code = int(fields[1])
+    if not 0 <= exit_code <= 255:
+        raise LifecycleError("container state inspection was invalid")
+    if fields[0] != "running":
+        raise LifecycleError(f"container is not running state={fields[0]} exit_code={exit_code}")
+    return fields[0], exit_code
+
+
+def _mapped_port_from_inspect(raw: str) -> int:
+    """Accept exactly one loopback binding for the exact SmartPBX TCP port."""
+    try:
+        ports = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise LifecycleError("container port binding was invalid") from exc
+    if not isinstance(ports, dict):
+        raise LifecycleError("container port binding was invalid")
+    bindings = ports.get("8000/tcp")
+    if not isinstance(bindings, list) or len(bindings) != 1 or not isinstance(bindings[0], dict):
+        raise LifecycleError("container port binding was invalid")
+    host, port = bindings[0].get("HostIp"), bindings[0].get("HostPort")
+    if host not in {"127.0.0.1", "::1"} or not isinstance(port, str) or not port.isdecimal():
+        raise LifecycleError("container port binding was invalid")
+    value = int(port)
+    if not 1 <= value <= 65_535:
+        raise LifecycleError("container port binding was invalid")
+    return value
+
+
 def mapped_port(container: str) -> int:
-    raw = command("port-discover", ["docker", "port", container, "8000/tcp"], capture=True).strip()
-    host, separator, port = raw.rpartition(":")
-    if not separator or host not in {"127.0.0.1", "[::1]"} or not port.isdecimal():
-        raise LifecycleError("container did not receive an ephemeral loopback-only port")
-    return int(port)
+    state = command(
+        "container-state-inspect",
+        ["docker", "container", "inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", container],
+        capture=True,
+    )
+    _container_state_from_inspect(state)
+    bindings = command(
+        "port-inspect",
+        ["docker", "container", "inspect", "--format", "{{json .NetworkSettings.Ports}}", container],
+        capture=True,
+    )
+    return _mapped_port_from_inspect(bindings)
 
 
 def inspect_image(image: str, provenance: dict[str, object]) -> None:
