@@ -9,6 +9,17 @@
     "Kavya/smartpbx_session.py": "sha256:18695c13c0174f3c3c45a53d7de76cc76c6d76984e998ddb4c6265fe5f19c76e",
     "Kavya/smartpbx_transport.py": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e"
   },
+  "website_demo_source": {
+    "source_revision": "22cc536ffb45f95f06159f6fe1c00332c85f3231",
+    "source_hashes": {
+      "HattonHills/server.py": "sha256:e4c94ac4be52613162b1e08cfa00939ab08bc64d363decb2c47cccac8513fb16",
+      "HattonHills/requirements-prod.lock.txt": "sha256:e1719b42ae685ace1fb61749bb7e11afb44cf5c7cae131b339566b3e75f2c6d0"
+    },
+    "source_ranges": ["1060-1140", "1253-1332"],
+    "extraction": "The isolated issuer preserves the short-lived browser Voice SDK token response shape and agent/lang webhook seam. Customer ConversationRelay and Media Streams orchestration is not extracted.",
+    "transport_status": "fail-closed-adapter-boundary",
+    "blocker": "No client-neutral, source-approved browser ConversationRelay or Media Streams adapter exists. The current transport is embedded in customer runtime code and cannot be copied without bringing customer policy, persona, or business behavior into generated agents."
+  },
   "components": [
     {
       "template_path": "provider_catalogue.json",
@@ -132,6 +143,62 @@
         {"source_path": "Kavya/english_voice_profile.py", "source_ranges": ["1-59"]}
       ],
       "extraction": "startup-injected exact language-profile routes plus English ElevenLabs and Sinhala Gemini or approved Rime streaming TTS; bounded provider bodies, validated 8 kHz mu-law conversion, 20 ms framing, and generation-fenced transport handoff"
+    },
+    {
+      "template_path": "runtime/website_demo.py.tmpl",
+      "template_sha256": "sha256:4463df7eca84644fc5256ee7fc2c25374e29b33e8be38c4dfc4401397f4b88ae",
+      "source_path": "HattonHills/server.py",
+      "source_ranges": ["1060-1140", "1253-1332"],
+      "extraction": "isolated Voice SDK token response and agent/lang ingress contract with bounded issuance, signature verification, and an unavailable transport adapter; no customer conversation implementation is copied"
+    },
+    {
+      "template_path": "infrastructure/docker-compose.yml.tmpl",
+      "template_sha256": "sha256:243b7441d3df1ea54d52559b5979714a94a20a058a7d39d46b61cf9f93f386a9",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "separate opt-in website-demo service, loopback port, credential boundary, and resource limits; review-only candidate"
+    },
+    {
+      "template_path": "infrastructure/Dockerfile.tmpl",
+      "template_sha256": "sha256:355f827d322c85e699c55c04247de4779170b6e59c10ec812092176eae3d90ea",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "explicit website-demo module copy in the existing review-only image candidate"
+    },
+    {
+      "template_path": "infrastructure/requirements-prod.txt.tmpl",
+      "template_sha256": "sha256:ea3068d727c50d24f6057f77b1745569cc856404b106c53d782702317de0ad0d",
+      "source_path": "HattonHills/requirements-prod.lock.txt",
+      "source_ranges": ["96", "119"],
+      "extraction": "exact direct pins for form parsing and the Voice SDK issuer dependency"
+    },
+    {
+      "template_path": "infrastructure/requirements-prod.lock.txt.tmpl",
+      "template_sha256": "sha256:8fbd1ea0fcf81e1450646983b6f3c1ae0cf2388af337676863598b04c0a091b3",
+      "source_path": "HattonHills/requirements-prod.lock.txt",
+      "source_ranges": ["96", "119"],
+      "extraction": "exact review-only lock candidate for the isolated browser ingress"
+    },
+    {
+      "template_path": "infrastructure/env.example.tmpl",
+      "template_sha256": "sha256:46c0325db13c853649977d2a0946bcba5020e94dfa12eaac894de79234d2d9aa",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "separate website-demo secret contract with no SmartPBX service propagation"
+    },
+    {
+      "template_path": "infrastructure/nginx-website-demo.conf.tmpl",
+      "template_sha256": "sha256:b785999510671b4141556a6c48a90d85367498a0f4562fac315a172a532284a8",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "review-only loopback proxy surface for health, issuer, voice ingress, and unavailable media route"
+    },
+    {
+      "template_path": "infrastructure/WEBSITE_DEMO_RUNBOOK.md.tmpl",
+      "template_sha256": "sha256:80937363e65a92bceaecd7006b18c3de96b880a3c8a2e34fefa907abee72e538",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "explicit no-routing/no-deploy operational boundary and transport approval blocker"
     }
   ]
 }

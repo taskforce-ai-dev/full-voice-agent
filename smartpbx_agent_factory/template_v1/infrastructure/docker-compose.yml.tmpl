@@ -1,6 +1,7 @@
 # REVIEW-ONLY. This file is a static candidate, not an activation mechanism.
 services:
   {{smartpbx_service}}:
+    profiles: ["smartpbx"]
     image: "{{ghcr_repository}}@${SMARTPBX_IMAGE_DIGEST:?immutable digest required}"
     container_name: {{smartpbx_service}}
     ports:
@@ -42,6 +43,53 @@ services:
     networks:
       - {{smartpbx_service}}_bridge
 
+  {{website_service}}:
+    # A separate, opt-in browser-demo boundary. It deliberately receives no
+    # SmartPBX credential, WSS, account, or provider-runtime environment.
+    profiles: ["website-demo"]
+    image: "{{ghcr_repository}}@${SMARTPBX_IMAGE_DIGEST:?immutable digest required}"
+    container_name: {{website_service}}
+    command: ["uvicorn", "website_demo:app", "--host", "0.0.0.0", "--port", "8081", "--workers", "1"]
+    ports:
+      - "127.0.0.1:{{website_port}}:8081"
+    environment:
+      WEBSITE_DEMO_ENABLED: "true"
+      WEBSITE_DEMO_AGENT_ID: "{{agent_slug}}"
+      WEBSITE_DEMO_PUBLIC_URL: "https://{{website_hostname}}"
+      WEBSITE_DEMO_ALLOWED_ORIGINS: "${WEBSITE_DEMO_ALLOWED_ORIGINS:?required}"
+      WEBSITE_DEMO_TWILIO_ACCOUNT_SID: "${WEBSITE_DEMO_TWILIO_ACCOUNT_SID:?required}"
+      WEBSITE_DEMO_TWILIO_API_KEY_SID: "${WEBSITE_DEMO_TWILIO_API_KEY_SID:?required}"
+      WEBSITE_DEMO_TWILIO_API_KEY_SECRET: "${WEBSITE_DEMO_TWILIO_API_KEY_SECRET:?required}"
+      WEBSITE_DEMO_TWILIO_AUTH_TOKEN: "${WEBSITE_DEMO_TWILIO_AUTH_TOKEN:?required}"
+      WEBSITE_DEMO_TWIML_APP_SID: "${WEBSITE_DEMO_TWIML_APP_SID:?required}"
+      WEBSITE_DEMO_PRODUCT_PROFILE_PATH: "/app/config/product_profile.json"
+      WEBSITE_DEMO_KNOWLEDGE_DIR: "/app/knowledge_docs"
+      WEBSITE_DEMO_PROVIDER_PROFILE_PATH: "/app/config/provider_profile.json"
+      WEBSITE_DEMO_MAX_ACTIVE_SESSIONS: "${WEBSITE_DEMO_MAX_ACTIVE_SESSIONS:-4}"
+      WEBSITE_DEMO_TOKEN_TTL_SECONDS: "${WEBSITE_DEMO_TOKEN_TTL_SECONDS:-300}"
+    mem_limit: 256m
+    cpus: 0.50
+    pids_limit: 96
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    restart: "no"
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - {{website_service}}_bridge
+
 networks:
   {{smartpbx_service}}_bridge:
     internal: false
+  {{website_service}}_bridge:
+    internal: true

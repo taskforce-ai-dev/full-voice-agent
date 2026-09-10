@@ -19,6 +19,7 @@
     "tts_adapters.py",
     "turn_engine.py",
     "provider_runtime.py",
+    "website_demo.py",
     "config/product_profile.json",
     "config/provider_profile.json"
   ],
@@ -42,6 +43,9 @@
     {"template_path": "infrastructure/SMARTPBX_RUNBOOK.md.tmpl", "role": "review boundary runbook"},
     {"template_path": "infrastructure/CLIENT_CONNECT.md.tmpl", "role": "pending Client Connect contract"},
     {"template_path": "infrastructure/ci-runtime-review.yml.tmpl", "role": "inert static CI fragment"},
-    {"template_path": "infrastructure/scripts/deploy_runtime_image.sh.tmpl", "role": "disabled provenance gate"}
+    {"template_path": "infrastructure/scripts/deploy_runtime_image.sh.tmpl", "role": "disabled provenance gate"},
+    {"template_path": "runtime/website_demo.py.tmpl", "role": "isolated token issuer and fail-closed browser media adapter"},
+    {"template_path": "infrastructure/nginx-website-demo.conf.tmpl", "role": "loopback-only website-demo ingress proxy"},
+    {"template_path": "infrastructure/WEBSITE_DEMO_RUNBOOK.md.tmpl", "role": "blocked website-demo routing boundary"}
   ]
 }

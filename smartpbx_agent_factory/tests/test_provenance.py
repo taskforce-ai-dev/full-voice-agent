@@ -68,12 +68,14 @@ def test_partial_candidate_runtime_records_only_pinned_source_lineage():
         "Kavya/smartpbx_transport.py",
     }
     assert set(candidate["source_hashes"]) == expected
+    website_sources = set(candidate["website_demo_source"]["source_hashes"])
+    assert website_sources == {"HattonHills/server.py", "HattonHills/requirements-prod.lock.txt"}
     for component in candidate["components"]:
         template = root / component["template_path"]
         assert template.is_file()
         assert component["template_sha256"] == "sha256:" + sha256(template.read_bytes()).hexdigest()
         if component["source_path"] is not None:
-            assert component["source_path"] in expected
+            assert component["source_path"] in expected | website_sources
             assert component["source_ranges"]
 
 

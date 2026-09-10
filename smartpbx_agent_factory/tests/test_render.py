@@ -107,7 +107,7 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
         "runtime/smartpbx_transport.py.tmpl": "# synthetic transport marker\n",
         "runtime/smartpbx_diagnostics.py.tmpl": "# synthetic diagnostics marker\n",
         "runtime/tools.py.tmpl": "TOOL_REGISTRY = {}\n",
-        "runtime/website_demo.py.tmpl": "ROUTES = ('/voice/demo-incoming',)\n",
+        "runtime/website_demo.py.tmpl": "ROUTES = ('/api/voice-token', '/voice/demo-incoming', '/ws/website-demo/media')\n",
         "runtime/startup.py.tmpl": "app = object()\n",
         "runtime/product_profile.py.tmpl": "def load_product_profile(path): return object()\n",
         "runtime/provider_adapters.py.tmpl": "class ConversationProviderAdapter: pass\n",
@@ -118,7 +118,17 @@ def fixture_templates(root: Path) -> TemplateAllowlist:
         "runtime/llm_adapters.py.tmpl": "class InquiryOnlyLLMAdapter: pass\n",
         "runtime/tts_adapters.py.tmpl": "class SmartPBXTTSAdapter: pass\n",
         "infrastructure/Dockerfile.tmpl": "FROM python:3.11-slim\n",
-        "infrastructure/docker-compose.yml.tmpl": "services: {}\n",
+        "infrastructure/docker-compose.yml.tmpl": """services:
+  {{smartpbx_service}}:
+    profiles: [\"smartpbx\"]
+    environment:
+      SMARTPBX_WS_TOKEN: \"${SMARTPBX_WS_TOKEN?required}\"
+  {{website_service}}:
+    profiles: [\"website-demo\"]
+    environment:
+      WEBSITE_DEMO_TWILIO_AUTH_TOKEN: \"${WEBSITE_DEMO_TWILIO_AUTH_TOKEN?required}\"
+    ports: [\"127.0.0.1:{{website_port}}:8081\"]
+""",
         "infrastructure/nginx-smartpbx.conf.tmpl": "location /smartpbx/status {}\n",
         "infrastructure/nginx-website.conf.tmpl": "location /voice/demo-incoming {}\n",
         "infrastructure/env.example.tmpl": "SMARTPBX_WS_TOKEN\n",

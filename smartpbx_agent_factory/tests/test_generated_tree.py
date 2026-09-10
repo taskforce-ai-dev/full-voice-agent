@@ -22,17 +22,19 @@ def test_backend_has_two_separate_service_profiles_and_bidirectional_isolation(t
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
     smartpbx = (root / "server.py").read_text(encoding="utf-8")
     website = (root / "website_demo.py").read_text(encoding="utf-8")
+    smartpbx_compose, website_compose = compose.split("smartpbx-acme-inquiry-website", 1)
     assert "smartpbx-acme-inquiry-website" in compose
     assert "smartpbx-acme-inquiry" in compose
-    assert "SMARTPBX_WS_TOKEN" in compose
-    assert "TWILIO_AUTH_TOKEN" not in compose
+    assert "SMARTPBX_WS_TOKEN" in smartpbx_compose
+    assert "WEBSITE_DEMO_TWILIO_AUTH_TOKEN" not in smartpbx_compose
+    assert "WEBSITE_DEMO_TWILIO_AUTH_TOKEN" in website_compose
     assert 'profiles: ["smartpbx"]' in compose
     assert 'profiles: ["website-demo"]' in compose
     assert '127.0.0.1:' in compose
     assert "/smartpbx/status" in smartpbx
     assert "/voice/demo-incoming" not in smartpbx
     assert "/voice/demo-incoming" in website
-    assert "/api/voice-token" not in website
+    assert "/api/voice-token" in website
     assert "SMARTPBX_WS_TOKEN" not in website
 
 
