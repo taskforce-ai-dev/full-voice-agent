@@ -178,3 +178,12 @@ def test_sealed_bundle_contract_normalizes_paths_and_does_not_mask_inventory_typ
     reserved_resources = source[source.index("    def _reserved_resources"):source.index("    @staticmethod\n    def _require_private_state_file")]
     assert "inspect.signature(snapshot)" in reserved_resources
     assert "except TypeError" not in reserved_resources
+
+
+def test_orchestrator_binds_canonical_approved_source_roots_without_public_paths():
+    orchestrator = (Path(__file__).parents[1] / "orchestrator.py").read_text(encoding="utf-8")
+    cli = (Path(__file__).parents[1] / "cli.py").read_text(encoding="utf-8")
+    assert "approved_source_roots_digest" in orchestrator
+    assert "approved_source_roots=stored.approved_source_roots" in orchestrator
+    assert '"approved_source_roots": _serialize_approved_source_roots' in orchestrator
+    assert "--approved-source-root" in cli
