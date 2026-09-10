@@ -1,4 +1,5 @@
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,27 @@ def test_checked_in_blocked_allowlist_cannot_verify_templates(tmp_path):
     )
     with pytest.raises(ProvenanceError, match="approved|blocked"):
         verify_template_files(tmp_path, allowlist)
+
+
+def test_partial_candidate_runtime_records_only_pinned_source_lineage():
+    root = Path(__file__).parents[1] / "template_v1"
+    candidate = json.loads((root / "candidate_runtime_provenance.json").read_text(encoding="utf-8"))
+    assert candidate["status"] == "partial-candidate-not-approved-for-rendering"
+    assert candidate["source_revision"] == "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e"
+    expected = {
+        "Kavya/server.py",
+        "Kavya/smartpbx_gateway.py",
+        "Kavya/smartpbx_session.py",
+        "Kavya/smartpbx_transport.py",
+    }
+    assert set(candidate["source_hashes"]) == expected
+    for component in candidate["components"]:
+        template = root / component["template_path"]
+        assert template.is_file()
+        assert component["template_sha256"] == "sha256:" + sha256(template.read_bytes()).hexdigest()
+        if component["source_path"] is not None:
+            assert component["source_path"] in expected
+            assert component["source_ranges"]
 
 
 def test_template_allowlist_files_are_deeply_immutable():
