@@ -41,7 +41,7 @@ class CredentialSourcePolicy:
     rotation_owner: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class OperationsPrerequisites:
     """Operator-approved inputs required before SOPS/age may be invoked."""
 
@@ -54,7 +54,14 @@ class OperationsPrerequisites:
     credential_source_policy: Mapping[str, CredentialSourcePolicy]
     sops_binary: Path | None
     age_binary: Path | None
-    repository_is_private: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "repository_path", Path(self.repository_path) if self.repository_path else None)
+        object.__setattr__(self, "recipient_file", Path(self.recipient_file) if self.recipient_file else None)
+        object.__setattr__(self, "sops_binary", Path(self.sops_binary) if self.sops_binary else None)
+        object.__setattr__(self, "age_binary", Path(self.age_binary) if self.age_binary else None)
+        object.__setattr__(self, "approved_recipient_fingerprints", tuple(self.approved_recipient_fingerprints))
+        object.__setattr__(self, "credential_source_policy", MappingProxyType(dict(self.credential_source_policy)))
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,12 @@ class SecretProvider(Protocol):
     def validate(self) -> None: ...
 
 
+class RepositoryVisibilityVerifier(Protocol):
+    """Authoritatively determines whether an existing operations repository is private."""
+
+    def is_private(self, *, repository: Path, canonical_remote: str) -> bool: ...
+
+
 _SECRET_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*(?:/[a-z][a-z0-9_-]*)+$")
 _AGE_RECIPIENT_RE = re.compile(r"^age1[ac-hj-np-z02-9]{20,}$")
 _CANONICAL_REMOTE_RE = re.compile(r"^(?:https://[^/\s]+/.+|ssh://[^\s]+|git@[^:\s]+:.+)$")
@@ -116,11 +129,13 @@ class SopsAgeSecretProvider:
         *,
         generation_state: MutableMapping[str, str] | None = None,
         credential_reader: Callable[[CredentialSourcePolicy], str] | None = None,
+        visibility_verifier: RepositoryVisibilityVerifier | None = None,
         runner: Callable[..., object] = subprocess.run,
     ) -> None:
         self._prerequisites = prerequisites
         self._generation_state = generation_state if generation_state is not None else {}
         self._credential_reader = credential_reader
+        self._visibility_verifier = visibility_verifier
         self._runner = runner
         self._fetched_names: list[str] = []
         self._generated_names: list[str] = []
@@ -164,25 +179,27 @@ class SopsAgeSecretProvider:
             raise OperationsPrerequisiteError("approved_recipients")
         return recipients
 
-    @staticmethod
-    def _verify_origin_remote(repository: Path, canonical_remote: str) -> None:
-        """Check the checked-out private repository's origin without network I/O."""
+    def _verify_origin_remote(self, repository: Path, canonical_remote: str) -> None:
+        """Ask Git for origin, supporting both normal and linked worktrees."""
         if not _CANONICAL_REMOTE_RE.fullmatch(canonical_remote):
             raise OperationsPrerequisiteError("canonical_remote")
-        git_marker = repository / ".git"
-        config = git_marker / "config"
-        if not config.is_file():
+        argv = ["git", "-C", str(repository), "config", "--get", "remote.origin.url"]
+        try:
+            result = self._runner(argv, capture_output=True, check=False, shell=False, text=False)
+        except OSError as error:
             raise OperationsPrerequisiteError("canonical_remote")
-        in_origin = False
-        actual_remote = ""
-        for raw_line in config.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if line.startswith("["):
-                in_origin = line == '[remote "origin"]'
-                continue
-            if in_origin and line.startswith("url") and "=" in line:
-                actual_remote = line.split("=", 1)[1].strip()
-                break
+        if getattr(result, "returncode", 1) != 0:
+            raise OperationsPrerequisiteError("canonical_remote")
+        raw_remote = getattr(result, "stdout", b"")
+        if isinstance(raw_remote, bytes):
+            try:
+                actual_remote = raw_remote.decode("utf-8", errors="strict").strip()
+            except UnicodeDecodeError as error:
+                raise OperationsPrerequisiteError("canonical_remote") from error
+        elif isinstance(raw_remote, str):
+            actual_remote = raw_remote.strip()
+        else:
+            actual_remote = ""
         if not actual_remote or actual_remote.rstrip("/") != canonical_remote.rstrip("/"):
             raise OperationsPrerequisiteError("canonical_remote")
 
@@ -207,8 +224,16 @@ class SopsAgeSecretProvider:
         if not (repository / ".git").exists():
             raise OperationsPrerequisiteError("repository_path")
         canonical_remote = self._require_text(prerequisites.canonical_remote, "canonical_remote")
+        if self._visibility_verifier is None:
+            raise OperationsPrerequisiteError("private_repository")
         self._verify_origin_remote(repository, canonical_remote)
-        if not prerequisites.repository_is_private:
+        try:
+            private = self._visibility_verifier.is_private(
+                repository=repository, canonical_remote=canonical_remote
+            )
+        except Exception as error:
+            raise OperationsPrerequisiteError("private_repository") from error
+        if private is not True:
             raise OperationsPrerequisiteError("private_repository")
         self._require_text(prerequisites.owner, "owner")
         recipient_file = self._require_absolute_file(prerequisites.recipient_file, "recipient_file")
