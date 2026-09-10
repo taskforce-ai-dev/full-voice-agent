@@ -9,16 +9,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from html.parser import HTMLParser
+import http.client
 import ipaddress
 from io import BytesIO
 import json
 from pathlib import Path
 import posixpath
 import re
+import socket
+import ssl
 from typing import Iterable, Protocol
-from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .model import KnowledgeSource
 from .state import GenerationState
@@ -110,6 +111,29 @@ class URLNetworkPolicy(Protocol):
         """Reject a destination hostname that is unsafe for this environment."""
 
 
+class URLResolver(Protocol):
+    """Resolve a hostname once before a pinned connection is made."""
+
+    def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
+        """Return every candidate A/AAAA address for the destination."""
+
+
+@dataclass(frozen=True)
+class URLFetchResponse:
+    status: int
+    headers: dict[str, str]
+    body: bytes
+
+
+class URLTransport(Protocol):
+    """Fetch a URL by connecting only to already-validated IP addresses."""
+
+    def fetch(
+        self, url: str, addresses: tuple[str, ...], timeout_seconds: float, max_bytes: int
+    ) -> URLFetchResponse:
+        """Fetch through the supplied address set without resolving the hostname again."""
+
+
 class _PublicURLNetworkPolicy:
     def validate(self, hostname: str) -> None:
         if hostname.lower().rstrip(".") == "localhost":
@@ -122,14 +146,72 @@ class _PublicURLNetworkPolicy:
             raise KnowledgeError("private, link-local, or loopback URL origins are not allowed")
 
 
-class LocalFixtureNetworkPolicy:
-    """Explicit test-only policy for loopback fake HTTP fixtures.
+class _SystemURLResolver:
+    def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
+        addresses = tuple(
+            dict.fromkeys(
+                item[4][0]
+                for item in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+                if item[0] in {socket.AF_INET, socket.AF_INET6}
+            )
+        )
+        if not addresses:
+            raise OSError("hostname did not resolve to an IP address")
+        return addresses
 
-    Production callers must use the default public-network policy.
-    """
 
-    def validate(self, hostname: str) -> None:
-        return
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, address: str, port: int, server_hostname: str, timeout_seconds: float) -> None:
+        super().__init__(address, port=port, timeout=timeout_seconds)
+        self._server_hostname = server_hostname
+
+    def connect(self) -> None:
+        self.sock = self._create_connection((self.host, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._server_hostname)
+
+
+class _PinnedURLTransport:
+    def fetch(
+        self, url: str, addresses: tuple[str, ...], timeout_seconds: float, max_bytes: int
+    ) -> URLFetchResponse:
+        parsed = urlsplit(url)
+        if not parsed.hostname:
+            raise KnowledgeError("URL must have a hostname")
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as exc:
+            raise KnowledgeError("URL origin has an invalid port") from exc
+        target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        authority = parsed.hostname
+        if ":" in authority:
+            authority = f"[{authority}]"
+        if parsed.port not in {None, 443 if parsed.scheme == "https" else 80}:
+            authority = f"{authority}:{parsed.port}"
+        last_error: OSError | None = None
+        for address in addresses:
+            connection: http.client.HTTPConnection
+            if parsed.scheme == "https":
+                connection = _PinnedHTTPSConnection(address, port, parsed.hostname, timeout_seconds)
+            else:
+                connection = http.client.HTTPConnection(address, port=port, timeout=timeout_seconds)
+            try:
+                connection.putrequest("GET", target, skip_host=True, skip_accept_encoding=True)
+                connection.putheader("Host", authority)
+                connection.putheader("Accept", ", ".join(sorted(_ALLOWED_CONTENT_TYPES)))
+                connection.endheaders()
+                response = connection.getresponse()
+                return URLFetchResponse(
+                    status=response.status,
+                    headers={key.lower(): value for key, value in response.getheaders()},
+                    body=response.read(max_bytes + 1),
+                )
+            except (OSError, http.client.HTTPException) as exc:
+                last_error = OSError(str(exc))
+            finally:
+                connection.close()
+        raise last_error or OSError("pinned connection failed")
 
 
 @dataclass(frozen=True)
@@ -157,24 +239,6 @@ class _TextOnlyHTML(HTMLParser):
         return "\n".join(self.parts)
 
 
-class _AllowlistedRedirectHandler(HTTPRedirectHandler):
-    def __init__(self, check_url, max_redirects: int) -> None:
-        super().__init__()
-        self._check_url = check_url
-        self._max_redirects = max_redirects
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
-        target = urljoin(req.full_url, newurl)
-        redirects = int(getattr(req, "_knowledge_redirects", 0)) + 1
-        if redirects > self._max_redirects:
-            raise KnowledgeError("URL redirect limit exceeded")
-        self._check_url(target)
-        redirected = super().redirect_request(req, fp, code, msg, headers, target)
-        if redirected is not None:
-            setattr(redirected, "_knowledge_redirects", redirects)
-        return redirected
-
-
 class KnowledgeBuilderImpl:
     """Extract source text under explicit local and network resource bounds."""
 
@@ -188,6 +252,8 @@ class KnowledgeBuilderImpl:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         approved_source_roots: Iterable[Path] | None = None,
         network_policy: URLNetworkPolicy | None = None,
+        resolver: URLResolver | None = None,
+        transport: URLTransport | None = None,
     ) -> None:
         if min(max_bytes, total_max_bytes, max_chars, max_redirects) <= 0 or timeout_seconds <= 0:
             raise KnowledgeError("knowledge limits must be positive")
@@ -198,6 +264,8 @@ class KnowledgeBuilderImpl:
         self.timeout_seconds = timeout_seconds
         self.approved_source_roots = tuple(Path(root) for root in approved_source_roots or ())
         self.network_policy = network_policy or _PublicURLNetworkPolicy()
+        self.resolver = resolver or _SystemURLResolver()
+        self.transport = transport or _PinnedURLTransport()
 
     def build(self, sources: tuple[KnowledgeSource, ...], output_dir: Path) -> KnowledgeReview:
         if not isinstance(sources, tuple):
@@ -319,28 +387,63 @@ class KnowledgeBuilderImpl:
         return content
 
     def _fetch_url(self, source: KnowledgeSource) -> tuple[bytes, str, str]:
-        def check_url(value: str) -> None:
-            self._check_allowed_url(value, source)
+        current_url = source.url or ""
+        for redirects in range(self.max_redirects + 1):
+            self._check_allowed_url(current_url, source)
+            addresses = self._resolve_global_addresses(current_url)
+            try:
+                response = self.transport.fetch(
+                    current_url, addresses, self.timeout_seconds, self.max_bytes
+                )
+            except KnowledgeError:
+                raise
+            except (OSError, TimeoutError) as exc:
+                raise _SourceUnavailable from exc
+            if response.status in {301, 302, 303, 307, 308}:
+                headers = {key.lower(): value for key, value in response.headers.items()}
+                location = headers.get("location")
+                if not location:
+                    raise _SourceUnavailable
+                if redirects == self.max_redirects:
+                    raise KnowledgeError("URL redirect limit exceeded")
+                current_url = urljoin(current_url, location)
+                continue
+            if response.status < 200 or response.status >= 300:
+                raise _SourceUnavailable
+            headers = {key.lower(): value for key, value in response.headers.items()}
+            content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type not in _ALLOWED_CONTENT_TYPES:
+                raise KnowledgeError("URL content type is not allowed")
+            declared = headers.get("content-length")
+            if declared is not None and (not declared.isdigit() or int(declared) > self.max_bytes):
+                raise KnowledgeError("source byte limit exceeded")
+            if len(response.body) > self.max_bytes:
+                raise KnowledgeError("source byte limit exceeded")
+            return response.body, content_type, current_url
+        raise KnowledgeError("URL redirect limit exceeded")
 
-        check_url(source.url or "")
-        opener = build_opener(_AllowlistedRedirectHandler(check_url, self.max_redirects))
-        request = Request(source.url, headers={"Accept": ", ".join(sorted(_ALLOWED_CONTENT_TYPES))})
+    def _resolve_global_addresses(self, value: str) -> tuple[str, ...]:
+        parsed = urlsplit(value)
+        if not parsed.hostname:
+            raise KnowledgeError("URL must have a hostname")
         try:
-            with opener.open(request, timeout=self.timeout_seconds) as response:
-                content_type = response.headers.get_content_type().lower()
-                if content_type not in _ALLOWED_CONTENT_TYPES:
-                    raise KnowledgeError("URL content type is not allowed")
-                declared = response.headers.get("Content-Length")
-                if declared is not None and (not declared.isdigit() or int(declared) > self.max_bytes):
-                    raise KnowledgeError("source byte limit exceeded")
-                content = response.read(self.max_bytes + 1)
-                if len(content) > self.max_bytes:
-                    raise KnowledgeError("source byte limit exceeded")
-                return content, content_type, response.geturl()
-        except KnowledgeError:
-            raise
-        except (HTTPError, URLError, OSError, TimeoutError) as exc:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as exc:
+            raise KnowledgeError("URL origin has an invalid port") from exc
+        try:
+            addresses = self.resolver.resolve(parsed.hostname, port)
+        except OSError as exc:
             raise _SourceUnavailable from exc
+        if not addresses:
+            raise _SourceUnavailable
+        for address in addresses:
+            try:
+                parsed_address = ipaddress.ip_address(address)
+            except ValueError as exc:
+                raise KnowledgeError("resolver returned an invalid IP address") from exc
+            if not parsed_address.is_global:
+                raise KnowledgeError("resolved URL address is non-global")
+        return addresses
 
     @staticmethod
     def _normal_path(value: str) -> str:
