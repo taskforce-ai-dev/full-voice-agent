@@ -16,15 +16,28 @@ from pathlib import Path
 import pytest
 
 
-def _lane():
-    template = Path(__file__).parents[1] / "template_v1" / "runtime" / "llm_adapters.py.tmpl"
-    loader = importlib.machinery.SourceFileLoader("candidate_llm_lane", str(template))
+_RUNTIME = Path(__file__).parents[1] / "template_v1" / "runtime"
+
+
+def _load_template(module_name: str, template_name: str):
+    loader = importlib.machinery.SourceFileLoader(module_name, str(_RUNTIME / template_name))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[loader.name] = module
     loader.exec_module(module)
     return module
+
+
+def _lane():
+    """Materialize the shared runtime graph used by a rendered lane.
+
+    The candidate deliberately shares event definitions with the turn engine;
+    loading only this one template cannot represent the generated module graph.
+    """
+    _load_template("product_profile", "product_profile.py.tmpl")
+    _load_template("provider_adapters", "provider_adapters.py.tmpl")
+    return _load_template("candidate_llm_lane", "llm_adapters.py.tmpl")
 
 
 class _ClaudeContext(AbstractAsyncContextManager):

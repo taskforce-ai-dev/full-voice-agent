@@ -66,7 +66,7 @@ def test_tts_template_accepts_only_explicit_catalogue_language_codes():
             sinhala_gemini=module.SinhalaGeminiSettings("key"),
             language_routes={
                 "en-US": module.TTSLanguageRoute("elevenlabs"),
-                "si-LK": module.TTSLanguageRoute("sinhala"),
+                "si-LK": module.TTSLanguageRoute("gemini"),
             },
         )
         adapter = module.SmartPBXTTSAdapter(config, module.TTSProviderClients(http=None, gemini=None))

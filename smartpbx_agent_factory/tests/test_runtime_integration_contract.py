@@ -139,7 +139,7 @@ def test_renderer_uses_the_verified_gateway_template_and_keeps_web_ingress_revie
     assert '"website_demo_core.py": runtime_template("website_demo_core.py.tmpl")' in renderer
     assert "synthetic=synthetic" in renderer and "review-only-exact-template" in renderer
     assert "signed-webhook" in candidate
-    assert "website-demo profile is source-extracted" in allowlist
+    assert "source-extracted website-demo profile" in allowlist
     compose = (root / "template_v1" / "infrastructure" / "docker-compose.yml.tmpl").read_text(encoding="utf-8")
     website_proxy = (root / "template_v1" / "infrastructure" / "nginx-website-demo.conf.tmpl").read_text(encoding="utf-8")
     website = source("website_demo.py.tmpl")

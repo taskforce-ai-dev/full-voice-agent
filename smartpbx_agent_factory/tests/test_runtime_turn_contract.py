@@ -34,21 +34,27 @@ class RecordingTransport:
         self.events: list[tuple[str, bytes | str]] = []
         self.pending_audio: list[bytes] = []
         self.clears = 0
+        self.audio_sent = asyncio.Event()
+        self.mark_sent = asyncio.Event()
+        self.audio_cleared = asyncio.Event()
         self.mark_release = asyncio.Event()
         self.hold_mark = False
 
     async def send_audio(self, audio: bytes) -> None:
         self.events.append(("audio", audio))
         self.pending_audio.append(audio)
+        self.audio_sent.set()
 
     async def send_mark(self, name: str) -> None:
         self.events.append(("mark", name))
+        self.mark_sent.set()
         if self.hold_mark:
             await self.mark_release.wait()
         self.pending_audio.clear()
 
     async def clear_audio(self) -> None:
         self.clears += 1
+        self.audio_cleared.set()
 
 
 class RecordingRecognizer:
@@ -76,7 +82,6 @@ class RecordingAdapter:
         self.generated: list[str] = []
         self.block_first_response = False
         self.first_response_started = asyncio.Event()
-        self.echo_texts: set[str] = set()
         self.response_factory = None
 
     async def start_recognizer(self, language: str, on_result) -> RecordingRecognizer:
@@ -96,11 +101,6 @@ class RecordingAdapter:
     async def synthesize_audio(self, response: str, _language: str) -> bytes:
         return response.encode("ascii")
 
-
-    def is_echo(self, text: str, _language: str) -> bool:
-        return text in self.echo_texts
-
-
 async def _new_engine(runtime_module, adapter: RecordingAdapter, transport: RecordingTransport, **options):
     profile_module = importlib.import_module("product_profile")
     language = profile_module.test_product_profile().language("en")
@@ -115,6 +115,11 @@ async def _new_engine(runtime_module, adapter: RecordingAdapter, transport: Reco
     await engine.start(language)
     assert adapter.recognizer is not None
     return engine, language, adapter.recognizer
+
+
+async def _await_event(event: asyncio.Event) -> None:
+    """Synchronize with the event-loop bridge; never count scheduler ticks."""
+    await asyncio.wait_for(event.wait(), timeout=0.5)
 
 
 def test_continuous_recognizer_owns_audio_and_final_endpoint(runtime_module):
@@ -164,8 +169,7 @@ def test_barge_in_cancels_old_generation_and_fences_late_tts(runtime_module):
         result = runtime_module.RecognizerResult
 
         recognizer.emit(result("first", is_final=True, result_id=1))
-        for _ in range(4):
-            await asyncio.sleep(0)
+        await _await_event(transport.audio_sent)
         recognizer.emit(result("this is a material interruption", is_final=False, result_id=2))
         recognizer.emit(result("second", is_final=True, result_id=3))
         transport.mark_release.set()
@@ -196,15 +200,18 @@ def test_pre_audio_requires_sustained_material_speech_before_barge_in(runtime_mo
 
         recognizer.emit(result("first", is_final=True, result_id="first"))
         await asyncio.wait_for(adapter.first_response_started.wait(), timeout=0.2)
-        recognizer.emit(result("this is material but only one callback", is_final=False))
-        for _ in range(4):
-            await asyncio.sleep(0)
+        await engine._handle_recognizer_result(
+            engine._recognizer_epoch,
+            result("this is material but only one callback", is_final=False),
+        )
         assert transport.clears == 0
 
         now[0] = 0.25
-        recognizer.emit(result("this is the second sustained callback", is_final=False))
-        for _ in range(4):
-            await asyncio.sleep(0)
+        await engine._handle_recognizer_result(
+            engine._recognizer_epoch,
+            result("this is the second sustained callback", is_final=False),
+        )
+        await _await_event(transport.audio_cleared)
         assert transport.clears == 1
 
         await engine.close()
@@ -261,24 +268,23 @@ def test_immediate_material_speech_after_audio_obeys_debounce(runtime_module):
 def test_provider_echo_is_not_admitted_as_a_barge_in(runtime_module):
     async def exercise():
         adapter, transport = RecordingAdapter(), RecordingTransport()
-        adapter.echo_texts.add("this is echoed assistant audio")
         transport.hold_mark = True
         engine, _language, recognizer = await _new_engine(
             runtime_module, adapter, transport, barge_in_debounce_seconds=0.0
         )
         result = runtime_module.RecognizerResult
 
-        recognizer.emit(result("first reply", is_final=True, result_id="first"))
-        for _ in range(4):
-            await asyncio.sleep(0)
-        recognizer.emit(result("this is echoed assistant audio", is_final=False))
-        for _ in range(4):
-            await asyncio.sleep(0)
+        recognizer.emit(result("this is echoed assistant audio", is_final=True, result_id="first"))
+        await _await_event(transport.audio_sent)
+        await engine._handle_recognizer_result(
+            engine._recognizer_epoch,
+            result("this is echoed assistant audio", is_final=False),
+        )
 
         assert transport.clears == 0
         transport.mark_release.set()
         await engine.drain()
-        assert adapter.generated == ["first reply"]
+        assert adapter.generated == ["this is echoed assistant audio"]
 
     asyncio.run(exercise())
 
@@ -403,8 +409,7 @@ def test_provisional_sentence_starts_tts_before_terminal_commit(runtime_module):
         result = runtime_module.RecognizerResult
 
         recognizer.emit(result("question", is_final=True))
-        for _ in range(4):
-            await asyncio.sleep(0)
+        await _await_event(transport.audio_sent)
         assert transport.events == [("audio", b"speak promptly")]
         assert engine.turns_completed == 0
         assert engine.committed_responses == []
@@ -438,11 +443,9 @@ def test_cancelled_generation_cannot_speak_after_a_late_terminal_commit(runtime_
         result = runtime_module.RecognizerResult
 
         recognizer.emit(result("first", is_final=True))
-        for _ in range(4):
-            await asyncio.sleep(0)
+        await _await_event(transport.audio_sent)
         recognizer.emit(result("this is a material interruption", is_final=False))
-        for _ in range(4):
-            await asyncio.sleep(0)
+        await _await_event(transport.audio_cleared)
         assert transport.clears == 1
         old_commit.set()
         await engine.drain()
@@ -551,8 +554,7 @@ def test_turn_counts_only_after_transport_mark_barrier(runtime_module):
         result = runtime_module.RecognizerResult
 
         recognizer.emit(result("delivered", is_final=True, result_id=1))
-        for _ in range(4):
-            await asyncio.sleep(0)
+        await _await_event(transport.mark_sent)
         assert transport.events == [("audio", b"delivered"), ("mark", "conversation-turn")]
         assert engine.turns_completed == 0
 

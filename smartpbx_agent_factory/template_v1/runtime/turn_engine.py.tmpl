@@ -719,7 +719,6 @@ class ConversationTurnEngine:
         if self._closed or self._max_reprompts == 0 or self._reprompt_count >= self._max_reprompts:
             return
         self._reprompt_task = asyncio.create_task(self._reprompt_after_silence())
-        self._track(self._reprompt_task)
 
     async def _reprompt_after_silence(self) -> None:
         try:
