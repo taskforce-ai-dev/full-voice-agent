@@ -10,6 +10,7 @@ from smartpbx_agent_factory.orchestrator import (
     GenerationOrchestrator,
 )
 from smartpbx_agent_factory.gitops import WorktreeManager
+from smartpbx_agent_factory.knowledge import KnowledgeDocument, KnowledgeFact, KnowledgeReview
 from smartpbx_agent_factory.secrets import SecretAudit
 from smartpbx_agent_factory.state import Stage
 
@@ -262,3 +263,70 @@ def test_secret_resolution_does_not_accept_a_caller_forged_audit_argument(tmp_pa
             provider=Provider(),
             audit=SecretAudit(generated_names=("forged/wss_token",)),
         )
+
+
+def test_secret_resolution_binds_the_concrete_knowledge_review_not_manifest_source_metadata(tmp_path):
+    class Provider:
+        def validate(self):
+            return None
+
+        def audit_report(self):
+            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
+
+    class Builder:
+        def __init__(self):
+            self.calls = []
+
+        def build(self, sources, output_dir):
+            self.calls.append((sources, output_dir))
+            return KnowledgeReview(
+                facts=(KnowledgeFact("Approved local fact.", "file:///fixture", "document"),),
+                conflicts=(),
+                missing_facts=(),
+                sensitive_findings=(),
+                inaccessible_sources=(),
+                duplicate_facts=(),
+                instruction_findings=(),
+                digest="a" * 64,
+                documents=(KnowledgeDocument("file:///fixture", "owner", "2026-01-01", "public", "Approved local fact."),),
+            )
+
+    builder = Builder()
+    orchestrator = GenerationOrchestrator(
+        tmp_path,
+        catalogue_path=CATALOGUE,
+        knowledge_builder_factory=lambda _root: builder,
+    )
+    report = orchestrator.plan(FIXTURE)
+    state = orchestrator.record_secrets_resolved(report.generation_id, provider=Provider())
+
+    assert state.stage is Stage.KNOWLEDGE_REVIEW_REQUIRED
+    assert state.knowledge_review_digest == "a" * 64
+    assert builder.calls and builder.calls[0][0]
+    assert builder.calls[0][1] == tmp_path / "knowledge-reviews" / report.generation_id
+
+
+def test_secret_resolution_rejects_a_noncanonical_knowledge_review_digest(tmp_path):
+    class Provider:
+        def validate(self):
+            return None
+
+        def audit_report(self):
+            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
+
+    class Builder:
+        def build(self, sources, output_dir):
+            return KnowledgeReview(
+                facts=(), conflicts=(), missing_facts=(), sensitive_findings=(),
+                inaccessible_sources=(), duplicate_facts=(), instruction_findings=(),
+                digest="a" * 64,
+            )
+
+    orchestrator = GenerationOrchestrator(
+        tmp_path,
+        catalogue_path=CATALOGUE,
+        knowledge_builder_factory=lambda _root: Builder(),
+    )
+    report = orchestrator.plan(FIXTURE)
+    with pytest.raises(GenerationBlockedError, match="knowledge review digest"):
+        orchestrator.record_secrets_resolved(report.generation_id, provider=Provider())
