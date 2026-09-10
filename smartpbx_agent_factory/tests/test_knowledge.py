@@ -150,8 +150,10 @@ def test_url_query_is_not_persisted_in_review_or_source_document(http_server, tm
         (source,), output_dir=tmp_path / "out"
     )
     document = (tmp_path / "out" / "knowledge_docs" / "source-001.md").read_text(encoding="utf-8")
+    report = (tmp_path / "out" / "knowledge_docs" / "review.md").read_text(encoding="utf-8")
     assert "benign-query-value" not in review.facts[0].source_uri
     assert "benign-query-value" not in document
+    assert "benign-query-value" not in report
 
 
 def test_poisoned_instructions_are_reported_as_data(tmp_path):
