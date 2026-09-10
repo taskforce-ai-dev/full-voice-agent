@@ -9,6 +9,7 @@ from smartpbx_agent_factory.orchestrator import (
     GenerationInfrastructureError,
     GenerationOrchestrator,
 )
+from smartpbx_agent_factory.gitops import WorktreeManager
 from smartpbx_agent_factory.state import Stage
 
 
@@ -110,3 +111,75 @@ def test_abandon_refuses_legacy_state_without_cleanup_inventory(tmp_path):
     state_file.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(GenerationBlockedError, match="cleanup inventory"):
         orchestrator.abandon(report.generation_id)
+
+
+def test_state_root_rejects_a_symlinked_parent_before_writing(tmp_path):
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_root, target_is_directory=True)
+    with pytest.raises(GenerationInfrastructureError, match="symlink"):
+        GenerationOrchestrator(linked_parent / "state", catalogue_path=CATALOGUE).plan(FIXTURE)
+
+
+def test_resume_rejects_state_file_with_non_private_mode(tmp_path):
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    report = orchestrator.plan(FIXTURE)
+    state_file = tmp_path / f"{report.generation_id}.json"
+    state_file.chmod(0o644)
+    with pytest.raises(GenerationInfrastructureError, match="mode 0600"):
+        GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE).resume(report.generation_id)
+
+
+def test_abandon_can_recover_a_recorded_worktree_after_orchestrator_restart(tmp_path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    worktree_root = tmp_path / "worktrees"
+    target = worktree_root / "agent"
+    removed: list[tuple[str, ...]] = []
+
+    def run(args):
+        if args[-2:] == ("status", "--porcelain"):
+            return ""
+        if args[-1] == "origin/main":
+            return "a" * 40
+        if args[-2:] == ("list", "--porcelain"):
+            return f"worktree {primary}\nHEAD {'b' * 40}\n\nworktree {target}\nHEAD {'a' * 40}\ndetached\n\n"
+        if "remove" in args:
+            removed.append(tuple(args))
+        return ""
+
+    manager = WorktreeManager(worktree_root, run=run)
+    handle = manager.create(primary=primary, remote="origin", revision="a" * 40, target=target)
+    first = GenerationOrchestrator(tmp_path / "state", catalogue_path=CATALOGUE)
+    report = first.plan(FIXTURE)
+    first.record_owned_worktree(report.generation_id, manager, handle)
+    restarted = GenerationOrchestrator(tmp_path / "state", catalogue_path=CATALOGUE)
+    restarted.abandon(report.generation_id)
+    assert removed
+
+
+def test_abandon_persists_each_completed_cleanup_item_before_the_next_failure(tmp_path, monkeypatch):
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    report = orchestrator.plan(FIXTURE)
+    first = tmp_path / "plaintext" / report.generation_id / "first"
+    second = tmp_path / "plaintext" / report.generation_id / "second"
+    first.parent.mkdir(parents=True)
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    orchestrator.record_owned_plaintext_path(report.generation_id, first)
+    orchestrator.record_owned_plaintext_path(report.generation_id, second)
+    original_unlink = Path.unlink
+
+    def fail_second(path, *args, **kwargs):
+        if path == second:
+            raise OSError("simulated second cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_second)
+    with pytest.raises(OSError, match="second cleanup failure"):
+        orchestrator.abandon(report.generation_id)
+    raw = json.loads((tmp_path / f"{report.generation_id}.json").read_text(encoding="utf-8"))
+    assert str(first) in raw["cleanup_inventory"]["completed_plaintext_paths"]
+    assert str(second) not in raw["cleanup_inventory"]["completed_plaintext_paths"]
