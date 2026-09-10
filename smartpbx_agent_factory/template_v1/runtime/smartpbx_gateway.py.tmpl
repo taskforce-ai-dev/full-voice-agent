@@ -24,6 +24,9 @@ from smartpbx_protocol import (
 from smartpbx_transport import SmartPBXMediaTransport
 
 
+SMARTPBX_PROTOCOL_VERSION = "smartpbx-ai-provider-v07"
+
+
 @dataclass(frozen=True)
 class CarrierIngressSettings:
     enabled: bool
@@ -156,8 +159,13 @@ class SmartPBXGateway:
         self._settings = settings
         self._registry = registry
 
-    def snapshot(self) -> dict[str, bool | int]:
-        return {"enabled": self._settings.enabled, "configured": self._settings.configured, **self._registry.snapshot()}
+    def snapshot(self) -> dict[str, bool | int | str]:
+        return {
+            "enabled": self._settings.enabled,
+            "configured": self._settings.configured,
+            "protocol_version": SMARTPBX_PROTOCOL_VERSION,
+            **self._registry.snapshot(),
+        }
 
     async def handle(self, websocket: Any, session_factory: SessionFactory) -> None:
         if not self._settings.enabled or not self._settings.configured:

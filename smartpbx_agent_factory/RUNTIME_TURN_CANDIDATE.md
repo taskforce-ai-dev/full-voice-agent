@@ -1,7 +1,8 @@
 # Candidate runtime turn contract
 
 This is a narrow, client-neutral extraction candidate from pinned Kavya revision
-`6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e`. It is not an approved rendering
+`0f83ac662a34657f06d490a46dc1b773bfe021e7`, including the reviewed V07
+compatibility-marker boundary. It is not an approved rendering
 template and does not authorize an integration, deployment, or provider setup.
 
 ## Ownership model

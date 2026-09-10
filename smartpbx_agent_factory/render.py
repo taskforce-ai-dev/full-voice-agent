@@ -1,8 +1,9 @@
 """Fail-closed rendering for isolated, inquiry-only SmartPBX backend trees.
 
-This module deliberately has no fallback to a mutable source tree.  The default
-allowlist is digest-bound to an approved v06 source revision; a later protocol
-overlay must be separately approved rather than relabeling that deployed source.
+This module deliberately has no fallback to a mutable source tree. The default
+allowlist is digest-bound to the approved V06 image baseline; the separately
+source-pinned V07 candidate remains blocked until it has immutable-image and
+lifecycle proof rather than being relabelled as that deployed source.
 """
 
 from __future__ import annotations
@@ -119,7 +120,7 @@ def _load_default_allowlist() -> TemplateAllowlist:
         raw = json.loads(_DEFAULT_ALLOWLIST.read_text(encoding="utf-8"))
         if raw.get("status") == "partial":
             raise IncompleteTemplateError(
-                "INCOMPLETE_TEMPLATE: verified v06 provenance has no complete client-neutral runtime extraction"
+                "INCOMPLETE_TEMPLATE: the V06 image baseline cannot approve the partial V07 candidate runtime extraction"
             )
         return validate_allowlist_metadata(raw)
     except IncompleteTemplateError:
