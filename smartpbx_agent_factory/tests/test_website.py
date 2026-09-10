@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import smartpbx_agent_factory.website as website
 from smartpbx_agent_factory.catalogue import CapabilityCatalogue
 from smartpbx_agent_factory.resources import AllocationRegistry, derive_resources
 from smartpbx_agent_factory.schema import parse_manifest
@@ -25,6 +26,16 @@ def fixture_manifest(*, profile: str = "demo"):
 
 def fixture_resources():
     return derive_resources(fixture_manifest(), AllocationRegistry())
+
+
+def named_manifest(slug: str, **changes):
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    raw.update({"slug": slug, **changes})
+    return parse_manifest(
+        raw,
+        approved_source_roots=(Path.cwd(),),
+        catalogue=CapabilityCatalogue.load(CATALOGUE),
+    )
 
 
 def write_website_target(path: Path) -> None:
@@ -164,3 +175,136 @@ def test_generated_module_is_deterministic_and_rejects_invalid_digests(tmp_path)
             fixture_manifest(), fixture_resources(), output_dir=first,
             backend_artifact_digest="not-a-digest", backend_branch_sha="b" * 40,
         )
+
+
+def test_repeated_generations_preserve_existing_cards_and_sort_by_id(tmp_path):
+    write_website_target(tmp_path)
+    render_website_artifacts(
+        fixture_manifest(),
+        fixture_resources(),
+        backend_artifact_digest="a" * 64,
+        backend_branch_sha="b" * 40,
+        output_dir=tmp_path,
+    )
+    beta = named_manifest(
+        "beta-inquiry",
+        display_name="Beta Inquiry",
+        public_name="Beta Inquiry",
+        agent_name="Bea",
+    )
+    render_website_artifacts(
+        beta,
+        derive_resources(beta, AllocationRegistry()),
+        backend_artifact_digest="c" * 64,
+        backend_branch_sha="d" * 40,
+        output_dir=tmp_path,
+    )
+    source = (tmp_path / "data" / "smartpbx-agents.generated.mjs").read_text(encoding="utf-8")
+    assert 'id: "acme-inquiry"' in source
+    assert 'id: "beta-inquiry"' in source
+    assert source.index('id: "acme-inquiry"') < source.index('id: "beta-inquiry"')
+    assert source.count("backendArtifactDigest") == 2
+    assert "eval(" not in source
+
+
+def test_conflicting_existing_card_fails_without_mutating_any_artifact(tmp_path):
+    write_website_target(tmp_path)
+    render_website_artifacts(
+        fixture_manifest(),
+        fixture_resources(),
+        backend_artifact_digest="a" * 64,
+        backend_branch_sha="b" * 40,
+        output_dir=tmp_path,
+    )
+    paths = (
+        tmp_path / "data" / "smartpbx-agents.generated.mjs",
+        tmp_path / "scripts" / "validate-smartpbx-card.mjs",
+        tmp_path / "components" / "pages" / "BookDemo.tsx",
+        tmp_path / "package.json",
+    )
+    before = {path: path.read_bytes() for path in paths}
+    with pytest.raises(ValueError, match="conflicting generated website card"):
+        render_website_artifacts(
+            fixture_manifest(),
+            fixture_resources(),
+            backend_artifact_digest="c" * 64,
+            backend_branch_sha="d" * 40,
+            output_dir=tmp_path,
+        )
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"public_name": "Acme sk-abcdefghijklmnopqrstuvwxyz0123456789"},
+        {"agent_name": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhY21lIn0.signature"},
+        {"purpose": "-----BEGIN " + "PRIVATE KEY-----"},
+        {"allowed_topics": ["api_key=super-secret-value"]},
+    ),
+)
+def test_manifest_derived_credential_like_values_are_rejected_before_output(tmp_path, changes):
+    write_website_target(tmp_path)
+    manifest = named_manifest("acme-inquiry", **changes)
+    with pytest.raises(ValueError, match="credential-like|non-public"):
+        render_website_artifacts(
+            manifest,
+            derive_resources(manifest, AllocationRegistry()),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+    assert not (tmp_path / "data" / "smartpbx-agents.generated.mjs").exists()
+    assert not (tmp_path / "scripts" / "validate-smartpbx-card.mjs").exists()
+
+
+def test_book_demo_validation_failure_leaves_no_partial_output(tmp_path):
+    write_website_target(tmp_path)
+    page = tmp_path / "components" / "pages" / "BookDemo.tsx"
+    page.write_text(page.read_text(encoding="utf-8").replace("hattonhills", "invalid"), encoding="utf-8")
+    package = tmp_path / "package.json"
+    before_page = page.read_bytes()
+    before_package = package.read_bytes()
+    with pytest.raises(ValueError, match="shared HattonHills token issuer"):
+        render_website_artifacts(
+            fixture_manifest(),
+            fixture_resources(),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+    assert page.read_bytes() == before_page
+    assert package.read_bytes() == before_package
+    assert not (tmp_path / "data").exists()
+    assert not (tmp_path / "scripts").exists()
+
+
+def test_atomic_write_failure_restores_every_website_artifact(tmp_path, monkeypatch):
+    write_website_target(tmp_path)
+    paths = (
+        tmp_path / "data" / "smartpbx-agents.generated.mjs",
+        tmp_path / "scripts" / "validate-smartpbx-card.mjs",
+        tmp_path / "components" / "pages" / "BookDemo.tsx",
+        tmp_path / "package.json",
+    )
+    before = {path: path.read_bytes() if path.exists() else None for path in paths}
+    original_replace = website.os.replace
+    page = tmp_path / "components" / "pages" / "BookDemo.tsx"
+
+    def fail_at_page(source, destination):
+        if Path(destination) == page:
+            raise OSError("simulated BookDemo replace failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(website.os, "replace", fail_at_page)
+    with pytest.raises(OSError, match="simulated BookDemo"):
+        render_website_artifacts(
+            fixture_manifest(),
+            fixture_resources(),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+    assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
+    assert not (tmp_path / "data").exists()
+    assert not (tmp_path / "scripts").exists()
