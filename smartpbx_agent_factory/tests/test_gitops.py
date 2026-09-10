@@ -119,3 +119,64 @@ def test_worktree_manager_rejects_a_value_equal_constructed_handle(tmp_path):
     assert equal_but_constructed == handle
     with pytest.raises(WorktreeConflictError, match="created by this manager"):
         manager.remove(equal_but_constructed)
+
+
+def test_generation_branch_starts_at_pinned_base_and_records_its_later_head(tmp_path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    target = tmp_path / "generated" / "site"
+    calls: list[tuple[str, ...]] = []
+
+    def run(args):
+        calls.append(tuple(args))
+        if args[-2:] == ("status", "--porcelain"):
+            return ""
+        if args[-1] == "origin/main":
+            return "a" * 40
+        if args[-2:] == ("list", "--porcelain"):
+            return f"worktree {target}\nHEAD {'b' * 40}\nbranch refs/heads/smartpbx-agent-factory/gen-001\n\n"
+        if args[-2:] == ("rev-parse", "HEAD"):
+            return "b" * 40
+        return ""
+
+    manager = WorktreeManager(tmp_path / "generated", run=run)
+    handle = manager.create(
+        primary=primary,
+        remote="origin",
+        revision="a" * 40,
+        target=target,
+        branch="smartpbx-agent-factory/gen-001",
+    )
+    assert handle.revision == "a" * 40
+    assert handle.branch == "smartpbx-agent-factory/gen-001"
+    assert ("git", "-C", str(primary), "worktree", "add", "-b", handle.branch, str(target), "a" * 40) in calls
+    updated = manager.record_current_head(handle)
+    assert updated.revision == "b" * 40
+
+
+def test_recorded_worktree_refuses_unknown_head_drift(tmp_path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    target = tmp_path / "generated" / "site"
+
+    def run(args):
+        if args[-2:] == ("status", "--porcelain"):
+            return ""
+        if args[-1] == "origin/main":
+            return "a" * 40
+        if args[-2:] == ("list", "--porcelain"):
+            return f"worktree {target}\nHEAD {'c' * 40}\nbranch refs/heads/smartpbx-agent-factory/gen-001\n\n"
+        return ""
+
+    manager = WorktreeManager(tmp_path / "generated", run=run)
+    handle = manager.create(
+        primary=primary,
+        remote="origin",
+        revision="a" * 40,
+        target=target,
+        branch="smartpbx-agent-factory/gen-001",
+    )
+    with pytest.raises(WorktreeConflictError, match="revision"):
+        manager.remove_recorded(handle)

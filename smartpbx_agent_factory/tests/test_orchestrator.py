@@ -10,6 +10,7 @@ from smartpbx_agent_factory.orchestrator import (
     GenerationOrchestrator,
 )
 from smartpbx_agent_factory.gitops import WorktreeManager
+from smartpbx_agent_factory.secrets import SecretAudit
 from smartpbx_agent_factory.state import Stage
 
 
@@ -188,3 +189,35 @@ def test_abandon_persists_each_completed_cleanup_item_before_the_next_failure(tm
     raw = json.loads((tmp_path / f"{report.generation_id}.json").read_text(encoding="utf-8"))
     assert str(first) in raw["cleanup_inventory"]["completed_plaintext_paths"]
     assert str(second) not in raw["cleanup_inventory"]["completed_plaintext_paths"]
+
+
+def test_plaintext_registration_persists_owned_path_without_constructor_error(tmp_path):
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    report = orchestrator.plan(FIXTURE)
+    path = tmp_path / "plaintext" / report.generation_id / "value"
+    path.parent.mkdir(parents=True)
+    path.write_text("temporary", encoding="utf-8")
+    orchestrator.record_owned_plaintext_path(report.generation_id, path)
+    raw = json.loads((tmp_path / f"{report.generation_id}.json").read_text(encoding="utf-8"))
+    assert raw["cleanup_inventory"]["plaintext_paths"] == [str(path)]
+
+
+def test_secret_resolution_requires_a_validated_provider_audit_and_binds_digest(tmp_path):
+    class Provider:
+        def __init__(self):
+            self.validated = False
+
+        def validate(self):
+            self.validated = True
+
+    provider = Provider()
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    report = orchestrator.plan(FIXTURE)
+    state = orchestrator.record_secrets_resolved(
+        report.generation_id,
+        provider=provider,
+        audit=SecretAudit(generated_names=("acme-inquiry/wss_token",), ciphertext_paths=("agents/acme/secrets.sops.yaml",)),
+    )
+    assert provider.validated is True
+    assert state.stage is Stage.KNOWLEDGE_REVIEW_REQUIRED
+    assert len(state.stage_digests["secrets"]) == 64
