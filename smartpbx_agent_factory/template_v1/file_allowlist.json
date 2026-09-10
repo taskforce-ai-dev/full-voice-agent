@@ -8,7 +8,13 @@
   "protocol_version": "unverified",
   "environment_schema_version": "unverified",
   "files": {
-    "runtime/README.md": "sha256:30160154ec7513712cffe89c441d0e7655ce8a58ac9dadcce5f0965d3c490e9a",
-    "infrastructure/README.md": "sha256:12d918d86d7bb53891e22fbb1ac94302d25cff506af091033ca59f6f52bfcf14"
+    "runtime/README.md": {
+      "template_path": "runtime/README.md",
+      "sha256": "sha256:30160154ec7513712cffe89c441d0e7655ce8a58ac9dadcce5f0965d3c490e9a"
+    },
+    "infrastructure/README.md": {
+      "template_path": "infrastructure/README.md",
+      "sha256": "sha256:12d918d86d7bb53891e22fbb1ac94302d25cff506af091033ca59f6f52bfcf14"
+    }
   }
 }

@@ -14,17 +14,28 @@ class CatalogueError(ValueError):
 
 
 @dataclass(frozen=True)
+class ProviderModel:
+    provider: str
+    model: str
+
+
+@dataclass(frozen=True)
 class CapabilityCatalogue:
     version: int
-    languages: Mapping[str, Mapping[str, tuple[str, ...]]]
+    languages: Mapping[str, Mapping[str, Mapping[str, tuple[ProviderModel, ...] | tuple[str, ...]]]]
     status: str = ""
 
     def __post_init__(self) -> None:
         frozen = {
             language: MappingProxyType(
-                {component: tuple(providers) for component, providers in pipeline.items()}
+                {
+                    locale: MappingProxyType(
+                        {component: tuple(providers) for component, providers in pipeline.items()}
+                    )
+                    for locale, pipeline in locales.items()
+                }
             )
-            for language, pipeline in self.languages.items()
+            for language, locales in self.languages.items()
         }
         object.__setattr__(self, "languages", MappingProxyType(frozen))
 
@@ -38,31 +49,56 @@ class CapabilityCatalogue:
             raise CatalogueError("catalogue must be an object")
         if raw.get("version") != 1:
             raise CatalogueError("catalogue version must be 1")
-        languages = raw.get("languages")
-        if not isinstance(languages, Mapping) or not languages:
-            raise CatalogueError("catalogue languages must be a non-empty object")
-        parsed: dict[str, dict[str, tuple[str, ...]]] = {}
-        for language, pipeline in languages.items():
-            if not isinstance(language, str) or not language:
-                raise CatalogueError("catalogue language names must be non-empty strings")
-            if not isinstance(pipeline, Mapping):
-                raise CatalogueError(f"catalogue language {language} must be an object")
-            parsed_pipeline: dict[str, tuple[str, ...]] = {}
-            for component in ("stt", "llm", "tts", "fallback"):
-                providers = pipeline.get(component, ())
-                if not isinstance(providers, (list, tuple)):
-                    raise CatalogueError(f"catalogue {language}.{component} must be an array")
-                if any(not isinstance(provider, str) or not provider for provider in providers):
-                    raise CatalogueError(f"catalogue {language}.{component} has an invalid provider")
-                parsed_pipeline[component] = tuple(providers)
-            if any(not parsed_pipeline[name] for name in ("stt", "llm", "tts")):
-                raise CatalogueError(f"catalogue {language} must list stt, llm and tts providers")
-            parsed[language] = parsed_pipeline
         status = raw.get("catalogue_status", "")
         if not isinstance(status, str):
             raise CatalogueError("catalogue_status must be a string")
         if status != "approved":
             raise CatalogueError("catalogue is not approved for operational use")
+        languages = raw.get("languages")
+        if not isinstance(languages, Mapping) or not languages:
+            raise CatalogueError("catalogue languages must be a non-empty object")
+        parsed: dict[str, dict[str, dict[str, tuple[ProviderModel, ...] | tuple[str, ...]]]] = {}
+        for language, raw_locales in languages.items():
+            if not isinstance(language, str) or not language:
+                raise CatalogueError("catalogue language names must be non-empty strings")
+            if not isinstance(raw_locales, Mapping):
+                raise CatalogueError(f"catalogue language {language} must be an object")
+            if set(raw_locales) != {"locales"}:
+                raise CatalogueError(f"catalogue language {language} must contain locales only")
+            locales = raw_locales["locales"]
+            if not isinstance(locales, Mapping) or not locales:
+                raise CatalogueError(f"catalogue language {language}.locales must be a non-empty object")
+            parsed_locales: dict[str, dict[str, tuple[ProviderModel, ...] | tuple[str, ...]]] = {}
+            for locale, pipeline in locales.items():
+                if not isinstance(locale, str) or not locale:
+                    raise CatalogueError(f"catalogue {language} locale names must be non-empty strings")
+                if not isinstance(pipeline, Mapping) or set(pipeline) - {"stt", "llm", "tts", "fallback"}:
+                    raise CatalogueError(f"catalogue {language}.{locale} has an invalid pipeline")
+                parsed_pipeline: dict[str, tuple[ProviderModel, ...] | tuple[str, ...]] = {}
+                for component in ("stt", "llm", "tts"):
+                    combinations = pipeline.get(component)
+                    if not isinstance(combinations, (list, tuple)) or not combinations:
+                        raise CatalogueError(f"catalogue {language}.{locale}.{component} must be a non-empty array")
+                    entries: list[ProviderModel] = []
+                    for combination in combinations:
+                        if not isinstance(combination, Mapping) or set(combination) != {"provider", "model"}:
+                            raise CatalogueError(f"catalogue {language}.{locale}.{component} has an invalid provider/model pair")
+                        provider = combination["provider"]
+                        model = combination["model"]
+                        if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+                            raise CatalogueError(f"catalogue {language}.{locale}.{component} has an invalid provider/model pair")
+                        entries.append(ProviderModel(provider, model))
+                    if len(set(entries)) != len(entries):
+                        raise CatalogueError(f"catalogue {language}.{locale}.{component} has duplicate provider/model pairs")
+                    parsed_pipeline[component] = tuple(entries)
+                fallback = pipeline.get("fallback", ())
+                if not isinstance(fallback, (list, tuple)) or any(
+                    not isinstance(provider, str) or not provider for provider in fallback
+                ):
+                    raise CatalogueError(f"catalogue {language}.{locale}.fallback has an invalid provider")
+                parsed_pipeline["fallback"] = tuple(fallback)
+                parsed_locales[locale] = parsed_pipeline
+            parsed[language] = parsed_locales
         return cls(1, parsed, status)
 
     def validate_pipeline(self, language: str, pipeline: Mapping[str, object]) -> None:
@@ -72,10 +108,19 @@ class CapabilityCatalogue:
             raise CatalogueError(f"language/provider pipeline is not verified: {language}")
         if not isinstance(pipeline, Mapping):
             raise CatalogueError("provider pipeline must be an object")
-        approved = self.languages[language]
+        locale = pipeline.get("locale")
+        if not isinstance(locale, str) or locale not in self.languages[language]:
+            raise CatalogueError(f"language/provider pipeline is not verified: {language}")
+        approved = self.languages[language][locale]
         for component in ("stt", "llm", "tts"):
             provider = pipeline.get(component)
-            if not isinstance(provider, str) or provider not in approved[component]:
+            model = pipeline.get(f"{component}_model")
+            combinations = approved[component]
+            if (
+                not isinstance(provider, str)
+                or not isinstance(model, str)
+                or ProviderModel(provider, model) not in combinations
+            ):
                 raise CatalogueError(f"provider pipeline is not verified for {language}: {component}")
         fallback = pipeline.get("fallback")
         if fallback is not None and (not isinstance(fallback, str) or fallback not in approved["fallback"]):

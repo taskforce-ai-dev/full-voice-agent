@@ -31,7 +31,12 @@ class LanguageProfile:
 
     @property
     def pipeline(self) -> Mapping[str, str]:
-        result = {"stt": self.stt, "llm": self.llm, "tts": self.tts}
+        result = {
+            "locale": self.locale,
+            "stt": self.stt,
+            "llm": self.llm,
+            "tts": self.tts,
+        }
         if self.fallback:
             result["fallback"] = self.fallback
         if self.stt_model:

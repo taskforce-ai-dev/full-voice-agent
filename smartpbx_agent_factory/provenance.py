@@ -23,6 +23,12 @@ class ProvenanceEvidence:
 
 
 @dataclass(frozen=True)
+class TemplateFile:
+    template_path: str
+    sha256: str
+
+
+@dataclass(frozen=True)
 class TemplateAllowlist:
     template_version: str
     source_revision: str
@@ -30,7 +36,7 @@ class TemplateAllowlist:
     oci_revision: str
     protocol_version: str
     environment_schema_version: str
-    files: Mapping[str, str]
+    files: Mapping[str, TemplateFile]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "files", MappingProxyType(dict(self.files)))
@@ -132,17 +138,39 @@ def validate_allowlist_metadata(allowlist: Mapping[str, object]) -> TemplateAllo
     )
 
 
-def _allowlisted_files(allowlist: Mapping[str, object]) -> Mapping[str, str]:
+def _safe_relative_path(value: object) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise ProvenanceError("template allowlist contains an unsafe path")
+    path = Path(value)
+    normalized = path.as_posix()
+    if (
+        normalized == "."
+        or value != normalized
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ProvenanceError("template allowlist contains an unsafe path")
+    return normalized
+
+
+def _allowlisted_files(allowlist: Mapping[str, object]) -> Mapping[str, TemplateFile]:
     raw_files = allowlist.get("files") if isinstance(allowlist, Mapping) else None
     if not isinstance(raw_files, Mapping):
         raise ProvenanceError("template allowlist files must be an object")
-    normalized: dict[str, str] = {}
-    for raw_path, raw_hash in raw_files.items():
-        if not isinstance(raw_path, str) or not raw_path or Path(raw_path).is_absolute() or ".." in Path(raw_path).parts:
-            raise ProvenanceError("template allowlist contains an unsafe path")
-        if not isinstance(raw_hash, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", raw_hash):
-            raise ProvenanceError(f"invalid template hash for {raw_path}")
-        normalized[raw_path.replace("\\", "/")] = raw_hash
+    normalized: dict[str, TemplateFile] = {}
+    targets: set[str] = set()
+    for raw_source_path, raw_entry in raw_files.items():
+        source_path = _safe_relative_path(raw_source_path)
+        if not isinstance(raw_entry, Mapping) or set(raw_entry) != {"template_path", "sha256"}:
+            raise ProvenanceError(f"template allowlist entry is incomplete for {source_path}")
+        template_path = _safe_relative_path(raw_entry["template_path"])
+        sha256 = raw_entry["sha256"]
+        if not isinstance(sha256, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", sha256):
+            raise ProvenanceError(f"invalid template hash for {source_path}")
+        if template_path in targets:
+            raise ProvenanceError(f"duplicate template path: {template_path}")
+        targets.add(template_path)
+        normalized[source_path] = TemplateFile(template_path, sha256)
     return normalized
 
 
@@ -154,6 +182,7 @@ def verify_template_files(path: Path, allowlist: Mapping[str, object]) -> dict[s
     if root.is_symlink():
         raise ProvenanceError("template root may not be a symlink")
     expected = dict(metadata.files)
+    expected_by_target = {entry.template_path: (source_path, entry) for source_path, entry in expected.items()}
     actual: dict[str, Path] = {}
     for candidate in root.rglob("*"):
         relative = candidate.relative_to(root).as_posix()
@@ -161,18 +190,19 @@ def verify_template_files(path: Path, allowlist: Mapping[str, object]) -> dict[s
             raise ProvenanceError(f"template symlink is not allowed: {relative}")
         if candidate.is_file():
             actual[relative] = candidate
-    extras = sorted(set(actual) - set(expected))
+    extras = sorted(set(actual) - set(expected_by_target))
     if extras:
         raise ProvenanceError(f"template file is not allowlisted: {extras[0]}")
-    missing = sorted(set(expected) - set(actual))
+    missing = sorted(set(expected_by_target) - set(actual))
     if missing:
         raise ProvenanceError(f"allowlisted template file is missing: {missing[0]}")
     verified: dict[str, str] = {}
     for relative, candidate in actual.items():
+        source_path, entry = expected_by_target[relative]
         digest = "sha256:" + hashlib.sha256(candidate.read_bytes()).hexdigest()
-        if digest != expected[relative]:
-            raise ProvenanceError(f"template hash drift: {relative}")
-        verified[relative] = digest
+        if digest != entry.sha256:
+            raise ProvenanceError(f"template source hash drift: {source_path}")
+        verified[source_path] = digest
     return verified
 
 
