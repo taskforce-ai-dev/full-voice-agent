@@ -78,7 +78,6 @@ _BUSINESS_TOOLS = ("create_booking", "transfer_to_human", "hangup_call")
 _PROVIDER_RUNTIME = {
     "azure": {"requirements": ("azure-cognitiveservices-speech==1.51.1",), "environment": ("AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION")},
     "claude": {"requirements": ("anthropic==0.120.2",), "environment": ("ANTHROPIC_API_KEY",)},
-    "deepgram": {"requirements": ("httpx==0.28.1",), "environment": ("DEEPGRAM_API_KEY",)},
     "elevenlabs": {"requirements": ("httpx==0.28.1",), "environment": ("ELEVENLABS_API_KEY",)},
     "gemini": {"requirements": ("google-genai==2.16.0",), "environment": ("GEMINI_API_KEY",)},
     "google": {"requirements": ("google-cloud-speech==2.40.0",), "environment": ("GOOGLE_APPLICATION_CREDENTIALS",)},
@@ -395,10 +394,10 @@ activation_state: pending
         "room_catalogue": {}, "room_aliases": {}, "transliterations": {}, "rates": {},
         "post_call_vocabulary": [], "knowledge_paths": ["/app/knowledge_docs/approved-facts.md"],
     }
-    provider_lanes = ("provider_stt.py", "provider_llm.py", "provider_tts.py")
-    missing_lanes = [name for name in provider_lanes if f"runtime/{name}.tmpl" not in templates]
-    if missing_lanes:
-        raise IncompleteTemplateError(f"INCOMPLETE_TEMPLATE: missing concrete provider lane: {missing_lanes[0]}")
+    runtime_templates = ("stt_adapters.py.tmpl", "llm_adapters.py.tmpl", "tts_adapters.py.tmpl")
+    missing_templates = [name for name in runtime_templates if f"runtime/{name}" not in templates]
+    if missing_templates:
+        raise IncompleteTemplateError(f"INCOMPLETE_TEMPLATE: missing runtime template: {missing_templates[0]}")
     return {
         "AGENTS.md": "# Generated SmartPBX agent\n\nNo production provisioning or release is authorized by this tree.\n",
         "CLAUDE.md": "# Generated SmartPBX agent\n\nInquiry-only capability policy.\n",
@@ -419,9 +418,9 @@ activation_state: pending
         "product_profile.py": templates.get("runtime/product_profile.py.tmpl", "def load_product_profile(path): return object()\n"),
         "provider_adapters.py": templates.get("runtime/provider_adapters.py.tmpl", "class ConversationProviderAdapter: pass\n"),
         "provider_runtime.py": templates.get("runtime/provider_runtime.py.tmpl", "def bind_provider_adapter(*_args): raise RuntimeError('provider lane unavailable')\n"),
-        "provider_stt.py": templates["runtime/provider_stt.py.tmpl"],
-        "provider_llm.py": templates["runtime/provider_llm.py.tmpl"],
-        "provider_tts.py": templates["runtime/provider_tts.py.tmpl"],
+        "stt_adapters.py": templates["runtime/stt_adapters.py.tmpl"],
+        "llm_adapters.py": templates["runtime/llm_adapters.py.tmpl"],
+        "tts_adapters.py": templates["runtime/tts_adapters.py.tmpl"],
         "turn_engine.py": templates.get("runtime/turn_engine.py.tmpl", "class ConversationTurnEngine: pass\n"),
         "config/product_profile.json": json.dumps(product_profile, sort_keys=True, indent=2) + "\n",
         "config/provider_profile.json": json.dumps(provider_profile, sort_keys=True, indent=2) + "\n",

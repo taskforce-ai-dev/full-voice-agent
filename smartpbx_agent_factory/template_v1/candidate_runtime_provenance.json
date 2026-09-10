@@ -32,7 +32,7 @@
     },
     {
       "template_path": "runtime/llm_adapters.py.tmpl",
-      "template_sha256": "sha256:0db4f4b3a33c8f82fd24508d1ceb41a575032f0f2c141295b375782d506be4e4",
+      "template_sha256": "sha256:a8a3fff79823436de37d93dd6e148bbb684781adf4073b3372825017729a2ccf",
       "source_path": "Kavya/server.py",
       "source_ranges": ["950-1095", "1567-1708", "8437-8522", "11702-12051", "12488-12845"],
       "extraction": "startup-injected Claude and Gemini stream adapters: closed terminal outcomes, generation-scoped provisional sentence delivery, atomic fencing, bounded acquisition and stalls, one retry, and inquiry-only recovery"
@@ -60,10 +60,24 @@
     },
     {
       "template_path": "runtime/provider_adapters.py.tmpl",
-      "template_sha256": "sha256:74adf6f283b2d00374f0f710ac47431dfb2c71c621626f6cfb3e0dc3fe0a5afe",
+      "template_sha256": "sha256:834b46ce6dd6eda1fd642c7d4bc26d8f4b319f6bf80ef79232ef6413369c59b8",
       "source_path": null,
       "source_ranges": [],
       "extraction": "inversion boundary for separately approved continuous STT/fatal callbacks, generation-scoped provisional/terminal/fence LLM events, and TTS implementations"
+    },
+    {
+      "template_path": "runtime/provider_runtime.py.tmpl",
+      "template_sha256": "sha256:0d0805082b030c78e49af4a287ad5899200e1c22ecff1dbc7aaa4e435a0cdfa8",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "startup-only exact-provider selection and fail-closed concrete-builder seam; no source-approved SDK builders are present"
+    },
+    {
+      "template_path": "runtime/startup.py.tmpl",
+      "template_sha256": "sha256:5e3289d320385e3b8588fb63f25f0e658545bdf083960e07ef794f6a09046d27",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "one-time ASGI startup configuration; runtime provider construction remains blocked on source-approved SDK builders"
     },
     {
       "template_path": "runtime/stt_adapters.py.tmpl",

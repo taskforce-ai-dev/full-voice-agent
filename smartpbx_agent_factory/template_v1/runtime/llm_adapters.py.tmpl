@@ -13,9 +13,17 @@ import asyncio
 from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from enum import Enum
 from time import monotonic
 from typing import Literal, Protocol
+
+from provider_adapters import (
+    GenerationFence,
+    ProvisionalSentence,
+    RecoveryBoundary,
+    RoundOutcome,
+    TerminalCommit,
+    ThinkingProgress,
+)
 
 
 ProviderName = Literal["claude", "gemini"]
@@ -128,48 +136,6 @@ class TerminalMetadata:
     finish_reason: str
     output_tokens: int | None
     attempt: int
-
-
-@dataclass(frozen=True)
-class ProvisionalSentence:
-    generation: int
-    text: str
-
-
-@dataclass(frozen=True)
-class ThinkingProgress:
-    generation: int
-
-
-@dataclass(frozen=True)
-class TerminalCommit:
-    generation: int
-    metadata: TerminalMetadata
-
-
-class RoundOutcome(str, Enum):
-    COMPLETED = "completed"
-    TRUE_EMPTY = "true_empty"
-    MAX_TOKENS_TRUNCATED = "max_tokens_truncated"
-    STREAM_ABORTED = "stream_aborted"
-    INCOMPLETE_TOOL_BLOCK = "incomplete_tool_block"
-    MALFORMED_TOOL_JSON = "malformed_tool_json"
-    TIMEOUT = "timeout"
-    ABORTED = "aborted"
-
-
-@dataclass(frozen=True)
-class GenerationFence:
-    generation: int
-    reason: RoundOutcome
-    retrying: bool
-
-
-@dataclass(frozen=True)
-class RecoveryBoundary:
-    generation: int
-    reason: RoundOutcome
-    retrying: bool = False
 
 
 StreamEvent = ProvisionalSentence | ThinkingProgress | TerminalCommit | GenerationFence | RecoveryBoundary

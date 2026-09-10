@@ -44,10 +44,10 @@ class RecognizerResult:
 class RecognizerFatal:
     """Bounded provider failure class; never carries provider payload or text."""
 
-    failure_class: str
+    reason: str
 
     def __post_init__(self) -> None:
-        if self.failure_class not in {
+        if self.reason not in {
             "provider_unavailable",
             "provider_timeout",
             "provider_stream_aborted",
