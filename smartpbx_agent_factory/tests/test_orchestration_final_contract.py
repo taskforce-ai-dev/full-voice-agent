@@ -141,3 +141,20 @@ def test_checkpoint_keeps_canonical_backend_artifact_digest_separate_from_tree_o
         "ciphertext_reference": "",
     }
     assert restored.lane_records["backend"]["output_digest"] != restored.lane_records["backend"]["artifact_digest"]
+
+
+def test_secret_resolution_contract_requires_a_sealed_ciphertext_bundle_not_audit_only():
+    from smartpbx_agent_factory.orchestrator import GenerationOrchestrator
+
+    source = GenerationOrchestrator.record_secrets_resolved.__doc__ or ""
+    assert "sealed" in source.lower()
+    assert "audit" in source.lower()
+
+
+def test_operations_renderer_accepts_only_sealed_ciphertext_not_a_secret_provider():
+    import inspect
+    from smartpbx_agent_factory.operations import render_operations_artifacts
+
+    parameters = inspect.signature(render_operations_artifacts).parameters
+    assert "sealed_ciphertext" in parameters
+    assert "provider" not in parameters

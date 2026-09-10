@@ -11,7 +11,7 @@ from typing import Iterable
 from .gitops import WorktreeHandle, WorktreeManager, WorktreeConflictError, manager_owned_worktree_target
 from .model import AgentManifest
 from .resources import DerivedResources
-from .secrets import SecretAudit, SecretError, SecretPlan, SecretProvider
+from .secrets import SecretAudit, SecretError, SecretPlan
 
 
 class SecretLeakError(SecretError):
@@ -82,11 +82,11 @@ def _remove_generation_artifacts(root: Path, agent_dir: Path) -> None:
 def render_operations_artifacts(
     manifest: AgentManifest,
     resources: DerivedResources,
-    provider: SecretProvider,
     *,
     worktree: WorktreeHandle,
     worktree_manager: WorktreeManager,
     secret_plan: SecretPlan,
+    sealed_ciphertext: bytes,
 ) -> SecretAudit:
     """Write non-secret metadata and a single SOPS ciphertext document.
 
@@ -100,7 +100,6 @@ def render_operations_artifacts(
         raise SecretError(str(exc)) from exc
     if root.is_symlink() or not root.is_dir():
         raise SecretError("operations worktree target must be a real directory")
-    provider.validate()
     agents = root / "agents"
     if agents.is_symlink() or (agents.exists() and not agents.is_dir()):
         raise SecretError("operations artifact path may not traverse a symlink")
@@ -113,6 +112,8 @@ def render_operations_artifacts(
     metadata_path = agent_dir / "metadata.yaml"
     if not isinstance(secret_plan, SecretPlan):
         raise SecretError("operations renderer requires an exact approved secret plan")
+    if not isinstance(sealed_ciphertext, bytes) or not sealed_ciphertext or b"sops:" not in sealed_ciphertext:
+        raise SecretError("operations renderer requires a sealed SOPS ciphertext bundle")
     plan = secret_plan
     created_agent_dir = False
     try:
@@ -121,39 +122,20 @@ def render_operations_artifacts(
             raise SecretError("operations artifact directory is unsafe")
         agent_dir.mkdir(exist_ok=False, mode=0o700)
         created_agent_dir = True
-        values: dict[str, str] = {}
-        for requirement in plan.requirements:
-            value = (
-                provider.generate(requirement.record_id, length=32)
-                if requirement.generated
-                else provider.fetch(requirement.record_id)
-            )
-            if not isinstance(value, str) or not value:
-                raise SecretError("secret provider returned an invalid secret value")
-            values[requirement.runtime_env] = value
-        ciphertext = provider.encrypt_yaml(_plaintext_secret_document(values), path=secret_path)
-        if not isinstance(ciphertext, bytes) or not ciphertext:
-            raise SecretError("secret provider returned invalid ciphertext")
         metadata_path.write_bytes(_metadata(manifest, resources))
-        secret_path.write_bytes(ciphertext)
+        secret_path.write_bytes(sealed_ciphertext)
         metadata_path.chmod(0o600)
         secret_path.chmod(0o600)
-        _scan_artifact_tree(agent_dir, values.values())
+        _scan_artifact_tree(agent_dir, ())
     except Exception:
         if created_agent_dir:
             _remove_generation_artifacts(root, agent_dir)
         raise
-    audit = provider.audit_report() if hasattr(provider, "audit_report") else None
-    fetched_names = getattr(audit, "fetched_names", ()) if audit is not None else ()
-    generated_names = getattr(audit, "generated_names", ()) if audit is not None else ()
-    fetched_names = getattr(audit, "fetched_names", ()) if audit is not None else ()
     expected_fetched = tuple(item.record_id for item in plan.requirements if not item.generated)
     expected_generated = tuple(item.record_id for item in plan.requirements if item.generated)
-    if tuple(sorted(set(fetched_names))) != tuple(sorted(expected_fetched)) or tuple(sorted(set(generated_names))) != tuple(sorted(expected_generated)):
-        raise SecretError("secret provider audit does not exactly cover the secret plan")
     return SecretAudit(
-        fetched_names=fetched_names,
-        generated_names=generated_names,
+        fetched_names=expected_fetched,
+        generated_names=expected_generated,
         ciphertext_paths=(secret_path.relative_to(root),),
         plaintext_paths=(),
     )
