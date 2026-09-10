@@ -32,18 +32,30 @@ def main() -> int:
 
     runner_source = RUNNER.read_text(encoding="utf-8")
     for required in (
-        "127.0.0.1", "docker", "health", "smartpbx/status", "cross-agent", "missing", "wrong",
-        "stop", "hangup", "active_sessions", "active_tasks", "active_resources", "finally", "network\", \"rm",
-        "image\", \"rm", "review-only",
+        "127.0.0.1", "docker", "health", "smartpbx/status", "HTTP/1.1 403", "sec-websocket-accept",
+        "cross_agent_rejection", "account-cross-agent", "missing or wrong authentication", "stop", "hangup",
+        "PROTOCOL_FIXTURE", "active_sessions", "active_tasks", "active_resources", "admitted_total", "released_total",
+        "HEALTH_WAIT_SECONDS", "finally", "network\", \"rm", "image\", \"rm", "nondeployable",
     ):
         require(required in runner_source, f"runner missing {required!r}")
     for forbidden in ("print(response", "print(body", "communicate(input="):
         require(forbidden not in runner_source, f"runner contains unsafe or unowned execution form {forbidden!r}")
+    require("review-only" not in runner_source, "review-only release state must not block lifecycle proof")
+    require("Authorization" not in runner_source, "status must use the integrated agent-specific authentication header")
+    require(runner_source.count("time.sleep(") == 1, "only bounded health waiting may sleep")
+
+    fixture = (ROOT / "smartpbx_agent_factory" / "tests" / "fixtures" / "protocol_messages.json").read_text(encoding="utf-8")
+    for required in ("callId", "otherLegCallId", "callerIdNumber", "calleeIdNumber", "mediaFormat", "g711_ulaw", "sampleRate", "normal_clearing"):
+        require(required in fixture, f"canonical protocol fixture missing {required!r}")
+    require("<synthetic-silence>" not in fixture, "fixture must carry valid base64 ulaw silence")
 
     workflow = WORKFLOW.read_text(encoding="utf-8")
     require("check_smartpbx_ci_lifecycle_contract.py" in workflow, "workflow must execute static contract check")
     require("run_smartpbx_ci_lifecycle.py" in workflow, "workflow must invoke repository-owned runner")
     require("SmartPBX Agents/**" in workflow, "workflow must cover generated-tree changes")
+    require("scripts/check_smartpbx_ci_lifecycle_contract.py" in workflow and "scripts/run_smartpbx_ci_lifecycle.py" in workflow, "workflow paths must cover both lifecycle scripts")
+    require("timeout-minutes: 10" in workflow, "workflow lifecycle job must be bounded")
+    require("github.event_name" in workflow and "github.event.before" in workflow and "github.event.pull_request.base.sha" in workflow, "workflow must select a robust diff base")
     require("no generated agent directory" in workflow, "workflow must fail rather than pass empty generated-tree changes")
     return 0
 

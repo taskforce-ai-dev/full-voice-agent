@@ -8,6 +8,8 @@ this module has no caller-injectable lifecycle-success seam.
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -197,6 +199,8 @@ def _safe_protocol_value(value: object, *, depth: int = 0) -> None:
         for item in value.values():
             _safe_protocol_value(item, depth=depth + 1)
         return
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10_000:
+        return
     if not isinstance(value, str) or len(value) > 80 or _SECRET_OR_CONTROL.search(value):
         raise VerificationError("protocol fixture values are unsafe")
 
@@ -218,10 +222,27 @@ def _read_protocol_scenarios(path: Path = _PROTOCOL_FIXTURE) -> Mapping[str, tup
         for event, item in zip(expected_events, items):
             if not isinstance(item, dict) or set(item) != {"event", event} or item.get("event") != event or not isinstance(item[event], dict):
                 raise VerificationError("protocol fixture has an invalid production-shaped message")
-            _safe_protocol_value(item[event])
+            if event == "media":
+                media = item["media"]
+                if set(media) != {"payload"} or not isinstance(media["payload"], str):
+                    raise VerificationError("protocol fixture media must contain only a payload")
+                try:
+                    audio = base64.b64decode(media["payload"], validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise VerificationError("protocol fixture media must be valid base64") from exc
+                if audio != b"\xff" * 160:
+                    raise VerificationError("protocol fixture media must be one synthetic ulaw silence frame")
+            else:
+                _safe_protocol_value(item[event])
             messages.append({"event": event, event: dict(item[event])})
-        if messages[2]["media"] != {"track": "inbound", "payload": "<synthetic-silence>"}:
-            raise VerificationError("protocol fixture media must be synthetic silence only")
+        start = messages[1]["start"]
+        required_start = {"callId", "otherLegCallId", "callerIdNumber", "calleeIdNumber", "accountId", "mediaFormat"}
+        if set(start) != required_start or start["mediaFormat"] != {"encoding": "g711_ulaw", "sampleRate": 8000}:
+            raise VerificationError("protocol fixture start must be production-shaped g711 ulaw")
+        if terminal_path == "hangup":
+            hangup = messages[3]["hangup"]
+            if hangup.get("callId") != start["callId"] or hangup.get("otherLegCallId") != start["otherLegCallId"]:
+                raise VerificationError("protocol fixture hangup must match the start context")
         scenarios[terminal_path] = tuple(messages)
     return scenarios
 

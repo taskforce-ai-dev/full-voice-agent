@@ -133,7 +133,10 @@ def test_protocol_fixture_has_no_customer_or_media_content():
     assert set(fixture) == {"stop", "hangup"}
     assert [item["event"] for item in fixture["stop"]] == ["connected", "start", "media", "stop"]
     assert [item["event"] for item in fixture["hangup"]] == ["connected", "start", "media", "hangup"]
-    assert fixture["stop"][2]["media"]["payload"] == "<synthetic-silence>"
+    assert fixture["stop"][1]["start"]["mediaFormat"] == {"encoding": "g711_ulaw", "sampleRate": 8000}
+    assert fixture["hangup"][3]["hangup"]["callId"] == fixture["hangup"][1]["start"]["callId"]
+    assert fixture["hangup"][3]["hangup"]["otherLegCallId"] == fixture["hangup"][1]["start"]["otherLegCallId"]
+    assert fixture["stop"][2]["media"]["payload"].endswith("/w==")
     assert all("fields" not in item for scenario in fixture.values() for item in scenario)
 
 

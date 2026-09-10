@@ -2,10 +2,10 @@ name: smartpbx-generated-agents
 
 on:
   pull_request:
-    paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", ".github/workflows/smartpbx-generated-agents.yml"]
+    paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", "scripts/check_smartpbx_ci_lifecycle_contract.py", "scripts/run_smartpbx_ci_lifecycle.py", ".github/workflows/smartpbx-generated-agents.yml"]
   push:
     branches: [main]
-    paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", ".github/workflows/smartpbx-generated-agents.yml"]
+    paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", "scripts/check_smartpbx_ci_lifecycle_contract.py", "scripts/run_smartpbx_ci_lifecycle.py", ".github/workflows/smartpbx-generated-agents.yml"]
 
 permissions:
   contents: read
@@ -14,8 +14,11 @@ jobs:
   smartpbx-generated-agent:
     name: smartpbx-generated-agent
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -33,7 +36,16 @@ jobs:
           fi
       - name: Run disposable generated-agent contracts
         run: |
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha || github.event.before }}" "${{ github.sha }}")"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            changed="$(git ls-tree -r --name-only HEAD)"
+          else
+            changed="$(git diff --name-only "$base" "${{ github.sha }}")"
+          fi
           generated_changed=false
           if printf '%s\n' "$changed" | grep -q '^SmartPBX Agents/'; then
             generated_changed=true
