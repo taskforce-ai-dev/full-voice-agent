@@ -195,6 +195,7 @@ def test_renderer_rejects_review_with_forged_digest_after_facts_change(tmp_path)
             fixture_manifest(), forged, fixture_resources(), tmp_path, state=fixture_state(original),
             template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
         )
+    assert not (tmp_path / "SmartPBX Agents").exists()
 
 
 def test_renderer_rejects_review_with_forged_digest_after_document_change(tmp_path):
@@ -208,6 +209,7 @@ def test_renderer_rejects_review_with_forged_digest_after_document_change(tmp_pa
             fixture_manifest(), forged, fixture_resources(), tmp_path, state=fixture_state(original),
             template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
         )
+    assert not (tmp_path / "SmartPBX Agents").exists()
 
 
 def test_renderer_rejects_review_with_forged_digest_after_conflict_change(tmp_path):
@@ -221,6 +223,7 @@ def test_renderer_rejects_review_with_forged_digest_after_conflict_change(tmp_pa
             fixture_manifest(), forged, fixture_resources(), tmp_path, state=fixture_state(original),
             template_allowlist=fixture_templates(tmp_path / "synthetic"), template_root=tmp_path / "synthetic",
         )
+    assert not (tmp_path / "SmartPBX Agents").exists()
 
 
 def test_scan_rejects_identity_leak_in_late_review_document(tmp_path):
