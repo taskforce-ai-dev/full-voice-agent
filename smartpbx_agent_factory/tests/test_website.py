@@ -398,7 +398,13 @@ def test_manifest_derived_bearer_authorization_value_is_rejected_before_output(t
     assert not (tmp_path / "data" / "smartpbx-agents.generated.mjs").exists()
 
 
-def write_interrupted_transaction(root: Path, originals: dict[str, bytes | None], records: list[dict[str, object]] | None = None):
+def write_interrupted_transaction(
+    root: Path,
+    originals: dict[str, bytes | None],
+    records: list[dict[str, object]] | None = None,
+    *,
+    version: int | None = None,
+):
     stage = root / ".smartpbx-agent-factory-website-txn" / "interrupted"
     stage.mkdir(parents=True)
     if records is None:
@@ -418,13 +424,17 @@ def write_interrupted_transaction(root: Path, originals: dict[str, bytes | None]
                 record["size"] = len(original)
                 record["sha256"] = hashlib.sha256(original).hexdigest()
             records.append(record)
+    version = website._TRANSACTION_VERSION if version is None else version
     marker = {
-        "version": website._TRANSACTION_VERSION,
+        "version": version,
         "stage": "interrupted",
         "files": records,
-        "applied": [item["target"] for item in records if item.get("target") in website._TRANSACTION_TARGETS],
         "created_dirs": [],
     }
+    if version != 1:
+        marker["applied"] = [item["target"] for item in records if item.get("target") in website._TRANSACTION_TARGETS]
+    if version >= 3:
+        marker["phase"] = "active"
     (root / ".smartpbx-agent-factory-website-transaction.json").write_text(
         json.dumps(marker), encoding="utf-8"
     )
@@ -457,6 +467,164 @@ def test_next_render_recovers_an_interrupted_owned_transaction_before_rejecting_
     assert (tmp_path / "package.json").read_bytes() == paths["package.json"]
     assert not (tmp_path / ".smartpbx-agent-factory-website-transaction.json").exists()
     assert not (tmp_path / ".smartpbx-agent-factory-website-txn" / "interrupted").exists()
+
+
+def test_next_render_finishes_terminal_cleanup_after_stage_was_removed_before_crash(tmp_path):
+    """A cleanup-phase marker is sufficient after stage deletion but before marker retirement."""
+    write_website_target(tmp_path)
+    page = tmp_path / "components/pages/BookDemo.tsx"
+    before_page = page.read_bytes()
+    originals = {
+        "data/smartpbx-agents.generated.mjs": None,
+        "scripts/validate-smartpbx-card.mjs": None,
+        "components/pages/BookDemo.tsx": before_page,
+        "package.json": (tmp_path / "package.json").read_bytes(),
+    }
+    write_interrupted_transaction(tmp_path, originals, version=3)
+    marker_path = tmp_path / ".smartpbx-agent-factory-website-transaction.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["phase"] = "cleanup"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    shutil.rmtree(tmp_path / ".smartpbx-agent-factory-website-txn")
+
+    invalid = named_manifest("acme-inquiry", purpose="Authorization: Bearer opaque-session-value")
+    with pytest.raises(ValueError, match="credential-like"):
+        render_website_artifacts(
+            invalid,
+            derive_resources(invalid, AllocationRegistry()),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+
+    assert page.read_bytes() == before_page
+    assert not marker_path.exists()
+    assert not (tmp_path / ".smartpbx-agent-factory-website-txn").exists()
+
+
+def test_terminal_cleanup_resumes_after_a_backup_was_removed_before_crash(tmp_path):
+    write_website_target(tmp_path)
+    before_page = (tmp_path / "components/pages/BookDemo.tsx").read_bytes()
+    originals = {
+        "data/smartpbx-agents.generated.mjs": None,
+        "scripts/validate-smartpbx-card.mjs": None,
+        "components/pages/BookDemo.tsx": before_page,
+        "package.json": (tmp_path / "package.json").read_bytes(),
+    }
+    write_interrupted_transaction(tmp_path, originals, version=3)
+    marker_path = tmp_path / ".smartpbx-agent-factory-website-transaction.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["phase"] = "cleanup"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    (tmp_path / ".smartpbx-agent-factory-website-txn/interrupted/backup-2.bin").unlink()
+
+    invalid = named_manifest("acme-inquiry", purpose="Authorization: Bearer opaque-session-value")
+    with pytest.raises(ValueError, match="credential-like"):
+        render_website_artifacts(
+            invalid,
+            derive_resources(invalid, AllocationRegistry()),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+
+    assert (tmp_path / "components/pages/BookDemo.tsx").read_bytes() == before_page
+    assert not marker_path.exists()
+    assert not (tmp_path / ".smartpbx-agent-factory-website-txn").exists()
+
+
+def test_preparing_marker_recovers_after_stage_setup_crash(tmp_path):
+    """No marker-owned partial stage can permanently block a later render."""
+    write_website_target(tmp_path)
+    originals = {
+        "data/smartpbx-agents.generated.mjs": None,
+        "scripts/validate-smartpbx-card.mjs": None,
+        "components/pages/BookDemo.tsx": (tmp_path / "components/pages/BookDemo.tsx").read_bytes(),
+        "package.json": (tmp_path / "package.json").read_bytes(),
+    }
+    write_interrupted_transaction(tmp_path, originals, version=4)
+    marker_path = tmp_path / ".smartpbx-agent-factory-website-transaction.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["phase"] = "preparing"
+    marker["applied"] = []
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    (tmp_path / ".smartpbx-agent-factory-website-txn/interrupted/backup-2.bin").unlink()
+
+    invalid = named_manifest("acme-inquiry", purpose="Authorization: Bearer opaque-session-value")
+    with pytest.raises(ValueError, match="credential-like"):
+        render_website_artifacts(
+            invalid,
+            derive_resources(invalid, AllocationRegistry()),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+
+    assert not marker_path.exists()
+    assert not (tmp_path / ".smartpbx-agent-factory-website-txn").exists()
+
+
+def test_next_render_recovers_a_real_transaction_interrupted_before_activation(tmp_path, monkeypatch):
+    """The durable preparing marker owns a staged transaction before it can mutate targets."""
+    write_website_target(tmp_path)
+    write_marker = website._write_transaction_marker
+
+    def interrupt_before_activation(marker_path, **kwargs):
+        if kwargs["phase"] == "active":
+            raise RuntimeError("injected crash before transaction activation")
+        write_marker(marker_path, **kwargs)
+
+    monkeypatch.setattr(website, "_write_transaction_marker", interrupt_before_activation)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        render_website_artifacts(
+            fixture_manifest(),
+            fixture_resources(),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+
+    marker_path = tmp_path / ".smartpbx-agent-factory-website-transaction.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["version"] == website._TRANSACTION_VERSION
+    assert marker["phase"] == "preparing"
+    assert (tmp_path / ".smartpbx-agent-factory-website-txn" / marker["stage"]).is_dir()
+    assert not (tmp_path / "data" / "smartpbx-agents.generated.mjs").exists()
+
+    monkeypatch.setattr(website, "_write_transaction_marker", write_marker)
+    render_website_artifacts(
+        fixture_manifest(),
+        fixture_resources(),
+        backend_artifact_digest="a" * 64,
+        backend_branch_sha="b" * 40,
+        output_dir=tmp_path,
+    )
+
+    assert not marker_path.exists()
+    assert not (tmp_path / ".smartpbx-agent-factory-website-txn").exists()
+
+
+def test_next_render_recovers_the_pre_progress_v1_transaction_marker(tmp_path):
+    write_website_target(tmp_path)
+    paths = {
+        "data/smartpbx-agents.generated.mjs": None,
+        "scripts/validate-smartpbx-card.mjs": None,
+        "components/pages/BookDemo.tsx": (tmp_path / "components/pages/BookDemo.tsx").read_bytes(),
+        "package.json": (tmp_path / "package.json").read_bytes(),
+    }
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/smartpbx-agents.generated.mjs").write_text("partial generated data", encoding="utf-8")
+    write_interrupted_transaction(tmp_path, paths, version=1)
+    invalid = named_manifest("acme-inquiry", purpose="Authorization: Bearer opaque-session-value")
+    with pytest.raises(ValueError, match="credential-like"):
+        render_website_artifacts(
+            invalid,
+            derive_resources(invalid, AllocationRegistry()),
+            backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40,
+            output_dir=tmp_path,
+        )
+    assert not (tmp_path / "data/smartpbx-agents.generated.mjs").exists()
 
 
 def test_malformed_recovery_marker_cannot_overwrite_outside_owned_targets(tmp_path):
@@ -538,5 +706,6 @@ def test_transaction_writer_durably_stages_replacements_before_marker_retirement
     assert "handle.flush()" in atomic
     assert "os.fsync(handle.fileno())" in atomic
     assert "_fsync_directory(path.parent)" in atomic
+    assert finish.index("_cleanup_terminal_transaction") < finish.index("marker_path.unlink()")
     assert finish.index("marker_path.unlink()") < finish.index("_fsync_directory(output_dir)")
-    assert recover.index("marker_path.unlink()") < recover.index("_fsync_directory(output_dir)")
+    assert "_finish_transaction(output_dir)" in recover

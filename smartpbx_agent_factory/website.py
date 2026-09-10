@@ -38,7 +38,7 @@ _MARKER_START = "/* smartpbx-agent-factory-data-v1\n"
 _MARKER_END = "\n*/"
 _TRANSACTION_MARKER = ".smartpbx-agent-factory-website-transaction.json"
 _TRANSACTION_ROOT = ".smartpbx-agent-factory-website-txn"
-_TRANSACTION_VERSION = 2
+_TRANSACTION_VERSION = 4
 _TRANSACTION_TARGETS = (
     "data/smartpbx-agents.generated.mjs",
     "scripts/validate-smartpbx-card.mjs",
@@ -352,7 +352,7 @@ def _durable_backup(path: Path, value: bytes) -> tuple[int, str]:
     return len(value), hashlib.sha256(value).hexdigest()
 
 
-def _load_transaction(output_dir: Path) -> tuple[Path, Path, list[dict[str, object]], list[str], tuple[str, ...]] | None:
+def _load_transaction(output_dir: Path) -> tuple[Path, Path, list[dict[str, object]], list[str], tuple[str, ...], str] | None:
     marker_path, transaction_root = _transaction_paths(output_dir)
     if marker_path.is_symlink() or transaction_root.is_symlink():
         raise ValueError("transaction marker paths must not be symlinks")
@@ -368,9 +368,19 @@ def _load_transaction(output_dir: Path) -> tuple[Path, Path, list[dict[str, obje
     if version == 1:
         required = {"version", "stage", "files", "created_dirs"}
         applied: list[object] = list(_TRANSACTION_TARGETS)
+        phase = "active"
     elif version == _TRANSACTION_VERSION:
+        required = {"version", "stage", "files", "applied", "created_dirs", "phase"}
+        applied = marker.get("applied")
+        phase = marker.get("phase")
+    elif version == 3:
+        required = {"version", "stage", "files", "applied", "created_dirs", "phase"}
+        applied = marker.get("applied")
+        phase = marker.get("phase")
+    elif version == 2:
         required = {"version", "stage", "files", "applied", "created_dirs"}
         applied = marker.get("applied")
+        phase = "active"
     else:
         raise ValueError("transaction marker has an invalid shape")
     if set(marker) != required:
@@ -380,7 +390,7 @@ def _load_transaction(output_dir: Path) -> tuple[Path, Path, list[dict[str, obje
     created_dirs = marker.get("created_dirs", [])
     if not isinstance(stage, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", stage):
         raise ValueError("transaction marker has an unsafe stage")
-    if not isinstance(files, list) or not isinstance(applied, list) or not isinstance(created_dirs, list):
+    if not isinstance(files, list) or not isinstance(applied, list) or not isinstance(created_dirs, list) or phase not in {"preparing", "active", "cleanup"}:
         raise ValueError("transaction marker has invalid collections")
     if {item.get("target") for item in files if isinstance(item, dict)} != set(_TRANSACTION_TARGETS):
         raise ValueError("transaction marker has unsafe targets")
@@ -391,15 +401,25 @@ def _load_transaction(output_dir: Path) -> tuple[Path, Path, list[dict[str, obje
         or len(applied) != len(set(applied))
         or any(target not in _TRANSACTION_TARGETS for target in applied)
         or applied != [target for target in _TRANSACTION_TARGETS if target in applied]
+        or (phase == "preparing" and applied)
     ):
         raise ValueError("transaction marker has unsafe applied targets")
     if any(item not in {"data", "scripts"} for item in created_dirs):
         raise ValueError("transaction marker has unsafe created directories")
     stage_path = _owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage}")
-    if stage_path.is_symlink() or not stage_path.is_dir():
-        raise ValueError("transaction marker staging directory is unavailable")
-    if {item.name for item in transaction_root.iterdir()} != {stage}:
-        raise ValueError("transaction marker staging root has unexpected contents")
+    if phase == "active":
+        if stage_path.is_symlink() or not stage_path.is_dir():
+            raise ValueError("transaction marker staging directory is unavailable")
+        if {item.name for item in transaction_root.iterdir()} != {stage}:
+            raise ValueError("transaction marker staging root has unexpected contents")
+    elif transaction_root.exists():
+        if transaction_root.is_symlink() or not transaction_root.is_dir():
+            raise ValueError("transaction marker staging root is unavailable")
+        if stage_path.exists():
+            if stage_path.is_symlink() or not stage_path.is_dir() or {item.name for item in transaction_root.iterdir()} != {stage}:
+                raise ValueError("transaction marker staging root has unexpected contents")
+        elif any(transaction_root.iterdir()):
+            raise ValueError("transaction marker staging root has unexpected contents")
     validated: list[dict[str, object]] = []
     expected_backups: set[str] = set()
     for index, record in enumerate(files):
@@ -414,17 +434,46 @@ def _load_transaction(output_dir: Path) -> tuple[Path, Path, list[dict[str, obje
         if not existed and (backup is not None or size is not None or digest is not None):
             raise ValueError("transaction marker file record has an unexpected backup")
         if existed:
+            expected_backups.add(expected_backup)
+        if existed and stage_path.exists() and phase == "active":
             backup_path = _owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage}/{expected_backup}")
             if backup_path.is_symlink() or not backup_path.is_file():
                 raise ValueError("transaction marker backup must not be a symlink")
             payload = backup_path.read_bytes()
             if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
                 raise ValueError("transaction marker backup integrity check failed")
-            expected_backups.add(expected_backup)
+        elif existed and stage_path.exists():
+            backup_path = _owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage}/{expected_backup}")
+            if backup_path.is_symlink() or (backup_path.exists() and not backup_path.is_file()):
+                raise ValueError("transaction marker backup must not be a symlink")
         validated.append(record)
-    if {item.name for item in stage_path.iterdir()} != expected_backups:
-        raise ValueError("transaction marker staging directory has unexpected contents")
-    return marker_path, stage_path, validated, created_dirs, tuple(applied)
+    if stage_path.exists():
+        contents = {item.name for item in stage_path.iterdir()}
+        if (phase == "active" and contents != expected_backups) or (phase in {"preparing", "cleanup"} and not contents.issubset(expected_backups)):
+            raise ValueError("transaction marker staging directory has unexpected contents")
+    return marker_path, stage_path, validated, created_dirs, tuple(applied), phase
+
+
+def _write_transaction_marker(
+    marker_path: Path,
+    *,
+    stage: str,
+    files: list[dict[str, object]],
+    created_dirs: list[str],
+    applied: tuple[str, ...],
+    phase: str,
+) -> None:
+    if phase not in {"preparing", "active", "cleanup"}:
+        raise ValueError("transaction marker phase is invalid")
+    marker = {
+        "version": _TRANSACTION_VERSION,
+        "stage": stage,
+        "files": files,
+        "applied": list(applied),
+        "created_dirs": created_dirs,
+        "phase": phase,
+    }
+    _atomic_bytes(marker_path, json.dumps(marker, sort_keys=True).encode("utf-8"), scope="smartpbx-transaction")
 
 
 def _record_transaction_progress(
@@ -439,30 +488,41 @@ def _record_transaction_progress(
     transaction = _load_transaction(output_dir)
     if transaction is None:
         raise ValueError("transaction marker is unavailable")
-    marker_path, stage_path, files, created_dirs, recorded = transaction
+    marker_path, stage_path, files, created_dirs, recorded, phase = transaction
+    if phase != "active":
+        raise ValueError("transaction is already in terminal cleanup")
     values = set(recorded)
     if applied:
         values.add(target)
     else:
         values.discard(target)
-    marker = {
-        "version": _TRANSACTION_VERSION,
-        "stage": stage_path.name,
-        "files": files,
-        "applied": [item for item in _TRANSACTION_TARGETS if item in values],
-        "created_dirs": created_dirs,
-    }
-    _atomic_bytes(marker_path, json.dumps(marker, sort_keys=True).encode("utf-8"), scope="smartpbx-transaction")
+    _write_transaction_marker(
+        marker_path,
+        stage=stage_path.name,
+        files=files,
+        created_dirs=created_dirs,
+        applied=tuple(item for item in _TRANSACTION_TARGETS if item in values),
+        phase="active",
+    )
 
 
 def _recover_transaction(output_dir: Path) -> None:
     transaction = _load_transaction(output_dir)
     if transaction is None:
         return
-    marker_path, stage_path, files, created_dirs, applied = transaction
+    _, _, files, _, applied, phase = transaction
+    if phase in {"preparing", "cleanup"}:
+        _finish_transaction(output_dir)
+        return
     for index, record in enumerate(files):
         if record["target"] not in applied:
             continue
+        transaction = _load_transaction(output_dir)
+        if transaction is None:
+            raise ValueError("transaction marker is unavailable")
+        _, stage_path, _, _, _, current_phase = transaction
+        if current_phase != "active":
+            raise ValueError("transaction entered cleanup during recovery")
         target = _owned_path(output_dir, str(record["target"]))
         if record["existed"]:
             backup_path = _owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage_path.name}/backup-{index}.bin")
@@ -474,15 +534,55 @@ def _recover_transaction(output_dir: Path) -> None:
             _atomic_bytes(target, payload, scope="smartpbx-recover")
         else:
             target.unlink(missing_ok=True)
+
+    _finish_transaction(output_dir)
+
+
+def _cleanup_terminal_transaction(output_dir: Path, stage_path: Path, files: list[dict[str, object]]) -> None:
+    """Remove only marker-owned staging contents before retiring its cleanup marker."""
+    transaction_root = stage_path.parent
+    if stage_path.exists():
+        if stage_path.is_symlink() or not stage_path.is_dir():
+            raise ValueError("transaction marker staging directory is unavailable")
+        for index, record in enumerate(files):
+            if record["existed"]:
+                backup = stage_path / f"backup-{index}.bin"
+                if backup.is_symlink() or (backup.exists() and not backup.is_file()):
+                    raise ValueError("transaction marker backup must not be a symlink")
+                if backup.exists():
+                    backup.unlink()
+        stage_path.rmdir()
+        _fsync_directory(transaction_root)
+    if transaction_root.exists():
+        if transaction_root.is_symlink() or not transaction_root.is_dir() or any(transaction_root.iterdir()):
+            raise ValueError("transaction marker staging root has unexpected contents")
+        transaction_root.rmdir()
+        _fsync_directory(output_dir)
+
+
+def _finish_transaction(output_dir: Path) -> None:
+    transaction = _load_transaction(output_dir)
+    if transaction is None:
+        return
+    marker_path, stage_path, files, created_dirs, applied, phase = transaction
+    if phase in {"preparing", "active"}:
+        _write_transaction_marker(
+            marker_path,
+            stage=stage_path.name,
+            files=files,
+            created_dirs=created_dirs,
+            applied=applied,
+            phase="cleanup",
+        )
+        transaction = _load_transaction(output_dir)
+        if transaction is None:
+            raise ValueError("transaction marker is unavailable")
+        marker_path, stage_path, files, created_dirs, _, phase = transaction
+    if phase != "cleanup":
+        raise ValueError("transaction marker cleanup phase is invalid")
+    _cleanup_terminal_transaction(output_dir, stage_path, files)
     marker_path.unlink()
     _fsync_directory(output_dir)
-    for index, record in enumerate(files):
-        if record["existed"]:
-            (stage_path / f"backup-{index}.bin").unlink(missing_ok=True)
-    stage_path.rmdir()
-    transaction_root = stage_path.parent
-    if not any(transaction_root.iterdir()):
-        transaction_root.rmdir()
     for relative in reversed(created_dirs):
         try:
             (output_dir / relative).rmdir()
@@ -490,46 +590,46 @@ def _recover_transaction(output_dir: Path) -> None:
             pass
 
 
-def _finish_transaction(output_dir: Path) -> None:
-    transaction = _load_transaction(output_dir)
-    if transaction is None:
-        return
-    marker_path, stage_path, files, _, _ = transaction
-    marker_path.unlink()
-    _fsync_directory(output_dir)
-    for index, record in enumerate(files):
-        if record["existed"]:
-            (stage_path / f"backup-{index}.bin").unlink(missing_ok=True)
-    stage_path.rmdir()
-    transaction_root = stage_path.parent
-    if not any(transaction_root.iterdir()):
-        transaction_root.rmdir()
-
-
 def _begin_transaction(output_dir: Path, originals: Mapping[Path, bytes | None], created_dirs: list[str], *, scope: str) -> None:
     marker_path, transaction_root = _transaction_paths(output_dir)
     if transaction_root.exists() and (transaction_root.is_symlink() or not transaction_root.is_dir() or any(transaction_root.iterdir())):
         raise ValueError("transaction staging root must be an empty real directory")
-    transaction_root.mkdir(exist_ok=True)
-    _fsync_directory(output_dir)
-    stage_path = Path(tempfile.mkdtemp(prefix=scope + ".", dir=transaction_root))
-    _fsync_directory(transaction_root)
     files: list[dict[str, object]] = []
     for index, relative in enumerate(_TRANSACTION_TARGETS):
         original = originals[output_dir / relative]
         backup, size, digest = None, None, None
         if original is not None:
             backup = f"backup-{index}.bin"
-            size, digest = _durable_backup(_owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage_path.name}/{backup}"), original)
+            size, digest = len(original), hashlib.sha256(original).hexdigest()
         files.append({"target": relative, "existed": original is not None, "backup": backup, "size": size, "sha256": digest})
-    marker = {
-        "version": _TRANSACTION_VERSION,
-        "stage": stage_path.name,
-        "files": files,
-        "applied": [],
-        "created_dirs": created_dirs,
-    }
-    _atomic_bytes(marker_path, json.dumps(marker, sort_keys=True).encode("utf-8"), scope="smartpbx-transaction")
+    stage = scope + "." + os.urandom(16).hex()
+    _write_transaction_marker(
+        marker_path,
+        stage=stage,
+        files=files,
+        created_dirs=created_dirs,
+        applied=(),
+        phase="preparing",
+    )
+    transaction_root.mkdir(exist_ok=True)
+    _fsync_directory(output_dir)
+    stage_path = _owned_path(output_dir, f"{_TRANSACTION_ROOT}/{stage}")
+    stage_path.mkdir()
+    _fsync_directory(transaction_root)
+    for index, record in enumerate(files):
+        if record["existed"]:
+            original = originals[output_dir / str(record["target"])]
+            if original is None:
+                raise ValueError("transaction backup source is unavailable")
+            _durable_backup(stage_path / f"backup-{index}.bin", original)
+    _write_transaction_marker(
+        marker_path,
+        stage=stage,
+        files=files,
+        created_dirs=created_dirs,
+        applied=(),
+        phase="active",
+    )
 
 
 def _atomic(output_dir: Path, contents: Mapping[Path, bytes], scope: str) -> None:
