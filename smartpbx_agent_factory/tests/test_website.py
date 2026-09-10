@@ -354,6 +354,7 @@ def test_transaction_recovery_accepts_factory_owned_underscore_stage(tmp_path):
         "files": files,
         "applied": [],
         "created_dirs": [],
+        "phase": "active",
     }
     (tmp_path / ".smartpbx-agent-factory-website-transaction.json").write_text(
         json.dumps(marker), encoding="utf-8"
@@ -363,6 +364,12 @@ def test_transaction_recovery_accepts_factory_owned_underscore_stage(tmp_path):
 
     assert transaction is not None
     assert transaction[1].name == stage
+    assert transaction[-1] == "active"
+
+    website._recover_transaction(tmp_path)
+
+    assert not (tmp_path / ".smartpbx-agent-factory-website-transaction.json").exists()
+    assert not transaction_root.exists()
 
 
 def test_generated_validator_has_one_reserved_declaration_and_parses_with_node(tmp_path):
