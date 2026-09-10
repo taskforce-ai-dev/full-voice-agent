@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -308,3 +310,22 @@ def test_atomic_write_failure_restores_every_website_artifact(tmp_path, monkeypa
     assert {path: path.read_bytes() if path.exists() else None for path in paths} == before
     assert not (tmp_path / "data").exists()
     assert not (tmp_path / "scripts").exists()
+
+
+def test_generated_validator_has_one_reserved_declaration_and_parses_with_node(tmp_path):
+    write_website_target(tmp_path)
+    render_website_artifacts(
+        fixture_manifest(),
+        fixture_resources(),
+        backend_artifact_digest="a" * 64,
+        backend_branch_sha="b" * 40,
+        output_dir=tmp_path,
+    )
+    validator = tmp_path / "scripts" / "validate-smartpbx-card.mjs"
+    source = validator.read_text(encoding="utf-8")
+    assert source.count("const RESERVED =") == 1
+    assert "export function validateCards" in source
+    node = shutil.which("node")
+    if node is not None:
+        result = subprocess.run([node, "--check", str(validator)], capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
