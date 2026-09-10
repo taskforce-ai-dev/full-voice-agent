@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from html.parser import HTMLParser
+import ipaddress
 from io import BytesIO
 import json
 from pathlib import Path
@@ -16,7 +17,7 @@ import posixpath
 import re
 from typing import Iterable, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .model import KnowledgeSource
@@ -102,12 +103,42 @@ class KnowledgeBuilder(Protocol):
         """Extract bounded source data and return the human-review artifact."""
 
 
+class URLNetworkPolicy(Protocol):
+    """Network destinations permitted after manifest-origin validation."""
+
+    def validate(self, hostname: str) -> None:
+        """Reject a destination hostname that is unsafe for this environment."""
+
+
+class _PublicURLNetworkPolicy:
+    def validate(self, hostname: str) -> None:
+        if hostname.lower().rstrip(".") == "localhost":
+            raise KnowledgeError("loopback URL origins are not allowed")
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            return
+        if address.is_loopback or address.is_private or address.is_link_local:
+            raise KnowledgeError("private, link-local, or loopback URL origins are not allowed")
+
+
+class LocalFixtureNetworkPolicy:
+    """Explicit test-only policy for loopback fake HTTP fixtures.
+
+    Production callers must use the default public-network policy.
+    """
+
+    def validate(self, hostname: str) -> None:
+        return
+
+
 @dataclass(frozen=True)
 class _ExtractedSource:
     source: KnowledgeSource
     uri: str
     text: str
     byte_count: int
+    markdown: bool
 
 
 class _SourceUnavailable(Exception):
@@ -156,6 +187,7 @@ class KnowledgeBuilderImpl:
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         approved_source_roots: Iterable[Path] | None = None,
+        network_policy: URLNetworkPolicy | None = None,
     ) -> None:
         if min(max_bytes, total_max_bytes, max_chars, max_redirects) <= 0 or timeout_seconds <= 0:
             raise KnowledgeError("knowledge limits must be positive")
@@ -165,6 +197,7 @@ class KnowledgeBuilderImpl:
         self.max_redirects = max_redirects
         self.timeout_seconds = timeout_seconds
         self.approved_source_roots = tuple(Path(root) for root in approved_source_roots or ())
+        self.network_policy = network_policy or _PublicURLNetworkPolicy()
 
     def build(self, sources: tuple[KnowledgeSource, ...], output_dir: Path) -> KnowledgeReview:
         if not isinstance(sources, tuple):
@@ -176,7 +209,7 @@ class KnowledgeBuilderImpl:
             try:
                 item = self._extract_source(source)
             except _SourceUnavailable:
-                inaccessible.append(source.url or source.path or "unknown source")
+                inaccessible.append(self._sanitized_source_uri(source))
                 continue
             total_bytes += item.byte_count
             if total_bytes > self.total_max_bytes:
@@ -215,30 +248,35 @@ class KnowledgeBuilderImpl:
             path = self._safe_local_path(source.path)
             content = self._read_bounded(path)
             text = self._normalize_text(self._extract_bytes(content, path.suffix.lower(), None))
-            return _ExtractedSource(source, path.as_uri(), text, len(content))
+            return _ExtractedSource(
+                source, path.as_uri(), text, len(content), path.suffix.lower() in {".md", ".markdown"}
+            )
         if source.kind == "url":
             if not source.url or source.path:
                 raise KnowledgeError("URL knowledge source requires url only")
             content, content_type, effective_url = self._fetch_url(source)
             suffix = Path(urlsplit(effective_url).path).suffix.lower()
             text = self._normalize_text(self._extract_bytes(content, suffix, content_type))
-            return _ExtractedSource(source, effective_url, text, len(content))
+            return _ExtractedSource(
+                source,
+                self._sanitize_url(effective_url),
+                text,
+                len(content),
+                suffix in {".md", ".markdown"} or content_type == "text/markdown",
+            )
         raise KnowledgeError("knowledge source kind must be local or url")
 
     def _safe_local_path(self, value: str) -> Path:
         raw = Path(value).expanduser()
         if "\x00" in value or any(part == ".." for part in raw.parts):
             raise KnowledgeError("local knowledge source is outside approved root")
+        roots = self.approved_source_roots
+        if not roots:
+            raise KnowledgeError("local knowledge source requires explicit approved source roots")
         candidates: tuple[tuple[Path, Path], ...]
         if raw.is_absolute():
-            roots = self.approved_source_roots
-            if not roots:
-                roots = (raw.parent,)
             candidates = tuple((Path(root), raw) for root in roots)
         else:
-            roots = self.approved_source_roots
-            if not roots:
-                raise KnowledgeError("relative local knowledge source requires approved source root")
             candidates = tuple((Path(root), Path(root) / raw) for root in roots)
         for root, candidate in candidates:
             try:
@@ -315,20 +353,55 @@ class KnowledgeBuilderImpl:
             raise KnowledgeError("URL must have an HTTP(S) origin")
         if parsed.username or parsed.password:
             raise KnowledgeError("URL credentials are not allowed")
-        host = parsed.hostname.lower().rstrip(".")
-        allowed_hosts = {self._origin_host(origin) for origin in source.approved_origins}
-        if host not in allowed_hosts:
+        self.network_policy.validate(parsed.hostname)
+        origin = self._canonical_origin(value)
+        allowed_origins = {self._canonical_origin(item, approved=True) for item in source.approved_origins}
+        if origin not in allowed_origins:
             raise KnowledgeError("URL origin is not allowlisted")
         path = self._normal_path(parsed.path)
         if source.path_prefixes and not any(self._path_matches(path, prefix) for prefix in source.path_prefixes):
             raise KnowledgeError("URL path is outside the allowlisted prefix")
 
     @staticmethod
-    def _origin_host(origin: str) -> str:
-        parsed = urlsplit(origin if "://" in origin else f"//{origin}")
-        if not parsed.hostname:
+    def _canonical_origin(value: str, *, approved: bool = False) -> tuple[str, str, int]:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise KnowledgeError("approved URL origin is invalid")
-        return parsed.hostname.lower().rstrip(".")
+        if parsed.username or parsed.password:
+            raise KnowledgeError("approved URL origin must not contain credentials")
+        if approved and (parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+            raise KnowledgeError("approved URL origin must not include path, query, or fragment")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise KnowledgeError("URL origin has an invalid port") from exc
+        return (
+            parsed.scheme.lower(),
+            parsed.hostname.lower().rstrip("."),
+            port if port is not None else (443 if parsed.scheme == "https" else 80),
+        )
+
+    @staticmethod
+    def _sanitize_url(value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return "unknown source"
+        try:
+            port = parsed.port
+        except ValueError:
+            return "unknown source"
+        host = parsed.hostname.lower().rstrip(".")
+        if ":" in host:
+            host = f"[{host}]"
+        default_port = 443 if parsed.scheme == "https" else 80
+        authority = host if port in {None, default_port} else f"{host}:{port}"
+        return urlunsplit((parsed.scheme.lower(), authority, parsed.path or "/", "", ""))
+
+    @classmethod
+    def _sanitized_source_uri(cls, source: KnowledgeSource) -> str:
+        if source.url:
+            return cls._sanitize_url(source.url)
+        return source.path or "unknown source"
 
     @classmethod
     def _path_matches(cls, path: str, prefix: str) -> bool:
@@ -391,18 +464,12 @@ class KnowledgeBuilderImpl:
         seen: set[str] = set()
         for index, item in enumerate(sources, start=1):
             section = "document"
-            first_content = True
             for line in item.text.splitlines():
                 line = line.strip()
                 if not line:
                     continue
-                if line.startswith("#"):
+                if item.markdown and line.startswith("#"):
                     section = _anchor(line.lstrip("#").strip())
-                    first_content = False
-                    continue
-                if first_content:
-                    section = _anchor(line)
-                    first_content = False
                     continue
                 normalized = " ".join(line.split())
                 key = normalized.casefold()
@@ -497,25 +564,43 @@ class KnowledgeBuilderImpl:
         docs = output_dir / "knowledge_docs"
         if docs.exists() and docs.is_symlink():
             raise KnowledgeError("knowledge output directory must not be a symlink")
+        if docs.exists() and not docs.is_dir():
+            raise KnowledgeError("knowledge output directory collision")
+        names = [f"source-{index:03d}.md" for index in range(1, len(sources) + 1)] + ["review.md"]
+        expected = set(names)
+        marker_prefix = f"<!-- smartpbx-agent-factory: knowledge-digest={review.digest} artifact="
+        if docs.exists():
+            for existing in docs.iterdir():
+                if existing.name not in expected:
+                    raise KnowledgeError("knowledge output directory contains an unexpected collision")
+            for name in names:
+                path = docs / name
+                if not path.exists():
+                    continue
+                if path.is_symlink() or not path.is_file():
+                    raise KnowledgeError("knowledge output file must not be a regular non-symlink file")
+                with path.open("r", encoding="utf-8") as handle:
+                    marker = handle.readline().rstrip("\n")
+                if marker != f"{marker_prefix}{name} -->":
+                    raise KnowledgeError("knowledge output file collision")
         docs.mkdir(parents=True, exist_ok=True)
         for index, item in enumerate(sources, start=1):
-            path = docs / f"source-{index:03d}.md"
-            if path.exists() and path.is_symlink():
-                raise KnowledgeError("knowledge output file must not be a symlink")
+            name = f"source-{index:03d}.md"
+            path = docs / name
             metadata = json.dumps(
                 {
                     "source_uri": item.uri,
                     "owner": item.source.owner,
                     "effective_date": item.source.effective_date,
                     "classification": item.source.classification,
-                    "section_anchors": _section_anchors(item.text),
+                    "section_anchors": _section_anchors(item.text) if item.markdown else ("document",),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             )
             fence = "`" * (max((len(run) for run in re.findall(r"`+", item.text)), default=2) + 1)
             path.write_text(
-                f"# Imported knowledge source\n\n{metadata}\n\n"
+                f"{marker_prefix}{name} -->\n# Imported knowledge source\n\n{metadata}\n\n"
                 f"## Extracted text (untrusted data)\n\n{fence}\n{item.text}\n{fence}\n",
                 encoding="utf-8",
             )
@@ -529,7 +614,7 @@ class KnowledgeBuilderImpl:
             "instruction_findings": review.instruction_findings,
         }
         (docs / "review.md").write_text(
-            "# Knowledge review\n\n```json\n"
+            f"{marker_prefix}review.md -->\n# Knowledge review\n\n```json\n"
             + json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
             + "\n```\n",
             encoding="utf-8",
