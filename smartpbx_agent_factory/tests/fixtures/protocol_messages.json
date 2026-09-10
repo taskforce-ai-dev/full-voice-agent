@@ -1,7 +1,7 @@
 [
-  {"event": "connected", "fields": []},
-  {"event": "start", "fields": ["accountId"]},
-  {"event": "media", "fields": ["payload"]},
-  {"event": "stop", "fields": []},
-  {"event": "hangup", "fields": []}
+  {"event": "connected", "connected": {"protocol": "smartpbx-ai-provider-v07"}},
+  {"event": "start", "start": {"accountId": "account-synthetic", "streamSid": "stream-synthetic"}},
+  {"event": "media", "media": {"track": "inbound", "payload": "<synthetic-silence>"}},
+  {"event": "stop", "stop": {}},
+  {"event": "hangup", "hangup": {"reason": "synthetic-terminal"}}
 ]
