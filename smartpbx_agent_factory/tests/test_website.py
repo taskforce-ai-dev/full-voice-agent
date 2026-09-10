@@ -1,4 +1,5 @@
 import json
+import hashlib
 import shutil
 import subprocess
 from pathlib import Path
@@ -351,16 +352,25 @@ def write_interrupted_transaction(root: Path, originals: dict[str, bytes | None]
     if records is None:
         records = []
         for index, (target, original) in enumerate(originals.items()):
-            record = {"target": target, "existed": original is not None, "backup": None}
+            record = {
+                "target": target,
+                "existed": original is not None,
+                "backup": None,
+                "size": None,
+                "sha256": None,
+            }
             if original is not None:
                 backup = f"backup-{index}.bin"
                 (stage / backup).write_bytes(original)
                 record["backup"] = backup
+                record["size"] = len(original)
+                record["sha256"] = hashlib.sha256(original).hexdigest()
             records.append(record)
     marker = {
         "version": 1,
         "stage": "interrupted",
         "files": records,
+        "created_dirs": [],
     }
     (root / ".smartpbx-agent-factory-website-transaction.json").write_text(
         json.dumps(marker), encoding="utf-8"
@@ -415,3 +425,53 @@ def test_malformed_recovery_marker_cannot_overwrite_outside_owned_targets(tmp_pa
         )
     assert page.read_bytes() == before
     assert not (tmp_path / "data").exists()
+
+
+def test_renderer_refuses_a_symlinked_output_root_or_artifact_parent(tmp_path):
+    real_target = tmp_path / "real-target"
+    write_website_target(real_target)
+    linked_target = tmp_path / "linked-target"
+    linked_target.symlink_to(real_target, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        render_website_artifacts(
+            fixture_manifest(), fixture_resources(), backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40, output_dir=linked_target,
+        )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (real_target / "data").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        render_website_artifacts(
+            fixture_manifest(), fixture_resources(), backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40, output_dir=real_target,
+        )
+    assert not list(outside.iterdir())
+
+
+def test_recovery_rejects_tampered_or_symlinked_backup_without_writing_targets(tmp_path):
+    write_website_target(tmp_path)
+    originals = {
+        "data/smartpbx-agents.generated.mjs": None,
+        "scripts/validate-smartpbx-card.mjs": None,
+        "components/pages/BookDemo.tsx": (tmp_path / "components/pages/BookDemo.tsx").read_bytes(),
+        "package.json": (tmp_path / "package.json").read_bytes(),
+    }
+    write_interrupted_transaction(tmp_path, originals)
+    page = tmp_path / "components/pages/BookDemo.tsx"
+    before = page.read_bytes()
+    backup = tmp_path / ".smartpbx-agent-factory-website-txn/interrupted/backup-2.bin"
+    backup.write_bytes(b"tampered backup")
+    with pytest.raises(ValueError, match="backup integrity"):
+        render_website_artifacts(
+            fixture_manifest(), fixture_resources(), backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40, output_dir=tmp_path,
+        )
+    assert page.read_bytes() == before
+    backup.unlink()
+    backup.symlink_to(tmp_path / "package.json")
+    with pytest.raises(ValueError, match="symlink"):
+        render_website_artifacts(
+            fixture_manifest(), fixture_resources(), backend_artifact_digest="a" * 64,
+            backend_branch_sha="b" * 40, output_dir=tmp_path,
+        )
+    assert page.read_bytes() == before
