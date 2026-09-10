@@ -118,7 +118,7 @@ def validate_allowlist_metadata(allowlist: Mapping[str, object]) -> TemplateAllo
         raise ProvenanceError("OCI revision does not match source revision")
     image_digest = validate_image_digest(allowlist.get("image_digest"))
     protocol_version = allowlist.get("protocol_version")
-    if protocol_version != "smartpbx-ai-provider-v07":
+    if protocol_version not in {"smartpbx-ai-provider-v06", "smartpbx-ai-provider-v07"}:
         raise ProvenanceError("template allowlist protocol version is not verified")
     environment_schema_version = allowlist.get("environment_schema_version")
     if (

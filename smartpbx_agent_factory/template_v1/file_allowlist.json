@@ -1,20 +1,23 @@
 {
   "template_version": "v1",
-  "status": "blocked",
-  "block_reason": "immutable deployed source revision and image digest are unavailable from approved repository evidence",
-  "source_revision": null,
-  "image_digest": null,
-  "oci_revision": null,
-  "protocol_version": "unverified",
-  "environment_schema_version": "unverified",
+  "status": "approved",
+  "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
+  "image_digest": "sha256:3d1cfce67574efd1c8bde484d26345c027713c4d169f37804114fecec5b81350",
+  "oci_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
+  "protocol_version": "smartpbx-ai-provider-v06",
+  "environment_schema_version": "isolated-smartpbx-v1",
   "files": {
-    "runtime/README.md": {
-      "template_path": "runtime/README.md",
-      "sha256": "sha256:30160154ec7513712cffe89c441d0e7655ce8a58ac9dadcce5f0965d3c490e9a"
+    "Kavya/smartpbx_protocol.py": {
+      "template_path": "runtime/smartpbx_protocol.py.tmpl",
+      "sha256": "sha256:5007ad11f6966cfa33a6e43a5262f728b4e67ca7a31b59530f94068f5339f5ed"
     },
-    "infrastructure/README.md": {
-      "template_path": "infrastructure/README.md",
-      "sha256": "sha256:12d918d86d7bb53891e22fbb1ac94302d25cff506af091033ca59f6f52bfcf14"
+    "Kavya/smartpbx_diagnostics.py": {
+      "template_path": "runtime/smartpbx_diagnostics.py.tmpl",
+      "sha256": "sha256:08a8a8f31232208a0ab8bfd52d71fb8124ba9eaac44453680350d69bbdc980be"
+    },
+    "Kavya/smartpbx_transport.py": {
+      "template_path": "runtime/smartpbx_transport.py.tmpl",
+      "sha256": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e"
     }
   }
 }

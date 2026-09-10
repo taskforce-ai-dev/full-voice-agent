@@ -1,8 +1,8 @@
 """Fail-closed rendering for isolated, inquiry-only SmartPBX backend trees.
 
-This module deliberately has no fallback to Kavya or to a mutable source tree.
-The checked-in template allowlist is currently blocked, so normal rendering stops
-until an approved, digest-bound ``TemplateAllowlist`` is supplied.
+This module deliberately has no fallback to a mutable source tree.  The default
+allowlist is digest-bound to an approved v06 source revision; a later protocol
+overlay must be separately approved rather than relabeling that deployed source.
 """
 
 from __future__ import annotations
@@ -120,6 +120,29 @@ def _review_facts(review: KnowledgeReviewLike) -> tuple[str, ...]:
     return facts
 
 
+def _knowledge_documents(review: KnowledgeReviewLike, facts: tuple[str, ...]) -> Mapping[str, str]:
+    """Accept only renderer-owned, basename-only review document names."""
+    raw = getattr(review, "documents", None)
+    if raw is None:
+        return {"approved-facts.md": "\n\n".join(facts) or "No approved facts were supplied."}
+    if not isinstance(raw, Mapping) or not raw:
+        raise ReviewNotApprovedError("knowledge review documents must be a non-empty mapping")
+    documents: dict[str, str] = {}
+    for filename, content in raw.items():
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or "/" in filename
+            or "\\" in filename
+            or filename in {".", ".."}
+        ):
+            raise RenderError("knowledge source filename contains a path separator")
+        if not isinstance(content, str):
+            raise ReviewNotApprovedError("knowledge review document content must be text")
+        documents[filename] = content
+    return documents
+
+
 def _python_gateway(resources: DerivedResources) -> str:
     return f'''"""Generated SmartPBX gateway. Authentication always precedes accept()."""
 from __future__ import annotations
@@ -186,12 +209,13 @@ class SmartPBXGateway:
 '''
 
 
-def _files(manifest: AgentManifest, resources: DerivedResources, facts: tuple[str, ...]) -> Mapping[str, str]:
+def _files(
+    manifest: AgentManifest, resources: DerivedResources, documents: Mapping[str, str], templates: Mapping[str, str]
+) -> Mapping[str, str]:
     enabled = manifest.capabilities.enabled_names
     if enabled:
         raise RenderError("capability rendering is unavailable until an explicit capability module is approved")
     title = manifest.display_name
-    knowledge = "\n\n".join(facts) or "No approved facts were supplied."
     compose = f'''services:
   {resources.smartpbx_service}:
     profiles: ["smartpbx"]
@@ -234,14 +258,13 @@ activation_state: pending
         "requirements-prod.txt": "# Standard-library runtime only.\n",
         "requirements-prod.lock.txt": "# No runtime packages.\n",
         "server.py": "ROUTES = ('/smartpbx/status', '/ws/v1/smartpbx/media')\nfrom smartpbx_gateway import SmartPBXGateway, SmartPBXSessionRegistry, SmartPBXSettings\n",
-        "smartpbx_diagnostics.py": "def redacted_status(active_sessions=0):\n    return {'active_sessions': active_sessions}\n",
+        "smartpbx_diagnostics.py": templates.get("runtime/smartpbx_diagnostics.py.tmpl", "def redacted_status(active_sessions=0):\n    return {'active_sessions': active_sessions}\n"),
         "smartpbx_gateway.py": _python_gateway(resources),
-        "smartpbx_protocol.py": "PROTOCOL_VERSION = 'smartpbx-ai-provider-v07'\n",
+        "smartpbx_protocol.py": templates.get("runtime/smartpbx_protocol.py.tmpl", "PROTOCOL_VERSION = 'smartpbx-ai-provider-v06'\n"),
         "smartpbx_session.py": "class InquirySession:\n    async def start(self): pass\n    async def finish(self): pass\n",
-        "smartpbx_transport.py": "class SmartPBXMediaTransport: pass\n",
+        "smartpbx_transport.py": templates.get("runtime/smartpbx_transport.py.tmpl", "class SmartPBXMediaTransport: pass\n"),
         "tools.py": "TOOL_REGISTRY = {}\n",
         "website_demo.py": "ROUTES = ('/voice/demo-incoming',)\n# Browser tokens are issued only by the shared approved issuer.\n",
-        "knowledge_docs/approved-facts.md": f"# Approved knowledge\n\n{knowledge}\n",
         "nginx-smartpbx.conf": "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n",
         f"nginx-{resources.smartpbx_service}.conf": "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n",
         "scripts/deploy_smartpbx_image.sh": "#!/bin/sh\necho 'Manual release approval required.'\nexit 1\n",
@@ -312,7 +335,7 @@ def test_inquiry_only_registry_and_preaccept_authentication():
     asyncio.run(exercise())
 ''',
         ".github-workflow-fragment.yml": workflow_fragment,
-    }
+    } | {f"knowledge_docs/{filename}": f"# Approved knowledge\n\n{content}\n" for filename, content in documents.items()}
 
 
 def _scan_outputs(files: Mapping[str, str]) -> None:
@@ -357,11 +380,11 @@ def render_backend(
     """
     allowlist = template_allowlist or _load_default_allowlist()
     root = Path(template_root) if template_root is not None else _TEMPLATE_ROOT
-    _verify_supplied_templates(root, allowlist)
+    templates = _verify_supplied_templates(root, allowlist)
     if resources.slug != manifest.slug or resources.folder_identity != f"SmartPBX Agents/{manifest.slug}":
         raise RenderError("derived resources do not match manifest identity")
     facts = _review_facts(review)
-    files = _files(manifest, resources, facts)
+    files = _files(manifest, resources, _knowledge_documents(review, facts), templates)
     _scan_outputs(files)
     rendered_root = Path(output_dir) / resources.folder_identity
     names = _write_files(rendered_root, files)
