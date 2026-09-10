@@ -153,6 +153,8 @@ def test_generation_branch_starts_at_pinned_base_and_records_its_later_head(tmp_
     assert ("git", "-C", str(primary), "worktree", "add", "-b", handle.branch, str(target), "a" * 40) in calls
     updated = manager.record_current_head(handle)
     assert updated.revision == "b" * 40
+    manager.remove_recorded(updated)
+    assert ("git", "-C", str(primary), "worktree", "remove", str(target)) in calls
 
 
 def test_recorded_worktree_refuses_unknown_head_drift(tmp_path):

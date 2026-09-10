@@ -17,6 +17,7 @@ from .gitops import WorktreeHandle, WorktreeManager
 from .provenance import ProvenanceError, validate_allowlist_metadata
 from .resources import AllocationRegistry, DerivedResources, derive_resources
 from .schema import ManifestError, manifest_digest, parse_manifest
+from .secrets import SecretAudit, SecretProvider
 from .state import GenerationState, Stage, StateError
 
 
@@ -175,6 +176,31 @@ class GenerationOrchestrator:
         self._save(stored)
         return state
 
+    def record_secrets_resolved(
+        self, generation_id: str, *, provider: SecretProvider, audit: SecretAudit
+    ) -> GenerationState:
+        """Advance only from a validated, redacted SecretProvider audit artifact."""
+        if not isinstance(audit, SecretAudit) or not hasattr(provider, "validate"):
+            raise GenerationBlockedError("validated SecretProvider audit is required")
+        stored = self._load_verified(generation_id)
+        state = stored.state
+        if state.stage is not Stage.INPUT_COLLECTED:
+            raise GenerationBlockedError("secret resolution requires stage INPUT_COLLECTED")
+        try:
+            provider.validate()
+        except Exception as error:
+            raise GenerationBlockedError("SecretProvider validation failed") from error
+        audit_digest = _digest_payload(dict(audit))
+        try:
+            state.record_stage_digest("secrets", audit_digest)
+            state.transition(Stage.SECRETS_RESOLVED)
+            state.transition(Stage.KNOWLEDGE_REVIEW_REQUIRED)
+            state.record_knowledge_review_digest(stored.knowledge_digest)
+        except StateError as error:
+            raise GenerationBlockedError(str(error)) from error
+        self._save(stored)
+        return state
+
     def abandon(self, generation_id: str) -> GenerationState:
         stored = self._load(generation_id)
         inventory = stored.cleanup_inventory
@@ -218,8 +244,14 @@ class GenerationOrchestrator:
         inventory = stored.cleanup_inventory
         if inventory is None or inventory.completed or not manager.owns(handle):
             raise GenerationBlockedError("generation worktree ownership cannot be recorded")
-        if handle in inventory.worktrees:
+        existing = next((item for item in inventory.worktrees if item.target == handle.target), None)
+        if existing is not None and existing == handle:
             return
+        if existing is not None and existing.ownership_token != handle.ownership_token:
+            raise GenerationBlockedError("generation worktree ownership cannot be replaced")
+        worktrees = tuple(handle if item.target == handle.target else item for item in inventory.worktrees)
+        if existing is None:
+            worktrees += (handle,)
         self._save(
             _StoredGeneration(
                 stored.state,
@@ -229,7 +261,7 @@ class GenerationOrchestrator:
                 stored.resource_digest,
                 stored.plan_digest,
                 CleanupInventory(
-                    inventory.worktrees + (handle,),
+                    worktrees,
                     inventory.plaintext_paths,
                     inventory.completed_worktree_targets,
                     inventory.completed_plaintext_paths,
@@ -254,13 +286,8 @@ class GenerationOrchestrator:
         if owned_path in inventory.plaintext_paths:
             return
         self._save(
-            _StoredGeneration(
-                stored.state,
-                stored.manifest_path,
-                stored.resources,
-                stored.knowledge_digest,
-                stored.resource_digest,
-                stored.plan_digest,
+            _replace_cleanup_inventory(
+                stored,
                 CleanupInventory(
                     inventory.worktrees,
                     inventory.plaintext_paths + (owned_path,),
@@ -355,7 +382,7 @@ class GenerationOrchestrator:
             path = self._state_path(stored.state.generation_id)
             self._require_private_state_file(path)
             payload = {
-                "version": 3,
+                "version": 4,
                 "state": stored.state.to_dict(),
                 "manifest_path": str(stored.manifest_path),
                 "resources": asdict(stored.resources),
@@ -396,7 +423,7 @@ class GenerationOrchestrator:
             path = self._state_path(generation_id)
             self._require_private_state_file(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2, 3}:
+            if not isinstance(raw, Mapping) or raw.get("version") not in {1, 2, 3, 4}:
                 raise ValueError("state document is invalid")
             state = GenerationState.from_dict(dict(raw["state"]))
             resources = DerivedResources(**dict(raw["resources"]))
@@ -409,7 +436,7 @@ class GenerationOrchestrator:
                 for value in digests
             ):
                 raise ValueError("state document is invalid")
-            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory")) if raw["version"] == 3 else None
+            inventory = _parse_cleanup_inventory(raw.get("cleanup_inventory")) if raw["version"] == 4 else None
             return _StoredGeneration(state, manifest_path, resources, *digests, inventory)
         except (OSError, KeyError, TypeError, ValueError, StateError) as error:
             raise GenerationInfrastructureError("cannot load generation state") from error
@@ -560,6 +587,7 @@ def _serialize_cleanup_inventory(inventory: CleanupInventory | None) -> object:
                 "revision": handle.revision,
                 "temporary_root": str(handle.temporary_root),
                 "ownership_token": handle.ownership_token,
+                "branch": handle.branch,
             }
             for handle in inventory.worktrees
         ],
@@ -594,16 +622,18 @@ def _parse_cleanup_inventory(raw: object) -> CleanupInventory | None:
     parsed_worktrees: list[WorktreeHandle] = []
     for item in worktrees:
         if not isinstance(item, Mapping) or set(item) != {
-            "primary", "target", "revision", "temporary_root", "ownership_token"
+            "primary", "target", "revision", "temporary_root", "ownership_token", "branch"
         }:
             raise ValueError("generation cleanup inventory is invalid")
-        primary, target, revision, temporary_root, ownership_token = (
-            item["primary"], item["target"], item["revision"], item["temporary_root"], item["ownership_token"]
+        primary, target, revision, temporary_root, ownership_token, branch = (
+            item["primary"], item["target"], item["revision"], item["temporary_root"], item["ownership_token"], item["branch"]
         )
-        if not all(isinstance(value, str) for value in (primary, target, revision, temporary_root, ownership_token)):
+        if not all(isinstance(value, str) for value in (primary, target, revision, temporary_root, ownership_token)) or (
+            branch is not None and not isinstance(branch, str)
+        ):
             raise ValueError("generation cleanup inventory is invalid")
         parsed_worktrees.append(
-            WorktreeHandle(Path(primary), Path(target), revision, Path(temporary_root), ownership_token)
+            WorktreeHandle(Path(primary), Path(target), revision, Path(temporary_root), ownership_token, branch)
         )
     parsed_paths = tuple(Path(value) for value in plaintext_paths if isinstance(value, str))
     completed_targets = tuple(Path(value) for value in completed_worktree_targets if isinstance(value, str))

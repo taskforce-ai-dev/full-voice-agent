@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import secrets
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -29,12 +29,14 @@ class WorktreeHandle:
     revision: str
     temporary_root: Path = Path("/")
     ownership_token: str = ""
+    branch: str | None = None
 
 
 Runner = Callable[[Sequence[str]], str]
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REMOTE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*$")
 _OWNERSHIP_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+_GENERATION_BRANCH_RE = re.compile(r"^smartpbx-agent-factory/[a-z0-9][a-z0-9-]{0,63}$")
 
 
 def _subprocess_runner(args: Sequence[str]) -> str:
@@ -58,13 +60,15 @@ class WorktreeManager:
         self._handles: dict[int, WorktreeHandle] = {}
 
     def create(
-        self, *, primary: Path, remote: str, revision: str, target: Path
+        self, *, primary: Path, remote: str, revision: str, target: Path, branch: str | None = None
     ) -> WorktreeHandle:
         remote = self._validate_remote(remote)
         primary = self._validate_primary(primary)
         target = self._validate_target(target)
         if not isinstance(revision, str) or not _SHA_RE.fullmatch(revision):
             raise WorktreeConflictError("revision must be a full 40-hex SHA")
+        if branch is not None and (not isinstance(branch, str) or not _GENERATION_BRANCH_RE.fullmatch(branch)):
+            raise WorktreeConflictError("generation branch name is invalid")
 
         status = self._run(("git", "-C", str(primary), "status", "--porcelain"))
         if status.strip():
@@ -75,13 +79,17 @@ class WorktreeManager:
             raise WorktreeConflictError("remote main did not resolve to a full 40-hex SHA")
         if resolved != revision:
             raise WorktreeConflictError("requested revision does not match fetched remote main")
-        self._run(("git", "-C", str(primary), "worktree", "add", "--detach", str(target), resolved))
+        if branch is None:
+            self._run(("git", "-C", str(primary), "worktree", "add", "--detach", str(target), resolved))
+        else:
+            self._run(("git", "-C", str(primary), "worktree", "add", "-b", branch, str(target), resolved))
         handle = WorktreeHandle(
             primary=primary,
             target=target,
             revision=resolved,
             temporary_root=self._temporary_root,
             ownership_token=secrets.token_hex(32),
+            branch=branch,
         )
         self._handles[id(handle)] = handle
         return handle
@@ -115,6 +123,8 @@ class WorktreeManager:
         """
         if not isinstance(handle, WorktreeHandle) or not _OWNERSHIP_TOKEN_RE.fullmatch(handle.ownership_token):
             raise WorktreeConflictError("recorded worktree ownership evidence is invalid")
+        if handle.branch is not None and not _GENERATION_BRANCH_RE.fullmatch(handle.branch):
+            raise WorktreeConflictError("recorded generation branch is invalid")
         if handle.temporary_root != self._temporary_root:
             raise WorktreeConflictError("recorded worktree temporary root does not match manager")
         primary = self._validate_primary(handle.primary)
@@ -122,14 +132,41 @@ class WorktreeManager:
         if primary != handle.primary or target != handle.target or not _SHA_RE.fullmatch(handle.revision):
             raise WorktreeConflictError("recorded worktree ownership changed")
         entries = self._worktree_entries(primary)
-        matching_revision = entries.get(target)
-        if matching_revision is None:
+        matching = entries.get(target)
+        if matching is None:
             if target.exists():
                 raise WorktreeConflictError("recorded target is not an authoritative Git worktree")
             return
+        matching_revision, matching_branch = matching
         if matching_revision != handle.revision:
             raise WorktreeConflictError("recorded worktree revision does not match authoritative Git state")
+        if handle.branch is not None and matching_branch != f"refs/heads/{handle.branch}":
+            raise WorktreeConflictError("recorded worktree branch does not match authoritative Git state")
         self._run(("git", "-C", str(primary), "worktree", "remove", str(target)))
+
+    def record_current_head(self, handle: WorktreeHandle) -> WorktreeHandle:
+        """Persist an authoritative post-commit SHA for a safe generation branch."""
+        if self._handles.get(id(handle)) is not handle:
+            raise WorktreeConflictError("worktree handle was not created by this manager")
+        if handle.branch is None:
+            raise WorktreeConflictError("only an explicit generation branch may record a new head")
+        if not _GENERATION_BRANCH_RE.fullmatch(handle.branch):
+            raise WorktreeConflictError("generation branch name is invalid")
+        primary = self._validate_primary(handle.primary)
+        target = self._validate_target(handle.target, must_not_exist=False)
+        if primary != handle.primary or target != handle.target:
+            raise WorktreeConflictError("worktree handle ownership changed")
+        entries = self._worktree_entries(primary)
+        matching = entries.get(target)
+        if matching is None or matching[1] != f"refs/heads/{handle.branch}":
+            raise WorktreeConflictError("generation branch is not an authoritative Git worktree")
+        head = self._run(("git", "-C", str(target), "rev-parse", "HEAD")).strip()
+        if not _SHA_RE.fullmatch(head) or matching[0] != head:
+            raise WorktreeConflictError("generation worktree HEAD is not authoritative")
+        updated = replace(handle, revision=head)
+        del self._handles[id(handle)]
+        self._handles[id(updated)] = updated
+        return updated
 
     @staticmethod
     def _validate_remote(remote: str) -> str:
@@ -157,20 +194,24 @@ class WorktreeManager:
             raise WorktreeConflictError("worktree target already exists")
         return resolved
 
-    def _worktree_entries(self, primary: Path) -> dict[Path, str]:
+    def _worktree_entries(self, primary: Path) -> dict[Path, tuple[str, str | None]]:
         raw = self._run(("git", "-C", str(primary), "worktree", "list", "--porcelain"))
-        entries: dict[Path, str] = {}
+        entries: dict[Path, tuple[str, str | None]] = {}
         current_path: Path | None = None
         current_head: str | None = None
+        current_branch: str | None = None
         for line in raw.splitlines() + [""]:
             if not line:
                 if current_path is not None and current_head is not None:
-                    entries[current_path.resolve()] = current_head
+                    entries[current_path.resolve()] = (current_head, current_branch)
                 current_path = None
                 current_head = None
+                current_branch = None
                 continue
             if line.startswith("worktree "):
                 current_path = Path(line.removeprefix("worktree "))
             elif line.startswith("HEAD "):
                 current_head = line.removeprefix("HEAD ")
+            elif line.startswith("branch "):
+                current_branch = line.removeprefix("branch ")
         return entries
