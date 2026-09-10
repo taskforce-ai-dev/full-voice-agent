@@ -1,7 +1,18 @@
 """Immutable data contracts shared by the factory foundation."""
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Mapping, Optional
+
+
+def _freeze(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze(item) for item in value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -14,12 +25,21 @@ class LanguageProfile:
     fallback: Optional[str] = None
     greeting: str = ""
     voice: str = ""
+    stt_model: str = ""
+    llm_model: str = ""
+    tts_model: str = ""
 
     @property
     def pipeline(self) -> Mapping[str, str]:
         result = {"stt": self.stt, "llm": self.llm, "tts": self.tts}
         if self.fallback:
             result["fallback"] = self.fallback
+        if self.stt_model:
+            result["stt_model"] = self.stt_model
+        if self.llm_model:
+            result["llm_model"] = self.llm_model
+        if self.tts_model:
+            result["tts_model"] = self.tts_model
         return result
 
 
@@ -39,6 +59,9 @@ class Capability:
     fallback: Optional[str] = None
     identifier: Optional[str] = None
     details: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "details", _freeze(self.details))
 
 
 @dataclass(frozen=True)
@@ -89,8 +112,8 @@ class KnowledgeSource:
 class SmartPBXInput:
     account_id: str
     capacity: int
-    protocol_profile: str = "smartpbx-ai-provider-v06"
-    status_authentication: bool = False
+    protocol_profile: str = "smartpbx-ai-provider-v07"
+    status_authentication: bool = True
 
 
 @dataclass(frozen=True)
@@ -130,3 +153,6 @@ class AgentManifest:
     smartpbx: SmartPBXInput
     operations: OperationsInput
     website_demo: WebsiteDemoInput
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operating_hours", _freeze(self.operating_hours))

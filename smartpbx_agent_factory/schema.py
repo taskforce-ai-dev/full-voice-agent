@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-from dataclasses import asdict
+from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
+from .catalogue import CapabilityCatalogue, CatalogueError
 from .model import (
     AgentManifest,
     Capability,
@@ -63,6 +63,16 @@ _CAPABILITIES = (
     "transcript_retention",
 )
 _CAPABILITY_KEYS = frozenset({"enabled", "destination", "fallback", "identifier", "details"})
+_CAPABILITY_DETAIL_KEYS = {
+    "booking": frozenset({"calendar", "resource", "duration_minutes"}),
+    "handover": frozenset({"fallback_policy", "queue"}),
+    "whatsapp": frozenset({"template"}),
+    "crm": frozenset({"system", "record_type"}),
+    "payment": frozenset({"provider", "currency"}),
+    "post_call_reporting": frozenset({"dashboard", "retention_days"}),
+    "recording": frozenset({"consent_mode"}),
+    "transcript_retention": frozenset({"retention_days", "consent_mode"}),
+}
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 
 
@@ -132,9 +142,12 @@ def _parse_language(raw: object, index: int) -> LanguageProfile:
     providers = {}
     for name in ("stt", "llm", "tts"):
         provider = value.get(name)
+        model = ""
         if isinstance(provider, Mapping):
+            _strict_keys(provider, {"provider", "name", "model"}, f"languages[{index}].{name}")
+            model = _optional_text(provider.get("model"), f"languages[{index}].{name}.model") or ""
             provider = provider.get("provider", provider.get("name"))
-        providers[name] = _text(provider, f"languages[{index}].{name}")
+        providers[name] = (_text(provider, f"languages[{index}].{name}"), model)
     fallback = _optional_text(value.get("fallback"), f"languages[{index}].fallback")
     greeting = value.get("greeting", "")
     voice = value.get("voice", "")
@@ -142,7 +155,19 @@ def _parse_language(raw: object, index: int) -> LanguageProfile:
         raise ManifestError(f"languages[{index}].greeting must be a string")
     if voice and not isinstance(voice, str):
         raise ManifestError(f"languages[{index}].voice must be a string")
-    return LanguageProfile(code, locale, providers["stt"], providers["llm"], providers["tts"], fallback, greeting, voice)
+    return LanguageProfile(
+        code=code,
+        locale=locale,
+        stt=providers["stt"][0],
+        llm=providers["llm"][0],
+        tts=providers["tts"][0],
+        fallback=fallback,
+        greeting=greeting,
+        voice=voice,
+        stt_model=providers["stt"][1],
+        llm_model=providers["llm"][1],
+        tts_model=providers["tts"][1],
+    )
 
 
 def _parse_capability(name: str, raw: object) -> Capability:
@@ -156,6 +181,11 @@ def _parse_capability(name: str, raw: object) -> Capability:
     details = value.get("details", {})
     if not isinstance(details, Mapping):
         raise ManifestError(f"capabilities.{name}.details must be an object")
+    unsupported_details = sorted(set(details) - _CAPABILITY_DETAIL_KEYS[name])
+    if unsupported_details:
+        raise ManifestError(
+            f"unsupported capability detail key: capabilities.{name}.details.{unsupported_details[0]}"
+        )
     capability = Capability(
         enabled=enabled,
         destination=_optional_text(value.get("destination"), f"capabilities.{name}.destination"),
@@ -170,7 +200,9 @@ def _parse_capability(name: str, raw: object) -> Capability:
     return capability
 
 
-def _parse_source(raw: object, index: int) -> KnowledgeSource:
+def _parse_source(
+    raw: object, index: int, approved_source_roots: Iterable[Path] | None
+) -> KnowledgeSource:
     value = _mapping(raw, f"knowledge_sources[{index}]")
     allowed = {"kind", "path", "url", "owner", "effective_date", "classification", "approved_origins", "path_prefixes"}
     _strict_keys(value, allowed, f"knowledge_sources[{index}]")
@@ -182,7 +214,7 @@ def _parse_source(raw: object, index: int) -> KnowledgeSource:
     if kind == "local":
         if not path or url:
             raise ManifestError(f"knowledge_sources[{index}] local source requires path only")
-        _validate_local_path(path)
+        _validate_local_path(path, approved_source_roots)
     elif not url or path:
         raise ManifestError(f"knowledge_sources[{index}] URL source requires url only")
     owner = _text(value.get("owner"), f"knowledge_sources[{index}].owner")
@@ -195,18 +227,33 @@ def _parse_source(raw: object, index: int) -> KnowledgeSource:
     return KnowledgeSource(kind, path, url, owner, effective_date, classification, origins, prefixes)
 
 
-def _validate_local_path(path: str) -> None:
+def _validate_local_path(path: str, approved_source_roots: Iterable[Path] | None) -> None:
     candidate = Path(path)
     if "\x00" in path or any(part == ".." for part in candidate.parts):
         raise ManifestError("knowledge source path is outside the approved root")
-    roots_raw = os.environ.get("SMARTPBX_APPROVED_SOURCE_ROOTS", str(Path.cwd()))
-    roots = [Path(item).expanduser().resolve() for item in roots_raw.split(os.pathsep) if item]
-    resolved = candidate.expanduser().resolve() if candidate.is_absolute() else (Path.cwd() / candidate).resolve()
-    if not any(resolved == root or root in resolved.parents for root in roots):
+    if approved_source_roots is None:
+        raise ManifestError("approved source roots must be explicitly supplied")
+    roots = [Path(item).expanduser().resolve() for item in approved_source_roots]
+    if not roots:
+        raise ManifestError("approved source roots must not be empty")
+    if candidate.is_absolute():
+        resolved_candidates = (candidate.expanduser().resolve(),)
+    else:
+        resolved_candidates = tuple((root / candidate).resolve() for root in roots)
+    if not any(
+        resolved == root or root in resolved.parents
+        for resolved in resolved_candidates
+        for root in roots
+    ):
         raise ManifestError("knowledge source path is outside the approved root")
 
 
-def parse_manifest(raw: Mapping[str, object]) -> AgentManifest:
+def parse_manifest(
+    raw: Mapping[str, object],
+    *,
+    approved_source_roots: Iterable[Path] | None = None,
+    catalogue: CapabilityCatalogue | None = None,
+) -> AgentManifest:
     if not isinstance(raw, Mapping):
         raise ManifestError("manifest must be an object")
     unknown = sorted(set(raw) - TOP_LEVEL_KEYS)
@@ -231,6 +278,13 @@ def parse_manifest(raw: Mapping[str, object]) -> AgentManifest:
     languages = tuple(_parse_language(value, index) for index, value in enumerate(languages_raw))
     if len({language.code for language in languages}) != len(languages):
         raise ManifestError("languages must not contain duplicate codes")
+    if catalogue is None:
+        raise ManifestError("reviewed capability catalogue is required")
+    for language in languages:
+        try:
+            catalogue.validate_pipeline(language.code, language.pipeline)
+        except CatalogueError as exc:
+            raise ManifestError(str(exc)) from exc
     pii_raw = _mapping(raw["pii_policy"], "pii_policy")
     _strict_keys(pii_raw, {"explicit_consent", "collect_name", "collect_phone", "collect_other", "confirmation_policy"}, "pii_policy")
     pii = PiiPolicy(
@@ -248,15 +302,22 @@ def parse_manifest(raw: Mapping[str, object]) -> AgentManifest:
     sources_raw = raw["knowledge_sources"]
     if not isinstance(sources_raw, Sequence) or isinstance(sources_raw, (str, bytes)):
         raise ManifestError("knowledge_sources must be an array")
-    sources = tuple(_parse_source(value, index) for index, value in enumerate(sources_raw))
+    sources = tuple(
+        _parse_source(value, index, approved_source_roots)
+        for index, value in enumerate(sources_raw)
+    )
     smart_raw = _mapping(raw["smartpbx"], "smartpbx")
     _strict_keys(smart_raw, {"account_id", "capacity", "protocol_profile", "status_authentication"}, "smartpbx")
     smartpbx = SmartPBXInput(
         account_id=_text(smart_raw.get("account_id"), "smartpbx.account_id"),
-        capacity=_int(smart_raw.get("capacity"), "smartpbx.capacity", minimum=1, maximum=100),
-        protocol_profile=_text(smart_raw.get("protocol_profile", "smartpbx-ai-provider-v06"), "smartpbx.protocol_profile"),
-        status_authentication=_bool(smart_raw.get("status_authentication", False), "smartpbx.status_authentication"),
+        capacity=_int(smart_raw.get("capacity"), "smartpbx.capacity", minimum=1, maximum=4),
+        protocol_profile=_text(smart_raw.get("protocol_profile", "smartpbx-ai-provider-v07"), "smartpbx.protocol_profile"),
+        status_authentication=_bool(smart_raw.get("status_authentication", True), "smartpbx.status_authentication"),
     )
+    if smartpbx.protocol_profile != "smartpbx-ai-provider-v07":
+        raise ManifestError("smartpbx.protocol_profile must be smartpbx-ai-provider-v07")
+    if not smartpbx.status_authentication:
+        raise ManifestError("smartpbx.status_authentication is required")
     operations_raw = _mapping(raw["operations"], "operations")
     _strict_keys(operations_raw, {"alert_owner", "support_contact", "rotation_due"}, "operations")
     operations = OperationsInput(
@@ -274,6 +335,8 @@ def parse_manifest(raw: Mapping[str, object]) -> AgentManifest:
     unknown_languages = set(website.supported_languages) - {language.code for language in languages}
     if unknown_languages:
         raise ManifestError(f"website_demo.supported_languages contains unknown language: {sorted(unknown_languages)[0]}")
+    if website.visibility != "pending":
+        raise ManifestError("website_demo.visibility must be pending for v1")
     return AgentManifest(
         schema_version=schema_version,
         **values,
@@ -295,5 +358,15 @@ def parse_manifest(raw: Mapping[str, object]) -> AgentManifest:
 def manifest_digest(manifest: AgentManifest) -> str:
     if not isinstance(manifest, AgentManifest):
         raise ManifestError("manifest_digest requires AgentManifest")
-    payload = json.dumps(asdict(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    payload = json.dumps(_canonical(manifest), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _canonical(value: object) -> object:
+    if is_dataclass(value):
+        return {field.name: _canonical(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, Mapping):
+        return {str(key): _canonical(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_canonical(item) for item in value]
+    return value

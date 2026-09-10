@@ -25,7 +25,7 @@ class Stage(str, Enum):
 
 
 _NEXT: dict[Stage, frozenset[Stage]] = {
-    Stage.NEW: frozenset({Stage.INPUT_COLLECTED, Stage.KNOWLEDGE_REVIEW_REQUIRED}),
+    Stage.NEW: frozenset({Stage.INPUT_COLLECTED}),
     Stage.INPUT_COLLECTED: frozenset({Stage.SECRETS_RESOLVED}),
     Stage.SECRETS_RESOLVED: frozenset({Stage.KNOWLEDGE_REVIEW_REQUIRED}),
     Stage.KNOWLEDGE_REVIEW_REQUIRED: frozenset({Stage.PLAN_REVIEW_REQUIRED}),
@@ -43,16 +43,33 @@ class GenerationState:
     generation_id: str
     manifest_digest: str
     stage: Stage = Stage.NEW
+    knowledge_review_digest: str | None = None
+    plan_digest: str | None = None
     knowledge_approval_digest: str | None = None
     plan_approval_digest: str | None = None
     stage_digests: dict[str, str] = field(default_factory=dict)
     blocked_reason: str | None = None
 
     @classmethod
-    def start(cls, generation_id: str, manifest_digest: str) -> "GenerationState":
+    def start(
+        cls,
+        generation_id: str,
+        manifest_digest: str,
+        knowledge_review_digest: str | None = None,
+        plan_digest: str | None = None,
+    ) -> "GenerationState":
         if not generation_id or not manifest_digest:
             raise StateError("generation_id and manifest_digest are required")
-        return cls(generation_id, manifest_digest)
+        if knowledge_review_digest is not None and not knowledge_review_digest:
+            raise StateError("knowledge review digest must not be empty")
+        if plan_digest is not None and not plan_digest:
+            raise StateError("plan digest must not be empty")
+        return cls(
+            generation_id=generation_id,
+            manifest_digest=manifest_digest,
+            knowledge_review_digest=knowledge_review_digest,
+            plan_digest=plan_digest,
+        )
 
     def transition(self, target: Stage) -> None:
         if not isinstance(target, Stage):
@@ -74,8 +91,13 @@ class GenerationState:
     def _require_approval(self, expected: Stage, digest: str, name: str) -> None:
         if self.stage is not expected:
             raise StateError(f"{name} approval requires stage {expected.value}")
-        if digest != self.manifest_digest:
-            raise StateError(f"{name} approval digest does not match manifest digest")
+        expected_digest = (
+            self.knowledge_review_digest if name == "knowledge" else self.plan_digest
+        )
+        if expected_digest is None:
+            raise StateError(f"expected {name} review digest is required")
+        if digest != expected_digest:
+            raise StateError(f"{name} approval digest does not match expected reviewed artifact")
 
     def record_stage_digest(self, name: str, digest: str) -> None:
         if not name or not digest:
@@ -99,6 +121,8 @@ class GenerationState:
         return {
             "generation_id": self.generation_id,
             "manifest_digest": self.manifest_digest,
+            "knowledge_review_digest": self.knowledge_review_digest,
+            "plan_digest": self.plan_digest,
             "stage": self.stage.value,
             "knowledge_approval_digest": self.knowledge_approval_digest,
             "plan_approval_digest": self.plan_approval_digest,
@@ -112,6 +136,8 @@ class GenerationState:
             state = cls(
                 generation_id=raw["generation_id"],
                 manifest_digest=raw["manifest_digest"],
+                knowledge_review_digest=raw.get("knowledge_review_digest"),
+                plan_digest=raw.get("plan_digest"),
                 stage=Stage(raw["stage"]),
                 knowledge_approval_digest=raw.get("knowledge_approval_digest"),
                 plan_approval_digest=raw.get("plan_approval_digest"),
@@ -120,4 +146,11 @@ class GenerationState:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise StateError("invalid serialized generation state") from exc
+        if (
+            state.knowledge_approval_digest is not None
+            and state.knowledge_approval_digest != state.knowledge_review_digest
+        ):
+            raise StateError("knowledge approval digest does not match expected review digest")
+        if state.plan_approval_digest is not None and state.plan_approval_digest != state.plan_digest:
+            raise StateError("plan approval digest does not match expected review digest")
         return state
