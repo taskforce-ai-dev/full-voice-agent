@@ -1,5 +1,6 @@
 """Renderer contracts use explicit synthetic templates, never deployed provenance."""
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path

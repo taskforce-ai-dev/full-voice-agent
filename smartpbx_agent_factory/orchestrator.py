@@ -1523,7 +1523,7 @@ def _parse_cleanup_inventory(raw: object) -> CleanupInventory | None:
         "completed",
     }
     keys = legacy_keys | {"sealed_ciphertext_paths", "completed_sealed_ciphertext_paths"}
-    if not isinstance(raw, Mapping) or set(raw) not in {legacy_keys, keys}:
+    if not isinstance(raw, Mapping) or set(raw) not in (legacy_keys, keys):
         raise ValueError("generation cleanup inventory is invalid")
     worktrees = raw["worktrees"]
     plaintext_paths = raw["plaintext_paths"]

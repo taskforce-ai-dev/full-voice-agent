@@ -66,14 +66,15 @@ def test_generated_tree_contains_non_deploy_ci_gate_and_pending_activation_check
 
 def test_root_generated_agent_workflow_has_exact_safe_triggers_and_stable_check_name():
     workflow = Path(".github/workflows/smartpbx-generated-agents.yml").read_text(encoding="utf-8")
-    assert 'paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", ".github/workflows/smartpbx-generated-agents.yml"]' in workflow
-    assert "branches: [main]" in workflow
+    assert 'paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", "scripts/check_smartpbx_ci_lifecycle_contract.py", "scripts/materialize_smartpbx_ci_fixture.py", "scripts/run_smartpbx_ci_lifecycle.py", ".github/workflows/smartpbx-generated-agents.yml"]' in workflow
+    assert 'branches: [main, "smartpbx-agent-factory/**"]' in workflow
     assert "smartpbx-generated-agent:" in workflow
     assert "python -m pytest smartpbx_agent_factory/tests" in workflow
     assert 'if [ -d "SmartPBX Agents" ]; then' in workflow
     assert 'find "SmartPBX Agents" -mindepth 1 -maxdepth 1 -type d -print0' in workflow
     assert "while IFS= read -r -d '' agent_dir; do" in workflow
     assert "workflow_call" not in workflow
+    assert 'branches: ["**"]' not in workflow
     assert "gh workflow run" not in workflow
     assert "docker push" not in workflow
     assert "test -s /tmp/smartpbx-agent-dirs" not in workflow

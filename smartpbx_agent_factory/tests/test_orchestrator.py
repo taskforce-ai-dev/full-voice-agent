@@ -36,6 +36,26 @@ def test_plan_writes_only_private_state_without_claiming_secret_resolution(tmp_p
     assert list(tmp_path.glob("*.json")) == [state_file]
 
 
+def test_cleanup_inventory_loads_current_sealed_ciphertext_schema():
+    from smartpbx_agent_factory.orchestrator import _parse_cleanup_inventory
+
+    inventory = _parse_cleanup_inventory(
+        {
+            "worktrees": [],
+            "plaintext_paths": [],
+            "completed_worktree_targets": [],
+            "completed_plaintext_paths": [],
+            "completed": False,
+            "sealed_ciphertext_paths": [],
+            "completed_sealed_ciphertext_paths": [],
+        }
+    )
+
+    assert inventory is not None
+    assert inventory.sealed_ciphertext_paths == ()
+    assert inventory.completed_sealed_ciphertext_paths == ()
+
+
 def test_plan_refuses_an_already_reserved_slug_and_resource_set(tmp_path):
     orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
     orchestrator.plan(FIXTURE)
