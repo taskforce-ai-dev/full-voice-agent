@@ -62,6 +62,28 @@ def test_generate_fails_closed_before_any_artifact_without_both_approvals(tmp_pa
         orchestrator.generate(report.generation_id)
 
 
+def test_generate_partial_runtime_creates_no_worktree_or_factory_state_artifact(tmp_path):
+    class Provider:
+        def validate(self):
+            return None
+
+        def audit_report(self):
+            return SecretAudit(generated_names=("acme-inquiry/wss_token",))
+
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    report = orchestrator.plan(FIXTURE)
+    state = orchestrator.record_secrets_resolved(report.generation_id, provider=Provider())
+    state = orchestrator.resume(report.generation_id, knowledge_approval=state.knowledge_review_digest)
+    orchestrator.resume(report.generation_id, plan_approval=state.plan_digest)
+
+    with pytest.raises(GenerationBlockedError, match="INCOMPLETE_TEMPLATE"):
+        orchestrator.generate(report.generation_id)
+
+    raw = json.loads((tmp_path / f"{report.generation_id}.json").read_text(encoding="utf-8"))
+    assert raw["cleanup_inventory"]["worktrees"] == []
+    assert not (tmp_path / "generated").exists()
+
+
 def test_abandon_marks_generation_without_removing_state_audit(tmp_path):
     orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
     report = orchestrator.plan(FIXTURE)
