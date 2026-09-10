@@ -26,6 +26,7 @@ def test_candidate_llm_template_keeps_streaming_and_safety_boundaries_explicit()
     assert "provider emitted a tool event in inquiry-only mode" in source
     assert "buffer_until_terminal" in source
     assert "provisional" in source
+    assert '"tools"' not in source
 
 
 def test_candidate_llm_template_has_pinned_server_ranges_and_remains_partial() -> None:

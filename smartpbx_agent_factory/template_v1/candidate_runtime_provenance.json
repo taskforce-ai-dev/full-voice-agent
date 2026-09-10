@@ -30,6 +30,13 @@
       "extraction": "endpointed STT callback, streamed LLM response, TTS media emission"
     },
     {
+      "template_path": "runtime/llm_adapters.py.tmpl",
+      "template_sha256": "sha256:21de334fbe0371fc688ff6023ec0e5eecdd77a2c3a3cc3bee4ceb8f2edd2c53f",
+      "source_path": "Kavya/server.py",
+      "source_ranges": ["1567-1708", "8437-8522", "11702-12051", "12488-12845"],
+      "extraction": "startup-injected Claude and Gemini stream adapters: thinking progress, terminal metadata, bounded acquisition and stalls, single safe retry, and inquiry-only fail-closed recovery"
+    },
+    {
       "template_path": "runtime/smartpbx_transport.py.tmpl",
       "template_sha256": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e",
       "source_path": "Kavya/smartpbx_transport.py",

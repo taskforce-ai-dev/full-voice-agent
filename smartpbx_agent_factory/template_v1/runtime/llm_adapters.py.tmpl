@@ -1,0 +1,492 @@
+"""Injected, inquiry-only streaming adapters for two supported LLM protocols.
+
+Clients and configuration are supplied by startup wiring.  This module never
+reads an environment variable, constructs a credential, logs a request, or
+contains product identity.  Provider clients normalize SDK events into the
+small mapping shapes documented by ``ClaudeStreamClient`` and
+``GeminiStreamClient`` before they reach this boundary.
+
+Visible text is buffered until terminal metadata proves a completed turn.  The
+provider stream is still consumed incrementally, but only terminal-confirmed
+text is safe to hand to speech or history; provisional text is deliberately
+not exposed.  A caller that needs latency hints may observe
+``ThinkingProgress``; it must never render thinking content.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass, field
+from enum import Enum
+from time import monotonic
+from typing import Literal, Protocol
+
+
+ProviderName = Literal["claude", "gemini"]
+StreamPhase = Literal["initial", "stall"]
+
+
+class ClaudeStreamClient(Protocol):
+    """Injected client whose context-manager entry opens a Claude stream.
+
+    Each item is a mapping with the provider's event names: ``message_start``,
+    ``content_block_start``, ``content_block_delta``, ``message_delta``, and
+    ``message_stop``.  Text and thinking live only in their content-block
+    events; terminal ``message_delta`` carries ``stop_reason`` and optional
+    ``output_tokens``.
+    """
+
+    def open_stream(
+        self, request: Mapping[str, object]
+    ) -> AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]]: ...
+
+
+class GeminiStreamClient(Protocol):
+    """Injected client returning normalized incremental Gemini event mappings.
+
+    Event ``kind`` is one of ``text``, ``thinking``, ``usage``, ``finish``, or
+    ``tool``.  A ``finish`` event is mandatory and may contain
+    ``finish_reason`` and ``output_tokens``.  The client must not flatten a
+    function call into ordinary text.
+    """
+
+    async def open_stream(self, request: Mapping[str, object]) -> AsyncIterator[Mapping[str, object]]: ...
+
+
+@dataclass(frozen=True)
+class ThinkingConfig:
+    """Provider thinking controls, retained by default instead of disabled."""
+
+    enabled: bool = True
+    claude_effort: Literal["low", "medium", "high"] | None = None
+    gemini_level: Literal["low", "medium", "high"] | None = "low"
+    gemini_budget: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("thinking enabled must be boolean")
+        if self.gemini_level is not None and self.gemini_budget is not None:
+            raise ValueError("Gemini thinking level and budget are mutually exclusive")
+        if self.gemini_budget is not None and not 0 <= self.gemini_budget <= 16_384:
+            raise ValueError("Gemini thinking budget is outside the supported range")
+
+
+@dataclass(frozen=True)
+class StreamTimeouts:
+    initial_seconds: float = 8.0
+    stall_seconds: float = 8.0
+    claude_thinking_stall_seconds: float = 15.0
+
+    def __post_init__(self) -> None:
+        for value in (self.initial_seconds, self.stall_seconds, self.claude_thinking_stall_seconds):
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not 1.0 <= float(value) <= 30.0:
+                raise ValueError("stream timeout must be a finite value between one and thirty seconds")
+        if self.claude_thinking_stall_seconds < self.stall_seconds:
+            raise ValueError("Claude thinking stall timeout may not weaken the ordinary stall timeout")
+
+
+@dataclass(frozen=True)
+class LLMRuntimeConfig:
+    claude_model: str
+    gemini_model: str
+    max_output_tokens: int
+    timeouts: StreamTimeouts = field(default_factory=StreamTimeouts)
+    thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
+
+    def __post_init__(self) -> None:
+        if not self.claude_model or not self.gemini_model:
+            raise ValueError("configured model names are required")
+        if not isinstance(self.max_output_tokens, int) or isinstance(self.max_output_tokens, bool):
+            raise ValueError("max output tokens must be an integer")
+        if not 1 <= self.max_output_tokens <= 16_384:
+            raise ValueError("max output tokens are outside the supported range")
+
+
+@dataclass(frozen=True)
+class InquiryMessage:
+    role: Literal["user", "assistant"]
+    content: str
+
+    def __post_init__(self) -> None:
+        if self.role not in {"user", "assistant"} or not isinstance(self.content, str) or not self.content:
+            raise ValueError("inquiry messages require a user or assistant role and text content")
+
+
+@dataclass(frozen=True)
+class InquiryRequest:
+    provider: ProviderName
+    system_prompt: str
+    messages: Sequence[InquiryMessage]
+
+    def __post_init__(self) -> None:
+        if self.provider not in {"claude", "gemini"} or not isinstance(self.system_prompt, str):
+            raise ValueError("inquiry request is invalid")
+        _validate_inquiry_messages(self.messages)
+
+
+@dataclass(frozen=True)
+class TextDelta:
+    text: str
+
+
+@dataclass(frozen=True)
+class ThinkingProgress:
+    """Content-free progress marker; thinking text is intentionally discarded."""
+
+
+@dataclass(frozen=True)
+class TerminalMetadata:
+    provider: ProviderName
+    finish_reason: str
+    output_tokens: int | None
+    attempt: int
+
+
+StreamEvent = TextDelta | ThinkingProgress | TerminalMetadata
+
+
+class RecoveryReason(str, Enum):
+    TIMEOUT = "timeout"
+    TRUNCATED = "truncated"
+    EMPTY = "empty"
+    PROVIDER_FAILURE = "provider_failure"
+
+
+class LLMStreamTimeout(TimeoutError):
+    def __init__(self, phase: StreamPhase) -> None:
+        self.phase = phase
+        super().__init__(phase)
+
+
+class LLMProtocolError(RuntimeError):
+    """Raised when a provider stream violates the inquiry-only contract."""
+
+
+class LLMRecoveryRequired(RuntimeError):
+    """A caller-facing recovery boundary with no provider payload or secret."""
+
+    def __init__(self, provider: ProviderName, reason: RecoveryReason, attempts: int) -> None:
+        self.provider = provider
+        self.reason = reason
+        self.attempts = attempts
+        super().__init__(f"{provider}:{reason.value}:{attempts}")
+
+
+@dataclass
+class _AttemptState:
+    provider: ProviderName
+    text: list[str] = field(default_factory=list)
+    progress: Literal["none", "metadata", "thinking", "text"] = "none"
+    saw_terminal_metadata: bool = False
+    saw_terminal_stop: bool = False
+    finish_reason: str = "unknown"
+    output_tokens: int | None = None
+
+    @property
+    def terminal_metadata(self) -> bool:
+        return self.saw_terminal_metadata and self.saw_terminal_stop
+
+
+class _DeadlineContext(AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]]):
+    def __init__(self, context: AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]], timeout: float) -> None:
+        self._context = context
+        self._timeout = timeout
+        self._entered = False
+
+    async def __aenter__(self) -> AsyncIterator[Mapping[str, object]]:
+        try:
+            stream = await asyncio.wait_for(self._context.__aenter__(), timeout=self._timeout)
+        except asyncio.TimeoutError as exc:
+            raise LLMStreamTimeout("initial") from exc
+        self._entered = True
+        return stream
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> bool | None:
+        if not self._entered:
+            return False
+        return await self._context.__aexit__(exc_type, exc, traceback)
+
+
+class InquiryOnlyLLMAdapter:
+    """One startup-injected LLM lane with no tool surface or tenant data."""
+
+    def __init__(
+        self,
+        *,
+        claude_client: ClaudeStreamClient,
+        gemini_client: GeminiStreamClient,
+        config: LLMRuntimeConfig,
+    ) -> None:
+        self._claude_client = claude_client
+        self._gemini_client = gemini_client
+        self._config = config
+
+    async def stream_response(self, request: InquiryRequest) -> AsyncIterator[StreamEvent]:
+        """Yield terminal-confirmed text and metadata, or raise one recovery boundary.
+
+        Provider transport remains incremental under the hood.  Text is not
+        yielded until both terminal metadata and a terminal stop are present,
+        making truncation and timeout failures fail closed for TTS/history.
+        A first attempt may retry once only before any visible text exists.
+        """
+        retry_used = False
+        for attempt in (1, 2):
+            state = _AttemptState(request.provider)
+            try:
+                await self._collect_attempt(request, state)
+            except LLMStreamTimeout as exc:
+                if self._timeout_is_retryable(state, exc, retry_used):
+                    retry_used = True
+                    continue
+                raise LLMRecoveryRequired(request.provider, RecoveryReason.TIMEOUT, attempt) from None
+            except LLMProtocolError:
+                raise
+            except Exception:
+                raise LLMRecoveryRequired(request.provider, RecoveryReason.PROVIDER_FAILURE, attempt) from None
+
+            if state.terminal_metadata:
+                if state.text:
+                    for text in state.text:
+                        yield TextDelta(text)
+                    yield TerminalMetadata(request.provider, state.finish_reason, state.output_tokens, attempt)
+                    return
+                if not retry_used:
+                    retry_used = True
+                    continue
+                raise LLMRecoveryRequired(request.provider, RecoveryReason.EMPTY, attempt)
+            if not retry_used and not state.text:
+                retry_used = True
+                continue
+            raise LLMRecoveryRequired(request.provider, RecoveryReason.TRUNCATED, attempt)
+        raise LLMRecoveryRequired(request.provider, RecoveryReason.EMPTY, 2)
+
+    def _timeout_is_retryable(self, state: _AttemptState, error: LLMStreamTimeout, retry_used: bool) -> bool:
+        return (
+            not retry_used
+            and not state.text
+            and error.phase == "stall"
+            and state.provider == "claude"
+            and state.progress in {"metadata", "thinking"}
+        )
+
+    async def _collect_attempt(self, request: InquiryRequest, state: _AttemptState) -> None:
+        if request.provider == "claude":
+            async for raw in self._claude_events(request):
+                self._consume_claude_event(raw, state)
+            return
+        async for raw in self._gemini_events(request):
+            self._consume_gemini_event(raw, state)
+
+    async def _claude_events(self, request: InquiryRequest) -> AsyncIterator[Mapping[str, object]]:
+        deadline = monotonic() + self._config.timeouts.initial_seconds
+        context = self._claude_client.open_stream(_claude_request(request, self._config))
+        async with _DeadlineContext(context, self._config.timeouts.initial_seconds) as stream:
+            async for item in _guarded_stream(
+                stream,
+                initial_seconds=max(deadline - monotonic(), 0.0),
+                stall_seconds=self._config.timeouts.stall_seconds,
+                thinking_stall_seconds=self._config.timeouts.claude_thinking_stall_seconds,
+            ):
+                yield _event_mapping(item)
+
+    async def _gemini_events(self, request: InquiryRequest) -> AsyncIterator[Mapping[str, object]]:
+        deadline = monotonic() + self._config.timeouts.initial_seconds
+        try:
+            stream = await asyncio.wait_for(
+                self._gemini_client.open_stream(_gemini_request(request, self._config)),
+                timeout=self._config.timeouts.initial_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise LLMStreamTimeout("initial") from exc
+        async for item in _guarded_stream(
+            stream,
+            initial_seconds=max(deadline - monotonic(), 0.0),
+            stall_seconds=self._config.timeouts.stall_seconds,
+            thinking_stall_seconds=self._config.timeouts.stall_seconds,
+        ):
+            yield _event_mapping(item)
+
+    @staticmethod
+    def _consume_claude_event(event: Mapping[str, object], state: _AttemptState) -> None:
+        event_type = event.get("type")
+        if event_type == "message_start":
+            state.progress = _advance_progress(state.progress, "metadata")
+            return
+        if event_type == "content_block_start":
+            block = _mapping(event.get("content_block"), "content_block")
+            block_type = block.get("type")
+            if block_type == "thinking":
+                state.progress = _advance_progress(state.progress, "thinking")
+                return
+            if block_type == "tool_use":
+                raise LLMProtocolError("provider emitted a tool event in inquiry-only mode")
+            return
+        if event_type == "content_block_delta":
+            delta = _mapping(event.get("delta"), "delta")
+            delta_type = delta.get("type")
+            if delta_type == "thinking_delta":
+                state.progress = _advance_progress(state.progress, "thinking")
+                return
+            if delta_type == "text_delta":
+                text = delta.get("text")
+                if not isinstance(text, str):
+                    raise LLMProtocolError("Claude text delta is invalid")
+                if text:
+                    state.progress = _advance_progress(state.progress, "text")
+                    state.text.append(text)
+                return
+            if delta_type == "input_json_delta":
+                raise LLMProtocolError("provider emitted a tool event in inquiry-only mode")
+            return
+        if event_type == "message_delta":
+            delta = _mapping(event.get("delta"), "delta")
+            state.saw_terminal_metadata = True
+            state.finish_reason = _safe_terminal_value(delta.get("stop_reason"))
+            usage = event.get("usage")
+            if isinstance(usage, Mapping):
+                state.output_tokens = _bounded_tokens(usage.get("output_tokens"))
+            return
+        if event_type == "message_stop":
+            state.saw_terminal_stop = True
+
+    @staticmethod
+    def _consume_gemini_event(event: Mapping[str, object], state: _AttemptState) -> None:
+        kind = event.get("kind")
+        if kind == "thinking":
+            state.progress = _advance_progress(state.progress, "thinking")
+            return
+        if kind == "text":
+            text = event.get("text")
+            if not isinstance(text, str):
+                raise LLMProtocolError("Gemini text delta is invalid")
+            if text:
+                state.progress = _advance_progress(state.progress, "text")
+                state.text.append(text)
+            return
+        if kind == "usage":
+            state.output_tokens = _bounded_tokens(event.get("output_tokens"))
+            return
+        if kind == "finish":
+            state.saw_terminal_metadata = True
+            state.saw_terminal_stop = True
+            state.finish_reason = _safe_terminal_value(event.get("finish_reason"))
+            state.output_tokens = _bounded_tokens(event.get("output_tokens", state.output_tokens))
+            return
+        if kind in {"tool", "function_call"}:
+            raise LLMProtocolError("provider emitted a tool event in inquiry-only mode")
+
+
+async def _guarded_stream(
+    stream: AsyncIterable[Mapping[str, object]],
+    *,
+    initial_seconds: float,
+    stall_seconds: float,
+    thinking_stall_seconds: float,
+) -> AsyncIterator[Mapping[str, object]]:
+    """Bound acquisition-to-first-item and inter-item waits without a total cap."""
+    iterator = stream.__aiter__()
+    first = True
+    progress = "none"
+    while True:
+        timeout = initial_seconds if first else (thinking_stall_seconds if progress == "thinking" else stall_seconds)
+        try:
+            item = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise LLMStreamTimeout("initial" if first else "stall") from exc
+        except StopAsyncIteration:
+            return
+        event = _event_mapping(item)
+        if event.get("type") == "message_start" or event.get("kind") == "usage":
+            progress = "metadata"
+        elif _is_thinking_event(event):
+            progress = "thinking"
+        elif _is_text_event(event):
+            progress = "text"
+        first = False
+        yield event
+
+
+def _claude_request(request: InquiryRequest, config: LLMRuntimeConfig) -> Mapping[str, object]:
+    payload: dict[str, object] = {
+        "model": config.claude_model,
+        "max_tokens": config.max_output_tokens,
+        "system": request.system_prompt,
+        "messages": [{"role": item.role, "content": item.content} for item in request.messages],
+    }
+    if config.thinking.enabled and config.thinking.claude_effort is not None:
+        payload["output_config"] = {"effort": config.thinking.claude_effort}
+    return payload
+
+
+def _gemini_request(request: InquiryRequest, config: LLMRuntimeConfig) -> Mapping[str, object]:
+    generation: dict[str, object] = {
+        "system_instruction": request.system_prompt,
+        "max_output_tokens": config.max_output_tokens,
+    }
+    if config.thinking.enabled:
+        if config.thinking.gemini_level is not None:
+            generation["thinking_config"] = {"thinking_level": config.thinking.gemini_level}
+        elif config.thinking.gemini_budget is not None:
+            generation["thinking_config"] = {"thinking_budget": config.thinking.gemini_budget}
+    return {
+        "model": config.gemini_model,
+        "contents": [{"role": item.role, "parts": [{"text": item.content}]} for item in request.messages],
+        "config": generation,
+    }
+
+
+def _validate_inquiry_messages(messages: Sequence[InquiryMessage]) -> None:
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)) or not messages:
+        raise ValueError("inquiry request requires at least one message")
+    if any(not isinstance(item, InquiryMessage) for item in messages):
+        raise ValueError("inquiry request may contain only text messages")
+
+
+def _event_mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise LLMProtocolError("provider stream event must be a mapping")
+    return value
+
+
+def _mapping(value: object, label: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise LLMProtocolError(f"provider {label} is invalid")
+    return value
+
+
+def _advance_progress(current: str, candidate: Literal["metadata", "thinking", "text"]) -> Literal["none", "metadata", "thinking", "text"]:
+    order = {"none": 0, "metadata": 1, "thinking": 2, "text": 3}
+    return candidate if order[candidate] > order[current] else current  # type: ignore[return-value]
+
+
+def _safe_terminal_value(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return "unknown"
+    return value if value.replace("_", "").isalnum() else "unknown"
+
+
+def _bounded_tokens(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000 else None
+
+
+def _is_thinking_event(event: Mapping[str, object]) -> bool:
+    if event.get("kind") == "thinking":
+        return True
+    if event.get("type") == "content_block_start":
+        block = event.get("content_block")
+        return isinstance(block, Mapping) and block.get("type") == "thinking"
+    if event.get("type") == "content_block_delta":
+        delta = event.get("delta")
+        return isinstance(delta, Mapping) and delta.get("type") == "thinking_delta"
+    return False
+
+
+def _is_text_event(event: Mapping[str, object]) -> bool:
+    if event.get("kind") == "text":
+        return True
+    if event.get("type") != "content_block_delta":
+        return False
+    delta = event.get("delta")
+    return isinstance(delta, Mapping) and delta.get("type") == "text_delta"
