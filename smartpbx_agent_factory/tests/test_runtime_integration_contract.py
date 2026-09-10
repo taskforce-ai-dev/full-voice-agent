@@ -111,6 +111,7 @@ def test_source_shaped_history_recognition_and_selection_contracts_prevent_known
     session = source("smartpbx_session.py.tmpl")
     renderer = (Path(__file__).parents[1] / "render.py").read_text(encoding="utf-8")
     assert 'messages=messages' in builders
+    assert '(("user", transcript),)' in builders
     assert 'messages=(*messages, InquiryMessage("user", transcript))' not in builders
     assert 'self._history.append(("user", transcript))' in engine
     assert 'self._history.append(("assistant", committed_response))' in engine
@@ -121,10 +122,25 @@ def test_source_shaped_history_recognition_and_selection_contracts_prevent_known
     assert 'exact_prefix = f"{committed} "' in engine
     assert "_normalized_tokens" in engine and "SequenceMatcher" in engine
     assert "len(transcript_tokens) < 5" in engine
-    assert "set_recognizer_result_admission(False)" in session
+    assert session.index("set_recognizer_result_admission(False)") < session.index("await self._turn_engine.start")
     assert "set_recognizer_result_admission(True)" in session
     assert "_reviewed_language_ux" in renderer and "no reviewed caller UX catalogue entry" in renderer
     assert "කරුණාකර රැඳෙන්න." in renderer
+
+
+def test_renderer_uses_the_verified_gateway_template_and_keeps_partial_web_ingress_blocked():
+    root = Path(__file__).parents[1]
+    renderer = (root / "render.py").read_text(encoding="utf-8")
+    candidate = (root / "template_v1" / "runtime_infrastructure_candidate.json").read_text(encoding="utf-8")
+    allowlist = (root / "template_v1" / "file_allowlist.json").read_text(encoding="utf-8")
+    assert '"smartpbx_gateway.py": runtime_template("smartpbx_gateway.py.tmpl")' in renderer
+    assert "def _python_gateway" not in renderer
+    assert '"website_demo.py": runtime_template("website_demo.py.tmpl")' in renderer
+    assert "synthetic=synthetic" in renderer and "review-only-exact-template" in renderer
+    assert "website-demo/Twilio ingress" in candidate
+    assert "website-demo ingress" in allowlist
+    compose = (root / "template_v1" / "infrastructure" / "docker-compose.yml.tmpl").read_text(encoding="utf-8")
+    assert "website-demo" not in compose
 
 
 def test_deepgram_is_not_an_approved_generated_runtime_provider():

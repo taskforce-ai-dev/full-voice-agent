@@ -56,8 +56,8 @@ class InquirySmartPBXSession:
             raise RuntimeError("conversation provider adapter is inactive")
         self._started = True
         default = self._product_profile.default_language
-        await self._turn_engine.start(self._product_profile.language(default))
         self._turn_engine.set_recognizer_result_admission(False)
+        await self._turn_engine.start(self._product_profile.language(default))
         if len(self._product_profile.language_profiles) == 1:
             self._selected_language = default
             await self._turn_engine.speak_profile_message(

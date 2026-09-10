@@ -19,6 +19,7 @@ def test_review_only_runtime_infrastructure_candidate_is_complete_but_not_approv
     assert candidate["source_revision"] == "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e"
     assert candidate["oci_revision"] == candidate["source_revision"]
     assert candidate["approval"] == {"rendering": "blocked", "release": "blocked", "routing": "blocked"}
+    assert any("website-demo/Twilio ingress" in item for item in candidate["unresolved_blockers"])
     assert candidate["runtime_outputs"] == [
         "startup.py",
         "server.py",

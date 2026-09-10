@@ -286,74 +286,8 @@ def _language_prompt_block(manifest: AgentManifest, language_code: str) -> str:
     )
 
 
-def _python_gateway(resources: DerivedResources) -> str:
-    return f'''"""Generated SmartPBX gateway. Authentication always precedes accept()."""
-from __future__ import annotations
-
-import json
-import secrets
-from dataclasses import dataclass
-from typing import Mapping
-
-
-@dataclass(frozen=True)
-class SmartPBXSettings:
-    token: str
-    account_id: str
-    auth_header_name: str = "{resources.wss_header}"
-    max_calls: int = 1
-
-    @classmethod
-    def from_env(cls, environ: Mapping[str, str]) -> "SmartPBXSettings":
-        token = environ.get("SMARTPBX_WS_TOKEN", "")
-        account_id = environ.get("SMARTPBX_ACCOUNT_ID", "")
-        header = environ.get("SMARTPBX_AUTH_HEADER_NAME", "{resources.wss_header}")
-        if not token or not account_id or not header:
-            raise ValueError("SmartPBX settings are incomplete")
-        return cls(token=token, account_id=account_id, auth_header_name=header)
-
-    def token_matches(self, candidate: object) -> bool:
-        return isinstance(candidate, str) and candidate.isascii() and secrets.compare_digest(self.token, candidate)
-
-
-class SmartPBXSessionRegistry:
-    def __init__(self, max_sessions: int) -> None:
-        if not isinstance(max_sessions, int) or isinstance(max_sessions, bool) or max_sessions < 1:
-            raise ValueError("max_sessions must be positive")
-        self.max_sessions = max_sessions
-
-
-class SmartPBXGateway:
-    def __init__(self, settings: SmartPBXSettings, registry: SmartPBXSessionRegistry) -> None:
-        self.settings = settings
-        self.registry = registry
-
-    async def handle(self, websocket, factory) -> None:
-        candidate = websocket.headers.get(self.settings.auth_header_name)
-        if not self.settings.token_matches(candidate):
-            await websocket.close(code=1008, reason="unauthorized")
-            return
-        await websocket.accept()
-        session = None
-        while True:
-            event = json.loads(await websocket.receive_text())
-            if event.get("event") == "start":
-                start = event.get("start", {{}})
-                if start.get("accountId") != self.settings.account_id:
-                    await websocket.close(code=1008, reason="unauthorized")
-                    return
-                session = await factory(start, None)
-                if hasattr(session, "start"):
-                    await session.start()
-            elif event.get("event") == "stop":
-                if session is not None and hasattr(session, "finish"):
-                    await session.finish()
-                return
-'''
-
-
 def _files(
-    manifest: AgentManifest, resources: DerivedResources, documents: Mapping[str, str], templates: Mapping[str, str]
+    manifest: AgentManifest, resources: DerivedResources, documents: Mapping[str, str], templates: Mapping[str, str], *, synthetic: bool
 ) -> Mapping[str, str]:
     enabled = manifest.capabilities.enabled_names
     if enabled:
@@ -420,7 +354,18 @@ activation_state: pending
     }
 
     def infrastructure_template(name: str, fallback: str) -> str:
-        return render_template_text(templates.get(f"infrastructure/{name}", fallback), infrastructure_variables)
+        template = templates.get(f"infrastructure/{name}")
+        if template is None:
+            if not synthetic:
+                raise IncompleteTemplateError(f"INCOMPLETE_TEMPLATE: missing infrastructure template: {name}")
+            template = fallback
+        return render_template_text(template, infrastructure_variables)
+
+    def runtime_template(name: str) -> str:
+        try:
+            return templates[f"runtime/{name}"]
+        except KeyError as error:
+            raise IncompleteTemplateError(f"INCOMPLETE_TEMPLATE: missing runtime template: {name}") from error
 
     runtime_templates = ("stt_adapters.py.tmpl", "llm_adapters.py.tmpl", "tts_adapters.py.tmpl", "provider_builders.py.tmpl")
     missing_templates = [name for name in runtime_templates if f"runtime/{name}" not in templates]
@@ -436,27 +381,26 @@ activation_state: pending
         "docker-compose.yml": infrastructure_template("docker-compose.yml.tmpl", compose),
         "requirements-prod.txt": infrastructure_template("requirements-prod.txt.tmpl", "# Standard-library runtime only.\n"),
         "requirements-prod.lock.txt": infrastructure_template("requirements-prod.lock.txt.tmpl", "# No runtime packages.\n"),
-        "startup.py": templates.get("runtime/startup.py.tmpl", "app = object()\n"),
-        "server.py": templates.get("runtime/server.py.tmpl", "def build_service_app(*_args): raise RuntimeError('runtime template unavailable')\n"),
+        "startup.py": runtime_template("startup.py.tmpl"),
+        "server.py": runtime_template("server.py.tmpl"),
         "product_profile.py": product_profile_template,
         "product_profile.json": product_profile,
-        "smartpbx_diagnostics.py": templates.get("runtime/smartpbx_diagnostics.py.tmpl", "def redacted_status(active_sessions=0):\n    return {'active_sessions': active_sessions}\n"),
-        "smartpbx_gateway.py": _python_gateway(resources),
-        "smartpbx_protocol.py": templates.get("runtime/smartpbx_protocol.py.tmpl", "PROTOCOL_VERSION = 'smartpbx-ai-provider-v06'\n"),
-        "smartpbx_session.py": templates.get("runtime/smartpbx_session.py.tmpl", "class InquirySession:\n    async def start(self): pass\n    async def finish(self): pass\n"),
-        "smartpbx_transport.py": templates.get("runtime/smartpbx_transport.py.tmpl", "class SmartPBXMediaTransport: pass\n"),
-        "product_profile.py": templates.get("runtime/product_profile.py.tmpl", "def load_product_profile(path): return object()\n"),
-        "provider_adapters.py": templates.get("runtime/provider_adapters.py.tmpl", "class ConversationProviderAdapter: pass\n"),
-        "provider_runtime.py": templates.get("runtime/provider_runtime.py.tmpl", "def bind_provider_adapter(*_args): raise RuntimeError('provider lane unavailable')\n"),
+        "smartpbx_diagnostics.py": runtime_template("smartpbx_diagnostics.py.tmpl"),
+        "smartpbx_gateway.py": runtime_template("smartpbx_gateway.py.tmpl"),
+        "smartpbx_protocol.py": runtime_template("smartpbx_protocol.py.tmpl"),
+        "smartpbx_session.py": runtime_template("smartpbx_session.py.tmpl"),
+        "smartpbx_transport.py": runtime_template("smartpbx_transport.py.tmpl"),
+        "provider_adapters.py": runtime_template("provider_adapters.py.tmpl"),
+        "provider_runtime.py": runtime_template("provider_runtime.py.tmpl"),
         "provider_builders.py": templates["runtime/provider_builders.py.tmpl"],
         "stt_adapters.py": templates["runtime/stt_adapters.py.tmpl"],
         "llm_adapters.py": templates["runtime/llm_adapters.py.tmpl"],
         "tts_adapters.py": templates["runtime/tts_adapters.py.tmpl"],
-        "turn_engine.py": templates.get("runtime/turn_engine.py.tmpl", "class ConversationTurnEngine: pass\n"),
+        "turn_engine.py": runtime_template("turn_engine.py.tmpl"),
         "config/product_profile.json": json.dumps(product_profile, sort_keys=True, indent=2) + "\n",
         "config/provider_profile.json": json.dumps(provider_profile, sort_keys=True, indent=2) + "\n",
         "tools.py": "TOOL_REGISTRY = {}\n",
-        "website_demo.py": "ROUTES = ('/voice/demo-incoming',)\n# Browser tokens are issued only by the shared approved issuer.\n",
+        "website_demo.py": runtime_template("website_demo.py.tmpl"),
         "nginx-smartpbx.conf": infrastructure_template("nginx-smartpbx.conf.tmpl", "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n"),
         f"nginx-{resources.smartpbx_service}.conf": infrastructure_template("nginx-smartpbx.conf.tmpl", "location /smartpbx/status {}\nlocation /ws/v1/smartpbx/media {}\n"),
         "scripts/deploy_smartpbx_image.sh": infrastructure_template("scripts/deploy_runtime_image.sh.tmpl", "#!/bin/sh\necho 'Manual release approval required.'\nexit 1\n"),
@@ -572,15 +516,14 @@ def render_backend(
     provides a complete runtime.  Explicit templates are test-only synthetic
     fixtures and reports label their output non-deployable.
     """
-    if template_allowlist is not None and not template_allowlist.template_version.startswith("synthetic-test-"):
-        raise IncompleteTemplateError("INCOMPLETE_TEMPLATE: only synthetic fixture rendering is available")
     allowlist = template_allowlist or _load_default_allowlist()
+    synthetic = allowlist.template_version.startswith("synthetic-test-")
     root = Path(template_root) if template_root is not None else _TEMPLATE_ROOT
     templates = _verify_supplied_templates(root, allowlist)
     if resources.slug != manifest.slug or resources.folder_identity != f"SmartPBX Agents/{manifest.slug}":
         raise RenderError("derived resources do not match manifest identity")
     facts = _review_facts(review, state, manifest)
-    files = _files(manifest, resources, _knowledge_documents(review, facts), templates)
+    files = _files(manifest, resources, _knowledge_documents(review, facts), templates, synthetic=synthetic)
     _scan_outputs(files)
     rendered_root = _derived_render_root(worktree, worktree_manager, resources)
     names = _write_files(rendered_root, files)
@@ -592,7 +535,7 @@ def render_backend(
         enabled_capabilities=manifest.capabilities.enabled_names,
         template_version=allowlist.template_version,
         review_digest=review.digest,
-        synthetic=True,
+        synthetic=synthetic,
         deployable=False,
-        runtime_status="synthetic-structural-contract-only",
+        runtime_status="synthetic-structural-contract-only" if synthetic else "review-only-exact-template",
     )

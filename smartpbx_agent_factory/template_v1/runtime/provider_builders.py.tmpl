@@ -161,7 +161,9 @@ class _RoutedLLM:
         self._adapter, self._providers, self._closers = adapter, dict(providers), closers
 
     async def stream_response(self, transcript: str, language: str, prompt: str) -> AsyncIterator[Any]:
-        async for event in self.stream_response_with_history(transcript, language, prompt, ()):
+        async for event in self.stream_response_with_history(
+            transcript, language, prompt, (("user", transcript),)
+        ):
             yield event
 
     async def stream_response_with_history(

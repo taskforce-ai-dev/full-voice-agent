@@ -28,6 +28,10 @@
     "release": "blocked",
     "routing": "blocked"
   },
+  "unresolved_blockers": [
+    "CI has not proved real provider startup or connected/start/media/stop/hangup cleanup.",
+    "A source-approved isolated website-demo/Twilio ingress profile is not yet extracted; no stub may satisfy this requirement."
+  ],
   "artifacts": [
     {"template_path": "infrastructure/Dockerfile.tmpl", "role": "explicit runtime copy and import guard"},
     {"template_path": "infrastructure/requirements-prod.txt.tmpl", "role": "exact direct dependency input"},

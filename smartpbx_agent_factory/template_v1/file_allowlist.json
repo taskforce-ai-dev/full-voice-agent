@@ -1,7 +1,7 @@
 {
   "template_version": "v1",
   "status": "partial",
-  "block_reason": "candidate runtime templates remain unapproved: source-pinned SDK builders and offline synthetic composition are structural evidence only until the CI lifecycle lane proves provider startup and carrier connected/start/media/stop/hangup cleanup",
+  "block_reason": "candidate runtime templates remain unapproved: source-pinned SDK builders and offline synthetic composition are structural evidence only until the CI lifecycle lane proves provider startup and carrier connected/start/media/stop/hangup cleanup; the separate website-demo ingress profile has not been source-extracted and must not be rendered from a stub",
   "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
   "image_digest": "sha256:3d1cfce67574efd1c8bde484d26345c027713c4d169f37804114fecec5b81350",
   "oci_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
