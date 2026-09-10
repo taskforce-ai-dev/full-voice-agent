@@ -67,6 +67,21 @@ def test_plan_writes_only_private_state_without_claiming_secret_resolution(tmp_p
     assert list(tmp_path.glob("*.json")) == [state_file]
 
 
+def test_planned_transaction_loads_before_plan_approval_without_forging_approval_state(tmp_path):
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    report = orchestrator.plan(FIXTURE)
+
+    stored = orchestrator._load_verified(report.generation_id)
+
+    assert stored.plan_digest == report.plan_digest
+    assert stored.plan_artifact is not None
+    assert stored.plan_artifact["digest"] == report.plan_digest
+    assert stored.state.plan_digest is None
+    assert stored.state.plan_approval_digest is None
+    with pytest.raises(GenerationBlockedError, match="secret resolution"):
+        orchestrator.resume(report.generation_id)
+
+
 def test_cleanup_inventory_loads_current_sealed_ciphertext_schema():
     from smartpbx_agent_factory.orchestrator import _parse_cleanup_inventory
 
@@ -293,6 +308,21 @@ def test_secret_resolution_requires_a_validated_provider_audit_and_binds_digest(
     assert provider.validated is True
     assert state.stage is Stage.KNOWLEDGE_REVIEW_REQUIRED
     assert len(state.stage_digests["secrets"]) == 64
+
+
+def test_secret_resolution_rejects_ciphertext_that_contains_an_exact_plaintext_value(tmp_path):
+    class LeakingProvider(FakeSecretProvider):
+        def encrypt_yaml(self, plaintext: bytes, *, path: Path) -> bytes:
+            assert plaintext and path.name.startswith(".sealed-")
+            return b"sops:\n" + plaintext
+
+    orchestrator = GenerationOrchestrator(tmp_path, catalogue_path=CATALOGUE)
+    report = orchestrator.plan(FIXTURE)
+
+    with pytest.raises(GenerationBlockedError, match="plaintext secret"):
+        orchestrator.record_secrets_resolved(report.generation_id, provider=LeakingProvider())
+
+    assert not (tmp_path / "sealed-secrets" / report.generation_id).exists()
 
 
 @pytest.mark.parametrize(

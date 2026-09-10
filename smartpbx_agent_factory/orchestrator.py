@@ -572,8 +572,15 @@ class GenerationOrchestrator:
             os.fchmod(descriptor, 0o600)
             os.close(descriptor)
             ciphertext = provider.encrypt_yaml(plaintext, path=temporary_path)
+            contains_plaintext_secret = isinstance(ciphertext, bytes) and any(
+                value.encode("utf-8") in ciphertext for value in values.values()
+            )
             values.clear()
             del plaintext
+            if contains_plaintext_secret:
+                raise GenerationBlockedError(
+                    "secret provider ciphertext contains plaintext secret material"
+                )
             if not isinstance(ciphertext, bytes) or not ciphertext or b"sops:" not in ciphertext:
                 raise GenerationBlockedError("secret provider did not return SOPS ciphertext")
             with temporary_path.open("wb") as sealed_file:
@@ -589,10 +596,16 @@ class GenerationOrchestrator:
                 raise GenerationInfrastructureError("sealed secret bundle must be private")
             audit = provider.audit_report()
         except GenerationError:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+                temporary_path = None
             if created_root:
                 self._remove_exact_sealed_bundle(stored.state.generation_id, path)
             raise
         except Exception as error:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+                temporary_path = None
             if created_root:
                 self._remove_exact_sealed_bundle(stored.state.generation_id, path)
             raise GenerationBlockedError("secret resolution and sealing failed") from error
@@ -1268,7 +1281,11 @@ class GenerationOrchestrator:
             artifact = raw.get("plan_artifact") if raw["version"] in {6, 7, 8} else None
             binding = raw.get("binding") if raw["version"] in {6, 7, 8} else None
             sealed = _parse_sealed_secret(raw.get("sealed_secret")) if raw["version"] in {7, 8} else None
-            if raw["version"] in {6, 7, 8} and (not isinstance(artifact, Mapping) or artifact.get("digest") != state.plan_digest or not isinstance(binding, Mapping)):
+            if raw["version"] in {6, 7, 8} and (
+                not isinstance(artifact, Mapping)
+                or artifact.get("digest") != digests[2]
+                or not isinstance(binding, Mapping)
+            ):
                 raise ValueError("state document is missing canonical transaction artifacts")
             if raw["version"] == 8 and artifact.get("approved_source_roots_digest") != roots_digest:
                 raise ValueError("state document is missing its approved source roots binding")

@@ -83,7 +83,7 @@ def test_leak_scan_removes_only_this_generation_artifacts(tmp_path: Path):
     unrelated.write_text("keep", encoding="utf-8")
     with pytest.raises(SecretLeakError):
         render_operations_artifacts(
-            fixture_manifest(), fixture_resources(), b"sops:\n  token: fixture-only-generated-value", tmp_path
+            fixture_manifest(), fixture_resources(), b"sops:\n-----BEGIN FIXTURE", tmp_path
         )
     assert unrelated.read_text(encoding="utf-8") == "keep"
     assert not (tmp_path / "agents/acme-inquiry").exists()
