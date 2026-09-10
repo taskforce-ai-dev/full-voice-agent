@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from hashlib import sha256
 from dataclasses import replace
 from pathlib import Path
 
@@ -164,6 +165,45 @@ def test_authority_requires_private_record_permissions(tmp_path: Path) -> None:
 
     with pytest.raises(ReadinessError, match="0600"):
         authority.load(_state(), worktrees=_worktrees())
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"readiness_report_path": ".smartpbx-generations/gen-001/other.json"},
+        {"review_label": "Authorization: Bearer credential-value"},
+        {"wss_url": "https://smartpbx-acme.taskforceai.tech/ws/v1/smartpbx/media"},
+    ),
+)
+def test_authority_revalidates_persisted_semantic_pr_constraints(
+    tmp_path: Path, change: dict[str, str]
+) -> None:
+    authority = ReadinessAuthority(tmp_path / ".smartpbx-generations")
+    record_path = authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees(), verification_reports=_reports())
+    document = json.loads(record_path.read_text(encoding="utf-8"))
+    document.update(change)
+    document["record_digest"] = sha256(
+        json.dumps(
+            {key: value for key, value in document.items() if key != "record_digest"},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    record_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ReadinessError, match="semantic"):
+        authority.load(_state(), worktrees=_worktrees())
+
+
+def test_authority_revalidates_exact_verified_stage_digests(tmp_path: Path) -> None:
+    authority = ReadinessAuthority(tmp_path / ".smartpbx-generations")
+    authority.persist(_state(), readiness=_readiness(), worktrees=_worktrees(), verification_reports=_reports())
+    stale_state = _state()
+    stale_state.stage_digests.pop("artifact_website")
+
+    with pytest.raises(ReadinessError, match="state digest"):
+        authority.load(stale_state, worktrees=_worktrees())
 
 
 def test_provider_boundary_does_not_accept_caller_built_readiness() -> None:

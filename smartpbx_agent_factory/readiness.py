@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -12,8 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence
+from urllib.parse import urlsplit
 
-from .state import GenerationState
+from .state import GenerationState, Stage
 from .verify import VerificationReport
 
 
@@ -25,6 +27,14 @@ _DIGEST = re.compile(r"[0-9a-f]{64}$")
 _SHA = re.compile(r"[0-9a-f]{40}$")
 _ROLES = ("backend", "operations", "website")
 _RECORD_VERSION = 1
+_MAX_URL_LENGTH = 2048
+_MAX_REVIEW_LABEL_LENGTH = 160
+_CONTROL_PLANE_SUFFIX = ".taskforceai.tech"
+_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_CREDENTIAL_LIKE = re.compile(
+    r"(?:authorization\s*:\s*bearer\s+\S+|(?:api[_-]?key|secret|token|password)\s*[:=]\s*\S+|(?:sk|ghp)_[A-Za-z0-9_-]{8,})",
+    re.IGNORECASE,
+)
 _RECORD_KEYS = {
     "version", "generation_id", "manifest_digest", "readiness_report_path",
     "readiness_verified", "secret_scan_passed", "ci_registered",
@@ -115,6 +125,7 @@ class ReadinessAuthority:
         if document.get("record_digest") != expected_digest:
             raise ReadinessError("readiness record digest does not match its canonical contents")
         readiness = self._readiness_from_document(document)
+        self._validate_loaded_semantics(state, readiness)
         self._validate_record_worktrees(document["worktrees"])
         if worktrees is not None and document["worktrees"] != self._worktree_payloads(worktrees):
             raise ReadinessError("readiness record worktree binding changed")
@@ -238,6 +249,32 @@ class ReadinessAuthority:
                 raise ReadinessError(f"readiness {role} artifact digest is not verified")
             if report.source_revision != readiness.provenance_source_revision:
                 raise ReadinessError(f"readiness {role} source revision is not verified")
+
+    @staticmethod
+    def _validate_loaded_semantics(state: GenerationState, readiness: ReadinessEvidence) -> None:
+        expected_report = Path(".smartpbx-generations") / state.generation_id / "readiness.json"
+        expected_digests = {
+            "readiness": readiness.readiness_digest,
+            "secret_scan": readiness.secret_scan_digest,
+            "ci_registration": readiness.ci_registration_digest,
+            "provenance": readiness.provenance_digest,
+            "worktree_ownership": readiness.worktree_ownership_digest,
+            "artifact_backend": readiness.artifact_digests["backend"],
+            "artifact_operations": readiness.artifact_digests["operations"],
+            "artifact_website": readiness.artifact_digests["website"],
+        }
+        if state.stage is not Stage.VERIFIED:
+            raise ReadinessError("readiness record semantic stage is not VERIFIED")
+        if readiness.readiness_report_path != expected_report:
+            raise ReadinessError("readiness record semantic report path is invalid")
+        if any(state.stage_digests.get(name) != digest for name, digest in expected_digests.items()):
+            raise ReadinessError("readiness record state digest does not match verified state")
+        if not _valid_review_label(readiness.review_label):
+            raise ReadinessError("readiness record semantic review label is invalid")
+        if not _valid_wss_url(
+            readiness.wss_url, readiness.expected_wss_hostname, readiness.allowed_wss_paths
+        ):
+            raise ReadinessError("readiness record semantic public WSS URL is invalid")
 
     @staticmethod
     def _validate_record_worktrees(value: object) -> None:
@@ -386,4 +423,74 @@ def _valid_worktree_payload(value: object) -> bool:
         and isinstance(ownership, dict) and set(ownership) == {"generation_id", "generation_root", "handle", "digest"}
         and all(isinstance(ownership[name], str) and ownership[name] for name in ("generation_id", "generation_root", "handle"))
         and isinstance(ownership["digest"], str) and _DIGEST.fullmatch(ownership["digest"]) is not None
+    )
+
+
+def _contains_control(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _valid_review_label(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value) <= _MAX_REVIEW_LABEL_LENGTH
+        and not _contains_control(value)
+        and _CREDENTIAL_LIKE.search(value) is None
+    )
+
+
+def _valid_public_hostname(value: object) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 253 or _contains_control(value):
+        return False
+    hostname = value.lower()
+    labels = hostname.split(".")
+    try:
+        ipaddress.ip_address(hostname)
+        return False
+    except ValueError:
+        pass
+    if (
+        "." not in hostname
+        or all(label.isdigit() for label in labels)
+        or hostname.endswith((".localhost", ".local", ".internal", ".lan", ".home"))
+        or not hostname.startswith("smartpbx-")
+        or not hostname.endswith(_CONTROL_PLANE_SUFFIX)
+    ):
+        return False
+    return all(_HOST_LABEL.fullmatch(label) is not None for label in labels)
+
+
+def _valid_wss_url(value: object, expected_hostname: object, allowed_paths: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_URL_LENGTH
+        or _contains_control(value)
+        or not _valid_public_hostname(expected_hostname)
+        or not isinstance(allowed_paths, tuple)
+        or not allowed_paths
+        or any(
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or _contains_control(path)
+            or "?" in path
+            or "#" in path
+            for path in allowed_paths
+        )
+    ):
+        return False
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "wss"
+        and parsed.hostname == str(expected_hostname).lower()
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path in allowed_paths
     )
