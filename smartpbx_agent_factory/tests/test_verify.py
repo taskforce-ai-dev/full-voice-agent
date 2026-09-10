@@ -140,6 +140,27 @@ def test_protocol_fixture_has_no_customer_or_media_content():
     assert all("fields" not in item for scenario in fixture.values() for item in scenario)
 
 
+def test_ci_lifecycle_runner_requires_the_runtime_integration_contract():
+    runner = (Path(__file__).parents[2] / "scripts" / "run_smartpbx_ci_lifecycle.py").read_text(encoding="utf-8")
+    for required in (
+        '"8000/tcp"', '"127.0.0.1::8000"', "SMARTPBX_RUNTIME_MODE=synthetic",
+        "SMARTPBX_ALLOW_SYNTHETIC_FOR_CI=1", "SMARTPBX_PRODUCT_PROFILE_PATH=/app/config/product_profile.json",
+        "SMARTPBX_KNOWLEDGE_DIR=/app/knowledge_docs", "SMARTPBX_PROVIDER_PROFILE_PATH=/app/config/provider_profile.json",
+        "active_sessions", "active_tasks", "active_resources", "admitted_total", "released_total",
+        "canonical_ci_fixture", "template_allowlist_digest", "--canonical-fixture",
+    ):
+        assert required in runner
+    assert "ANTHROPIC_API_KEY" not in runner
+    assert "GEMINI_API_KEY" not in runner
+
+
+def test_ci_workflow_cannot_pass_without_the_canonical_review_only_fixture():
+    workflow = (Path(__file__).parents[2] / ".github" / "workflows" / "smartpbx-generated-agents.yml").read_text(encoding="utf-8")
+    assert 'canonical_fixture="SmartPBX Agents/.ci-lifecycle-canonical"' in workflow
+    assert "canonical review-only CI fixture is required" in workflow
+    assert "--canonical-fixture" in workflow
+
+
 def test_provenance_cannot_be_rewritten_to_match_a_modified_artifact(tmp_path):
     agent, binding = fixture_backend(tmp_path / "agent")
     (agent / "server.py").write_text("ROUTES = ('/health', '/smartpbx/status', '/ws/v1/smartpbx/media')\nSTATUS_AUTHENTICATED = True\n# tampered\n", encoding="utf-8")

@@ -46,12 +46,28 @@ jobs:
           else
             changed="$(git diff --name-only "$base" "${{ github.sha }}")"
           fi
+          relevant_changed=false
+          if printf '%s\n' "$changed" | grep -Eq '^(SmartPBX Agents/|smartpbx_agent_factory/|scripts/(check_smartpbx_ci_lifecycle_contract|run_smartpbx_ci_lifecycle)\.py$|\.github/workflows/smartpbx-generated-agents\.yml$)'; then
+            relevant_changed=true
+          fi
           generated_changed=false
           if printf '%s\n' "$changed" | grep -q '^SmartPBX Agents/'; then
             generated_changed=true
           fi
+          canonical_fixture="SmartPBX Agents/.ci-lifecycle-canonical"
+          if [ "$relevant_changed" = true ]; then
+            if [ ! -d "$canonical_fixture" ]; then
+              echo "canonical review-only CI fixture is required for lifecycle-relevant changes" >&2
+              exit 1
+            fi
+            python scripts/run_smartpbx_ci_lifecycle.py --canonical-fixture "$canonical_fixture"
+          fi
           found=false
           while IFS= read -r -d '' agent_dir; do
+            if [ "$agent_dir" = "$canonical_fixture" ]; then
+              found=true
+              continue
+            fi
             found=true
             python -m pytest "$agent_dir/tests"
             python scripts/run_smartpbx_ci_lifecycle.py "$agent_dir"

@@ -36,11 +36,19 @@ def main() -> int:
         "cross_agent_rejection", "account-cross-agent", "missing or wrong authentication", "stop", "hangup",
         "PROTOCOL_FIXTURE", "active_sessions", "active_tasks", "active_resources", "admitted_total", "released_total",
         "HEALTH_WAIT_SECONDS", "finally", "network\", \"rm", "image\", \"rm", "nondeployable",
+        "--canonical-fixture", "canonical_ci_fixture", "template_allowlist_digest", "8000/tcp", "127.0.0.1::8000",
+        "SMARTPBX_RUNTIME_MODE=synthetic", "SMARTPBX_ALLOW_SYNTHETIC_FOR_CI=1",
+        "SMARTPBX_PRODUCT_PROFILE_PATH=/app/config/product_profile.json",
+        "SMARTPBX_KNOWLEDGE_DIR=/app/knowledge_docs",
+        "SMARTPBX_PROVIDER_PROFILE_PATH=/app/config/provider_profile.json",
     ):
         require(required in runner_source, f"runner missing {required!r}")
-    for forbidden in ("print(response", "print(body", "communicate(input="):
+    for forbidden in (
+        "print(response", "print(body", "communicate(input=", "GOOGLE_APPLICATION_CREDENTIALS",
+        "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "ELEVENLABS_API_KEY",
+    ):
         require(forbidden not in runner_source, f"runner contains unsafe or unowned execution form {forbidden!r}")
-    require("review-only" not in runner_source, "review-only release state must not block lifecycle proof")
+    require('provenance.get("release_state") == "review-only"' in runner_source, "review-only release state must be accepted for the canonical fixture")
     require("Authorization" not in runner_source, "status must use the integrated agent-specific authentication header")
     require(runner_source.count("time.sleep(") == 1, "only bounded health waiting may sleep")
 
@@ -56,7 +64,9 @@ def main() -> int:
     require("scripts/check_smartpbx_ci_lifecycle_contract.py" in workflow and "scripts/run_smartpbx_ci_lifecycle.py" in workflow, "workflow paths must cover both lifecycle scripts")
     require("timeout-minutes: 10" in workflow, "workflow lifecycle job must be bounded")
     require("github.event_name" in workflow and "github.event.before" in workflow and "github.event.pull_request.base.sha" in workflow, "workflow must select a robust diff base")
-    require("no generated agent directory" in workflow, "workflow must fail rather than pass empty generated-tree changes")
+    require("canonical_fixture=\"SmartPBX Agents/.ci-lifecycle-canonical\"" in workflow, "workflow must name the canonical review-only fixture")
+    require("canonical review-only CI fixture is required" in workflow, "workflow must fail rather than pass lifecycle-relevant changes without the fixture")
+    require("--canonical-fixture" in workflow and "relevant_changed" in workflow, "workflow must run the canonical fixture on every lifecycle-relevant change")
     return 0
 
 

@@ -71,11 +71,24 @@ def provenance_for(agent_dir: Path) -> dict[str, object]:
     return value
 
 
-def require_real_runtime(agent_dir: Path, provenance: dict[str, object]) -> None:
-    if provenance.get("runtime_status") in {"synthetic", "nondeployable"} or provenance.get("runtime") in {"synthetic", "nondeployable"}:
+def _synthetic_or_nondeployable(value: object) -> bool:
+    return isinstance(value, str) and any(marker in value.lower() for marker in ("synthetic", "nondeployable"))
+
+
+def require_ci_runtime(agent_dir: Path, provenance: dict[str, object], *, canonical_fixture: bool) -> None:
+    marked_nonproduction = any(
+        _synthetic_or_nondeployable(provenance.get(key)) for key in ("runtime_status", "runtime")
+    ) or any((agent_dir / marker).is_file() for marker in (".smartpbx-nondeployable", ".smartpbx-synthetic-runtime"))
+    if canonical_fixture:
+        if not marked_nonproduction:
+            raise LifecycleError("canonical fixture must be explicitly synthetic and nondeployable")
+        review_only_release = provenance.get("release_state") == "review-only"
+        if not review_only_release or provenance.get("canonical_ci_fixture") is not True:
+            raise LifecycleError("canonical fixture provenance is not review-only CI evidence")
+    elif marked_nonproduction:
         raise LifecycleError("generated provenance explicitly marks the runtime nondeployable")
-    if any((agent_dir / marker).is_file() for marker in (".smartpbx-nondeployable", ".smartpbx-synthetic-runtime")):
-        raise LifecycleError("generated runtime explicitly marks itself nondeployable")
+    if not isinstance(provenance.get("template_allowlist_digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", provenance["template_allowlist_digest"]):
+        raise LifecycleError("generated provenance is not bound to an approved template allowlist")
     for required in ("Dockerfile", "server.py", "smartpbx_gateway.py", "smartpbx_diagnostics.py", "docker-compose.yml"):
         if not (agent_dir / required).is_file():
             raise LifecycleError("generated agent is incomplete")
@@ -296,7 +309,7 @@ def valid_lifecycle(host: str, port: int, header: str, token: str, messages: tup
 
 
 def mapped_port(container: str) -> int:
-    raw = command(["docker", "port", container, "8080/tcp"], capture=True).strip()
+    raw = command(["docker", "port", container, "8000/tcp"], capture=True).strip()
     host, separator, port = raw.rpartition(":")
     if not separator or host not in {"127.0.0.1", "[::1]"} or not port.isdecimal():
         raise LifecycleError("container did not receive an ephemeral loopback-only port")
@@ -316,12 +329,13 @@ def inspect_image(image: str, provenance: dict[str, object]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="CI-only disposable SmartPBX lifecycle verifier")
     parser.add_argument("agent_dir", type=Path)
+    parser.add_argument("--canonical-fixture", action="store_true")
     args = parser.parse_args()
     agent_dir = args.agent_dir.resolve()
     if not agent_dir.is_dir():
         raise LifecycleError("agent directory is unavailable")
     provenance = provenance_for(agent_dir)
-    require_real_runtime(agent_dir, provenance)
+    require_ci_runtime(agent_dir, provenance, canonical_fixture=args.canonical_fixture)
     header = authentication_header(agent_dir)
     scenarios = protocol_scenarios()
     run_id = uuid.uuid4().hex
@@ -338,9 +352,15 @@ def main() -> int:
         inspect_image(image, provenance)
         command([
             "docker", "run", "--detach", "--name", container, "--network", network,
-            "--label", f"com.taskforce.smartpbx.lifecycle={run_id}", "--publish", "127.0.0.1::8080",
+            "--label", f"com.taskforce.smartpbx.lifecycle={run_id}", "--publish", "127.0.0.1::8000",
             "--env", f"SMARTPBX_WS_TOKEN={token}", "--env", "SMARTPBX_ACCOUNT_ID=account-synthetic",
-            "--env", f"SMARTPBX_AUTH_HEADER_NAME={header}", image,
+            "--env", f"SMARTPBX_AUTH_HEADER_NAME={header}",
+            "--env", "SMARTPBX_RUNTIME_MODE=synthetic",
+            "--env", "SMARTPBX_ALLOW_SYNTHETIC_FOR_CI=1",
+            "--env", "SMARTPBX_PRODUCT_PROFILE_PATH=/app/config/product_profile.json",
+            "--env", "SMARTPBX_KNOWLEDGE_DIR=/app/knowledge_docs",
+            "--env", "SMARTPBX_PROVIDER_PROFILE_PATH=/app/config/provider_profile.json",
+            image,
         ])
         port = mapped_port(container)
         base_url = f"http://127.0.0.1:{port}"
