@@ -150,8 +150,8 @@ def test_encrypt_uses_argument_vector_and_removes_plaintext_tempfile(tmp_path: P
     assert encrypted.startswith(b"sops:")
     git_call, sops_version, age_version, sops_call = runner.calls
     assert git_call[0][0] == "git"
-    assert sops_version[0] == ["/bin/true", "--version"]
-    assert age_version[0] == ["/bin/true", "--version"]
+    assert sops_version[0] == [str(Path("/bin/true").resolve()), "--version"]
+    assert age_version[0] == [str(Path("/bin/true").resolve()), "--version"]
     assert sops_call[0][0] == "/bin/true" and "--encrypt" in sops_call[0]
     assert all(kwargs["shell"] is False for _, kwargs in runner.calls)
     assert b"fixture-only" not in b" ".join(" ".join(argv).encode() for argv, _ in runner.calls)

@@ -35,10 +35,13 @@ def test_worktree_manager_rejects_dirty_primary_without_fetching(tmp_path):
 
 
 def test_worktree_manager_rejects_target_outside_explicit_root(tmp_path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    (primary / ".git").mkdir()
     manager = WorktreeManager(tmp_path / "generated", run=lambda args: "")
     with pytest.raises(WorktreeConflictError, match="explicit temporary root"):
         manager.create(
-            primary=tmp_path / "primary",
+            primary=primary,
             remote="origin",
             revision="a" * 40,
             target=tmp_path / "outside",
@@ -194,6 +197,7 @@ def test_real_inspector_requires_the_exact_recorded_handle_and_rechecks_git_stat
     def run(args):
         if "worktree" in args and "add" in args:
             target.mkdir(parents=True)
+            (target / ".git").write_text("gitdir: simulated\n", encoding="utf-8")
             return ""
         if args[-2:] == ("status", "--porcelain"):
             return ""
