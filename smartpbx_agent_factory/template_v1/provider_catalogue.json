@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "catalogue_status": "fixture-only-until-provider-evidence-is-reviewed",
+  "languages": {
+    "en-US": {
+      "stt": ["deepgram"],
+      "llm": ["claude"],
+      "tts": ["elevenlabs"],
+      "fallback": []
+    }
+  }
+}
