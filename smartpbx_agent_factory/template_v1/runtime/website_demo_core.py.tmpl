@@ -79,6 +79,53 @@ class TokenQuota:
 
 
 @dataclass(frozen=True)
+class _IssuedBrowserIdentity:
+    expires_at: float
+
+
+class IssuedBrowserIdentities:
+    """Bounded, one-time browser identities accepted by the signed callback.
+
+    A Twilio AccessToken's ``identity`` becomes ``From=client:<identity>`` on
+    the voice webhook.  Recording it only after issuing a browser token keeps
+    a signed callback from minting a relay ticket for an arbitrary client name.
+    """
+
+    def __init__(
+        self,
+        *,
+        capacity: int = 512,
+        ttl_seconds: float = 300.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if capacity < 1 or ttl_seconds <= 0:
+            raise ValueError("invalid website demo browser identity store")
+        self._capacity = capacity
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._identities: OrderedDict[str, _IssuedBrowserIdentity] = OrderedDict()
+
+    def issue(self, identity: str) -> None:
+        if not _safe_identifier(identity):
+            raise ValueError("invalid website demo browser identity")
+        self._purge_expired()
+        self._identities[identity] = _IssuedBrowserIdentity(self._clock() + self._ttl_seconds)
+        self._identities.move_to_end(identity)
+        while len(self._identities) > self._capacity:
+            self._identities.popitem(last=False)
+
+    def consume(self, identity: str) -> bool:
+        self._purge_expired()
+        return self._identities.pop(identity, None) is not None
+
+    def _purge_expired(self) -> None:
+        now = self._clock()
+        for identity, record in tuple(self._identities.items()):
+            if record.expires_at <= now:
+                self._identities.pop(identity, None)
+
+
+@dataclass(frozen=True)
 class _SessionTicket:
     agent: str
     language: str

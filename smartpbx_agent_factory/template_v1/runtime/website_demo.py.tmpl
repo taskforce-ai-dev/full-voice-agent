@@ -29,6 +29,7 @@ from product_profile import LanguageProfile, ProductProfile, load_product_profil
 from provider_adapters import GenerationFence, ProvisionalSentence, RecoveryBoundary, TerminalCommit, ThinkingProgress
 from provider_runtime import build_llm_adapter, load_provider_profile
 from website_demo_core import (
+    IssuedBrowserIdentities,
     SessionTickets,
     TokenQuota,
     WebsiteDemoConfigurationError,
@@ -294,6 +295,7 @@ def build_website_demo_app(settings: WebsiteDemoSettings, provider: Any, profile
     if not getattr(provider, "active", False):
         raise WebsiteDemoConfigurationError("website demo LLM provider is inactive")
     knowledge = _ReviewedKnowledge(profile, settings.knowledge_dir)
+    identities = IssuedBrowserIdentities()
     tickets = SessionTickets()
     quota = TokenQuota()
     sessions = _SessionCounter(settings.max_sessions)
@@ -320,7 +322,9 @@ def build_website_demo_app(settings: WebsiteDemoSettings, provider: Any, profile
         identity = "demo-" + os.urandom(12).hex()
         token = AccessToken(settings.account_sid, settings.api_key_sid, settings.api_key_secret, identity=identity, ttl=300)
         token.add_grant(VoiceGrant(outgoing_application_sid=settings.twiml_app_sid, incoming_allow=False))
-        return {"token": token.to_jwt(), "identity": identity}
+        serialized_token = token.to_jwt()
+        identities.issue(identity)
+        return {"token": serialized_token, "identity": identity}
 
     @app.post("/voice/demo-incoming")
     async def demo_incoming(request: Request) -> Response:
@@ -333,6 +337,9 @@ def build_website_demo_app(settings: WebsiteDemoSettings, provider: Any, profile
         language_code = form.get("lang") or profile.default_language
         if form.get("agent") != settings.agent_id or language_code not in profile.language_profiles:
             raise HTTPException(status_code=404)
+        caller = form.get("From", "")
+        if not caller.startswith("client:") or not identities.consume(caller.removeprefix("client:")):
+            raise HTTPException(status_code=403)
         language = profile.language(language_code)
         ticket = tickets.issue(agent=settings.agent_id, language=language_code)
         return Response(

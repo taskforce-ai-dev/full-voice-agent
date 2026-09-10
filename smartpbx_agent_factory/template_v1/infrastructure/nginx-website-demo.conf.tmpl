@@ -20,6 +20,8 @@ server {
     }
 
     location = /ws/v1/website-demo/conversation {
+        # The one-time admission ticket is in the query string; never persist it.
+        access_log off;
         proxy_pass http://127.0.0.1:{{website_port}};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;

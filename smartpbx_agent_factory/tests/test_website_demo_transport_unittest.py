@@ -19,6 +19,10 @@ _TEMPLATE = (
     / "runtime"
     / "website_demo_core.py.tmpl"
 )
+_WEBSITE_TEMPLATE = _TEMPLATE.with_name("website_demo.py.tmpl")
+_PROVIDER_TEMPLATE = _TEMPLATE.with_name("provider_builders.py.tmpl")
+_WEBSITE_PROXY_TEMPLATE = _TEMPLATE.parents[1] / "infrastructure" / "nginx-website-demo.conf.tmpl"
+_RUNBOOK_TEMPLATE = _TEMPLATE.parents[1] / "infrastructure" / "SMARTPBX_RUNBOOK.md.tmpl"
 
 
 def _load_core():
@@ -53,6 +57,18 @@ class WebsiteDemoTransportContractTests(unittest.TestCase):
         now[0] = 106.0
         self.assertIsNone(tickets.consume(ticket, agent="acme-inquiry", language="en"))
 
+    def test_issued_browser_identity_is_exact_one_time_and_bounded_by_ttl(self) -> None:
+        core = _load_core()
+        now = [100.0]
+        identities = core.IssuedBrowserIdentities(capacity=2, ttl_seconds=5.0, clock=lambda: now[0])
+        identities.issue("demo-0123456789abcdef")
+        self.assertTrue(identities.consume("demo-0123456789abcdef"))
+        self.assertFalse(identities.consume("demo-0123456789abcdef"))
+        self.assertFalse(identities.consume("demo-unknown"))
+        identities.issue("demo-expired")
+        now[0] = 106.0
+        self.assertFalse(identities.consume("demo-expired"))
+
     def test_quota_is_per_client_and_bounded(self) -> None:
         core = _load_core()
         now = [50.0]
@@ -79,6 +95,39 @@ class WebsiteDemoTransportContractTests(unittest.TestCase):
         self.assertIn('language="si-LK"', twiml)
         self.assertIn("welcomeGreeting=\"Hello &amp; welcome\"", twiml)
         self.assertNotIn("<Dial", twiml)
+
+    def test_signed_webhook_consumes_issued_client_identity_before_ticket_issue(self) -> None:
+        website = _WEBSITE_TEMPLATE.read_text(encoding="utf-8")
+        self.assertIn("identities.issue(identity)", website)
+        self.assertIn('caller = form.get("From", "")', website)
+        self.assertIn('caller.startswith("client:")', website)
+        self.assertIn("identities.consume(caller.removeprefix(\"client:\"))", website)
+        self.assertLess(
+            website.index("identities.consume(caller.removeprefix(\"client:\"))"),
+            website.index("tickets.issue(agent=settings.agent_id, language=language_code)"),
+        )
+
+    def test_current_user_is_supplied_once_to_provider_history(self) -> None:
+        website = _WEBSITE_TEMPLATE.read_text(encoding="utf-8")
+        provider = _PROVIDER_TEMPLATE.read_text(encoding="utf-8")
+        self.assertEqual(website.count('self._history.append(("user", text))'), 1)
+        self.assertIn(
+            "stream_with_history(transcript, self._language.code, prompt, tuple(self._history))",
+            website,
+        )
+        history_method = provider.split("async def stream_response_with_history(", 1)[1].split(
+            "async def close", 1
+        )[0]
+        self.assertIn("for role, content in history", history_method)
+        self.assertNotIn('(("user", transcript),)', history_method)
+
+    def test_relay_ticket_is_not_written_to_nginx_access_logs(self) -> None:
+        proxy = _WEBSITE_PROXY_TEMPLATE.read_text(encoding="utf-8")
+        runbook = _RUNBOOK_TEMPLATE.read_text(encoding="utf-8")
+        location = proxy.split("location = /ws/v1/website-demo/conversation {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("access_log off;", location)
+        self.assertIn("relay ticket", runbook)
+        self.assertIn("access_log off", runbook)
 
 
 if __name__ == "__main__":

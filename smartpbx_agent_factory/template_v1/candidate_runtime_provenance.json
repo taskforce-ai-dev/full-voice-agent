@@ -20,7 +20,7 @@
   "components": [
     {
       "template_path": "runtime/website_demo_core.py.tmpl",
-      "template_sha256": "sha256:949c75680192968b2b8c95fa4e39da888ba6cc0b4b4de35935bcce1927efa7db",
+      "template_sha256": "sha256:31df2c40331735e701e5f8086b51b9e1f7cce86d8057bf6cd367a37a5c82ad8e",
       "source_path": "Flico Agent/server.py",
       "source_ranges": ["1095-1163", "2923-3140"],
       "source_evidence": [
@@ -28,11 +28,11 @@
         {"source_path": "Kitchened/server.py", "source_ranges": ["828-906"]},
         {"source_path": "Taskforce_AI_Website/components/pages/BookDemo.tsx", "source_ranges": ["28-40", "407-445"]}
       ],
-      "extraction": "client-neutral browser token rate bound, one-time text-relay admission, callback URL construction, XML escaping, and no-transfer demo path; business identity, tools, transcripts, and customer routing are excluded"
+      "extraction": "client-neutral browser token rate bound, bounded one-time browser identity and text-relay admission, callback URL construction, XML escaping, and no-transfer demo path; business identity, tools, transcripts, and customer routing are excluded"
     },
     {
       "template_path": "runtime/website_demo.py.tmpl",
-      "template_sha256": "sha256:980edb602458aac9396c6347ac63cb65298ddbc21af7b0fb9fe9174817d382ea",
+      "template_sha256": "sha256:6040eba8a02eacaed371598f748e0cf6dd25e8bbb8746c27726cdb5babdf63e3",
       "source_path": "Flico Agent/server.py",
       "source_ranges": ["1095-1163", "2923-3140"],
       "source_evidence": [
@@ -41,7 +41,7 @@
         {"source_path": "Kitchened/requirements-prod.txt", "source_ranges": ["10-12"]},
         {"source_path": "Taskforce_AI_Website/components/pages/BookDemo.tsx", "source_ranges": ["28-40", "407-445"]}
       ],
-      "extraction": "isolated signed Twilio webhook, browser access token, bounded ConversationRelay WebSocket lifecycle, generated-language selection, provider LLM history, and startup-loaded reviewed knowledge; no SmartPBX carrier credentials or business actions"
+      "extraction": "isolated signed Twilio webhook consuming an issued browser identity, browser access token, bounded ConversationRelay WebSocket lifecycle, generated-language selection, provider LLM history, and startup-loaded reviewed knowledge; no SmartPBX carrier credentials or business actions"
     },
     {
       "template_path": "provider_catalogue.json",
