@@ -73,3 +73,12 @@ def test_leak_scan_removes_only_this_generation_artifacts(tmp_path: Path):
         render_operations_artifacts(fixture_manifest(), fixture_resources(), provider, tmp_path)
     assert unrelated.read_text(encoding="utf-8") == "keep"
     assert not (tmp_path / "agents/acme-inquiry").exists()
+
+
+def test_operations_rejects_symlinked_agents_component_before_any_write(tmp_path: Path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "agents").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(Exception, match="symlink"):
+        render_operations_artifacts(fixture_manifest(), fixture_resources(), FakeSecretProvider(), tmp_path)
+    assert not list(outside.iterdir())
