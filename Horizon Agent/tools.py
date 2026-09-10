@@ -1,12 +1,17 @@
 """
-Claude tool definitions for the hotel voice agent.
+Tool definitions for the Horizon (Vidya) inquiry-only voice agent.
 
-Defines the tool schemas that Claude uses for function calling and
-dispatches tool invocations to the booking API (n8n webhook integration).
+Horizon is an INQUIRY-ONLY demo: it must never expose booking/availability/
+cancellation/transfer tools. Unlike the HattonHills base — which gates tools on
+whether the booking API is configured — Horizon returns NO tools BY
+CONSTRUCTION, so inheriting a Yanolja/PMS credential from a shared .env can
+never turn booking tools on. Enabling them requires the explicit opt-in env
+`HORIZON_ENABLE_BOOKING_TOOLS=true`, which the demo never sets.
 """
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 from typing import Any
@@ -20,6 +25,20 @@ from booking_api import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Inquiry-only is the invariant. Tools are OFF unless a human deliberately opts
+# in via this env var — never merely because a PMS key leaked in from a shared
+# environment. `is_configured()` alone must NEVER be sufficient to expose tools.
+_BOOKING_TOOLS_OPT_IN = os.getenv("HORIZON_ENABLE_BOOKING_TOOLS", "false").strip().lower() in (
+    "1", "true", "yes",
+)
+
+
+def _tools_enabled() -> bool:
+    """True only when booking tools are BOTH explicitly opted in AND configured."""
+    if not _BOOKING_TOOLS_OPT_IN:
+        return False
+    return is_configured()
 
 # ---------------------------------------------------------------------------
 # Tool definitions (Claude function-calling schema)
@@ -209,17 +228,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 def get_tools() -> list[dict[str, Any]]:
-    """Return tool definitions (Anthropic format) if the booking API (n8n) is configured."""
-    if is_configured():
-        return TOOL_DEFINITIONS
-    logger.warning("Booking API (n8n) is not configured — no tools will be available.")
-    return []
+    """Return tool definitions (Anthropic format). Inquiry-only: [] by construction."""
+    if not _tools_enabled():
+        logger.info("Horizon is inquiry-only — no tools exposed (booking tools not opted in).")
+        return []
+    return TOOL_DEFINITIONS
 
 
 def get_tools_openai() -> list[dict[str, Any]]:
-    """Return tool definitions in OpenAI function-calling format."""
-    if not is_configured():
-        logger.warning("Booking API (n8n) is not configured — no tools will be available.")
+    """Return tool definitions in OpenAI function-calling format. Inquiry-only: [] by construction."""
+    if not _tools_enabled():
+        logger.info("Horizon is inquiry-only — no tools exposed (booking tools not opted in).")
         return []
     return [
         {
@@ -238,9 +257,10 @@ def get_tools_gemini() -> list[dict[str, Any]]:
     """Return tool definitions in Google Gemini native format.
 
     Returns a list with a single Tool dict containing all function declarations.
+    Inquiry-only: [] by construction.
     """
-    if not is_configured():
-        logger.warning("Booking API (n8n) is not configured — no tools will be available.")
+    if not _tools_enabled():
+        logger.info("Horizon is inquiry-only — no tools exposed (booking tools not opted in).")
         return []
     return [
         {

@@ -317,11 +317,19 @@ async def _post_to_n8n(payload: dict[str, Any]) -> None:
 # Orchestrator — entry point called from server.py
 # ---------------------------------------------------------------------------
 
+def _demo_safe() -> bool:
+    """True (default) means NO post-call egress of any kind: no LLM extraction,
+    no n8n webhook, no dashboard dispatch. Fail-closed by construction so a
+    shared/inherited environment cannot start shipping caller transcripts. Set
+    DEMO_SAFE_BOOKINGS=false to enable the real post-call pipeline."""
+    return os.getenv("DEMO_SAFE_BOOKINGS", "true").strip().lower() in ("1", "true", "yes")
+
+
 def _format_transcript(full_transcript: list[dict[str, str]]) -> str:
     """Convert transcript list to readable text."""
     lines: list[str] = []
     for entry in full_transcript:
-        role = "Guest" if entry["role"] == "user" else "Tanya"
+        role = "Guest" if entry["role"] == "user" else "Vidya"
         lines.append(f"{role}: {entry['text']}")
     return "\n".join(lines)
 
@@ -345,6 +353,17 @@ async def process_post_call_data(
     are caught and logged -- never propagated.
     """
     try:
+        # FAIL-CLOSED: in the demo build (default) nothing leaves the process —
+        # no LLM extraction, no n8n webhook, no dashboard dispatch. This is the
+        # single gate for ALL post-call egress, so an inherited DASHBOARD/N8N
+        # config can never cause a caller transcript to be shipped.
+        if _demo_safe():
+            logger.info(
+                "DEMO-SAFE: skipping ALL post-call processing for %s "
+                "(no extraction, no n8n, no dashboard).", call_sid,
+            )
+            return
+
         logger.info("Starting post-call processing for CallSid: %s", call_sid)
 
         transcript_text = _format_transcript(full_transcript)

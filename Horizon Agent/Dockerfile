@@ -1,5 +1,5 @@
 # =============================================================================
-# Dockerfile — Hatton Hills Voice Agent (Tanya)
+# Dockerfile — Horizon Airline & Aviation Academy Voice Agent (Vidya)
 # =============================================================================
 # Production image for the FastAPI voice agent.
 # Build:  docker build -t hatton-hills-voice-agent .
@@ -45,13 +45,14 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 RUN pip install --no-cache-dir -r requirements-prod.lock.txt
 
 # --- Application code --------------------------------------------------------
-# Only the files needed at runtime are copied. We deliberately exclude:
+# Only the files needed at runtime are copied. The entrypoint is server:app; the
+# standalone media_stream_server.py and the local test_voice*.py demos were
+# removed from this agent (reference-only, stale branding). We deliberately exclude:
 #   .env              — secrets; injected at runtime via --env-file or orchestrator
-#   test_voice*.py    — local demo scripts, not needed in production
 #   venv/             — local virtualenv
 #   chroma_db/        — ephemeral vector store, rebuilt on startup from knowledge_docs/
 #   __pycache__/      — bytecode cache
-COPY server.py media_stream_server.py tools.py booking_api.py post_call.py knowledge_base.py yanolja_client.py yanolja_service.py dashboard_client.py ./
+COPY server.py tools.py booking_api.py post_call.py knowledge_base.py yanolja_client.py yanolja_service.py dashboard_client.py ./
 COPY knowledge_docs/ ./knowledge_docs/
 
 # --- Port --------------------------------------------------------------------

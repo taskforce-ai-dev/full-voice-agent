@@ -2,9 +2,11 @@
 # Docker Compose -- Horizon Airline & Aviation Academy Voice Agent (Vidya)
 # ============================================================
 # De-identified aviation-college INQUIRY demo. Runs the production
-# server (server.py) behind Twilio: English via ConversationRelay
-# (Claude + ElevenLabs), Sinhala via Media Streams (Claude +
-# OpenAI TTS + Azure STT). Inquiry-only -- no PMS / booking creds.
+# server (server.py) behind Twilio, four demo languages:
+#   English / Russian -> ConversationRelay (Claude + ElevenLabs)
+#   Arabic            -> Media Streams (Claude + Azure STT + ElevenLabs)
+#   Sinhala           -> Media Streams (Gemini brain + Gemini TTS + Azure STT)
+# Inquiry-only -- no PMS / booking creds; tools OFF by construction.
 #
 # Usage:
 #   docker compose up -d          # start in background

@@ -244,7 +244,7 @@ DEFAULT_FILLER: str = "Let me check that for you."
 
 # Backchannel filter: short non-semantic utterances that callers emit while
 # thinking ("um", "uh", "hmm"). Twilio's STT fires these as full prompts and
-# without filtering, Tanya would jump in mid-thought, derailing the call.
+# without filtering, Vidya would jump in mid-thought, derailing the call.
 # We deliberately do NOT include "ok", "yeah", "yes", "no", "right" â€” those
 # are genuine answers in this booking flow.
 BACKCHANNEL_TOKENS: set[str] = {
@@ -1046,7 +1046,7 @@ async def voice_demo_incoming(request: Request) -> Response:
     voiceUrl as a POST form field (or query string for GET). Routing mirrors
     the phone paths but skips the <Gather> menu:
 
-      - ``en`` (default / unknown) → English ConversationRelay (Tanya, ElevenLabs).
+      - ``en`` (default / unknown) → English ConversationRelay (Vidya, ElevenLabs).
       - ``ru`` → Russian ConversationRelay: Twilio CR natively supports ``ru-RU``
         (TTS + Twilio-managed transcription), so Russian rides CR like English.
       - ``ar`` → Media Streams (``/ws/media-stream/ar``): Twilio ConversationRelay
@@ -1281,7 +1281,7 @@ async def whisper(request: Request) -> Response:
 @app.post("/voice/dial-result")
 async def dial_result(request: Request) -> Response:
     """Callback from <Dial action>. If the human answered â†’ hang up.
-    Otherwise, drop the caller back into Tanya with a recovery greeting.
+    Otherwise, drop the caller back into Vidya with a recovery greeting.
     """
     form = await request.form()
     status = form.get("DialCallStatus", "")
@@ -1293,7 +1293,7 @@ async def dial_result(request: Request) -> Response:
             media_type="application/xml",
         )
 
-    # No answer / busy / failed / canceled â†’ recover into Tanya with a
+    # No answer / busy / failed / canceled â†’ recover into Vidya with a
     # one-off greeting. We build the ConversationRelay TwiML by reusing the
     # standard helper but swapping in the apology greeting.
     recovery_config = dict(LANGUAGE_CONFIGS["en"])

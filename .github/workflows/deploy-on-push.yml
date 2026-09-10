@@ -52,7 +52,15 @@ jobs:
           fi
           echo "Changed files:"; printf '%s\n' "$CHANGED"
           items=""
-          for entry in "BSL Agent:bsl" "Flico Agent:flico" "HattonHills:hatton" "SLIC Agent:slic" "Sofia Agent:sofia" "Kavya:kavya" "Kitchened:kitchened" "WorldOfRefrigerators:wor" "Horizon Agent:horizon"; do
+          # NOTE: "Horizon Agent" is deliberately NOT in this auto-deploy list
+          # yet. Its first production bring-up needs /opt/horizon/.env, an nginx
+          # vhost and a TLS cert provisioned + verified by hand first; auto-
+          # deploying on merge would ship it before those exist. Deploy it the
+          # first time via the manual "Deploy Agent" workflow (deploy.yml,
+          # workflow_dispatch: agent=horizon), confirm /health, then add
+          # "Horizon Agent:horizon" here in a follow-up so later code changes
+          # auto-deploy like the other agents.
+          for entry in "BSL Agent:bsl" "Flico Agent:flico" "HattonHills:hatton" "SLIC Agent:slic" "Sofia Agent:sofia" "Kavya:kavya" "Kitchened:kitchened" "WorldOfRefrigerators:wor"; do
             dir="${entry%%:*}"; id="${entry##*:}"
             match=$(printf '%s\n' "$CHANGED" | grep -F "$dir/" || true)
             [ -z "$match" ] && continue
