@@ -138,8 +138,9 @@ def test_url_origin_requires_exact_scheme_and_port_without_network_access(tmp_pa
         KnowledgeBuilderImpl().build((downgraded,), output_dir=tmp_path / "out-two")
 
 
-def test_default_network_policy_rejects_loopback_url_without_network_access(tmp_path):
-    source = url_source("http://127.0.0.1:8080/faq", origins=("http://127.0.0.1:8080",))
+@pytest.mark.parametrize("host", ("localhost", "127.0.0.1", "10.0.0.1", "169.254.1.1"))
+def test_default_network_policy_rejects_non_public_ip_literals_without_network_access(host, tmp_path):
+    source = url_source(f"http://{host}:8080/faq", origins=(f"http://{host}:8080",))
     with pytest.raises(KnowledgeError, match="private|loopback"):
         KnowledgeBuilderImpl().build((source,), output_dir=tmp_path / "out")
 
