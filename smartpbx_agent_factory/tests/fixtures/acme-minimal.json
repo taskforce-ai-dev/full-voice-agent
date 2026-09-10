@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "display_name": "Acme Inquiry",
+  "public_name": "Acme Inquiry",
+  "slug": "acme-inquiry",
+  "agent_name": "Acme Guide",
+  "industry": "general information",
+  "purpose": "Answer approved company questions",
+  "audience": "prospective customers",
+  "profile": "demo",
+  "timezone": "UTC",
+  "operating_hours": {
+    "mon-fri": "09:00-17:00"
+  },
+  "technical_owner": "owner@example.invalid",
+  "languages": [
+    {
+      "code": "en-US",
+      "locale": "en-US",
+      "stt": "deepgram",
+      "llm": "claude",
+      "tts": "elevenlabs"
+    }
+  ],
+  "allowed_topics": ["company information"],
+  "refused_topics": ["account changes"],
+  "pii_policy": {
+    "explicit_consent": false,
+    "collect_name": false,
+    "collect_phone": false
+  },
+  "capabilities": {},
+  "knowledge_sources": [
+    {
+      "kind": "local",
+      "path": "smartpbx_agent_factory/tests/fixtures/acme-faq.txt",
+      "owner": "Acme Inquiry",
+      "effective_date": "2026-09-10",
+      "classification": "public"
+    }
+  ],
+  "smartpbx": {
+    "account_id": "account-fixture",
+    "capacity": 1,
+    "protocol_profile": "smartpbx-ai-provider-v06"
+  },
+  "operations": {
+    "alert_owner": "owner@example.invalid",
+    "support_contact": "support@example.invalid"
+  },
+  "website_demo": {
+    "enabled": true,
+    "visibility": "pending"
+  }
+}
