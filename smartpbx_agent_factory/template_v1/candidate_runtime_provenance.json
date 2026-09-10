@@ -74,14 +74,14 @@
     },
     {
       "template_path": "runtime/tts_adapters.py.tmpl",
-      "template_sha256": "sha256:92d40736674601eb15b4da9f0d03026cf1f5f50de8846975c4dea741001026db",
+      "template_sha256": "sha256:16aa737d2a39fcb14b88b1b7e33552b06d4fed4dbda59457c007b3939d76c642",
       "source_path": "Kavya/server.py",
       "source_ranges": ["3075-3090", "2092-2310", "13112-13152", "13407-13848"],
       "source_evidence": [
         {"source_path": "Kavya/server.py", "source_ranges": ["3075-3090", "2092-2310", "13112-13152", "13407-13848"]},
         {"source_path": "Kavya/english_voice_profile.py", "source_ranges": ["1-59"]}
       ],
-      "extraction": "startup-injected English ElevenLabs and Sinhala Gemini or approved Rime streaming TTS; validated 8 kHz mu-law conversion, 20 ms framing, and generation-fenced transport handoff"
+      "extraction": "startup-injected exact language-profile routes plus English ElevenLabs and Sinhala Gemini or approved Rime streaming TTS; bounded provider bodies, validated 8 kHz mu-law conversion, 20 ms framing, and generation-fenced transport handoff"
     }
   ]
 }

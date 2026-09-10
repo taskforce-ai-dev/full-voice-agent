@@ -13,7 +13,8 @@ import audioop
 from collections.abc import AsyncIterable, AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import Any, Protocol
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol
 
 
 SAMPLE_RATE_HZ = 8_000
@@ -21,6 +22,7 @@ FRAME_BYTES = 160  # 20 ms of g711_ulaw/8 kHz, matching SmartPBX wire frames.
 SILENCE_ULAW = b"\xff"
 ELEVENLABS_STREAM_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
 RIME_ARCANA_ENDPOINT = "https://users.rime.ai/v1/rime-tts"
+MAX_PROVIDER_RESPONSE_BYTES = 10 * 1024 * 1024
 
 
 class TTSConfigurationError(ValueError):
@@ -42,6 +44,7 @@ class ElevenLabsSettings:
     model_id: str = "eleven_flash_v2_5"
     optimize_streaming_latency: int = 3
     timeout_seconds: float = 15.0
+    max_response_bytes: int = MAX_PROVIDER_RESPONSE_BYTES
 
     def __post_init__(self) -> None:
         if not self.api_key or not self.voice_id:
@@ -50,6 +53,8 @@ class ElevenLabsSettings:
             raise TTSConfigurationError("ElevenLabs latency must be between 0 and 4")
         if not 3 <= self.timeout_seconds <= 30:
             raise TTSConfigurationError("ElevenLabs timeout must be between 3 and 30 seconds")
+        if not 1 <= self.max_response_bytes <= MAX_PROVIDER_RESPONSE_BYTES:
+            raise TTSConfigurationError("ElevenLabs response bound is invalid")
 
 
 @dataclass(frozen=True)
@@ -78,12 +83,26 @@ class SinhalaRimeSettings:
     api_key: str
     endpoint: str = RIME_ARCANA_ENDPOINT
     timeout_seconds: float = 15.0
+    max_response_bytes: int = MAX_PROVIDER_RESPONSE_BYTES
 
     def __post_init__(self) -> None:
         if not self.api_key or not self.endpoint.startswith("https://"):
             raise TTSConfigurationError("Rime key and HTTPS endpoint are required")
         if not 3 <= self.timeout_seconds <= 30:
             raise TTSConfigurationError("Rime timeout must be between 3 and 30 seconds")
+        if not 1 <= self.max_response_bytes <= MAX_PROVIDER_RESPONSE_BYTES:
+            raise TTSConfigurationError("Rime response bound is invalid")
+
+
+@dataclass(frozen=True)
+class TTSLanguageRoute:
+    """One exact profile code selected during startup; no locale guessing occurs."""
+
+    provider: str
+
+    def __post_init__(self) -> None:
+        if self.provider not in {"elevenlabs", "sinhala"}:
+            raise TTSConfigurationError("unsupported TTS language route")
 
 
 @dataclass(frozen=True)
@@ -92,6 +111,7 @@ class TTSStartupConfig:
 
     english: ElevenLabsSettings
     sinhala_gemini: SinhalaGeminiSettings
+    language_routes: Mapping[str, TTSLanguageRoute]
     sinhala_provider: str = "gemini"
     sinhala_rime: SinhalaRimeSettings | None = None
 
@@ -100,6 +120,13 @@ class TTSStartupConfig:
             raise TTSConfigurationError("Sinhala provider must be gemini or rime")
         if self.sinhala_provider == "rime" and self.sinhala_rime is None:
             raise TTSConfigurationError("Rime settings are required when Rime is selected")
+        routes = dict(self.language_routes)
+        if not routes or any(
+            not isinstance(code, str) or not code or not isinstance(route, TTSLanguageRoute)
+            for code, route in routes.items()
+        ):
+            raise TTSConfigurationError("language routes must use explicit profile codes")
+        object.__setattr__(self, "language_routes", MappingProxyType(routes))
 
 
 class HTTPResponse(Protocol):
@@ -163,6 +190,16 @@ async def _frame_ulaw(
         yield residual + (SILENCE_ULAW * (FRAME_BYTES - len(residual)))
 
 
+async def _bounded_provider_audio(chunks: AsyncIterable[bytes], maximum: int) -> AsyncIterator[bytes]:
+    """Reject an oversized provider body before it can fill the paced transport."""
+    total_bytes = 0
+    async for chunk in chunks:
+        total_bytes += len(chunk)
+        if total_bytes > maximum:
+            raise TTSProviderError("response_too_large")
+        yield chunk
+
+
 class SmartPBXTTSAdapter:
     """Concrete provider selection that yields only framed PCMU to the caller."""
 
@@ -183,13 +220,17 @@ class SmartPBXTTSAdapter:
         text = response.strip()
         if not text:
             return _empty_audio_stream()
-        if language == "en":
+        try:
+            route = self._config.language_routes[language]
+        except KeyError as exc:
+            raise TTSConfigurationError("language profile has no TTS route") from exc
+        if route.provider == "elevenlabs":
             return _frame_ulaw(
                 self._stream_elevenlabs(text), generation=generation, generation_is_current=generation_is_current
             )
-        if language == "si":
+        if route.provider == "sinhala":
             return self._stream_sinhala(text, generation=generation, generation_is_current=generation_is_current)
-        raise TTSConfigurationError("TTS supports only explicit en or si profiles")
+        raise TTSConfigurationError("unsupported TTS language route")
 
     async def _stream_elevenlabs(self, text: str) -> AsyncIterator[bytes]:
         settings = self._config.english
@@ -204,7 +245,9 @@ class SmartPBXTTSAdapter:
         ) as response:
             if response.status_code != 200:
                 raise TTSProviderError("http_status")
-            async for chunk in response.aiter_bytes(chunk_size=640):
+            async for chunk in _bounded_provider_audio(
+                response.aiter_bytes(chunk_size=640), settings.max_response_bytes
+            ):
                 if chunk:
                     yield chunk
 
@@ -249,7 +292,9 @@ class SmartPBXTTSAdapter:
                 raise TTSProviderError("http_status")
             if media_type not in {"audio/pcmu", "audio/basic"}:
                 raise TTSProviderError("invalid_audio_metadata")
-            async for chunk in response.aiter_bytes(chunk_size=640):
+            async for chunk in _bounded_provider_audio(
+                response.aiter_bytes(chunk_size=640), settings.max_response_bytes
+            ):
                 if chunk:
                     yield chunk
 
