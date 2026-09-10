@@ -31,3 +31,13 @@ only Azure's bounded exact `result_id` as optional identity; offsets and
 durations never become ordering inputs. Azure's startup future is awaited and
 any start failure leaves the provider inactive. Azure JSON metadata is size
 bounded before parsing.
+
+## Fatal callback contract
+
+The shared recognizer callback union includes `RecognizerFatal(reason)` in
+addition to `RecognizerResult`. `reason` is the fixed bounded value
+`provider_unavailable`; no SDK exception, cancellation detail, or provider
+payload crosses this boundary. A call-local adapter emits at most one fatal on
+its event loop after a Google worker failure or an unexpected Azure cancellation.
+Recognizer close first fences the bridge, then stops the provider, suppressing
+expected shutdown callbacks and every late fatal.

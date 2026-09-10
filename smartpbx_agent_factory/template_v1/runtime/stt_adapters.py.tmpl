@@ -18,7 +18,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Protocol
 
-from provider_adapters import ContinuousRecognizer, RecognizerCallback, RecognizerResult
+from provider_adapters import ContinuousRecognizer, RecognizerCallback, RecognizerFatal, RecognizerResult
 
 
 EventKind = Literal["interim", "final", "fatal"]
@@ -189,6 +189,8 @@ class GoogleStreamingSTT:
                 self._run_one_stream(client, epoch)
             except Exception:
                 if self.active:
+                    with self._state_lock:
+                        self._running = False
                     self._events.submit(STTEvent("fatal"))
                 return
             finally:
@@ -452,8 +454,16 @@ class SmartPBXSTTAdapter:
         if not callable(on_result):
             raise ValueError("recognizer callback is required")
         loop = asyncio.get_running_loop()
+        fatal_delivered = False
 
         async def on_event(event: STTEvent) -> None:
+            nonlocal fatal_delivered
+            if event.kind == "fatal":
+                if fatal_delivered:
+                    return
+                fatal_delivered = True
+                on_result(RecognizerFatal(reason="provider_unavailable"))
+                return
             if event.kind not in {"interim", "final"}:
                 return
             on_result(

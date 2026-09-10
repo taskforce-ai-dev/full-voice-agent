@@ -59,7 +59,7 @@
     },
     {
       "template_path": "runtime/stt_adapters.py.tmpl",
-      "template_sha256": "sha256:a55e74dc1e668c3ba00fc569faae44e9160e44f73ff42b9ab794d91a2c79366c",
+      "template_sha256": "sha256:6fbcb00d278e2e39e45db2692eae72598ec3401bf6a7aa2e9a531b49f1aa360f",
       "source_path": "Kavya/server.py",
       "source_ranges": ["575-582", "1855-1863", "6549-6881", "6884-6980", "6983-7252", "9359-9443"],
       "extraction": "startup-injected Google mu-law and Azure PCM streaming adapters exposed through the shared continuous-recognizer contract; SDK callbacks cross only through the session-owned event-loop bridge"
