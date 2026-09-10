@@ -109,7 +109,7 @@
     },
     {
       "template_path": "runtime/turn_engine.py.tmpl",
-      "template_sha256": "sha256:ee57e38d3510a31b730a04b447c7b1a1209c84c54136a4fb142dfc6ccd21b233",
+      "template_sha256": "sha256:7bbe4a2f34c0623b5363e7d8e5692830d645ed3a64fa5843a814f74734ac7be2",
       "source_path": "Kavya/server.py",
       "source_ranges": ["1916-1936", "8540-8567", "10560-10639", "10690-10910", "11150-11174", "11242-11315", "13112-13190"],
       "extraction": "bounded provider-identity/audio-coverage reconciliation, exact cumulative interim overlay, current-turn echo overlap, delivered-only history, recovery, silence reprompt, and generation-fenced filler"

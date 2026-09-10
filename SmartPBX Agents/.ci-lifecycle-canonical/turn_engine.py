@@ -123,6 +123,7 @@ class ConversationTurnEngine:
         self._sentence_tts_task: asyncio.Task[None] | None = None
         self._filler_task: asyncio.Task[None] | None = None
         self._reprompt_task: asyncio.Task[None] | None = None
+        self._reprompt_epoch = 0
         self._reprompt_count = 0
         self._filler_index = 0
         self._delivery_epoch = 0
@@ -194,7 +195,7 @@ class ConversationTurnEngine:
         if recognizer is None:
             return False
         await recognizer.feed_audio(bytes(audio))
-        self._cancel_reprompt()
+        await self._cancel_reprompt()
         return True
 
     async def close(self) -> None:
@@ -207,7 +208,7 @@ class ConversationTurnEngine:
         self._pending_transcript = ""
         self._deferred_endpoint_due = False
         await self._cancel_active_turn(clear_audio=True)
-        self._cancel_reprompt()
+        await self._cancel_reprompt()
         await self._cancel_filler()
         await self._close_recognizer()
 
@@ -511,7 +512,7 @@ class ConversationTurnEngine:
                 send_mark = getattr(self._transport, "send_mark", None)
                 if callable(send_mark):
                     await send_mark("conversation-turn")
-                self._arm_reprompt()
+                await self._arm_reprompt()
             if self._owns_generation(generation):
                 committed_response = " ".join(
                     sentence.strip() for sentence in committed_sentences if sentence.strip()
@@ -684,7 +685,7 @@ class ConversationTurnEngine:
             if callable(send_mark):
                 await send_mark(mark_name)
         if mark_name in {"conversation-turn", "initial-greeting", "recovery"}:
-            self._arm_reprompt()
+            await self._arm_reprompt()
 
     def _start_filler(self, language: LanguageProfile, generation: int) -> None:
         if not language.filler_phrases or self._closed:
@@ -709,17 +710,44 @@ class ConversationTurnEngine:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    def _cancel_reprompt(self) -> None:
+    def _take_reprompt_task(self) -> tuple[int, asyncio.Task[None] | None]:
+        """Invalidate the current timer before any await can yield ownership."""
+        self._reprompt_epoch += 1
         task, self._reprompt_task = self._reprompt_task, None
-        if task is not None and not task.done():
-            task.cancel()
+        return self._reprompt_epoch, task
 
-    def _arm_reprompt(self) -> None:
-        self._cancel_reprompt()
+    async def _await_reprompt_task(self, task: asyncio.Task[None] | None) -> None:
+        if task is None or task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _cancel_reprompt(self) -> None:
+        _epoch, task = self._take_reprompt_task()
+        await self._await_reprompt_task(task)
+
+    async def _arm_reprompt(self) -> None:
+        epoch, task = self._take_reprompt_task()
+        await self._await_reprompt_task(task)
+        # A later input or re-arm owns the slot if it ran while we waited for
+        # the previous timer to finish cancellation.
+        if epoch != self._reprompt_epoch:
+            return
         if self._closed or self._max_reprompts == 0 or self._reprompt_count >= self._max_reprompts:
             return
-        self._reprompt_task = asyncio.create_task(self._reprompt_after_silence())
-        self._track(self._reprompt_task)
+        task = asyncio.create_task(self._reprompt_after_silence())
+        self._reprompt_task = task
+        task.add_done_callback(self._observe_reprompt_task)
+
+    def _observe_reprompt_task(self, task: asyncio.Task[None]) -> None:
+        """Consume task outcomes and clear only the task that still owns the slot."""
+        if self._reprompt_task is task:
+            self._reprompt_task = None
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            return
 
     async def _reprompt_after_silence(self) -> None:
         try:
