@@ -475,3 +475,15 @@ def test_recovery_rejects_tampered_or_symlinked_backup_without_writing_targets(t
             backend_branch_sha="b" * 40, output_dir=tmp_path,
         )
     assert page.read_bytes() == before
+
+
+def test_transaction_writer_durably_stages_replacements_before_marker_retirement():
+    source = Path(website.__file__).read_text(encoding="utf-8")
+    atomic = source[source.index("def _atomic("):source.index("def render_website_artifacts(")]
+    finish = source[source.index("def _finish_transaction("):source.index("def _begin_transaction(")]
+    recover = source[source.index("def _recover_transaction("):source.index("def _finish_transaction(")]
+    assert "handle.flush()" in atomic
+    assert "os.fsync(handle.fileno())" in atomic
+    assert "_fsync_directory(path.parent)" in atomic
+    assert finish.index("marker_path.unlink()") < finish.index("_fsync_directory(output_dir)")
+    assert recover.index("marker_path.unlink()") < recover.index("_fsync_directory(output_dir)")
