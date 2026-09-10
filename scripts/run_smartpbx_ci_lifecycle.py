@@ -507,6 +507,15 @@ def _mapped_port_from_inspect(raw: str) -> int:
     return value
 
 
+def lifecycle_network_create_argv(network: str, run_id: str) -> list[str]:
+    """Create a private bridge that still supports the loopback-only probe."""
+    return [
+        "docker", "network", "create", "--driver", "bridge",
+        "--opt", "com.docker.network.bridge.enable_ip_masquerade=false",
+        "--label", f"com.taskforce.smartpbx.lifecycle={run_id}", network,
+    ]
+
+
 def mapped_port(container: str) -> int:
     state = command(
         "container-state-inspect",
@@ -592,7 +601,7 @@ def main() -> int:
     network = f"smartpbx-ci-{run_id}"
     token = secrets.token_urlsafe(32)
     try:
-        command("network-create", ["docker", "network", "create", "--internal", "--label", f"com.taskforce.smartpbx.lifecycle={run_id}", network])
+        command("network-create", lifecycle_network_create_argv(network, run_id))
         command("image-build", [
             "docker", "build", "--label", f"org.taskforce.smartpbx.artifact={provenance['artifact_digest']}",
             "--label", f"org.opencontainers.image.revision={provenance['source_revision']}", "--tag", image, str(agent_dir),

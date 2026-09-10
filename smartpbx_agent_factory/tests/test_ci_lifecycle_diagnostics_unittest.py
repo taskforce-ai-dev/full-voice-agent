@@ -68,6 +68,16 @@ class LifecycleDockerDiagnosticsTests(unittest.TestCase):
         self.assertIn("port-inspect", self.runner.DOCKER_OPERATION_LABELS)
         self.assertNotIn("port-discover", self.runner.DOCKER_OPERATION_LABELS)
 
+    def test_lifecycle_network_allows_loopback_publish_without_masqueraded_egress(self) -> None:
+        self.assertEqual(
+            self.runner.lifecycle_network_create_argv("owned-network", "owned-run"),
+            [
+                "docker", "network", "create", "--driver", "bridge",
+                "--opt", "com.docker.network.bridge.enable_ip_masquerade=false",
+                "--label", "com.taskforce.smartpbx.lifecycle=owned-run", "owned-network",
+            ],
+        )
+
     def test_image_build_subphase_classifier_uses_only_the_fixed_vocabulary(self) -> None:
         cases = (
             (b"RUN pip install --no-cache-dir -r requirements-prod.lock.txt", "dependency-install"),

@@ -45,13 +45,14 @@ def main() -> int:
         "validate_allowlist_metadata", "CANDIDATE_PROVENANCE", "_normal_runtime_binding", "_canonical_fixture_binding",
         "rejected_status", "status authentication", "--attestation", "--lane", "--repository", "--head-sha", "--run-id", "observed_cases",
         "container-state-inspect", "port-inspect", "CONTAINER_STATE_STATUSES", "{{json .NetworkSettings.Ports}}",
-        "_container_state_from_inspect", "_mapped_port_from_inspect",
+        "_container_state_from_inspect", "_mapped_port_from_inspect", "lifecycle_network_create_argv",
+        "com.docker.network.bridge.enable_ip_masquerade=false",
     ):
         require(required in runner_source, f"runner missing {required!r}")
     for forbidden in (
         "print(response", "print(body", "communicate(input=", "GOOGLE_APPLICATION_CREDENTIALS",
         "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "ELEVENLABS_API_KEY",
-        '"docker", "port"',
+        '"docker", "port"', '"--internal"',
     ):
         require(forbidden not in runner_source, f"runner contains unsafe or unowned execution form {forbidden!r}")
     require('provenance.get("release_state") == "review-only"' in runner_source, "review-only release state must be accepted for the canonical fixture")
