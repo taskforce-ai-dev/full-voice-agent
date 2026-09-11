@@ -1,0 +1,523 @@
+"""Injected Google and Azure streaming STT adapters for SmartPBX media audio.
+
+This candidate preserves the stable Kavya boundary: providers receive live 8 kHz
+mu-law frames, emit interim/final recognition events, and never own endpointing.
+All SDK modules, credentials, factories, callbacks, and the event loop are
+provided by startup wiring; this module performs no configuration discovery.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import queue
+import threading
+import time
+from collections.abc import Awaitable, Callable
+from concurrent.futures import Future
+from dataclasses import dataclass
+from typing import Any, Literal, Mapping, Protocol
+
+from provider_adapters import ContinuousRecognizer, RecognizerCallback, RecognizerFatal, RecognizerResult
+
+
+EventKind = Literal["interim", "final", "fatal"]
+
+
+@dataclass(frozen=True)
+class AzureFinalMetadata:
+    """Bounded provider final metadata for loop-owned deduplication if needed."""
+
+    result_id: str | None
+    offset: int | None
+    duration: int | None
+    confidence: float | None
+
+
+@dataclass(frozen=True)
+class STTEvent:
+    kind: EventKind
+    text: str = ""
+    metadata: AzureFinalMetadata | None = None
+
+
+class StreamingSTTAdapter(Protocol):
+    @property
+    def active(self) -> bool: ...
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def feed(self, mulaw_audio: bytes) -> bool: ...
+
+
+class LoopEventBridge:
+    """Transfers SDK-thread events into a session-owned asyncio loop.
+
+    The callback owns transcript mutation, endpoint timers, and turn admission.
+    Provider threads only submit immutable event values through this bridge.
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        on_event: Callable[[STTEvent], Awaitable[None]],
+    ) -> None:
+        self._loop = loop
+        self._on_event = on_event
+        self._lock = threading.Lock()
+        self._closing = False
+        self._futures: set[Future[Any]] = set()
+
+    def submit(self, event: STTEvent) -> bool:
+        with self._lock:
+            if self._closing:
+                return False
+            try:
+                future = asyncio.run_coroutine_threadsafe(self._on_event(event), self._loop)
+            except (RuntimeError, TypeError):
+                return False
+            self._futures.add(future)
+        future.add_done_callback(self._discard)
+        return True
+
+    def _discard(self, future: Future[Any]) -> None:
+        with self._lock:
+            self._futures.discard(future)
+
+    async def close(self, timeout_seconds: float = 2.0) -> None:
+        """Fence new provider callbacks, then bounded-drain already admitted work."""
+        with self._lock:
+            self._closing = True
+            pending = tuple(self._futures)
+        if not pending:
+            return
+        wrapped = tuple(asyncio.wrap_future(future) for future in pending)
+        _done, still_pending = await asyncio.wait(wrapped, timeout=timeout_seconds)
+        for future in still_pending:
+            future.cancel()
+        if still_pending:
+            await asyncio.gather(*still_pending, return_exceptions=True)
+
+
+@dataclass(frozen=True)
+class GoogleSTTConfig:
+    """Google dependencies and recognition configuration supplied at startup."""
+
+    speech: Any
+    client_factory: Callable[[], Any]
+    language_code: str
+    alternative_language_codes: tuple[str, ...] = ()
+    queue_max_chunks: int = 500
+    stream_rotation_seconds: float = 270.0
+
+    def __post_init__(self) -> None:
+        if not self.language_code:
+            raise ValueError("Google language_code is required")
+        if self.queue_max_chunks < 1:
+            raise ValueError("Google queue_max_chunks must be positive")
+        if self.stream_rotation_seconds <= 0:
+            raise ValueError("Google stream_rotation_seconds must be positive")
+
+
+class GoogleStreamingSTT:
+    """Stream native 8 kHz mu-law frames to Google from one bounded worker queue."""
+
+    def __init__(self, config: GoogleSTTConfig, events: LoopEventBridge) -> None:
+        self._config = config
+        self._events = events
+        self._audio: queue.Queue[bytes | None] = queue.Queue(config.queue_max_chunks)
+        self._state_lock = threading.Lock()
+        self._running = False
+        self._epoch = 0
+        self._thread: threading.Thread | None = None
+
+    @property
+    def active(self) -> bool:
+        with self._state_lock:
+            return self._running
+
+    def start(self) -> None:
+        with self._state_lock:
+            if self._running:
+                return
+            self._audio = queue.Queue(self._config.queue_max_chunks)
+            self._running = True
+            self._epoch += 1
+            self._thread = threading.Thread(target=self._run, name="smartpbx-google-stt", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        with self._state_lock:
+            self._running = False
+            self._epoch += 1
+            thread = self._thread
+        self._enqueue_stop_sentinel()
+        if thread is not None:
+            thread.join(timeout=5.0)
+
+    def feed(self, mulaw_audio: bytes) -> bool:
+        """Queue one native mu-law frame without blocking the media event loop."""
+        if not self.active:
+            return False
+        try:
+            self._audio.put_nowait(bytes(mulaw_audio))
+        except queue.Full:
+            return False
+        return True
+
+    def _enqueue_stop_sentinel(self) -> None:
+        try:
+            self._audio.put_nowait(None)
+        except queue.Full:
+            try:
+                self._audio.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._audio.put_nowait(None)
+            except queue.Full:
+                return
+
+    def _run(self) -> None:
+        while self.active:
+            epoch = self._current_epoch()
+            client: Any = None
+            try:
+                client = self._config.client_factory()
+                self._run_one_stream(client, epoch)
+            except Exception:
+                if self.active:
+                    with self._state_lock:
+                        self._running = False
+                    self._events.submit(STTEvent("fatal"))
+                return
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+    def _current_epoch(self) -> int:
+        with self._state_lock:
+            return self._epoch
+
+    def _run_one_stream(self, client: Any, epoch: int) -> None:
+        speech = self._config.speech
+        recognition = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
+            sample_rate_hertz=8000,
+            language_code=self._config.language_code,
+            alternative_language_codes=list(self._config.alternative_language_codes),
+            enable_automatic_punctuation=True,
+        )
+        config = speech.StreamingRecognitionConfig(config=recognition, interim_results=True)
+        started_at = time.monotonic()
+
+        def requests() -> Any:
+            while self.active and epoch == self._current_epoch():
+                if time.monotonic() - started_at >= self._config.stream_rotation_seconds:
+                    return
+                try:
+                    chunk = self._audio.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    return
+                yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+        responses = client.streaming_recognize(config=config, requests=requests())
+        for response in responses:
+            if not self.active or epoch != self._current_epoch():
+                return
+            for result in getattr(response, "results", ()):
+                alternatives = getattr(result, "alternatives", ())
+                if not alternatives:
+                    continue
+                text = str(getattr(alternatives[0], "transcript", "")).strip()
+                if text:
+                    self._events.submit(STTEvent("final" if result.is_final else "interim", text))
+
+
+@dataclass(frozen=True)
+class AzureSTTConfig:
+    """Azure dependencies and credentials supplied by startup composition."""
+
+    speech: Any
+    subscription_key: str
+    region: str
+    language_code: str
+    ulaw_to_pcm: Callable[[bytes], bytes]
+    segmentation_silence_ms: int | None = None
+    detailed_output: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.subscription_key.strip() or not self.region.strip() or not self.language_code:
+            raise ValueError("Azure key, region, and language_code are required")
+        if self.segmentation_silence_ms is not None and self.segmentation_silence_ms < 1:
+            raise ValueError("Azure segmentation_silence_ms must be positive")
+
+
+class AzurePushStreamSTT:
+    """Decode mu-law to PCM16 and stream it to Azure's push-input recognizer."""
+
+    def __init__(self, config: AzureSTTConfig, events: LoopEventBridge) -> None:
+        self._config = config
+        self._events = events
+        self._state_lock = threading.Lock()
+        self._running = False
+        self._stop_requested = False
+        self._fatal_notified = False
+        self._push_stream: Any = None
+        self._recognizer: Any = None
+
+    @property
+    def active(self) -> bool:
+        with self._state_lock:
+            return self._running
+
+    def start(self) -> None:
+        with self._state_lock:
+            if self._running:
+                return
+        speech = self._config.speech
+        speech_config = speech.SpeechConfig(subscription=self._config.subscription_key, region=self._config.region)
+        speech_config.speech_recognition_language = self._config.language_code
+        if self._config.detailed_output:
+            speech_config.output_format = speech.OutputFormat.Detailed
+        if self._config.segmentation_silence_ms is not None:
+            speech_config.set_property(
+                speech.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+                str(self._config.segmentation_silence_ms),
+            )
+        fmt = speech.audio.AudioStreamFormat(
+            samples_per_second=8000,
+            bits_per_sample=16,
+            channels=1,
+        )
+        self._push_stream = speech.audio.PushAudioInputStream(stream_format=fmt)
+        self._recognizer = speech.SpeechRecognizer(
+            speech_config=speech_config,
+            audio_config=speech.audio.AudioConfig(stream=self._push_stream),
+        )
+        self._recognizer.recognizing.connect(self._on_recognizing)
+        self._recognizer.recognized.connect(self._on_recognized)
+        self._recognizer.canceled.connect(self._on_canceled)
+        with self._state_lock:
+            self._stop_requested = False
+            self._fatal_notified = False
+            self._running = True
+        try:
+            self._recognizer.start_continuous_recognition_async().get()
+        except Exception as exc:
+            with self._state_lock:
+                self._running = False
+            if self._push_stream is not None:
+                try:
+                    self._push_stream.close()
+                except Exception:
+                    pass
+            raise RuntimeError("Azure continuous recognition failed to start") from exc
+
+    def stop(self) -> None:
+        with self._state_lock:
+            self._stop_requested = True
+            self._running = False
+            push_stream = self._push_stream
+            recognizer = self._recognizer
+        if push_stream is not None:
+            try:
+                push_stream.close()
+            except Exception:
+                pass
+        if recognizer is not None:
+            try:
+                recognizer.stop_continuous_recognition_async().get()
+            except Exception:
+                pass
+
+    def feed(self, mulaw_audio: bytes) -> bool:
+        """Convert carrier mu-law to Azure's required 8 kHz PCM16 input."""
+        with self._state_lock:
+            if not self._running or self._push_stream is None:
+                return False
+            push_stream = self._push_stream
+        try:
+            pcm = self._config.ulaw_to_pcm(bytes(mulaw_audio))
+        except Exception:
+            return False
+        push_stream.write(pcm)
+        return True
+
+    def _on_recognizing(self, event: Any) -> None:
+        if not self.active:
+            return
+        text = str(getattr(event.result, "text", "")).strip()
+        if text:
+            self._events.submit(STTEvent("interim", text))
+
+    def _on_recognized(self, event: Any) -> None:
+        if not self.active:
+            return
+        result = event.result
+        if result.reason != self._config.speech.ResultReason.RecognizedSpeech:
+            return
+        text = str(getattr(result, "text", "")).strip()
+        if text:
+            self._events.submit(STTEvent("final", text, _azure_final_metadata(result)))
+
+    def _on_canceled(self, _event: Any) -> None:
+        with self._state_lock:
+            self._running = False
+            notify = not self._stop_requested and not self._fatal_notified
+            self._fatal_notified = True
+        if notify:
+            self._events.submit(STTEvent("fatal"))
+
+
+def _bounded_nonnegative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+MAX_AZURE_METADATA_JSON_BYTES = 16_384
+
+
+def _azure_confidence(result: Any) -> float | None:
+    raw_json = getattr(result, "json", None)
+    if (
+        not isinstance(raw_json, str)
+        or not raw_json
+        or len(raw_json.encode("utf-8")) > MAX_AZURE_METADATA_JSON_BYTES
+    ):
+        return None
+    try:
+        confidence = float(json.loads(raw_json)["NBest"][0]["Confidence"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return confidence if 0.0 <= confidence <= 1.0 else None
+
+
+def _azure_final_metadata(result: Any) -> AzureFinalMetadata:
+    raw_result_id = getattr(result, "result_id", None)
+    result_id = raw_result_id.strip() if isinstance(raw_result_id, str) else ""
+    return AzureFinalMetadata(
+        result_id=result_id if 0 < len(result_id) <= 256 else None,
+        offset=_bounded_nonnegative_int(getattr(result, "offset", None)),
+        duration=_bounded_nonnegative_int(getattr(result, "duration", None)),
+        confidence=_azure_confidence(result),
+    )
+
+
+@dataclass(frozen=True)
+class STTProfile:
+    """One exact generated language code, locale, and startup-selected provider."""
+
+    code: str
+    locale: str
+    provider: Literal["google", "azure"]
+    google: GoogleSTTConfig | None = None
+    azure: AzureSTTConfig | None = None
+
+    def __post_init__(self) -> None:
+        if not self.code or not self.locale:
+            raise ValueError("STT profile code and locale are required")
+        if self.provider not in {"google", "azure"}:
+            raise ValueError("STT profile provider is not supported")
+        if self.provider == "google" and (self.google is None or self.azure is not None):
+            raise ValueError("Google STT profile must contain only Google configuration")
+        if self.provider == "azure" and (self.azure is None or self.google is not None):
+            raise ValueError("Azure STT profile must contain only Azure configuration")
+
+
+class SmartPBXSTTAdapter:
+    """Startup-composed factory for call-local shared continuous recognizers."""
+
+    def __init__(self, profiles: Mapping[str, STTProfile]) -> None:
+        copied = dict(profiles)
+        if not copied or any(key != profile.code for key, profile in copied.items()):
+            raise ValueError("STT profiles must be keyed by their exact language code")
+        self._profiles = copied
+
+    @property
+    def active(self) -> bool:
+        return bool(self._profiles)
+
+    async def start_recognizer(
+        self, language: str, on_result: RecognizerCallback
+    ) -> ContinuousRecognizer:
+        profile = self._profiles.get(language)
+        if profile is None or profile.code != language:
+            raise ValueError("requested STT language is not configured")
+        if not callable(on_result):
+            raise ValueError("recognizer callback is required")
+        loop = asyncio.get_running_loop()
+        fatal_delivered = False
+
+        async def on_event(event: STTEvent) -> None:
+            nonlocal fatal_delivered
+            if event.kind == "fatal":
+                if fatal_delivered:
+                    return
+                fatal_delivered = True
+                on_result(RecognizerFatal(reason="provider_unavailable"))
+                return
+            if event.kind not in {"interim", "final"}:
+                return
+            on_result(
+                RecognizerResult(
+                    text=event.text,
+                    is_final=event.kind == "final",
+                    result_id=event.metadata.result_id if event.metadata is not None else None,
+                    audio_offset=event.metadata.offset if event.metadata is not None else None,
+                    audio_duration=event.metadata.duration if event.metadata is not None else None,
+                )
+            )
+
+        bridge = LoopEventBridge(loop, on_event)
+        provider = self._provider_for(profile, bridge)
+        recognizer = _ContinuousRecognizer(provider, bridge)
+        try:
+            await asyncio.to_thread(provider.start)
+            if not provider.active:
+                raise RuntimeError("STT provider did not become active")
+        except Exception:
+            await recognizer.close()
+            raise
+        return recognizer
+
+    def _provider_for(self, profile: STTProfile, bridge: LoopEventBridge) -> StreamingSTTAdapter:
+        if profile.provider == "google":
+            config = profile.google
+            if config is None or profile.locale != config.language_code:
+                raise ValueError("Google STT profile locale does not match its configuration")
+            return GoogleStreamingSTT(config, bridge)
+        config = profile.azure
+        if config is None or profile.locale != config.language_code:
+            raise ValueError("Azure STT profile locale does not match its configuration")
+        return AzurePushStreamSTT(config, bridge)
+
+
+class _ContinuousRecognizer:
+    """Async shared-contract wrapper that owns one bridge and one provider stream."""
+
+    def __init__(self, provider: StreamingSTTAdapter, bridge: LoopEventBridge) -> None:
+        self._provider = provider
+        self._bridge = bridge
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+
+    async def feed_audio(self, audio: bytes) -> None:
+        if self._closed:
+            return
+        self._provider.feed(bytes(audio))
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            await self._bridge.close()
+            await asyncio.to_thread(self._provider.stop)

@@ -1,0 +1,391 @@
+"""Review-only, client-neutral Twilio browser-demo service.
+
+It is deliberately separate from SmartPBX media ingress: it has its own port,
+credentials, health surface, browser token quota, signed TwiML webhook, and
+one-time ConversationRelay admission ticket.  It exposes no booking, PMS,
+handover, carrier, or SmartPBX credential path.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+from urllib.parse import parse_qsl
+
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from starlette.websockets import WebSocketDisconnect
+from twilio.jwt.access_token import AccessToken
+from twilio.jwt.access_token.grants import VoiceGrant
+from twilio.request_validator import RequestValidator
+
+from product_profile import LanguageProfile, ProductProfile, load_product_profile
+from provider_adapters import GenerationFence, ProvisionalSentence, RecoveryBoundary, TerminalCommit, ThinkingProgress
+from provider_runtime import build_llm_adapter, load_provider_profile
+from website_demo_core import (
+    IssuedBrowserIdentities,
+    SessionTickets,
+    TokenQuota,
+    WebsiteDemoConfigurationError,
+    conversation_relay_twiml,
+    validate_public_base_url,
+)
+
+
+_MAX_PROMPT_CHARS = 4_000
+_MAX_RELAY_MESSAGE_CHARS = 8_192
+_MAX_KNOWLEDGE_CHARS = 12_000
+
+
+@dataclass(frozen=True)
+class WebsiteDemoSettings:
+    agent_id: str
+    public_base_url: str
+    allowed_origin: str
+    account_sid: str
+    auth_token: str
+    api_key_sid: str
+    api_key_secret: str
+    twiml_app_sid: str
+    product_profile_path: str
+    provider_profile_path: str
+    knowledge_dir: str
+    max_sessions: int
+
+    @classmethod
+    def from_environ(cls, environ: Mapping[str, str]) -> "WebsiteDemoSettings":
+        names = (
+            "WEBSITE_DEMO_AGENT_ID", "WEBSITE_DEMO_PUBLIC_BASE_URL", "WEBSITE_DEMO_ALLOWED_ORIGIN",
+            "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_API_KEY_SID", "TWILIO_API_KEY_SECRET",
+            "TWILIO_TWIML_APP_SID", "WEBSITE_DEMO_PRODUCT_PROFILE_PATH",
+            "WEBSITE_DEMO_PROVIDER_PROFILE_PATH", "WEBSITE_DEMO_KNOWLEDGE_DIR",
+        )
+        if environ.get("WEBSITE_DEMO_ENABLED") != "true":
+            raise WebsiteDemoConfigurationError("website demo profile is disabled")
+        values = {name: environ.get(name, "").strip() for name in names}
+        missing = [name for name in names if not values[name]]
+        if missing:
+            raise WebsiteDemoConfigurationError("missing website demo configuration: " + ", ".join(missing))
+        try:
+            max_sessions = int(environ.get("WEBSITE_DEMO_MAX_SESSIONS", "2"))
+        except ValueError as error:
+            raise WebsiteDemoConfigurationError("website demo session limit is invalid") from error
+        if not 1 <= max_sessions <= 4:
+            raise WebsiteDemoConfigurationError("website demo session limit is outside approved bounds")
+        return cls(
+            agent_id=values["WEBSITE_DEMO_AGENT_ID"],
+            public_base_url=validate_public_base_url(values["WEBSITE_DEMO_PUBLIC_BASE_URL"]),
+            allowed_origin=validate_public_base_url(values["WEBSITE_DEMO_ALLOWED_ORIGIN"]),
+            account_sid=values["TWILIO_ACCOUNT_SID"], auth_token=values["TWILIO_AUTH_TOKEN"],
+            api_key_sid=values["TWILIO_API_KEY_SID"], api_key_secret=values["TWILIO_API_KEY_SECRET"],
+            twiml_app_sid=values["TWILIO_TWIML_APP_SID"],
+            product_profile_path=values["WEBSITE_DEMO_PRODUCT_PROFILE_PATH"],
+            provider_profile_path=values["WEBSITE_DEMO_PROVIDER_PROFILE_PATH"],
+            knowledge_dir=values["WEBSITE_DEMO_KNOWLEDGE_DIR"], max_sessions=max_sessions,
+        )
+
+
+class _SessionCounter:
+    """Payload-free admission accounting for the isolated website profile."""
+
+    def __init__(self, maximum: int) -> None:
+        self._maximum = maximum
+        self._active = 0
+        self._admitted = 0
+        self._rejected = 0
+        self._lock = asyncio.Lock()
+
+    async def admit(self) -> bool:
+        async with self._lock:
+            if self._active >= self._maximum:
+                self._rejected = min(self._rejected + 1, (1 << 63) - 1)
+                return False
+            self._active += 1
+            self._admitted = min(self._admitted + 1, (1 << 63) - 1)
+            return True
+
+    async def release(self) -> None:
+        async with self._lock:
+            self._active = max(self._active - 1, 0)
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "active_sessions": self._active,
+            "admitted_total": self._admitted,
+            "rejected_capacity_total": self._rejected,
+        }
+
+
+class _ReviewedKnowledge:
+    """Bounded, startup-loaded reviewed documents; no unreviewed file traversal."""
+
+    def __init__(self, profile: ProductProfile, knowledge_dir: str) -> None:
+        root = Path(knowledge_dir).resolve(strict=True)
+        pieces: list[str] = []
+        remaining = _MAX_KNOWLEDGE_CHARS
+        for relative in profile.knowledge_paths:
+            candidate = Path(relative)
+            if candidate.is_absolute() or candidate.parts[:1] != ("knowledge_docs",):
+                raise WebsiteDemoConfigurationError("website demo knowledge path is invalid")
+            unresolved = root.parent / candidate
+            if unresolved.is_symlink():
+                raise WebsiteDemoConfigurationError("website demo knowledge material is unavailable")
+            source = unresolved.resolve(strict=True)
+            if root not in source.parents or not source.is_file():
+                raise WebsiteDemoConfigurationError("website demo knowledge material is unavailable")
+            text = source.read_text(encoding="utf-8")
+            if remaining <= 0:
+                break
+            pieces.append(text[:remaining])
+            remaining -= len(pieces[-1])
+        self._context = "\n\n".join(pieces)
+
+    async def retrieve(self, _transcript: str, _profile: ProductProfile) -> str:
+        return self._context
+
+
+class _RelayConversation:
+    """Text-only ConversationRelay session, scoped to one consumed ticket."""
+
+    def __init__(self, websocket: WebSocket, provider: Any, profile: ProductProfile, language: LanguageProfile, retriever: _ReviewedKnowledge) -> None:
+        self._websocket = websocket
+        self._provider = provider
+        self._profile = profile
+        self._language = language
+        self._retriever = retriever
+        self._history: deque[tuple[str, str]] = deque(maxlen=12)
+        self._generation = 0
+        self._turn_task: asyncio.Task[None] | None = None
+        self._closed = False
+
+    async def run(self) -> None:
+        try:
+            while True:
+                raw = await self._websocket.receive_text()
+                if len(raw) > _MAX_RELAY_MESSAGE_CHARS:
+                    await self._websocket.close(code=1009)
+                    return
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(message, Mapping):
+                    continue
+                kind = message.get("type")
+                if kind == "prompt":
+                    prompt = message.get("voicePrompt")
+                    if isinstance(prompt, str):
+                        await self._begin_turn(prompt)
+                elif kind == "interrupt":
+                    await self._cancel_turn()
+                elif kind == "setup":
+                    continue
+        except WebSocketDisconnect:
+            return
+        finally:
+            self._closed = True
+            await self._cancel_turn()
+
+    async def _begin_turn(self, transcript: str) -> None:
+        text = transcript.strip()
+        if not text or len(text) > _MAX_PROMPT_CHARS:
+            return
+        await self._cancel_turn()
+        self._generation += 1
+        generation = self._generation
+        self._history.append(("user", text))
+        self._turn_task = asyncio.create_task(self._run_turn(text, generation))
+
+    async def _cancel_turn(self) -> None:
+        self._generation += 1
+        task, self._turn_task = self._turn_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _run_turn(self, transcript: str, generation: int) -> None:
+        committed: list[str] = []
+        try:
+            context = await self._retriever.retrieve(transcript, self._profile)
+            prompt = _inquiry_prompt(self._language, context)
+            stream_with_history = getattr(self._provider, "stream_response_with_history", None)
+            if not callable(stream_with_history):
+                return
+            response = stream_with_history(transcript, self._language.code, prompt, tuple(self._history))
+            async for item in response:
+                if self._closed or generation != self._generation:
+                    return
+                if isinstance(item, ThinkingProgress):
+                    continue
+                if isinstance(item, ProvisionalSentence):
+                    if item.text:
+                        committed.append(item.text)
+                        await self._send_token(item.text, last=False)
+                    continue
+                if isinstance(item, TerminalCommit):
+                    if committed:
+                        self._history.append(("assistant", " ".join(committed)))
+                    await self._send_token("", last=True)
+                    return
+                if isinstance(item, (GenerationFence, RecoveryBoundary)):
+                    await self._send_token("", last=True)
+                    return
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            raise
+        except Exception:
+            if not self._closed and generation == self._generation:
+                await self._send_token(self._language.recovery_line, last=True)
+        finally:
+            if self._turn_task is asyncio.current_task():
+                self._turn_task = None
+
+    async def _send_token(self, token: str, *, last: bool) -> None:
+        await self._websocket.send_text(json.dumps({"type": "text", "token": token, "last": last}))
+
+
+def _inquiry_prompt(language: LanguageProfile, context: str) -> str:
+    pieces = [
+        "You are an inquiry assistant.",
+        language.prompt_block,
+        "Use only reviewed knowledge. Do not perform business actions.",
+    ]
+    if context:
+        pieces.append(context)
+    return "\n\n".join(pieces)
+
+
+def _request_form(request: Request, body: bytes) -> dict[str, str]:
+    try:
+        pairs = parse_qsl(body.decode("utf-8"), keep_blank_values=True, strict_parsing=True)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise HTTPException(status_code=400) from error
+    values: dict[str, str] = {}
+    for key, value in pairs:
+        if key in values:
+            raise HTTPException(status_code=400)
+        values[key] = value
+    return values
+
+
+def _browser_origin(request: Request) -> str:
+    return request.headers.get("origin", "").rstrip("/")
+
+
+def _client_id(request: Request) -> str:
+    # The service is loopback-only; its proxy appends the immediate peer as the
+    # final X-Forwarded-For element. Never trust a caller-controlled first hop.
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        candidate = forwarded.rsplit(",", 1)[-1].strip()
+        if candidate and len(candidate) <= 128:
+            return candidate
+    return request.client.host if request.client is not None else "unknown"
+
+
+def build_website_demo_app(settings: WebsiteDemoSettings, provider: Any, profile: ProductProfile) -> FastAPI:
+    if not getattr(provider, "active", False):
+        raise WebsiteDemoConfigurationError("website demo LLM provider is inactive")
+    knowledge = _ReviewedKnowledge(profile, settings.knowledge_dir)
+    identities = IssuedBrowserIdentities()
+    tickets = SessionTickets()
+    quota = TokenQuota()
+    sessions = _SessionCounter(settings.max_sessions)
+    validator = RequestValidator(settings.auth_token)
+    app = FastAPI(title="website-demo", docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.allowed_origin],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=[],
+    )
+
+    @app.get("/health")
+    async def health() -> dict[str, str | int | bool]:
+        return {"status": "ok", "service_mode": "website-demo", "release_allowed": False, **sessions.snapshot()}
+
+    @app.get("/api/voice-token")
+    async def voice_token(request: Request, agent: str = "") -> dict[str, str]:
+        if _browser_origin(request) != settings.allowed_origin or agent != settings.agent_id:
+            raise HTTPException(status_code=403)
+        if not quota.admit(_client_id(request)):
+            raise HTTPException(status_code=429)
+        identity = "demo-" + os.urandom(12).hex()
+        token = AccessToken(settings.account_sid, settings.api_key_sid, settings.api_key_secret, identity=identity, ttl=300)
+        token.add_grant(VoiceGrant(outgoing_application_sid=settings.twiml_app_sid, incoming_allow=False))
+        serialized_token = token.to_jwt()
+        identities.issue(identity)
+        return {"token": serialized_token, "identity": identity}
+
+    @app.post("/voice/demo-incoming")
+    async def demo_incoming(request: Request) -> Response:
+        body = await request.body()
+        form = _request_form(request, body)
+        signature = request.headers.get("x-twilio-signature", "")
+        callback_url = settings.public_base_url + "/voice/demo-incoming"
+        if not signature or not validator.validate(callback_url, form, signature):
+            raise HTTPException(status_code=403)
+        language_code = form.get("lang") or profile.default_language
+        if form.get("agent") != settings.agent_id or language_code not in profile.language_profiles:
+            raise HTTPException(status_code=404)
+        caller = form.get("From", "")
+        if not caller.startswith("client:") or not identities.consume(caller.removeprefix("client:")):
+            raise HTTPException(status_code=403)
+        language = profile.language(language_code)
+        ticket = tickets.issue(agent=settings.agent_id, language=language_code)
+        return Response(
+            content=conversation_relay_twiml(
+                public_base_url=settings.public_base_url, agent=settings.agent_id, language=language_code,
+                locale=language.locale, ticket=ticket, greeting=language.greeting,
+            ),
+            media_type="application/xml",
+        )
+
+    @app.websocket("/ws/v1/website-demo/conversation")
+    async def relay(websocket: WebSocket) -> None:
+        agent = websocket.query_params.get("agent", "")
+        language_code = websocket.query_params.get("lang", "")
+        ticket = websocket.query_params.get("ticket", "")
+        if (
+            agent != settings.agent_id
+            or language_code not in profile.language_profiles
+            or tickets.consume(ticket, agent=agent, language=language_code) is None
+            or not await sessions.admit()
+        ):
+            await websocket.close(code=1008)
+            return
+        try:
+            await websocket.accept()
+            await _RelayConversation(websocket, provider, profile, profile.language(language_code), knowledge).run()
+        finally:
+            await sessions.release()
+
+    @app.on_event("shutdown")
+    async def shutdown() -> None:
+        close = getattr(provider, "close", None)
+        if callable(close):
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
+    app.state.website_demo_sessions = sessions
+    return app
+
+
+def create_app() -> FastAPI:
+    settings = WebsiteDemoSettings.from_environ(os.environ)
+    profile = load_product_profile(Path(settings.product_profile_path))
+    provider = build_llm_adapter(load_provider_profile(settings.provider_profile_path), os.environ)
+    return build_website_demo_app(settings, provider, profile)
+
+
+app = create_app()

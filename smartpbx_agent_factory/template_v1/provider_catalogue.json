@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "catalogue_status": "approved",
+  "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
+  "source_hashes": {
+    "Kavya/docker-compose.yml": "sha256:f14ce9896c526943386cfc94e158d8bc452936a2342f172a6f6e27121d22ceec",
+    "Kavya/english_voice_profile.py": "sha256:7d694df737dcdcf6382b416467bde7269bc16edb654bc6e13aed94fc032c0274",
+    "Kavya/server.py": "sha256:27e58046ce3b4c32eb0331bdafe4c0d300d7e7596ebea9dc680d7de4febee28b",
+    "Kavya/smartpbx_session.py": "sha256:18695c13c0174f3c3c45a53d7de76cc76c6d76984e998ddb4c6265fe5f19c76e"
+  },
+  "runtime_required_secret_identifiers": ["SMARTPBX_WS_TOKEN"],
+  "runtime_required_metadata_identifiers": ["SMARTPBX_ACCOUNT_ID"],
+  "manifest_selection_required": true,
+  "source_defaults": {
+    "en": {
+      "evidence": "source-default",
+      "locale": "en-US",
+      "stt": "google",
+      "llm": "claude",
+      "llm_model": "claude-sonnet-4-5-20250929",
+      "tts": "elevenlabs",
+      "tts_model": "eleven_flash_v2_5"
+    },
+    "si": {
+      "evidence": "source-default",
+      "locale": "si-LK",
+      "stt": "azure",
+      "llm": "gemini",
+      "llm_model": "gemini-3.7-flash",
+      "tts": "gemini",
+      "tts_model": "gemini-3.1-flash-tts-preview",
+      "fallback": "claude",
+      "fallback_model": "claude-sonnet-4-5-20250929"
+    }
+  },
+  "languages": {
+    "en": {
+      "locales": {
+        "en-US": {
+          "stt": [
+            {"provider": "google", "model": null, "required_secret_identifiers": [], "required_metadata_identifiers": ["GOOGLE_APPLICATION_CREDENTIALS"], "generated_runnable": false},
+            {"provider": "azure", "model": null, "required_secret_identifiers": ["AZURE_SPEECH_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}
+          ],
+          "llm": [{"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}],
+          "tts": [{"provider": "elevenlabs", "model": "eleven_flash_v2_5", "required_secret_identifiers": ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"], "required_metadata_identifiers": [], "generated_runnable": true}],
+          "fallback": []
+        }
+      }
+    },
+    "si": {
+      "locales": {
+        "si-LK": {
+          "stt": [{"provider": "azure", "model": null, "required_secret_identifiers": ["AZURE_SPEECH_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}],
+          "llm": [
+            {"provider": "gemini", "model": "gemini-3.7-flash", "required_secret_identifiers": ["GEMINI_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true},
+            {"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}
+          ],
+          "tts": [
+            {"provider": "gemini", "model": "gemini-3.1-flash-tts-preview", "required_secret_identifiers": ["GEMINI_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true},
+            {"provider": "rime", "model": "arcana", "required_secret_identifiers": ["RIME_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}
+          ],
+          "fallback": [{"provider": "claude", "model": "claude-sonnet-4-5-20250929", "required_secret_identifiers": ["ANTHROPIC_API_KEY"], "required_metadata_identifiers": [], "generated_runnable": true}]
+        }
+      }
+    }
+  }
+}

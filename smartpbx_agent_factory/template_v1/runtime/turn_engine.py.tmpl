@@ -1,0 +1,813 @@
+"""Continuous-recognizer endpoint-to-media turn orchestration.
+
+The recognizer owns streaming audio.  This engine owns every mutable turn,
+endpointing, generation, and teardown decision on its event loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from difflib import SequenceMatcher
+import re
+from collections.abc import AsyncIterable, Awaitable, Callable
+from inspect import isawaitable
+from time import monotonic
+from typing import Any
+
+from product_profile import LanguageProfile, ProductProfile
+from provider_adapters import (
+    ContinuousRecognizer,
+    ConversationProviderAdapter,
+    GenerationFence,
+    ProvisionalSentence,
+    RecognizerEvent,
+    RecognizerFatal,
+    RecognizerResult,
+    RecoveryBoundary,
+    Retriever,
+    TerminalCommit,
+    ThinkingProgress,
+)
+
+
+class ConversationTurnEngine:
+    """One continuous recognizer and at most one active conversation turn."""
+
+    def __init__(
+        self,
+        provider_adapter: ConversationProviderAdapter,
+        transport: Any,
+        product_profile: ProductProfile,
+        *,
+        retriever: Retriever | None = None,
+        endpointing_silence_seconds: float = 1.0,
+        final_grace_seconds: float = 0.5,
+        barge_in_min_chars: int = 12,
+        barge_in_debounce_seconds: float = 0.6,
+        pre_audio_min_events: int = 2,
+        pre_audio_min_seconds: float = 0.25,
+        duplicate_identity_window_seconds: float = 2.0,
+        silence_reprompt_seconds: float = 20.0,
+        max_reprompts: int = 2,
+        filler_delay_seconds: float = 0.75,
+        clock: Callable[[], float] = monotonic,
+        on_terminal_failure: Callable[[RecognizerFatal], Awaitable[None] | None] | None = None,
+    ) -> None:
+        if (
+            not isinstance(endpointing_silence_seconds, (int, float))
+            or isinstance(endpointing_silence_seconds, bool)
+            or endpointing_silence_seconds < 0
+            or not isinstance(final_grace_seconds, (int, float))
+            or isinstance(final_grace_seconds, bool)
+            or final_grace_seconds < 0
+            or not isinstance(barge_in_min_chars, int)
+            or isinstance(barge_in_min_chars, bool)
+            or not 0 <= barge_in_min_chars <= 200
+            or not isinstance(barge_in_debounce_seconds, (int, float))
+            or isinstance(barge_in_debounce_seconds, bool)
+            or not 0 <= barge_in_debounce_seconds <= 5.0
+            or not isinstance(pre_audio_min_events, int)
+            or isinstance(pre_audio_min_events, bool)
+            or not 1 <= pre_audio_min_events <= 8
+            or not isinstance(pre_audio_min_seconds, (int, float))
+            or isinstance(pre_audio_min_seconds, bool)
+            or not 0 <= pre_audio_min_seconds <= 5.0
+            or not isinstance(duplicate_identity_window_seconds, (int, float))
+            or isinstance(duplicate_identity_window_seconds, bool)
+            or not 0 < duplicate_identity_window_seconds <= 10.0
+            or not callable(clock)
+            or not isinstance(silence_reprompt_seconds, (int, float))
+            or isinstance(silence_reprompt_seconds, bool)
+            or not 5 <= silence_reprompt_seconds <= 120
+            or not isinstance(max_reprompts, int)
+            or isinstance(max_reprompts, bool)
+            or not 0 <= max_reprompts <= 3
+            or not isinstance(filler_delay_seconds, (int, float))
+            or isinstance(filler_delay_seconds, bool)
+            or not 0 <= filler_delay_seconds <= 5
+        ):
+            raise ValueError("invalid conversation turn timing")
+        self._provider_adapter = provider_adapter
+        self._transport = transport
+        self._product_profile = product_profile
+        self._retriever = retriever
+        self._endpointing_silence_seconds = endpointing_silence_seconds
+        self._final_grace_seconds = final_grace_seconds
+        self._barge_in_min_chars = barge_in_min_chars
+        self._barge_in_debounce_seconds = barge_in_debounce_seconds
+        self._pre_audio_min_events = pre_audio_min_events
+        self._pre_audio_min_seconds = pre_audio_min_seconds
+        self._duplicate_identity_window_seconds = duplicate_identity_window_seconds
+        self._clock = clock
+        self._silence_reprompt_seconds = silence_reprompt_seconds
+        self._max_reprompts = max_reprompts
+        self._filler_delay_seconds = filler_delay_seconds
+        self._on_terminal_failure = on_terminal_failure
+        self.turns_completed = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._recognizer: ContinuousRecognizer | None = None
+        self._language: LanguageProfile | None = None
+        self._recognizer_epoch = 0
+        self._generation = 0
+        self._endpoint_token = 0
+        self._recent_result_identities: deque[tuple[tuple[str | int, bool], float]] = deque(maxlen=32)
+        self._final_result_ids: deque[str | int] = deque(maxlen=256)
+        self._final_audio_intervals: deque[tuple[int, int]] = deque(maxlen=256)
+        self._pending_final_intervals: list[tuple[int, int]] = []
+        self._pending_transcript = ""
+        self._committed_finals: list[str] = []
+        self._latest_interim = ""
+        self._endpoint_handle: asyncio.TimerHandle | None = None
+        self._turn_task: asyncio.Task[None] | None = None
+        self._sentence_tts_task: asyncio.Task[None] | None = None
+        self._filler_task: asyncio.Task[None] | None = None
+        self._reprompt_task: asyncio.Task[None] | None = None
+        self._reprompt_epoch = 0
+        self._reprompt_count = 0
+        self._filler_index = 0
+        self._delivery_epoch = 0
+        self._deferred_endpoint_due = False
+        self._audible_generation: int | None = None
+        self._audible_since: float | None = None
+        self._assistant_turn_sentences: list[str] = []
+        self._pre_audio_generation: int | None = None
+        self._pre_audio_first_result_at: float | None = None
+        self._pre_audio_result_count = 0
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._callback_lock = asyncio.Lock()
+        self._closed = False
+        self._recognizer_results_admitted = True
+        self.terminal_failure: RecognizerFatal | None = None
+        self.committed_responses: list[str] = []
+        self._history: deque[tuple[str, str]] = deque(maxlen=12)
+
+    @property
+    def active(self) -> bool:
+        return bool(getattr(self._provider_adapter, "active", False))
+
+    async def start(self, language: LanguageProfile) -> None:
+        """Bind a recognizer before audio can enter this call-local engine."""
+        if self._closed:
+            raise RuntimeError("conversation turn engine is closed")
+        if not self.active:
+            raise RuntimeError("conversation provider adapter is inactive")
+        if self._recognizer is not None:
+            if self._language == language:
+                return
+            await self.set_language(language)
+            return
+        self._loop = asyncio.get_running_loop()
+        await self._start_recognizer(language)
+
+    async def set_language(self, language: LanguageProfile) -> None:
+        """Restart the recognizer only at this explicit session-owned boundary."""
+        if self._closed:
+            return
+        if self._recognizer is None:
+            await self.start(language)
+            return
+        if self._language == language:
+            return
+        await self._cancel_active_turn(clear_audio=True)
+        await self._close_recognizer()
+        self._pending_transcript = ""
+        self._committed_finals.clear()
+        self._pending_final_intervals.clear()
+        self._latest_interim = ""
+        self._recent_result_identities.clear()
+        self._invalidate_endpointing()
+        await self._start_recognizer(language)
+
+    def set_recognizer_result_admission(self, admitted: bool) -> None:
+        """Discard callbacks during delivered IVR/greeting media, call-locally."""
+        self._recognizer_results_admitted = bool(admitted)
+
+    async def accept_audio(self, audio: bytes, language: LanguageProfile) -> bool:
+        """Feed the already-started recognizer; never transcribe per frame."""
+        if self._closed:
+            return False
+        if self._recognizer is None:
+            await self.start(language)
+        if self._language != language:
+            await self.set_language(language)
+        recognizer = self._recognizer
+        if recognizer is None:
+            return False
+        await recognizer.feed_audio(bytes(audio))
+        await self._cancel_reprompt()
+        return True
+
+    async def close(self) -> None:
+        """Fence callbacks first, then cancel media/turn work and close STT."""
+        if self._closed:
+            return
+        self._closed = True
+        self._recognizer_epoch += 1
+        self._invalidate_endpointing()
+        self._pending_transcript = ""
+        self._deferred_endpoint_due = False
+        await self._cancel_active_turn(clear_audio=True)
+        await self._cancel_reprompt()
+        await self._cancel_filler()
+        await self._close_recognizer()
+
+    async def drain(self) -> None:
+        """Testing/teardown barrier for tracked endpoint and turn tasks."""
+        while True:
+            pending = tuple(task for task in self._tasks if task is not asyncio.current_task())
+            if not pending:
+                await asyncio.sleep(0)
+                if not self._tasks:
+                    return
+                continue
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _start_recognizer(self, language: LanguageProfile) -> None:
+        self._recognizer_epoch += 1
+        epoch = self._recognizer_epoch
+        self._language = language
+        self._recognizer = await self._provider_adapter.start_recognizer(
+            language.code,
+            lambda event: self._on_recognizer_event(epoch, event),
+        )
+
+    async def _close_recognizer(self) -> None:
+        recognizer, self._recognizer = self._recognizer, None
+        if recognizer is not None:
+            await recognizer.close()
+
+    def _on_recognizer_event(self, epoch: int, event: RecognizerEvent) -> None:
+        """Provider callbacks may be threaded; mutation always returns to our loop."""
+        loop = self._loop
+        if self._closed or loop is None or not isinstance(event, RecognizerEvent):
+            return
+        try:
+            loop.call_soon_threadsafe(self._schedule_recognizer_event, epoch, event)
+        except RuntimeError:
+            return
+
+    def _schedule_recognizer_event(self, epoch: int, event: RecognizerEvent) -> None:
+        if self._closed or not self._recognizer_results_admitted or epoch != self._recognizer_epoch:
+            return
+        if isinstance(event, RecognizerFatal):
+            self._track(asyncio.create_task(self._handle_recognizer_fatal(epoch, event)))
+            return
+        self._track(asyncio.create_task(self._handle_recognizer_result(epoch, event)))
+
+    async def _handle_recognizer_fatal(self, epoch: int, failure: RecognizerFatal) -> None:
+        """Fail one session once without retaining any provider payload."""
+        async with self._callback_lock:
+            if self._closed or epoch != self._recognizer_epoch or self.terminal_failure is not None:
+                return
+            self.terminal_failure = failure
+            self._closed = True
+            self._recognizer_epoch += 1
+            self._pending_transcript = ""
+            self._deferred_endpoint_due = False
+            await self._cancel_active_turn(clear_audio=True)
+            await self._cancel_reprompt()
+            await self._close_recognizer()
+            if self._on_terminal_failure is not None:
+                try:
+                    callback_result = self._on_terminal_failure(failure)
+                    if isawaitable(callback_result):
+                        await callback_result
+                except Exception:
+                    return
+
+    async def _handle_recognizer_result(self, epoch: int, result: RecognizerResult) -> None:
+        async with self._callback_lock:
+            if (
+                self._closed
+                or epoch != self._recognizer_epoch
+            ):
+                return
+            if not result.is_final and self._is_duplicate(result):
+                return
+            text = result.text.strip()
+            if not text:
+                return
+            language = self._language
+            if language is not None and self._is_echo(text, language):
+                return
+            if self._turn_task is not None and not self._turn_task.done():
+                if self._should_barge_in(text):
+                    await self._cancel_active_turn(clear_audio=True)
+            if not self._reconcile_recognizer_text(text, result):
+                return
+            self._arm_endpointing(
+                self._final_grace_seconds if result.is_final else self._endpointing_silence_seconds
+            )
+
+    def _invalidate_endpointing(self) -> None:
+        self._endpoint_token += 1
+        if self._endpoint_handle is not None:
+            self._endpoint_handle.cancel()
+            self._endpoint_handle = None
+
+    def _arm_endpointing(self, delay: float) -> None:
+        self._invalidate_endpointing()
+        if self._closed or self._loop is None:
+            return
+        token = self._endpoint_token
+        epoch = self._recognizer_epoch
+        self._endpoint_handle = self._loop.call_later(delay, self._launch_turn, token, epoch)
+
+    def _launch_turn(self, token: int, epoch: int) -> None:
+        if (
+            self._closed
+            or token != self._endpoint_token
+            or epoch != self._recognizer_epoch
+        ):
+            return
+        if self._turn_task is not None and not self._turn_task.done():
+            self._deferred_endpoint_due = bool(self._pending_transcript.strip())
+            return
+        transcript = self._pending_transcript.strip()
+        self._pending_transcript = ""
+        self._committed_finals.clear()
+        self._pending_final_intervals.clear()
+        self._latest_interim = ""
+        self._endpoint_handle = None
+        if not transcript or self._language is None:
+            return
+        # Endpoint ownership, rather than raw interim recognition, is the
+        # sole boundary at which user text enters bounded call-local history.
+        self._history.append(("user", transcript))
+        self._generation += 1
+        generation = self._generation
+        self._assistant_turn_sentences = []
+        task = asyncio.create_task(self._run_turn(transcript, self._language, generation))
+        self._turn_task = task
+        self._track(task)
+
+    async def _cancel_active_turn(self, *, clear_audio: bool) -> None:
+        self._invalidate_endpointing()
+        self._generation += 1
+        self._delivery_epoch += 1
+        self._deferred_endpoint_due = False
+        self._audible_generation = None
+        self._audible_since = None
+        self._pre_audio_generation = None
+        self._pre_audio_first_result_at = None
+        self._pre_audio_result_count = 0
+        self._assistant_turn_sentences = []
+        task, self._turn_task = self._turn_task, None
+        await self._cancel_sentence_tts()
+        await self._cancel_filler()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if clear_audio:
+            clear_audio_method = getattr(self._transport, "clear_audio", None)
+            if callable(clear_audio_method):
+                await clear_audio_method()
+
+    def _owns_generation(self, generation: int) -> bool:
+        return not self._closed and generation == self._generation
+
+    def _is_duplicate(self, result: RecognizerResult) -> bool:
+        """Suppress only an immediate exact callback replay with an explicit ID."""
+        identity = result.duplicate_identity()
+        if identity is None:
+            return False
+        now = self._clock()
+        while (
+            self._recent_result_identities
+            and now - self._recent_result_identities[0][1] > self._duplicate_identity_window_seconds
+        ):
+            self._recent_result_identities.popleft()
+        if any(previous == identity for previous, _seen_at in self._recent_result_identities):
+            return True
+        self._recent_result_identities.append((identity, now))
+        return False
+
+    def _reconcile_recognizer_text(self, text: str, result: RecognizerResult) -> bool:
+        """Keep committed finals plus one interim overlay, never regress final text.
+
+        Google may report cumulative finals while Azure reports segmented ones;
+        both forms are deduplicated before endpointing. A late interim that
+        merely repeats a committed final is ignored instead of overwriting it.
+        """
+        if result.is_final:
+            if result.result_id is not None and result.result_id in self._final_result_ids:
+                return False
+            interval = result.audio_interval
+            if interval is not None and self._intervals_cover(self._final_audio_intervals, *interval):
+                return False
+            committed = " ".join(self._committed_finals).strip()
+            pending_coverage = self._pending_audio_coverage()
+            if interval is not None and pending_coverage is not None and interval[0] <= pending_coverage[0] and interval[1] > pending_coverage[1]:
+                self._committed_finals = [text]
+                self._pending_final_intervals.clear()
+                self._latest_interim = ""
+            else:
+                self._committed_finals.append(text)
+                self._latest_interim = ""
+            if result.result_id is not None:
+                self._final_result_ids.append(result.result_id)
+            if interval is not None:
+                self._final_audio_intervals.append(interval)
+                self._pending_final_intervals.append(interval)
+        else:
+            committed = " ".join(self._committed_finals).strip()
+            exact_prefix = f"{committed} "
+            if committed and text == committed:
+                self._latest_interim = ""
+            elif committed and text.startswith(exact_prefix) and len(text) > len(exact_prefix) and not text[len(exact_prefix)].isspace():
+                self._latest_interim = ""
+                self._pending_transcript = text
+                return True
+            elif committed:
+                self._latest_interim = text
+            else:
+                self._latest_interim = text
+        parts = [" ".join(self._committed_finals).strip(), self._latest_interim]
+        self._pending_transcript = " ".join(part for part in parts if part).strip()
+        return True
+
+    @staticmethod
+    def _intervals_cover(intervals: deque[tuple[int, int]], start: int, end: int) -> bool:
+        cursor = start
+        for segment_start, segment_end in sorted(intervals):
+            if segment_end <= cursor:
+                continue
+            if segment_start > cursor:
+                return False
+            cursor = max(cursor, segment_end)
+            if cursor >= end:
+                return True
+        return False
+
+    def _pending_audio_coverage(self) -> tuple[int, int] | None:
+        if not self._pending_final_intervals:
+            return None
+        ordered = sorted(self._pending_final_intervals)
+        start, end = ordered[0]
+        for segment_start, segment_end in ordered[1:]:
+            if segment_start > end:
+                return None
+            end = max(end, segment_end)
+        return start, end
+
+    def _should_barge_in(self, text: str) -> bool:
+        """Apply Kavya's speaking-time material, debounce, and echo policy."""
+        language = self._language
+        if language is None or len(text.strip()) < self._barge_in_min_chars or self._is_echo(text, language):
+            return False
+        generation = self._generation
+        now = self._clock()
+        if self._audible_generation == generation and self._audible_since is not None:
+            return now - self._audible_since >= self._barge_in_debounce_seconds
+        if self._pre_audio_generation != generation:
+            return False
+        self._pre_audio_result_count += 1
+        if self._pre_audio_first_result_at is None:
+            self._pre_audio_first_result_at = now
+        return (
+            self._pre_audio_result_count >= self._pre_audio_min_events
+            and now - self._pre_audio_first_result_at >= self._pre_audio_min_seconds
+        )
+
+    def _is_echo(self, text: str, language: LanguageProfile) -> bool:
+        """Client-neutral current-turn overlap guard; it retains no old turns."""
+        if self._audible_generation != self._generation:
+            return False
+        transcript_tokens = _normalized_tokens(text)
+        if len(transcript_tokens) < 5 or not self._assistant_turn_sentences:
+            return False
+        starts_with_affirmation = transcript_tokens[0] in _ECHO_AFFIRMATIONS
+        for sentence in self._assistant_turn_sentences:
+            sentence_tokens = _normalized_tokens(sentence)
+            if not sentence_tokens:
+                continue
+            if starts_with_affirmation and sentence_tokens[0] not in _ECHO_AFFIRMATIONS:
+                continue
+            transcript_ratio = _token_overlap_ratio(sentence_tokens, transcript_tokens)
+            sentence_ratio = _token_overlap_ratio(transcript_tokens, sentence_tokens)
+            if transcript_ratio >= 0.8 and sentence_ratio >= 0.6:
+                return True
+        return False
+
+    async def _run_turn(self, transcript: str, language: LanguageProfile, generation: int) -> None:
+        try:
+            self._pre_audio_generation = generation
+            self._pre_audio_first_result_at = None
+            self._pre_audio_result_count = 0
+            context = ""
+            if self._retriever is not None:
+                context = await self._retriever.retrieve(transcript, self._product_profile)
+            if not self._owns_generation(generation):
+                return
+            prompt = _build_prompt(self._product_profile, language, context)
+            self._start_filler(language, generation)
+            generate_with_history = getattr(self._provider_adapter, "generate_response_with_history", None)
+            if callable(generate_with_history):
+                response = await generate_with_history(transcript, language.code, prompt, tuple(self._history))
+            else:
+                response = await self._provider_adapter.generate_response(transcript, language.code, prompt)
+            committed_sentences = await self._speak_response(response, language, generation)
+            if committed_sentences is None:
+                return
+            if not self._owns_generation(generation):
+                return
+            if committed_sentences:
+                send_mark = getattr(self._transport, "send_mark", None)
+                if callable(send_mark):
+                    await send_mark("conversation-turn")
+                await self._arm_reprompt()
+            if self._owns_generation(generation):
+                committed_response = " ".join(
+                    sentence.strip() for sentence in committed_sentences if sentence.strip()
+                )
+                if committed_response:
+                    self.committed_responses.append(committed_response)
+                    # Only a terminal commit followed by the transport mark is
+                    # durable assistant history; provisional/fenced media is not.
+                    self._history.append(("assistant", committed_response))
+                self.turns_completed += 1
+        finally:
+            await self._cancel_filler()
+            if self._turn_task is asyncio.current_task():
+                self._turn_task = None
+                self._pre_audio_generation = None
+                self._pre_audio_first_result_at = None
+                self._pre_audio_result_count = 0
+                if self._deferred_endpoint_due and self._pending_transcript.strip() and not self._closed:
+                    self._deferred_endpoint_due = False
+                    self._arm_endpointing(0.0)
+
+    async def _speak_response(
+        self,
+        response: str | AsyncIterable[
+            ProvisionalSentence | ThinkingProgress | TerminalCommit | GenerationFence | RecoveryBoundary
+        ],
+        language: LanguageProfile,
+        turn_generation: int,
+    ) -> list[str] | None:
+        """Speak complete provisional sentences; commit them only at terminal metadata.
+
+        The provider owns a single recovery retry.  A fence has to cancel and
+        drain the current sentence task before transport media is cleared, so a
+        failed preamble cannot leak into a retried response or assistant history.
+        """
+        if isinstance(response, str):
+            if response:
+                await self._speak_sentence(response, language, turn_generation)
+            return [response] if self._owns_generation(turn_generation) else None
+
+        active_attempt: int | None = None
+        fenced_attempts: set[int] = set()
+        retry_used = False
+        provisional_sentences: list[str] = []
+        try:
+            async for item in response:
+                if not self._owns_generation(turn_generation):
+                    return None
+                if isinstance(item, ThinkingProgress):
+                    continue
+                if isinstance(item, ProvisionalSentence):
+                    await self._cancel_filler()
+                    if item.generation in fenced_attempts:
+                        continue
+                    if active_attempt is None:
+                        active_attempt = item.generation
+                    elif item.generation != active_attempt:
+                        await self._fence_provisional_media()
+                        return None
+                    if item.text:
+                        await self._speak_sentence(item.text, language, turn_generation)
+                        if not self._owns_generation(turn_generation):
+                            return None
+                        provisional_sentences.append(item.text)
+                    continue
+                if isinstance(item, TerminalCommit):
+                    await self._cancel_filler()
+                    if active_attempt is None:
+                        active_attempt = item.generation
+                    if item.generation != active_attempt or item.generation in fenced_attempts:
+                        await self._fence_provisional_media()
+                        return None
+                    return provisional_sentences
+                if isinstance(item, GenerationFence):
+                    await self._cancel_filler()
+                    if item.generation in fenced_attempts:
+                        continue
+                    if active_attempt is not None and item.generation != active_attempt:
+                        continue
+                    fenced_attempts.add(item.generation)
+                    await self._fence_provisional_media()
+                    provisional_sentences.clear()
+                    active_attempt = None
+                    if not item.retrying or retry_used:
+                        return None
+                    retry_used = True
+                    continue
+                if isinstance(item, RecoveryBoundary):
+                    await self._cancel_filler()
+                    if active_attempt is None or item.generation == active_attempt:
+                        if item.generation not in fenced_attempts:
+                            fenced_attempts.add(item.generation)
+                            await self._fence_provisional_media()
+                        # Exhaustion has one profile-owned, delivered recovery
+                        # sentence. It is never placed in assistant history.
+                        await self._speak_profile_text(language.recovery_line, language, turn_generation, "recovery")
+                        return None
+                    continue
+                raise TypeError("LLM adapter yielded an unsupported stream event")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._fence_provisional_media()
+            return None
+        await self._fence_provisional_media()
+        return None
+
+    async def _speak_sentence(
+        self, sentence: str, language: LanguageProfile, turn_generation: int
+    ) -> None:
+        if turn_generation == self._generation and sentence.strip():
+            self._assistant_turn_sentences.append(sentence)
+        delivery_epoch = self._delivery_epoch
+        task = asyncio.create_task(
+            self._send_sentence_audio(sentence, language, turn_generation, delivery_epoch)
+        )
+        self._sentence_tts_task = task
+        try:
+            await task
+        finally:
+            if self._sentence_tts_task is task:
+                self._sentence_tts_task = None
+
+    async def _send_sentence_audio(
+        self,
+        sentence: str,
+        language: LanguageProfile,
+        turn_generation: int,
+        delivery_epoch: int,
+    ) -> None:
+        audio_result = await self._provider_adapter.synthesize_audio(sentence, language.code)
+        async for audio_chunk in _iterate_audio(audio_result):
+            if (
+                not self._owns_generation(turn_generation)
+                or delivery_epoch != self._delivery_epoch
+            ):
+                return
+            if not audio_chunk:
+                continue
+            await self._transport.send_audio(audio_chunk)
+            if (
+                self._owns_generation(turn_generation)
+                and delivery_epoch == self._delivery_epoch
+                and self._audible_generation != turn_generation
+            ):
+                self._audible_generation = turn_generation
+                self._audible_since = self._clock()
+                self._pre_audio_generation = None
+
+    async def _cancel_sentence_tts(self) -> None:
+        task = self._sentence_tts_task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def speak_profile_message(self, text: str, mark_name: str) -> None:
+        """Deliver a profile-owned greeting/menu through TTS and a transport mark."""
+        language = self._language
+        if self._closed or language is None or not text.strip():
+            return
+        await self._speak_profile_text(text, language, self._generation, mark_name)
+
+    async def _speak_profile_text(self, text: str, language: LanguageProfile, generation: int, mark_name: str) -> None:
+        if not text.strip() or not self._owns_generation(generation):
+            return
+        await self._speak_sentence(text, language, generation)
+        if self._owns_generation(generation):
+            send_mark = getattr(self._transport, "send_mark", None)
+            if callable(send_mark):
+                await send_mark(mark_name)
+        if mark_name in {"conversation-turn", "initial-greeting", "recovery"}:
+            await self._arm_reprompt()
+
+    def _start_filler(self, language: LanguageProfile, generation: int) -> None:
+        if not language.filler_phrases or self._closed:
+            return
+        self._filler_task = asyncio.create_task(self._delayed_filler(language, generation))
+        self._track(self._filler_task)
+
+    async def _delayed_filler(self, language: LanguageProfile, generation: int) -> None:
+        try:
+            await asyncio.sleep(self._filler_delay_seconds)
+            if not self._owns_generation(generation):
+                return
+            text = language.filler_phrases[self._filler_index % len(language.filler_phrases)]
+            self._filler_index += 1
+            await self._speak_profile_text(text, language, generation, "thinking-filler")
+        except asyncio.CancelledError:
+            return
+
+    async def _cancel_filler(self) -> None:
+        task, self._filler_task = self._filler_task, None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def _take_reprompt_task(self) -> tuple[int, asyncio.Task[None] | None]:
+        """Invalidate the current timer before any await can yield ownership."""
+        self._reprompt_epoch += 1
+        task, self._reprompt_task = self._reprompt_task, None
+        return self._reprompt_epoch, task
+
+    async def _await_reprompt_task(self, task: asyncio.Task[None] | None) -> None:
+        if task is None or task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _cancel_reprompt(self) -> None:
+        _epoch, task = self._take_reprompt_task()
+        await self._await_reprompt_task(task)
+
+    async def _arm_reprompt(self) -> None:
+        epoch, task = self._take_reprompt_task()
+        await self._await_reprompt_task(task)
+        # A later input or re-arm owns the slot if it ran while we waited for
+        # the previous timer to finish cancellation.
+        if epoch != self._reprompt_epoch:
+            return
+        if self._closed or self._max_reprompts == 0 or self._reprompt_count >= self._max_reprompts:
+            return
+        task = asyncio.create_task(self._reprompt_after_silence())
+        self._reprompt_task = task
+        task.add_done_callback(self._observe_reprompt_task)
+
+    def _observe_reprompt_task(self, task: asyncio.Task[None]) -> None:
+        """Consume task outcomes and clear only the task that still owns the slot."""
+        if self._reprompt_task is task:
+            self._reprompt_task = None
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            return
+
+    async def _reprompt_after_silence(self) -> None:
+        try:
+            await asyncio.sleep(self._silence_reprompt_seconds)
+            if self._closed or self._turn_task is not None or self._deferred_endpoint_due or self._language is None:
+                return
+            self._reprompt_count += 1
+            await self._speak_profile_text(self._language.reprompt, self._language, self._generation, "silence-reprompt")
+        except asyncio.CancelledError:
+            return
+
+    async def _fence_provisional_media(self) -> None:
+        """Atomically fence sentence synthesis before discarding queued media."""
+        self._delivery_epoch += 1
+        await self._cancel_filler()
+        await self._cancel_sentence_tts()
+        clear_audio = getattr(self._transport, "clear_audio", None)
+        if callable(clear_audio):
+            await clear_audio()
+
+    def _track(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+
+def _build_prompt(profile: ProductProfile, language: LanguageProfile, context: str) -> str:
+    pieces = [
+        "You are an inquiry assistant.",
+        language.prompt_block,
+        "Use only reviewed knowledge. Do not perform business actions.",
+    ]
+    if context:
+        pieces.append(context)
+    return "\n\n".join(piece for piece in pieces if piece)
+
+
+async def _iterate_audio(value: bytes | AsyncIterable[bytes]) -> AsyncIterable[bytes]:
+    if isinstance(value, bytes):
+        yield value
+        return
+    async for item in value:
+        if not isinstance(item, bytes):
+            raise TypeError("TTS adapter yielded non-audio content")
+        yield item
+
+
+_ECHO_AFFIRMATIONS = frozenset({"yes", "yeah", "no", "correct", "right", "okay"})
+_ECHO_NORMALIZE = re.compile(r"[^\w\s]+", re.UNICODE)
+
+
+def _normalized_tokens(text: str) -> list[str]:
+    return _ECHO_NORMALIZE.sub(" ", text.lower()).split()
+
+
+def _token_overlap_ratio(reference: list[str], candidate: list[str]) -> float:
+    if not reference or not candidate:
+        return 0.0
+    matched = sum(block.size for block in SequenceMatcher(None, reference, candidate).get_matching_blocks())
+    return matched / len(candidate)

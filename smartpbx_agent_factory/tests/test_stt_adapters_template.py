@@ -1,0 +1,86 @@
+"""Static source contract for the pending client-neutral STT template lane."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+
+ROOT = Path(__file__).parents[1] / "template_v1"
+TEMPLATE = ROOT / "runtime" / "stt_adapters.py.tmpl"
+
+
+def test_stt_template_preserves_the_pinned_streaming_provider_boundary() -> None:
+    text = TEMPLATE.read_text(encoding="utf-8")
+
+    assert "class GoogleStreamingSTT" in text
+    assert "class AzurePushStreamSTT" in text
+    assert "AudioEncoding.MULAW" in text
+    assert "samples_per_second=8000" in text
+    assert "bits_per_sample=16" in text
+    assert "channels=1" in text
+    assert "asyncio.run_coroutine_threadsafe" in text
+    assert "def feed(self, mulaw_audio: bytes)" in text
+    assert "def start(self)" in text
+    assert "def stop(self)" in text
+
+
+def test_stt_template_has_startup_injection_and_no_client_identity() -> None:
+    text = TEMPLATE.read_text(encoding="utf-8")
+
+    assert "GoogleSTTConfig" in text
+    assert "AzureSTTConfig" in text
+    assert "os.getenv" not in text
+    assert "import os" not in text
+    assert "tenant" not in text.lower()
+
+
+def test_stt_template_adapts_to_the_shared_continuous_recognizer_contract() -> None:
+    text = TEMPLATE.read_text(encoding="utf-8")
+
+    assert "from provider_adapters import ContinuousRecognizer, RecognizerCallback, RecognizerFatal, RecognizerResult" in text
+    assert "class SmartPBXSTTAdapter" in text
+    assert "async def start_recognizer(" in text
+    assert "class _ContinuousRecognizer" in text
+    assert "async def feed_audio(self, audio: bytes)" in text
+    assert "async def close(self)" in text
+    assert "RecognizerResult(" in text
+    assert "result_id=event.metadata.result_id" in text
+    assert "profile.code != language" in text
+    assert "profile.locale != config.language_code" in text
+    assert 'if self.provider not in {"google", "azure"}:' in text
+    assert "start_continuous_recognition_async().get()" in text
+    assert "MAX_AZURE_METADATA_JSON_BYTES" in text
+
+
+def test_stt_template_delivers_one_payload_free_fatal_and_fences_late_callbacks() -> None:
+    text = TEMPLATE.read_text(encoding="utf-8")
+
+    assert "RecognizerFatal" in text
+    assert "fatal_delivered = False" in text
+    assert "if fatal_delivered:" in text
+    assert "RecognizerFatal(reason=\"provider_unavailable\")" in text
+    assert "self._events.submit(STTEvent(\"fatal\"))" in text
+    assert "self._stop_requested" in text
+    assert text.index("await self._bridge.close()") < text.index("await asyncio.to_thread(self._provider.stop)")
+
+
+def test_google_worker_failure_and_azure_cancellation_have_the_same_fenced_fatal_path() -> None:
+    text = TEMPLATE.read_text(encoding="utf-8")
+    google = text[text.index("class GoogleStreamingSTT"):text.index("class AzurePushStreamSTT")]
+    azure = text[text.index("class AzurePushStreamSTT"):text.index("class STTProfile")]
+
+    assert "except Exception:" in google
+    assert "self._events.submit(STTEvent(\"fatal\"))" in google
+    assert "def _on_canceled" in azure
+    assert "not self._stop_requested and not self._fatal_notified" in azure
+    assert "self._events.submit(STTEvent(\"fatal\"))" in azure
+
+
+def test_candidate_provenance_records_exact_kavya_stt_ranges_without_approval() -> None:
+    candidate = json.loads((ROOT / "candidate_runtime_provenance.json").read_text(encoding="utf-8"))
+
+    assert candidate["status"] == "partial-candidate-not-approved-for-rendering"
+    component = next(item for item in candidate["components"] if item["template_path"] == "runtime/stt_adapters.py.tmpl")
+    assert component["source_path"] == "Kavya/server.py"
+    assert component["source_ranges"] == ["575-582", "1855-1863", "6549-6881", "6884-6980", "6983-7252", "9359-9443"]

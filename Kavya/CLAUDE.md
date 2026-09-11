@@ -244,7 +244,7 @@ Typed input -> KB retrieval -> LLM tool-use loop -> text response -> TTS playbac
 - `GET /smartpbx/status` — session counters (`active_sessions`, `admitted_total`, `rejected_capacity_total`, `released_total`, `frames_dropped_total`), `enabled`, `configured`, `protocol_version`, `transfer_enabled` — no secrets, no PII. **Requires the same `X-Kavya-SmartPBX-Token` header as the media socket** (constant-time compare): the counters are a live occupancy oracle and a call-volume signal, so they are not publicly readable. `/health` stays unauthenticated for liveness probes; point uptime monitoring there.
 - `WS /ws/v1/smartpbx/media` — the Dialog media socket, gated by a required `X-Kavya-SmartPBX-Token` header (constant-time compare) checked before `websocket.accept()`
 
-Protocol version is `smartpbx-ai-provider-v06`. Audio is exact `g711_ulaw` at `8000` Hz only — any other codec/rate is rejected at the `start` event. Capacity is hard-capped at **4 concurrent calls** (a 5th is rejected before the socket is even accepted; `SmartPBXSessionRegistry` cannot be constructed outside 1–4).
+Protocol version is `smartpbx-ai-provider-v07`. Audio is exact `g711_ulaw` at `8000` Hz only — any other codec/rate is rejected at the `start` event. Capacity is hard-capped at **4 concurrent calls** (a 5th is rejected before the socket is even accepted; `SmartPBXSessionRegistry` cannot be constructed outside 1–4).
 
 **Module map** (`Kavya/smartpbx_*.py`):
 - `smartpbx_protocol.py` — strict, transport-independent parser for the Dialog wire events (`connected`/`start`/`media`/`dtmf`/`hangup`/`stop`, else `Unsupported`) into a closed dataclass union; fail-closed on anything malformed.
