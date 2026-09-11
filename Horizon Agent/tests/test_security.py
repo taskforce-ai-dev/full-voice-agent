@@ -69,6 +69,20 @@ def test_ws_media_stream_rejects_without_ticket(monkeypatch):
             ws.receive_text()
 
 
+def test_media_stream_ticket_rides_the_path_not_query(monkeypatch):
+    """Twilio Media Streams drops query strings, so the ticket must be in the
+    URL PATH (/ws/media-stream/si/<ticket>), never ?t=. Regression for the
+    Sinhala/Arabic auto-hangup."""
+    import re
+    monkeypatch.setenv("WS_TICKET_SECRET", "unit-secret")
+    body = client.post("/voice/demo-incoming", data={"lang": "si"}).text
+    assert "/ws/media-stream/si/" in body          # ticket in the path
+    assert "/ws/media-stream/si?t=" not in body     # NOT in the query
+    m = re.search(r"/ws/media-stream/si/([^\"\s]+)", body)
+    assert m, "no ticket segment found in the Media Streams URL"
+    assert server._verify_ws_ticket(m.group(1)) is True
+
+
 # ---------------------------------------------------------------------------
 # Dashboard call-started egress suppression (blocker 1)
 # ---------------------------------------------------------------------------

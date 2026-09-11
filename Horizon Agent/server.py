@@ -175,11 +175,23 @@ def _verify_ws_ticket(ticket: str) -> bool:
 
 def _ws_query_suffix(existing: bool = False) -> str:
     """`&t=<ticket>` / `?t=<ticket>` (or "") for embedding in a wss URL.
-    `existing=True` when the URL already has a query string."""
+    `existing=True` when the URL already has a query string.
+
+    Use this ONLY for ConversationRelay URLs — Twilio CR forwards query params
+    reliably. For Media Streams use `_ws_path_suffix()` instead (Twilio Media
+    Streams drops query strings)."""
     ticket = _mint_ws_ticket()
     if not ticket:
         return ""
     return f"{'&' if existing else '?'}t={ticket}"
+
+
+def _ws_path_suffix() -> str:
+    """`/<ticket>` (or "") to embed the ingress ticket in a wss URL PATH.
+    Used for Media Streams, where Twilio does not reliably forward query
+    strings — so the ticket rides the path, same as `lang`."""
+    ticket = _mint_ws_ticket()
+    return f"/{ticket}" if ticket else ""
 
 
 def _now_ts() -> float:
@@ -1252,7 +1264,7 @@ async def voice_demo_incoming(request: Request) -> Response:
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
             "  <Connect>\n"
-            f'    <Stream url="wss://{host}/ws/media-stream/{lang}{_ws_query_suffix()}" />\n'
+            f'    <Stream url="wss://{host}/ws/media-stream/{lang}{_ws_path_suffix()}" />\n'
             "  </Connect>\n"
             "</Response>"
         )
@@ -1319,7 +1331,7 @@ async def voice_language_selected(request: Request) -> Response:
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
             "  <Connect>\n"
-            f'    <Stream url="wss://{host}/ws/media-stream/{lang}{_ws_query_suffix()}" />\n'
+            f'    <Stream url="wss://{host}/ws/media-stream/{lang}{_ws_path_suffix()}" />\n'
             "  </Connect>\n"
             "</Response>"
         )
@@ -3984,18 +3996,21 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en", t: str = ""):
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/media-stream/{lang}")
-async def ws_media_stream(websocket: WebSocket, lang: str, t: str = ""):
-    """Handle a Twilio Media Streams WebSocket session for Sinhala or Tamil.
+@app.websocket("/ws/media-stream/{lang}/{ticket}")
+async def ws_media_stream(websocket: WebSocket, lang: str, ticket: str = ""):
+    """Handle a Twilio Media Streams WebSocket session for Sinhala/Arabic/Tamil.
 
-    Language is encoded in the URL path (e.g. /ws/media-stream/si) so it
-    is always present â€” avoids unreliable query-string passing by Twilio.
-    The `t` query param is the short-lived HMAC ingress ticket.
+    Both the language AND the HMAC ingress ticket are carried in the URL PATH
+    (e.g. /ws/media-stream/si/<ticket>). Twilio Media Streams does NOT reliably
+    forward query strings (that is why lang has always been a path segment), so
+    the ticket must be in the path too — putting it in ?t= caused Twilio to
+    connect with no ticket, which rejected the socket and hung up the call.
 
     Receives raw mulaw 8 kHz audio from Twilio, runs Azure STT, sends the
     LLM's responses back through the per-language TTS as mulaw audio.
     """
     # Authenticated ingress: reject anything without a valid ticket pre-accept.
-    if not _verify_ws_ticket(t):
+    if not _verify_ws_ticket(ticket):
         logger.warning("Rejected /ws/media-stream — missing/invalid ticket")
         await websocket.close(code=1008)
         return
