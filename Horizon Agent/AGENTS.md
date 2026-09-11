@@ -44,10 +44,11 @@ consistency, but the enforcement does NOT rely on a credential being absent:
 
 Vidya offers **four demo languages — English, Sinhala, Arabic, Russian** — and
 mirrors **Kavya's Dialog (SmartPBX) line's language stack** where one exists
-(English + Sinhala): Claude+ElevenLabs for English, Gemini brain + Gemini TTS for
-Sinhala. The only difference from the Dialog line is transport — a website demo
-is a Twilio **browser** call, so audio rides Twilio (ConversationRelay for
-en/ru, Media Streams for ar/si) rather than Dialog SIP.
+(English + Sinhala): Claude+ElevenLabs for English; for Sinhala, a Gemini brain
+with **Rime Arcana** as the primary voice (Gemini TTS as fallback). The only
+difference from the Dialog line is transport — a website demo is a Twilio
+**browser** call, so audio rides Twilio (ConversationRelay for en/ru, Media
+Streams for ar/si) rather than Dialog SIP.
 
 - **English (`en`):** ConversationRelay — Claude brain (`LLM_PROVIDER=claude`) +
   ElevenLabs voice (`CR_VOICE_EN`); Twilio owns STT.
