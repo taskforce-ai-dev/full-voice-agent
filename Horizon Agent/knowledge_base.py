@@ -58,6 +58,17 @@ PERSIST_DIRECTORY: str = "./chroma_db"
 SUPPORTED_EXTENSIONS: set = {".txt", ".md", ".pdf"}
 DEFAULT_DOCS_DIRECTORY: str = "knowledge_docs"
 
+# Retrieval depth (top-k chunks returned per query). The KB has ~4 programs ×
+# several detail paragraphs (fee / duration / entry requirements / syllabus)
+# each, so a shallow top-3 often misses the specific paragraph a question needs
+# and the agent wrongly says it has no data. 8 covers a program's paragraphs
+# comfortably while staying cheap on this small KB. Env-tunable so it can be
+# raised without a code deploy.
+try:
+    KB_N_RESULTS: int = int(os.getenv("KB_N_RESULTS", "8"))
+except ValueError:
+    KB_N_RESULTS = 8
+
 # ---------------------------------------------------------------------------
 # Lazy singletons
 # ---------------------------------------------------------------------------
@@ -376,15 +387,19 @@ def initialize_kb(docs_directory: str = DEFAULT_DOCS_DIRECTORY) -> bool:
 # Semantic retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve_context(query: str, n_results: int = 3) -> str:
+def retrieve_context(query: str, n_results: int | None = None) -> str:
     """Run a semantic search against the knowledge base.
 
     Uses the LRU-cached ``_cached_embed_query`` so that repeated identical
     queries skip the embedding step entirely.
 
     Returns a formatted string of the top *n_results* chunks, or an empty
-    string when the KB is unavailable / empty.
+    string when the KB is unavailable / empty. When *n_results* is None it
+    defaults to ``KB_N_RESULTS`` (env-tunable, default 8) so a question about
+    one of several programs still surfaces that program's own paragraphs.
     """
+    if n_results is None:
+        n_results = KB_N_RESULTS
     client = _get_chroma_client()
     if client is None:
         return ""
