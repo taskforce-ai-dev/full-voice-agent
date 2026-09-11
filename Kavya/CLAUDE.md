@@ -141,6 +141,44 @@ explicit environment allowlist and must not receive Twilio credentials or
   `SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR` (default `7`, i.e. `07:00` UTC).
   `/smartpbx/status` exposes the currently active model as `sinhala_tts_model`;
   see `SMARTPBX_RUNBOOK.md`'s Monitoring section for the full contract.
+- **Fallback-model usability fixes (2026-09-04), same fallback chain above.**
+  Live probes against `gemini-2.5-flash-preview-tts` (the first fallback)
+  found it fails short Sinhala utterances (zero audio deltas with no error,
+  or an outright `invalid_request`) and is non-streaming (one terminal delta
+  holding the whole reply, ~12 s for a 154-token reply). Three fixes, all
+  scoped to a NON-primary model -- the primary's existing behavior (never
+  retries a non-quota error) is unchanged:
+  - **Text-specific retry.** `empty_audio`/`invalid_request` on a fallback
+    model retries the same text once on the next available model, bounded by
+    chain length, without marking the model exhausted (`smartpbx_media
+    event=sinhala_tts_model_retry from=<model> to=<model>
+    reason=empty_audio|invalid_request`) -- length-agnostic; a long reply
+    that hits either shape retries the same way a short one does. Only
+    exhausting the whole chain for this text falls through to the existing
+    apology. An `empty_audio` occurrence also logs `smartpbx_media
+    event=sinhala_tts_stream_empty model=<model> events=<kind>=<count> ...`,
+    a bounded (<=8 distinct kinds, overflow folded into `other`) histogram
+    of the SDK protocol event kinds the stream actually carried -- never
+    content, so it is privacy-safe as-is.
+  - **Short-utterance cache bank.** `SMARTPBX_SINHALA_SHORT_UTTERANCE_BANK`
+    (`ඔව්.`, `හරි.`, `ඔව්, හරි.`, `හොඳයි.`, `ස්තූතියි.`, `සමාවෙන්න.`,
+    `ඔව්, ඒ හරි.`, `නැහැ.`) joins the prewarmed `SMARTPBX_SINHALA_CACHED_PHRASES`
+    allowlist, with cache lookup now canonicalizing whitespace/trailing
+    punctuation so a near-exact model utterance still hits the cache.
+    `SMARTPBX_SINHALA_TTS_MIN_CHARS` (default `12`) documents the length
+    below which a fallback model is disproportionately likely to fail this
+    way; it never blocks synthesis of an uncached short text.
+  - **Per-sentence synthesis on a non-streaming model.**
+    `SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS` (comma list, default
+    `gemini-2.5-flash-preview-tts,gemini-2.5-pro-preview-tts`, same
+    validation as the fallback list) marks models that cannot stream. When
+    the model that would be tried first is one of these, a no-tool Sinhala
+    reply is synthesised per sentence (not batched into one request) so the
+    first sentence's audio starts in seconds, not after the whole reply
+    renders -- capped at 4 live TTS requests per turn (sentences beyond the
+    cap merge into the final request). The streaming primary keeps batching;
+    capture-mode turns are unaffected either way.
+  See `SMARTPBX_RUNBOOK.md`'s Monitoring section for the full contract.
 
 **TTS/STT:**
 - `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` — ElevenLabs TTS (English ConversationRelay + Tamil Media Streams)

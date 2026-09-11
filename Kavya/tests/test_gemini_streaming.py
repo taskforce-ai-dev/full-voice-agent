@@ -290,6 +290,98 @@ def test_direct_smartpbx_sinhala_batches_a_no_tool_reply_into_one_tts_request():
     )
 
 
+def test_direct_smartpbx_sinhala_non_streaming_model_uses_incremental_sentence_tts(
+    monkeypatch,
+):
+    """A non-streaming fallback model (2026-09-04) must not batch the whole
+    reply -- each sentence reaches TTS as it completes, same as the English
+    per-sentence path, so the first sentence's audio starts in seconds."""
+    import server
+
+    monkeypatch.setattr(
+        server, "_smartpbx_sinhala_tts_current_model",
+        lambda **_kw: "gemini-2.5-flash-preview-tts",
+    )
+    timeline: list[tuple] = []
+    session, spoken = _session(
+        [[
+            _text_chunk("එක. "),
+            _text_chunk("දෙක. "),
+            _text_chunk("තුන."),
+        ]],
+        lang="si",
+        smartpbx=True,
+        timeline=timeline,
+    )
+
+    result = asyncio.run(session._run_llm_gemini())
+
+    assert spoken == ["එක.", "දෙක.", "තුන."]
+    assert result == "එක. දෙක. තුන."
+    # Load-bearing: the first sentence must reach TTS before the stream
+    # finishes, unlike the batched (streaming-model) path above.
+    first_tts = next(i for i, entry in enumerate(timeline) if entry[0] == "tts")
+    last_chunk = max(i for i, entry in enumerate(timeline) if entry[0] == "chunk")
+    assert first_tts < last_chunk
+
+
+def test_direct_smartpbx_sinhala_non_streaming_model_caps_requests_and_merges_the_tail(
+    monkeypatch,
+):
+    """Per-sentence synthesis on a non-streaming model is capped at 4 live
+    TTS requests per turn -- sentences beyond the cap merge into the final
+    request instead of each starting a new one."""
+    import server
+
+    monkeypatch.setattr(
+        server, "_smartpbx_sinhala_tts_current_model",
+        lambda **_kw: "gemini-2.5-flash-preview-tts",
+    )
+    session, spoken = _session(
+        [[
+            _text_chunk("එක. "),
+            _text_chunk("දෙක. "),
+            _text_chunk("තුන. "),
+            _text_chunk("හතර. "),
+            _text_chunk("පහ. "),
+            _text_chunk("හය."),
+        ]],
+        lang="si",
+        smartpbx=True,
+    )
+
+    asyncio.run(session._run_llm_gemini())
+
+    assert len(spoken) <= 4
+    assert spoken[:3] == ["එක.", "දෙක.", "තුන."]
+    assert spoken[3] == "හතර. පහ. හය."
+
+
+def test_direct_smartpbx_sinhala_streaming_primary_still_batches_despite_non_streaming_config(
+    monkeypatch,
+):
+    """The non-streaming-models config must never touch the streaming
+    primary -- batching stays exactly as it is when the primary is active."""
+    import server
+
+    monkeypatch.setattr(
+        server, "SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS",
+        frozenset({"gemini-2.5-flash-preview-tts"}),
+    )
+    session, spoken = _session(
+        [[
+            _text_chunk("පළමු වාක්‍යය. "),
+            _text_chunk("දෙවන වාක්‍යය."),
+        ]],
+        lang="si",
+        smartpbx=True,
+    )
+
+    asyncio.run(session._run_llm_gemini())
+
+    assert spoken == ["පළමු වාක්‍යය. දෙවන වාක්‍යය."]
+
+
 def test_direct_smartpbx_english_keeps_incremental_sentence_tts():
     """The Sinhala batching boundary must not alter the established English path."""
     session, spoken = _session(
