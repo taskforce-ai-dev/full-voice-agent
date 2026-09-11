@@ -69,14 +69,20 @@ def test_sinhala_brain_defaults_to_gemini():
     assert server.SI_GEMINI_MODEL  # non-empty
 
 
-def test_sinhala_voice_defaults_to_gemini_tts():
+def test_sinhala_voice_primary_is_rime_arcana():
+    """Primary Sinhala voice is Rime Arcana (speaker chandani)."""
+    assert server.SI_TTS_PROVIDER == "rime"
+    assert server.RIME_ARCANA_SPEAKER  # non-empty (e.g. 'chandani')
+    assert server.RIME_ARCANA_URL.startswith("https://")
+    assert server._rime_arcana_payload("hi")["modelId"] == "arcana"
+    assert server._rime_arcana_payload("hi")["lang"] == "si"
+
+
+def test_sinhala_voice_fallback_chain_configured():
+    """Fallbacks after Arcana: Gemini TTS, then OpenAI TTS — both must be set."""
     assert server.GEMINI_TTS_MODEL.startswith("gemini-")
     assert "tts" in server.GEMINI_TTS_MODEL
     assert server.GEMINI_TTS_VOICE  # non-empty
-
-
-def test_openai_tts_fallback_configured():
-    """The graceful-degradation path uses OpenAI TTS; its voice must be set."""
     assert server.OPENAI_TTS_VOICE  # non-empty (e.g. 'sage')
     assert server.OPENAI_TTS_MODEL.startswith("gpt-")
 
