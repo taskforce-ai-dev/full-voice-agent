@@ -1,5 +1,5 @@
 ﻿"""
-server.py â€” Main FastAPI server for Hatton Hills Voice Agent (Tanya).
+server.py — Main FastAPI server for Horizon Airline & Aviation Academy Voice Agent (Vidya).
 
 Handles:
   - IVR / DTMF language menu (POST /voice/incoming)
@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -42,7 +45,7 @@ if os.getenv("SENTRY_DSN"):
         send_default_pii=os.getenv("SENTRY_SEND_PII", "false").lower() == "true",
         enable_logs=os.getenv("SENTRY_ENABLE_LOGS", "true").lower() == "true",
     )
-    sentry_sdk.set_tag("agent", "hatton")
+    sentry_sdk.set_tag("agent", "horizon")
 import queue
 import re
 import threading
@@ -64,7 +67,7 @@ from twilio.rest import Client as TwilioRestClient
 from knowledge_base import retrieve_context, initialize_kb, prewarm, reload_kb_from_content
 from tools import get_tools, get_tools_openai, get_tools_gemini, execute_tool
 from booking_api import close_session, is_configured
-from post_call import process_post_call_data
+from post_call import process_post_call_data, egress_enabled
 
 try:
     import dashboard_client
@@ -74,6 +77,11 @@ except ImportError:
 
 def _dashboard_call_started(call_sid, caller_phone, lang, started_at):
     if dashboard_client is None:
+        return
+    # FAIL-CLOSED: call-started carries caller metadata (phone), so it is egress.
+    # Suppress it unless post-call egress is explicitly enabled — an inherited
+    # dashboard credential must not leak caller metadata in the demo.
+    if not egress_enabled():
         return
     import asyncio
     logger.info(
@@ -108,8 +116,8 @@ OPENAI_TTS_MODEL: str = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 OPENAI_TTS_VOICE: str = os.getenv("OPENAI_TTS_VOICE", "sage")
 OPENAI_TTS_INSTRUCTIONS: str = os.getenv(
     "OPENAI_TTS_INSTRUCTIONS",
-    "You are Tanya, a warm and professional front-office reservations agent at "
-    "Hatton Hills, a boutique hillside hotel in Sri Lanka. Speak natural, "
+    "You are Vidya, a warm and professional course advisor at Horizon Airline & "
+    "Aviation Academy, an aviation training academy in Sri Lanka. Speak natural, "
     "courteous conversational Sinhala with genuine warmth. Vary pitch and pace "
     "naturally and sound like a real person on the phone, not a robot.",
 )
@@ -117,6 +125,66 @@ TWILIO_ACCOUNT_SID: str = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN: str = os.getenv("TWILIO_AUTH_TOKEN", "")
 HUMAN_AGENT_PHONE: str = os.getenv("HUMAN_AGENT_PHONE", "").strip()
 PUBLIC_HOSTNAME: str = os.getenv("PUBLIC_HOSTNAME", "voice.taskforceai.tech").strip()
+
+# ---------------------------------------------------------------------------
+# WebSocket ingress authentication (short-lived signed ticket)
+# ---------------------------------------------------------------------------
+# nginx exposes /ws/ publicly, so /ws/conversation and /ws/media-stream/{lang}
+# would otherwise accept ANY client and burn LLM/STT/TTS capacity. Twilio does
+# not sign the media WebSocket the way it signs HTTP webhooks, so we mint a
+# short-lived HMAC ticket into the wss URL at TwiML-generation time (only WE
+# produce those URLs) and require it on connect. Secret: WS_TICKET_SECRET, else
+# the Twilio auth token (a server-only secret). If NEITHER is set (local dev),
+# enforcement is skipped so `python server.py` still works.
+WS_TICKET_TTL_SECONDS: int = int(os.getenv("WS_TICKET_TTL_SECONDS", "300"))
+
+
+def _ws_ticket_secret() -> str:
+    return (os.getenv("WS_TICKET_SECRET", "") or TWILIO_AUTH_TOKEN or "").strip()
+
+
+def _mint_ws_ticket() -> str:
+    """Return a signed `<exp>.<hexsig>` ticket, or "" when no secret is set."""
+    secret = _ws_ticket_secret()
+    if not secret:
+        return ""
+    exp = int(_now_ts()) + WS_TICKET_TTL_SECONDS
+    sig = hmac.new(secret.encode(), str(exp).encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _verify_ws_ticket(ticket: str) -> bool:
+    """Validate a ticket. When no secret is configured, enforcement is disabled
+    (returns True) so local dev works; in production the Twilio token is always
+    present, so a missing/expired/forged ticket is rejected."""
+    secret = _ws_ticket_secret()
+    if not secret:
+        return True
+    if not ticket or "." not in ticket:
+        return False
+    exp_str, _, sig = ticket.partition(".")
+    try:
+        exp = int(exp_str)
+    except ValueError:
+        return False
+    if exp < int(_now_ts()):
+        return False
+    expected = hmac.new(secret.encode(), exp_str.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _ws_query_suffix(existing: bool = False) -> str:
+    """`&t=<ticket>` / `?t=<ticket>` (or "") for embedding in a wss URL.
+    `existing=True` when the URL already has a query string."""
+    ticket = _mint_ws_ticket()
+    if not ticket:
+        return ""
+    return f"{'&' if existing else '?'}t={ticket}"
+
+
+def _now_ts() -> float:
+    import time as _t
+    return _t.time()
 
 # Twilio REST client singleton â€” used for Path B human handoff
 # (client.calls(sid).update(twiml=...)) to bypass the unreliable
@@ -148,6 +216,28 @@ LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "claude")
 CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# ---------------------------------------------------------------------------
+# Sinhala stack = Kavya Dialog line's stack (Gemini brain + Gemini TTS voice).
+# English keeps Claude + ElevenLabs via ConversationRelay (LLM_PROVIDER above).
+# Only the Sinhala Media Streams path is overridden here, so English is
+# untouched. Set SI_LLM_PROVIDER=claude to fall the Sinhala brain back to the
+# global provider without touching TTS.
+# ---------------------------------------------------------------------------
+SI_LLM_PROVIDER: str = os.getenv("SI_LLM_PROVIDER", "gemini").lower()
+SI_GEMINI_MODEL: str = os.getenv("SI_GEMINI_MODEL", "gemini-3.7-flash")
+# Gemini TTS (Sinhala voice) â€” same model + voice the Kavya Dialog line uses.
+# Interactions API returns 24 kHz 16-bit mono PCM; downsampled to 8 kHz mulaw
+# on the fly, exactly like _tts_openai. NOTE: gemini-3.1-flash-tts-preview is a
+# PREVIEW model with a ~100 requests/day cap â€” see CLAUDE.md.
+GEMINI_TTS_MODEL: str = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+GEMINI_TTS_VOICE: str = os.getenv("GEMINI_TTS_VOICE", "Vindemiatrix")
+try:
+    GEMINI_TTS_TIMEOUT_SECONDS: float = float(
+        os.getenv("GEMINI_TTS_TIMEOUT_SECONDS", "30")
+    )
+except ValueError:
+    GEMINI_TTS_TIMEOUT_SECONDS = 30.0
 
 # ---------------------------------------------------------------------------
 # Optional: Google Gemini native SDK
@@ -221,7 +311,7 @@ DEFAULT_FILLER: str = "Let me check that for you."
 
 # Backchannel filter: short non-semantic utterances that callers emit while
 # thinking ("um", "uh", "hmm"). Twilio's STT fires these as full prompts and
-# without filtering, Tanya would jump in mid-thought, derailing the call.
+# without filtering, Vidya would jump in mid-thought, derailing the call.
 # We deliberately do NOT include "ok", "yeah", "yes", "no", "right" â€” those
 # are genuine answers in this booking flow.
 BACKCHANNEL_TOKENS: set[str] = {
@@ -277,9 +367,6 @@ DEMO_AGENT_HOSTS: dict[str, str] = {
     # deployment is still named "flico" for historical reasons.
     "starproperties": os.getenv(
         "DEMO_HOST_STARPROPERTIES", "flico.taskforceai.tech"),
-    # Horizon Airline & Aviation Academy (Vidya) — de-identified aviation-college
-    # inquiry demo. Key MUST equal the id in the website BookDemo.tsx ("horizon").
-    "horizon": os.getenv("DEMO_HOST_HORIZON", "horizon.taskforceai.tech"),
 }
 
 # Per-language ConversationRelay TwiML configuration
@@ -289,7 +376,7 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         # English ConversationRelay voice — configurable via env (deploy sets CR_VOICE_EN)
         "voice": os.getenv("CR_VOICE_EN", "bm3QvaZ3fUSCRBC3UV1f-flash_v2_5"),
         "language": "en-US",
-        "welcome_greeting": "Welcome to Hatton Hills! I'm Tanya, how can I help you today?",
+        "welcome_greeting": "Welcome to Horizon Airline and Aviation Academy. I'm Vidya. How can I help you today?",
         "extra_attrs": '        elevenlabsTextNormalization="on"\n',
     },
     "ru": {
@@ -304,8 +391,8 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "transcription_provider": "google",
         "speech_model": os.getenv("CR_SPEECH_MODEL_RU", "long"),
         "welcome_greeting": (
-            "Добро пожаловать в Hatton Hills! Меня зовут Таня, "
-            "чем я могу вам помочь сегодня?"
+            "Добро пожаловать в Horizon Airline and Aviation Academy! "
+            "Меня зовут Видья. Чем я могу вам помочь сегодня?"
         ),
         "extra_attrs": '        elevenlabsTextNormalization="on"\n',
     },
@@ -314,14 +401,9 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "voice": "si-LK-Standard-A",
         "language": "si-LK",
         "welcome_greeting": (
-            "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
-            "Hatton Hills \u0DC0\u0DD9\u0DAD "
-            "\u0DC3\u0DCF\u0DAF\u0DBB\u0DBA\u0DD9\u0DB1\u0DCA "
-            "\u0DB4\u0DD2\u0DC5\u0DD2\u0D9C\u0DB1\u0DD2\u0DB8\u0DD4. "
-            "\u0DB8\u0DA7 \u0D94\u0DB6\u0DA7 "
-            "\u0D9A\u0DD9\u0DC3\u0DDA "
-            "\u0D8B\u0DAF\u0DC0\u0DCA "
-            "\u0D9A\u0DC5 \u0DC4\u0DD0\u0D9A\u0DD2\u0DAF?"
+            "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! Horizon Airline and Aviation Academy "
+            "\u0DC0\u0DD9\u0DAD \u0DC3\u0DCF\u0DAF\u0DBB\u0DBA\u0DD9\u0DB1\u0DCA \u0DB4\u0DD2\u0DC5\u0DD2\u0D9C\u0DB1\u0DD2\u0DB8\u0DD4. \u0DB8\u0DB8 \u0DC0\u0DD2\u0DAF\u0DCA\u200D\u0DBA\u0DCF. "
+            "\u0DB8\u0DA7 \u0D94\u0DB6\u0DA7 \u0D9A\u0DD9\u0DC3\u0DDA \u0D8B\u0DAF\u0DC0\u0DCA \u0D9A\u0DC5 \u0DC4\u0DD0\u0D9A\u0DD2\u0DAF?"
         ),
         "extra_attrs": "",
     },
@@ -330,13 +412,9 @@ LANGUAGE_CONFIGS: dict[str, dict[str, str]] = {
         "voice": "ta-IN-Standard-A",
         "language": "ta-IN",
         "welcome_greeting": (
-            "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-            "Hatton Hills \u0B95\u0BCD\u0B95\u0BC1 "
-            "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
-            "\u0BA8\u0BBE\u0BA9\u0BCD "
-            "\u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
-            "\u0B8E\u0BAA\u0BCD\u0BAA\u0B9F\u0BBF "
-            "\u0B89\u0BA4\u0BB5\u0BB2\u0BBE\u0BAE\u0BCD?"
+            "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! Horizon Airline and Aviation Academy "
+            "\u0B95\u0BCD\u0B95\u0BC1 \u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. \u0BA8\u0BBE\u0BA9\u0BCD \u0BB5\u0BBF\u0BA4\u0BCD\u0BAF\u0BBE. "
+            "\u0BA8\u0BBE\u0BA9\u0BCD \u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 \u0B8E\u0BAA\u0BCD\u0BAA\u0B9F\u0BBF \u0B89\u0BA4\u0BB5\u0BB2\u0BBE\u0BAE\u0BCD?"
         ),
         "extra_attrs": "",
     },
@@ -376,13 +454,13 @@ MAX_REPROMPTS: int = 1
 REPROMPT_MESSAGES: dict[str, list[str]] = {
     "en": [
         "Hello, are you still there?",
-        "Welcome to Hatton Hills. How may I help you today?",
+        "Welcome to Horizon Airline and Aviation Academy. How may I help you today?",
     ],
     "ar": [
         # "Hello, are you still there?"
         "مرحباً، هل ما زلتم على الخط؟",
         # Full welcome re-greet
-        "أهلاً بكم في Hatton Hills. كيف يمكنني مساعدتكم اليوم؟",
+        "أهلاً بكم في Horizon Airline and Aviation Academy. كيف يمكنني مساعدتكم اليوم؟",
     ],
     "si": [
         # "Hello, are you still there?"
@@ -394,7 +472,7 @@ REPROMPT_MESSAGES: dict[str, list[str]] = {
         # Full welcome re-greet
         (
             "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
-            "Hatton Hills \u0DC0\u0DD9\u0DAD "
+            "Horizon Airline and Aviation Academy \u0DC0\u0DD9\u0DAD "
             "\u0DC3\u0DCF\u0DAF\u0DBB\u0DBA\u0DD9\u0DB1\u0DCA "
             "\u0DB4\u0DD2\u0DC5\u0DD2\u0D9C\u0DB1\u0DD2\u0DB8\u0DD4. "
             "\u0DB8\u0DA7 \u0D94\u0DB6\u0DA7 "
@@ -414,7 +492,7 @@ REPROMPT_MESSAGES: dict[str, list[str]] = {
         # Full welcome re-greet
         (
             "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-            "Hatton Hills \u0B95\u0BCD\u0B95\u0BC1 "
+            "Horizon Airline and Aviation Academy \u0B95\u0BCD\u0B95\u0BC1 "
             "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
             "\u0BA8\u0BBE\u0BA9\u0BCD "
             "\u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
@@ -427,12 +505,12 @@ REPROMPT_MESSAGES: dict[str, list[str]] = {
 # Welcome greetings for Media Streams (spoken via ElevenLabs/Azure TTS on stream start)
 MEDIA_STREAM_WELCOME: dict[str, str] = {
     "ar": (
-        "أهلاً وسهلاً بكم في Hatton Hills! "
-        "أنا تانيا، كيف يمكنني مساعدتكم اليوم؟"
+        "أهلاً وسهلاً بكم في Horizon Airline and Aviation Academy! "
+        "أنا فيديا، كيف يمكنني مساعدتكم اليوم؟"
     ),
     "si": (
         "\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
-        "Hatton Hills \u0DC0\u0DD9\u0DAD "
+        "Horizon Airline and Aviation Academy \u0DC0\u0DD9\u0DAD "
         "\u0DC3\u0DCF\u0DAF\u0DBB\u0DBA\u0DD9\u0DB1\u0DCA "
         "\u0DB4\u0DD2\u0DC5\u0DD2\u0D9C\u0DB1\u0DD2\u0DB8\u0DD4. "
         "\u0DB8\u0DA7 \u0D94\u0DB6\u0DA7 \u0D9A\u0DD9\u0DC3\u0DDA "
@@ -440,7 +518,7 @@ MEDIA_STREAM_WELCOME: dict[str, str] = {
     ),
     "ta": (
         "\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-        "Hatton Hills \u0B95\u0BCD\u0B95\u0BC1 "
+        "Horizon Airline and Aviation Academy \u0B95\u0BCD\u0B95\u0BC1 "
         "\u0BB5\u0BB0\u0BB5\u0BC7\u0BB1\u0BCD\u0B95\u0BBF\u0BB1\u0BCB\u0BAE\u0BCD. "
         "\u0BA8\u0BBE\u0BA9\u0BCD \u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
         "\u0B8E\u0BAA\u0BCD\u0BAA\u0B9F\u0BBF \u0B89\u0BA4\u0BB5\u0BB2\u0BBE\u0BAE\u0BCD?"
@@ -480,10 +558,13 @@ _SENTENCE_END = re.compile(r'(?<=[.!?\u0964\u0DF4])\s+')
 # ---------------------------------------------------------------------------
 
 def _build_system_prompt(lang: str = "en") -> str:
-    """Build the system prompt for Claude, tailored to the caller's language.
+    """Build the system prompt for Vidya, tailored to the caller's language.
 
-    The language is determined by the IVR DTMF selection, so Claude does not
-    need to auto-detect â€” it responds exclusively in the chosen language.
+    The language is determined by the IVR / web-demo selection, so Claude does
+    not auto-detect -- it responds exclusively in the chosen language. Vidya is
+    an INQUIRY-ONLY agent for Horizon Airline & Aviation Academy: she answers
+    questions about the academy from the knowledge base and never takes
+    bookings, payments, or student registrations.
     """
     today = date.today().isoformat()
 
@@ -491,378 +572,119 @@ def _build_system_prompt(lang: str = "en") -> str:
     if lang == "si":
         language_rules = (
             "LANGUAGE RULES:\n"
-            "- The caller selected Sinhala. You MUST respond entirely in "
-            "Sinhala using native Unicode script "
-            "(e.g. '\u0D86\u0DBA\u0DD4\u0DB6\u0DDD\u0DC0\u0DB1\u0DCA! "
-            "\u0D94\u0DB6\u0DA7 \u0D9A\u0DDC\u0DC4\u0DDD\u0DB8\u0DAF "
-            "\u0D8B\u0DAF\u0DC0\u0DCA \u0D9A\u0DBB\u0DB1\u0DCA\u0DB1\u0DDA?').\n"
-            "- NEVER use romanized Latin script for Sinhala words.\n"
-            "- NEVER respond in English unless the guest explicitly switches "
-            "to English.\n"
-            "- Use proper Sinhala grammar and a natural conversational tone.\n\n"
+            "- The caller selected Sinhala. Respond in contemporary conversational "
+            "Sri Lankan Sinhala, in native Unicode script, not formal written or "
+            "ceremonial Sinhala.\n"
+            "- Natural English code-switching is allowed for Horizon, course names, "
+            "and common aviation terms (for example Cabin Crew, Ground Operations, "
+            "Air Cargo, IATA, GDS). Never romanize Sinhala words.\n"
+            "- Never switch the whole reply to English unless the caller switches "
+            "first.\n"
+            "- Keep course names, fees, durations, entry requirements, and phone "
+            "digits exactly correct while phrasing the rest of the reply "
+            "naturally.\n\n"
         )
     elif lang == "ta":
         language_rules = (
             "LANGUAGE RULES:\n"
-            "- The caller selected Tamil. You MUST respond entirely in "
-            "Tamil using native Unicode script "
-            "(e.g. '\u0BB5\u0BA3\u0B95\u0BCD\u0B95\u0BAE\u0BCD! "
-            "\u0BA8\u0BBE\u0BA9\u0BCD \u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BC1 "
-            "\u0B8E\u0BAA\u0BCD\u0BAA\u0B9F\u0BBF "
-            "\u0B89\u0BA4\u0BB5\u0BB2\u0BBE\u0BAE\u0BCD?').\n"
-            "- NEVER use romanized Latin script for Tamil words.\n"
-            "- NEVER respond in English unless the guest explicitly switches "
-            "to English.\n"
-            "- Use proper Tamil grammar and a natural conversational tone.\n\n"
+            "- The caller selected Tamil. Respond entirely in Tamil using native "
+            "Unicode script. Never use romanized Latin script for Tamil words.\n"
+            "- Natural English code-switching is allowed for Horizon, course names, "
+            "and common aviation terms. Never switch the whole reply to English "
+            "unless the caller switches first.\n"
+            "- Keep course names, fees, durations, entry requirements, and phone "
+            "digits exactly correct while phrasing the rest naturally.\n\n"
         )
     elif lang == "ar":
         language_rules = (
             "LANGUAGE RULES:\n"
-            "- The caller selected Arabic. You MUST respond entirely in "
-            "Modern Standard Arabic (fus-ha) using native Arabic script "
-            "(e.g. 'أهلاً وسهلاً! كيف يمكنني مساعدتكم اليوم؟').\n"
-            "- NEVER use romanized Latin script for Arabic words.\n"
-            "- NEVER respond in English unless the guest explicitly switches "
-            "to English.\n"
-            "- Use proper Modern Standard Arabic grammar and a natural, "
-            "courteous conversational tone.\n\n"
+            "- The caller selected Arabic. Respond entirely in Modern Standard "
+            "Arabic (fus-ha) using native Arabic script. Never use romanized Latin "
+            "script for Arabic words.\n"
+            "- Natural English code-switching is allowed for Horizon, course names, "
+            "and common aviation terms. Never switch the whole reply to English "
+            "unless the caller switches first.\n\n"
         )
     elif lang == "ru":
         language_rules = (
             "LANGUAGE RULES:\n"
-            "- The caller selected Russian. You MUST respond entirely in "
-            "Russian using native Cyrillic script "
-            "(e.g. 'Добро пожаловать! Чем я могу вам помочь сегодня?').\n"
-            "- NEVER use romanized Latin script for Russian words.\n"
-            "- NEVER respond in English unless the guest explicitly switches "
-            "to English.\n"
-            "- Use proper Russian grammar and a natural, courteous "
-            "conversational tone.\n\n"
+            "- The caller selected Russian. Respond entirely in Russian using "
+            "native Cyrillic script. Never use romanized Latin script for Russian "
+            "words.\n"
+            "- Natural English code-switching is allowed for Horizon, course names, "
+            "and common aviation terms. Never switch the whole reply to English "
+            "unless the caller switches first.\n\n"
         )
     else:
         language_rules = (
             "LANGUAGE RULES:\n"
             "- The caller selected English. Respond only in English.\n"
-            "- Use clear, simple English appropriate for international callers.\n\n"
+            "- Use clear, simple English suitable for both local and international "
+            "callers.\n\n"
         )
-
-    # English-only human-handoff guidance. Sinhala/Tamil run on Media Streams
-    # and do not have the transfer_to_human tool wired in.
-    if lang == "en":
-        handoff_rules = (
-            "HUMAN HANDOFF:\n"
-            "- If the guest explicitly asks to speak to a human, agent, manager, or real person, immediately call the transfer_to_human tool with a one-sentence reason. Do NOT promise a callback; the tool handles the live transfer.\n"
-            "- If you do NOT know the answer to a guest's question, or the request is outside what you can help with (e.g. complex booking changes, special packages, complaints, anything not covered by Hatton Hills booking/general info), PROACTIVELY offer to transfer them to a human team member. Say something like 'I don't have that information on hand â€” would you like me to connect you with one of our team members who can help?' Wait for the guest to say yes before calling transfer_to_human. If they say no, continue helping them with what you can.\n"
-            "- Do NOT guess or make up answers just to avoid a transfer. Honesty + a quick handoff offer beats a wrong answer.\n\n"
-        )
-    else:
-        handoff_rules = ""
 
     # The welcome greeting is delivered by Twilio (English ConversationRelay) or
     # spoken on stream start (Media Streams). Tell Claude not to repeat it,
     # without asserting an English greeting for non-English callers.
     if lang == "en":
         greeting_note = (
-            "The caller has already heard your greeting: 'Welcome to Hatton "
-            "Hills! I'm Tanya, how can I help you today?' — do NOT "
-            "repeat a greeting or re-introduce yourself. Respond directly to "
-            "whatever the caller says first.\n\n"
+            "The caller has already heard your greeting: 'Welcome to Horizon "
+            "Airline and Aviation Academy. I'm Vidya. How can I help you "
+            "today?' -- do NOT repeat a greeting or re-introduce yourself. "
+            "Respond directly to whatever the caller says first.\n\n"
         )
     else:
         greeting_note = (
-            "The caller has already heard your welcome greeting — do NOT repeat a "
+            "The caller has already heard your welcome greeting -- do NOT repeat a "
             "greeting or re-introduce yourself. Respond directly to whatever the "
             "caller says first.\n\n"
         )
 
     return (
-        f"You are Tanya, the warm and gracious reservations voice agent for "
-        f"Hatton Hills, Sri Lanka.\n"
-        f"Today's date is {today}.\n\n"
+        f"You are Vidya, the warm, friendly, and professional voice assistant "
+        f"for Horizon Airline & Aviation Academy, an aviation training academy "
+        f"in Sri Lanka. Horizon offers diplomas and courses in areas such as "
+        f"Airline Cabin Crew, Airport Ground Operations, Airline Ticketing and "
+        f"Reservations, and Air Cargo and Logistics. Today's date is {today}.\n\n"
 
         + greeting_note
         + language_rules +
-        handoff_rules +
+
+        "YOUR ROLE:\n"
+        "- You are an inquiry assistant. You answer callers' questions about "
+        "Horizon: its courses, course fees, entry requirements, course "
+        "duration, class schedules, the campus, and how to apply.\n"
+        "- You do NOT take bookings, enrolments, payments, or student "
+        "registrations over the phone, and you cannot look up or change an "
+        "individual student's records or results. If a caller wants to enrol or "
+        "apply, tell them they can apply on the Horizon website, or give them "
+        "the Horizon office phone number so a staff member can help them "
+        "enrol.\n\n"
+
+        "USING THE PROVIDED INFORMATION:\n"
+        "- Answer using ONLY the reference information provided with each "
+        "message. That reference text holds Horizon's real courses, fees, "
+        "durations, entry requirements, campus, and contact details.\n"
+        "- Never invent or guess a fee, a duration, an entry requirement, a "
+        "date, or any other fact. If the answer is not in the reference "
+        "information, say honestly that you do not have that detail, and offer "
+        "the Horizon phone number or website so the caller can confirm it.\n"
+        "- State fees, durations, and entry requirements exactly as they appear "
+        "in the reference information.\n\n"
 
         "VOICE RULES (you are speaking on a phone call, not writing text):\n"
-        "- Keep every response to one or two short sentences.\n"
-        "- Never use markdown, bullet points, numbered lists, asterisks, or URLs.\n"
-        "- Use natural spoken language. Say numbers as words.\n"
-        "- Do not use abbreviations. Say 'rupees' not 'LKR'.\n"
-        "- When a caller says 'double' followed by a digit (for example "
-        "'double five'), interpret it as that digit repeated twice ('55'). "
-        "Likewise 'triple seven' means '777'. This is common when callers "
-        "read out phone numbers. Apply the same rule if the equivalent word "
-        "is said in Sinhala or Tamil.\n"
-        "- Never read out full rate lists. Mention only the relevant room.\n"
-        "- Pause naturally between ideas by using short sentences.\n\n"
-
-        "IMPORTANT RULES:\n"
-        "- For general questions about room types, prices, amenities, policies, "
-        "activities, or hotel info, answer directly from the hotel information "
-        "provided in context. Do NOT ask for dates or call any tool for general "
-        "info questions.\n"
-        "- Only use the check_availability tool when the guest wants to actually "
-        "BOOK a room or specifically asks if rooms are available on certain dates.\n"
-        "- When a guest expresses booking intent, collect only what is needed to "
-        "check availability: check-in and check-out dates, and number of guests "
-        "(adults and children with ages). Ask ONE question at a time. Do NOT "
-        "ask for residency, the guest's name, mobile, or email at this stage. "
-        "Do NOT ask for any salutation or title (no Mr / Mrs / Ms / Dr).\n"
-        "- CHILDREN UNDER 11: if the guest already stated the party is "
-        "only adults (e.g. '2 adults', 'just the two of us'), do NOT ask "
-        "again about children â€” accept it and move on with num_children=0. "
-        "Only ask 'Are there any children under eleven in your party?' if "
-        "the guest gave an ambiguous count (e.g. '4 people' without "
-        "specifying adults vs children). Children under 11 affect pricing, "
-        "so if there is genuine ambiguity you must clarify, but never "
-        "repeat a question the guest already answered.\n"
-        "- ROOM COUNT IMPLIES OCCUPANCY â€” DO NOT ASK FOR A HEADCOUNT YOU "
-        "CAN ALREADY WORK OUT: a 'double room' means double occupancy, i.e. "
-        "two guests. If the guest states a number of rooms by occupancy "
-        "(e.g. 'two double rooms'), infer the total guests yourself rather "
-        "than asking 'how many guests in total' â€” two double rooms is four "
-        "adults. Briefly confirm the figure you derived instead of asking "
-        "open-endedly, e.g. 'That's four adults across two double rooms â€” "
-        "is that right?'. Only ask for an explicit guest count when it is "
-        "genuinely ambiguous â€” for example a chalet (which holds up to "
-        "five) where the party size is not implied.\n"
-        "- KB IS THE SOURCE OF TRUTH FOR ROOM FACTS: the PMS (via the "
-        "check_availability tool) is used ONLY to find out which rooms "
-        "are free for the requested dates, and later to create the "
-        "booking. EVERYTHING ELSE â€” capacity, rates, descriptions, "
-        "amenities, policies â€” comes from the hotel information in "
-        "context (the knowledge base). The tool result only tells you "
-        "the room name and whether it is available; never quote a rate, "
-        "capacity, or feature from the tool. For reference: Forest "
-        "Escape, Eco Harmony, and Sunrise Vista are suites for up to 2 "
-        "pax; Mount Luxe and Mount Monarch are chalets for up to 5 pax.\n"
-        "- AVAILABILITY CHECK â€” STRICT SINGLE-CALL RULE: as soon as you "
-        "have dates and pax, call check_availability EXACTLY "
-        "ONCE. NEVER pass a room_type filter, even if the guest already "
-        "mentioned a room they like â€” the tool returns ALL room types in "
-        "one response. After that single call, read the response and "
-        "surface every available type in one sentence, e.g. 'Eco Harmony "
-        "and Sunrise Vista are available for those dates â€” which would "
-        "you prefer?' Calling check_availability a second time in the "
-        "same booking flow (e.g. once per room type, or because the "
-        "guest changed their mind) is FORBIDDEN unless the guest changes "
-        "their dates or pax. If the guest just picks a different room "
-        "from the list you already have, do NOT call the tool again â€” "
-        "you already know the answer.\n"
-        "- After check_availability returns, share the available room names "
-        "with the guest (do NOT quote any prices yet) and ask which room "
-        "they would like.\n"
-        "- RESIDENCY QUESTION â€” ASK ONLY WHEN QUOTING PRICES: once the "
-        "guest has picked a room, ask whether they are a Sri Lankan "
-        "resident or a foreign guest BEFORE quoting the rate. This is "
-        "essential â€” we have two completely different rate sheets (local "
-        "resident rates in LKR, and foreigner rates in USD). Quote rates "
-        "ONLY from the rate sheet that matches their residency.\n"
-        "- Once the guest has told you their residency, NEVER ask again "
-        "and NEVER forget it. Anchor every subsequent rate, supplement, "
-        "and currency mention to their residency: foreign guest â†’ USD, "
-        "Sri Lankan resident â†’ LKR. If you ever find yourself about to "
-        "quote a rate, silently verify which rate sheet applies before "
-        "speaking.\n"
-        "- After quoting the rate and the guest confirms they are happy "
-        "to proceed, begin collecting their personal details, ONE "
-        "question at a time, in this order: full name (no salutation), "
-        "then mobile number. Do NOT ask for an email address at any "
-        "point â€” we do not collect email.\n"
-        "- For full name: you MUST capture a first name and a last name "
-        "(surname / family name) before proceeding. The guest may give more "
-        "than two tokens — a first, middle and last name is a normal, "
-        "common shape for a Sri Lankan name (e.g. 'Chanya Malsha Shehani') "
-        "and is NOT an error condition or a transcription problem. Ask "
-        "'May I have your full name please?'. When the guest replies, "
-        "check what you heard:\n"
-        "    * What you receive is a MACHINE TRANSCRIPTION of the guest's "
-        "speech, and it often mangles Sri Lankan names (e.g. 'Chanya "
-        "Shehani' can arrive as 'cha Shawnee' or 'Chara Shahani'). Judge "
-        "only the TEXT you received — never say the audio or line was "
-        "unclear; you cannot hear audio.\n"
-        "    * If you received only ONE name token (e.g. just 'Fernando'), "
-        "you do not know whether it is the first or last name. Ask: "
-        "'Hello, I couldn't hear your first name, can you repeat it "
-        "again?' Then once you have the first name, ask: 'And could you "
-        "repeat your last name as well?'\n"
-        "    * If you received TWO OR MORE tokens, decide first whether any "
-        "of them look mis-transcribed. Treat a token as suspect when it: is "
-        "a lone syllable or fragment ('cha'); is an ordinary English word "
-        "that is clearly not a name ('car'); contains stray "
-        "punctuation inside the name ('Chara,'); or changes spelling "
-        "between the guest's repeats.\n"
-        "    * If NONE of the tokens look suspect, the tokens ARE the name: "
-        "take the FIRST token as the first name and join every remaining "
-        "token together as the last name (e.g. 'Chanya Malsha Shehani' → "
-        "first name 'Chanya', last name 'Malsha Shehani'). This applies "
-        "whether the guest gave two tokens or more — extra tokens are a "
-        "normal name, not a transcription problem, and do NOT by "
-        "themselves trigger a re-ask.\n"
-        "    * If ONE OR MORE tokens look suspect, confirm ONE PART AT A "
-        "TIME. Anchor on the solid-looking token(s) and re-ask ONLY the "
-        "first suspect part, naming whichever part it actually is — e.g. "
-        "'Thank you. I want to be sure I note your first name correctly — "
-        "could you say just your first name once more, slowly?' if the "
-        "suspect part is the first name, or the equivalent for the last "
-        "name. Read that single part back for a yes/no before moving on to "
-        "the next suspect part, if any. Once every token is resolved, map "
-        "them the same way as the clean case above: the first token is the "
-        "first name and every other token together is the last name.\n"
-        "    * NEVER ask the guest to repeat their 'full name', or their "
-        "'first name and last name', in one breath — every re-ask names "
-        "exactly ONE part.\n"
-        "    * LOOP EXIT: if you have re-asked the same part TWICE and the "
-        "transcriptions still disagree or the guest still says no, try the "
-        "SPELLING FALLBACK below for that part before giving up on it. "
-        "Only if spelling ALSO fails to resolve it, do NOT ask again. Read "
-        "back your single best guess of the whole name once — this final "
-        "read-back is an exception to the read-back rules below: even if "
-        "the guest says it is still wrong, do NOT ask them to spell it "
-        "again. Whatever the answer, say: 'Thank you — I've got that noted "
-        "down.' Then proceed to the mobile number. A booking with a "
-        "best-effort name is better than trapping the guest in a repeat "
-        "loop.\n"
-        "  Do NOT proceed to the mobile number, do NOT read back the booking "
-        "summary, and do NOT call create_booking until you have BOTH a "
-        "distinct first name AND a distinct last name captured and "
-        "confirmed — except under the LOOP EXIT rule above, which "
-        "explicitly permits proceeding on a best-effort guess once the "
-        "repeat attempts and the spelling fallback have both failed.\n"
-        "- Once you have captured both the first name and last name, check "
-        "whether the name is unusual/unfamiliar, or could plausibly be "
-        "spelled or heard more than one way (e.g. Katrina/Katerina, "
-        "Stephen/Steven, Zoe/Zoey). If either is true, read the full name "
-        "back and ask for a yes/no confirmation before continuing, e.g. "
-        "'Just to confirm, that's Chris Fernando — is that right?' If the "
-        "name is common and unambiguous, do NOT add a confirmation step — "
-        "proceed straight to the mobile number as usual.\n"
-        "- SPELLING FALLBACK for names: a guest's name is worth getting "
-        "exactly right, and making them say it over and over is worse than "
-        "asking them to spell it once. Use spelling ONLY in these two cases, "
-        "and never for a name you already heard clearly and confirmed:\n"
-        "    * If the repeat attempts described above have STILL not "
-        "resolved the name, politely ask them "
-        "to spell it, e.g. 'Could you "
-        "spell that for me, please?'. Build the name from the letters they "
-        "give — accept plain letters and phonetic forms like 'B for Bravo' — "
-        "then read the full name back for a yes/no confirmation.\n"
-        "    * If you read a name back and the guest says it is NOT right, do "
-        "not just guess again — ask them to spell the part that was wrong, "
-        "e.g. 'Sorry about that — could you spell your last name for me?'. "
-        "Rebuild it from the spelling and read it back once more to "
-        "confirm.\n"
-        "  When a guest spells a name, assemble the letters into the name and "
-        "read the assembled name back — do NOT read the individual letters "
-        "back to them.\n"
-        "- When you pass the name to create_booking in guest_name, ALWAYS "
-        "send both parts together as 'First Last' (e.g. 'Chris Fernando'), "
-        "never a single token.\n"
-        "- SLOT OVERWRITE RULE: once a guest has given you a value for a slot "
-        "(name, mobile, dates, room, residency, pax), do NOT silently "
-        "replace it if they say a different value later in the same call. "
-        "Instead, explicitly confirm the change: 'I have your name as Chris "
-        "Fernando â€” did you mean to change it to TJ Pereira?' Only update "
-        "the slot after the guest confirms the change. This prevents "
-        "telephony lag or repeated speech from corrupting the booking.\n"
-        "- SLOT DISAMBIGUATION RULE: match the guest's answer to the slot you "
-        "just asked about. If you asked for the mobile number and the guest "
-        "replies with letters/words (a name), do NOT overwrite the name â€” say "
-        "'Sorry, I was asking for your mobile number â€” could you say the "
-        "digits please?' If you asked for a name and the guest replies with "
-        "digits, ask for the name again. If the guest repeats themselves "
-        "(e.g. says 'pardon' or restates the same answer), treat it as a "
-        "repeat, not a new value â€” confirm what you already captured.\n"
-        "- For mobile number: NEVER ask the guest for a country code. If the "
-        "guest is a Sri Lankan resident (default assumption), assume +94 "
-        "yourself â€” accept whatever digits they say (with or without a "
-        "leading zero) and silently treat it as a +94 number. If the guest "
-        "is a foreign guest, ask which country they are calling from and "
-        "you add the country code yourself based on that country. Under no "
-        "circumstances should you ask the caller to dictate the country "
-        "code digits. If the number you heard sounds incomplete, only ask "
-        "them to repeat the local number â€” never the country code.\n"
-        "- DIGIT SHORTHAND: guests often use shortcuts when dictating "
-        "numbers. 'double [digit]' means that digit TWICE (e.g. "
-        "'double six' = 66, 'double oh' = 00). 'triple [digit]' means "
-        "THREE times (e.g. 'triple five' = 555). Always expand these "
-        "fully. For example, 'oh seven one one, seven five four, "
-        "double six eight' = 0711 754 668.\n"
-        "- Ask ONE question at a time and wait for the answer before asking the "
-        "next. Never stack multiple questions in a single turn. Keep each "
-        "question short and conversational.\n"
-        "- ALWAYS END YOUR TURN WITH A QUESTION until the booking is fully "
-        "confirmed (create_booking has returned success). Every reply must "
-        "drive the conversation forward by asking the next thing you need. "
-        "Never finish a turn with a statement, an upsell, or a list of "
-        "perks and then go silent â€” that leaves the caller hanging. If "
-        "you have just surfaced available rooms, end with 'which would "
-        "you like to proceed with?'. If the guest has picked a room, end "
-        "with 'shall I go ahead and book Sunrise Vista for you?' (or the "
-        "chosen room). If the guest has confirmed they want to proceed, "
-        "end with 'may I have your full name please?'. Mentions of "
-        "complimentary activities, advance-payment notes, and honeymoon "
-        "perks belong in a SHORT prefix before the question â€” not as the "
-        "final sentence. The only exceptions are the post-create_booking "
-        "reference read-back and the closing line at the very end of the "
-        "call.\n"
-        "- Never call create_booking unless check_availability already returned "
-        "available=true for the chosen room and dates in this same call AND the "
-        "guest has confirmed they want to proceed.\n"
-        "- Before calling create_booking, read back the full booking summary "
-        "(residency, guest name, dates, room, number of guests, mobile) and "
-        "get explicit confirmation (e.g. 'shall I confirm this booking?'). "
-        "Only after the guest says yes, call create_booking.\n"
-        "- When create_booking returns success=true, confirm the booking "
-        "is done, read the booking reference number once, and tell them "
-        "they will also receive a WhatsApp confirmation shortly with all "
-        "the details.\n"
-        "- If create_booking returns an error or times out, apologise and tell "
-        "the guest the hotel will call them back to confirm the booking. Do "
-        "NOT retry create_booking automatically.\n"
-        "- Always mention that nature walks, night walks, and stargazing are "
-        "complimentary for stays of 2 or more nights.\n"
-        "- If April or December dates are mentioned, note that 50% advance "
-        "payment is required.\n"
-        "- HONEYMOON / ANNIVERSARY UPSELL: if the guest mentions a "
-        "honeymoon, anniversary, birthday celebration, or proposal, you "
-        "MUST in your VERY NEXT sentence mention our complimentary "
-        "candlelit dinner package and offer to add it to the booking. "
-        "Do not save this for later â€” say it immediately after "
-        "congratulating them. Example: 'Congratulations! For honeymoon "
-        "stays, we offer a complimentary candlelit dinner â€” would you "
-        "like me to arrange that for one of your nights?' Skipping this "
-        "is a missed opportunity and is not acceptable.\n"
-        "- Be empathetic and attentive. If a guest seems frustrated, acknowledge "
-        "their feelings.\n"
-        "- THREE-STRIKES EXIT: if you have asked the same clarifying question "
-        "three turns in a row without making progress, OR the caller is "
-        "clearly off-topic, abusive, or testing the system, do NOT keep "
-        "engaging. Politely say something like 'It seems we're having "
-        "trouble connecting today â€” please feel free to call back when "
-        "you're ready to make a booking. Thank you for calling Hatton "
-        "Hills.' Then stop. Do not keep repeating the question.\n"
-        "- If you do not have enough information to use a tool, ask the guest "
-        "for the missing details.\n"
-        "- Do not try to collect the caller's name early. The name is only "
-        "collected after availability has been checked and the guest has "
-        "agreed to proceed.\n"
-        "- VOLUNTEERED DETAILS: if the guest proactively shares their "
-        "name, phone, or other details before you're ready to collect "
-        "them, briefly acknowledge (e.g. 'Thanks, I'll note that down') "
-        "but DO NOT skip the dates / pax / residency steps. When you "
-        "later reach the personal-details step, refer to what they "
-        "already told you â€” do NOT silently re-ask the same question as "
-        "if you had never heard the answer. Confirm: 'Just to confirm, "
-        "your name is Chris Fernando, correct?' This makes the call feel "
-        "human, not robotic.\n"
-        "- If the caller mentions dates or a time period, confirm the exact "
-        "check-in and check-out dates.\n"
-        "- Before ending the call, briefly summarize what was discussed and "
-        "any next steps.\n"
+        "- Keep replies short and natural: usually one or two short sentences, "
+        "and ask at most one question at a time.\n"
+        "- Say numbers, fees, and phone numbers as spoken words, never as digits "
+        "or symbols. For example say 'one hundred thousand rupees', and read a "
+        "phone number out digit by digit.\n"
+        "- Do not use abbreviations for currency. Say 'rupees', not 'LKR'.\n"
+        "- Never use markdown, bullet points, asterisks, emoji, or written-out "
+        "website links in your spoken reply. Speak any website or email address "
+        "in a natural spoken form.\n"
+        "- Be warm and encouraging. Many callers are school leavers exploring an "
+        "aviation career, so sound helpful and human, never robotic.\n"
     )
-
 
 # ---------------------------------------------------------------------------
 # LLM client (module-level singletons)
@@ -905,6 +727,26 @@ def _get_gemini_client():
         _gemini_client = google_genai.Client(api_key=GEMINI_API_KEY)
         logger.info("Initialized native Gemini client with model %s", MODEL)
     return _gemini_client
+
+
+async def _iter_gemini_tts_audio_deltas(stream: Any):
+    """Yield base64 audio payloads from the Gemini Interactions SSE stream.
+
+    The documented shape is a sequence of events; audio arrives on
+    `step.delta` events whose `delta.type == "audio"` and `delta.data` is a
+    base64 chunk (audio/l16, 24 kHz, mono). Everything else is skipped. Ported
+    from Kavya's Dialog Sinhala TTS path (server.py::_iter_gemini_tts_audio_deltas)
+    minus the pilot-only provider-error classification.
+    """
+    async for event in stream:
+        if getattr(event, "event_type", None) != "step.delta":
+            continue
+        delta = getattr(event, "delta", None)
+        if getattr(delta, "type", None) != "audio":
+            continue
+        data = getattr(delta, "data", None)
+        if isinstance(data, str) and data:
+            yield data
 
 
 def _history_to_gemini(history: list[dict]) -> list[dict]:
@@ -991,7 +833,7 @@ def _history_to_gemini(history: list[dict]) -> list[dict]:
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle for the FastAPI application."""
     # --- Startup ---
-    logger.info("Starting Hatton Hills Voice Agent server...")
+    logger.info("Starting Horizon Airline & Aviation Academy Voice Agent server...")
 
     # Initialize knowledge base
     logger.info("Initializing knowledge base from '%s'...", KB_DOCS_DIRECTORY)
@@ -1053,7 +895,7 @@ async def lifespan(app: FastAPI):
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Hatton Hills Voice Agent (Tanya)",
+    title="Horizon Airline & Aviation Academy Voice Agent (Vidya)",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -1120,10 +962,15 @@ async def voice_token(request: Request):
     Tokens are short-lived (300s TTL) and outgoing-only (incoming disabled).
     """
     # Per-IP rate limit + concurrency cap (lightweight, in-process).
+    # Use the RIGHTMOST X-Forwarded-For entry — the one appended by our own
+    # trusted nginx (`proxy_add_x_forwarded_for`) — not the leftmost, which is
+    # fully client-controlled and trivially spoofed to dodge the per-IP limit.
     client_ip = request.client.host if request.client else "unknown"
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
-        client_ip = fwd.split(",")[0].strip()
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if parts:
+            client_ip = parts[-1]
     _voice_token_rate_check(client_ip)
 
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -1158,12 +1005,60 @@ async def health() -> dict[str, Any]:
         "stt_provider": STT_PROVIDER,
         "azure_stt": AZURE_STT_AVAILABLE,
         "azure_tts": bool(AZURE_SPEECH_KEY),
+        # Sinhala stack (Kavya Dialog line parity): Gemini brain + Gemini TTS.
+        "sinhala_llm_provider": SI_LLM_PROVIDER,
+        "sinhala_gemini_model": SI_GEMINI_MODEL,
+        "sinhala_tts": "gemini" if (GOOGLE_GENAI_AVAILABLE and GEMINI_API_KEY) else "openai_fallback",
+        "gemini_tts_model": GEMINI_TTS_MODEL,
+        "gemini_configured": bool(GEMINI_API_KEY),
     }
 
 
 # ---------------------------------------------------------------------------
 # Admin: hot-reload knowledge base without container restart
 # ---------------------------------------------------------------------------
+
+_KB_ALLOWED_EXTENSIONS = (".txt", ".md")
+
+
+def _safe_kb_filename(filename: str) -> str:
+    """Validate a caller-supplied KB filename and return it, or raise 400.
+
+    `/kb-reload` writes `KB_DOCS_DIRECTORY / filename`, so an unvalidated name is
+    a path-traversal / arbitrary-write primitive. Accept ONLY a bare basename
+    with an allowed text extension that resolves strictly inside the KB dir, and
+    never through a symlink. Rejects absolute paths, separators, `..`, empty/dot
+    names, disallowed extensions, and symlinked targets.
+    """
+    from pathlib import Path
+    from fastapi import HTTPException
+
+    def _reject(why: str):
+        logger.warning("Rejected /kb-reload filename %r: %s", filename, why)
+        raise HTTPException(status_code=400, detail=f"Invalid filename: {why}")
+
+    if not filename or not filename.strip():
+        _reject("empty")
+    # Must be a bare basename — no directory components, no traversal, no NUL.
+    if filename != os.path.basename(filename):
+        _reject("must be a bare filename")
+    if "/" in filename or "\\" in filename or "\x00" in filename or ".." in filename:
+        _reject("path separators or traversal not allowed")
+    if filename in (".", ".."):
+        _reject("reserved name")
+    if not filename.lower().endswith(_KB_ALLOWED_EXTENSIONS):
+        _reject(f"extension must be one of {_KB_ALLOWED_EXTENSIONS}")
+
+    kb_dir = Path(KB_DOCS_DIRECTORY).resolve()
+    target = (kb_dir / filename).resolve()
+    # Containment: the resolved target's parent must be exactly the KB dir.
+    if target.parent != kb_dir:
+        _reject("resolves outside the knowledge-base directory")
+    # Never follow a symlink at the target path.
+    if target.is_symlink() or (kb_dir / filename).is_symlink():
+        _reject("symlinked target not allowed")
+    return filename
+
 
 @app.post("/kb-reload")
 async def kb_reload(request: Request) -> dict:
@@ -1178,7 +1073,7 @@ async def kb_reload(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Unauthorized")
     body = await request.json()
     content: str = body.get("content", "")
-    filename: str = body.get("filename", "hotel_info.txt")
+    filename: str = _safe_kb_filename(body.get("filename", "horizon_info.txt"))
     if not content:
         return {"ok": False, "error": "Empty content"}
     import asyncio, concurrent.futures
@@ -1230,7 +1125,7 @@ async def voice_incoming(request: Request) -> Response:
     gather = (
         f'  <Gather numDigits="1" action="https://{host}/voice/language-selected"'
         ' method="POST" timeout="6">\n'
-        '    <Say voice="Polly.Joanna">Welcome to Hatton Hills. '
+        '    <Say voice="Polly.Joanna">Welcome to Horizon Airline and Aviation Academy. '
         'For English, press 1.</Say>\n'
         '    <Say voice="Polly.Zeina">للغة العربية، اضغط اثنين.</Say>\n'
         "  </Gather>\n"
@@ -1265,7 +1160,7 @@ async def voice_demo_incoming(request: Request) -> Response:
     voiceUrl as a POST form field (or query string for GET). Routing mirrors
     the phone paths but skips the <Gather> menu:
 
-      - ``en`` (default / unknown) → English ConversationRelay (Tanya, ElevenLabs).
+      - ``en`` (default / unknown) → English ConversationRelay (Vidya, ElevenLabs).
       - ``ru`` → Russian ConversationRelay: Twilio CR natively supports ``ru-RU``
         (TTS + Twilio-managed transcription), so Russian rides CR like English.
       - ``ar`` → Media Streams (``/ws/media-stream/ar``): Twilio ConversationRelay
@@ -1318,7 +1213,7 @@ async def voice_demo_incoming(request: Request) -> Response:
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
             "  <Connect>\n"
-            f'    <Stream url="wss://{host}/ws/media-stream/{lang}" />\n'
+            f'    <Stream url="wss://{host}/ws/media-stream/{lang}{_ws_query_suffix()}" />\n'
             "  </Connect>\n"
             "</Response>"
         )
@@ -1385,7 +1280,7 @@ async def voice_language_selected(request: Request) -> Response:
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             "<Response>\n"
             "  <Connect>\n"
-            f'    <Stream url="wss://{host}/ws/media-stream/{lang}" />\n'
+            f'    <Stream url="wss://{host}/ws/media-stream/{lang}{_ws_query_suffix()}" />\n'
             "  </Connect>\n"
             "</Response>"
         )
@@ -1500,7 +1395,7 @@ async def whisper(request: Request) -> Response:
 @app.post("/voice/dial-result")
 async def dial_result(request: Request) -> Response:
     """Callback from <Dial action>. If the human answered â†’ hang up.
-    Otherwise, drop the caller back into Tanya with a recovery greeting.
+    Otherwise, drop the caller back into Vidya with a recovery greeting.
     """
     form = await request.form()
     status = form.get("DialCallStatus", "")
@@ -1512,12 +1407,12 @@ async def dial_result(request: Request) -> Response:
             media_type="application/xml",
         )
 
-    # No answer / busy / failed / canceled â†’ recover into Tanya with a
+    # No answer / busy / failed / canceled â†’ recover into Vidya with a
     # one-off greeting. We build the ConversationRelay TwiML by reusing the
     # standard helper but swapping in the apology greeting.
     recovery_config = dict(LANGUAGE_CONFIGS["en"])
     recovery_config["welcome_greeting"] = (
-        "Sorry, no agent was available. I'm Tanya, how can I help?"
+        "Sorry about that. I'm Vidya, how can I help?"
     )
     cr_tag = _build_conversation_relay_twiml(host, "en", recovery_config)
     twiml = (
@@ -1545,8 +1440,13 @@ def _build_conversation_relay_twiml(
     transcription_provider = config.get("transcription_provider", "google")
     speech_model = config.get("speech_model", "telephony")
 
+    # WS auth ticket — XML-escape the query separator (& -> &amp;) or Twilio
+    # rejects the TwiML. Empty when no signing secret is configured (local dev).
+    _cr_ticket = _mint_ws_ticket()
+    ticket_attr = f"&amp;t={_cr_ticket}" if _cr_ticket else ""
+
     return (
-        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}"\n'
+        f'<ConversationRelay url="wss://{host}/ws/conversation?lang={lang}{ticket_attr}"\n'
         f'        ttsProvider="{config["tts_provider"]}"\n'
         f'        voice="{config["voice"]}"\n'
         f'{extra}'
@@ -1880,10 +1780,20 @@ class MediaStreamSession:
         self.gemini_client = gemini_client
         self.lang = lang
         self.system_prompt = _build_system_prompt(lang)
-        if LLM_PROVIDER == "claude":
-            self.tools = get_tools()
-        elif LLM_PROVIDER == "gemini":
+        # Sinhala runs on the Gemini brain (Kavya Dialog stack) regardless of the
+        # global provider, so it needs Gemini-format tools. (Inquiry-only builds
+        # have no tools, so this is defensive/future-proof.) Requires a live
+        # Gemini client â€” without one (missing key) it falls back to the global
+        # provider so the call still works.
+        self._si_gemini_brain = (
+            lang == "si"
+            and SI_LLM_PROVIDER == "gemini"
+            and gemini_client is not None
+        )
+        if self._si_gemini_brain or LLM_PROVIDER == "gemini":
             self.tools = get_tools_gemini()
+        elif LLM_PROVIDER == "claude":
+            self.tools = get_tools()
         else:
             self.tools = get_tools_openai()
 
@@ -2175,7 +2085,11 @@ class MediaStreamSession:
         self.history = _trim_history(self.history)
 
         try:
-            if LLM_PROVIDER == "claude":
+            if self._si_gemini_brain:
+                # Sinhala uses the Gemini brain (Kavya Dialog stack) even when
+                # the global provider is Claude (English/ConversationRelay).
+                response_text = await self._run_llm_gemini(model=SI_GEMINI_MODEL)
+            elif LLM_PROVIDER == "claude":
                 response_text = await self._run_llm_claude()
             elif LLM_PROVIDER == "gemini":
                 response_text = await self._run_llm_gemini()
@@ -2322,8 +2236,13 @@ class MediaStreamSession:
 
     # â”€â”€ Gemini native streaming with tool use + sentence-level TTS â”€â”€â”€â”€â”€â”€â”€
 
-    async def _run_llm_gemini(self) -> str:
-        """Gemini-native streaming version of _run_llm for Media Streams."""
+    async def _run_llm_gemini(self, model: str | None = None) -> str:
+        """Gemini-native streaming version of _run_llm for Media Streams.
+
+        `model` overrides the global MODEL (used by the Sinhala path to pin the
+        Kavya Dialog line's Gemini LLM model).
+        """
+        gemini_model = model or MODEL
         full_text = ""
         fillers = MEDIA_STREAM_FILLERS.get(self.lang, {})
 
@@ -2346,7 +2265,7 @@ class MediaStreamSession:
                 config["tools"] = self.tools
 
             response = await self.gemini_client.aio.models.generate_content_stream(
-                model=MODEL,
+                model=gemini_model,
                 contents=gemini_contents,
                 config=config,
             )
@@ -2610,7 +2529,14 @@ class MediaStreamSession:
             if generation >= 0 and generation != self._speak_generation:
                 return
             if self.lang == "si":
-                await self._tts_openai(text)
+                # Sinhala voice = Kavya Dialog stack (Gemini TTS). Falls back to
+                # OpenAI TTS if the Gemini TTS client/key is unavailable, so a
+                # missing GEMINI_API_KEY degrades to a working voice instead of
+                # silence.
+                if self.gemini_client is not None:
+                    await self._tts_gemini(text)
+                else:
+                    await self._tts_openai(text)
             elif self.lang in ("ta", "ar"):
                 await self._tts_elevenlabs(text)
             else:
@@ -2793,6 +2719,115 @@ class MediaStreamSession:
         except Exception:
             logger.exception("OpenAI TTS failed for: %s", text[:80])
             self._is_speaking = False
+
+    # â”€â”€ Gemini TTS (Sinhala â€” Kavya Dialog stack) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    async def _tts_gemini(self, text: str):
+        """Stream Gemini TTS as mulaw 8 kHz to Twilio (Sinhala).
+
+        Uses the same model + voice the Kavya Dialog line uses
+        (gemini-3.1-flash-tts-preview / Vindemiatrix). The Interactions API
+        returns raw 24 kHz 16-bit mono LE PCM in base64 audio deltas; we
+        downsample to 8 kHz and mulaw-encode on the fly, dropping straight into
+        the same Twilio media framing the OpenAI/Azure paths use.
+        Must only be called from _speak (lock already held).
+
+        NOTE: gemini-3.1-flash-tts-preview is a PREVIEW model with a ~100
+        requests/day cap. On a failure it degrades to OpenAI TTS so the caller
+        still hears a reply instead of silence.
+        """
+        if audioop is None or self.gemini_client is None:
+            logger.warning("Gemini TTS unavailable â€” falling back to OpenAI TTS")
+            await self._tts_openai(text)
+            return
+
+        self._is_speaking = True
+        ratecv_state = None   # audioop.ratecv carry-over state (24k -> 8k)
+        pcm_tail = b""        # holds a stray odd byte across chunk boundaries
+        mulaw_buf = b""       # accumulates mulaw output, flushed in 640-byte frames
+        got_audio = False
+
+        try:
+            stream = await self.gemini_client.aio.interactions.create(
+                model=GEMINI_TTS_MODEL,
+                input=text,
+                stream=True,
+                response_format={"type": "audio"},
+                generation_config={
+                    "speech_config": [{"voice": GEMINI_TTS_VOICE}],
+                },
+                timeout=GEMINI_TTS_TIMEOUT_SECONDS,
+            )
+
+            async for audio_b64 in _iter_gemini_tts_audio_deltas(stream):
+                if not self._is_speaking:
+                    break
+                try:
+                    chunk = base64.b64decode(audio_b64, validate=True)
+                except (binascii.Error, ValueError, TypeError):
+                    continue
+                if not chunk:
+                    continue
+                got_audio = True
+                # PCM is 2 bytes/sample -- keep sample alignment.
+                data = pcm_tail + chunk
+                if len(data) % 2:
+                    data, pcm_tail = data[:-1], data[-1:]
+                else:
+                    pcm_tail = b""
+                if not data:
+                    continue
+                pcm8k, ratecv_state = audioop.ratecv(
+                    data, 2, 1, 24000, 8000, ratecv_state)
+                mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
+
+                while len(mulaw_buf) >= 640:
+                    if not self._is_speaking:
+                        break
+                    frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
+                    b64 = base64.b64encode(frame).decode("ascii")
+                    async with self._ws_lock:
+                        await self.ws.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": self.stream_sid,
+                            "media": {"payload": b64},
+                        }))
+
+            # Nothing came back at all -- treat as a provider failure and fall
+            # back so the caller is not left in silence (e.g. quota exhausted).
+            if not got_audio:
+                logger.error("Gemini TTS returned no audio â€” falling back to OpenAI TTS")
+                await self._tts_openai(text)
+                return
+
+            # Flush any remaining tail of mulaw audio.
+            if self._is_speaking and mulaw_buf:
+                b64 = base64.b64encode(mulaw_buf).decode("ascii")
+                async with self._ws_lock:
+                    await self.ws.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": b64},
+                    }))
+
+            if self._is_speaking:
+                async with self._ws_lock:
+                    await self.ws.send_text(json.dumps({
+                        "event": "mark",
+                        "streamSid": self.stream_sid,
+                        "mark": {"name": "tts_done"},
+                    }))
+            else:
+                logger.info("Gemini TTS interrupted by barge-in [%s]", self.call_sid)
+
+        except Exception:
+            logger.exception("Gemini TTS failed for: %s", text[:80])
+            # Degrade to OpenAI TTS rather than dropping the turn. If we already
+            # streamed some frames, _is_speaking guards against double audio.
+            if not got_audio:
+                await self._tts_openai(text)
+            else:
+                self._is_speaking = False
 
     # â”€â”€ Azure TTS (Sinhala) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -3377,7 +3412,7 @@ async def _run_llm_streaming_claude(
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/conversation")
-async def ws_conversation(websocket: WebSocket, lang: str = "en"):
+async def ws_conversation(websocket: WebSocket, lang: str = "en", t: str = ""):
     """Handle a Twilio ConversationRelay WebSocket session.
 
     The ``lang`` query parameter is set by the IVR routing and determines
@@ -3390,6 +3425,13 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
       - "interrupt": User interrupted the agent mid-speech.
       - Others    : Logged and ignored.
     """
+    # Authenticated ingress: reject anything without a valid short-lived ticket
+    # BEFORE accepting the socket (closing pre-accept sends an HTTP 403).
+    if not _verify_ws_ticket(t):
+        logger.warning("Rejected /ws/conversation — missing/invalid ticket")
+        await websocket.close(code=1008)
+        return
+
     # Validate lang param
     if lang not in LANGUAGE_CONFIGS:
         lang = "en"
@@ -3641,7 +3683,9 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
 
                         # Dispatch dashboard event SYNCHRONOUSLY here so it
                         # doesn't get cancelled when the WS goes away.
-                        if dashboard_client is not None:
+                        # (Unreachable on the inquiry-only demo — no transfer
+                        # tool — but fail-closed on egress regardless.)
+                        if dashboard_client is not None and egress_enabled():
                             try:
                                 await dashboard_client.send_call_transferred(
                                     call_sid=call_sid,
@@ -3799,15 +3843,22 @@ async def ws_conversation(websocket: WebSocket, lang: str = "en"):
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/media-stream/{lang}")
-async def ws_media_stream(websocket: WebSocket, lang: str):
+async def ws_media_stream(websocket: WebSocket, lang: str, t: str = ""):
     """Handle a Twilio Media Streams WebSocket session for Sinhala or Tamil.
 
     Language is encoded in the URL path (e.g. /ws/media-stream/si) so it
     is always present â€” avoids unreliable query-string passing by Twilio.
+    The `t` query param is the short-lived HMAC ingress ticket.
 
-    Receives raw mulaw 8 kHz audio from Twilio, runs Google Cloud STT,
-    sends Claude responses through Azure TTS back as mulaw audio.
+    Receives raw mulaw 8 kHz audio from Twilio, runs Azure STT, sends the
+    LLM's responses back through the per-language TTS as mulaw audio.
     """
+    # Authenticated ingress: reject anything without a valid ticket pre-accept.
+    if not _verify_ws_ticket(t):
+        logger.warning("Rejected /ws/media-stream — missing/invalid ticket")
+        await websocket.close(code=1008)
+        return
+
     if lang not in ("si", "ta", "ar"):
         lang = "si"
 
@@ -3826,6 +3877,19 @@ async def ws_media_stream(websocket: WebSocket, lang: str):
         await websocket.accept()
         await websocket.close(code=1011, reason="Server configuration error")
         return
+
+    # Sinhala rides the Kavya Dialog stack: Gemini brain + Gemini TTS. Ensure a
+    # Gemini client exists for it regardless of the global provider (English is
+    # Claude/ConversationRelay). If the key is missing we still start the call â€”
+    # the LLM/TTS paths degrade gracefully â€” rather than dropping the socket.
+    if lang == "si" and gemini_client is None:
+        try:
+            gemini_client = _get_gemini_client()
+        except RuntimeError:
+            logger.error(
+                "Sinhala requested but GEMINI_API_KEY/SDK unavailable â€” "
+                "Sinhala brain falls back to global provider, voice to OpenAI TTS"
+            )
 
     session = MediaStreamSession(
         websocket=websocket, lang=lang,

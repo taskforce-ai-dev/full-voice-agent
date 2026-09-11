@@ -1,0 +1,1501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI TaskForce — Corporate Overview 2026</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=Source+Sans+3:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --navy: #0F172A;
+    --navy-mid: #1E293B;
+    --navy-light: #334155;
+    --blue: #0369A1;
+    --blue-light: #0EA5E9;
+    --blue-pale: #E0F2FE;
+    --blue-bg: #F0F9FF;
+    --accent: #0369A1;
+    --accent-light: rgba(3,105,161,0.08);
+    --accent-border: rgba(3,105,161,0.18);
+    --green: #059669;
+    --green-light: #D1FAE5;
+    --amber: #D97706;
+    --amber-light: #FEF3C7;
+    --bg: #FFFFFF;
+    --bg-warm: #F8FAFC;
+    --bg-section: #F1F5F9;
+    --text: #020617;
+    --text-secondary: #475569;
+    --text-muted: #94A3B8;
+    --border: #E2E8F0;
+    --border-strong: #CBD5E1;
+    --heading: 'Lexend', sans-serif;
+    --body: 'Source Sans 3', sans-serif;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --shadow-md: 0 4px 16px rgba(0,0,0,0.08);
+    --shadow-lg: 0 12px 40px rgba(0,0,0,0.1);
+    --radius: 10px;
+  }
+
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--body);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ─── SLIDE ENGINE ──────────────────────────────────────── */
+  #deck { position: fixed; inset: 0; overflow: hidden; }
+
+  .slide {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: flex;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.45s ease;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .slide.active { opacity: 1; pointer-events: all; }
+
+  .slide-inner {
+    width: 100%;
+    min-height: 100%;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 80px 64px 100px;
+  }
+
+  /* ─── TOP BAR ───────────────────────────────────────────── */
+  #topbar {
+    position: fixed; z-index: 100;
+    top: 0; left: 0; right: 0;
+    height: 52px;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 32px;
+    background: rgba(255,255,255,0.92);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  #topbar-brand {
+    font-family: var(--heading);
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--navy);
+    letter-spacing: -0.02em;
+  }
+
+  #topbar-brand span { color: var(--blue); }
+
+  #topbar-counter {
+    font-family: var(--heading);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+
+  #topbar-counter strong { color: var(--navy); }
+
+  #topbar-right {
+    font-family: var(--body);
+    font-size: 12px;
+    color: var(--text-muted);
+    letter-spacing: 0.04em;
+  }
+
+  /* ─── BOTTOM NAV ────────────────────────────────────────── */
+  #nav {
+    position: fixed; z-index: 100;
+    bottom: 0; left: 0; right: 0;
+    height: 56px;
+    display: flex; align-items: center; justify-content: center; gap: 12px;
+    background: rgba(255,255,255,0.92);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid var(--border);
+  }
+
+  .nav-btn {
+    width: 40px; height: 40px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    border-radius: 8px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--navy);
+    transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .nav-btn:hover { border-color: var(--blue); background: var(--blue-pale); box-shadow: var(--shadow-sm); }
+  .nav-btn:disabled { opacity: 0.3; cursor: default; background: var(--bg); border-color: var(--border); box-shadow: none; }
+
+  .nav-btn svg { width: 18px; height: 18px; }
+
+  .progress-track {
+    width: 180px; height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    margin: 0 8px;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: var(--blue);
+    border-radius: 2px;
+    transition: width 0.4s ease;
+  }
+
+  /* ─── TYPOGRAPHY ────────────────────────────────────────── */
+  h1, h2, h3 {
+    font-family: var(--heading);
+    color: var(--navy);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+  }
+
+  .slide-label {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--heading);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--blue);
+    margin-bottom: 14px;
+  }
+
+  .slide-label::before {
+    content: '';
+    display: block;
+    width: 20px; height: 2px;
+    background: var(--blue);
+    border-radius: 1px;
+  }
+
+  .slide-title {
+    font-size: clamp(28px, 3.5vw, 48px);
+    font-weight: 700;
+    margin-bottom: 12px;
+  }
+
+  .slide-subtitle {
+    font-size: 17px;
+    color: var(--text-secondary);
+    max-width: 680px;
+    line-height: 1.65;
+  }
+
+  .section-header {
+    text-align: center;
+    max-width: 780px;
+    margin-bottom: 40px;
+  }
+
+  .blue { color: var(--blue); }
+
+  /* ─── CARDS ─────────────────────────────────────────────── */
+  .card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    box-shadow: var(--shadow-sm);
+    transition: box-shadow 0.25s, border-color 0.25s, transform 0.25s;
+    cursor: default;
+  }
+
+  .card:hover { box-shadow: var(--shadow-md); border-color: var(--border-strong); transform: translateY(-2px); }
+
+  .card-icon {
+    width: 48px; height: 48px;
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 16px;
+    flex-shrink: 0;
+  }
+
+  .card-icon svg { width: 24px; height: 24px; }
+
+  .card-icon.blue-bg { background: var(--blue-pale); color: var(--blue); }
+  .card-icon.green-bg { background: var(--green-light); color: var(--green); }
+  .card-icon.amber-bg { background: var(--amber-light); color: var(--amber); }
+  .card-icon.navy-bg { background: #E2E8F0; color: var(--navy); }
+
+  .card-badge {
+    display: inline-block;
+    font-family: var(--heading);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 3px 10px;
+    border-radius: 4px;
+    margin-bottom: 12px;
+  }
+
+  .badge-blue { background: var(--blue-pale); color: var(--blue); }
+  .badge-green { background: var(--green-light); color: var(--green); }
+
+  .card h3 {
+    font-size: 17px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  .card p {
+    font-size: 14px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ─── PILL / TAG ────────────────────────────────────────── */
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--heading);
+    font-size: 12px;
+    font-weight: 500;
+    padding: 6px 14px;
+    border-radius: 100px;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    background: var(--bg-warm);
+  }
+
+  .pill.solid { background: var(--blue); color: white; border-color: var(--blue); }
+
+  /* ─── DIVIDER ────────────────────────────────────────────── */
+  .hr {
+    width: 48px; height: 3px;
+    background: var(--blue);
+    border-radius: 2px;
+    margin: 16px 0 20px;
+  }
+
+  .hr.centered { margin: 16px auto 20px; }
+
+  /* ─── USE-CASE LIST ─────────────────────────────────────── */
+  .use-cases {
+    list-style: none;
+    display: flex; flex-direction: column; gap: 10px;
+    margin-top: 16px;
+  }
+
+  .use-cases li {
+    display: flex; align-items: flex-start; gap: 10px;
+    font-size: 14px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  .use-cases li svg {
+    flex-shrink: 0;
+    width: 16px; height: 16px;
+    color: var(--green);
+    margin-top: 2px;
+  }
+
+  /* ─── STAT BLOCK ────────────────────────────────────────── */
+  .stat-block {
+    text-align: center;
+    padding: 20px 16px;
+  }
+
+  .stat-val {
+    font-family: var(--heading);
+    font-size: 42px;
+    font-weight: 700;
+    color: var(--blue);
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+
+  .stat-label {
+    font-size: 13px;
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
+
+  /* ─── LAYOUT HELPERS ────────────────────────────────────── */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; width: 100%; max-width: 1080px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; width: 100%; max-width: 1080px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; width: 100%; max-width: 1080px; }
+  .flex-center { display: flex; flex-direction: column; align-items: center; text-align: center; }
+
+  .w-full { width: 100%; max-width: 1080px; }
+
+  .mt-24 { margin-top: 24px; }
+  .mt-32 { margin-top: 32px; }
+  .mt-40 { margin-top: 40px; }
+  .mb-8 { margin-bottom: 8px; }
+  .mb-12 { margin-bottom: 12px; }
+  .mb-16 { margin-bottom: 16px; }
+  .gap-16 { gap: 16px; }
+
+  /* ════════════════════════════════════════════════════════════
+     SLIDE 1 — COVER
+  ════════════════════════════════════════════════════════════ */
+  #s1 .slide-inner {
+    background: linear-gradient(160deg, #0F172A 0%, #1E3A5F 50%, #0F172A 100%);
+    position: relative;
+    overflow: hidden;
+  }
+
+  #s1 .slide-inner::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse at 70% 40%, rgba(3,105,161,0.25) 0%, transparent 60%),
+                radial-gradient(ellipse at 30% 80%, rgba(14,165,233,0.1) 0%, transparent 50%);
+    pointer-events: none;
+  }
+
+  .cover-content {
+    position: relative; z-index: 1;
+    display: flex; flex-direction: column; align-items: center; text-align: center;
+    max-width: 820px;
+  }
+
+  .cover-logo-mark {
+    width: 72px; height: 72px;
+    border: 2px solid rgba(255,255,255,0.2);
+    border-radius: 16px;
+    background: rgba(255,255,255,0.07);
+    backdrop-filter: blur(12px);
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 28px;
+  }
+
+  .cover-logo-mark svg { width: 36px; height: 36px; }
+
+  .cover-name {
+    font-family: var(--heading);
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.5);
+    margin-bottom: 20px;
+  }
+
+  .cover-h1 {
+    font-family: var(--heading);
+    font-size: clamp(34px, 5vw, 64px);
+    font-weight: 700;
+    color: #FFFFFF;
+    line-height: 1.08;
+    letter-spacing: -0.03em;
+    margin-bottom: 18px;
+  }
+
+  .cover-h1 span { color: var(--blue-light); }
+
+  .cover-sub {
+    font-size: 18px;
+    color: rgba(255,255,255,0.6);
+    line-height: 1.6;
+    max-width: 580px;
+    margin-bottom: 36px;
+  }
+
+  .cover-pills {
+    display: flex; gap: 10px; flex-wrap: wrap; justify-content: center;
+  }
+
+  .cover-pill {
+    font-family: var(--heading);
+    font-size: 12px;
+    font-weight: 500;
+    padding: 8px 18px;
+    border-radius: 100px;
+    border: 1px solid rgba(255,255,255,0.15);
+    color: rgba(255,255,255,0.7);
+    background: rgba(255,255,255,0.05);
+  }
+
+  .cover-footer {
+    position: absolute; bottom: 100px;
+    display: flex; gap: 40px;
+    font-size: 12px;
+    color: rgba(255,255,255,0.35);
+    font-family: var(--heading);
+    font-weight: 400;
+    letter-spacing: 0.06em;
+    z-index: 1;
+  }
+
+  /* Decorative grid dots */
+  .dot-grid {
+    position: absolute;
+    width: 200px; height: 200px;
+    opacity: 0.07;
+    background-image: radial-gradient(circle, white 1px, transparent 1px);
+    background-size: 20px 20px;
+    pointer-events: none;
+  }
+
+  .dot-grid.tl { top: 60px; left: 40px; }
+  .dot-grid.br { bottom: 40px; right: 40px; }
+
+  /* ════════════════════════════════════════════════════════════
+     SLIDE 2 — THE CHALLENGE
+  ════════════════════════════════════════════════════════════ */
+  .challenge-card {
+    display: flex; gap: 16px; align-items: flex-start;
+    padding: 20px 24px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    border-left: 3px solid #EF4444;
+  }
+
+  .challenge-card .ch-num {
+    font-family: var(--heading);
+    font-size: 28px;
+    font-weight: 700;
+    color: #FCA5A5;
+    line-height: 1;
+    min-width: 40px;
+  }
+
+  .challenge-card h3 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--navy);
+    margin-bottom: 4px;
+  }
+
+  .challenge-card p {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     SLIDE 4 — MAP
+  ════════════════════════════════════════════════════════════ */
+  .map-container {
+    width: 100%; max-width: 1080px;
+    display: flex; gap: 32px;
+    align-items: stretch;
+  }
+
+  .map-visual {
+    flex: 1.4;
+    background: var(--bg-warm);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 32px;
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+    min-height: 320px;
+  }
+
+  .map-visual svg { width: 100%; max-width: 520px; }
+
+  .map-offices {
+    flex: 0.6;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+
+  .office-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    flex: 1;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+
+  .office-card:hover { border-color: var(--blue); box-shadow: var(--shadow-md); }
+
+  .office-region {
+    font-family: var(--heading);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--blue);
+    margin-bottom: 6px;
+  }
+
+  .office-city {
+    font-family: var(--heading);
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--navy);
+  }
+
+  .office-country {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     SLIDE 5 — AGENTS OVERVIEW
+  ════════════════════════════════════════════════════════════ */
+  .agent-mini {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 22px;
+    display: flex; flex-direction: column;
+    box-shadow: var(--shadow-sm);
+    transition: box-shadow 0.25s, border-color 0.25s, transform 0.25s;
+    cursor: default;
+  }
+
+  .agent-mini:hover { box-shadow: var(--shadow-md); border-color: var(--border-strong); transform: translateY(-2px); }
+
+  .agent-mini-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 12px;
+  }
+
+  .agent-mini-num {
+    font-family: var(--heading);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .agent-mini-status {
+    font-family: var(--heading);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    color: var(--green);
+    display: flex; align-items: center; gap: 4px;
+  }
+
+  .agent-mini-status::before {
+    content: '';
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+  }
+
+  .agent-mini h3 {
+    font-size: 16px;
+    margin-bottom: 6px;
+  }
+
+  .agent-mini p {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    flex: 1;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     SLIDES 6–8 — DEEP DIVE AGENTS
+  ════════════════════════════════════════════════════════════ */
+  .deep-layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+    width: 100%;
+    max-width: 1080px;
+  }
+
+  .deep-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 32px;
+    box-shadow: var(--shadow-sm);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .deep-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 3px;
+  }
+
+  .deep-card.blue-top::before { background: linear-gradient(90deg, var(--blue), var(--blue-light)); }
+  .deep-card.green-top::before { background: linear-gradient(90deg, var(--green), #34D399); }
+  .deep-card.amber-top::before { background: linear-gradient(90deg, var(--amber), #F59E0B); }
+  .deep-card.navy-top::before { background: linear-gradient(90deg, var(--navy), var(--navy-light)); }
+
+  .deep-header {
+    display: flex; align-items: center; gap: 14px;
+    margin-bottom: 16px;
+  }
+
+  .deep-header .card-icon { margin-bottom: 0; }
+
+  .deep-header-text h3 {
+    font-size: 20px;
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+
+  .deep-header-text .deep-unit {
+    font-family: var(--heading);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .deep-body {
+    font-size: 14px;
+    color: var(--text-secondary);
+    line-height: 1.7;
+    margin-bottom: 18px;
+  }
+
+  .how-it-works {
+    background: var(--bg-warm);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+    margin-top: 16px;
+  }
+
+  .how-it-works-title {
+    font-family: var(--heading);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--navy);
+    margin-bottom: 8px;
+  }
+
+  .how-it-works p {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     SLIDE 9 — PROCESS
+  ════════════════════════════════════════════════════════════ */
+  .process-row {
+    display: flex;
+    width: 100%;
+    max-width: 1080px;
+    position: relative;
+    gap: 0;
+  }
+
+  .process-row::before {
+    content: '';
+    position: absolute;
+    top: 32px;
+    left: 10%; right: 10%;
+    height: 2px;
+    background: linear-gradient(90deg, var(--blue), var(--green));
+    border-radius: 1px;
+    z-index: 0;
+  }
+
+  .process-step {
+    flex: 1;
+    display: flex; flex-direction: column; align-items: center;
+    text-align: center;
+    position: relative; z-index: 1;
+    padding: 0 8px;
+  }
+
+  .step-circle {
+    width: 64px; height: 64px;
+    border-radius: 50%;
+    background: var(--bg);
+    border: 2px solid var(--blue);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--heading);
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--blue);
+    margin-bottom: 16px;
+    box-shadow: var(--shadow-md);
+  }
+
+  .step-name {
+    font-family: var(--heading);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--navy);
+    margin-bottom: 6px;
+    line-height: 1.3;
+  }
+
+  .step-text {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    max-width: 160px;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     SLIDE 10 — CTA
+  ════════════════════════════════════════════════════════════ */
+  #s10 .slide-inner {
+    background: linear-gradient(160deg, #0F172A, #1E3A5F);
+    position: relative;
+    overflow: hidden;
+  }
+
+  #s10 .slide-inner::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse at 50% 50%, rgba(3,105,161,0.2) 0%, transparent 60%);
+    pointer-events: none;
+  }
+
+  .cta-content {
+    position: relative; z-index: 1;
+    display: flex; flex-direction: column; align-items: center; text-align: center;
+    max-width: 700px;
+  }
+
+  .cta-h2 {
+    font-family: var(--heading);
+    font-size: clamp(28px, 4vw, 48px);
+    font-weight: 700;
+    color: #FFFFFF;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    margin-bottom: 14px;
+  }
+
+  .cta-h2 span { color: var(--blue-light); }
+
+  .cta-sub {
+    font-size: 17px;
+    color: rgba(255,255,255,0.55);
+    line-height: 1.6;
+    margin-bottom: 32px;
+  }
+
+  .cta-button {
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 16px 36px;
+    background: var(--blue-light);
+    color: white;
+    font-family: var(--heading);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.15s;
+    box-shadow: 0 4px 20px rgba(14,165,233,0.4);
+  }
+
+  .cta-button:hover { background: #38BDF8; transform: translateY(-2px); }
+  .cta-button svg { width: 18px; height: 18px; }
+
+  .cta-note {
+    font-size: 13px;
+    color: rgba(255,255,255,0.35);
+    margin-top: 14px;
+  }
+
+  .cta-trust {
+    display: flex; gap: 24px; margin-top: 40px; flex-wrap: wrap; justify-content: center;
+  }
+
+  .cta-trust-item {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px;
+    color: rgba(255,255,255,0.5);
+    font-family: var(--heading);
+    font-weight: 400;
+  }
+
+  .cta-trust-item svg { width: 16px; height: 16px; color: var(--blue-light); }
+
+  .cta-locations {
+    display: flex; gap: 28px; margin-top: 36px; flex-wrap: wrap; justify-content: center;
+  }
+
+  .cta-loc {
+    text-align: center;
+  }
+
+  .cta-loc-city {
+    font-family: var(--heading);
+    font-size: 16px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.85);
+  }
+
+  .cta-loc-country {
+    font-size: 12px;
+    color: rgba(255,255,255,0.35);
+  }
+
+  .cta-sep {
+    width: 1px; height: 36px;
+    background: rgba(255,255,255,0.12);
+    align-self: center;
+  }
+
+  /* ─── SVG ICONS ─────────────────────────────────────────── */
+  .check-icon { display: inline-block; width: 16px; height: 16px; flex-shrink: 0; }
+
+  /* ─── RESPONSIVE ────────────────────────────────────────── */
+  @media (max-width: 900px) {
+    .slide-inner { padding: 70px 24px 90px; }
+    .grid-2, .deep-layout { grid-template-columns: 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr; }
+    .grid-4 { grid-template-columns: 1fr 1fr; }
+    .map-container { flex-direction: column; }
+    .process-row { flex-direction: column; gap: 20px; align-items: center; }
+    .process-row::before { display: none; }
+    .cover-footer { gap: 20px; flex-wrap: wrap; justify-content: center; }
+  }
+
+  @media (max-width: 600px) {
+    .grid-3 { grid-template-columns: 1fr; }
+    .grid-4 { grid-template-columns: 1fr; }
+    .cover-h1 { font-size: 28px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .slide { transition: opacity 0.2s ease; }
+    .card:hover, .agent-mini:hover, .office-card:hover, .deep-card:hover { transform: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Top bar -->
+<header id="topbar">
+  <div id="topbar-brand">AI <span>TaskForce</span></div>
+  <div id="topbar-counter">Slide <strong id="cur">1</strong> of <span id="tot">10</span></div>
+  <div id="topbar-right">Corporate Overview 2026</div>
+</header>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 1 — COVER
+═══════════════════════════════════════════════════════════ -->
+<div id="deck">
+<section class="slide active" id="s1">
+  <div class="slide-inner">
+    <div class="dot-grid tl"></div>
+    <div class="dot-grid br"></div>
+
+    <div class="cover-content">
+      <div class="cover-logo-mark">
+        <svg viewBox="0 0 36 36" fill="none"><polygon points="18,2 33,10 33,26 18,34 3,26 3,10" stroke="white" stroke-width="1.2" fill="none" opacity="0.7"/><circle cx="18" cy="18" r="3.5" fill="white" opacity="0.9"/><line x1="18" y1="9" x2="18" y2="14.5" stroke="white" stroke-width="1.2" opacity="0.6"/><line x1="18" y1="21.5" x2="18" y2="27" stroke="white" stroke-width="1.2" opacity="0.6"/><line x1="10" y1="13.5" x2="14.5" y2="16" stroke="white" stroke-width="1.2" opacity="0.6"/><line x1="21.5" y1="20" x2="26" y2="22.5" stroke="white" stroke-width="1.2" opacity="0.6"/></svg>
+      </div>
+
+      <div class="cover-name">AI TaskForce</div>
+
+      <h1 class="cover-h1">
+        Autonomous <span>AI Agents</span><br>for Every Organization
+      </h1>
+
+      <p class="cover-sub">
+        We deploy intelligent agents that absorb operational workload — so your teams can focus on innovation, strategy, and growth.
+      </p>
+
+      <div class="cover-pills">
+        <div class="cover-pill">Workflow Automation</div>
+        <div class="cover-pill">Voice AI</div>
+        <div class="cover-pill">Document Intelligence</div>
+        <div class="cover-pill">Business Analytics</div>
+        <div class="cover-pill">Custom Software</div>
+      </div>
+    </div>
+
+    <div class="cover-footer">
+      <span>Colombo, Sri Lanka — HQ</span>
+      <span>London, UK</span>
+      <span>Muscat, Oman</span>
+      <span>taskforceai.tech</span>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 2 — THE CHALLENGE
+═══════════════════════════════════════════════════════════ -->
+<section class="slide" id="s2">
+  <div class="slide-inner" style="background:var(--bg-warm);">
+    <div class="section-header">
+      <div class="slide-label">The Challenge</div>
+      <h2 class="slide-title">Every Organization Has the <span class="blue">Same Problem</span></h2>
+      <p class="slide-subtitle">Across governments, enterprises, and SMEs — up to 65% of operational time is consumed by work that doesn't require human judgment. The cost is compounding.</p>
+    </div>
+
+    <div class="grid-2 mt-24" style="gap:18px;">
+      <div class="challenge-card">
+        <div class="ch-num">01</div>
+        <div>
+          <h3>Repetitive Administrative Work</h3>
+          <p>Staff spend 40+ hours per week on email replies, data entry, lead follow-ups, and onboarding paperwork — work that adds zero strategic value but consumes your best people.</p>
+        </div>
+      </div>
+      <div class="challenge-card">
+        <div class="ch-num">02</div>
+        <div>
+          <h3>Missed Revenue After Hours</h3>
+          <p>Customer calls, booking requests, and sales inquiries outside 9–5 are lost entirely. No voicemail follow-through. Leads go cold while your team sleeps.</p>
+        </div>
+      </div>
+      <div class="challenge-card">
+        <div class="ch-num">03</div>
+        <div>
+          <h3>Document Processing Bottlenecks</h3>
+          <p>Invoices, shipping manifests, HR paperwork, and compliance documents pile up. Manual extraction introduces errors that cascade downstream through finance and operations.</p>
+        </div>
+      </div>
+      <div class="challenge-card">
+        <div class="ch-num">04</div>
+        <div>
+          <h3>Fragmented, Invisible Data</h3>
+          <p>Critical business metrics live in disconnected CRMs, spreadsheets, and email threads. Decision-makers operate on gut feeling rather than real-time intelligence.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 3 — OUR SOLUTION + KEY METRICS
+═══════════════════════════════════════════════════════════ -->
+<section class="slide" id="s3">
+  <div class="slide-inner">
+    <div class="section-header">
+      <div class="slide-label">Our Solution</div>
+      <h2 class="slide-title">Multi-language <span class="blue">AI Agents</span> That Work Like Employees</h2>
+      <p class="slide-subtitle">
+        We don't build tools — we deploy agents. Each one is trained on your processes, speaks your customers' language (Arabic, English, French), integrates with your existing systems, and operates autonomously 24/7. From government ministries to hospitality SMEs.
+      </p>
+    </div>
+
+    <div class="grid-4 mt-32">
+      <div class="card" style="text-align:center; padding:28px 16px;">
+        <div class="stat-val">40+</div>
+        <div class="stat-label">Hours saved per week<br>per organization</div>
+      </div>
+      <div class="card" style="text-align:center; padding:28px 16px; border-color:var(--green);">
+        <div class="stat-val" style="color:var(--green);">65%</div>
+        <div class="stat-label">Reduction in<br>operational overhead</div>
+      </div>
+      <div class="card" style="text-align:center; padding:28px 16px;">
+        <div class="stat-val">24/7</div>
+        <div class="stat-label">Continuous operation<br>zero downtime</div>
+      </div>
+      <div class="card" style="text-align:center; padding:28px 16px; border-color:var(--green);">
+        <div class="stat-val" style="color:var(--green);">90%</div>
+        <div class="stat-label">Reduction in manual<br>data entry errors</div>
+      </div>
+    </div>
+
+    <div style="display:flex; gap:12px; margin-top:32px; flex-wrap:wrap; justify-content:center;">
+      <div class="pill">SOC-2 Compliant</div>
+      <div class="pill">Arabic · English · French</div>
+      <div class="pill">Custom Deployment</div>
+      <div class="pill">24/7 Dedicated Support</div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 4 — GLOBAL PRESENCE
+═══════════════════════════════════════════════════════════ -->
+<section class="slide" id="s4">
+  <div class="slide-inner" style="background:var(--bg-warm);">
+    <div class="section-header">
+      <div class="slide-label">Global Presence</div>
+      <h2 class="slide-title">Three Offices Across <span class="blue">Two Continents</span></h2>
+      <p class="slide-subtitle">
+        Headquartered in Colombo, Sri Lanka with regional offices in London and Muscat — positioned to serve Asia, the Middle East, and Europe with local expertise.
+      </p>
+    </div>
+
+    <div class="map-container mt-24">
+      <div class="map-visual">
+        <svg viewBox="0 0 900 440" xmlns="http://www.w3.org/2000/svg">
+          <rect width="900" height="440" fill="transparent"/>
+          <g stroke="#CBD5E1" stroke-width="0.4" opacity="0.5">
+            <line x1="0" y1="73" x2="900" y2="73"/><line x1="0" y1="146" x2="900" y2="146"/>
+            <line x1="0" y1="219" x2="900" y2="219"/><line x1="0" y1="292" x2="900" y2="292"/>
+            <line x1="0" y1="365" x2="900" y2="365"/>
+            <line x1="150" y1="0" x2="150" y2="440"/><line x1="300" y1="0" x2="300" y2="440"/>
+            <line x1="450" y1="0" x2="450" y2="440"/><line x1="600" y1="0" x2="600" y2="440"/>
+            <line x1="750" y1="0" x2="750" y2="440"/>
+          </g>
+          <!-- Landmasses -->
+          <path d="M60 80 L200 60 230 100 220 160 190 200 170 230 150 250 120 280 90 260 60 200 50 150Z" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="0.8"/>
+          <path d="M165 260 L210 250 230 310 220 380 180 420 150 390 145 340 155 300Z" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="0.8"/>
+          <path d="M380 70 L460 65 470 100 455 130 420 140 390 120 370 100Z" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="0.8"/>
+          <path d="M390 145 L460 140 480 200 470 300 430 380 400 370 380 300 370 220 380 170Z" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="0.8"/>
+          <path d="M460 60 L700 55 750 90 740 160 680 200 620 190 570 170 510 150 470 130 455 100Z" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="0.8"/>
+          <path d="M510 150 L570 145 580 195 545 220 510 200Z" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="0.8"/>
+          <path d="M590 170 L640 165 650 230 620 270 590 250 580 210Z" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="0.8"/>
+          <path d="M710 280 L800 265 830 320 800 380 740 375 700 330Z" fill="#E2E8F0" stroke="#CBD5E1" stroke-width="0.8"/>
+          <!-- London -->
+          <circle cx="408" cy="88" r="22" fill="rgba(3,105,161,0.1)" stroke="none"/>
+          <circle cx="408" cy="88" r="7" fill="#0369A1"/>
+          <text x="420" y="82" fill="#0369A1" font-family="Lexend,sans-serif" font-size="11" font-weight="600">London</text>
+          <!-- Muscat -->
+          <circle cx="556" cy="188" r="22" fill="rgba(5,150,105,0.1)" stroke="none"/>
+          <circle cx="556" cy="188" r="7" fill="#059669"/>
+          <text x="568" y="182" fill="#059669" font-family="Lexend,sans-serif" font-size="11" font-weight="600">Muscat</text>
+          <!-- Colombo -->
+          <circle cx="625" cy="248" r="22" fill="rgba(3,105,161,0.1)" stroke="none"/>
+          <circle cx="625" cy="248" r="7" fill="#0369A1"/>
+          <text x="637" y="242" fill="#0369A1" font-family="Lexend,sans-serif" font-size="11" font-weight="600">Colombo</text>
+          <!-- Connection arcs -->
+          <path d="M408 88 Q 480 110 556 188" fill="none" stroke="#0369A1" stroke-width="1.2" stroke-dasharray="6 4" opacity="0.4"/>
+          <path d="M556 188 Q 595 200 625 248" fill="none" stroke="#059669" stroke-width="1.2" stroke-dasharray="6 4" opacity="0.4"/>
+        </svg>
+      </div>
+
+      <div class="map-offices">
+        <div class="office-card">
+          <div class="office-region" style="color:var(--blue);">Asia — Headquarters</div>
+          <div class="office-city">Colombo</div>
+          <div class="office-country">Sri Lanka</div>
+        </div>
+        <div class="office-card">
+          <div class="office-region">Europe</div>
+          <div class="office-city">London</div>
+          <div class="office-country">United Kingdom</div>
+        </div>
+        <div class="office-card">
+          <div class="office-region" style="color:var(--green);">Middle East</div>
+          <div class="office-city">Muscat</div>
+          <div class="office-country">Oman</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 5 — ALL 6 AGENT UNITS (Overview Grid)
+═══════════════════════════════════════════════════════════ -->
+<section class="slide" id="s5">
+  <div class="slide-inner">
+    <div class="section-header">
+      <div class="slide-label">Agent Portfolio</div>
+      <h2 class="slide-title">Six Specialized <span class="blue">Agent Units</span> — All Operational</h2>
+      <p class="slide-subtitle">Each agent is purpose-built for a category of operational work. They integrate with your existing tech stack, learn your processes, and operate autonomously around the clock.</p>
+    </div>
+
+    <div class="grid-3 mt-24">
+      <div class="agent-mini">
+        <div class="agent-mini-header">
+          <div class="agent-mini-num">UNIT 01</div>
+          <div class="agent-mini-status">Active</div>
+        </div>
+        <div class="card-icon blue-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M9 9h6M9 13h4"/></svg></div>
+        <h3>Workflow Agents</h3>
+        <p>Automated email responses, lead nurturing sequences, and end-to-end customer onboarding — zero manual intervention.</p>
+      </div>
+
+      <div class="agent-mini">
+        <div class="agent-mini-header">
+          <div class="agent-mini-num">UNIT 02</div>
+          <div class="agent-mini-status">Active</div>
+        </div>
+        <div class="card-icon green-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6A19.79 19.79 0 012.12 4.18 2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg></div>
+        <h3>Voice Agents</h3>
+        <p>Natural-sounding phone AI that answers calls, books appointments, qualifies leads, and handles customer service — 24/7 in multiple languages.</p>
+      </div>
+
+      <div class="agent-mini">
+        <div class="agent-mini-header">
+          <div class="agent-mini-num">UNIT 03</div>
+          <div class="agent-mini-status">Active</div>
+        </div>
+        <div class="card-icon amber-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div>
+        <h3>Document Processing</h3>
+        <p>AI extraction from invoices, logistics manifests, and HR paperwork. Validates, structures, and routes data directly into your systems.</p>
+      </div>
+
+      <div class="agent-mini">
+        <div class="agent-mini-header">
+          <div class="agent-mini-num">UNIT 04</div>
+          <div class="agent-mini-status">Active</div>
+        </div>
+        <div class="card-icon navy-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10M12 20V4M6 20v-6"/></svg></div>
+        <h3>Business Intelligence</h3>
+        <p>Unify data from every tool into intelligent dashboards. Track sales pipelines, forecast cashflow, and measure marketing ROI — all in real time.</p>
+      </div>
+
+      <div class="agent-mini">
+        <div class="agent-mini-header">
+          <div class="agent-mini-num">UNIT 05</div>
+          <div class="agent-mini-status">Active</div>
+        </div>
+        <div class="card-icon blue-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></div>
+        <h3>Custom Software</h3>
+        <p>Purpose-built applications for your industry — quoting tools, field service systems, and multi-location management platforms.</p>
+      </div>
+
+      <div class="agent-mini">
+        <div class="agent-mini-header">
+          <div class="agent-mini-num">UNIT 06</div>
+          <div class="agent-mini-status">Active</div>
+        </div>
+        <div class="card-icon green-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></div>
+        <h3>AI Micro Apps</h3>
+        <p>Internal-facing apps for your staff — expense submissions, leave approvals, and document processing portals. Simple, fast, powerful.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 6 — DEEP DIVE: WORKFLOW + VOICE
+═══════════════════════════════════════════════════════════ -->
+<section class="slide" id="s6">
+  <div class="slide-inner" style="background:var(--bg-warm);">
+    <div class="section-header">
+      <div class="slide-label">Agent Deep Dive</div>
+      <h2 class="slide-title">Workflow Automation &amp; <span class="blue">Voice AI</span></h2>
+    </div>
+
+    <div class="deep-layout">
+      <div class="deep-card blue-top">
+        <div class="deep-header">
+          <div class="card-icon blue-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M9 9h6M9 13h4"/></svg></div>
+          <div class="deep-header-text">
+            <div class="deep-unit">UNIT 01</div>
+            <h3>AI Workflow Agents</h3>
+          </div>
+        </div>
+        <div class="deep-body">
+          These agents sit inside your operational flow — monitoring inboxes, CRMs, and databases — and take autonomous action on routine tasks. They don't just notify; they <strong>execute</strong>. When a new lead enters your CRM, the agent qualifies it, sends a personalized follow-up, schedules the next touchpoint, and updates your pipeline — all within seconds, not days.
+        </div>
+        <ul class="use-cases">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Email Autoreply System</strong> — Context-aware responses that match tone, answer questions, and escalate when needed</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Lead Generation &amp; Follow-up</strong> — Captures, scores, nurtures, and hands off qualified leads to your sales team</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Customer Onboarding</strong> — End-to-end automation of welcome flows, document collection, and account setup</span></li>
+        </ul>
+        <div class="how-it-works">
+          <div class="how-it-works-title">How It Works</div>
+          <p>Integrates with your CRM (HubSpot, Salesforce, Zoho), email (Gmail, Outlook), and databases via API. Rules and triggers are configured during onboarding. The agent operates autonomously with escalation rules for edge cases that need human judgment.</p>
+        </div>
+      </div>
+
+      <div class="deep-card green-top">
+        <div class="deep-header">
+          <div class="card-icon green-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6A19.79 19.79 0 012.12 4.18 2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg></div>
+          <div class="deep-header-text">
+            <div class="deep-unit">UNIT 02</div>
+            <h3>Voice Agents</h3>
+          </div>
+        </div>
+        <div class="deep-body">
+          These are not IVR menus or "press 1 for sales" bots. Our voice agents hold natural, flowing conversations with callers — understanding intent, answering complex questions from a knowledge base, and taking real actions like creating bookings or looking up orders. They speak in the caller's language with human-like intonation and can handle interruptions gracefully.
+        </div>
+        <ul class="use-cases">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>After-Hours Customer Service</strong> — Never miss a call. Full conversational support while your team is offline</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Appointment Booking &amp; Confirmation</strong> — Checks live availability, books slots, sends confirmations in real-time</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Lead Qualification Calls</strong> — Asks structured questions, scores leads, routes qualified prospects to closers</span></li>
+        </ul>
+        <div class="how-it-works">
+          <div class="how-it-works-title">How It Works</div>
+          <p>Powered by LLMs (Claude, GPT-4) with Twilio telephony. The agent receives calls, uses speech-to-text to understand the caller, generates intelligent responses, and converts them back to natural speech. Integrates with your booking system, CRM, or any API. Supports multilingual conversations (Arabic, English, French, Sinhala, Tamil).</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 7 — DEEP DIVE: DOCUMENT + BI
+═══════════════════════════════════════════════════════════ -->
+<section class="slide" id="s7">
+  <div class="slide-inner">
+    <div class="section-header">
+      <div class="slide-label">Agent Deep Dive</div>
+      <h2 class="slide-title">Document Intelligence &amp; <span class="blue">Business Analytics</span></h2>
+    </div>
+
+    <div class="deep-layout">
+      <div class="deep-card amber-top">
+        <div class="deep-header">
+          <div class="card-icon amber-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div>
+          <div class="deep-header-text">
+            <div class="deep-unit">UNIT 03</div>
+            <h3>Document Processing</h3>
+          </div>
+        </div>
+        <div class="deep-body">
+          Every organization is drowning in documents — invoices, purchase orders, shipping manifests, compliance forms, HR paperwork. Our document agent reads any format (PDF, scanned image, email attachment), extracts structured data with near-perfect accuracy, validates it against your rules, and pushes it into your accounting, ERP, or HR system. What took a human 15 minutes takes the agent 8 seconds.
+        </div>
+        <ul class="use-cases">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Shipping &amp; Logistics</strong> — Bills of lading, customs forms, and freight invoices processed and routed automatically</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>HR Onboarding</strong> — Employment contracts, ID verification, tax forms extracted and filed into your HRIS</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Supplier Invoices to Xero / MYOB</strong> — Line items, tax codes, and totals extracted and posted directly to your accounting software</span></li>
+        </ul>
+        <div class="how-it-works">
+          <div class="how-it-works-title">How It Works</div>
+          <p>Uses OCR and LLM-based extraction to understand document structure regardless of layout. Validation rules catch anomalies (duplicate invoices, mismatched totals). Connects to Xero, MYOB, SAP, or any system via API. Exceptions are flagged for human review rather than silently passing through.</p>
+        </div>
+      </div>
+
+      <div class="deep-card navy-top">
+        <div class="deep-header">
+          <div class="card-icon navy-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10M12 20V4M6 20v-6"/></svg></div>
+          <div class="deep-header-text">
+            <div class="deep-unit">UNIT 04</div>
+            <h3>Business Intelligence</h3>
+          </div>
+        </div>
+        <div class="deep-body">
+          Most businesses have data everywhere — CRM, accounting, marketing tools, spreadsheets — but no unified view. Our BI agent connects all your data sources, builds real-time dashboards, and doesn't just show you <em>what</em> is happening — it tells you <em>why</em>. You get cashflow forecasts, pipeline velocity, and marketing attribution without hiring a data analyst.
+        </div>
+        <ul class="use-cases">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Real-time Sales Pipeline</strong> — See deal progression, conversion rates, and forecasted revenue across all channels</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Cashflow Forecasting</strong> — Predict inflows/outflows with early warning alerts for liquidity risk</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Marketing ROI by Channel</strong> — Attribution modeling that shows which spend drives actual revenue, not just clicks</span></li>
+        </ul>
+        <div class="how-it-works">
+          <div class="how-it-works-title">How It Works</div>
+          <p>Connectors pull data from Salesforce, HubSpot, Xero, Google Analytics, Meta Ads, and more. Data is normalized and modeled in a warehouse. Dashboards update in real-time with drill-down capability. Alerting rules notify stakeholders when KPIs deviate from targets.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 8 — DEEP DIVE: CUSTOM SOFTWARE + MICRO APPS
+═══════════════════════════════════════════════════════════ -->
+<section class="slide" id="s8">
+  <div class="slide-inner" style="background:var(--bg-warm);">
+    <div class="section-header">
+      <div class="slide-label">Agent Deep Dive</div>
+      <h2 class="slide-title">Custom Software &amp; <span class="blue">Team-Facing Applications</span></h2>
+    </div>
+
+    <div class="deep-layout">
+      <div class="deep-card blue-top">
+        <div class="deep-header">
+          <div class="card-icon blue-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></div>
+          <div class="deep-header-text">
+            <div class="deep-unit">UNIT 05</div>
+            <h3>Custom Software</h3>
+          </div>
+        </div>
+        <div class="deep-body">
+          Off-the-shelf software forces you to adapt your business to someone else's workflow. We build the opposite — applications designed from the ground up for your specific industry, processes, and team structure. Whether it's a quoting tool that understands your pricing logic or a field service app that manages your technicians' schedules, every feature exists because your business needs it.
+        </div>
+        <ul class="use-cases">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Industry-Specific Quoting</strong> — Configure complex pricing rules, material costs, and margins with auto-generated proposals</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Field Service Management</strong> — Dispatch, track, and manage mobile technicians with GPS, job status, and client sign-off</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Multi-Location Platform</strong> — Centralize operations across branches with role-based access and consolidated reporting</span></li>
+        </ul>
+        <div class="how-it-works">
+          <div class="how-it-works-title">How It Works</div>
+          <p>We scope, design, and build web and mobile applications using modern stacks (React, Next.js, Python). The software integrates with your existing ecosystem via APIs. We handle hosting, maintenance, and iterative improvements based on real usage data post-launch.</p>
+        </div>
+      </div>
+
+      <div class="deep-card green-top">
+        <div class="deep-header">
+          <div class="card-icon green-bg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></div>
+          <div class="deep-header-text">
+            <div class="deep-unit">UNIT 06</div>
+            <h3>AI Micro Apps</h3>
+          </div>
+        </div>
+        <div class="deep-body">
+          Not every problem needs a full software platform. Micro apps are lightweight, focused interfaces that solve one specific operational pain point for your staff. An employee submits an expense with a photo of the receipt — the AI extracts the data, categorizes it, and routes it for approval. A manager approves leave requests from a single dashboard. These are fast to build, fast to deploy, and immediately impactful.
+        </div>
+        <ul class="use-cases">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Expense Submission App</strong> — Photograph receipt, AI extracts fields, auto-categorizes, routes to approver in seconds</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Leave Request Dashboard</strong> — Staff submit requests, managers approve/decline, balances update in real-time</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> <span><strong>Document Processing Portal</strong> — Upload any document, AI classifies and extracts, routes to correct department</span></li>
+        </ul>
+        <div class="how-it-works">
+          <div class="how-it-works-title">How It Works</div>
+          <p>Each micro app is a standalone web application accessible from any device. AI handles the data extraction and classification layer. Approval workflows and notifications are built in. Typically deployed within 2–4 weeks from kickoff, with ongoing refinement based on your team's feedback.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 9 — ENGAGEMENT PROCESS
+═══════════════════════════════════════════════════════════ -->
+<section class="slide" id="s9">
+  <div class="slide-inner">
+    <div class="section-header">
+      <div class="slide-label">Engagement Process</div>
+      <h2 class="slide-title">From Discovery to <span class="blue">Continuous Improvement</span></h2>
+      <p class="slide-subtitle">A structured, zero-friction deployment methodology. Every engagement follows the same systematic path — designed for clarity, speed, and measurable ROI.</p>
+    </div>
+
+    <div class="process-row mt-40">
+      <div class="process-step">
+        <div class="step-circle">1</div>
+        <div class="step-name">Discovery &amp; Mapping</div>
+        <div class="step-text">In-depth audit of your operations to identify high-impact automation opportunities</div>
+      </div>
+      <div class="process-step">
+        <div class="step-circle" style="border-color:var(--navy-light);color:var(--navy-light);">2</div>
+        <div class="step-name">Workflow Design</div>
+        <div class="step-text">Bespoke agent architecture tailored to your exact processes and tools</div>
+      </div>
+      <div class="process-step">
+        <div class="step-circle">3</div>
+        <div class="step-name">Integration &amp; Testing</div>
+        <div class="step-text">Seamless connection to existing systems with rigorous QA before go-live</div>
+      </div>
+      <div class="process-step">
+        <div class="step-circle" style="border-color:var(--navy-light);color:var(--navy-light);">4</div>
+        <div class="step-name">Deploy &amp; Train</div>
+        <div class="step-text">Live deployment with hands-on team training — impact from day one</div>
+      </div>
+      <div class="process-step">
+        <div class="step-circle" style="border-color:var(--green);color:var(--green);">5</div>
+        <div class="step-name">Monitor &amp; Optimize</div>
+        <div class="step-text">Continuous refinement, monthly enhancements, and dedicated remote support</div>
+      </div>
+    </div>
+
+    <div style="margin-top:40px; background:var(--blue-pale); border:1px solid var(--accent-border); border-radius:var(--radius); padding:20px 28px; display:flex; align-items:center; gap:16px; max-width:1080px; width:100%;">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--blue)" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+      <div>
+        <div style="font-family:var(--heading); font-size:14px; font-weight:600; color:var(--navy); margin-bottom:2px;">Ongoing Evolution Included</div>
+        <div style="font-size:13px; color:var(--text-secondary); line-height:1.5;">Every engagement includes monthly workflow updates, new automation capabilities, and proactive optimization — your agents get smarter over time, not stale.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════
+     SLIDE 10 — CALL TO ACTION
+═══════════════════════════════════════════════════════════ -->
+<section class="slide" id="s10">
+  <div class="slide-inner">
+    <div class="dot-grid tl"></div>
+    <div class="dot-grid br"></div>
+
+    <div class="cta-content">
+      <div class="slide-label" style="color:var(--blue-light);">Next Steps</div>
+
+      <h2 class="cta-h2">
+        Ready to Deploy Your<br><span>AI Workforce?</span>
+      </h2>
+
+      <p class="cta-sub">
+        Stop losing time and revenue to manual processes. Book a free 30-minute discovery call and we'll map out exactly which agents can transform your operations.
+      </p>
+
+      <button class="cta-button" onclick="window.open('https://taskforceai.tech','_blank')">
+        Book Free Discovery Call
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+      </button>
+
+      <p class="cta-note">No commitment required &middot; 30-minute strategy session</p>
+
+      <div class="cta-trust">
+        <div class="cta-trust-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          SOC-2 Compliant
+        </div>
+        <div class="cta-trust-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6M9 12h6M9 15h4"/></svg>
+          Custom Deployment
+        </div>
+        <div class="cta-trust-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          24/7 Support
+        </div>
+      </div>
+
+      <div class="cta-locations">
+        <div class="cta-loc">
+          <div class="cta-loc-city">Colombo</div>
+          <div class="cta-loc-country">Sri Lanka — HQ</div>
+        </div>
+        <div class="cta-sep"></div>
+        <div class="cta-loc">
+          <div class="cta-loc-city">London</div>
+          <div class="cta-loc-country">United Kingdom</div>
+        </div>
+        <div class="cta-sep"></div>
+        <div class="cta-loc">
+          <div class="cta-loc-city">Muscat</div>
+          <div class="cta-loc-country">Oman</div>
+        </div>
+      </div>
+
+      <p style="margin-top:32px; font-family:var(--heading); font-size:13px; color:rgba(255,255,255,0.3); letter-spacing:0.06em;">taskforceai.tech</p>
+    </div>
+  </div>
+</section>
+</div>
+
+<!-- Bottom nav -->
+<nav id="nav">
+  <button class="nav-btn" id="bp" aria-label="Previous slide" disabled>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+  </button>
+  <div class="progress-track"><div class="progress-fill" id="pf" style="width:10%"></div></div>
+  <button class="nav-btn" id="bn" aria-label="Next slide">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+  </button>
+</nav>
+
+<script>
+const T = 10;
+let c = 0, busy = false;
+const ss = [...document.querySelectorAll('.slide')];
+const bp = document.getElementById('bp');
+const bn = document.getElementById('bn');
+const pf = document.getElementById('pf');
+const cn = document.getElementById('cur');
+
+function up() {
+  cn.textContent = c + 1;
+  bp.disabled = c === 0;
+  bn.disabled = c === T - 1;
+  pf.style.width = ((c + 1) / T * 100) + '%';
+}
+
+function go(n) {
+  if (busy || n === c || n < 0 || n >= T) return;
+  busy = true;
+  ss[c].classList.remove('active');
+  ss[n].classList.add('active');
+  c = n;
+  up();
+  setTimeout(() => busy = false, 470);
+}
+
+bp.addEventListener('click', () => go(c - 1));
+bn.addEventListener('click', () => go(c + 1));
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') { e.preventDefault(); go(c + 1); }
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); go(c - 1); }
+});
+
+up();
+</script>
+</body>
+</html>

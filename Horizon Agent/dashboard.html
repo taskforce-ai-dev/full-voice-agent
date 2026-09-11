@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hatton Hills — Call Analytics</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,400;0,500;0,600;0,700;0,800&display=swap" rel="stylesheet">
+    <style>
+        * { box-sizing: border-box; }
+        body { background: #F1F4F8; font-family: 'Inter', system-ui, sans-serif; margin: 0; }
+
+        /* Sidebar */
+        .sidebar { width: 220px; background: #0F1C2E; min-height: 100vh; position: fixed; top: 0; left: 0; z-index: 50; display: flex; flex-direction: column; }
+        .main { margin-left: 220px; min-height: 100vh; }
+
+        /* Cards */
+        .card { background: #fff; border: 1px solid #E2E8F0; border-radius: 8px; }
+
+        /* KPI top border colors */
+        .kpi-blue   { border-top: 3px solid #1E40AF; }
+        .kpi-emerald{ border-top: 3px solid #059669; }
+        .kpi-amber  { border-top: 3px solid #D97706; }
+        .kpi-slate  { border-top: 3px solid #475569; }
+
+        /* Table rows */
+        tbody tr:hover { background: #F8FAFF; }
+        .row-details { max-height: 0; overflow: hidden; transition: max-height 0.25s ease; }
+        .row-details.open { max-height: 160px; }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-track { background: #F1F4F8; }
+        ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 4px; }
+
+        /* Nav items */
+        .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 16px; font-size: 13px; font-weight: 500; color: #94A3B8; border-radius: 6px; margin: 1px 8px; cursor: pointer; transition: background 0.15s, color 0.15s; text-decoration: none; }
+        .nav-item:hover { background: rgba(255,255,255,0.07); color: #E2E8F0; }
+        .nav-item.active { background: #1E40AF; color: #fff; }
+
+        /* Badge */
+        .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; }
+
+        /* Date range buttons */
+        .dr-btn { padding: 5px 12px; font-size: 12px; font-weight: 600; border: 1px solid #E2E8F0; background: #fff; color: #64748B; cursor: pointer; transition: all 0.15s; }
+        .dr-btn:first-child { border-radius: 6px 0 0 6px; }
+        .dr-btn:last-child  { border-radius: 0 6px 6px 0; }
+        .dr-btn + .dr-btn   { border-left: none; }
+        .dr-btn.active { background: #1E40AF; border-color: #1E40AF; color: #fff; }
+        .dr-btn:hover:not(.active) { background: #F8FAFC; color: #1E40AF; }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .sidebar { display: none; }
+            .main { margin-left: 0; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .row-details { transition: none; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- ============================================================
+     CONFIG — paste published Google Sheet CSV URL below
+     Sheet ID: 17aUyUY2SWwf7SwiWPhK1S7SJbdyP3VBswqCOnBsmOtQ
+     ============================================================ -->
+
+<!-- ========== SIDEBAR ========== -->
+<aside class="sidebar">
+    <div class="px-5 py-5 border-b border-white/10">
+        <div class="flex items-center gap-2.5">
+            <img src="logo.webp" alt="Hatton Hills" style="width:48px;height:48px;object-fit:contain;border-radius:6px;flex-shrink:0;background:#c8bfb0;">
+            <div>
+                <div style="font-size:13px;font-weight:700;color:#F1F5F9;line-height:1.2">Hatton Hills</div>
+                <div style="font-size:10px;color:#64748B;font-weight:500;letter-spacing:0.04em">ANALYTICS</div>
+            </div>
+        </div>
+    </div>
+
+    <nav class="flex-1 py-4">
+        <div style="font-size:10px;color:#475569;font-weight:700;letter-spacing:0.08em;padding:8px 24px 4px">REPORTS</div>
+        <a class="nav-item active" href="#">
+            <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+            Call Analytics
+        </a>
+        <a class="nav-item" href="#">
+            <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+            Bookings
+        </a>
+        <a class="nav-item" href="#">
+            <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
+            Guests
+        </a>
+
+        <div style="font-size:10px;color:#475569;font-weight:700;letter-spacing:0.08em;padding:16px 24px 4px">SYSTEM</div>
+        <a class="nav-item" href="#">
+            <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><circle cx="12" cy="12" r="3"/></svg>
+            Settings
+        </a>
+    </nav>
+
+    <div class="px-4 py-4 border-t border-white/10">
+        <div style="font-size:10px;color:#475569;font-weight:500">Tanya Voice Agent</div>
+        <div style="font-size:10px;color:#1E40AF;font-weight:600;margin-top:2px" id="sidebarStatus">● Live</div>
+    </div>
+</aside>
+
+<!-- ========== MAIN CONTENT ========== -->
+<main class="main">
+    <!-- Top bar -->
+    <div style="background:#fff;border-bottom:1px solid #E2E8F0;padding:12px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px;position:sticky;top:0;z-index:40">
+        <div>
+            <h1 style="font-size:15px;font-weight:700;color:#0F172A;margin:0">Call Analytics</h1>
+            <p style="font-size:12px;color:#94A3B8;margin:0;font-weight:500" id="lastUpdated">Loading…</p>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <div style="display:flex" id="dateRangeGroup">
+                <button class="dr-btn" data-range="today" onclick="setDateRange('today')">Today</button>
+                <button class="dr-btn" data-range="7d" onclick="setDateRange('7d')">7 Days</button>
+                <button class="dr-btn active" data-range="30d" onclick="setDateRange('30d')">30 Days</button>
+                <button class="dr-btn" data-range="all" onclick="setDateRange('all')">All Time</button>
+            </div>
+            <button onclick="refreshData()" title="Refresh" style="padding:6px 10px;background:#fff;border:1px solid #E2E8F0;border-radius:6px;cursor:pointer;color:#64748B;display:flex;align-items:center;transition:background 0.15s" onmouseover="this.style.background='#F8FAFC'" onmouseout="this.style.background='#fff'">
+                <svg id="refreshIcon" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <div style="padding:20px 24px;max-width:1400px">
+
+        <!-- KPI CARDS -->
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px">
+            <!-- Total Calls -->
+            <div class="card kpi-blue" style="padding:18px 20px">
+                <div style="font-size:11px;font-weight:700;color:#94A3B8;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:10px">Total Calls</div>
+                <div style="font-size:30px;font-weight:800;color:#0F172A;line-height:1" id="kpiTotalCalls">—</div>
+                <div style="font-size:11px;color:#94A3B8;margin-top:6px;font-weight:500" id="kpiTotalTrend">—</div>
+            </div>
+            <!-- Booking Interest -->
+            <div class="card kpi-emerald" style="padding:18px 20px">
+                <div style="font-size:11px;font-weight:700;color:#94A3B8;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:10px">Booking Interest</div>
+                <div style="font-size:30px;font-weight:800;color:#0F172A;line-height:1" id="kpiBookingRate">—</div>
+                <div style="font-size:11px;color:#94A3B8;margin-top:6px;font-weight:500" id="kpiBookingSub">—</div>
+            </div>
+            <!-- Follow-Ups -->
+            <div class="card kpi-amber" style="padding:18px 20px">
+                <div style="font-size:11px;font-weight:700;color:#94A3B8;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:10px">Follow-Ups Pending</div>
+                <div style="font-size:30px;font-weight:800;color:#0F172A;line-height:1" id="kpiFollowUps">—</div>
+                <div style="font-size:11px;color:#94A3B8;margin-top:6px;font-weight:500" id="kpiFollowSub">—</div>
+            </div>
+            <!-- Avg Calls/Day -->
+            <div class="card kpi-slate" style="padding:18px 20px">
+                <div style="font-size:11px;font-weight:700;color:#94A3B8;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:10px">Avg Calls / Day</div>
+                <div style="font-size:30px;font-weight:800;color:#0F172A;line-height:1" id="kpiAvgCalls">—</div>
+                <div style="font-size:11px;color:#94A3B8;margin-top:6px;font-weight:500" id="kpiAvgSub">—</div>
+            </div>
+        </div>
+
+        <!-- CHARTS ROW 1 -->
+        <div style="display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:14px">
+            <div class="card" style="padding:18px 20px">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+                    <div style="font-size:13px;font-weight:700;color:#0F172A">Calls Over Time</div>
+                    <span style="font-size:10px;font-weight:700;color:#1E40AF;letter-spacing:0.05em;background:#EFF6FF;padding:2px 8px;border-radius:4px">DAILY</span>
+                </div>
+                <div style="height:220px;position:relative"><canvas id="chartCallsOverTime"></canvas></div>
+            </div>
+            <div class="card" style="padding:18px 20px">
+                <div style="font-size:13px;font-weight:700;color:#0F172A;margin-bottom:14px">Call Outcomes</div>
+                <div style="height:220px;position:relative;display:flex;align-items:center;justify-content:center"><canvas id="chartOutcomes"></canvas></div>
+            </div>
+        </div>
+
+        <!-- CHARTS ROW 2 -->
+        <div style="display:grid;grid-template-columns:1fr 2fr;gap:14px;margin-bottom:16px">
+            <div class="card" style="padding:18px 20px">
+                <div style="font-size:13px;font-weight:700;color:#0F172A;margin-bottom:14px">Language Split</div>
+                <div style="height:200px;position:relative;display:flex;align-items:center;justify-content:center"><canvas id="chartLanguage"></canvas></div>
+            </div>
+            <div class="card" style="padding:18px 20px">
+                <div style="font-size:13px;font-weight:700;color:#0F172A;margin-bottom:14px">Room Preferences</div>
+                <div style="height:200px;position:relative"><canvas id="chartRooms"></canvas></div>
+            </div>
+        </div>
+
+        <!-- CALLS TABLE -->
+        <div class="card" style="overflow:hidden">
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid #E2E8F0;gap:12px">
+                <div style="font-size:13px;font-weight:700;color:#0F172A">Call Log</div>
+                <input id="tableSearch" type="text" placeholder="Search calls..."
+                    style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:6px 12px;font-size:12px;color:#334155;font-family:inherit;width:220px;outline:none;transition:border 0.15s"
+                    onfocus="this.style.borderColor='#1E40AF'" onblur="this.style.borderColor='#E2E8F0'">
+            </div>
+            <div style="overflow-x:auto">
+                <table style="width:100%;border-collapse:collapse;font-size:12px">
+                    <thead>
+                        <tr style="background:#F8FAFC;border-bottom:1px solid #E2E8F0">
+                            <th style="text-align:left;padding:10px 20px;font-size:10px;font-weight:700;color:#94A3B8;letter-spacing:0.07em;cursor:pointer;white-space:nowrap" onclick="sortTable('timestamp')">DATE <span class="sort-arrow" data-col="timestamp">▼</span></th>
+                            <th style="text-align:left;padding:10px 12px;font-size:10px;font-weight:700;color:#94A3B8;letter-spacing:0.07em;cursor:pointer" onclick="sortTable('language')">LANG <span class="sort-arrow" data-col="language"></span></th>
+                            <th style="text-align:left;padding:10px 12px;font-size:10px;font-weight:700;color:#94A3B8;letter-spacing:0.07em;cursor:pointer" onclick="sortTable('guest_name')">GUEST <span class="sort-arrow" data-col="guest_name"></span></th>
+                            <th style="text-align:left;padding:10px 12px;font-size:10px;font-weight:700;color:#94A3B8;letter-spacing:0.07em;cursor:pointer" onclick="sortTable('call_outcome')">OUTCOME <span class="sort-arrow" data-col="call_outcome"></span></th>
+                            <th style="text-align:left;padding:10px 12px;font-size:10px;font-weight:700;color:#94A3B8;letter-spacing:0.07em">ROOM</th>
+                            <th style="text-align:left;padding:10px 12px;font-size:10px;font-weight:700;color:#94A3B8;letter-spacing:0.07em">FOLLOW-UP</th>
+                            <th style="text-align:left;padding:10px 12px;font-size:10px;font-weight:700;color:#94A3B8;letter-spacing:0.07em">SUMMARY</th>
+                        </tr>
+                    </thead>
+                    <tbody id="callsTableBody"></tbody>
+                </table>
+            </div>
+            <div style="padding:10px 20px;border-top:1px solid #E2E8F0;display:flex;justify-content:space-between;align-items:center">
+                <span style="font-size:11px;color:#94A3B8;font-weight:500" id="tableCount"></span>
+            </div>
+        </div>
+
+    </div>
+</main>
+
+<script>
+// ====================================================================
+// CONFIG
+// ====================================================================
+// Uses JSONP (script tag) — works when opening dashboard.html directly from file://.
+// Sheet must be shared as "Anyone with the link can view".
+const SHEET_ID = '17aUyUY2SWwf7SwiWPhK1S7SJbdyP3VBswqCOnBsmOtQ';
+
+const SAMPLE_DATA = [
+    { timestamp: "2026-04-08 09:15", language: "English", guest_name: "Sarah Mitchell", check_in: "2026-04-20", check_out: "2026-04-22", room_preference: "Eco Harmony", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Guest booked Eco Harmony for 2 nights (Apr 20-22). Confirmed with advance payment." },
+    { timestamp: "2026-04-08 10:30", language: "Sinhala", guest_name: "Nuwan Perera", check_in: "2026-04-25", check_out: "2026-04-27", room_preference: "Mount Monarch", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Family inquired about Mount Monarch. Interested but wants to confirm with spouse." },
+    { timestamp: "2026-04-07 14:20", language: "English", guest_name: "James Cooper", check_in: "2026-05-10", check_out: "2026-05-13", room_preference: "Forest Escape Suite", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "UK tourist booked Forest Escape Suite for 3 nights. Asked about birding tours." },
+    { timestamp: "2026-04-07 11:05", language: "Tamil", guest_name: null, room_preference: null, call_outcome: "general_inquiry", follow_up_needed: "No", summary: "Caller asked about room rates and meal plans." },
+    { timestamp: "2026-04-07 16:45", language: "English", guest_name: "Emma Watson", check_in: "2026-04-15", room_preference: "Sunrise Vista", call_outcome: "no_availability", follow_up_needed: "Yes", summary: "Australian family wanted Sunrise Vista for Easter. Fully booked." },
+    { timestamp: "2026-04-06 09:30", language: "Sinhala", guest_name: "Dinesh Fernando", room_preference: "Eco Harmony", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Local couple booked Eco Harmony for 1 night." },
+    { timestamp: "2026-04-06 13:15", language: "English", guest_name: "Priya Sharma", room_preference: "Mount Luxe", call_outcome: "callback_requested", follow_up_needed: "Yes", summary: "Group of 6 planning May Day trip. Will call back." },
+    { timestamp: "2026-04-06 15:40", language: "Tamil", guest_name: "Karthik Rajan", room_preference: "Mount Monarch", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Family asked about Mount Monarch. Interested in Junior Naturalists program." },
+    { timestamp: "2026-04-05 10:00", language: "English", guest_name: "Michael Brown", check_in: "2026-06-15", room_preference: "Forest Escape Suite", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "American couple booked 5-night stay. Interested in Jeep Safari." },
+    { timestamp: "2026-04-05 12:30", language: "Sinhala", guest_name: null, room_preference: null, call_outcome: "dropped", follow_up_needed: "Yes", summary: "Call dropped after initial greeting." },
+    { timestamp: "2026-04-04 08:45", language: "English", guest_name: "Anoma Wijesekara", room_preference: "Sunrise Vista", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Anniversary couple booked Sunrise Vista Premium Suite." },
+    { timestamp: "2026-04-04 11:20", language: "English", guest_name: "Ravi Kumar", room_preference: "Mount Luxe", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Group inquiry for Mount Luxe Chalet. Will confirm." },
+    { timestamp: "2026-04-03 09:00", language: "Tamil", guest_name: "Lakshmi Devi", room_preference: "Eco Harmony", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Tamil family booked Eco Harmony Suite. Child under 5 stays free." },
+    { timestamp: "2026-04-03 14:50", language: "English", guest_name: "Oliver Smith", room_preference: null, call_outcome: "general_inquiry", follow_up_needed: "No", summary: "UK caller asked about cancellation policy and birdwatching." },
+    { timestamp: "2026-04-02 10:15", language: "Sinhala", guest_name: "Chaminda Bandara", room_preference: "Mount Monarch", call_outcome: "no_availability", follow_up_needed: "Yes", summary: "Group wanted Mount Monarch for Sinhala New Year. Fully booked." },
+    { timestamp: "2026-04-02 16:00", language: "English", guest_name: "Sophie Clark", check_in: "2026-07-01", room_preference: "Sunrise Vista", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Australian couple booked Sunrise Vista for July." },
+    { timestamp: "2026-04-01 09:45", language: "English", guest_name: "Arjun Jayawardena", room_preference: "Mount Luxe", call_outcome: "booking_inquiry", follow_up_needed: "Yes", summary: "Family planning April holiday. Asking about child rates." },
+    { timestamp: "2026-04-01 13:30", language: "Tamil", guest_name: null, room_preference: null, call_outcome: "general_inquiry", follow_up_needed: "No", summary: "Caller asked about directions from Colombo." },
+    { timestamp: "2026-03-31 11:00", language: "Sinhala", guest_name: "Samantha Wijeratne", room_preference: "Forest Escape Suite", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "Couple booked Forest Escape Suite for Sinhala New Year." },
+    { timestamp: "2026-03-30 15:20", language: "English", guest_name: "David Chen", check_in: "2026-05-20", room_preference: "Mount Monarch", call_outcome: "booking_confirmed", follow_up_needed: "No", summary: "US couple booked Mount Monarch (5 nights) for honeymoon." }
+];
+
+// ====================================================================
+// STATE
+// ====================================================================
+let allData = [], filteredData = [];
+let currentRange = '30d';
+let sortCol = 'timestamp', sortAsc = false;
+let charts = {};
+
+// ====================================================================
+// INIT
+// ====================================================================
+document.addEventListener('DOMContentLoaded', () => {
+    loadData();
+    document.getElementById('tableSearch').addEventListener('input', debounce(renderTable, 200));
+});
+
+// JSONP loader — injects a <script> tag so it works from file:// (no CORS issues)
+function loadViaJSONP(sheetId) {
+    return new Promise((resolve, reject) => {
+        const cbName = '__gviz_cb_' + Date.now();
+        const script = document.createElement('script');
+        const timeout = setTimeout(() => {
+            delete window[cbName];
+            document.head.removeChild(script);
+            reject(new Error('JSONP timeout'));
+        }, 10000);
+
+        window[cbName] = function(data) {
+            clearTimeout(timeout);
+            delete window[cbName];
+            document.head.removeChild(script);
+            try { resolve(parseGvizTable(data)); }
+            catch(e) { reject(e); }
+        };
+
+        script.src = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json;responseHandler:${cbName}`;
+        script.onerror = () => { clearTimeout(timeout); reject(new Error('Script load error')); };
+        document.head.appendChild(script);
+    });
+}
+
+// Parse the gviz JSON table into our row format
+function parseGvizTable(data) {
+    const cols = data.table.cols.map(c => normalizeKey(c.label));
+    return data.table.rows
+        .map(row => {
+            const obj = {};
+            cols.forEach((key, i) => {
+                const cell = row.c ? row.c[i] : null;
+                if (!cell || cell.v === null || cell.v === undefined) {
+                    obj[key] = null;
+                } else {
+                    const v = String(cell.v);
+                    // gviz encodes dates as "Date(year,month0,day,h,m,s)"
+                    const dm = v.match(/^Date\((\d+),(\d+),(\d+)(?:,(\d+),(\d+),(\d+))?\)$/);
+                    if (dm) {
+                        const d = new Date(+dm[1], +dm[2], +dm[3], +(dm[4]||0), +(dm[5]||0), +(dm[6]||0));
+                        obj[key] = d.getFullYear() + '-'
+                            + String(d.getMonth()+1).padStart(2,'0') + '-'
+                            + String(d.getDate()).padStart(2,'0') + ' '
+                            + String(d.getHours()).padStart(2,'0') + ':'
+                            + String(d.getMinutes()).padStart(2,'0');
+                    } else {
+                        obj[key] = v;
+                    }
+                }
+            });
+            return obj;
+        })
+        .filter(r => r.timestamp);
+}
+
+function normalizeKey(label) {
+    return label.trim().toLowerCase()
+        .replace(/date\/time/i, 'timestamp')
+        .replace(/call sid/i, 'call_sid')
+        .replace(/caller phone/i, 'caller_phone')
+        .replace(/guest name/i, 'guest_name')
+        .replace(/^guests$/i, 'num_guests')
+        .replace(/check[\s-]?in/i, 'check_in')
+        .replace(/check[\s-]?out/i, 'check_out')
+        .replace(/room preference/i, 'room_preference')
+        .replace(/^availability$/i, 'availability_result')
+        .replace(/^outcome$/i, 'call_outcome')
+        .replace(/follow[\s-]?up[\s-]?needed/i, 'follow_up_needed')
+        .replace(/\s+/g, '_');
+}
+
+async function loadData() {
+    try {
+        allData = await loadViaJSONP(SHEET_ID);
+        if (!allData.length) throw new Error('Empty response');
+    } catch (e) {
+        console.warn('⚠️ Sheet load failed — using sample data:', e.message);
+        allData = SAMPLE_DATA;
+    }
+    const now = new Date();
+    document.getElementById('lastUpdated').textContent =
+        'Updated ' + now.toLocaleDateString('en-US',{month:'short',day:'numeric'}) + ' at ' +
+        now.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+    applyFilters();
+}
+
+function refreshData() {
+    const icon = document.getElementById('refreshIcon');
+    icon.style.animation = 'spin 0.6s linear';
+    loadData().then(() => { icon.style.animation = ''; });
+}
+
+// ====================================================================
+// CSV PARSER
+// ====================================================================
+function parseCSV(csv) {
+    const lines = csv.trim().split('\n');
+    if (lines.length < 2) return [];
+    const headers = parseCSVLine(lines[0]);
+    return lines.slice(1).map(line => {
+        const vals = parseCSVLine(line);
+        const row = {};
+        headers.forEach((h, i) => {
+            const key = h.trim().toLowerCase()
+                .replace(/date\/time/i,'timestamp').replace(/call sid/i,'call_sid')
+                .replace(/caller phone/i,'caller_phone').replace(/guest name/i,'guest_name')
+                .replace(/num guests|guests/i,'num_guests').replace(/check.?in/i,'check_in')
+                .replace(/check.?out/i,'check_out').replace(/room preference|room/i,'room_preference')
+                .replace(/availability.*result|availability/i,'availability_result')
+                .replace(/call outcome|outcome/i,'call_outcome')
+                .replace(/follow.?up.*needed|follow.?up/i,'follow_up_needed')
+                .replace(/\s+/g,'_');
+            row[key] = vals[i] && vals[i] !== '' ? vals[i] : null;
+        });
+        return row;
+    }).filter(r => r.timestamp);
+}
+
+function parseCSVLine(line) {
+    const res = []; let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        if (inQ) { if(c==='"'&&line[i+1]==='"'){cur+='"';i++;} else if(c==='"'){inQ=false;} else cur+=c; }
+        else { if(c==='"'){inQ=true;} else if(c===','){res.push(cur.trim());cur='';} else cur+=c; }
+    }
+    res.push(cur.trim()); return res;
+}
+
+// ====================================================================
+// FILTERS
+// ====================================================================
+function setDateRange(range) {
+    currentRange = range;
+    document.querySelectorAll('.dr-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.range === range);
+    });
+    applyFilters();
+}
+
+function applyFilters() {
+    const now = new Date();
+    let cutoff = null;
+    if (currentRange === 'today') cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    else if (currentRange === '7d')  cutoff = new Date(now.getTime() - 7*86400000);
+    else if (currentRange === '30d') cutoff = new Date(now.getTime() - 30*86400000);
+    filteredData = cutoff ? allData.filter(d => new Date(d.timestamp) >= cutoff) : [...allData];
+    updateKPIs(); updateCharts(); renderTable();
+}
+
+// ====================================================================
+// KPIs
+// ====================================================================
+function updateKPIs() {
+    const total = filteredData.length;
+    document.getElementById('kpiTotalCalls').textContent = total;
+    document.getElementById('kpiTotalTrend').textContent = total > 0
+        ? currentRange === 'all' ? 'All time' : 'In selected period'
+        : 'No data';
+
+    const confirmed = filteredData.filter(d => d.call_outcome === 'booking_confirmed').length;
+    const inquiry   = filteredData.filter(d => d.call_outcome === 'booking_inquiry').length;
+    const rate = total > 0 ? Math.round(((confirmed + inquiry) / total) * 100) : 0;
+    document.getElementById('kpiBookingRate').textContent = rate + '%';
+    document.getElementById('kpiBookingSub').textContent = confirmed + ' confirmed · ' + inquiry + ' inquiries';
+
+    const fu = filteredData.filter(d => d.follow_up_needed === 'Yes').length;
+    document.getElementById('kpiFollowUps').textContent = fu;
+    document.getElementById('kpiFollowSub').textContent = fu > 0 ? 'Require action' : 'None outstanding';
+
+    if (total > 0) {
+        const days = new Set(filteredData.map(d => d.timestamp.split(' ')[0])).size;
+        document.getElementById('kpiAvgCalls').textContent = (total / Math.max(days,1)).toFixed(1);
+        document.getElementById('kpiAvgSub').textContent = 'across ' + days + ' day' + (days!==1?'s':'');
+    } else {
+        document.getElementById('kpiAvgCalls').textContent = '0';
+        document.getElementById('kpiAvgSub').textContent = '—';
+    }
+}
+
+// ====================================================================
+// CHARTS
+// ====================================================================
+Chart.defaults.color = '#94A3B8';
+Chart.defaults.font.family = "'Inter', system-ui, sans-serif";
+Chart.defaults.font.size = 11;
+
+const OUTCOME_CFG = {
+    booking_confirmed:  { color: '#059669', label: 'Confirmed' },
+    booking_inquiry:    { color: '#1E40AF', label: 'Inquiry' },
+    general_inquiry:    { color: '#0284C7', label: 'General' },
+    callback_requested: { color: '#7C3AED', label: 'Callback' },
+    no_availability:    { color: '#D97706', label: 'No Avail.' },
+    dropped:            { color: '#DC2626', label: 'Dropped' },
+    other:              { color: '#94A3B8', label: 'Other' },
+};
+const LANG_CFG = { English: '#1E40AF', Sinhala: '#059669', Tamil: '#D97706' };
+const ROOM_COLORS = ['#1E40AF','#059669','#D97706','#7C3AED','#0284C7'];
+
+function destroyChart(k) { if (charts[k]) { charts[k].destroy(); delete charts[k]; } }
+
+function updateCharts() {
+    renderLineChart(); renderOutcomesChart(); renderLangChart(); renderRoomChart();
+}
+
+function renderLineChart() {
+    const byDate = {};
+    filteredData.forEach(d => { const dt = d.timestamp.split(' ')[0]; byDate[dt]=(byDate[dt]||0)+1; });
+    const sorted = Object.keys(byDate).sort();
+    const labels = sorted.map(d => new Date(d).toLocaleDateString('en-US',{month:'short',day:'numeric'}));
+    const values = sorted.map(d => byDate[d]);
+
+    destroyChart('line');
+    const ctx = document.getElementById('chartCallsOverTime').getContext('2d');
+    const grad = ctx.createLinearGradient(0,0,0,220);
+    grad.addColorStop(0,'rgba(30,64,175,0.12)');
+    grad.addColorStop(1,'rgba(30,64,175,0)');
+
+    charts.line = new Chart(ctx, {
+        type: 'line',
+        data: { labels, datasets: [{ data: values, borderColor:'#1E40AF', backgroundColor:grad, fill:true, tension:0.35, pointRadius:3, pointHoverRadius:5, pointBackgroundColor:'#1E40AF', pointBorderColor:'#fff', pointBorderWidth:1.5, borderWidth:2 }] },
+        options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+            scales:{
+                x:{grid:{display:false},ticks:{maxTicksLimit:8}},
+                y:{beginAtZero:true,ticks:{stepSize:1,precision:0},grid:{color:'#F1F5F9'}}
+            },
+            interaction:{intersect:false,mode:'index'} }
+    });
+}
+
+function renderOutcomesChart() {
+    const counts = {};
+    filteredData.forEach(d => { const k=d.call_outcome||'other'; counts[k]=(counts[k]||0)+1; });
+    const keys = Object.keys(counts);
+    destroyChart('outcomes');
+    charts.outcomes = new Chart(document.getElementById('chartOutcomes'), {
+        type: 'doughnut',
+        data: { labels: keys.map(k=>(OUTCOME_CFG[k]||{label:k}).label),
+            datasets:[{ data:keys.map(k=>counts[k]), backgroundColor:keys.map(k=>(OUTCOME_CFG[k]||{color:'#94A3B8'}).color), borderColor:'#fff', borderWidth:2.5, hoverOffset:4 }] },
+        options: { responsive:true, maintainAspectRatio:false, cutout:'62%',
+            plugins:{ legend:{ position:'bottom', labels:{ boxWidth:9, padding:10, font:{size:11} } } } }
+    });
+}
+
+function renderLangChart() {
+    const counts = {};
+    filteredData.forEach(d => { const l=d.language||'Unknown'; counts[l]=(counts[l]||0)+1; });
+    const keys = Object.keys(counts);
+    destroyChart('lang');
+    charts.lang = new Chart(document.getElementById('chartLanguage'), {
+        type: 'doughnut',
+        data: { labels: keys, datasets:[{ data:keys.map(k=>counts[k]), backgroundColor:keys.map(k=>LANG_CFG[k]||'#94A3B8'), borderColor:'#fff', borderWidth:2.5, hoverOffset:4 }] },
+        options: { responsive:true, maintainAspectRatio:false, cutout:'62%',
+            plugins:{ legend:{ position:'bottom', labels:{ boxWidth:9, padding:10, font:{size:11} } } } }
+    });
+}
+
+function renderRoomChart() {
+    const counts = {};
+    filteredData.forEach(d => { if(d.room_preference){ counts[d.room_preference]=(counts[d.room_preference]||0)+1; } });
+    const sorted = Object.entries(counts).sort((a,b)=>b[1]-a[1]);
+    destroyChart('rooms');
+    charts.rooms = new Chart(document.getElementById('chartRooms'), {
+        type: 'bar',
+        data: { labels:sorted.map(e=>e[0]), datasets:[{ data:sorted.map(e=>e[1]), backgroundColor:sorted.map((_,i)=>ROOM_COLORS[i%ROOM_COLORS.length]), borderRadius:4, borderSkipped:false, barThickness:22 }] },
+        options: { indexAxis:'y', responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+            scales:{ x:{beginAtZero:true,ticks:{stepSize:1,precision:0},grid:{color:'#F1F5F9'}}, y:{grid:{display:false}} } }
+    });
+}
+
+// ====================================================================
+// TABLE
+// ====================================================================
+function renderTable() {
+    const q = (document.getElementById('tableSearch').value||'').toLowerCase();
+    let rows = q ? filteredData.filter(d =>
+        (d.guest_name||'').toLowerCase().includes(q) ||
+        (d.language||'').toLowerCase().includes(q) ||
+        (d.call_outcome||'').toLowerCase().includes(q) ||
+        (d.room_preference||'').toLowerCase().includes(q) ||
+        (d.summary||'').toLowerCase().includes(q)
+    ) : filteredData;
+
+    rows = [...rows].sort((a,b) => {
+        const va=(a[sortCol]||'').toLowerCase(), vb=(b[sortCol]||'').toLowerCase();
+        return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+    });
+
+    document.querySelectorAll('.sort-arrow').forEach(el => {
+        el.textContent = el.dataset.col===sortCol ? (sortAsc?' ▲':' ▼') : '';
+    });
+
+    const tbody = document.getElementById('callsTableBody');
+    tbody.innerHTML = rows.slice(0,100).map((d,i) => {
+        const fu = d.follow_up_needed === 'Yes';
+        const leftStyle = fu ? 'border-left:3px solid #D97706' : 'border-left:3px solid transparent';
+        return `
+        <tr style="border-bottom:1px solid #F1F5F9;cursor:pointer;${leftStyle}" onclick="toggleRow(${i})" onmouseover="this.style.background='#F8FAFF'" onmouseout="this.style.background=''">
+            <td style="padding:10px 20px;color:#64748B;white-space:nowrap;font-size:11.5px">${formatDate(d.timestamp)}</td>
+            <td style="padding:10px 12px">${langBadge(d.language)}</td>
+            <td style="padding:10px 12px;font-weight:600;color:#0F172A;font-size:12px">${d.guest_name||'<span style="color:#CBD5E1;font-weight:400">Unknown</span>'}</td>
+            <td style="padding:10px 12px">${outcomeBadge(d.call_outcome)}</td>
+            <td style="padding:10px 12px;color:#64748B;font-size:11.5px">${d.room_preference||'<span style="color:#CBD5E1">—</span>'}</td>
+            <td style="padding:10px 12px">${fu
+                ? '<span class="badge" style="background:#FEF3C7;color:#B45309">YES</span>'
+                : '<span class="badge" style="background:#F1F5F9;color:#94A3B8">NO</span>'
+            }</td>
+            <td style="padding:10px 12px;color:#94A3B8;font-size:11.5px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${d.summary||''}</td>
+        </tr>
+        <tr id="detail-${i}" style="background:#FAFBFF">
+            <td colspan="7" style="padding:0 20px">
+                <div class="row-details" id="details-${i}">
+                    <div style="padding:10px 0 10px 12px;font-size:12px;color:#475569;line-height:1.6;border-left:2px solid #1E40AF">${d.summary||'No summary available.'}</div>
+                </div>
+            </td>
+        </tr>`;
+    }).join('');
+
+    document.getElementById('tableCount').textContent = rows.length + ' record' + (rows.length!==1?'s':'');
+}
+
+function toggleRow(i) { document.getElementById('details-'+i).classList.toggle('open'); }
+function sortTable(col) { sortAsc = sortCol===col ? !sortAsc : true; sortCol = col; renderTable(); }
+
+function outcomeBadge(outcome) {
+    const cfg = OUTCOME_CFG[outcome]||{color:'#94A3B8',label:(outcome||'Other').replace(/_/g,' ')};
+    return `<span class="badge" style="background:${cfg.color}18;color:${cfg.color}">${cfg.label}</span>`;
+}
+
+function langBadge(lang) {
+    const c = LANG_CFG[lang]||'#94A3B8';
+    const abbr = {English:'EN',Sinhala:'SI',Tamil:'TA'};
+    return `<span class="badge" style="background:${c}15;color:${c}">${abbr[lang]||lang}</span>`;
+}
+
+function formatDate(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts);
+    return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'2-digit'}) + ' ' +
+        d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true});
+}
+
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; }
+</script>
+</body>
+</html>

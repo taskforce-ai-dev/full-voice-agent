@@ -30,7 +30,7 @@ on:
         description: "Which agent to deploy"
         required: true
         type: choice
-        options: [bsl, flico, hatton, slic, sofia, kavya, kitchened, wor]
+        options: [bsl, flico, hatton, slic, sofia, kavya, kitchened, wor, horizon]
       ref:
         description: "Git ref / tag / commit to deploy"
         required: true
@@ -95,6 +95,7 @@ jobs:
             kavya)     SRC="Kavya";                OPT="/opt/kavya";                CON="kavya-voice-agent" ;;
             kitchened) SRC="Kitchened";            OPT="/opt/kitchened";            CON="kitchened-voice-agent" ;;
             wor)       SRC="WorldOfRefrigerators"; OPT="/opt/worldofrefrigerators"; CON="wor-voice-agent" ;;
+            horizon)   SRC="Horizon Agent";        OPT="/opt/horizon";              CON="horizon-voice-agent" ;;
             *) echo "Unknown agent id: $AGENT" >&2; exit 1 ;;
           esac
           { echo "src=$SRC"; echo "opt=$OPT"; echo "con=$CON"; } >> "$GITHUB_OUTPUT"
