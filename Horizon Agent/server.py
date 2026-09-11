@@ -239,6 +239,39 @@ try:
 except ValueError:
     GEMINI_TTS_TIMEOUT_SECONDS = 30.0
 
+# --- Sinhala TTS provider: Rime Arcana (primary) with Gemini fallback --------
+# Matches Kavya's Dialog Arcana path. Arcana returns audio/PCMU (mulaw 8 kHz)
+# streamed directly — no resampling. When SI_TTS_PROVIDER=rime (default) and a
+# RIME_API_KEY is set, Sinhala speaks via Arcana; on any Arcana failure it falls
+# back to Gemini TTS (which itself falls back to OpenAI). Set SI_TTS_PROVIDER=
+# gemini to make Gemini primary again.
+SI_TTS_PROVIDER: str = os.getenv("SI_TTS_PROVIDER", "rime").strip().lower()
+RIME_API_KEY: str = os.getenv("RIME_API_KEY", "")
+RIME_ARCANA_URL: str = os.getenv("RIME_ARCANA_URL", "https://users.rime.ai/v1/rime-tts")
+RIME_ARCANA_SPEAKER: str = os.getenv("RIME_ARCANA_SPEAKER", "chandani")
+RIME_ARCANA_LANG: str = os.getenv("RIME_ARCANA_LANG", "si")
+try:
+    RIME_TTS_TIMEOUT_SECONDS: float = float(os.getenv("RIME_TTS_TIMEOUT_SECONDS", "30"))
+except ValueError:
+    RIME_TTS_TIMEOUT_SECONDS = 30.0
+_RIME_ARCANA_MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024
+
+
+def _rime_arcana_payload(text: str) -> dict[str, Any]:
+    """Rime Arcana request body for Sinhala speech (mirrors Kavya's contract)."""
+    return {
+        "text": text,
+        "modelId": "arcana",
+        "speaker": RIME_ARCANA_SPEAKER,
+        "lang": RIME_ARCANA_LANG,
+        "max_tokens": 1200,
+        "repetition_penalty": 1.6,
+        "samplingRate": 8000,
+        "speedAlpha": 1,
+        "temperature": 0.5,
+        "top_p": 1,
+    }
+
 # ---------------------------------------------------------------------------
 # Optional: Google Gemini native SDK
 # ---------------------------------------------------------------------------
@@ -1005,10 +1038,16 @@ async def health() -> dict[str, Any]:
         "stt_provider": STT_PROVIDER,
         "azure_stt": AZURE_STT_AVAILABLE,
         "azure_tts": bool(AZURE_SPEECH_KEY),
-        # Sinhala stack (Kavya Dialog line parity): Gemini brain + Gemini TTS.
+        # Sinhala stack: Gemini brain; TTS = Rime Arcana (primary) -> Gemini -> OpenAI.
         "sinhala_llm_provider": SI_LLM_PROVIDER,
         "sinhala_gemini_model": SI_GEMINI_MODEL,
-        "sinhala_tts": "gemini" if (GOOGLE_GENAI_AVAILABLE and GEMINI_API_KEY) else "openai_fallback",
+        "sinhala_tts_primary": (
+            "rime" if (SI_TTS_PROVIDER == "rime" and RIME_API_KEY)
+            else ("gemini" if (GOOGLE_GENAI_AVAILABLE and GEMINI_API_KEY) else "openai")
+        ),
+        "sinhala_tts_fallback": "gemini->openai",
+        "rime_configured": bool(RIME_API_KEY),
+        "rime_speaker": RIME_ARCANA_SPEAKER,
         "gemini_tts_model": GEMINI_TTS_MODEL,
         "gemini_configured": bool(GEMINI_API_KEY),
     }
@@ -2529,11 +2568,13 @@ class MediaStreamSession:
             if generation >= 0 and generation != self._speak_generation:
                 return
             if self.lang == "si":
-                # Sinhala voice = Kavya Dialog stack (Gemini TTS). Falls back to
-                # OpenAI TTS if the Gemini TTS client/key is unavailable, so a
-                # missing GEMINI_API_KEY degrades to a working voice instead of
-                # silence.
-                if self.gemini_client is not None:
+                # Sinhala voice: Rime Arcana (primary) -> Gemini TTS (fallback)
+                # -> OpenAI (Gemini's own last resort). Arcana matches Kavya's
+                # Dialog Arcana path. If Arcana isn't selected/configured, use
+                # the Gemini path (which degrades to OpenAI if needed).
+                if SI_TTS_PROVIDER == "rime" and RIME_API_KEY.strip():
+                    await self._tts_rime(text)
+                elif self.gemini_client is not None:
                     await self._tts_gemini(text)
                 else:
                     await self._tts_openai(text)
@@ -2720,7 +2761,107 @@ class MediaStreamSession:
             logger.exception("OpenAI TTS failed for: %s", text[:80])
             self._is_speaking = False
 
-    # â”€â”€ Gemini TTS (Sinhala â€” Kavya Dialog stack) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â”€â”€ Rime Arcana TTS (Sinhala â€” primary) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    async def _tts_rime(self, text: str):
+        """Stream Rime Arcana as mulaw 8 kHz to Twilio (Sinhala, primary path).
+
+        Arcana returns `audio/PCMU` (mulaw 8 kHz) directly, so bytes stream to
+        Twilio with no resampling. On any failure (bad key, HTTP error, wrong
+        content-type, no audio) — but NOT a barge-in — fall back to Gemini TTS
+        (which itself falls back to OpenAI), so Sinhala never goes silent.
+        Ported from Kavya's Dialog Arcana path. Must only be called from _speak.
+        """
+        headers = {
+            "Accept": "audio/PCMU",
+            "Authorization": f"Bearer {RIME_API_KEY.strip()}",
+            "Content-Type": "application/json",
+        }
+        self._is_speaking = True
+        got_audio = False
+        mulaw_buf = b""
+        try:
+            async with httpx.AsyncClient() as http:
+                async with http.stream(
+                    "POST", RIME_ARCANA_URL,
+                    json=_rime_arcana_payload(text), headers=headers,
+                    timeout=RIME_TTS_TIMEOUT_SECONDS,
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        logger.error("Rime Arcana %d: %s â€” falling back to Gemini TTS",
+                                     resp.status_code, body[:200])
+                        await self._tts_gemini(text)
+                        return
+                    media_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    if media_type not in {"audio/pcmu", "audio/basic"}:
+                        logger.error("Rime Arcana unexpected content-type %r â€” falling back to Gemini TTS",
+                                     media_type)
+                        await self._tts_gemini(text)
+                        return
+
+                    total = 0
+                    async for chunk in resp.aiter_bytes():
+                        if not self._is_speaking:
+                            break
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > _RIME_ARCANA_MAX_RESPONSE_BYTES:
+                            logger.error("Rime Arcana response too large â€” truncating")
+                            break
+                        got_audio = True
+                        mulaw_buf += chunk
+                        while len(mulaw_buf) >= 640:
+                            if not self._is_speaking:
+                                break
+                            frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
+                            b64 = base64.b64encode(frame).decode("ascii")
+                            async with self._ws_lock:
+                                await self.ws.send_text(json.dumps({
+                                    "event": "media",
+                                    "streamSid": self.stream_sid,
+                                    "media": {"payload": b64},
+                                }))
+
+            if not got_audio:
+                logger.error("Rime Arcana returned no audio â€” falling back to Gemini TTS")
+                await self._tts_gemini(text)
+                return
+
+            if self._is_speaking and mulaw_buf:
+                b64 = base64.b64encode(mulaw_buf).decode("ascii")
+                async with self._ws_lock:
+                    await self.ws.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": b64},
+                    }))
+
+            if self._is_speaking:
+                async with self._ws_lock:
+                    await self.ws.send_text(json.dumps({
+                        "event": "mark",
+                        "streamSid": self.stream_sid,
+                        "mark": {"name": "tts_done"},
+                    }))
+            else:
+                logger.info("Rime Arcana TTS interrupted by barge-in [%s]", self.call_sid)
+
+        except httpx.TimeoutException:
+            logger.error("Rime Arcana timeout â€” falling back to Gemini TTS")
+            if not got_audio:
+                await self._tts_gemini(text)
+            else:
+                self._is_speaking = False
+        except Exception:
+            logger.exception("Rime Arcana TTS failed for: %s", text[:80])
+            if not got_audio:
+                await self._tts_gemini(text)
+            else:
+                self._is_speaking = False
+
+    # â”€â”€ Gemini TTS (Sinhala â€” fallback) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _tts_gemini(self, text: str):
         """Stream Gemini TTS as mulaw 8 kHz to Twilio (Sinhala).
