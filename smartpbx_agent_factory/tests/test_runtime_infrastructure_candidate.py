@@ -135,7 +135,7 @@ def test_compose_and_proxy_are_loopback_limited_and_status_is_authenticated():
     assert "proxy_set_header Upgrade $http_upgrade;" in nginx
     assert "location = /smartpbx/status" in nginx
     assert "server_name {{smartpbx_hostname}};" in nginx
-    assert "proxy_set_header {{wss_header}} $http_x_smartpbx_token;" in nginx
+    assert "proxy_set_header {{wss_header}} {{wss_header_variable}};" in nginx
     assert "location / { return 404; }" in nginx
 
 

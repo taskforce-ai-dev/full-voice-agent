@@ -60,6 +60,7 @@ class RenderReport:
 _TEMPLATE_ROOT = Path(__file__).parent / "template_v1"
 _DEFAULT_ALLOWLIST = _TEMPLATE_ROOT / "file_allowlist.json"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SMARTPBX_AUTH_HEADER_RE = re.compile(r"^X-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-Token$")
 _IDENTITY_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (r"hatton\s+hills", r"treehouse", r"mosvold", r"yanolja", r"kavya")
@@ -299,6 +300,13 @@ def _language_prompt_block(manifest: AgentManifest, language_code: str) -> str:
     )
 
 
+def _nginx_request_header_variable(header_name: str) -> str:
+    """Return the Nginx request variable for a generated SmartPBX auth header."""
+    if not isinstance(header_name, str) or not _SMARTPBX_AUTH_HEADER_RE.fullmatch(header_name):
+        raise RenderError("generated SmartPBX authentication header is invalid for Nginx")
+    return "$http_" + header_name.lower().replace("-", "_")
+
+
 def _files(
     manifest: AgentManifest, resources: DerivedResources, documents: Mapping[str, str], templates: Mapping[str, str], *, synthetic: bool
 ) -> Mapping[str, str]:
@@ -359,6 +367,7 @@ activation_state: pending
         "smartpbx_hostname": resources.smartpbx_hostname,
         "website_hostname": resources.website_hostname,
         "wss_header": resources.wss_header,
+        "wss_header_variable": _nginx_request_header_variable(resources.wss_header),
         "ghcr_repository": resources.ghcr_repository,
         "smartpbx_memory_limit": "1536m",
         "smartpbx_cpus": "2.0",

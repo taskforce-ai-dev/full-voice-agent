@@ -27,6 +27,13 @@
       "extraction": "review-only isolated website-demo process profile; Uvicorn access logging is disabled because relay admission tickets are query parameters"
     },
     {
+      "template_path": "infrastructure/nginx-smartpbx.conf.tmpl",
+      "template_sha256": "sha256:4e0e42bf130234704d7f1b7312225f55d176b3de607610998db3f8dda0e15e36",
+      "source_path": null,
+      "source_ranges": [],
+      "extraction": "client-neutral WSS ingress and authenticated status proxy; the renderer derives a validated Nginx request variable from the generated authentication header"
+    },
+    {
       "template_path": "infrastructure/nginx-website-demo.conf.tmpl",
       "template_sha256": "sha256:a0c7ff0060468f706ee1fb5d5026437ff91aaa66c9c6c9e5803390827e07c50f",
       "source_path": null,

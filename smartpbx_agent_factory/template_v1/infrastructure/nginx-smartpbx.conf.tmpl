@@ -16,7 +16,7 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header {{wss_header}} $http_x_smartpbx_token;
+        proxy_set_header {{wss_header}} {{wss_header_variable}};
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 120s;
@@ -33,7 +33,7 @@ server {
         proxy_pass http://127.0.0.1:{{smartpbx_port}};
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header {{wss_header}} $http_x_smartpbx_token;
+        proxy_set_header {{wss_header}} {{wss_header_variable}};
     }
 
     location / { return 404; }
