@@ -554,6 +554,31 @@ Only the dedicated WSS token is pasted into the Dialog dashboard.
 | Media WebSocket URL | `wss://smartpbx-kavya.taskforceai.tech/ws/v1/smartpbx/media` |
 | WebSocket headers | `X-Kavya-SmartPBX-Token: <SMARTPBX_WS_TOKEN>` |
 
+### SmartPBX AI Provider V07 compatibility boundary
+
+The authenticated `/smartpbx/status` field `protocol_version` is our externally
+visible SmartPBX compatibility marker and is `smartpbx-ai-provider-v07`. It is
+our client/provider compatibility label, not a vendor-negotiated wire field, a
+value pasted into the Dialog dashboard, or an extra WebSocket event.
+
+The dashboard media fields remain `g711_ulaw` and `8000` Hz. The WebSocket
+event shapes remain V07 `start`, `media`, `dtmf`, and `hangup`; the parser also
+accepts the existing value-free `connected` and `stop` compatibility events.
+No codec, sample rate, URL, header authentication, or media framing changes in
+this compatibility update.
+
+The V07 PDF table prints `destination_number`, but the authenticated live
+Dialog `tools/list` contract used by Kavya requires the literal MCP argument
+key `destination number`. Kavya sends the configured `tel:` or `sip:` URI under
+that key and always sends the non-empty `tier=BYPASS` disposition. Do not copy
+the PDF's snake-case spelling into the client configuration.
+
+Kavya does not expose `hangup_call`. The PDF requires
+`caller_confirmed_no_further_help="true"` only after a clear closing question
+and explicit caller confirmation, and forbids disconnecting during a pending
+transfer or unfinished step. Until a product-owned flow records those facts,
+adding the tool would turn a model decision into an unsafe caller disconnect.
+
 ## TLS bootstrap, local service validation, then public proxy
 
 The generic sequence below is safe from a blank host. Operator state on

@@ -1,0 +1,187 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from smartpbx_agent_factory.catalogue import CapabilityCatalogue, CatalogueError
+
+
+CATALOGUE = Path(__file__).parents[1] / "template_v1" / "provider_catalogue.json"
+
+
+def test_catalogue_rejects_unverified_language_locale_provider_model_pair():
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    with pytest.raises(CatalogueError, match="not verified"):
+        catalogue.validate_pipeline(
+            "en",
+            {
+                "locale": "en-GB",
+                "stt": "azure",
+                "llm": "claude",
+                "llm_model": "claude-sonnet-4-5-20250929",
+                "tts": "elevenlabs",
+                "tts_model": "eleven_flash_v2_5",
+            },
+        )
+
+
+def test_catalogue_accepts_only_source_proven_english_and_sinhala_profiles():
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    catalogue.validate_pipeline(
+        "en",
+        {
+            "locale": "en-US",
+            "stt": "google",
+            "llm": "claude",
+            "llm_model": "claude-sonnet-4-5-20250929",
+            "tts": "elevenlabs",
+            "tts_model": "eleven_flash_v2_5",
+        },
+    )
+
+
+def test_source_observed_google_stt_is_not_a_generated_runnable_choice_without_materialization_contract():
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    google_pipeline = {
+        "locale": "en-US",
+        "stt": "google",
+        "llm": "claude",
+        "llm_model": "claude-sonnet-4-5-20250929",
+        "tts": "elevenlabs",
+        "tts_model": "eleven_flash_v2_5",
+    }
+    catalogue.validate_pipeline("en", google_pipeline)
+    with pytest.raises(CatalogueError, match="not generated-runnable"):
+        catalogue.validate_generated_pipeline("en", google_pipeline)
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in catalogue.required_secret_identifiers_for_pipeline("en", google_pipeline)
+    assert catalogue.required_metadata_identifiers_for_pipeline("en", google_pipeline) == frozenset({"GOOGLE_APPLICATION_CREDENTIALS", "SMARTPBX_ACCOUNT_ID"})
+    catalogue.validate_pipeline(
+        "en",
+        {
+            "locale": "en-US",
+            "stt": "azure",
+            "llm": "claude",
+            "llm_model": "claude-sonnet-4-5-20250929",
+            "tts": "elevenlabs",
+            "tts_model": "eleven_flash_v2_5",
+        },
+    )
+    catalogue.validate_pipeline(
+        "si",
+        {
+            "locale": "si-LK",
+            "stt": "azure",
+            "llm": "gemini",
+            "llm_model": "gemini-3.7-flash",
+            "tts": "rime",
+            "tts_model": "arcana",
+            "fallback": "claude",
+            "fallback_model": "claude-sonnet-4-5-20250929",
+        },
+    )
+
+
+def test_catalogue_keeps_source_defaults_non_runnable_and_requires_manifest_selection():
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    assert catalogue.source_default("en") == {
+        "evidence": "source-default",
+        "locale": "en-US",
+        "stt": "google",
+        "llm": "claude",
+        "llm_model": "claude-sonnet-4-5-20250929",
+        "tts": "elevenlabs",
+        "tts_model": "eleven_flash_v2_5",
+    }
+    assert catalogue.manifest_selection_required is True
+    catalogue.validate_pipeline(
+        "si",
+        {
+            "locale": "si-LK",
+            "stt": "azure",
+            "llm": "gemini",
+            "llm_model": "gemini-3.7-flash",
+            "tts": "gemini",
+            "tts_model": "gemini-3.1-flash-tts-preview",
+            "fallback": "claude",
+            "fallback_model": "claude-sonnet-4-5-20250929",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("component", "model"),
+    (("stt", "unapproved-stt"), ("llm", "unapproved-llm"), ("tts", "unapproved-tts")),
+)
+def test_catalogue_rejects_an_unapproved_provider_model_pair(component, model):
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    pipeline = {
+        "locale": "en-US",
+        "stt": "azure",
+        "llm": "claude",
+        "llm_model": "claude-sonnet-4-5-20250929",
+        "tts": "elevenlabs",
+        "tts_model": "eleven_flash_v2_5",
+    }
+    pipeline[f"{component}_model"] = model
+    with pytest.raises(CatalogueError, match="not verified"):
+        catalogue.validate_pipeline("en", pipeline)
+
+
+def test_catalogue_rejects_malformed_or_unknown_provider_data(tmp_path):
+    malformed = tmp_path / "catalogue.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "catalogue_status": "approved",
+                "source_revision": "a" * 40,
+                "source_hashes": {"Kavya/server.py": "sha256:" + "b" * 64},
+                "runtime_required_secret_identifiers": [],
+                "runtime_required_metadata_identifiers": [],
+                "manifest_selection_required": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(CatalogueError, match="languages"):
+        CapabilityCatalogue.load(malformed)
+
+
+def test_catalogue_exposes_named_secret_identifiers_without_secret_values():
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    english = catalogue.required_secret_identifiers_for_pipeline(
+        "en",
+        {
+            "locale": "en-US",
+            "stt": "azure",
+            "llm": "claude",
+            "llm_model": "claude-sonnet-4-5-20250929",
+            "tts": "elevenlabs",
+            "tts_model": "eleven_flash_v2_5",
+        },
+    )
+    sinhala = catalogue.required_secret_identifiers_for_pipeline(
+        "si",
+        {
+            "locale": "si-LK",
+            "stt": "azure",
+            "llm": "gemini",
+            "llm_model": "gemini-3.7-flash",
+            "tts": "gemini",
+            "tts_model": "gemini-3.1-flash-tts-preview",
+            "fallback": "claude",
+            "fallback_model": "claude-sonnet-4-5-20250929",
+        },
+    )
+    assert english == frozenset({"ANTHROPIC_API_KEY", "AZURE_SPEECH_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID", "SMARTPBX_WS_TOKEN"})
+    assert sinhala == frozenset({"ANTHROPIC_API_KEY", "AZURE_SPEECH_KEY", "GEMINI_API_KEY", "SMARTPBX_WS_TOKEN"})
+    assert catalogue.runtime_required_metadata_identifiers == ("SMARTPBX_ACCOUNT_ID",)
+    assert "SMARTPBX_ACCOUNT_ID" not in english
+
+
+def test_catalogue_is_deeply_immutable_after_review():
+    catalogue = CapabilityCatalogue.load(CATALOGUE)
+    with pytest.raises(TypeError):
+        catalogue.languages["fr"] = {}
+    with pytest.raises(TypeError):
+        catalogue.languages["en"]["en-US"]["stt"] = ()

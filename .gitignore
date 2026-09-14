@@ -58,6 +58,9 @@ docker-volumes/
 htmlcov/
 .coverage
 
+# Resumable factory state (never commit generation records)
+/.smartpbx-generations/
+
 # Misc
 *.bak
 *.tmp

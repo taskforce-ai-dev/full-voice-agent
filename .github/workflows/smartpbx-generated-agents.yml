@@ -1,0 +1,87 @@
+name: smartpbx-generated-agents
+
+on:
+  pull_request:
+    paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", "scripts/check_smartpbx_ci_lifecycle_contract.py", "scripts/materialize_smartpbx_ci_fixture.py", "scripts/run_smartpbx_ci_lifecycle.py", ".github/workflows/smartpbx-generated-agents.yml"]
+  push:
+    branches: [main, "smartpbx-agent-factory/**"]
+    paths: ["SmartPBX Agents/**", "smartpbx_agent_factory/**", "scripts/check_smartpbx_ci_lifecycle_contract.py", "scripts/materialize_smartpbx_ci_fixture.py", "scripts/run_smartpbx_ci_lifecycle.py", ".github/workflows/smartpbx-generated-agents.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  smartpbx-generated-agent:
+    name: smartpbx-generated-agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check CI lifecycle contract
+        run: python scripts/check_smartpbx_ci_lifecycle_contract.py
+      - name: Install generated test dependency
+        run: python -m pip install "pytest==9.1.1"
+      - name: Run SmartPBX factory contracts
+        run: python -m pytest smartpbx_agent_factory/tests
+      - name: Discover generated agents
+        run: |
+          : > /tmp/smartpbx-agent-dirs
+          if [ -d "SmartPBX Agents" ]; then
+            find "SmartPBX Agents" -mindepth 1 -maxdepth 1 -type d -print0 > /tmp/smartpbx-agent-dirs
+          fi
+      - name: Run disposable generated-agent contracts
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            changed="$(git ls-tree -r --name-only HEAD)"
+          else
+            changed="$(git diff --name-only "$base" "${{ github.sha }}")"
+          fi
+          relevant_changed=false
+          if printf '%s\n' "$changed" | grep -Eq '^(SmartPBX Agents/|smartpbx_agent_factory/|scripts/(check_smartpbx_ci_lifecycle_contract|materialize_smartpbx_ci_fixture|run_smartpbx_ci_lifecycle)\.py$|\.github/workflows/smartpbx-generated-agents\.yml$)'; then
+            relevant_changed=true
+          fi
+          generated_changed=false
+          if printf '%s\n' "$changed" | grep -q '^SmartPBX Agents/'; then
+            generated_changed=true
+          fi
+          canonical_fixture="SmartPBX Agents/.ci-lifecycle-canonical"
+          attestation_dir="$RUNNER_TEMP/smartpbx-ci-lifecycle-attestations"
+          mkdir -p "$attestation_dir"
+          if [ "$relevant_changed" = true ]; then
+            if [ ! -d "$canonical_fixture" ]; then
+              echo "canonical review-only CI fixture is required for lifecycle-relevant changes" >&2
+              exit 1
+            fi
+            python scripts/materialize_smartpbx_ci_fixture.py --fixture "$canonical_fixture" --output "$RUNNER_TEMP/smartpbx-ci-canonical-materialization.json"
+            python scripts/run_smartpbx_ci_lifecycle.py --canonical-fixture "$canonical_fixture" --attestation "$attestation_dir/canonical.json" --lane backend --repository "${{ github.repository }}" --head-sha "${{ github.event.pull_request.head.sha || github.sha }}" --run-id "${{ github.run_id }}"
+          fi
+          found=false
+          while IFS= read -r -d '' agent_dir; do
+            if [ "$agent_dir" = "$canonical_fixture" ]; then
+              found=true
+              continue
+            fi
+            found=true
+            python -m pytest "$agent_dir/tests"
+            python scripts/run_smartpbx_ci_lifecycle.py "$agent_dir" --attestation "$attestation_dir/$(basename "$agent_dir").json" --lane backend --repository "${{ github.repository }}" --head-sha "${{ github.event.pull_request.head.sha || github.sha }}" --run-id "${{ github.run_id }}"
+          done < /tmp/smartpbx-agent-dirs
+          if [ "$generated_changed" = true ] && [ "$found" = false ]; then
+            echo "no generated agent directory for a generated-tree change" >&2
+            exit 1
+          fi
+      - name: Publish redacted lifecycle attestations
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartpbx-ci-lifecycle-attestations
+          path: ${{ runner.temp }}/smartpbx-ci-lifecycle-attestations/*.json
+          if-no-files-found: error

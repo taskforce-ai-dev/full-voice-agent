@@ -1,0 +1,513 @@
+"""Startup-injected, inquiry-only Claude and Gemini streaming lane.
+
+There are no environment reads, credentials, logging, product identity, or tool
+parameters here. A provisional sentence is generation-scoped: the turn engine
+may start TTS promptly, then must fence that generation to cancel synthesis and
+clear queued audio if the terminal result is unsafe. Only a TerminalCommit may
+write assistant history.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass, field
+from time import monotonic
+from typing import Literal, Protocol
+
+from provider_adapters import (
+    GenerationFence,
+    ProvisionalSentence,
+    RecoveryBoundary,
+    RoundOutcome,
+    TerminalCommit,
+    ThinkingProgress,
+)
+
+
+ProviderName = Literal["claude", "gemini"]
+StreamPhase = Literal["initial", "stall"]
+
+
+class ClaudeStreamClient(Protocol):
+    """Injected client returning normalized Claude event mappings."""
+
+    def open_stream(
+        self, request: Mapping[str, object]
+    ) -> AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]]: ...
+
+
+class GeminiStreamClient(Protocol):
+    """Injected client returning normalized Gemini kind event mappings."""
+
+    async def open_stream(self, request: Mapping[str, object]) -> AsyncIterator[Mapping[str, object]]: ...
+
+
+class GenerationEventSink(Protocol):
+    """Prompt TTS and atomic invalidation boundary for the turn engine.
+
+    fence_generation cancels the matching TTS work and clears pending media
+    before retry/recovery. commit_generation is the sole history-commit point.
+    No tool callback exists because this is an inquiry-only lane.
+    """
+
+    async def send_provisional_sentence(self, event: "ProvisionalSentence") -> None: ...
+
+    async def fence_generation(self, event: "GenerationFence") -> None: ...
+
+    async def commit_generation(self, event: "TerminalCommit") -> None: ...
+
+
+@dataclass(frozen=True)
+class ThinkingConfig:
+    """Provider thinking stays enabled by default and its content is discarded."""
+
+    enabled: bool = True
+    claude_effort: Literal["low", "medium", "high"] | None = None
+    gemini_level: Literal["low", "medium", "high"] | None = "low"
+    gemini_budget: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("thinking enabled must be boolean")
+        if self.gemini_level is not None and self.gemini_budget is not None:
+            raise ValueError("Gemini thinking level and budget are mutually exclusive")
+        if self.gemini_budget is not None and not 0 <= self.gemini_budget <= 16_384:
+            raise ValueError("Gemini thinking budget is outside the supported range")
+
+
+@dataclass(frozen=True)
+class StreamTimeouts:
+    initial_seconds: float = 8.0
+    stall_seconds: float = 8.0
+    claude_thinking_stall_seconds: float = 15.0
+
+    def __post_init__(self) -> None:
+        for value in (self.initial_seconds, self.stall_seconds, self.claude_thinking_stall_seconds):
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not 1.0 <= float(value) <= 30.0:
+                raise ValueError("stream timeout must be a finite value between one and thirty seconds")
+        if self.claude_thinking_stall_seconds < self.stall_seconds:
+            raise ValueError("Claude thinking stall timeout may not weaken the ordinary stall timeout")
+
+
+@dataclass(frozen=True)
+class LLMRuntimeConfig:
+    claude_model: str | None
+    gemini_model: str | None
+    max_output_tokens: int
+    timeouts: StreamTimeouts = field(default_factory=StreamTimeouts)
+    thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
+
+    def __post_init__(self) -> None:
+        if not self.claude_model and not self.gemini_model:
+            raise ValueError("at least one configured model name is required")
+        if not isinstance(self.max_output_tokens, int) or isinstance(self.max_output_tokens, bool):
+            raise ValueError("max output tokens must be an integer")
+        if not 1 <= self.max_output_tokens <= 16_384:
+            raise ValueError("max output tokens are outside the supported range")
+
+
+@dataclass(frozen=True)
+class InquiryMessage:
+    role: Literal["user", "assistant"]
+    content: str
+
+    def __post_init__(self) -> None:
+        if self.role not in {"user", "assistant"} or not isinstance(self.content, str) or not self.content:
+            raise ValueError("inquiry messages require a user or assistant role and text content")
+
+
+@dataclass(frozen=True)
+class InquiryRequest:
+    provider: ProviderName
+    system_prompt: str
+    messages: Sequence[InquiryMessage]
+
+    def __post_init__(self) -> None:
+        if self.provider not in {"claude", "gemini"} or not isinstance(self.system_prompt, str):
+            raise ValueError("inquiry request is invalid")
+        _validate_inquiry_messages(self.messages)
+
+
+@dataclass(frozen=True)
+class TerminalMetadata:
+    provider: ProviderName
+    finish_reason: str
+    output_tokens: int | None
+    attempt: int
+
+
+StreamEvent = ProvisionalSentence | ThinkingProgress | TerminalCommit | GenerationFence | RecoveryBoundary
+
+
+class LLMStreamTimeout(TimeoutError):
+    def __init__(self, phase: StreamPhase) -> None:
+        self.phase = phase
+        super().__init__(phase)
+
+
+class LLMProtocolError(RuntimeError):
+    """A provider violated the no-tools inquiry contract before a commit."""
+
+
+@dataclass
+class _AttemptState:
+    provider: ProviderName
+    generation: int
+    text: list[str] = field(default_factory=list)
+    sentence_buffer: str = ""
+    progress: Literal["none", "metadata", "thinking", "text"] = "none"
+    saw_terminal_metadata: bool = False
+    saw_terminal_stop: bool = False
+    finish_reason: str = "unknown"
+    output_tokens: int | None = None
+
+    @property
+    def terminal_metadata(self) -> bool:
+        return self.saw_terminal_metadata and self.saw_terminal_stop
+
+
+class _DeadlineContext(AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]]):
+    def __init__(self, context: AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]], timeout: float) -> None:
+        self._context = context
+        self._timeout = timeout
+        self._entered = False
+
+    async def __aenter__(self) -> AsyncIterator[Mapping[str, object]]:
+        try:
+            stream = await asyncio.wait_for(self._context.__aenter__(), timeout=self._timeout)
+        except asyncio.TimeoutError as exc:
+            raise LLMStreamTimeout("initial") from exc
+        self._entered = True
+        return stream
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> bool | None:
+        if not self._entered:
+            return False
+        return await self._context.__aexit__(exc_type, exc, traceback)
+
+
+class InquiryOnlyLLMAdapter:
+    """Provider-neutral stream consumer with no external side-effect surface."""
+
+    def __init__(
+        self,
+        *,
+        claude_client: ClaudeStreamClient,
+        gemini_client: GeminiStreamClient,
+        config: LLMRuntimeConfig,
+    ) -> None:
+        self._claude_client = claude_client
+        self._gemini_client = gemini_client
+        self._config = config
+
+    async def stream_response(self, request: InquiryRequest) -> AsyncIterator[StreamEvent]:
+        """Yield prompt provisional sentences then exactly one commit or recovery.
+
+        Any non-completed terminal round is fenced and retried once, even when
+        a preamble sentence has already been sent. Initial acquisition timeouts
+        recover directly; an established stall can retry only before text.
+        """
+        retry_used = False
+        generation = 0
+        for attempt in (1, 2):
+            generation += 1
+            state = _AttemptState(request.provider, generation)
+            try:
+                async for event in self._stream_attempt(request, state):
+                    yield event
+            except LLMStreamTimeout as exc:
+                retrying = self._timeout_can_retry(state, exc, retry_used)
+                yield GenerationFence(generation, RoundOutcome.TIMEOUT, retrying)
+                if retrying:
+                    retry_used = True
+                    continue
+                yield RecoveryBoundary(generation, RoundOutcome.TIMEOUT)
+                return
+            except LLMProtocolError:
+                yield GenerationFence(generation, RoundOutcome.ABORTED, False)
+                raise
+            except Exception:
+                yield GenerationFence(generation, RoundOutcome.ABORTED, False)
+                yield RecoveryBoundary(generation, RoundOutcome.ABORTED)
+                return
+
+            outcome = _classify_round(state)
+            if outcome is RoundOutcome.COMPLETED:
+                remainder = state.sentence_buffer.strip()
+                if remainder:
+                    yield ProvisionalSentence(generation, remainder)
+                yield TerminalCommit(
+                    generation,
+                    TerminalMetadata(request.provider, state.finish_reason, state.output_tokens, attempt),
+                )
+                return
+
+            retrying = not retry_used
+            yield GenerationFence(generation, outcome, retrying)
+            if retrying:
+                retry_used = True
+                continue
+            yield RecoveryBoundary(generation, outcome)
+            return
+
+    def _timeout_can_retry(self, state: _AttemptState, error: LLMStreamTimeout, retry_used: bool) -> bool:
+        return not retry_used and error.phase == "stall" and not state.text
+
+    async def _stream_attempt(self, request: InquiryRequest, state: _AttemptState) -> AsyncIterator[ThinkingProgress | ProvisionalSentence]:
+        source = self._claude_events(request) if request.provider == "claude" else self._gemini_events(request)
+        async for event in source:
+            text, thinking = _consume_event(request.provider, event, state)
+            if thinking:
+                yield ThinkingProgress(state.generation)
+            if text:
+                state.text.append(text)
+                state.sentence_buffer += text
+                sentences, state.sentence_buffer = _complete_sentences(state.sentence_buffer)
+                for sentence in sentences:
+                    yield ProvisionalSentence(state.generation, sentence)
+
+    async def _claude_events(self, request: InquiryRequest) -> AsyncIterator[Mapping[str, object]]:
+        deadline = monotonic() + self._config.timeouts.initial_seconds
+        context = self._claude_client.open_stream(_claude_request(request, self._config))
+        async with _DeadlineContext(context, self._config.timeouts.initial_seconds) as stream:
+            async for item in _guarded_stream(
+                stream,
+                initial_seconds=max(deadline - monotonic(), 0.0),
+                stall_seconds=self._config.timeouts.stall_seconds,
+                thinking_stall_seconds=self._config.timeouts.claude_thinking_stall_seconds,
+            ):
+                yield item
+
+    async def _gemini_events(self, request: InquiryRequest) -> AsyncIterator[Mapping[str, object]]:
+        deadline = monotonic() + self._config.timeouts.initial_seconds
+        try:
+            stream = await asyncio.wait_for(
+                self._gemini_client.open_stream(_gemini_request(request, self._config)),
+                timeout=self._config.timeouts.initial_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise LLMStreamTimeout("initial") from exc
+        async for item in _guarded_stream(
+            stream,
+            initial_seconds=max(deadline - monotonic(), 0.0),
+            stall_seconds=self._config.timeouts.stall_seconds,
+            thinking_stall_seconds=self._config.timeouts.stall_seconds,
+        ):
+            yield item
+
+
+async def _guarded_stream(
+    stream: AsyncIterable[Mapping[str, object]],
+    *,
+    initial_seconds: float,
+    stall_seconds: float,
+    thinking_stall_seconds: float,
+) -> AsyncIterator[Mapping[str, object]]:
+    """Bound first output and every provider inter-item stall."""
+    iterator = stream.__aiter__()
+    first = True
+    progress = "none"
+    while True:
+        timeout = initial_seconds if first else (thinking_stall_seconds if progress == "thinking" else stall_seconds)
+        try:
+            item = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise LLMStreamTimeout("initial" if first else "stall") from exc
+        except StopAsyncIteration:
+            return
+        event = _event_mapping(item)
+        progress = _raw_progress(event, progress)
+        first = False
+        yield event
+
+
+def _consume_event(provider: ProviderName, event: Mapping[str, object], state: _AttemptState) -> tuple[str | None, bool]:
+    return _consume_claude_event(event, state) if provider == "claude" else _consume_gemini_event(event, state)
+
+
+def _consume_claude_event(event: Mapping[str, object], state: _AttemptState) -> tuple[str | None, bool]:
+    event_type = event.get("type")
+    if event_type == "message_start":
+        state.progress = _advance_progress(state.progress, "metadata")
+        return None, False
+    if event_type == "content_block_start":
+        block = _mapping(event.get("content_block"), "content_block")
+        if block.get("type") == "thinking":
+            state.progress = _advance_progress(state.progress, "thinking")
+            return None, True
+        if block.get("type") == "tool_use":
+            raise LLMProtocolError("provider emitted a tool event in inquiry-only mode")
+        return None, False
+    if event_type == "content_block_delta":
+        delta = _mapping(event.get("delta"), "delta")
+        if delta.get("type") == "thinking_delta":
+            state.progress = _advance_progress(state.progress, "thinking")
+            return None, True
+        if delta.get("type") == "text_delta":
+            text = delta.get("text")
+            if not isinstance(text, str):
+                raise LLMProtocolError("Claude text delta is invalid")
+            if text:
+                state.progress = _advance_progress(state.progress, "text")
+                return text, False
+            return None, False
+        if delta.get("type") == "input_json_delta":
+            raise LLMProtocolError("provider emitted a tool event in inquiry-only mode")
+        return None, False
+    if event_type == "message_delta":
+        delta = _mapping(event.get("delta"), "delta")
+        state.saw_terminal_metadata = True
+        state.finish_reason = _normalize_claude_finish(delta.get("stop_reason"))
+        usage = event.get("usage")
+        if isinstance(usage, Mapping):
+            state.output_tokens = _bounded_tokens(usage.get("output_tokens"))
+        return None, False
+    if event_type == "message_stop":
+        state.saw_terminal_stop = True
+    return None, False
+
+
+def _consume_gemini_event(event: Mapping[str, object], state: _AttemptState) -> tuple[str | None, bool]:
+    kind = event.get("kind")
+    if kind == "thinking":
+        state.progress = _advance_progress(state.progress, "thinking")
+        return None, True
+    if kind == "text":
+        text = event.get("text")
+        if not isinstance(text, str):
+            raise LLMProtocolError("Gemini text delta is invalid")
+        if text:
+            state.progress = _advance_progress(state.progress, "text")
+            return text, False
+        return None, False
+    if kind == "usage":
+        state.progress = _advance_progress(state.progress, "metadata")
+        state.output_tokens = _bounded_tokens(event.get("output_tokens"))
+        return None, False
+    if kind == "finish":
+        state.saw_terminal_metadata = True
+        state.saw_terminal_stop = True
+        state.finish_reason = _normalize_gemini_finish(event.get("finish_reason"))
+        state.output_tokens = _bounded_tokens(event.get("output_tokens", state.output_tokens))
+        return None, False
+    if kind in {"tool", "function_call"}:
+        raise LLMProtocolError("provider emitted a tool event in inquiry-only mode")
+    return None, False
+
+
+def _classify_round(state: _AttemptState) -> RoundOutcome:
+    """Classify terminal failures before visible output."""
+    if state.finish_reason == "max_tokens":
+        return RoundOutcome.MAX_TOKENS_TRUNCATED
+    if not state.terminal_metadata:
+        return RoundOutcome.STREAM_ABORTED
+    if state.finish_reason not in {"end_turn", "stop"}:
+        return RoundOutcome.ABORTED
+    return RoundOutcome.COMPLETED if any(item.strip() for item in state.text) else RoundOutcome.TRUE_EMPTY
+
+
+def _claude_request(request: InquiryRequest, config: LLMRuntimeConfig) -> Mapping[str, object]:
+    if not config.claude_model:
+        raise LLMProtocolError("Claude is not configured")
+    payload: dict[str, object] = {
+        "model": config.claude_model,
+        "max_tokens": config.max_output_tokens,
+        "system": request.system_prompt,
+        "messages": [{"role": item.role, "content": item.content} for item in request.messages],
+    }
+    if config.thinking.enabled and config.thinking.claude_effort is not None:
+        payload["output_config"] = {"effort": config.thinking.claude_effort}
+    return payload
+
+
+def _gemini_request(request: InquiryRequest, config: LLMRuntimeConfig) -> Mapping[str, object]:
+    if not config.gemini_model:
+        raise LLMProtocolError("Gemini is not configured")
+    generation: dict[str, object] = {
+        "system_instruction": request.system_prompt,
+        "max_output_tokens": config.max_output_tokens,
+    }
+    if config.thinking.enabled:
+        if config.thinking.gemini_level is not None:
+            generation["thinking_config"] = {"thinking_level": config.thinking.gemini_level}
+        elif config.thinking.gemini_budget is not None:
+            generation["thinking_config"] = {"thinking_budget": config.thinking.gemini_budget}
+    return {
+        "model": config.gemini_model,
+        "contents": [{"role": item.role, "parts": [{"text": item.content}]} for item in request.messages],
+        "config": generation,
+    }
+
+
+def _validate_inquiry_messages(messages: Sequence[InquiryMessage]) -> None:
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)) or not messages:
+        raise ValueError("inquiry request requires at least one message")
+    if any(not isinstance(item, InquiryMessage) for item in messages):
+        raise ValueError("inquiry request may contain only text messages")
+
+
+def _event_mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise LLMProtocolError("provider stream event must be a mapping")
+    return value
+
+
+def _mapping(value: object, label: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise LLMProtocolError(f"provider {label} is invalid")
+    return value
+
+
+def _advance_progress(current: str, candidate: Literal["metadata", "thinking", "text"]) -> Literal["none", "metadata", "thinking", "text"]:
+    order = {"none": 0, "metadata": 1, "thinking": 2, "text": 3}
+    return candidate if order[candidate] > order[current] else current
+
+
+def _normalize_claude_finish(value: object) -> str:
+    return value if value in {"end_turn", "max_tokens"} else "aborted"
+
+
+def _normalize_gemini_finish(value: object) -> str:
+    raw = getattr(value, "name", value)
+    if raw == "MAX_TOKENS":
+        return "max_tokens"
+    return "stop" if raw == "STOP" else "aborted"
+
+
+def _bounded_tokens(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000 else None
+
+
+def _raw_progress(event: Mapping[str, object], current: str) -> str:
+    if event.get("kind") == "thinking":
+        return "thinking"
+    if event.get("kind") == "text":
+        return "text"
+    if event.get("type") == "message_start" or event.get("kind") == "usage":
+        return "metadata"
+    if event.get("type") == "content_block_start":
+        block = event.get("content_block")
+        if isinstance(block, Mapping) and block.get("type") == "thinking":
+            return "thinking"
+    if event.get("type") == "content_block_delta":
+        delta = event.get("delta")
+        if isinstance(delta, Mapping):
+            if delta.get("type") == "thinking_delta":
+                return "thinking"
+            if delta.get("type") == "text_delta":
+                return "text"
+    return current
+
+
+def _complete_sentences(buffer: str) -> tuple[tuple[str, ...], str]:
+    sentences: list[str] = []
+    start = 0
+    for index, character in enumerate(buffer):
+        if character in ".!?":
+            sentence = buffer[start:index + 1].strip()
+            if sentence:
+                sentences.append(sentence)
+            start = index + 1
+    return tuple(sentences), buffer[start:]

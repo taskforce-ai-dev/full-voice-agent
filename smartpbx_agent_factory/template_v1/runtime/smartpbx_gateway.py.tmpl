@@ -1,0 +1,297 @@
+"""Carrier-neutral SmartPBX admission, protocol, and media lifecycle boundary."""
+
+from __future__ import annotations
+
+import asyncio
+import secrets
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Protocol
+
+from starlette.websockets import WebSocketDisconnect
+
+from smartpbx_protocol import (
+    ConnectedEvent,
+    DtmfEvent,
+    HangupEvent,
+    MediaEvent,
+    POLICY_VIOLATION,
+    ProtocolViolation,
+    StartEvent,
+    StopEvent,
+    parse_smartpbx_event,
+    validate_event_context,
+)
+from smartpbx_transport import SmartPBXMediaTransport
+
+
+SMARTPBX_PROTOCOL_VERSION = "smartpbx-ai-provider-v07"
+
+
+@dataclass(frozen=True)
+class CarrierIngressSettings:
+    enabled: bool
+    token: str
+    account_id: str
+    auth_header_name: str
+    max_calls: int = 4
+    max_message_chars: int = 65_536
+    max_audio_bytes: int = 32_768
+    max_outbound_frames: int = 512
+    start_timeout_seconds: int = 10
+    idle_timeout_seconds: int = 90
+
+    def __post_init__(self) -> None:
+        if (
+            not self.auth_header_name.isascii()
+            or not self.auth_header_name
+            or not 1 <= self.max_calls <= 4
+            or not 1 <= self.start_timeout_seconds <= 30
+            or not 10 <= self.idle_timeout_seconds <= 300
+            or not 160 <= self.max_audio_bytes <= 32_768
+            or not 1_024 <= self.max_message_chars <= 65_536
+            or not 1 <= self.max_outbound_frames <= 512
+        ):
+            raise ValueError("invalid carrier ingress settings")
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.token and self.account_id)
+
+    def token_matches(self, candidate: object) -> bool:
+        return isinstance(candidate, str) and self.token and secrets.compare_digest(self.token, candidate)
+
+
+class SessionLike(Protocol):
+    terminal_future: asyncio.Future[None]
+
+    async def start(self) -> None: ...
+    async def feed_audio(self, audio: bytes) -> None: ...
+    async def feed_dtmf(self, digit: str) -> None: ...
+    async def finish(self, **kwargs: object) -> None: ...
+
+
+SessionFactory = Callable[[Any, SmartPBXMediaTransport], Awaitable[SessionLike]]
+
+
+class _Lease:
+    def __init__(self, registry: "SessionRegistry") -> None:
+        self._registry = registry
+        self._released = False
+
+    async def release(self) -> None:
+        if not self._released:
+            self._released = True
+            await self._registry._release()
+
+
+class SessionRegistry:
+    """Bounded call admission without retaining calls, transcripts, or audio."""
+
+    def __init__(self, max_sessions: int) -> None:
+        self._max_sessions = max_sessions
+        self._active_sessions = 0
+        # Each admitted call owns exactly one gateway receive task and one
+        # session resource until its lease is released; these are live gauges.
+        self._active_tasks = 0
+        self._active_resources = 0
+        self._rejected_capacity_total = 0
+        self._admitted_total = 0
+        self._released_total = 0
+        self._connected_total = 0
+        self._started_total = 0
+        self._media_frames_total = 0
+        self._stopped_total = 0
+        self._hung_up_total = 0
+        self._lock = asyncio.Lock()
+
+    async def try_acquire(self) -> _Lease | None:
+        async with self._lock:
+            if self._active_sessions >= self._max_sessions:
+                self._rejected_capacity_total += 1
+                return None
+            self._active_sessions += 1
+            self._active_tasks += 1
+            self._active_resources += 1
+            self._admitted_total += 1
+            return _Lease(self)
+
+    async def _release(self) -> None:
+        async with self._lock:
+            self._active_sessions = max(0, self._active_sessions - 1)
+            self._active_tasks = max(0, self._active_tasks - 1)
+            self._active_resources = max(0, self._active_resources - 1)
+            self._released_total += 1
+
+    async def record(self, name: str) -> None:
+        async with self._lock:
+            if name == "connected":
+                self._connected_total += 1
+            elif name == "start":
+                self._started_total += 1
+            elif name == "media":
+                self._media_frames_total += 1
+            elif name == "stop":
+                self._stopped_total += 1
+            elif name == "hangup":
+                self._hung_up_total += 1
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "active_sessions": self._active_sessions,
+            "active_tasks": self._active_tasks,
+            "active_resources": self._active_resources,
+            "max_sessions": self._max_sessions,
+            "rejected_capacity_total": self._rejected_capacity_total,
+            "admitted_total": self._admitted_total,
+            "released_total": self._released_total,
+            "connected_total": self._connected_total,
+            "started_total": self._started_total,
+            "media_frames_total": self._media_frames_total,
+            "stopped_total": self._stopped_total,
+            "hung_up_total": self._hung_up_total,
+        }
+
+
+class SmartPBXGateway:
+    """Authenticate before accept(), bind start context, and keep media paced."""
+
+    def __init__(self, settings: CarrierIngressSettings, registry: SessionRegistry) -> None:
+        self._settings = settings
+        self._registry = registry
+
+    def snapshot(self) -> dict[str, bool | int | str]:
+        return {
+            "enabled": self._settings.enabled,
+            "configured": self._settings.configured,
+            "protocol_version": SMARTPBX_PROTOCOL_VERSION,
+            **self._registry.snapshot(),
+        }
+
+    async def handle(self, websocket: Any, session_factory: SessionFactory) -> None:
+        if not self._settings.enabled or not self._settings.configured:
+            await _safe_close(websocket, POLICY_VIOLATION, "service unavailable")
+            return
+        if not self._settings.token_matches(websocket.headers.get(self._settings.auth_header_name, "")):
+            await _safe_close(websocket, POLICY_VIOLATION, "unauthorized")
+            return
+        lease = await self._registry.try_acquire()
+        if lease is None:
+            await _safe_close(websocket, 1013, "capacity unavailable")
+            return
+        transport: SmartPBXMediaTransport | None = None
+        session: SessionLike | None = None
+        disconnected = False
+        close = (1000, "call ended")
+        try:
+            await websocket.accept()
+            context = await self._receive_start(websocket)
+            await self._registry.record("start")
+            if context.account_id != self._settings.account_id:
+                raise ProtocolViolation(POLICY_VIOLATION, "account mismatch", "account_mismatch")
+            transport = SmartPBXMediaTransport(
+                websocket, context, max_queue_frames=self._settings.max_outbound_frames
+            )
+            transport.start()
+            session = await session_factory(context, transport)
+            await session.start()
+            while True:
+                raw = await self._receive_or_terminal(websocket, session, transport)
+                if raw is None:
+                    break
+                event = parse_smartpbx_event(
+                    raw,
+                    max_message_chars=self._settings.max_message_chars,
+                    max_audio_bytes=self._settings.max_audio_bytes,
+                )
+                if isinstance(event, StartEvent):
+                    validate_event_context(event, context)
+                    raise ProtocolViolation(POLICY_VIOLATION, "duplicate start", "duplicate_start")
+                if isinstance(event, MediaEvent):
+                    await self._registry.record("media")
+                    await session.feed_audio(event.audio)
+                elif isinstance(event, DtmfEvent):
+                    validate_event_context(event, context)
+                    await session.feed_dtmf(event.digit)
+                elif isinstance(event, HangupEvent):
+                    validate_event_context(event, context)
+                    await self._registry.record("hangup")
+                    break
+                elif isinstance(event, StopEvent):
+                    await self._registry.record("stop")
+                    break
+                elif isinstance(event, ConnectedEvent):
+                    await self._registry.record("connected")
+                    continue
+        except asyncio.TimeoutError:
+            close = (POLICY_VIOLATION, "idle timeout")
+        except WebSocketDisconnect:
+            disconnected = True
+        except ProtocolViolation as error:
+            close = (error.close_code, error.public_reason)
+        except Exception:
+            close = (1011, "internal error")
+        finally:
+            if session is not None:
+                await _finish_safely(session)
+            if transport is not None:
+                await transport.close()
+            await lease.release()
+            if not disconnected:
+                await _safe_close(websocket, *close)
+
+    async def _receive_start(self, websocket: Any):
+        deadline = asyncio.get_running_loop().time() + self._settings.start_timeout_seconds
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+            event = parse_smartpbx_event(
+                raw,
+                max_message_chars=self._settings.max_message_chars,
+                max_audio_bytes=self._settings.max_audio_bytes,
+            )
+            if isinstance(event, StartEvent):
+                return event.context
+            if isinstance(event, ConnectedEvent):
+                await self._registry.record("connected")
+                continue
+            if not isinstance(event, ConnectedEvent):
+                raise ProtocolViolation(POLICY_VIOLATION, "start required", "start_required")
+
+    async def _receive_or_terminal(
+        self, websocket: Any, session: SessionLike, transport: SmartPBXMediaTransport
+    ) -> str | None:
+        receive_task = asyncio.create_task(websocket.receive_text())
+        sender_failure = asyncio.create_task(transport.wait_send_failed())
+        done, _ = await asyncio.wait(
+            {receive_task, sender_failure, session.terminal_future},
+            timeout=self._settings.idle_timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in (receive_task, sender_failure):
+            if task not in done:
+                task.cancel()
+        await asyncio.gather(receive_task, sender_failure, return_exceptions=True)
+        if not done:
+            raise asyncio.TimeoutError
+        if session.terminal_future in done:
+            session.terminal_future.result()
+            return None
+        if sender_failure in done:
+            raise RuntimeError("outbound media sender failed")
+        return receive_task.result()
+
+
+async def _finish_safely(session: SessionLike) -> None:
+    try:
+        await asyncio.wait_for(session.finish(), timeout=5)
+    except Exception:
+        return
+
+
+async def _safe_close(websocket: Any, code: int, reason: str) -> None:
+    try:
+        await websocket.close(code=code, reason=reason)
+    except Exception:
+        return

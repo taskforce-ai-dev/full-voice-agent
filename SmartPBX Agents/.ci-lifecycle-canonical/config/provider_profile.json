@@ -1,0 +1,1 @@
+{"languages":{"en":{"llm":"claude","llm_model":"synthetic","locale":"en-US","stt":"azure","stt_model":"synthetic","tts":"elevenlabs","tts_model":"synthetic"}},"required_environment":["ANTHROPIC_API_KEY","AZURE_SPEECH_KEY","AZURE_SPEECH_REGION","ELEVENLABS_API_KEY","ELEVENLABS_VOICE_ID"]}

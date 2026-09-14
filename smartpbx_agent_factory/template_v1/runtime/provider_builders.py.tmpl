@@ -1,0 +1,377 @@
+"""Startup-only concrete provider construction for the reviewed runtime candidate.
+
+This is the sole generated module allowed to inspect the startup environment or
+instantiate provider SDK clients.  Per-call adapters receive immutable objects.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import audioop
+import base64
+from collections.abc import AsyncIterator, Mapping
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from llm_adapters import InquiryMessage, InquiryOnlyLLMAdapter, InquiryRequest, LLMRuntimeConfig, StreamTimeouts, ThinkingConfig
+from provider_adapters import GenerationFence, ProvisionalSentence, RecoveryBoundary, RoundOutcome, TerminalCommit
+from stt_adapters import AzureSTTConfig, GoogleSTTConfig, STTProfile, SmartPBXSTTAdapter
+from tts_adapters import (
+    ElevenLabsSettings, PCM24kChunk, SinhalaGeminiSettings, SinhalaRimeSettings,
+    SmartPBXTTSAdapter, TTSLanguageRoute, TTSProviderClients, TTSProviderError, TTSStartupConfig,
+)
+
+
+class ProviderBuildError(RuntimeError):
+    """A startup failure with no credential or provider payload disclosure."""
+
+
+def _required(environ: Mapping[str, str], name: str) -> str:
+    value = environ.get(name, "").strip()
+    if not value:
+        raise ProviderBuildError(f"missing provider configuration: {name}")
+    return value
+
+
+def _synthetic_enabled(environ: Mapping[str, str]) -> bool:
+    return (
+        environ.get("SMARTPBX_RUNTIME_MODE") == "synthetic"
+        and environ.get("SMARTPBX_ALLOW_SYNTHETIC_FOR_CI") == "1"
+    )
+
+
+def _language_lanes(profile: Any, language: str) -> Mapping[str, str]:
+    lanes = profile.languages.get(language)
+    if not isinstance(lanes, Mapping):
+        raise ProviderBuildError(f"missing exact language profile: {language}")
+    return lanes
+
+
+def build_stt_adapter(profile: Any, environ: Mapping[str, str]) -> Any:
+    if _synthetic_enabled(environ):
+        return _SyntheticSTT()
+    profiles: dict[str, STTProfile] = {}
+    for language, lanes in profile.languages.items():
+        locale = str(lanes.get("locale", ""))
+        provider = lanes.get("stt")
+        if provider == "google":
+            credential_path = Path(_required(environ, "GOOGLE_APPLICATION_CREDENTIALS"))
+            if not credential_path.is_file():
+                raise ProviderBuildError("Google credential materialization is unavailable")
+            try:
+                from google.cloud import speech_v1 as google_speech
+            except ImportError as error:
+                raise ProviderBuildError("google-cloud-speech is unavailable") from error
+            profiles[language] = STTProfile(
+                code=language, locale=locale, provider="google",
+                google=GoogleSTTConfig(
+                    speech=google_speech, client_factory=google_speech.SpeechClient,
+                    language_code=locale,
+                ),
+            )
+        elif provider == "azure":
+            try:
+                import azure.cognitiveservices.speech as azure_speech
+            except ImportError as error:
+                raise ProviderBuildError("azure-cognitiveservices-speech is unavailable") from error
+            profiles[language] = STTProfile(
+                code=language, locale=locale, provider="azure",
+                azure=AzureSTTConfig(
+                    speech=azure_speech, subscription_key=_required(environ, "AZURE_SPEECH_KEY"),
+                    region=_required(environ, "AZURE_SPEECH_REGION"), language_code=locale,
+                    ulaw_to_pcm=lambda audio: audioop.ulaw2lin(audio, 2), detailed_output=True,
+                ),
+            )
+        else:
+            raise ProviderBuildError(f"unsupported STT provider for {language}")
+    return SmartPBXSTTAdapter(profiles)
+
+
+class _ClaudeNativeClient:
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def open_stream(self, request: Mapping[str, object]) -> AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]]:
+        return _ClaudeMappingContext(self._client.messages.stream(**request))
+
+
+class _ClaudeMappingContext(AbstractAsyncContextManager[AsyncIterator[Mapping[str, object]]]):
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    async def __aenter__(self) -> AsyncIterator[Mapping[str, object]]:
+        raw = await self._stream.__aenter__()
+
+        async def mapped() -> AsyncIterator[Mapping[str, object]]:
+            async for event in raw:
+                value = event.model_dump() if callable(getattr(event, "model_dump", None)) else event.to_dict()
+                if not isinstance(value, Mapping):
+                    raise ProviderBuildError("Anthropic event normalization failed")
+                yield value
+        return mapped()
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> bool | None:
+        return await self._stream.__aexit__(exc_type, exc, traceback)
+
+
+class _GeminiNativeClient:
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def open_stream(self, request: Mapping[str, object]) -> AsyncIterator[Mapping[str, object]]:
+        stream = await self._client.aio.models.generate_content_stream(**request)
+        async for item in stream:
+            candidates = getattr(item, "candidates", ()) or ()
+            usage = getattr(item, "usage_metadata", None)
+            if usage is not None:
+                yield {"kind": "usage", "output_tokens": getattr(usage, "candidates_token_count", None)}
+            if not candidates:
+                feedback = getattr(item, "prompt_feedback", None)
+                block_reason = getattr(feedback, "block_reason", None) if feedback is not None else None
+                if block_reason:
+                    yield {"kind": "finish", "finish_reason": block_reason}
+                continue
+            candidate = candidates[0]
+            content = getattr(candidate, "content", None)
+            for part in (getattr(content, "parts", None) or ()):
+                # Gemini 3 thought parts are internal reasoning, never caller speech.
+                if getattr(part, "thought", False):
+                    continue
+                text = getattr(part, "text", None)
+                if isinstance(text, str) and text:
+                    yield {"kind": "text", "text": text}
+                if getattr(part, "function_call", None) is not None:
+                    yield {"kind": "tool"}
+            finish = getattr(candidate, "finish_reason", None)
+            if finish is not None:
+                yield {"kind": "finish", "finish_reason": finish}
+
+
+class _UnavailableLLMClient:
+    def open_stream(self, request: Mapping[str, object]) -> Any:
+        raise ProviderBuildError("unselected LLM provider was invoked")
+
+
+class _RoutedLLM:
+    active = True
+
+    def __init__(self, adapter: InquiryOnlyLLMAdapter, providers: Mapping[str, str], closers: tuple[Any, ...]) -> None:
+        self._adapter, self._providers, self._closers = adapter, dict(providers), closers
+
+    async def stream_response(self, transcript: str, language: str, prompt: str) -> AsyncIterator[Any]:
+        async for event in self.stream_response_with_history(
+            transcript, language, prompt, (("user", transcript),)
+        ):
+            yield event
+
+    async def stream_response_with_history(
+        self, transcript: str, language: str, prompt: str, history: tuple[tuple[str, str], ...]
+    ) -> AsyncIterator[Any]:
+        provider = self._providers.get(language)
+        if provider not in {"claude", "gemini"}:
+            raise ProviderBuildError("unsupported LLM language route")
+        messages = tuple(
+            InquiryMessage(role, content)
+            for role, content in history
+            if role in {"user", "assistant"} and isinstance(content, str) and content
+        )
+        # The endpoint owner inserted the current user exactly once before it
+        # invoked us.  `transcript` selects the request route; history is wire
+        # content and deliberately includes that current endpoint claim.
+        request = InquiryRequest(provider=provider, system_prompt=prompt, messages=messages)
+        async for event in self._adapter.stream_response(request):
+            yield event
+
+    async def close(self) -> None:
+        for client in self._closers:
+            close = getattr(client, "close", None) or getattr(client, "aclose", None)
+            if callable(close):
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+
+
+def build_llm_adapter(profile: Any, environ: Mapping[str, str]) -> Any:
+    if _synthetic_enabled(environ):
+        return _SyntheticLLM()
+    providers: dict[str, str] = {}
+    claude_model = gemini_model = ""
+    for language, lanes in profile.languages.items():
+        provider = lanes.get("llm")
+        model = lanes.get("llm_model")
+        if provider not in {"claude", "gemini"} or not isinstance(model, str) or not model:
+            raise ProviderBuildError(f"unsupported LLM provider for {language}")
+        providers[language] = provider
+        if provider == "claude":
+            claude_model = model
+        else:
+            gemini_model = model
+    claude: Any = _UnavailableLLMClient()
+    gemini: Any = _UnavailableLLMClient()
+    closers: list[Any] = []
+    if claude_model:
+        try:
+            from anthropic import AsyncAnthropic
+        except ImportError as error:
+            raise ProviderBuildError("anthropic is unavailable") from error
+        raw_claude = AsyncAnthropic(api_key=_required(environ, "ANTHROPIC_API_KEY"))
+        claude = _ClaudeNativeClient(raw_claude)
+        closers.append(raw_claude)
+    if gemini_model:
+        try:
+            from google import genai
+        except ImportError as error:
+            raise ProviderBuildError("google-genai is unavailable") from error
+        raw_gemini = genai.Client(api_key=_required(environ, "GEMINI_API_KEY"))
+        gemini = _GeminiNativeClient(raw_gemini)
+        closers.append(raw_gemini)
+    return _RoutedLLM(InquiryOnlyLLMAdapter(
+        claude_client=claude, gemini_client=gemini,
+        config=LLMRuntimeConfig(claude_model=claude_model, gemini_model=gemini_model, max_output_tokens=1024,
+            timeouts=StreamTimeouts(), thinking=ThinkingConfig(enabled=True, gemini_level="low")),
+    ), providers, tuple(closers))
+
+
+class _GeminiTTSClient:
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def aclose(self) -> None:
+        close = getattr(self._client, "close", None) or getattr(getattr(self._client, "aio", None), "close", None)
+        if callable(close):
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
+    async def stream_audio(self, *, api_key: str, model: str, text: str, voice: str, timeout: float) -> AsyncIterator[PCM24kChunk]:
+        stream = await asyncio.wait_for(self._client.aio.interactions.create(
+            model=model, input=text, stream=True, response_format={"type": "audio"},
+            generation_config={"speech_config": [{"voice": voice}]},
+        ), timeout=timeout)
+        async for event in stream:
+            event_type = getattr(event, "event_type", None)
+            error = getattr(event, "error", None)
+            if event_type == "error" or (isinstance(event_type, str) and event_type.startswith("interaction.") and error is not None):
+                raise TTSProviderError(_classify_gemini_tts_provider_error(error))
+            if event_type != "step.delta":
+                continue
+            delta = getattr(event, "delta", None)
+            if getattr(delta, "type", None) != "audio":
+                continue
+            if any(getattr(delta, name, None) not in (None, expected) for name, expected in (("mime_type", "audio/l16"), ("channels", 1), ("sample_rate", 24_000))):
+                raise TTSProviderError("invalid_audio_metadata")
+            data = getattr(delta, "data", None)
+            if not isinstance(data, str) or not data:
+                continue
+            try:
+                decoded = base64.b64decode(data, validate=True)
+            except (ValueError, TypeError) as error:
+                raise TTSProviderError("malformed_audio") from error
+            if decoded:
+                yield PCM24kChunk(data=decoded, mime_type=getattr(delta, "mime_type", None) or "audio/l16", channels=getattr(delta, "channels", None) or 1, sample_rate=getattr(delta, "sample_rate", None) or 24_000)
+
+
+_GEMINI_TTS_ERROR_CODES = frozenset({
+    "quota_exceeded", "rate_limited", "invalid_request", "permission_denied", "server_error", "unknown_provider_error",
+})
+
+
+def _classify_gemini_tts_provider_error(error: object) -> str:
+    """Port Kavya's closed code/status classification without retaining messages."""
+    code = getattr(error, "code", None)
+    status = getattr(error, "status", None)
+    code_text = code.strip().lower() if isinstance(code, str) else ""
+    status_text = status.strip().upper() if isinstance(status, str) else ""
+    if "quota" in code_text:
+        return "quota_exceeded"
+    if "rate" in code_text and "limit" in code_text:
+        return "rate_limited"
+    if "invalid" in code_text:
+        return "invalid_request"
+    if "permission" in code_text or "forbidden" in code_text:
+        return "permission_denied"
+    if "server" in code_text or "internal" in code_text or "unavailable" in code_text:
+        return "server_error"
+    if status_text == "RESOURCE_EXHAUSTED":
+        return "rate_limited"
+    if status_text == "PERMISSION_DENIED":
+        return "permission_denied"
+    if status_text == "INVALID_ARGUMENT":
+        return "invalid_request"
+    if status_text in {"UNAVAILABLE", "INTERNAL", "UNKNOWN"}:
+        return "server_error"
+    return "unknown_provider_error"
+
+
+def build_tts_adapter(profile: Any, environ: Mapping[str, str]) -> Any:
+    if _synthetic_enabled(environ):
+        return _SyntheticTTS()
+    routes: dict[str, TTSLanguageRoute] = {}
+    for language, lanes in profile.languages.items():
+        provider = lanes.get("tts")
+        if provider == "elevenlabs":
+            routes[language] = TTSLanguageRoute("elevenlabs")
+        elif provider in {"gemini", "rime"}:
+            routes[language] = TTSLanguageRoute(provider)
+        else:
+            raise ProviderBuildError(f"unsupported TTS provider for {language}")
+    selected = {route.provider for route in routes.values()}
+    http: Any = None
+    if selected & {"elevenlabs", "rime"}:
+        try:
+            import httpx
+        except ImportError as error:
+            raise ProviderBuildError("httpx is unavailable") from error
+        http = httpx.AsyncClient()
+    gemini: Any = None
+    if "gemini" in selected:
+        try:
+            from google import genai
+        except ImportError as error:
+            raise ProviderBuildError("google-genai is unavailable") from error
+        gemini = _GeminiTTSClient(genai.Client(api_key=_required(environ, "GEMINI_API_KEY")))
+    config = TTSStartupConfig(
+        english=ElevenLabsSettings(api_key=_required(environ, "ELEVENLABS_API_KEY"), voice_id=_required(environ, "ELEVENLABS_VOICE_ID")) if "elevenlabs" in selected else None,
+        sinhala_gemini=SinhalaGeminiSettings(api_key=_required(environ, "GEMINI_API_KEY")) if "gemini" in selected else None,
+        language_routes=routes,
+        sinhala_rime=SinhalaRimeSettings(api_key=_required(environ, "RIME_API_KEY")) if "rime" in selected else None,
+    )
+    return SmartPBXTTSAdapter(config, TTSProviderClients(http=http, gemini=gemini))
+
+
+class _SyntheticRecognizer:
+    async def feed_audio(self, audio: bytes) -> None:
+        return None
+    async def close(self) -> None:
+        return None
+
+
+class _SyntheticSTT:
+    active = True
+    async def start_recognizer(self, language: str, on_result: Any) -> _SyntheticRecognizer:
+        return _SyntheticRecognizer()
+
+
+class _SyntheticLLM:
+    active = True
+    async def stream_response(self, transcript: str, language: str, prompt: str) -> AsyncIterator[Any]:
+        yield ProvisionalSentence(1, "Synthetic runtime response.")
+        yield TerminalCommit(1)
+
+    async def stream_response_with_history(
+        self, transcript: str, language: str, prompt: str, history: tuple[tuple[str, str], ...]
+    ) -> AsyncIterator[Any]:
+        async for event in self.stream_response(transcript, language, prompt):
+            yield event
+
+
+class _SyntheticTTS:
+    active = True
+    async def synthesize_audio(self, response: str, language: str) -> AsyncIterator[bytes]:
+        return self._empty()
+
+    async def _empty(self) -> AsyncIterator[bytes]:
+        if False:
+            yield b""

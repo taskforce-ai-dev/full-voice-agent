@@ -1,0 +1,97 @@
+# REVIEW-ONLY. This file is a static candidate, not an activation mechanism.
+services:
+  smartpbx-canonical-ci-fixture:
+    profiles: ["smartpbx"]
+    image: "ghcr.io/taskforce-ai-dev/smartpbx-canonical-ci-fixture@${SMARTPBX_IMAGE_DIGEST:?immutable digest required}"
+    container_name: smartpbx-canonical-ci-fixture
+    ports:
+      - "127.0.0.1:19999:8000"
+    environment:
+      ENABLE_SMARTPBX_WSS: "true"
+      SMARTPBX_WS_TOKEN: "${SMARTPBX_WS_TOKEN:?required}"
+      SMARTPBX_ACCOUNT_ID: "${SMARTPBX_ACCOUNT_ID:?required}"
+      SMARTPBX_AUTH_HEADER_NAME: "X-SmartPBX-Canonical-CI-Token"
+      SMARTPBX_MAX_CALLS: "${SMARTPBX_MAX_CALLS:-4}"
+      SMARTPBX_MAX_MESSAGE_CHARS: "${SMARTPBX_MAX_MESSAGE_CHARS:-65536}"
+      SMARTPBX_MAX_AUDIO_BYTES: "${SMARTPBX_MAX_AUDIO_BYTES:-32768}"
+      SMARTPBX_MAX_OUTBOUND_FRAMES: "${SMARTPBX_MAX_OUTBOUND_FRAMES:-512}"
+      SMARTPBX_PRODUCT_PROFILE_PATH: "/app/config/product_profile.json"
+      SMARTPBX_KNOWLEDGE_DIR: "/app/knowledge_docs"
+      SMARTPBX_PROVIDER_PROFILE_PATH: "/app/config/provider_profile.json"
+      AZURE_SPEECH_KEY: "${AZURE_SPEECH_KEY:-}"
+      AZURE_SPEECH_REGION: "${AZURE_SPEECH_REGION:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      ELEVENLABS_API_KEY: "${ELEVENLABS_API_KEY:-}"
+      ELEVENLABS_VOICE_ID: "${ELEVENLABS_VOICE_ID:-}"
+    volumes:
+      - ./knowledge_docs:/app/knowledge_docs:ro
+
+    mem_limit: 1536m
+    cpus: 2.0
+    pids_limit: 256
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    restart: "no"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - smartpbx-canonical-ci-fixture_bridge
+
+  smartpbx-canonical-ci-fixture-website:
+    profiles: ["website-demo"]
+    image: "ghcr.io/taskforce-ai-dev/smartpbx-canonical-ci-fixture@${SMARTPBX_IMAGE_DIGEST:?immutable digest required}"
+    container_name: smartpbx-canonical-ci-fixture-website
+    command: ["uvicorn", "website_demo:app", "--host", "0.0.0.0", "--port", "8081", "--workers", "1", "--ws-max-size", "65536", "--no-access-log"]
+    ports:
+      - "127.0.0.1:18999:8081"
+    environment:
+      WEBSITE_DEMO_ENABLED: "${WEBSITE_DEMO_ENABLED:?required}"
+      WEBSITE_DEMO_AGENT_ID: "${WEBSITE_DEMO_AGENT_ID:?required}"
+      WEBSITE_DEMO_PUBLIC_BASE_URL: "${WEBSITE_DEMO_PUBLIC_BASE_URL:?required}"
+      WEBSITE_DEMO_ALLOWED_ORIGIN: "${WEBSITE_DEMO_ALLOWED_ORIGIN:?required}"
+      WEBSITE_DEMO_MAX_SESSIONS: "${WEBSITE_DEMO_MAX_SESSIONS:-2}"
+      WEBSITE_DEMO_PRODUCT_PROFILE_PATH: "/app/config/product_profile.json"
+      WEBSITE_DEMO_PROVIDER_PROFILE_PATH: "/app/config/provider_profile.json"
+      WEBSITE_DEMO_KNOWLEDGE_DIR: "/app/knowledge_docs"
+      TWILIO_ACCOUNT_SID: "${TWILIO_ACCOUNT_SID:?required}"
+      TWILIO_AUTH_TOKEN: "${TWILIO_AUTH_TOKEN:?required}"
+      TWILIO_API_KEY_SID: "${TWILIO_API_KEY_SID:?required}"
+      TWILIO_API_KEY_SECRET: "${TWILIO_API_KEY_SECRET:?required}"
+      TWILIO_TWIML_APP_SID: "${TWILIO_TWIML_APP_SID:?required}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    volumes:
+      - ./knowledge_docs:/app/knowledge_docs:ro
+    mem_limit: 1536m
+    cpus: 2.0
+    pids_limit: 256
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    restart: "no"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - smartpbx-canonical-ci-fixture_bridge
+
+networks:
+  smartpbx-canonical-ci-fixture_bridge:
+    internal: false

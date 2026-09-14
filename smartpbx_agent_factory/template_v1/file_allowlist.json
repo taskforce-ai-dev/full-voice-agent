@@ -1,0 +1,24 @@
+{
+  "template_version": "v1",
+  "status": "partial",
+  "block_reason": "the immutable approved baseline remains SmartPBX V06; the V07 candidate marker is separately source-pinned but has no immutable V07 image or lifecycle proof. Candidate runtime templates remain unapproved until the CI lifecycle lane proves provider startup and carrier connected/start/media/stop/hangup cleanup; the source-extracted website-demo profile also requires browser-token, signed-webhook, relay-session, disconnect, and release lifecycle proof",
+  "source_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
+  "image_digest": "sha256:3d1cfce67574efd1c8bde484d26345c027713c4d169f37804114fecec5b81350",
+  "oci_revision": "6f6c2a3ae6f50e3ea84d293a24c37ef74808ec0e",
+  "protocol_version": "smartpbx-ai-provider-v06",
+  "environment_schema_version": "isolated-smartpbx-v1",
+  "files": {
+    "Kavya/smartpbx_protocol.py": {
+      "template_path": "runtime/smartpbx_protocol.py.tmpl",
+      "sha256": "sha256:5007ad11f6966cfa33a6e43a5262f728b4e67ca7a31b59530f94068f5339f5ed"
+    },
+    "Kavya/smartpbx_diagnostics.py": {
+      "template_path": "runtime/smartpbx_diagnostics.py.tmpl",
+      "sha256": "sha256:08a8a8f31232208a0ab8bfd52d71fb8124ba9eaac44453680350d69bbdc980be"
+    },
+    "Kavya/smartpbx_transport.py": {
+      "template_path": "runtime/smartpbx_transport.py.tmpl",
+      "sha256": "sha256:b84642e7cd1d7d784b0817250004877761a73fcdc83c6590ce567c88ee6a921e"
+    }
+  }
+}

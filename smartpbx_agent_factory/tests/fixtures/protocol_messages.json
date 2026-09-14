@@ -1,0 +1,14 @@
+{
+  "stop": [
+    {"event": "connected", "connected": {"protocol": "smartpbx-ai-provider-v07"}},
+    {"event": "start", "start": {"callId": "ci-call-stop", "otherLegCallId": "ci-other-stop", "callerIdNumber": "ci-caller-000", "calleeIdNumber": "ci-callee-000", "accountId": "account-synthetic", "mediaFormat": {"encoding": "g711_ulaw", "sampleRate": 8000}}},
+    {"event": "media", "media": {"payload": "/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////w=="}},
+    {"event": "stop", "stop": {}}
+  ],
+  "hangup": [
+    {"event": "connected", "connected": {"protocol": "smartpbx-ai-provider-v07"}},
+    {"event": "start", "start": {"callId": "ci-call-hangup", "otherLegCallId": "ci-other-hangup", "callerIdNumber": "ci-caller-000", "calleeIdNumber": "ci-callee-000", "accountId": "account-synthetic", "mediaFormat": {"encoding": "g711_ulaw", "sampleRate": 8000}}},
+    {"event": "media", "media": {"payload": "/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////w=="}},
+    {"event": "hangup", "hangup": {"callId": "ci-call-hangup", "otherLegCallId": "ci-other-hangup", "reason": "normal_clearing"}}
+  ]
+}
