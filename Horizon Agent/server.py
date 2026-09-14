@@ -2012,6 +2012,24 @@ class MediaStreamSession:
                 "streamSid": self.stream_sid,
             }))
 
+    def _tts_superseded(self, gen: int) -> bool:
+        """True once a barge-in supersedes the TTS call that captured *gen*.
+
+        In-stream TTS loops must key interruption off this, NOT off
+        ``self._is_speaking``. A turn is spoken sentence-by-sentence, each a
+        separate TTS call that sends its own ``tts_done`` mark; Twilio echoes
+        that mark only after it finishes *playing* that sentence. Rime Arcana
+        streams at ~realtime, so sentence N's mark echoes back (clearing
+        ``_is_speaking``) while sentence N+1 is still streaming — which, with
+        the old ``if not self._is_speaking: break`` guard, cut Sinhala replies
+        off mid-sentence. Barge-in instead bumps ``_speak_generation``, so
+        comparing against the captured generation cancels on a real
+        interruption only. (ElevenLabs sends its audio in a fast network burst,
+        so every sentence was buffered before any mark echoed — which is why
+        English/Arabic never showed the truncation and Sinhala did.)
+        """
+        return self._speak_generation != gen
+
     # â”€â”€ Debug: live-call audio capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _write_audio_dump(self) -> None:
@@ -2607,6 +2625,7 @@ class MediaStreamSession:
             return
 
         self._is_speaking = True
+        gen = self._speak_generation
         # Arabic uses its own dedicated voice; Tamil keeps the shared cloned voice.
         voice_id = (
             ELEVENLABS_VOICE_ID_AR or ELEVENLABS_VOICE_ID
@@ -2644,7 +2663,7 @@ class MediaStreamSession:
                         return
 
                     async for chunk in resp.aiter_bytes(chunk_size=640):
-                        if not self._is_speaking:
+                        if self._tts_superseded(gen):
                             break
                         b64 = base64.b64encode(chunk).decode("ascii")
                         async with self._ws_lock:
@@ -2654,7 +2673,7 @@ class MediaStreamSession:
                                 "media": {"payload": b64},
                             }))
 
-            if self._is_speaking:
+            if not self._tts_superseded(gen):
                 async with self._ws_lock:
                     await self.ws.send_text(json.dumps({
                         "event": "mark",
@@ -2688,6 +2707,7 @@ class MediaStreamSession:
             return
 
         self._is_speaking = True
+        gen = self._speak_generation
         payload: dict[str, Any] = {
             "model": OPENAI_TTS_MODEL,
             "voice": OPENAI_TTS_VOICE,
@@ -2718,7 +2738,7 @@ class MediaStreamSession:
                         return
 
                     async for chunk in resp.aiter_bytes(chunk_size=4800):
-                        if not self._is_speaking:
+                        if self._tts_superseded(gen):
                             break
                         if not chunk:
                             continue
@@ -2735,7 +2755,7 @@ class MediaStreamSession:
                         mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
 
                         while len(mulaw_buf) >= 640:
-                            if not self._is_speaking:
+                            if self._tts_superseded(gen):
                                 break
                             frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
                             b64 = base64.b64encode(frame).decode("ascii")
@@ -2747,7 +2767,7 @@ class MediaStreamSession:
                                 }))
 
             # Flush any remaining tail of mulaw audio.
-            if self._is_speaking and mulaw_buf:
+            if not self._tts_superseded(gen) and mulaw_buf:
                 b64 = base64.b64encode(mulaw_buf).decode("ascii")
                 async with self._ws_lock:
                     await self.ws.send_text(json.dumps({
@@ -2756,7 +2776,7 @@ class MediaStreamSession:
                         "media": {"payload": b64},
                     }))
 
-            if self._is_speaking:
+            if not self._tts_superseded(gen):
                 async with self._ws_lock:
                     await self.ws.send_text(json.dumps({
                         "event": "mark",
@@ -2790,6 +2810,7 @@ class MediaStreamSession:
             "Content-Type": "application/json",
         }
         self._is_speaking = True
+        gen = self._speak_generation
         got_audio = False
         mulaw_buf = b""
         try:
@@ -2814,7 +2835,7 @@ class MediaStreamSession:
 
                     total = 0
                     async for chunk in resp.aiter_bytes():
-                        if not self._is_speaking:
+                        if self._tts_superseded(gen):
                             break
                         if not chunk:
                             continue
@@ -2825,7 +2846,7 @@ class MediaStreamSession:
                         got_audio = True
                         mulaw_buf += chunk
                         while len(mulaw_buf) >= 640:
-                            if not self._is_speaking:
+                            if self._tts_superseded(gen):
                                 break
                             frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
                             b64 = base64.b64encode(frame).decode("ascii")
@@ -2841,7 +2862,7 @@ class MediaStreamSession:
                 await self._tts_gemini(text)
                 return
 
-            if self._is_speaking and mulaw_buf:
+            if not self._tts_superseded(gen) and mulaw_buf:
                 b64 = base64.b64encode(mulaw_buf).decode("ascii")
                 async with self._ws_lock:
                     await self.ws.send_text(json.dumps({
@@ -2850,7 +2871,7 @@ class MediaStreamSession:
                         "media": {"payload": b64},
                     }))
 
-            if self._is_speaking:
+            if not self._tts_superseded(gen):
                 async with self._ws_lock:
                     await self.ws.send_text(json.dumps({
                         "event": "mark",
@@ -2895,6 +2916,7 @@ class MediaStreamSession:
             return
 
         self._is_speaking = True
+        gen = self._speak_generation
         ratecv_state = None   # audioop.ratecv carry-over state (24k -> 8k)
         pcm_tail = b""        # holds a stray odd byte across chunk boundaries
         mulaw_buf = b""       # accumulates mulaw output, flushed in 640-byte frames
@@ -2913,7 +2935,7 @@ class MediaStreamSession:
             )
 
             async for audio_b64 in _iter_gemini_tts_audio_deltas(stream):
-                if not self._is_speaking:
+                if self._tts_superseded(gen):
                     break
                 try:
                     chunk = base64.b64decode(audio_b64, validate=True)
@@ -2935,7 +2957,7 @@ class MediaStreamSession:
                 mulaw_buf += audioop.lin2ulaw(pcm8k, 2)
 
                 while len(mulaw_buf) >= 640:
-                    if not self._is_speaking:
+                    if self._tts_superseded(gen):
                         break
                     frame, mulaw_buf = mulaw_buf[:640], mulaw_buf[640:]
                     b64 = base64.b64encode(frame).decode("ascii")
@@ -2954,7 +2976,7 @@ class MediaStreamSession:
                 return
 
             # Flush any remaining tail of mulaw audio.
-            if self._is_speaking and mulaw_buf:
+            if not self._tts_superseded(gen) and mulaw_buf:
                 b64 = base64.b64encode(mulaw_buf).decode("ascii")
                 async with self._ws_lock:
                     await self.ws.send_text(json.dumps({
@@ -2963,7 +2985,7 @@ class MediaStreamSession:
                         "media": {"payload": b64},
                     }))
 
-            if self._is_speaking:
+            if not self._tts_superseded(gen):
                 async with self._ws_lock:
                     await self.ws.send_text(json.dumps({
                         "event": "mark",
@@ -2993,6 +3015,7 @@ class MediaStreamSession:
             return
 
         self._is_speaking = True
+        gen = self._speak_generation
         url = AZURE_TTS_URL.format(region=AZURE_SPEECH_REGION)
         headers = {
             "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
@@ -3019,7 +3042,7 @@ class MediaStreamSession:
                         self._is_speaking = False
                         return
                     async for chunk in resp.aiter_bytes(chunk_size=640):
-                        if not self._is_speaking:
+                        if self._tts_superseded(gen):
                             break
                         b64 = base64.b64encode(chunk).decode("ascii")
                         async with self._ws_lock:
@@ -3028,7 +3051,7 @@ class MediaStreamSession:
                                 "streamSid": self.stream_sid,
                                 "media": {"payload": b64},
                             }))
-            if self._is_speaking:
+            if not self._tts_superseded(gen):
                 async with self._ws_lock:
                     await self.ws.send_text(json.dumps({
                         "event": "mark",
