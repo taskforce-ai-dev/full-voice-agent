@@ -1,0 +1,143 @@
+# ============================================================
+# Docker Compose — IAAC Voice Agent (Vidya)
+# ============================================================
+# Vidya is the inquiry agent for IAAC (International Airline and Aviation
+# College). Dialog SmartPBX ("Client Connect") is the only ingress — there is
+# no Twilio number. Bilingual English + Sinhala, chosen by a DTMF menu on the
+# Dialog line (press 1 English, press 2 Sinhala).
+#
+# INQUIRY-ONLY: no PMS/booking, no live transfer, no post-call automation.
+# Cloned from Kavya's Dialog stack, with all of that dropped by config:
+#   * no YANOLJA_* -> get_tools() returns [] -> booking + transfer tools gone
+#   * no SMARTPBX_MCP_*/TRANSFER -> no live transfer
+#   * no N8N_/DASHBOARD_ -> no post-call webhook or dashboard push
+#
+# Deploy model mirrors Hutch (build on the VPS, auto-deploy on push to main),
+# NOT Kavya's immutable-image pipeline.
+#
+# Usage:
+#   docker compose --env-file .env.smartpbx --profile smartpbx up -d --build iaac-smartpbx
+#   docker compose --env-file .env.smartpbx --profile smartpbx logs -f iaac-smartpbx
+# ============================================================
+
+services:
+  # Isolated Dialog SmartPBX ingress -- the only real target for IAAC/Vidya.
+  # This profile is off unless explicitly selected.
+  iaac-smartpbx:
+    profiles: ["smartpbx"]
+    build: .
+    container_name: iaac-smartpbx
+
+    # Host Nginx is the public TLS boundary; keep the application loopback-only.
+    # 8042 is free (kavya-smartpbx=8006, hutch-smartpbx=8041).
+    ports:
+      - "127.0.0.1:8042:8000"
+
+    # Do not use env_file here: this is a complete, explicit SmartPBX allowlist,
+    # mirroring Kavya's kavya-smartpbx isolation pattern. Populate it only via
+    # `docker compose --env-file .env.smartpbx --profile smartpbx ...`.
+    # Never pass Twilio, Yanolja/PMS, MCP-transfer, or dashboard credentials here.
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-credentials.json
+      IAAC_SERVICE_MODE: smartpbx
+      ENABLE_SMARTPBX_WSS: "true"
+
+      # --- LLM (brain): Claude for English, Gemini (Claude fallback) for Sinhala
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-claude}"
+      CLAUDE_MODEL: "${CLAUDE_MODEL:-claude-sonnet-4-5-20250929}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GEMINI_MODEL: "${GEMINI_MODEL:-gemini-2.5-flash}"
+      GEMINI_FAILOVER_TO_CLAUDE: "${GEMINI_FAILOVER_TO_CLAUDE:-true}"
+      GEMINI_FAILOVER_STICKY_AFTER: "${GEMINI_FAILOVER_STICKY_AFTER:-2}"
+
+      # --- Language menu + Sinhala pipeline
+      SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS: "${SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS:-8.0}"
+      SMARTPBX_SINHALA_LLM_PROVIDER: "${SMARTPBX_SINHALA_LLM_PROVIDER:-gemini}"
+      SMARTPBX_SINHALA_GEMINI_LLM_MODEL: "${SMARTPBX_SINHALA_GEMINI_LLM_MODEL:-gemini-3.7-flash}"
+      SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL: "${SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL:-low}"
+      SMARTPBX_SINHALA_GEMINI_MAX_TOKENS: "${SMARTPBX_SINHALA_GEMINI_MAX_TOKENS:-1024}"
+      # Sinhala VOICE (TTS) = Gemini. IAAC's own GEMINI_API_KEY -> isolated quota.
+      SMARTPBX_SINHALA_TTS_PROVIDER: "${SMARTPBX_SINHALA_TTS_PROVIDER:-gemini}"
+      SMARTPBX_SINHALA_GEMINI_TTS_MODEL: "${SMARTPBX_SINHALA_GEMINI_TTS_MODEL:-gemini-3.1-flash-tts-preview}"
+      SMARTPBX_SINHALA_GEMINI_TTS_VOICE: "${SMARTPBX_SINHALA_GEMINI_TTS_VOICE:-Vindemiatrix}"
+      SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS: "${SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS:-15.0}"
+      SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER: "${SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER:-3}"
+      SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS: "${SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS:-}"
+      SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR: "${SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR:-7}"
+      SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS: "${SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS:-7.0}"
+      SMARTPBX_SINHALA_PHRASE_CACHE_DIR: "${SMARTPBX_SINHALA_PHRASE_CACHE_DIR:-/app/smartpbx_phrase_cache}"
+      RIME_API_KEY: "${RIME_API_KEY:-}"
+
+      # --- English VOICE (TTS) = ElevenLabs
+      ELEVENLABS_API_KEY: "${ELEVENLABS_API_KEY:-}"
+      KAVYA_EN_ELEVENLABS_VOICE_ID: "${KAVYA_EN_ELEVENLABS_VOICE_ID:-}"
+      ELEVENLABS_VOICE_ID: "${ELEVENLABS_VOICE_ID:-}"
+
+      # --- STT (ears): Azure for Sinhala (forced), Azure/Google for English
+      STT_PROVIDER: "${STT_PROVIDER:-azure}"
+      AZURE_SPEECH_KEY: "${AZURE_SPEECH_KEY:-}"
+      AZURE_SPEECH_REGION: "${AZURE_SPEECH_REGION:-southeastasia}"
+      SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS: "${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-1200}"
+      SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD: "${SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD:-0.65}"
+      STT_ENDPOINTING_SILENCE_SECONDS: "${STT_ENDPOINTING_SILENCE_SECONDS:-1.0}"
+      STT_FINAL_GRACE_SECONDS: "${STT_FINAL_GRACE_SECONDS:-0.5}"
+      DTMF_INTERDIGIT_TIMEOUT_SECONDS: "${DTMF_INTERDIGIT_TIMEOUT_SECONDS:-6.0}"
+      DTMF_OVERALL_TIMEOUT_SECONDS: "${DTMF_OVERALL_TIMEOUT_SECONDS:-30.0}"
+      DTMF_MAX_DIGITS: "${DTMF_MAX_DIGITS:-15}"
+      BARGEIN_MIN_CHARS: "${BARGEIN_MIN_CHARS:-12}"
+      BARGEIN_DEBOUNCE_SECONDS: "${BARGEIN_DEBOUNCE_SECONDS:-0.6}"
+
+      # --- Knowledge base. KB_N_RESULTS=8 from the start (the retrieval-depth
+      # fix Kavya needed): several IAAC courses look alike to the embedder, so
+      # top-3 would crowd out the specific course/fee a caller asks about.
+      KB_DOCS_DIRECTORY: /app/knowledge_docs
+      KB_N_RESULTS: "${KB_N_RESULTS:-8}"
+      HF_HUB_OFFLINE: "1"
+
+      # --- Dialog SmartPBX boundary
+      SMARTPBX_WS_TOKEN: "${SMARTPBX_WS_TOKEN:-}"
+      SMARTPBX_ACCOUNT_ID: "${SMARTPBX_ACCOUNT_ID:-}"
+      SMARTPBX_AUTH_HEADER_NAME: X-IAAC-SmartPBX-Token
+      SMARTPBX_MAX_CALLS: "${SMARTPBX_MAX_CALLS:-4}"
+      SMARTPBX_MAX_MESSAGE_CHARS: "${SMARTPBX_MAX_MESSAGE_CHARS:-65536}"
+      SMARTPBX_MAX_AUDIO_BYTES: "${SMARTPBX_MAX_AUDIO_BYTES:-32768}"
+      SMARTPBX_MAX_OUTBOUND_FRAMES: "${SMARTPBX_MAX_OUTBOUND_FRAMES:-512}"
+      SMARTPBX_START_TIMEOUT_SECONDS: "${SMARTPBX_START_TIMEOUT_SECONDS:-10}"
+      SMARTPBX_IDLE_TIMEOUT_SECONDS: "${SMARTPBX_IDLE_TIMEOUT_SECONDS:-90}"
+      SMARTPBX_MAX_CALL_SECONDS: "${SMARTPBX_MAX_CALL_SECONDS:-3600}"
+      # Inquiry-only: MCP live transfer stays disabled (empty destinations), and
+      # with no Yanolja creds the tool list is empty so the model cannot transfer
+      # or book anyway. Left explicit so the default can never silently arm it.
+      SMARTPBX_TRANSFER_DESTINATIONS_JSON: "${SMARTPBX_TRANSFER_DESTINATIONS_JSON:-{}}"
+
+    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws-max-size", "65536"]
+
+    volumes:
+      # Never share another agent's writable Chroma store.
+      - ./chroma_db_iaac_smartpbx:/app/chroma_db
+      - ./knowledge_docs:/app/knowledge_docs:ro
+      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+      # Persistent Sinhala fixed-phrase TTS cache (survives restart; avoids
+      # re-spending Gemini TTS quota on every boot).
+      - ./smartpbx_phrase_cache_iaac:/app/smartpbx_phrase_cache
+
+    mem_limit: 1536m
+    cpus: 2.0
+    pids_limit: 256
+
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
