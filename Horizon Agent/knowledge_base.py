@@ -197,20 +197,73 @@ def _stable_id(text: str, index: int) -> str:
 # Text chunking
 # ---------------------------------------------------------------------------
 
+def _split_long_block(block: str, chunk_size: int, overlap: int) -> List[str]:
+    """Split a single over-long block on sentence/word boundaries.
+
+    Used only for a paragraph that is itself larger than *chunk_size*. Always
+    makes forward progress of at least ``chunk_size - overlap`` characters, so
+    it can never stall (the bug the paragraph packer below was written to
+    avoid): the previous sliding window shrank its step to a single character
+    whenever a break landed within *overlap* of the window start, which on a
+    section-underline (``----``) doc exploded one short doc into hundreds of
+    near-duplicate slivers.
+    """
+    block = block.strip()
+    if len(block) <= chunk_size:
+        return [block] if block else []
+
+    step = max(chunk_size - overlap, 1)
+    chunks: List[str] = []
+    start = 0
+    while start < len(block):
+        end = start + chunk_size
+        if end >= len(block):
+            tail = block[start:].strip()
+            if tail:
+                chunks.append(tail)
+            break
+
+        window = block[start:end]
+        split_pos = -1
+        for pattern in (". ", "? ", "! "):
+            split_pos = window.rfind(pattern)
+            if split_pos != -1:
+                split_pos += 1  # keep the punctuation with the sentence
+                break
+        if split_pos == -1:
+            split_pos = window.rfind(" ")
+        # Never accept a split so early that the step would collapse; fall back
+        # to a fixed stride instead, guaranteeing progress.
+        if split_pos < step:
+            split_pos = chunk_size
+
+        piece = block[start:start + split_pos].strip()
+        if piece:
+            chunks.append(piece)
+        start += max(split_pos - overlap, step)
+
+    return chunks
+
+
 def chunk_text(
     text: str,
     chunk_size: int = 500,
     overlap: int = 50,
 ) -> List[str]:
-    """Split *text* into overlapping chunks, respecting natural boundaries.
+    """Split *text* into retrieval-sized chunks along paragraph boundaries.
 
-    Strategy (in order of preference):
-      1. Split on paragraph boundaries (double newlines).
-      2. Split on sentence boundaries (period / question-mark / exclamation-mark).
-      3. Split on word boundaries (whitespace).
+    The KB is authored as blank-line-separated paragraphs and small tables
+    (section headers, the campus contact table, the per-diploma paragraphs).
+    This packer keeps each of those blocks whole and greedily groups
+    consecutive blocks up to *chunk_size*, so a single question's facts (a
+    program's fee/duration/entry, or the full 3-campus table) land together in
+    one chunk instead of being shredded across many. A block that is itself
+    larger than *chunk_size* is split on sentence/word boundaries via
+    ``_split_long_block``.
 
-    Each chunk is at most *chunk_size* characters long.  Consecutive chunks
-    share *overlap* trailing characters to preserve context across boundaries.
+    Section-underline rules (``====`` / ``----``) travel attached to their
+    header block and never become standalone chunks, so the vector store is no
+    longer polluted with pure-punctuation entries.
     """
     if not text or not text.strip():
         return []
@@ -219,42 +272,29 @@ def chunk_text(
     if len(text) <= chunk_size:
         return [text]
 
+    # Blank line(s) separate paragraph blocks.
+    blocks = [b.strip() for b in re.split(r"\n[ \t]*\n", text) if b.strip()]
+
     chunks: List[str] = []
-    start = 0
+    current = ""
+    for block in blocks:
+        if len(block) > chunk_size:
+            # Carry any pending block (typically a short section header) into
+            # the over-long block so the header rides with its own content's
+            # first sub-chunk rather than becoming an orphan header chunk.
+            combined = f"{current}\n\n{block}" if current else block
+            current = ""
+            chunks.extend(_split_long_block(combined, chunk_size, overlap))
+            continue
 
-    while start < len(text):
-        end = start + chunk_size
+        if current and len(current) + 2 + len(block) > chunk_size:
+            chunks.append(current)
+            current = block
+        else:
+            current = f"{current}\n\n{block}" if current else block
 
-        if end >= len(text):
-            chunks.append(text[start:].strip())
-            break
-
-        # Look for the best split point inside the window.
-        window = text[start:end]
-
-        # 1. Paragraph break
-        split_pos = window.rfind("\n\n")
-        if split_pos == -1:
-            # 2. Sentence break
-            for pattern in (". ", "? ", "! "):
-                split_pos = window.rfind(pattern)
-                if split_pos != -1:
-                    split_pos += 1  # include the punctuation
-                    break
-        if split_pos == -1:
-            # 3. Word break
-            split_pos = window.rfind(" ")
-        if split_pos == -1:
-            # Hard cut as last resort
-            split_pos = chunk_size
-
-        actual_end = start + split_pos
-        chunk = text[start:actual_end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        # Move forward, applying overlap
-        start = max(actual_end - overlap, start + 1)
+    if current:
+        chunks.append(current)
 
     return chunks
 
