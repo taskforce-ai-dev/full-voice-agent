@@ -60,19 +60,19 @@ jobs:
           # workflow_dispatch: agent=horizon), confirm /health, then add
           # "Horizon Agent:horizon" here in a follow-up so later code changes
           # auto-deploy like the other agents.
-          for entry in "BSL Agent:bsl" "Flico Agent:flico" "HattonHills:hatton" "SLIC Agent:slic" "Sofia Agent:sofia" "Kavya:kavya" "Kitchened:kitchened" "WorldOfRefrigerators:wor"; do
+          for entry in "BSL Agent:bsl" "Flico Agent:flico" "HattonHills:hatton" "SLIC Agent:slic" "Sofia Agent:sofia" "Kavya:kavya" "Kitchened:kitchened" "WorldOfRefrigerators:wor" "Riviera:riviera"; do
             dir="${entry%%:*}"; id="${entry##*:}"
             match=$(printf '%s\n' "$CHANGED" | grep -F "$dir/" || true)
             [ -z "$match" ] && continue
-            # Kavya SmartPBX has a protected immutable-image route. Generic
-            # deploy.yml rejects its image mode, so do not manufacture an
-            # intentional failure here: use the reviewed probe -> publisher ->
-            # runbook flow instead.
-            if [ "$id" = "kavya" ]; then
-              echo "-> Kavya excluded from generic deployment; use reviewed SmartPBX probe -> publisher -> runbook route"
+            # Kavya and Riviera (a Kavya clone) have a protected immutable-image
+            # route. Generic deploy.yml rejects their image mode, so do not
+            # manufacture an intentional failure here: use the reviewed
+            # probe -> publisher -> runbook flow instead.
+            if [ "$id" = "kavya" ] || [ "$id" = "riviera" ]; then
+              echo "-> $id excluded from generic deployment; use reviewed SmartPBX probe -> publisher -> runbook route"
               {
-                echo "## Kavya SmartPBX deployment"
-                echo "- Kavya changes are excluded from generic deploy-on-push."
+                echo "## $id SmartPBX deployment"
+                echo "- $id changes are excluded from generic deploy-on-push."
                 echo "- Use the reviewed SmartPBX probe -> publisher -> runbook route."
               } >> "$GITHUB_STEP_SUMMARY"
               continue

@@ -32,10 +32,10 @@ on:
   # pinned deps, which is exactly the case a per-PR run CANNOT catch. Use
   # workflow_dispatch for an on-demand check when changing dependencies.
   #
-  # Kavya's `pull_request` trigger is scoped to its own requirements files
-  # only, so it does not reintroduce the per-PR cost for the other seven
-  # agents (their rows in the matrix still run, but only on this narrow
-  # trigger, and only Kavya's row is blocking).
+  # The `pull_request` trigger is scoped to Kavya's and Riviera's own
+  # requirements files only, so it does not reintroduce the per-PR cost for
+  # the other seven agents (only the Kavya and Riviera rows run on it, and
+  # only those two rows are blocking).
   #
   # If another agent is ever made blocking (drop its `continue-on-error`),
   # widen the `pull_request` `paths` filter below to include its
@@ -44,6 +44,7 @@ on:
   pull_request:
     paths:
       - 'Kavya/requirements*'
+      - 'Riviera/requirements*'
   workflow_dispatch:
   schedule:
     # Weekly, Mondays at 06:00 UTC.
@@ -60,11 +61,11 @@ jobs:
   audit:
     name: pip-audit (${{ matrix.dir }})
     runs-on: ubuntu-latest
-    # ADVISORY for every agent except Kavya: do not fail the workflow on
+    # ADVISORY for every agent except Kavya and Riviera: do not fail the workflow on
     # findings yet. Tighten another agent later by adding it to this
     # exclusion the same way, once its existing pinned advisories are
     # resolved.
-    continue-on-error: ${{ matrix.dir != 'Kavya' }}
+    continue-on-error: ${{ matrix.dir != 'Kavya' && matrix.dir != 'Riviera' }}
     strategy:
       # Audit every agent dir independently; one vulnerable agent does not
       # short-circuit the others.
@@ -74,7 +75,7 @@ jobs:
         # On pull_request only Kavya runs (its trigger is scoped to Kavya's
         # requirements files and it is the only blocking row); the weekly and
         # manual runs audit every agent.
-        dir: ${{ github.event_name == 'pull_request' && fromJSON('["Kavya"]') || fromJSON('["BSL Agent","Flico Agent","HattonHills","Kavya","Kitchened","SLIC Agent","Sofia Agent","WorldOfRefrigerators"]') }}
+        dir: ${{ github.event_name == 'pull_request' && fromJSON('["Kavya","Riviera"]') || fromJSON('["BSL Agent","Flico Agent","HattonHills","Kavya","Kitchened","Riviera","SLIC Agent","Sofia Agent","WorldOfRefrigerators"]') }}
 
     steps:
       - name: Checkout
@@ -104,10 +105,10 @@ jobs:
         run: |
           dir="${{ matrix.dir }}"
 
-          if [ "$dir" = "Kavya" ]; then
+          if [ "$dir" = "Kavya" ] || [ "$dir" = "Riviera" ]; then
             req="$dir/requirements-prod.lock.txt"
             if [ ! -f "$req" ]; then
-              echo "::error::Kavya requires a pinned lock file at $req" >&2
+              echo "::error::$dir requires a pinned lock file at $req" >&2
               exit 1
             fi
             echo "Auditing (locked, no-deps): $req"

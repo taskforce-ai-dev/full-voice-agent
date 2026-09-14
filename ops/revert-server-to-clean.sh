@@ -32,7 +32,7 @@ set -uo pipefail
 
 BASE=/opt/.handover-baseline
 BACKUP=/opt/.revert-backup
-AGENTS="bsl-agent flico hatton-hills slic-agent kavya kitchened worldofrefrigerators sofia"
+AGENTS="bsl-agent flico hatton-hills slic-agent kavya kitchened worldofrefrigerators sofia riviera"
 # Optional: pass one or more /opt dir names as args to revert only those
 # (e.g. `bash revert-server-to-clean.sh kitchened` for a single-agent dry run).
 # A partial (per-agent) run skips the deploy-key removal + self-destruct, so it's
@@ -47,6 +47,7 @@ container_for() {
     hatton-hills)         echo hatton-hills-voice-agent ;;
     slic-agent)           echo slic-voice-agent ;;
     kavya)                echo kavya-voice-agent ;;
+    riviera)              echo riviera-voice-agent ;;
     kitchened)            echo kitchened-voice-agent ;;
     worldofrefrigerators) echo wor-voice-agent ;;
     sofia)                echo sofia-voice-agent ;;

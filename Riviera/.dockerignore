@@ -1,0 +1,39 @@
+# Virtual environments
+venv/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Runtime data (persisted via Docker volume)
+chroma_db/
+
+# Secrets (passed via docker-compose environment)
+.env
+
+# Version control
+.git/
+.github/
+
+# IDE / editor config
+.vscode/
+.idea/
+
+# Claude Code config
+.claude/
+
+# Documentation (knowledge_docs/ is intentionally kept)
+*.md
+!knowledge_docs/**/*.md
+
+# Local-only test scripts
+test_voice.py
+test_voice_elevenlabs.py
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log

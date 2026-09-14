@@ -9,7 +9,11 @@ name: healthcheck
 # treat the ~20-minute cadence below as approximate, not guaranteed.
 #
 # URLs not yet reachable (add once DNS/health is live):
-#   (none — all recon URLs were reachable:true as of 2026-06-30)
+#   "Riviera|https://riviera.taskforceai.tech/health"
+#   "Riviera SmartPBX|https://smartpbx-riviera.taskforceai.tech/health"
+#   (Riviera/ was added Sep 2026 and is not provisioned on the VPS yet — see
+#   Riviera/README.md "Bring-up checklist". Move these into URLS below once
+#   they answer, or this job pages on every run.)
 #
 # Recon caveats baked into the list below:
 #   - SLIC and Sofia are both configured to abans.taskforceai.tech. The live

@@ -79,8 +79,11 @@ via `.github/workflows/deploy-on-push.yml` → `deploy.yml`:
   human gate is the pre-push risk analysis. Manual: Actions → "Deploy Agent", or
   `gh workflow run deploy.yml -f agent=<id> -f ref=main -f mode=fast|build`.
 - **Sentry → Claude auto-triage** uses **Opus 4.8** (`claude-opus-4-8`), draft-PR only.
-- **Kavya** is excluded from this matrix — see `Kavya/SMARTPBX_RUNBOOK.md`'s guarded
-  probe → publish → deploy pipeline instead. **Hutch** is also excluded (its VPS shape
+- **Kavya** and **Riviera** (a full Kavya clone for Riviera Resort, Batticaloa; see
+  `Riviera/AGENTS.md`) are excluded from this matrix — see `Kavya/SMARTPBX_RUNBOOK.md` /
+  `Riviera/SMARTPBX_RUNBOOK.md`'s guarded probe → publish → deploy pipeline instead
+  (`build-riviera-image.yml` + `probe-riviera-image.yml` mirror the Kavya pair).
+  **Hutch** is also excluded (its VPS shape
   doesn't fit the flat-rsync model here) but has its own auto-deploy on push to `main`
   under `Hutch Agent/**` — see `.github/workflows/deploy-hutch.yml` and
   `Hutch Agent/AGENTS.md`'s Deployment section.
@@ -178,8 +181,9 @@ future editing convenience.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 
-This project has a graphify knowledge graph at `graphify-out/`. It covers all 6 voice
-agents (BSL, Kavya, SLIC, Sofia, Flico, HattonHills), agent-dashboard, SinhalaVITS-TTS,
+This project has a graphify knowledge graph at `graphify-out/`. It covers the voice
+agents (BSL, Kavya, SLIC, Sofia, Flico, HattonHills; Kitchened, WorldOfRefrigerators,
+Horizon and Riviera were added later and need a `graphify update .`), agent-dashboard, SinhalaVITS-TTS,
 flico-dashboard, and the **Taskforce AI website** (`Taskforce_AI_Website/`). After the
 Jun 18, 2026 full LLM rebuild (2,170 nodes) the website was added via AST update, so it
 now has **~2,881 nodes, ~4,473 edges, 279 communities**, plus an interactive `graph.html`.

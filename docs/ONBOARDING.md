@@ -67,7 +67,7 @@ python server.py
 
 1. **Branch** — `feat/<scope>-<desc>`, `fix/<scope>-<desc>`, `chore/<desc>`.
    Scope is the agent id (`kavya`, `flico`, `bsl`, `hatton`, `slic`, `sofia`,
-   `kitchened`, `wor`) or an area (`ci`, `docs`, `ops`).
+   `kitchened`, `wor`, `horizon`, `riviera`) or an area (`ci`, `docs`, `ops`).
 2. **Commit** — conventional style: `fix(kavya): stop the failsafe leaking state`.
 3. **Open a PR.** The template asks which agents deploy and what the call impact
    is. Fill it in honestly — the reviewer is relying on it.
