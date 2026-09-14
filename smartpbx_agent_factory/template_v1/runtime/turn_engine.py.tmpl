@@ -195,7 +195,6 @@ class ConversationTurnEngine:
         if recognizer is None:
             return False
         await recognizer.feed_audio(bytes(audio))
-        await self._cancel_reprompt()
         return True
 
     async def close(self) -> None:
@@ -296,6 +295,8 @@ class ConversationTurnEngine:
                     await self._cancel_active_turn(clear_audio=True)
             if not self._reconcile_recognizer_text(text, result):
                 return
+            await self._cancel_reprompt()
+            self._reprompt_count = 0
             self._arm_endpointing(
                 self._final_grace_seconds if result.is_final else self._endpointing_silence_seconds
             )

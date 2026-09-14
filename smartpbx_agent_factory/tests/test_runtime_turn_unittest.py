@@ -156,6 +156,105 @@ class TurnDrainTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await engine.close()
 
+    async def test_raw_audio_frames_do_not_cancel_an_armed_reprompt(self) -> None:
+        engine = self._engine()
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        class RecordingRecognizer:
+            async def feed_audio(self, _audio: bytes) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        async def waiting_reprompt() -> None:
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        engine._recognizer = RecordingRecognizer()
+        engine._reprompt_after_silence = waiting_reprompt
+        await engine._arm_reprompt()
+        task = engine._reprompt_task
+        self.assertIsNotNone(task)
+        await entered.wait()
+
+        for _ in range(3):
+            self.assertTrue(await engine.accept_audio(b"\xff" * 160, self._language))
+
+        self.assertIs(engine._reprompt_task, task)
+        self.assertFalse(cancelled.is_set())
+        await engine.close()
+
+    async def test_admitted_material_recognizer_result_cancels_reprompt_and_resets_count(self) -> None:
+        engine = self._engine()
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def waiting_reprompt() -> None:
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        engine._reprompt_after_silence = waiting_reprompt
+        engine._reprompt_count = 1
+        await engine._arm_reprompt()
+        await entered.wait()
+
+        await engine._handle_recognizer_result(
+            engine._recognizer_epoch,
+            self._engine_module.RecognizerResult("material inquiry", is_final=False),
+        )
+
+        self.assertTrue(cancelled.is_set())
+        self.assertIsNone(engine._reprompt_task)
+        self.assertEqual(engine._reprompt_count, 0)
+        await engine.close()
+
+    async def test_empty_echo_and_duplicate_results_retain_an_armed_reprompt(self) -> None:
+        engine = self._engine()
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def waiting_reprompt() -> None:
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        duplicate = self._engine_module.RecognizerResult("duplicate input", is_final=False, result_id="duplicate")
+        await engine._handle_recognizer_result(engine._recognizer_epoch, duplicate)
+        engine._audible_generation = engine._generation
+        engine._assistant_turn_sentences = ["this is echoed assistant audio"]
+        engine._reprompt_after_silence = waiting_reprompt
+        await engine._arm_reprompt()
+        task = engine._reprompt_task
+        self.assertIsNotNone(task)
+        await entered.wait()
+
+        await engine._handle_recognizer_result(
+            engine._recognizer_epoch,
+            self._engine_module.RecognizerResult("   ", is_final=False),
+        )
+        await engine._handle_recognizer_result(
+            engine._recognizer_epoch,
+            self._engine_module.RecognizerResult("this is echoed assistant audio", is_final=False),
+        )
+        await engine._handle_recognizer_result(engine._recognizer_epoch, duplicate)
+
+        self.assertIs(engine._reprompt_task, task)
+        self.assertFalse(cancelled.is_set())
+        await engine.close()
+
     async def test_rearm_cannot_overwrite_a_newer_reprompt_while_awaiting_an_older_one(self) -> None:
         engine = self._engine()
         first_started = asyncio.Event()
