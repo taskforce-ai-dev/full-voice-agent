@@ -1,0 +1,264 @@
+name: Build Riviera image (no deploy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to check out and build
+        required: true
+        type: string
+      expected_sha:
+        description: Exact 40-character reviewed commit SHA
+        required: true
+        type: string
+
+concurrency:
+  group: riviera-image-publisher
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      # Least grant that can list the read-only probe workflow's run history.
+      actions: read
+    outputs:
+      digest: ${{ steps.verify.outputs.digest }}
+      tag: ${{ steps.identity.outputs.tag }}
+      revision: ${{ steps.identity.outputs.actual_sha }}
+    steps:
+      - name: Validate publisher dispatch trust
+        id: trust
+        env:
+          PUBLISHER_EVENT_NAME: ${{ github.event_name }}
+          PUBLISHER_REPOSITORY: ${{ github.repository }}
+          PUBLISHER_REF: ${{ github.ref }}
+          PUBLISHER_REF_NAME: ${{ github.ref_name }}
+          PUBLISHER_REF_TYPE: ${{ github.ref_type }}
+          PUBLISHER_REF_PROTECTED: ${{ github.ref_protected }}
+          PUBLISHER_SHA: ${{ github.sha }}
+          PUBLISHER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PUBLISHER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -Eeuo pipefail
+          fail() { printf '%s\n' 'publisher_trust=fail' >&2; exit 1; }
+          repository='taskforce-ai-dev/full-voice-agent'
+          # GitHub runs the selected ref's copy of this file, so the probe-run
+          # comparison below only means something if this run is itself pinned to
+          # protected main at its own workflow commit.
+          [[ "$PUBLISHER_EVENT_NAME" == 'workflow_dispatch' ]] || fail
+          [[ "$PUBLISHER_REPOSITORY" == "$repository" ]] || fail
+          [[ "$PUBLISHER_REF" == 'refs/heads/main' ]] || fail
+          [[ "$PUBLISHER_REF_NAME" == 'main' ]] || fail
+          [[ "$PUBLISHER_REF_TYPE" == 'branch' ]] || fail
+          [[ "$PUBLISHER_REF_PROTECTED" == 'true' ]] || fail
+          [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$PUBLISHER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$PUBLISHER_SHA" == "$PUBLISHER_WORKFLOW_SHA" ]] || fail
+          [[ "$PUBLISHER_WORKFLOW_REF" == "$repository/.github/workflows/build-riviera-image.yml@refs/heads/main" ]] || fail
+          printf 'gate_sha=%s\n' "$PUBLISHER_SHA" >> "$GITHUB_OUTPUT" || fail
+
+      - name: Require a fresh successful read-only probe
+        id: probe_gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATE_REPOSITORY: ${{ github.repository }}
+          GATE_SHA: ${{ steps.trust.outputs.gate_sha }}
+        run: |
+          set -Eeuo pipefail
+          fail() { printf '%s\n' 'probe_gate=fail' >&2; exit 1; }
+          [[ "$GATE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail
+          [[ "$GATE_REPOSITORY" == 'taskforce-ai-dev/full-voice-agent' ]] || fail
+          gate_dir="$(mktemp -d)" || fail
+          cleanup() { rm -rf -- "$gate_dir" || true; }
+          trap cleanup EXIT
+          # The filters must live in the URL query string. `gh api -f` on a GET is
+          # either rejected outright or silently dropped, which would leave the
+          # response unfiltered.
+          gh api \
+            "repos/$GATE_REPOSITORY/actions/workflows/probe-riviera-image.yml/runs?per_page=100&branch=main&status=success&head_sha=$GATE_SHA" \
+            >"$gate_dir/runs.json" 2>"$gate_dir/runs.err" || fail
+          jq -e 'type == "object"' "$gate_dir/runs.json" >/dev/null 2>&1 || fail
+          total="$(jq -r '.total_count // empty' "$gate_dir/runs.json" 2>/dev/null)" || fail
+          [[ "$total" =~ ^[0-9]+$ ]] || fail
+          [[ "$total" -ge 1 ]] || fail
+          # A full page cannot be reasoned about without paginating; fail closed.
+          [[ "$total" -le 100 ]] || fail
+          cutoff="$(( $(date -u +%s) - 86400 ))" || fail
+          # Re-verify every server-side filter locally rather than trusting them.
+          # Freshness keys on run_started_at: a re-run bumps updated_at without
+          # re-establishing the evidence, which would make stale evidence look current.
+          jq -r '.workflow_runs[]
+            | select(.head_sha == $sha and .head_branch == "main"
+                and .status == "completed" and .conclusion == "success"
+                and .path == ".github/workflows/probe-riviera-image.yml")
+            | "\(.id) \(.run_started_at)"' \
+            --arg sha "$GATE_SHA" "$gate_dir/runs.json" >"$gate_dir/candidates" 2>/dev/null || fail
+          gate_run_id=""
+          while read -r candidate_id candidate_stamp; do
+            [[ "$candidate_id" =~ ^[0-9]+$ ]] || continue
+            # Strict Z-suffix on purpose: a +00:00 offset form is rejected, not parsed.
+            [[ "$candidate_stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || continue
+            candidate_epoch="$(date -u -d "$candidate_stamp" +%s 2>/dev/null)" || continue
+            [[ "$candidate_epoch" =~ ^[0-9]+$ ]] || continue
+            [[ "$candidate_epoch" -ge "$cutoff" ]] || continue
+            gate_run_id="$candidate_id"
+            break
+          done < "$gate_dir/candidates"
+          [[ "$gate_run_id" =~ ^[0-9]+$ ]] || fail
+          {
+            printf '%s\n' 'probe_gate=pass'
+            printf 'probe_run_id=%s\n' "$gate_run_id"
+          } >> "$GITHUB_OUTPUT" || fail
+
+      - name: Checkout trusted publisher tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .publisher
+          persist-credentials: false
+
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          path: source
+          persist-credentials: false
+
+      - name: Validate reviewed checkout
+        id: identity
+        working-directory: source
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          expected_sha="$EXPECTED_SHA"
+          if ! [[ $expected_sha =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected SHA format is invalid" >&2
+            exit 1
+          fi
+          actual_sha="$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain)"
+          test "$actual_sha" = "$expected_sha"
+          image="ghcr.io/taskforce-ai-dev/riviera"
+          tag="${image}:${actual_sha::7}"
+          {
+            echo "actual_sha=$actual_sha"
+            echo "image=$image"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Probe immutable tag
+        id: probe
+        env:
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+          set +e
+          bash .publisher/.github/scripts/check-riviera-image-tag.sh "$TAG" >/dev/null
+          probe_code=$?
+          set -e
+          case "$probe_code" in
+            0) mode=absent ;;
+            10) mode=existing ;;
+            2) echo "registry tag probe returned an unrecognized message; read the failed run's capture and widen the helper allowlist in a reviewed change" >&2; exit 1 ;;
+            *) echo "registry tag probe failed" >&2; exit 1 ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+      # This workflow serializes itself, but out-of-band writers are possible;
+      # consumers use the verified digest emitted below rather than a mutable tag.
+      - name: Build and push immutable image
+        id: build
+        if: "${{ steps.probe.outputs.mode == 'absent' }}"
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: source/Riviera
+          file: source/Riviera/Dockerfile
+          push: true
+          tags: ${{ steps.identity.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ steps.identity.outputs.actual_sha }}
+
+      - name: Resolve image digest
+        id: digest
+        env:
+          MODE: ${{ steps.probe.outputs.mode }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Name the failing check. Registry stderr stays suppressed, but which
+          # of these tripped is not sensitive and not knowing it costs a round
+          # trip -- as it did on the first live publish.
+          fail_with() { printf 'resolve_digest=%s\n' "$1" >&2; exit 1; }
+          case "$MODE" in
+            absent)
+              [[ $BUILT_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || fail_with built_digest_malformed
+              # .Manifest.Digest, not .Digest: the bare field does not exist on
+              # imagetools.tplInput and exits 1. This is the index digest, which
+              # is what build-push-action reports as its own digest output.
+              pushed_digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Manifest.Digest}}" 2>/dev/null)" || fail_with registry_inspect_failed
+              [[ $pushed_digest =~ ^sha256:[0-9a-f]{64}$ ]] || fail_with pushed_digest_malformed
+              test "$pushed_digest" = "$BUILT_DIGEST" || fail_with pushed_digest_mismatch
+              digest="$pushed_digest"
+              ;;
+            existing)
+              digest="$(docker buildx imagetools inspect "$TAG" --format "{{.Manifest.Digest}}" 2>/dev/null)" || fail_with registry_inspect_failed
+              ;;
+            *) fail_with unrecognized_image_mode ;;
+          esac
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || fail_with digest_malformed
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify pushed digest and revision
+        id: verify
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ACTUAL_SHA: ${{ steps.identity.outputs.actual_sha }}
+        run: |
+          set -euo pipefail
+          [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_ref="${IMAGE}@${DIGEST}"
+          docker pull "$image_ref"
+          actual_revision="$(docker image inspect "$image_ref" --format "{{ index .Config.Labels \"org.opencontainers.image.revision\" }}")"
+          test -n "$actual_revision"
+          test "$actual_revision" = "$EXPECTED_SHA"
+          test "$actual_revision" = "$ACTUAL_SHA"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Write safe build summary
+        if: ${{ always() }}
+        env:
+          REVISION: ${{ steps.identity.outputs.actual_sha }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          DIGEST: ${{ steps.verify.outputs.digest }}
+          RUN_ID: ${{ github.run_id }}
+          STATUS: ${{ job.status }}
+          PROBE_GATE: ${{ steps.probe_gate.outputs.probe_gate }}
+          PROBE_RUN_ID: ${{ steps.probe_gate.outputs.probe_run_id }}
+        run: |
+          {
+            echo "## Riviera image build"
+            echo "- revision: ${REVISION:-unavailable}"
+            echo "- tag: ${TAG:-unavailable}"
+            echo "- digest: ${DIGEST:-unavailable}"
+            echo "- run_id: $RUN_ID"
+            echo "- status: $STATUS"
+            echo "- probe_gate: ${PROBE_GATE:-unavailable}"
+            echo "- probe_run_id: ${PROBE_RUN_ID:-unavailable}"
+          } >> "$GITHUB_STEP_SUMMARY"
