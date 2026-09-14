@@ -313,7 +313,7 @@ def wait_for_health(base_url: str) -> None:
 def status_snapshot(base_url: str, header: str, token: str) -> tuple[int, int]:
     status, body = http_request(f"{base_url}/smartpbx/status", {header: token})
     if status != 200:
-        raise LifecycleError("authenticated status was not accepted")
+        raise LifecycleError(f"authenticated status returned HTTP {status}")
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:

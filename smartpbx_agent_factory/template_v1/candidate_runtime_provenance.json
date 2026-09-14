@@ -130,7 +130,7 @@
     },
     {
       "template_path": "runtime/server.py.tmpl",
-      "template_sha256": "sha256:664939c76b1e08831b68a0eecccb503cb4551b4ba16a342c2b9276dc9f543bce",
+      "template_sha256": "sha256:aa72f7b2b311c3ac31050c63d02c990b101dfcfeb6b1165d5113eb4720f93b95",
       "source_path": "Kavya/server.py",
       "source_ranges": ["15617-15625"],
       "extraction": "isolated health, authenticated status, and media route construction"

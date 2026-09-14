@@ -52,7 +52,7 @@ def build_service_app(runtime: RuntimeDependencies) -> FastAPI:
         return {"status": "ok", "service_mode": "smartpbx"}
 
     @app.get("/smartpbx/status")
-    def status(request: Request) -> dict[str, bool | int]:
+    def status(request: Request) -> dict[str, bool | int | str]:
         if not runtime.ingress.token_matches(request.headers.get(runtime.ingress.auth_header_name, "")):
             raise HTTPException(status_code=401)
         return gateway.snapshot()
