@@ -34,11 +34,18 @@ PR remains review material, not a production release.
 4. Keep the Cloudflare tunnel credential file outside this repository, owned by
    root and readable only by the Cloudflared account (for example mode `0640`,
    group `cloudflared`). The template contains only its placeholder path.
-   Store the console policy, runtime configuration, and factory configuration
-   root-owned and mode `0640` or tighter; the service accepts no environment
-   configuration. Store the CSRF secret in a separate root-owned regular file,
-   at least 32 bytes, readable only by the service group and never placed in a
-   unit, environment file, process argument, log, or this repository.
+   Create `/etc/factory-console` as `root:factory-console` mode `0750`. Install
+   the non-secret policy and runtime JSON as root-owned regular files with no
+   group/other write permission; `root:factory-console` mode `0640` is the
+   recommended service-readable layout. The service accepts no environment
+   configuration. The configured factory JSON is also non-secret, but its
+   parent directory and file must be readable by `factory-console` while
+   remaining root-owned with no group/other write permission. Install the CSRF secret as a separate regular file owned by
+   `root:factory-console` mode **`0640`**: it must be at least 32 bytes,
+   not world-readable, and not group/other writable. The runtime rejects a
+   secret with any other-read, group-write, or other-write bit, and rejects a
+   group other than `factory-console`. Never place it in a unit, environment
+   file, process argument, log, or this repository.
 
 Do not use a quick tunnel for this service. Before enabling a host-local tunnel
 configuration, an authorized operator must run Cloudflared's documented

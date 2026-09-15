@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import grp
 import json
 import os
 import stat
@@ -37,13 +38,34 @@ def _absolute_path(value: object, label: str) -> Path:
     return path
 
 
-def _root_owned_regular(path: Path, stat_for_path: Callable[[Path], os.stat_result]) -> None:
+def _root_owned_regular(path: Path, stat_for_path: Callable[[Path], os.stat_result]) -> os.stat_result:
     try:
         metadata = stat_for_path(path)
     except OSError as error:
         raise RuntimeConfigurationError("a required root-owned runtime file is unavailable") from error
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise RuntimeConfigurationError("a required root-owned runtime file is unsafe")
+    return metadata
+
+
+def _factory_console_group_gid() -> int:
+    try:
+        return grp.getgrnam("factory-console").gr_gid
+    except KeyError as error:
+        raise RuntimeConfigurationError("factory-console service group is unavailable") from error
+
+
+def _service_readable_csrf_secret(
+    path: Path, stat_for_path: Callable[[Path], os.stat_result], service_gid: int
+) -> None:
+    metadata = _root_owned_regular(path, stat_for_path)
+    mode = metadata.st_mode
+    if (
+        metadata.st_gid != service_gid
+        or not mode & stat.S_IRGRP
+        or mode & (stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeConfigurationError("CSRF signing secret must be root-owned and service-group readable")
 
 
 def _load_json(path: Path) -> object:
@@ -65,6 +87,7 @@ def load_runtime_config(
     path: str | Path = _RUNTIME_CONFIG_PATH,
     *,
     stat_for_path: Callable[[Path], os.stat_result] = os.lstat,
+    service_gid: int | None = None,
 ) -> RuntimeConfig:
     config_path = _absolute_path(str(path), "runtime config path")
     _root_owned_regular(config_path, stat_for_path)
@@ -74,8 +97,13 @@ def load_runtime_config(
     policy_path = _absolute_path(raw["policy_path"], "policy path")
     factory_config_path = _absolute_path(raw["factory_config_path"], "factory config path")
     csrf_secret_file = _absolute_path(raw["csrf_secret_file"], "CSRF secret path")
-    for required_path in (policy_path, factory_config_path, csrf_secret_file):
+    for required_path in (policy_path, factory_config_path):
         _root_owned_regular(required_path, stat_for_path)
+    if service_gid is None:
+        service_gid = _factory_console_group_gid()
+    if not isinstance(service_gid, int) or isinstance(service_gid, bool) or service_gid < 0:
+        raise RuntimeConfigurationError("factory-console service group is invalid")
+    _service_readable_csrf_secret(csrf_secret_file, stat_for_path, service_gid)
     manifests = raw["manifests"]
     if not isinstance(manifests, dict) or not manifests:
         raise RuntimeConfigurationError("at least one server-owned manifest is required")

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import io
 import json
+import stat
+import tempfile
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -367,6 +370,50 @@ class RuntimeConfigurationTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeConfigurationError):
             load_runtime_config("/definitely/missing/factory-console.json")
+
+    def test_runtime_rejects_a_world_readable_csrf_secret(self) -> None:
+        from factory_console.runtime import RuntimeConfigurationError, load_runtime_config
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = self._runtime_config(Path(temporary))
+            with self.assertRaises(RuntimeConfigurationError):
+                load_runtime_config(config_path, stat_for_path=self._stat_fixture(0o644, 4242), service_gid=4242)
+
+    def test_runtime_accepts_a_root_owned_service_group_readable_csrf_secret(self) -> None:
+        from factory_console.runtime import load_runtime_config
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = self._runtime_config(Path(temporary))
+            config = load_runtime_config(config_path, stat_for_path=self._stat_fixture(0o640, 4242), service_gid=4242)
+
+        self.assertEqual(config.csrf_secret_file.name, "csrf-signing.key")
+
+    def test_runtime_rejects_a_root_only_csrf_secret_the_service_cannot_read(self) -> None:
+        from factory_console.runtime import RuntimeConfigurationError, load_runtime_config
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = self._runtime_config(Path(temporary))
+            with self.assertRaises(RuntimeConfigurationError):
+                load_runtime_config(config_path, stat_for_path=self._stat_fixture(0o400, 0), service_gid=4242)
+
+    @staticmethod
+    def _runtime_config(root: Path) -> Path:
+        config_path = root / "runtime.json"
+        config_path.write_text(json.dumps({
+            "version": 1,
+            "policy_path": str(root / "policy.json"),
+            "factory_config_path": str(root / "factory.json"),
+            "csrf_secret_file": str(root / "csrf-signing.key"),
+            "manifests": {"Example Hotel": str(root / "manifest.json")},
+        }), encoding="utf-8")
+        return config_path
+
+    @staticmethod
+    def _stat_fixture(secret_mode: int, service_gid: int):
+        def stat_for_path(path: Path):
+            mode = secret_mode if path.name == "csrf-signing.key" else 0o640
+            return type("Metadata", (), {"st_mode": stat.S_IFREG | mode, "st_uid": 0, "st_gid": service_gid})()
+        return stat_for_path
 
 
 class JobLifecycleTests(unittest.TestCase):

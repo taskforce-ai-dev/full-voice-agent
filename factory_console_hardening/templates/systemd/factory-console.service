@@ -7,6 +7,9 @@ After=network-online.target
 Type=exec
 User=factory-console
 Group=factory-console
+# /etc/factory-console is root:factory-console 0750; runtime files and the
+# CSRF signing secret are root:factory-console 0640 so this process can read,
+# but not modify, them.
 WorkingDirectory=/opt/factory-console/app
 ExecStartPre=/opt/factory-console/venv/bin/python -m factory_console verify-access-config --config /etc/factory-console/runtime.json
 ExecStart=/opt/factory-console/venv/bin/gunicorn --bind 127.0.0.1:8401 --workers 1 --worker-tmp-dir /run/factory-console --access-logfile - --error-logfile - --log-level warning factory_console.entrypoint:application

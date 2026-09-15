@@ -3,7 +3,8 @@
 This owner-only, review-only WSGI façade has a production entrypoint at
 `factory_console.entrypoint:application`. It reads only the root-owned
 `/etc/factory-console/runtime.json`, its root-owned policy, the existing
-root-owned factory configuration, and a root-owned CSRF secret file. It has no
+root-owned factory configuration, and a `root:factory-console` mode-`0640` CSRF
+secret file. It has no
 environment-variable or test-mode production fallback.
 
 `requirements-prod.txt` pins the production WSGI server and PyJWT crypto

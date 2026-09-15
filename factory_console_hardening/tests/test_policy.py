@@ -120,6 +120,8 @@ class FactoryConsolePolicyTests(unittest.TestCase):
 
         self.assertIn("User=factory-console", console)
         self.assertIn("Group=factory-console", console)
+        self.assertIn("root:factory-console 0750", console)
+        self.assertIn("root:factory-console 0640", console)
         self.assertIn("UMask=0077", console)
         self.assertIn("ProtectSystem=strict", console)
         self.assertIn("NoNewPrivileges=yes", console)
