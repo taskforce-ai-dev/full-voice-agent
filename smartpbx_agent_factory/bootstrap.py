@@ -617,6 +617,38 @@ class FactoryBootstrap:
             return value
         return SopsAgeSecretProvider(prerequisites, generation_state={}, credential_reader=read, visibility_verifier=GitHubCommandAdapter(self.config))
 
+    def operations_prerequisites_status(self) -> str:
+        """Validate non-secret operations inputs without resolving a credential."""
+        operations = self.config.lanes["operations"]
+        repository = operations.primary
+        if not repository.is_dir() or not (repository / ".git").exists():
+            return "blocked: operations repository is unavailable"
+        try:
+            remote = _run(("git", "-C", str(repository), "config", "--get", f"remote.{operations.remote}.url"))
+        except OSError:
+            return "blocked: operations remote is unavailable"
+        if getattr(remote, "returncode", 1) != 0 or getattr(remote, "stdout", "").strip().rstrip("/") != operations.canonical_remote.rstrip("/"):
+            return "blocked: operations remote differs"
+        recipient_file = self.config.age.recipient_file
+        try:
+            recipients = tuple(
+                line.strip()
+                for line in recipient_file.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            )
+        except OSError:
+            return "blocked: age recipient file is unavailable"
+        if not recipients or len(set(recipients)) != len(recipients) or any(not _AGE.fullmatch(recipient) for recipient in recipients):
+            return "blocked: approved age recipients are invalid"
+        if tuple(sorted(set(recipients))) != tuple(sorted(self.config.age.approved_recipient_fingerprints)):
+            return "blocked: approved age recipients differ"
+        if not self.config.age.credential_source_policy:
+            return "blocked: credential source policy is unavailable"
+        for binary, label in ((self.config.age.sops_binary, "sops"), (self.config.age.age_binary, "age")):
+            if not binary.is_file() or not os.access(binary, os.X_OK):
+                return f"blocked: {label} binary is unavailable"
+        return "ready"
+
     def orchestrator(self) -> GenerationOrchestrator:
         provider = GitHubCommandAdapter(self.config)
         return GenerationOrchestrator(
@@ -624,4 +656,5 @@ class FactoryBootstrap:
             approved_source_roots=self.config.approved_source_roots,
             verification_coordinator=RepositoryOwnedCIVerificationCoordinator(GitHubCIResultAdapter(self.config)),
             pr_coordinator=ConfiguredPRCoordinator(self.config, provider),
+            operations_prerequisites_checker=self.operations_prerequisites_status,
         )

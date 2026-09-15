@@ -207,6 +207,7 @@ class GenerationOrchestrator:
         verification_coordinator: RepositoryOwnedCIVerificationCoordinator | None = None,
         approved_source_roots: tuple[Path, ...] | None = None,
         pr_coordinator: object | None = None,
+        operations_prerequisites_checker: Callable[[], str] | None = None,
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise GenerationInfrastructureError("state root must be an absolute path")
@@ -227,6 +228,7 @@ class GenerationOrchestrator:
             else None
         )
         self._pr_coordinator = pr_coordinator
+        self._operations_prerequisites_checker = operations_prerequisites_checker
         self._last_pr_set: object | None = None
 
     def inspect(self, manifest_path: Path) -> Mapping[str, object]:
@@ -240,7 +242,6 @@ class GenerationOrchestrator:
             "origin_main": _git_check(factory_root, ("rev-parse", "--verify", "origin/main^{commit}")),
             "dirty_tree_overlap": _git_clean_check(factory_root),
             "git": _check(_available_binary("git"), "git unavailable"),
-            "docker": _check(_available_binary("docker"), "docker unavailable"),
             "gh": _check(_available_binary("gh"), "gh unavailable"),
             "sops": _check(_available_binary("sops"), "sops unavailable"),
             "age": _check(_available_binary("age"), "age unavailable"),
@@ -1371,20 +1372,15 @@ class GenerationOrchestrator:
         return "ready"
 
     def _inspect_operations_prerequisites(self) -> str:
-        required = (
-            "SMARTPBX_OPERATIONS_REPOSITORY",
-            "SMARTPBX_OPERATIONS_OWNER",
-            "SMARTPBX_AGE_RECIPIENT_FILE",
-            "SMARTPBX_AGE_RECIPIENT_REVIEW_SOURCE",
-            "SMARTPBX_CREDENTIAL_SOURCE_POLICY",
-        )
-        missing = [name for name in required if not os.environ.get(name)]
-        if missing:
-            return f"blocked: missing {missing[0]}"
-        repository = Path(os.environ["SMARTPBX_OPERATIONS_REPOSITORY"])
-        if not repository.is_absolute() or not repository.is_dir() or not (repository / ".git").exists():
-            return "blocked: operations repository is not an existing Git checkout"
-        return "blocked: operations lane must validate remote, privacy, recipients, and credential policy"
+        if self._operations_prerequisites_checker is None:
+            return "blocked: factory operations preflight is unavailable"
+        try:
+            status = self._operations_prerequisites_checker()
+        except Exception:
+            return "blocked: factory operations preflight failed"
+        if status == "ready" or (isinstance(status, str) and status.startswith("blocked: ")):
+            return status
+        return "blocked: factory operations preflight returned an invalid status"
 
 
 def _digest_payload(payload: object) -> str:
