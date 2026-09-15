@@ -39,7 +39,7 @@ reservations (`065 222 2164`, WhatsApp `077 842 2223`).
 | Room type | Max guests | Mid LKR | High LKR | PMS code | Rooms |
 |---|---|---|---|---|---|
 | Family Chalet | 4 | 32,100 | 46,900 | `RV-FCH` | 36, 37 |
-| Basic Room Single | 2 | 8,800 | 12,800 | `RV-BRS` | 7, 10, 11 |
+| Basic Room Single *(fan only, no A/C)* | 2 | 8,800 | 12,800 | `RV-BRS` | 7, 10, 11 |
 | Wooden Cabana *(fan only, no A/C)* | 2 | 11,000 | 16,000 | `RV-WCB` | 12 |
 | Lagoon View Steel Cabana | 2 | 14,600 | 21,300 | `RV-SCB` | 31–34 |
 | Double Lagoon or Garden View | 3 | 17,500 | 25,600 | `RV-DBL` | 4, 5, 6, 15, 16, 18, 19 |
@@ -60,11 +60,12 @@ returns `""` and the room silently vanishes from availability.
 ## Knowledge base
 
 `knowledge_docs/riviera_info.txt` — built from the client's *HOSPITALITY BOOKING AGENT
-REQUIREMENTS* and *RATES* sheets (Sep 2026) in the retrieval-optimised style the fleet uses
-(300–500-character paragraphs, explicit entity names, spelled-out numbers). Facts the client has
-not yet supplied (check-in/out times, cancellation and deposit terms, extra-bed supplements,
-activity prices, foreign rates) are written as "reservations will confirm", never guessed. Add the
-scraped website content as further paragraphs in the same style; the file is re-embedded on
+REQUIREMENTS* and *RATES* sheets plus a full scrape of riviera-online.com (Sep 2026), in the
+retrieval-optimised style the fleet uses (300–500-character paragraphs, explicit entity names,
+spelled-out numbers). It covers rooms and rates, meal plans, check-in/out and late-departure
+rules, deposit and cancellation terms, dining, facilities, activities, sustainability and the
+Batticaloa sights. Facts still not supplied (extra-bed supplements, activity and menu prices,
+foreign rates) are written as "reservations will confirm", never guessed. The file is re-embedded on
 container start (and via `POST /kb-reload`).
 
 ## Key files
