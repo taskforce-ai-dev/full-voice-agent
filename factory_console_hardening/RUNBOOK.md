@@ -63,8 +63,11 @@ verification for every request:
 2. Fetch/cache signing keys only from the configured issuer's JWKS endpoint.
    Verify an `RS256` signature selected by `kid`; reject any unsupported
    algorithm or missing signing key.
-3. Require exact equality for `iss`, a single configured Access application
-   `aud`, `type=app`, and the configured owner `sub` and `email` claim.
+3. Require exact equality for `iss`, membership of the single configured
+   Access application AUD in the signed `aud` list, `type=app`, and the
+   configured owner `sub` and `email` claim. The runtime stores the configured
+   AUD as its canonical identity value; it never treats the raw list as a
+   second identity selector.
    Validate `exp`, `nbf`, and `iat` with a small documented clock-skew bound.
    Do not case-fold, wildcard-match, or use a prefix for the owner fields.
 4. Fail closed if the JWKS cannot be refreshed. A bounded cache may continue

@@ -88,21 +88,27 @@ class PyJWTAccessJWTVerifier:
             raise AccessDenied("Cloudflare Access token was rejected") from error
         if not isinstance(claims, Mapping):
             raise AccessDenied("Cloudflare Access token was rejected")
-        issuer, audience, subject, email, token_type = (
+        issuer, audiences, subject, email, token_type = (
             claims.get("iss"),
             claims.get("aud"),
             claims.get("sub"),
             claims.get("email"),
             claims.get("type"),
         )
+        valid_audience = (
+            isinstance(audiences, (list, tuple))
+            and bool(audiences)
+            and all(isinstance(value, str) and value for value in audiences)
+            and self._audience in audiences
+        )
         if (
             issuer != self._issuer
-            or audience != self._audience
+            or not valid_audience
             or token_type != "app"
             or not all(isinstance(value, str) and value for value in (subject, email))
         ):
             raise AccessDenied("Cloudflare Access token was rejected")
-        return AccessIdentity(subject=subject, email=email, audience=audience, issuer=issuer)
+        return AccessIdentity(subject=subject, email=email, audience=self._audience, issuer=issuer)
 
 
 @dataclass(frozen=True)

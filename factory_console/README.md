@@ -9,7 +9,8 @@ environment-variable or test-mode production fallback.
 `requirements-prod.txt` pins the production WSGI server and PyJWT crypto
 dependency. The entrypoint validates `Cf-Access-Jwt-Assertion` with PyJWT,
 the configured Cloudflare Access JWKS URL, fixed `RS256`, exact issuer and
-single audience, expiry/not-before/issued-at claims, `type=app`, and exact
+the configured audience's membership in Cloudflare's documented audience list,
+expiry/not-before/issued-at claims, `type=app`, and exact
 configured owner `sub` and `email`. Errors do not contain token values or
 claims.
 

@@ -212,7 +212,8 @@ class CloudflareAccessTests(unittest.TestCase):
         for invalid in (
             _claims(iss="https://other.example"),
             _claims(aud="different-audience"),
-            _claims(aud=["factory-console"]),
+            _claims(aud=["different-audience"]),
+            _claims(aud="factory-console"),
             _claims(sub="other-subject"),
             _claims(email="other@example.com"),
             _claims(email=None),
@@ -233,6 +234,35 @@ class CloudflareAccessTests(unittest.TestCase):
             ))
             with self.assertRaises(AccessDenied):
                 verifier.require_owner({"Cf-Access-Jwt-Assertion": "valid"})
+
+    def test_pyjwt_verifier_normalizes_a_documented_access_audience_list(self) -> None:
+        from factory_console.auth import PyJWTAccessJWTVerifier
+
+        verifier = PyJWTAccessJWTVerifier(
+            jwks_url="https://access.example/cdn-cgi/access/certs",
+            expected_issuer="https://access.example",
+            expected_audience="factory-console",
+            jwks_client=_JWKS(),
+            decoder=lambda *args, **kwargs: _claims(aud=["factory-console"]),
+        )
+
+        identity = verifier.verify("valid")
+
+        self.assertEqual(identity.audience, "factory-console")
+
+    def test_pyjwt_verifier_rejects_audience_list_without_the_configured_application(self) -> None:
+        from factory_console.auth import AccessDenied, PyJWTAccessJWTVerifier
+
+        verifier = PyJWTAccessJWTVerifier(
+            jwks_url="https://access.example/cdn-cgi/access/certs",
+            expected_issuer="https://access.example",
+            expected_audience="factory-console",
+            jwks_client=_JWKS(),
+            decoder=lambda *args, **kwargs: _claims(aud=["another-application"]),
+        )
+
+        with self.assertRaises(AccessDenied):
+            verifier.verify("valid")
 
 
 class CSRFTokenTests(unittest.TestCase):
