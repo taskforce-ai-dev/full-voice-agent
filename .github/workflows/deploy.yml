@@ -75,11 +75,20 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Reject Kavya / Riviera generic deployment
+      - name: Reject Kavya generic deployment
         run: |
           set -euo pipefail
-          if [[ "$AGENT" == "kavya" || "$AGENT" == "riviera" ]]; then
-            echo "$AGENT is excluded from generic deploy.yml for every mode (image, fast, build); use its build-only image publisher (build-<agent>-image.yml) and the guarded runbook script (<Folder>/scripts/deploy_smartpbx_image.sh)." >&2
+          if [[ "$AGENT" == "kavya" ]]; then
+            echo "Kavya is excluded from generic deploy.yml for every mode (image, fast, build); use the build-only Kavya image publisher and the guarded runbook script (scripts/deploy_smartpbx_image.sh)." >&2
+            exit 1
+          fi
+
+      # Riviera is a Kavya clone with the same protected immutable-image route.
+      - name: Reject Riviera generic deployment
+        run: |
+          set -euo pipefail
+          if [[ "$AGENT" == "riviera" ]]; then
+            echo "Riviera is excluded from generic deploy.yml for every mode (image, fast, build); use the build-only Riviera image publisher (build-riviera-image.yml) and the guarded runbook script (Riviera/scripts/deploy_smartpbx_image.sh)." >&2
             exit 1
           fi
 
@@ -182,7 +191,7 @@ jobs:
           # host-side control plane (compose env allowlist, nginx vhosts, the
           # guarded deploy scripts, the runbook). Other agents are unaffected.
           extra_excludes=()
-          if [[ "$AGENT" == "kavya" || "$AGENT" == "riviera" ]]; then
+          if [[ "$AGENT" == "kavya" ]] || [[ "$AGENT" == "riviera" ]]; then
             extra_excludes=(
               --exclude='scripts/' --exclude='docker-compose.yml'
               --exclude='nginx-smartpbx*.conf' --exclude='SMARTPBX_RUNBOOK.md'
