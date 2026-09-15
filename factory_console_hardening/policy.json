@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "origin": {
+    "host": "127.0.0.1",
+    "port": 8401
+  },
+  "cloudflare_access": {
+    "jwt_header": "Cf-Access-Jwt-Assertion",
+    "issuer": "https://<TEAM-NAME>.cloudflareaccess.com",
+    "jwks_url": "https://<TEAM-NAME>.cloudflareaccess.com/cdn-cgi/access/certs",
+    "audience": "REPLACE_WITH_ACCESS_APPLICATION_AUDIENCE",
+    "owner_subject": "REPLACE_WITH_OWNER_IDENTITY_SUBJECT",
+    "owner_email": "REPLACE_WITH_OWNER_EMAIL",
+    "require_application_token": true,
+    "require_exact_owner_match": true
+  },
+  "requests": {
+    "max_body_bytes": 16384,
+    "uploads_enabled": false
+  },
+  "operations": {
+    "allowed_actions": ["inspect", "plan", "generate", "verify", "open-pr"],
+    "approval_required_actions": ["generate", "open-pr"],
+    "forbidden_actions": ["deploy", "provision"]
+  },
+  "audit": {
+    "sink": "journal",
+    "include_request_content": false,
+    "include_authorization_headers": false,
+    "include_token_claims": false
+  }
+}
