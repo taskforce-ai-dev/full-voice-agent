@@ -159,7 +159,7 @@ services:
       DEMO_RATES_ENABLED: "${DEMO_RATES_ENABLED:-true}"
       # No default: blank = post-call / handover webhooks disabled until Riviera's own n8n is set.
       N8N_BASE_URL: "${N8N_BASE_URL:-}"
-      N8N_POSTCALL_WEBHOOK: "${N8N_POSTCALL_WEBHOOK:-/webhook/post-call-data}"
+      N8N_POSTCALL_WEBHOOK: "${N8N_POSTCALL_WEBHOOK:-}"
       DASHBOARD_API_URL: "${DASHBOARD_API_URL:-}"
       DASHBOARD_API_KEY: "${DASHBOARD_API_KEY:-}"
       DASHBOARD_AGENT_ID: "${DASHBOARD_AGENT_ID:-riviera}"

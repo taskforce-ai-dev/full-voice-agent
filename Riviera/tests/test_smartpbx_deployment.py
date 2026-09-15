@@ -907,12 +907,18 @@ def test_claude_md_warns_that_deploy_sh_and_vps_builds_are_not_for_smartpbx():
     assert "SMARTPBX_RUNBOOK.md" in operational_section
 
 
+POSTCALL_WEBHOOK_NO_DEFAULT_NEEDLE = (
+    "N8N_POSTCALL_WEBHOOK` (no default — fail closed; set it to the path of Riviera's own "
+    "post-call workflow, e.g. `/webhook/post-call-data`)"
+)
+
+
 def test_claude_md_n8n_postcall_webhook_default_matches_code():
-    """P2-5: CLAUDE.md must not disagree with post_call.py's real default."""
+    """P2-5: CLAUDE.md must not disagree with post_call.py's real (absent) default."""
     claude_md = read_text("CLAUDE.md")
 
-    assert "N8N_POSTCALL_WEBHOOK` (default: `/webhook/post-call-data`)" in claude_md
-    assert "N8N_POSTCALL_WEBHOOK` env var (default: `/webhook/post-call-data`)" in claude_md
+    assert claude_md.count(POSTCALL_WEBHOOK_NO_DEFAULT_NEEDLE) == 2
+    assert "default: `/webhook/post-call-data`" not in claude_md
     assert "/webhook/transcript" not in claude_md
 
 
@@ -922,7 +928,7 @@ def test_agents_md_stays_in_sync_with_claude_md_on_shared_text():
     agents_md = read_text("AGENTS.md")
 
     for needle in (
-        "N8N_POSTCALL_WEBHOOK` (default: `/webhook/post-call-data`)",
+        POSTCALL_WEBHOOK_NO_DEFAULT_NEEDLE,
     ):
         if needle in claude_md:
             assert needle in agents_md, f"AGENTS.md is stale for: {needle}"

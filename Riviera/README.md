@@ -97,9 +97,10 @@ container start (and via `POST /kb-reload`).
    `YANOLJA_BASE_URL/USERNAME/PASSWORD`; run `ops/riviera-pms/verify_live.py`.
    **`YANOLJA_BASE_URL` has no default** — while it is blank the booking tools are withheld and
    no PMS request is made, even with credentials set (never point it at another property's PMS).
-4. **n8n destination** — set `N8N_BASE_URL` to Riviera's own n8n host with its own post-call
-   (`/webhook/post-call-data`) and handover (`/webhook/riviera-handover`) workflows. **No default**:
-   blank means no transcript, call record or handover payload ever leaves the container.
+4. **n8n destination** — set `N8N_BASE_URL` to Riviera's own n8n host and `N8N_POSTCALL_WEBHOOK`
+   to the path of its own post-call workflow (e.g. `/webhook/post-call-data`); the handover
+   workflow path defaults to `/webhook/riviera-handover`. **No default for host or post-call
+   path**: blank means no transcript, call record or handover payload ever leaves the container.
 5. **Regenerate `smartpbx_language_menu.ulaw`** with `scripts/generate_smartpbx_language_menu.py`
    — the committed asset was copied from Kavya and only announces English and Sinhala.
 6. **Twilio number** → `https://riviera.taskforceai.tech/voice/incoming`; **Dialog Client

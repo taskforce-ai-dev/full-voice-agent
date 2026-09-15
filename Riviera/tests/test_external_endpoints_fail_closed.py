@@ -38,7 +38,10 @@ SHARED_HOSTS = ("yanolja.taskforceai.tech", "automation.taskforceai.tech")
 
 def _import_attr(module: str, attr: str, env_overrides: dict[str, str]) -> str:
     """Import `module` fresh in a subprocess with `env_overrides` and return repr(attr)."""
-    env = {k: v for k, v in os.environ.items() if k not in ("YANOLJA_BASE_URL", "N8N_BASE_URL")}
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in ("YANOLJA_BASE_URL", "N8N_BASE_URL", "N8N_POSTCALL_WEBHOOK")
+    }
     env.update(env_overrides)
     result = subprocess.run(
         [sys.executable, "-c", f"import {module}; print(repr({module}.{attr}))"],
@@ -68,6 +71,14 @@ def test_yanolja_base_url_has_no_default(env):
 @pytest.mark.parametrize("env", [{}, {"N8N_BASE_URL": ""}, {"N8N_BASE_URL": "   "}])
 def test_post_call_n8n_base_url_has_no_default(env):
     assert _import_attr("post_call", "N8N_BASE_URL", env) == ""
+
+
+@pytest.mark.parametrize(
+    "env", [{}, {"N8N_POSTCALL_WEBHOOK": ""}, {"N8N_POSTCALL_WEBHOOK": "   "}]
+)
+def test_post_call_webhook_path_has_no_default(env):
+    """The shared workflow path is not a default either -- host AND path are explicit."""
+    assert _import_attr("post_call", "N8N_POSTCALL_WEBHOOK", env) == ""
 
 
 @pytest.mark.parametrize("env", [{}, {"N8N_BASE_URL": ""}, {"N8N_BASE_URL": "   "}])
@@ -152,6 +163,17 @@ async def test_post_call_dispatch_is_skipped_without_n8n_base_url(monkeypatch, c
         assert "CA-unconfigured" not in caplog.text
     else:
         assert "not configured" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_post_call_dispatch_is_skipped_when_only_the_path_is_missing(monkeypatch):
+    """A configured host with a blank path must not POST to the host root either."""
+    monkeypatch.setattr(post_call, "N8N_BASE_URL", "https://n8n.riviera.example")
+    monkeypatch.setattr(post_call, "N8N_POSTCALL_WEBHOOK", "")
+    assert post_call.is_post_call_dispatch_configured() is False
+
+    with patch.object(booking_api, "get_session", _session_must_not_be_used):
+        await post_call._post_to_n8n({"call_sid": "CA-no-path"})
 
 
 @pytest.mark.asyncio
@@ -247,6 +269,8 @@ def test_compose_env_passthroughs_have_no_shared_host_defaults():
             assert env["YANOLJA_BASE_URL"] == "${YANOLJA_BASE_URL:-}", service_name
         if "N8N_BASE_URL" in env:
             assert env["N8N_BASE_URL"] == "${N8N_BASE_URL:-}", service_name
+        if "N8N_POSTCALL_WEBHOOK" in env:
+            assert env["N8N_POSTCALL_WEBHOOK"] == "${N8N_POSTCALL_WEBHOOK:-}", service_name
     for host in SHARED_HOSTS:
         assert host not in compose_text
 
@@ -260,6 +284,13 @@ def test_env_example_leaves_external_destinations_blank():
     }
     assert values.get("YANOLJA_BASE_URL", "") == ""
     assert values.get("N8N_BASE_URL", "") == ""
+    assert values.get("N8N_POSTCALL_WEBHOOK", "") == ""
+
+
+def test_runbook_env_template_leaves_external_destinations_blank():
+    runbook = (PROJECT_ROOT / "SMARTPBX_RUNBOOK.md").read_text()
+    for key in ("YANOLJA_BASE_URL", "N8N_BASE_URL", "N8N_POSTCALL_WEBHOOK"):
+        assert f"\n{key}=\n" in runbook, f"{key} must be blank in the runbook env template"
 
 
 def test_runtime_modules_do_not_hardcode_shared_hosts():

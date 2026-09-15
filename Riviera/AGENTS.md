@@ -74,9 +74,10 @@ instance**, and grounds answers in a ChromaDB RAG knowledge base
 - **PMS:** Riviera needs its **own** PMS instance (the schema has no property column) —
   `ops/riviera-pms/` has the seed SQL, runbook and live verifier. Until it exists, availability
   returns zero room types (by design: `_property_of` filters unknown names).
-- **External endpoints fail closed (PR #329 review):** `YANOLJA_BASE_URL` (PMS) and
-  `N8N_BASE_URL` (post-call call log + handover notify) have **no default** in
-  `yanolja_client.py`, `post_call.py`, `handover.py`, `docker-compose.yml` or `.env.example`.
+- **External endpoints fail closed (PR #329 review):** `YANOLJA_BASE_URL` (PMS),
+  `N8N_BASE_URL` (post-call call log + handover notify) and `N8N_POSTCALL_WEBHOOK` (post-call
+  path) have **no default** in `yanolja_client.py`, `post_call.py`, `handover.py`,
+  `docker-compose.yml`, `.env.example` or the runbook env template.
   Blank/missing means unconfigured: `is_configured()` is False so no booking tools are offered,
   `_post_to_n8n` and `send_handover_notification` return without any outbound request, and
   the PMS client raises `YanoljaError` before touching a session — even when the PMS
@@ -329,7 +330,7 @@ n8n instance/workflows must be provisioned and set explicitly before any of thes
 Files in `knowledge_docs/` chunked (500 chars, 50 overlap) -> embedded with `all-MiniLM-L6-v2` -> stored in ChromaDB (`./chroma_db`). Query embeddings LRU-cached. KB context injected as user message prefix per turn (not system prompt). Prewarm on startup. Chunk IDs are SHA-256 hashes (idempotent re-indexing).
 
 **Post-call data capture** (`post_call.py`):
-When a call ends (WebSocket disconnect), `server.py` fires `asyncio.create_task(process_post_call_data(...))` to run post-call processing in the background. The flow: format the full transcript → call LLM (same provider as the conversation) to extract structured booking details (guest name, dates, room preference, outcome, follow-up needed, summary) → POST JSON payload to n8n webhook `/webhook/post-call-data` → n8n appends a row to Google Sheet "Riya Call Log". Caller phone number is captured from Twilio HTTP POST params (`From`) via a module-level `_call_phone` dict bridge between HTTP handlers and WebSocket handlers. A separate `full_transcript` list (never trimmed) accumulates all user/assistant messages alongside the trimmed `conversation_history`. All errors are caught and logged — post-call failures never affect the call or server stability. Env var: `N8N_POSTCALL_WEBHOOK` (default: `/webhook/post-call-data`).
+When a call ends (WebSocket disconnect), `server.py` fires `asyncio.create_task(process_post_call_data(...))` to run post-call processing in the background. The flow: format the full transcript → call LLM (same provider as the conversation) to extract structured booking details (guest name, dates, room preference, outcome, follow-up needed, summary) → POST JSON payload to n8n webhook `/webhook/post-call-data` → n8n appends a row to Google Sheet "Riya Call Log". Caller phone number is captured from Twilio HTTP POST params (`From`) via a module-level `_call_phone` dict bridge between HTTP handlers and WebSocket handlers. A separate `full_transcript` list (never trimmed) accumulates all user/assistant messages alongside the trimmed `conversation_history`. All errors are caught and logged — post-call failures never affect the call or server stability. Env var: `N8N_POSTCALL_WEBHOOK` (no default — fail closed; set it to the path of Riviera's own post-call workflow, e.g. `/webhook/post-call-data`).
 
 **Google Sheet columns** (n8n workflow "Post-Call Data to Google Sheets"): Date/Time, Call SID, Language, Caller Phone, Guest Name, Location, Guests, Check-In, Check-Out, Room Preference, Availability, Outcome, Follow-Up Needed, Summary, Transcript.
 
@@ -564,16 +565,17 @@ sheets; dedicated PMS seed + verifier under `ops/riviera-pms/`; own loopback por
 isolation-neighbour check in the deploy script; registered in CI, deploy exclusions, PR impact,
 dependabot, dep-audit, Sentry triage and the revert script; `build-riviera-image.yml` /
 `probe-riviera-image.yml` mirror Kavya's guarded pipeline. See the delta list at the top.
-Post-call capture is unchanged from Kavya: the summary is POSTed to the
-`N8N_POSTCALL_WEBHOOK` env var (default: `/webhook/post-call-data`) on `N8N_BASE_URL` — which is
-**blank by default (fail closed: nothing is POSTed until set)**;
-point Riviera at its own n8n workflow / Google Sheet before go-live so its call log does not
-land in Kavya's.
+Post-call capture is unchanged from Kavya in shape: the summary is POSTed to
+`N8N_POSTCALL_WEBHOOK` (no default — fail closed; set it to the path of Riviera's own post-call workflow, e.g. `/webhook/post-call-data`)
+on `N8N_BASE_URL` — **both blank by default, so nothing is POSTed until both are set**; point
+Riviera at its own n8n workflow / Google Sheet before go-live so its call log does not land in
+Kavya's.
 
 ### r0.2 — External endpoints fail closed (Sep 2026, PR #329 review)
-Removed the inherited shared-host defaults: `YANOLJA_BASE_URL` and `N8N_BASE_URL` are blank
-unless set (code, compose passthroughs, `.env.example`); PMS calls, post-call dispatch and the
-handover notification make no outbound request while unconfigured. Regression contract in
+Removed the inherited shared defaults: `YANOLJA_BASE_URL`, `N8N_BASE_URL` and
+`N8N_POSTCALL_WEBHOOK` are blank unless set (code, compose passthroughs, `.env.example`, runbook
+env template); PMS calls, post-call dispatch and the handover notification make no outbound
+request while unconfigured. Regression contract in
 `tests/test_external_endpoints_fail_closed.py`.
 
 The four inherited contracts below are kept here because they are load-bearing for any edit to
