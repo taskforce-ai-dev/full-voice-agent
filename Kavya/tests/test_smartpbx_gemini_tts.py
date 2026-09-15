@@ -360,7 +360,7 @@ async def test_smartpbx_sinhala_gemini_pcm_is_downsampled_and_completed_once(mon
     assert actual[:len(expected)] == expected
     assert actual[len(expected):] == b"\xff" * ((-len(expected)) % 640)
     assert transport.marks == ["tts_done"]
-    assert client.interactions.calls == [{
+    assert client.aio.interactions.calls == [{
         "model": "gemini-3.1-flash-tts-preview",
         "input": "සිංහල පිළිතුර",
         "stream": True,
@@ -862,8 +862,8 @@ async def test_smartpbx_sinhala_non_quota_provider_errors_never_fall_back(monkey
 
     await pipeline._tts_gemini_sinhala("private Sinhala text")
 
-    assert len(client.interactions.calls) == 1
-    assert client.interactions.calls[0]["model"] == server.SMARTPBX_SINHALA_GEMINI_TTS_MODEL
+    assert len(client.aio.interactions.calls) == 1
+    assert client.aio.interactions.calls[0]["model"] == server.SMARTPBX_SINHALA_GEMINI_TTS_MODEL
     assert (
         server.DiagnosticStage.TTS,
         server.DiagnosticOutcome.FAILED,
@@ -1150,3 +1150,373 @@ def test_smartpbx_status_json_exposes_the_active_sinhala_tts_model(monkeypatch):
 
     server._note_smartpbx_sinhala_tts_active_model("gemini-2.5-flash-preview-tts")
     assert status(request)["sinhala_tts_model"] == "gemini-2.5-flash-preview-tts"
+
+
+# --- text-specific retry on a NON-primary model (2026-09-04 live evidence) -
+
+class ModelRoutedInteractions:
+    """Route each `create()` call to a per-model stream factory."""
+
+    def __init__(self, by_model):
+        self.by_model = by_model
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.by_model[kwargs["model"]]()
+
+
+def _model_routed_client(by_model):
+    return SimpleNamespace(aio=SimpleNamespace(interactions=ModelRoutedInteractions(by_model)))
+
+
+@pytest.mark.asyncio
+async def test_invalid_request_on_a_fallback_model_retries_same_text_next_model(
+    monkeypatch, caplog,
+):
+    """The live-incident shape: a non-primary model rejects short Sinhala
+    text outright -- retry the SAME text on the next model, never marking
+    the model the caller heard nothing from as exhausted."""
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "primary")
+    monkeypatch.setattr(
+        server, "SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS", ("secondary", "tertiary"),
+    )
+    server._mark_smartpbx_sinhala_tts_model_exhausted("primary")
+    pipeline, transport = make_sinhala_smartpbx_pipeline(server)
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
+    payload = bytes(range(256)) * 4
+    client = _model_routed_client({
+        "secondary": lambda: FakeAsyncStream([error_event("invalid_request_error")]),
+        "tertiary": lambda: FakeAsyncStream([audio_event(payload)]),
+    })
+    pipeline._gemini_tts_client = client
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._tts_gemini_sinhala("ආයුබෝවන්.")
+
+    calls = client.aio.interactions.calls
+    assert [c["model"] for c in calls] == ["secondary", "tertiary"]
+    assert transport.audio, "audio must reach the wire via the retried model"
+    assert transport.marks == ["tts_done"]
+    assert (
+        "event=sinhala_tts_model_retry from=secondary to=tertiary "
+        "reason=invalid_request" in caplog.text
+    )
+    # Text-specific -- never mark the model exhausted for this.
+    assert server._smartpbx_sinhala_tts_model_is_exhausted("secondary") is False
+    assert server._smartpbx_sinhala_tts_model_is_exhausted("tertiary") is False
+    assert pipeline._smartpbx_tts_model_retries_total == 1
+    assert pipeline._smartpbx_tts_model_fallbacks_total == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_audio_on_a_fallback_model_retries_same_text_next_model(
+    monkeypatch, caplog,
+):
+    """The other live-incident shape: a completed stream with zero audio
+    deltas and no error on a non-primary model."""
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "primary")
+    monkeypatch.setattr(
+        server, "SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS", ("secondary", "tertiary"),
+    )
+    server._mark_smartpbx_sinhala_tts_model_exhausted("primary")
+    pipeline, transport = make_sinhala_smartpbx_pipeline(server)
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
+    payload = bytes(range(256)) * 4
+    client = _model_routed_client({
+        "secondary": lambda: FakeAsyncStream([
+            interaction_lifecycle_event("interaction.created"),
+            interaction_lifecycle_event("interaction.completed"),
+        ]),
+        "tertiary": lambda: FakeAsyncStream([audio_event(payload)]),
+    })
+    pipeline._gemini_tts_client = client
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._tts_gemini_sinhala("ඔව්, හරි.")
+
+    calls = client.aio.interactions.calls
+    assert [c["model"] for c in calls] == ["secondary", "tertiary"]
+    assert transport.audio, "audio must reach the wire via the retried model"
+    assert transport.marks == ["tts_done"]
+    assert (
+        "event=sinhala_tts_model_retry from=secondary to=tertiary "
+        "reason=empty_audio" in caplog.text
+    )
+    assert server._smartpbx_sinhala_tts_model_is_exhausted("secondary") is False
+    assert server._smartpbx_sinhala_tts_model_is_exhausted("tertiary") is False
+    assert pipeline._smartpbx_tts_model_retries_total == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_request_on_the_primary_model_still_never_falls_back(monkeypatch):
+    """The retry above is scoped to a NON-primary model -- a primary-model
+    invalid_request must keep the existing single-call, no-retry contract."""
+    import server
+
+    pipeline, _transport = make_sinhala_smartpbx_pipeline(server)
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
+    client = FakeGeminiTTSClient(FakeAsyncStream([error_event("invalid_request_error")]))
+    pipeline._gemini_tts_client = client
+
+    await pipeline._tts_gemini_sinhala("ආයුබෝවන්.")
+
+    assert len(client.aio.interactions.calls) == 1
+    assert client.aio.interactions.calls[0]["model"] == server.SMARTPBX_SINHALA_GEMINI_TTS_MODEL
+    assert pipeline._smartpbx_tts_model_retries_total == 0
+
+
+@pytest.mark.asyncio
+async def test_text_specific_retry_exhausts_the_chain_then_speaks_the_apology(monkeypatch):
+    """Every model failing for a text-specific reason must still end in the
+    existing never-silent apology, with no model marked exhausted."""
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "primary")
+    monkeypatch.setattr(
+        server, "SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS", ("secondary", "tertiary"),
+    )
+    server._mark_smartpbx_sinhala_tts_model_exhausted("primary")
+    pipeline, transport = make_sinhala_smartpbx_pipeline(server)
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
+    server._store_cached_smartpbx_sinhala_phrase_audio(
+        server.SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT, b"\xff" * 640,
+    )
+    client = _model_routed_client({
+        "secondary": lambda: FakeAsyncStream([
+            interaction_lifecycle_event("interaction.created"),
+            interaction_lifecycle_event("interaction.completed"),
+        ]),
+        "tertiary": lambda: FakeAsyncStream([error_event("invalid_request_error")]),
+    })
+    pipeline._gemini_tts_client = client
+
+    await pipeline._tts_gemini_sinhala("ඔව්, හරි.")
+
+    assert [c["model"] for c in client.aio.interactions.calls] == ["secondary", "tertiary"]
+    assert b"".join(transport.audio) == b"\xff" * 640
+    assert transport.marks == ["tts_done"]
+    assert server._smartpbx_sinhala_tts_model_is_exhausted("secondary") is False
+    assert server._smartpbx_sinhala_tts_model_is_exhausted("tertiary") is False
+    assert pipeline._smartpbx_tts_model_retries_total == 1
+
+
+# --- short-utterance cache bank (2026-09-04) --------------------------------
+
+def test_short_utterance_bank_is_small_and_on_the_cache_allowlist():
+    import server
+
+    assert 0 < len(server.SMARTPBX_SINHALA_SHORT_UTTERANCE_BANK) <= 10
+    for phrase in server.SMARTPBX_SINHALA_SHORT_UTTERANCE_BANK:
+        assert phrase in server.SMARTPBX_SINHALA_CACHED_PHRASES
+
+
+def test_cache_lookup_matches_punctuation_and_whitespace_variance():
+    import server
+
+    server._store_cached_smartpbx_sinhala_phrase_audio("ඔව්, හරි.", b"\xff" * 640)
+
+    assert server._is_smartpbx_sinhala_cacheable_phrase("ඔව්, හරි") is True
+    assert server._get_cached_smartpbx_sinhala_phrase_audio("ඔව්, හරි") == b"\xff" * 640
+    assert server._get_cached_smartpbx_sinhala_phrase_audio("  ඔව්,   හරි.  ") == b"\xff" * 640
+    assert server._get_cached_smartpbx_sinhala_phrase_audio("something else") is None
+
+
+@pytest.mark.asyncio
+async def test_short_utterance_bank_phrase_variant_served_from_cache_without_a_live_request(
+    monkeypatch,
+):
+    import server
+
+    pipeline, transport = make_sinhala_smartpbx_pipeline(server)
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
+    server._store_cached_smartpbx_sinhala_phrase_audio("ඔව්, හරි.", b"\xff" * 640)
+
+    def _forbidden_client():
+        raise AssertionError("a cached short utterance must not touch the live API")
+
+    monkeypatch.setattr(server, "_get_gemini_tts_client", _forbidden_client)
+
+    await pipeline._tts_gemini_sinhala("ඔව්,  හරි")
+
+    assert b"".join(transport.audio) == b"\xff" * 640
+    assert transport.marks == ["tts_done"]
+
+
+# --- non-streaming model config (2026-09-04) --------------------------------
+
+def test_parse_smartpbx_sinhala_tts_non_streaming_models_env_validation():
+    import server
+
+    default = frozenset({"gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"})
+    assert server._parse_smartpbx_sinhala_tts_non_streaming_models("") == default
+    assert server._parse_smartpbx_sinhala_tts_non_streaming_models("   ") == default
+    assert server._parse_smartpbx_sinhala_tts_non_streaming_models("model-a,model-b") == (
+        frozenset({"model-a", "model-b"})
+    )
+    assert server._parse_smartpbx_sinhala_tts_non_streaming_models("Bad_Model,model-ok,,") == (
+        frozenset({"model-ok"})
+    )
+    assert server._parse_smartpbx_sinhala_tts_non_streaming_models("INVALID_ONLY") == default
+
+
+def test_smartpbx_sinhala_tts_min_chars_default():
+    import server
+
+    assert server.SMARTPBX_SINHALA_TTS_MIN_CHARS == 12
+
+
+def test_smartpbx_sinhala_tts_model_is_non_streaming(monkeypatch):
+    import server
+
+    monkeypatch.setattr(
+        server, "SMARTPBX_SINHALA_TTS_NON_STREAMING_MODELS", frozenset({"fallback-a"}),
+    )
+    assert server._smartpbx_sinhala_tts_model_is_non_streaming("fallback-a") is True
+    assert server._smartpbx_sinhala_tts_model_is_non_streaming("primary") is False
+
+
+def test_smartpbx_sinhala_tts_current_model_prefers_available_head_over_active(monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "primary")
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS", ("secondary",))
+
+    assert server._smartpbx_sinhala_tts_current_model() == "primary"
+
+    server._mark_smartpbx_sinhala_tts_model_exhausted("primary")
+    assert server._smartpbx_sinhala_tts_current_model() == "secondary"
+
+
+
+# --- 2026-09-05 coordinator follow-up: length-agnostic retry + empty-stream
+# event-kind histogram --------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_empty_audio_retry_applies_regardless_of_text_length(monkeypatch, caplog):
+    """The empty_audio/invalid_request retry on a non-primary model is not
+    gated on the short-utterance case -- any text length must retry."""
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "primary")
+    monkeypatch.setattr(
+        server, "SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS", ("secondary", "tertiary"),
+    )
+    server._mark_smartpbx_sinhala_tts_model_exhausted("primary")
+    pipeline, transport = make_sinhala_smartpbx_pipeline(server)
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
+    payload = bytes(range(256)) * 4
+    long_text = (
+        "අද අපගේ පහසුකම් සියල්ල විවෘතව පවතී. ඔබට කැමති කාමරයක් වෙන් කරගැනීමට "
+        "දැන් අවස්ථාව තිබේ."
+    )
+    assert len(long_text) > server.SMARTPBX_SINHALA_TTS_MIN_CHARS
+    client = _model_routed_client({
+        "secondary": lambda: FakeAsyncStream([
+            interaction_lifecycle_event("interaction.created"),
+            interaction_lifecycle_event("interaction.completed"),
+        ]),
+        "tertiary": lambda: FakeAsyncStream([audio_event(payload)]),
+    })
+    pipeline._gemini_tts_client = client
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._tts_gemini_sinhala(long_text)
+
+    assert [c["model"] for c in client.aio.interactions.calls] == ["secondary", "tertiary"]
+    assert transport.audio, "a long text must retry to the next model exactly like a short one"
+    assert (
+        "event=sinhala_tts_model_retry from=secondary to=tertiary "
+        "reason=empty_audio" in caplog.text
+    )
+    assert server._smartpbx_sinhala_tts_model_is_exhausted("secondary") is False
+
+
+@pytest.mark.asyncio
+async def test_empty_stream_retry_logs_a_bounded_event_kind_histogram(monkeypatch, caplog):
+    """An empty-audio retry also logs a bounded, privacy-safe histogram of
+    the event kinds the failing attempt actually saw."""
+    import server
+
+    monkeypatch.setattr(server, "SMARTPBX_SINHALA_GEMINI_TTS_MODEL", "primary")
+    monkeypatch.setattr(
+        server, "SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS", ("secondary", "tertiary"),
+    )
+    server._mark_smartpbx_sinhala_tts_model_exhausted("primary")
+    pipeline, _transport = make_sinhala_smartpbx_pipeline(server)
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
+    payload = bytes(range(256)) * 4
+    client = _model_routed_client({
+        "secondary": lambda: FakeAsyncStream([
+            interaction_lifecycle_event("interaction.created"),
+            interaction_lifecycle_event("interaction.created"),
+            interaction_lifecycle_event("interaction.completed"),
+        ]),
+        "tertiary": lambda: FakeAsyncStream([audio_event(payload)]),
+    })
+    pipeline._gemini_tts_client = client
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._tts_gemini_sinhala("ඔව්, හරි.")
+
+    assert (
+        "event=sinhala_tts_stream_empty model=secondary "
+        "events=interaction.created=2 interaction.completed=1" in caplog.text
+    )
+    # Never the text, never anything beyond the bounded SDK-protocol tags.
+    assert "ඔව්, හරි" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_terminal_empty_audio_apology_also_logs_the_event_kind_histogram(
+    monkeypatch, caplog,
+):
+    """The final give-up (every model exhausted for this text) still logs the
+    histogram for the last attempt, not just an intermediate retry."""
+    import server
+
+    pipeline, transport = make_sinhala_smartpbx_pipeline(server)
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "test-key")
+    server._store_cached_smartpbx_sinhala_phrase_audio(
+        server.SMARTPBX_SINHALA_TTS_UNAVAILABLE_TEXT, b"\xff" * 640,
+    )
+    pipeline._gemini_tts_client = FakeGeminiTTSClient(FakeAsyncStream([
+        interaction_lifecycle_event("interaction.created"),
+        interaction_lifecycle_event("interaction.completed"),
+    ]))
+
+    with caplog.at_level(logging.WARNING):
+        await pipeline._tts_gemini_sinhala("private Sinhala text")
+
+    assert b"".join(transport.audio) == b"\xff" * 640
+    assert (
+        "event=sinhala_tts_stream_empty model=" in caplog.text
+        and "events=interaction.created=1 interaction.completed=1" in caplog.text
+    )
+    assert "private Sinhala text" not in caplog.text
+
+
+def test_event_kind_histogram_is_bounded_and_folds_overflow_into_other():
+    import server
+
+    max_kinds = server._GEMINI_TTS_EVENT_KIND_HISTOGRAM_MAX_KINDS
+    counts: dict[str, int] = {}
+    for i in range(max_kinds + 4):
+        server._note_gemini_tts_event_kind(counts, f"kind-{i}")
+    # max_kinds distinct real kinds, plus one "other" bucket for the overflow.
+    assert len(counts) == max_kinds + 1
+    assert counts["other"] == 4
+    assert all(counts[f"kind-{i}"] == 1 for i in range(max_kinds))
+    assert server._format_gemini_tts_event_kind_histogram({"a": 2, "b": 1}) == "a=2 b=1"
+
+
+def test_note_gemini_tts_event_kind_is_a_noop_without_a_counts_dict():
+    import server
+
+    # Must never raise when the caller passes no histogram (e.g. the
+    # short-lived prewarm synthesis path, which has no failure telemetry).
+    server._note_gemini_tts_event_kind(None, "step.delta")
