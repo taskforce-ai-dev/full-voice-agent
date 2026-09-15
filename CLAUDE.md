@@ -92,8 +92,11 @@ Pushing to `main` **auto-deploys** each changed agent to prod
   `gh workflow run deploy.yml -f agent=<id> -f ref=main -f mode=fast|build`.
 - **Sentry → Claude auto-triage** uses **Opus 4.8** (`claude-opus-4-8`),
   draft-PR only, never deploys.
-- **Kavya** is excluded from this matrix — see `Kavya/SMARTPBX_RUNBOOK.md`'s
-  guarded probe → publish → deploy pipeline instead. **Hutch** is also
+- **Kavya** and **Riviera** (a full Kavya clone for Riviera Resort, Batticaloa;
+  see `Riviera/CLAUDE.md`) are excluded from this matrix — see
+  `Kavya/SMARTPBX_RUNBOOK.md` / `Riviera/SMARTPBX_RUNBOOK.md`'s guarded
+  probe → publish → deploy pipeline instead (`build-riviera-image.yml` +
+  `probe-riviera-image.yml` mirror the Kavya pair). **Hutch** is also
   excluded, for the same reason (its VPS shape doesn't fit the flat-rsync
   model this engine assumes) but has its own auto-deploy on push to `main`
   under `Hutch Agent/**` — see `.github/workflows/deploy-hutch.yml` and
@@ -225,8 +228,9 @@ brought in for future editing convenience.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 
-This project has a graphify knowledge graph at `graphify-out/`. It covers all 6 voice
-agents (BSL, Kavya, SLIC, Sofia, Flico, HattonHills), agent-dashboard, SinhalaVITS-TTS,
+This project has a graphify knowledge graph at `graphify-out/`. It covers the voice
+agents (BSL, Kavya, SLIC, Sofia, Flico, HattonHills; Kitchened, WorldOfRefrigerators,
+Horizon and Riviera were added later and need a `graphify update .`), agent-dashboard, SinhalaVITS-TTS,
 flico-dashboard, and the **Taskforce AI website** (`Taskforce_AI_Website/`). After the
 Jun 18, 2026 full LLM rebuild (2,170 nodes) the website was added via AST update, so it
 now has **~2,881 nodes, ~4,473 edges, 279 communities**, plus an interactive `graph.html`.

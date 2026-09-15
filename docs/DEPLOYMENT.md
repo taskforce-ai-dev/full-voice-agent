@@ -73,6 +73,8 @@ Confirmed via `ls -d /opt/*/` and `docker ps` on 2026-06-29.
 | `kavya`  | `Kavya`                  | `/opt/kavya`                  | `kavya-voice-agent`           |
 | `kitchened` | `Kitchened`           | `/opt/kitchened`             | `kitchened-voice-agent`       |
 | `wor`    | `WorldOfRefrigerators`   | `/opt/worldofrefrigerators`   | `wor-voice-agent`             |
+| `horizon` | `Horizon Agent`         | `/opt/horizon`                | `horizon-voice-agent`         |
+| `riviera` | `Riviera`               | `/opt/riviera` (+ `riviera-smartpbx` profile) | `riviera-voice-agent` — **excluded from deploy.yml**, see `Riviera/SMARTPBX_RUNBOOK.md` |
 
 This table and the `case` statement in `deploy.yml` must stay in sync.
 

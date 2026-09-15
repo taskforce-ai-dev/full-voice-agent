@@ -84,6 +84,7 @@ jobs:
           any=false
           deploy_any=false
           kavya=false
+          riviera=false
           build_any=false
           image_any=false
           unknown_any=false
@@ -92,14 +93,15 @@ jobs:
           # keep them quoted and matched with grep -F.
           for entry in "BSL Agent:bsl" "Flico Agent:flico" "HattonHills:hatton" \
                        "SLIC Agent:slic" "Sofia Agent:sofia" "Kavya:kavya" \
-                       "Kitchened:kitchened" "WorldOfRefrigerators:wor"; do
+                       "Kitchened:kitchened" "WorldOfRefrigerators:wor" \
+                       "Riviera:riviera"; do
             dir="${entry%%:*}"; id="${entry##*:}"
             match=$(printf '%s\n' "$CHANGED" | grep -F "$dir/" || true)
             [ -z "$match" ] && continue
 
             any=true
-            if [ "$id" = "kavya" ]; then
-              kavya=true
+            if [ "$id" = "kavya" ] || [ "$id" = "riviera" ]; then
+              if [ "$id" = "kavya" ]; then kavya=true; else riviera=true; fi
               count=$(printf '%s\n' "$match" | grep -c . || true)
               printf '| `%s` | `%s` | **excluded** | reviewed SmartPBX probe -> publisher -> runbook route; no generic deployment | %s |\n' \
                 "$id" "$dir" "$count" >> rows.md
@@ -155,6 +157,7 @@ jobs:
           echo "any=$any" >> "$GITHUB_OUTPUT"
           echo "deploy_any=$deploy_any" >> "$GITHUB_OUTPUT"
           echo "kavya=$kavya" >> "$GITHUB_OUTPUT"
+          echo "riviera=$riviera" >> "$GITHUB_OUTPUT"
           echo "build_any=$build_any" >> "$GITHUB_OUTPUT"
           echo "image_any=$image_any" >> "$GITHUB_OUTPUT"
           echo "unknown_any=$unknown_any" >> "$GITHUB_OUTPUT"
@@ -170,6 +173,7 @@ jobs:
           ANY: ${{ steps.detect.outputs.any }}
           DEPLOY_ANY: ${{ steps.detect.outputs.deploy_any }}
           KAVYA: ${{ steps.detect.outputs.kavya }}
+          RIVIERA: ${{ steps.detect.outputs.riviera }}
           BUILD_ANY: ${{ steps.detect.outputs.build_any }}
           IMAGE_ANY: ${{ steps.detect.outputs.image_any }}
           UNKNOWN_ANY: ${{ steps.detect.outputs.unknown_any }}
@@ -213,11 +217,24 @@ jobs:
                 echo '> generic deployment and requires the reviewed SmartPBX probe -> publisher -> runbook route.'
                 echo
               fi
-            elif [ "$KAVYA" = "true" ]; then
-              echo '> Merging this PR does not deploy Kavya.'
-              echo '> Kavya is excluded from generic deployment; use the reviewed SmartPBX'
-              echo '> probe -> publisher -> runbook route only.'
-              echo
+              if [ "$RIVIERA" = "true" ]; then
+                echo '> Merging this PR does not deploy Riviera. It remains excluded from'
+                echo '> generic deployment and requires the reviewed SmartPBX probe -> publisher -> runbook route.'
+                echo
+              fi
+            elif [ "$KAVYA" = "true" ] || [ "$RIVIERA" = "true" ]; then
+              if [ "$KAVYA" = "true" ]; then
+                echo '> Merging this PR does not deploy Kavya.'
+                echo '> Kavya is excluded from generic deployment; use the reviewed SmartPBX'
+                echo '> probe -> publisher -> runbook route only.'
+                echo
+              fi
+              if [ "$RIVIERA" = "true" ]; then
+                echo '> Merging this PR does not deploy Riviera.'
+                echo '> Riviera is excluded from generic deployment; use the reviewed SmartPBX'
+                echo '> probe -> publisher -> runbook route only.'
+                echo
+              fi
               echo '| Agent | Folder | Mode | Effect on merge | Files |'
               echo '|---|---|---|---|---|'
               cat rows.md
@@ -253,6 +270,14 @@ jobs:
               echo 'the exact tag, full revision, and digest from its reviewed record.'
               echo 'Do not call generic deploy.yml with agent=kavya mode=image.'
               echo 'For clarity, do not call generic `deploy.yml` with `agent=kavya` and `mode=image`; that route rejects Kavya.'
+              echo
+            fi
+            if [ "$RIVIERA" = "true" ]; then
+              echo '**Riviera SmartPBX rollback:** first follow the withdraw/drain steps in'
+              echo '`Riviera/SMARTPBX_RUNBOOK.md`. For a reviewed last-good immutable image,'
+              echo 'use its guarded `/opt/riviera/scripts/deploy_smartpbx_image.sh` command with'
+              echo 'the exact tag, full revision, and digest from its reviewed record.'
+              echo 'Do not call generic `deploy.yml` with `agent=riviera`; that route rejects Riviera.'
               echo
             fi
 

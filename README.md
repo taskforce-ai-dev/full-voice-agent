@@ -24,6 +24,7 @@ can't handle (Sinhala, Tamil, Arabic). Each ships its own `Dockerfile`, `docker-
 | **SLIC** | Nimali | Sri Lanka Insurance (accident hotline) | English only | Transactional (mocked claim dispatch + real SMS) | [SLIC Agent/README.md](./SLIC%20Agent/README.md) |
 | **Kitchened** | — | Kitchen & Co. (commercial kitchen/bakery equipment) | see `Kitchened/server.py` | Informational (KB only) | _no folder README yet_ |
 | **WorldOfRefrigerators** | — | World Of Refrigerators (refrigeration sales) | see folder `server.py` | Informational (KB only) | _no folder README yet_ |
+| **Riviera** | Riya | Riviera Resort (lagoon-front resort, Kallady, Batticaloa) | EN / Sinhala / Tamil (Twilio IVR + Dialog SmartPBX) | Transactional (Yanolja PMS bookings) — full clone of Kavya, isolated container | [Riviera/README.md](./Riviera/README.md) |
 
 Each agent folder also contains a `CLAUDE.md` with the full architecture, design decisions, change
 history, and operational gotchas — start there for any deep work on an agent.
@@ -40,6 +41,7 @@ full-voice-agent/
 ├── SLIC Agent/             # Nimali — SLIC accident hotline (English, mocked + SMS)
 ├── Kitchened/              # Kitchen & Co. equipment agent (informational)
 ├── WorldOfRefrigerators/   # World Of Refrigerators agent (informational)
+├── Riviera/                # Riya — Riviera Resort, Batticaloa (Kavya clone, EN/SI/TA, SmartPBX)
 │
 ├── asterisk-flico/         # Additive Asterisk/SIP pilot for Flico (off by default)
 ├── flico-dashboard/        # Flico dashboard
@@ -87,7 +89,7 @@ its host port and the full env var list.
 
 Each agent deploys independently to the DigitalOcean VPS at **`67.207.90.109`** (SSH `root@`),
 running as a Docker container behind nginx (SSL termination, WebSocket upgrade, rate limiting), each
-on its own host port (e.g. Kavya `8000`, Sofia/SLIC `8001`, BSL `8002`, Flico `8003`).
+on its own host port (e.g. Kavya `8000`, Sofia/SLIC `8001`, BSL `8002`, Flico `8003`, Riviera `8060` + SmartPBX `8061`).
 
 ```bash
 cd "<Agent Folder>"
