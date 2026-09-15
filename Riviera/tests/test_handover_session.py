@@ -167,7 +167,7 @@ def test_failsafe_session_collects_details_and_messages_the_manager(n8n):
     # The manager notification actually went out, correctly shaped.
     assert len(n8n.calls) == 1
     url, payload = n8n.calls[0]
-    assert url == "https://automation.taskforceai.tech/webhook/riviera-handover"
+    assert url == "https://n8n.riviera.example/webhook/riviera-handover"
     assert payload["call_sid"] == CALL_SID
     assert payload["customer_name"] == "Chanya"
     assert payload["customer_whatsapp"] == "94771234567"

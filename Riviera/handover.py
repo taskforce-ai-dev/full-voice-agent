@@ -36,9 +36,10 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-N8N_BASE_URL: str = os.getenv(
-    "N8N_BASE_URL", "https://automation.taskforceai.tech"
-).rstrip("/")
+# Fail closed: no default host. A blank/missing N8N_BASE_URL means the
+# handover notification is never POSTed -- Riviera must not send guest
+# contact details to the fleet's shared automation host by default.
+N8N_BASE_URL: str = (os.getenv("N8N_BASE_URL") or "").strip().rstrip("/")
 
 N8N_HANDOVER_WEBHOOK: str = os.getenv(
     "N8N_HANDOVER_WEBHOOK", "/webhook/riviera-handover"
@@ -47,6 +48,11 @@ N8N_HANDOVER_WEBHOOK: str = os.getenv(
 # Sri Lanka. Callers give local numbers ("077...", "77...") far more often than
 # international ones, so we default to the property's own country code.
 DEFAULT_COUNTRY_CODE: str = os.getenv("WHATSAPP_COUNTRY_CODE", "94").strip()
+
+
+def is_handover_webhook_configured() -> bool:
+    """True only when a handover webhook destination has been explicitly set."""
+    return bool(N8N_BASE_URL) and bool(N8N_HANDOVER_WEBHOOK)
 
 # National significant number length for the default country (94 + 9 digits).
 # A Sri Lankan NSN is exactly 9 digits (e.g. 77 123 4567). This is the check
@@ -545,6 +551,16 @@ async def send_handover_notification(
     if privacy_safe and not payload["human_agent_whatsapp"]:
         logger.info("smartpbx_handover event=not_actionable")
         return {"ok": False, "error": "missing_human_agent_whatsapp"}
+
+    if not is_handover_webhook_configured():
+        if privacy_safe:
+            logger.warning("smartpbx_handover event=failed outcome=unconfigured")
+            return {"ok": False, "error": "handover_webhook_not_configured"}
+        logger.error(
+            "[handover] refusing to notify -- N8N_BASE_URL is blank, no handover "
+            "webhook destination configured (call_sid=%s)", call_sid,
+        )
+        return {"ok": False, "error": "handover_webhook_not_configured", "payload": payload}
 
     url = f"{N8N_BASE_URL}{N8N_HANDOVER_WEBHOOK}"
     try:

@@ -33,12 +33,20 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-N8N_BASE_URL: str = os.getenv(
-    "N8N_BASE_URL", "https://automation.taskforceai.tech"
-)
+# Fail closed: there is NO default post-call destination. A blank/missing
+# N8N_BASE_URL means transcripts and call records are never POSTed anywhere --
+# Riviera must not fall back to the fleet's shared automation host and land its
+# call log in another property's workflow. Only the webhook *path* has a
+# default; it is inert until a Riviera-owned base URL is configured.
+N8N_BASE_URL: str = (os.getenv("N8N_BASE_URL") or "").strip().rstrip("/")
 N8N_POSTCALL_WEBHOOK: str = os.getenv(
     "N8N_POSTCALL_WEBHOOK", "/webhook/post-call-data"
 )
+
+
+def is_post_call_dispatch_configured() -> bool:
+    """True only when a post-call webhook destination has been explicitly set."""
+    return bool(N8N_BASE_URL) and bool(N8N_POSTCALL_WEBHOOK)
 
 EXTRACTION_MAX_TOKENS: int = 2000
 
@@ -452,7 +460,20 @@ async def _retry_extraction(
 # ---------------------------------------------------------------------------
 
 async def _post_to_n8n(payload: dict[str, Any], privacy_safe: bool = False) -> None:
-    """POST the call data payload to the n8n webhook. Fire-and-forget."""
+    """POST the call data payload to the n8n webhook. Fire-and-forget.
+
+    Makes no outbound request at all while ``N8N_BASE_URL`` is unconfigured.
+    """
+    if not is_post_call_dispatch_configured():
+        if privacy_safe:
+            logger.warning("smartpbx_post_call event=n8n_skipped reason=unconfigured")
+        else:
+            logger.warning(
+                "Post-call webhook not configured (N8N_BASE_URL blank) -- "
+                "call record for %s not sent", payload.get("call_sid"),
+            )
+        return
+
     from booking_api import get_session
 
     url = f"{N8N_BASE_URL}{N8N_POSTCALL_WEBHOOK}"

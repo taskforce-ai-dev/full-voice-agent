@@ -2,7 +2,7 @@
 
 This file replaces the n8n-webhook polling implementation (moved to
 legacy_pms/booking_api.py on 2026-05-13) with a direct call into the new
-Yanolja PMS at https://yanolja.taskforceai.tech/api.
+Yanolja-style PMS at YANOLJA_BASE_URL (Riviera's dedicated instance; no default).
 
 The public surface (function names, signatures, and return-dict shapes)
 is preserved so tools.py and server.py need no changes. Extra fields

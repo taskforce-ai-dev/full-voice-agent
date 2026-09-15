@@ -151,12 +151,14 @@ services:
       BARGEIN_DEBOUNCE_SECONDS: "${BARGEIN_DEBOUNCE_SECONDS:-0.6}"
       AZURE_SPEECH_KEY: "${AZURE_SPEECH_KEY:-}"
       AZURE_SPEECH_REGION: "${AZURE_SPEECH_REGION:-southeastasia}"
-      YANOLJA_BASE_URL: "${YANOLJA_BASE_URL:-https://yanolja.taskforceai.tech/api}"
+      # No default: blank = PMS disabled. Never point Riviera at another property's PMS.
+      YANOLJA_BASE_URL: "${YANOLJA_BASE_URL:-}"
       YANOLJA_USERNAME: "${YANOLJA_USERNAME:-}"
       YANOLJA_PASSWORD: "${YANOLJA_PASSWORD:-}"
       YANOLJA_TIMEOUT: "${YANOLJA_TIMEOUT:-30}"
       DEMO_RATES_ENABLED: "${DEMO_RATES_ENABLED:-true}"
-      N8N_BASE_URL: "${N8N_BASE_URL:-https://automation.taskforceai.tech}"
+      # No default: blank = post-call / handover webhooks disabled until Riviera's own n8n is set.
+      N8N_BASE_URL: "${N8N_BASE_URL:-}"
       N8N_POSTCALL_WEBHOOK: "${N8N_POSTCALL_WEBHOOK:-/webhook/post-call-data}"
       DASHBOARD_API_URL: "${DASHBOARD_API_URL:-}"
       DASHBOARD_API_KEY: "${DASHBOARD_API_KEY:-}"

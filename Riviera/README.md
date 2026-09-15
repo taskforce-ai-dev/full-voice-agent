@@ -95,14 +95,19 @@ container start (and via `POST /kb-reload`).
    `SMARTPBX_RUNBOOK.md`; mount the GCP service-account JSON.
 3. **PMS instance** — provision and seed per `ops/riviera-pms/RUNBOOK.md`; set
    `YANOLJA_BASE_URL/USERNAME/PASSWORD`; run `ops/riviera-pms/verify_live.py`.
-4. **Regenerate `smartpbx_language_menu.ulaw`** with `scripts/generate_smartpbx_language_menu.py`
+   **`YANOLJA_BASE_URL` has no default** — while it is blank the booking tools are withheld and
+   no PMS request is made, even with credentials set (never point it at another property's PMS).
+4. **n8n destination** — set `N8N_BASE_URL` to Riviera's own n8n host with its own post-call
+   (`/webhook/post-call-data`) and handover (`/webhook/riviera-handover`) workflows. **No default**:
+   blank means no transcript, call record or handover payload ever leaves the container.
+5. **Regenerate `smartpbx_language_menu.ulaw`** with `scripts/generate_smartpbx_language_menu.py`
    — the committed asset was copied from Kavya and only announces English and Sinhala.
-5. **Twilio number** → `https://riviera.taskforceai.tech/voice/incoming`; **Dialog Client
+6. **Twilio number** → `https://riviera.taskforceai.tech/voice/incoming`; **Dialog Client
    Connect** → `wss://smartpbx-riviera.taskforceai.tech/ws/v1/smartpbx/media` with header
    `X-Riviera-SmartPBX-Token`.
-6. **GHCR package** `ghcr.io/taskforce-ai-dev/riviera`: first publish creates it private —
+7. **GHCR package** `ghcr.io/taskforce-ai-dev/riviera`: first publish creates it private —
    link it to this repo and grant write, exactly as was done for Kavya.
-7. Add the two health URLs to `.github/workflows/healthcheck.yml` once they answer.
+8. Add the two health URLs to `.github/workflows/healthcheck.yml` once they answer.
 
 ## Run locally
 ```bash

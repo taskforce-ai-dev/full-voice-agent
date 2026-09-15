@@ -321,7 +321,7 @@ async def test_send_posts_normalised_payload_to_the_handover_webhook():
     assert result["ok"] is True
     assert len(session.calls) == 1
     url, body = session.calls[0]
-    assert url == "https://automation.taskforceai.tech/webhook/riviera-handover"
+    assert url == "https://n8n.riviera.example/webhook/riviera-handover"
     assert body["customer_whatsapp"] == "94771234567"
     assert body["human_agent_whatsapp"] == "94711754668"
     assert body["call_sid"] == "CA999"

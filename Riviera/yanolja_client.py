@@ -13,7 +13,11 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-YANOLJA_BASE_URL: str = os.getenv("YANOLJA_BASE_URL", "https://yanolja.taskforceai.tech/api").rstrip("/")
+# Fail closed: there is NO default PMS endpoint. Riviera must never fall back
+# to another property's PMS (Kavya's shared instance) just because the
+# dedicated URL was left out of the env -- a missing or blank value means
+# "unconfigured", is_configured() is False, and no request is ever made.
+YANOLJA_BASE_URL: str = (os.getenv("YANOLJA_BASE_URL") or "").strip().rstrip("/")
 YANOLJA_USERNAME: str = os.getenv("YANOLJA_USERNAME", "")
 YANOLJA_PASSWORD: str = os.getenv("YANOLJA_PASSWORD", "")
 # A key present but blank (e.g. an unset compose ``${YANOLJA_TIMEOUT:-30}``
@@ -34,7 +38,19 @@ class YanoljaError(Exception):
 
 
 def is_configured() -> bool:
+    """True only when the dedicated PMS endpoint AND credentials are all set.
+
+    A blank ``YANOLJA_BASE_URL`` disables the PMS integration even when
+    credentials are present: Riviera has no shared fallback endpoint.
+    """
     return bool(YANOLJA_USERNAME) and bool(YANOLJA_PASSWORD) and bool(YANOLJA_BASE_URL)
+
+
+if (YANOLJA_USERNAME or YANOLJA_PASSWORD) and not YANOLJA_BASE_URL:
+    logger.warning(
+        "YANOLJA_USERNAME/PASSWORD are set but YANOLJA_BASE_URL is blank -- "
+        "PMS integration disabled (Riviera has no default PMS endpoint)"
+    )
 
 
 async def _get_session() -> aiohttp.ClientSession:
@@ -64,7 +80,7 @@ async def login() -> str:
     """POST /auth/login → token. Updates module-level cache."""
     global _token
     if not is_configured():
-        raise YanoljaError("Yanolja not configured (set YANOLJA_USERNAME/PASSWORD)")
+        raise YanoljaError("Yanolja not configured (set YANOLJA_BASE_URL/USERNAME/PASSWORD)")
     session = await _get_session()
     url = f"{YANOLJA_BASE_URL}/auth/login"
     payload = {"username": YANOLJA_USERNAME, "password": YANOLJA_PASSWORD}

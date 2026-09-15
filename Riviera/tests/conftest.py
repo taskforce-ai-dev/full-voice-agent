@@ -15,3 +15,20 @@ def smartpbx_bilingual_menu_credential(monkeypatch):
     import server
 
     monkeypatch.setattr(server, "GEMINI_API_KEY", "test-gemini-key")
+
+
+# Production defaults N8N_BASE_URL to blank -- fail closed, nothing is POSTed
+# until Riviera's own n8n destination is configured (see
+# test_external_endpoints_fail_closed.py). Tests that exercise the send path
+# stub booking_api.get_session, so give them an explicit, clearly non-shared
+# destination; the fail-closed tests override it back to "" themselves.
+TEST_N8N_BASE_URL = "https://n8n.riviera.example"
+
+
+@pytest.fixture(autouse=True)
+def explicit_test_n8n_destination(monkeypatch):
+    import handover
+    import post_call
+
+    monkeypatch.setattr(handover, "N8N_BASE_URL", TEST_N8N_BASE_URL)
+    monkeypatch.setattr(post_call, "N8N_BASE_URL", TEST_N8N_BASE_URL)
