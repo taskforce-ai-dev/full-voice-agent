@@ -79,11 +79,21 @@ instance**, and grounds answers in a ChromaDB RAG knowledge base
   inherited dead/reference code and still carry Kavya's Mosvold-era demo prompts inside — exactly
   as they do in `Kavya/`; nothing imports them.
 
-**Still to obtain from the client** (the KB says "reservations will confirm" for each): check-in
-/ check-out times, deposit + cancellation + refund terms (the fact sheet at
-riviera-online.com/fact-sheet was not reachable from the build environment), extra-adult /
-extra-child supplements, activity prices, foreign-guest rates, the room number of the Family
-Cottage (the sheet lists "Rm 9" twice), and the scraped website content the owner promised.
+**Knowledge sources.** The KB (`knowledge_docs/riviera_info.txt`) merges the client's
+*HOSPITALITY BOOKING AGENT REQUIREMENTS* + *RATES* sheets (Sep 2026) with a full scrape of
+riviera-online.com (15 pages, 2026-09-14): fact sheet (check-in 2 pm / check-out 12 noon,
+one-night deposit, 48-hour cancellation, late-departure fees, accepted cards), dining, pool and
+facilities, activities, sustainability, Batticaloa sights and contact details. The prompt's STAY
+BASICS and DEPOSIT AND CANCELLATION rules state those terms. Room-name reconciliation: the
+website's Standard Double / Standard Triple / AC Lagoon View Unit / Budget Single map to the
+rate sheet's Double Lagoon or Garden View / Triple Garden View / Lagoon View Steel Cabana /
+Basic Room Single; the website's Budget Double Room and Riviera Residence are NOT on the rate
+sheet and are referred to reservations, not booked.
+
+**Still to obtain from the client:** extra-adult / extra-child supplements, activity and menu
+prices, foreign-guest rates, the room number of the Family Cottage (the sheet lists "Rm 9"
+twice), and confirmation that the rate sheet's "Basic Room - Single" is the website's fan-only
+Budget Single Room (the KB and prompt currently say fan-cooled, from the website).
 
 **Two server modes:**
 - `server.py` — **Unified production server**: the Twilio service (IVR `<Gather>` → English
