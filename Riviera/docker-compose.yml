@@ -1,0 +1,241 @@
+# ============================================================
+# Docker Compose — Riya Voice Agent (Riviera Resort, Batticaloa)
+# ============================================================
+# Runs the production server (server.py) behind Twilio
+# ConversationRelay with Claude streaming + ElevenLabs TTS.
+#
+# Usage:
+#   docker compose up -d          # start in background
+#   docker compose logs -f riviera  # tail logs
+#   docker compose down           # stop and remove container
+# ============================================================
+
+services:
+  riviera:
+    # -- Build from the Dockerfile in the project root ----------
+    # -- Image is built in CI and pulled from GHCR --------------
+    # NOT built here. .github/workflows/deploy.yml (mode: image) builds on the
+    # GitHub runner and pushes ghcr.io/taskforce-ai-dev/riviera:<sha>; the VPS
+    # only pulls. Building on the production host is what starved the box on
+    # 2026-08-02. See CONTRIBUTING.md §6.
+    #
+    # IMAGE_TAG is exported by the deploy step and pins this to one immutable
+    # SHA tag. To roll back by hand:
+    #   IMAGE_TAG=<sha> docker compose pull && IMAGE_TAG=<sha> docker compose up -d
+    image: ghcr.io/taskforce-ai-dev/riviera:${IMAGE_TAG:-latest}
+    container_name: riviera-voice-agent
+
+    # -- Networking ---------------------------------------------
+    # Twilio webhooks hit port 8000; map host:container 1-to-1.
+    ports:
+      - "127.0.0.1:8060:8000"
+
+    # -- Secrets & configuration --------------------------------
+    # All API keys (Anthropic, ElevenLabs, Twilio, eZee, etc.)
+    # are loaded from .env — never baked into the image.
+    env_file:
+      - .env
+
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json
+      - DASHBOARD_API_URL=${DASHBOARD_API_URL:-}
+      - DASHBOARD_API_KEY=${DASHBOARD_API_KEY:-}
+      - DASHBOARD_AGENT_ID=${DASHBOARD_AGENT_ID:-riviera}
+      - HUMAN_AGENT_PHONE=${HUMAN_AGENT_PHONE:-}
+
+    # -- Persistent volumes -------------------------------------
+    volumes:
+      # ChromaDB vector store — survives container restarts so
+      # embeddings don't need to be regenerated each time.
+      - ./chroma_db:/app/chroma_db
+
+      # Knowledge documents — mount as a bind so new/updated
+      # docs can be dropped in without rebuilding the image.
+      - ./knowledge_docs:/app/knowledge_docs
+
+      # GCP service account credentials for Google Cloud STT
+      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+
+    # -- Restart policy -----------------------------------------
+    # Always restart unless explicitly stopped with
+    # `docker compose stop` or `docker compose down`.
+    restart: unless-stopped
+
+    # -- Logging ------------------------------------------------
+    # Cap log size to prevent disk exhaustion on long-running
+    # deployments.  3 rotated files x 10 MB each = 30 MB max.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # -- Health check -------------------------------------------
+    # Hits the FastAPI /health endpoint every 30 s.
+    # The container is marked unhealthy after 3 consecutive
+    # failures (retries) with a 10 s timeout per probe.
+    # start_period gives the app 40 s to boot (model warm-up,
+    # ChromaDB init, etc.) before checks count as failures.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Isolated Dialog SmartPBX ingress. This profile is off unless explicitly
+  # selected; it never changes the existing Twilio service above.
+  riviera-smartpbx:
+    profiles: ["smartpbx"]
+    # A SmartPBX deploy must set this to the reviewed CI commit SHA. The disabled
+    # default deliberately cannot pull an unreviewed mutable image.
+    image: ghcr.io/taskforce-ai-dev/riviera:${SMARTPBX_IMAGE_TAG:-disabled}
+    container_name: riviera-smartpbx
+
+    # Host Nginx is the public TLS boundary; keep the application loopback-only.
+    ports:
+      - "127.0.0.1:8061:8000"
+
+    # Do not use env_file here: this is a complete, explicit SmartPBX allowlist.
+    # Populate it only with `docker compose --env-file .env.smartpbx ...`.
+    # In particular, never pass Twilio credentials or HUMAN_AGENT_PHONE here.
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-credentials.json
+      RIVIERA_SERVICE_MODE: smartpbx
+      ENABLE_SMARTPBX_WSS: "true"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-claude}"
+      CLAUDE_MODEL: "${CLAUDE_MODEL:-claude-sonnet-4-5-20250929}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      RIME_API_KEY: "${RIME_API_KEY:-}"
+      GEMINI_MODEL: "${GEMINI_MODEL:-gemini-2.5-flash}"
+      GEMINI_FAILOVER_TO_CLAUDE: "${GEMINI_FAILOVER_TO_CLAUDE:-true}"
+      GEMINI_FAILOVER_STICKY_AFTER: "${GEMINI_FAILOVER_STICKY_AFTER:-2}"
+      SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS: "${SMARTPBX_LANGUAGE_SELECTION_TIMEOUT_SECONDS:-8.0}"
+      SMARTPBX_SINHALA_LLM_PROVIDER: "${SMARTPBX_SINHALA_LLM_PROVIDER:-gemini}"
+      SMARTPBX_SINHALA_GEMINI_LLM_MODEL: "${SMARTPBX_SINHALA_GEMINI_LLM_MODEL:-gemini-3.7-flash}"
+      SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL: "${SMARTPBX_SINHALA_GEMINI_THINKING_LEVEL:-low}"
+      SMARTPBX_SINHALA_GEMINI_MAX_TOKENS: "${SMARTPBX_SINHALA_GEMINI_MAX_TOKENS:-1024}"
+      SMARTPBX_SINHALA_GEMINI_TTS_MODEL: "${SMARTPBX_SINHALA_GEMINI_TTS_MODEL:-gemini-3.1-flash-tts-preview}"
+      SMARTPBX_SINHALA_GEMINI_TTS_VOICE: "${SMARTPBX_SINHALA_GEMINI_TTS_VOICE:-Vindemiatrix}"
+      SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS: "${SMARTPBX_SINHALA_GEMINI_TTS_TIMEOUT_SECONDS:-15.0}"
+      SMARTPBX_SINHALA_TTS_PROVIDER: "${SMARTPBX_SINHALA_TTS_PROVIDER:-gemini}"
+      SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER: "${SMARTPBX_SINHALA_TTS_QUOTA_STICKY_AFTER:-3}"
+      SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS: "${SMARTPBX_SINHALA_GEMINI_TTS_FALLBACK_MODELS:-}"
+      SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR: "${SMARTPBX_SINHALA_TTS_MODEL_RESET_UTC_HOUR:-7}"
+      SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS: "${SMARTPBX_SINHALA_PREWARM_INTERVAL_SECONDS:-7.0}"
+      SMARTPBX_SINHALA_PHRASE_CACHE_DIR: "${SMARTPBX_SINHALA_PHRASE_CACHE_DIR:-/app/smartpbx_phrase_cache}"
+      OPENAI_TTS_MODEL: "${OPENAI_TTS_MODEL:-gpt-4o-mini-tts}"
+      OPENAI_TTS_VOICE: "${OPENAI_TTS_VOICE:-nova}"
+      OPENAI_TTS_INSTRUCTIONS: "${OPENAI_TTS_INSTRUCTIONS:-}"
+      ELEVENLABS_API_KEY: "${ELEVENLABS_API_KEY:-}"
+      RIVIERA_EN_ELEVENLABS_VOICE_ID: "${RIVIERA_EN_ELEVENLABS_VOICE_ID:-}"
+      ELEVENLABS_VOICE_ID: "${ELEVENLABS_VOICE_ID:-}"
+      ELEVENLABS_VOICE_ID_AR: "${ELEVENLABS_VOICE_ID_AR:-tavIIPLplRB883FzWU0V}"
+      STT_PROVIDER: "${STT_PROVIDER:-azure}"
+      SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS: "${SMARTPBX_SINHALA_AZURE_SEGMENTATION_SILENCE_MS:-1200}"
+      SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD: "${SMARTPBX_SINHALA_STT_LOW_CONFIDENCE_THRESHOLD:-0.65}"
+      STT_ENDPOINTING_SILENCE_SECONDS: "${STT_ENDPOINTING_SILENCE_SECONDS:-1.0}"
+      STT_FINAL_GRACE_SECONDS: "${STT_FINAL_GRACE_SECONDS:-0.5}"
+      CAPTURE_ENDPOINTING_SILENCE_SECONDS: "${CAPTURE_ENDPOINTING_SILENCE_SECONDS:-1.5}"
+      CAPTURE_FINAL_GRACE_SECONDS: "${CAPTURE_FINAL_GRACE_SECONDS:-1.2}"
+      CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS: "${CAPTURE_VALID_LK_NUMBER_GRACE_SECONDS:-0.35}"
+      STT_DIGIT_CLASS_BOOST: "${STT_DIGIT_CLASS_BOOST:-}"
+      SMARTPBX_PILOT_TRANSCRIPT_LOGGING: "${SMARTPBX_PILOT_TRANSCRIPT_LOGGING:-0}"
+      DTMF_INTERDIGIT_TIMEOUT_SECONDS: "${DTMF_INTERDIGIT_TIMEOUT_SECONDS:-6.0}"
+      DTMF_OVERALL_TIMEOUT_SECONDS: "${DTMF_OVERALL_TIMEOUT_SECONDS:-30.0}"
+      DTMF_MAX_DIGITS: "${DTMF_MAX_DIGITS:-15}"
+      BARGEIN_MIN_CHARS: "${BARGEIN_MIN_CHARS:-12}"
+      BARGEIN_DEBOUNCE_SECONDS: "${BARGEIN_DEBOUNCE_SECONDS:-0.6}"
+      AZURE_SPEECH_KEY: "${AZURE_SPEECH_KEY:-}"
+      AZURE_SPEECH_REGION: "${AZURE_SPEECH_REGION:-southeastasia}"
+      # No default: blank = PMS disabled. Never point Riviera at another property's PMS.
+      YANOLJA_BASE_URL: "${YANOLJA_BASE_URL:-}"
+      YANOLJA_USERNAME: "${YANOLJA_USERNAME:-}"
+      YANOLJA_PASSWORD: "${YANOLJA_PASSWORD:-}"
+      YANOLJA_TIMEOUT: "${YANOLJA_TIMEOUT:-30}"
+      DEMO_RATES_ENABLED: "${DEMO_RATES_ENABLED:-true}"
+      # No default: blank = post-call / handover webhooks disabled until Riviera's own n8n is set.
+      N8N_BASE_URL: "${N8N_BASE_URL:-}"
+      N8N_POSTCALL_WEBHOOK: "${N8N_POSTCALL_WEBHOOK:-}"
+      DASHBOARD_API_URL: "${DASHBOARD_API_URL:-}"
+      DASHBOARD_API_KEY: "${DASHBOARD_API_KEY:-}"
+      DASHBOARD_AGENT_ID: "${DASHBOARD_AGENT_ID:-riviera}"
+      SENTRY_DSN: "${SENTRY_DSN:-}"
+      SENTRY_TRACES_SAMPLE_RATE: "${SENTRY_TRACES_SAMPLE_RATE:-0.0}"
+      SENTRY_ENV: "${SENTRY_ENV:-production}"
+      SENTRY_SEND_PII: "false"
+      SENTRY_ENABLE_LOGS: "false"
+      KB_DOCS_DIRECTORY: /app/knowledge_docs
+      HF_HUB_OFFLINE: "1"
+      SMARTPBX_WS_TOKEN: "${SMARTPBX_WS_TOKEN:-}"
+      SMARTPBX_ACCOUNT_ID: "${SMARTPBX_ACCOUNT_ID:-}"
+      SMARTPBX_AUTH_HEADER_NAME: X-Riviera-SmartPBX-Token
+      SMARTPBX_MAX_CALLS: "4"
+      SMARTPBX_MAX_MESSAGE_CHARS: "${SMARTPBX_MAX_MESSAGE_CHARS:-65536}"
+      SMARTPBX_MAX_AUDIO_BYTES: "${SMARTPBX_MAX_AUDIO_BYTES:-32768}"
+      SMARTPBX_MAX_OUTBOUND_FRAMES: "${SMARTPBX_MAX_OUTBOUND_FRAMES:-512}"
+      SMARTPBX_STARTUP_PREROLL_MS: "${SMARTPBX_STARTUP_PREROLL_MS:-0}"
+      SMARTPBX_MAX_TOKENS: "${SMARTPBX_MAX_TOKENS:-}"
+      SMARTPBX_CLAUDE_MAX_TOKENS: "${SMARTPBX_CLAUDE_MAX_TOKENS:-}"
+      SMARTPBX_SINHALA_CLAUDE_EFFORT: "${SMARTPBX_SINHALA_CLAUDE_EFFORT:-}"
+      SMARTPBX_INITIAL_FILLER_DELAY_SECONDS: "${SMARTPBX_INITIAL_FILLER_DELAY_SECONDS:-}"
+      SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS: "${SMARTPBX_SINHALA_INITIAL_FILLER_DELAY_SECONDS:-}"
+      SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS: "${SMARTPBX_LLM_INITIAL_RESPONSE_TIMEOUT_SECONDS:-}"
+      SMARTPBX_LLM_STALL_TIMEOUT_SECONDS: "${SMARTPBX_LLM_STALL_TIMEOUT_SECONDS:-}"
+      SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS: "${SMARTPBX_CLAUDE_THINKING_STALL_TIMEOUT_SECONDS:-}"
+      SMARTPBX_START_TIMEOUT_SECONDS: "${SMARTPBX_START_TIMEOUT_SECONDS:-10}"
+      SMARTPBX_IDLE_TIMEOUT_SECONDS: "${SMARTPBX_IDLE_TIMEOUT_SECONDS:-90}"
+      SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS: "${SMARTPBX_TRANSFER_PENDING_TIMEOUT_SECONDS:-300}"
+      SMARTPBX_MAX_CALL_SECONDS: "${SMARTPBX_MAX_CALL_SECONDS:-3600}"
+      SMARTPBX_HUMAN_AGENT_WHATSAPP: "${SMARTPBX_HUMAN_AGENT_WHATSAPP:-}"
+      SMARTPBX_MCP_URL: "${SMARTPBX_MCP_URL:-}"
+      SMARTPBX_API_KEY: "${SMARTPBX_API_KEY:-}"
+      SMARTPBX_MCP_ACCOUNT_HEADER: "${SMARTPBX_MCP_ACCOUNT_HEADER:-}"
+      SMARTPBX_TRANSFER_DESTINATIONS_JSON: "${SMARTPBX_TRANSFER_DESTINATIONS_JSON:-{}}"
+      SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS: "${SMARTPBX_MCP_CONNECT_TIMEOUT_SECONDS:-5}"
+      SMARTPBX_MCP_READ_TIMEOUT_SECONDS: "${SMARTPBX_MCP_READ_TIMEOUT_SECONDS:-15}"
+      SMARTPBX_MCP_MAX_RESPONSE_BYTES: "${SMARTPBX_MCP_MAX_RESPONSE_BYTES:-1048576}"
+      SMARTPBX_MCP_RETRIES: "${SMARTPBX_MCP_RETRIES:-1}"
+
+    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws-max-size", "65536"]
+
+    volumes:
+      # Never share the legacy service's writable Chroma store.
+      - ./chroma_db_smartpbx:/app/chroma_db
+      - ./knowledge_docs:/app/knowledge_docs:ro
+      - ./full-voice-agent-a8a245fb37cb.json:/app/gcp-credentials.json:ro
+      # Persistent Sinhala fixed-phrase TTS cache -- same ownership pattern as
+      # chroma_db_smartpbx: a bind mount so rendered audio survives a
+      # container restart instead of re-spending Gemini TTS quota on every
+      # boot. Deleting this directory only costs one re-render per phrase.
+      - ./smartpbx_phrase_cache:/app/smartpbx_phrase_cache
+
+    # The 7.8 GiB VPS retains headroom for the existing Twilio service, Nginx,
+    # Docker, and the host OS. Validate observed legacy usage before cutover.
+    mem_limit: 1536m
+    cpus: 2.0
+    pids_limit: 256
+
+    restart: unless-stopped
+
+    # SIGTERM grace before SIGKILL on stop/recreate. Docker's 10s default is not
+    # enough to let an in-flight Dialog call finish a sentence; this does not by
+    # itself drain calls -- callers must still poll active_sessions==0 before a
+    # recreate (see scripts/deploy_smartpbx_image.sh and SMARTPBX_RUNBOOK.md).
+    stop_grace_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

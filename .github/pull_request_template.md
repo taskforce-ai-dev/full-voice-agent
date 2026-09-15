@@ -9,13 +9,15 @@
 
 ## Agents touched
 
-<!-- Tick every agent whose folder this PR changes. These WILL deploy on merge. -->
+<!-- Tick every agent whose folder this PR changes. These WILL deploy on merge
+     (except Kavya and Riviera, which only deploy through their SmartPBX runbooks). -->
 
 - [ ] BSL Agent
 - [ ] Flico Agent
 - [ ] HattonHills
 - [ ] Kavya
 - [ ] Kitchened
+- [ ] Riviera
 - [ ] SLIC Agent
 - [ ] Sofia Agent
 - [ ] WorldOfRefrigerators

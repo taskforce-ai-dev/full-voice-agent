@@ -64,7 +64,7 @@ chore: consolidate voice agent fleet into monorepo
 ```
 
 Common scopes are the agent ids (`bsl`, `flico`, `hatton`, `slic`, `sofia`,
-`kavya`, `kitchened`, `wor`) and area types (`ci`, `docs`, `chore`, `ops`).
+`kavya`, `kitchened`, `wor`, `horizon`, `riviera`) and area types (`ci`, `docs`, `chore`, `ops`).
 Keep the subject imperative and concise.
 
 ---
@@ -181,6 +181,11 @@ mode is chosen automatically **per changed agent**:
 > `fast` and `build` remain only for `Sofia Agent`, which is parked. Do not use
 > them for a new agent.
 >
+> **Kavya and Riviera are excluded from this engine entirely** — every mode of
+> `deploy.yml` rejects them and `deploy-on-push.yml` skips them. They ship only
+> through the guarded probe → publisher → runbook route
+> (`.github/workflows/build-<agent>-image.yml` + `<Folder>/SMARTPBX_RUNBOOK.md`).
+>
 > The mode is chosen from the agent's `docker-compose.yml`: if it pulls a
 > `ghcr.io/...` image instead of declaring `build:`, it gets `image` mode. There
 > is no second list to keep in sync. For a registry agent **every** change means
@@ -202,9 +207,10 @@ time, which is why structural work is best done now rather than later.
 without a code change, or to roll back to an earlier ref:
 
 ```bash
-gh workflow run deploy.yml -f agent=kavya -f ref=main                  # tip of main
+gh workflow run deploy.yml -f agent=hatton -f ref=main                 # tip of main
 gh workflow run deploy.yml -f agent=flico -f ref=flico-v1.0.0          # a tag
-gh workflow run deploy.yml -f agent=kavya -f ref=<sha> -f mode=fast    # roll back
+gh workflow run deploy.yml -f agent=hatton -f ref=<sha> -f mode=image  # roll back
+# Kavya / Riviera: NOT via deploy.yml — see <Folder>/SMARTPBX_RUNBOOK.md
 ```
 
 Or **Actions tab → Deploy Agent → Run workflow**. Full details, the

@@ -57,6 +57,7 @@ jobs:
               bsl -> "BSL Agent"      flico -> "Flico Agent"   hatton -> "HattonHills"
               slic -> "SLIC Agent"    sofia -> "Sofia Agent"   kavya  -> "Kavya"
               kitchened -> "Kitchened"   wor -> "WorldOfRefrigerators"
+              horizon -> "Horizon Agent"   riviera -> "Riviera"
 
             Steps:
             1. Read the issue body; extract the exception, stack trace, and `agent` tag.

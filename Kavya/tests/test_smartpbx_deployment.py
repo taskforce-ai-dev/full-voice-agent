@@ -2535,10 +2535,12 @@ def test_dep_audit_workflow_audits_kavyas_lock_file_and_blocks_only_kavya():
     # Kavya alone on pull_request (the only blocking row, on a trigger scoped
     # to Kavya's requirements files), all 8 agents on the weekly/manual runs.
     audit_job = document["jobs"]["audit"]
-    assert audit_job["continue-on-error"] == "${{ matrix.dir != 'Kavya' }}"
+    # Riviera (a Kavya clone) shares the blocking row since 2026-09; every other
+    # agent stays advisory.
+    assert audit_job["continue-on-error"] == "${{ matrix.dir != 'Kavya' && matrix.dir != 'Riviera' }}"
     matrix_dir = audit_job["strategy"]["matrix"]["dir"]
     assert isinstance(matrix_dir, str) and matrix_dir.startswith("${{") and matrix_dir.endswith("}}")
-    assert "github.event_name == 'pull_request' && fromJSON('[\"Kavya\"]')" in matrix_dir
+    assert "github.event_name == 'pull_request' && fromJSON('[\"Kavya\",\"Riviera\"]')" in matrix_dir
     for agent in (
         "BSL Agent", "Flico Agent", "HattonHills", "Kavya",
         "Kitchened", "SLIC Agent", "Sofia Agent", "WorldOfRefrigerators",
@@ -2562,7 +2564,7 @@ def test_dep_audit_workflow_audits_kavyas_lock_file_and_blocks_only_kavya():
     # silently re-resolve to the latest matching versions.
     assert 'req="$dir/requirements-prod.lock.txt"' in run
     assert 'pip-audit -r "$req" --no-deps' in run
-    assert 'if [ "$dir" = "Kavya" ]; then' in run
+    assert 'if [ "$dir" = "Kavya" ] || [ "$dir" = "Riviera" ]; then' in run
     # Every other agent keeps the existing prod/base fallback, unaffected.
     assert 'prod="$dir/requirements-prod.txt"' in run
     assert 'base="$dir/requirements.txt"' in run
@@ -2571,7 +2573,7 @@ def test_dep_audit_workflow_audits_kavyas_lock_file_and_blocks_only_kavya():
     # only -- it must not reintroduce the per-PR cost for the other 7 agents.
     on = document["on"]
     assert "pull_request" in on
-    assert on["pull_request"]["paths"] == ["Kavya/requirements*"]
+    assert on["pull_request"]["paths"] == ["Kavya/requirements*", "Riviera/requirements*"]
     assert "workflow_dispatch" in on
     assert "schedule" in on
 
