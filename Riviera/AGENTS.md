@@ -34,7 +34,7 @@ instance**, and grounds answers in a ChromaDB RAG knowledge base
   `065 222 2164` (spoken "zero six five, two two two, two one six four"), WhatsApp `077 842 2223`.
   Voice: the client asked for a **female British** English voice — `RIVIERA_EN_ELEVENLABS_VOICE_ID`
   carries it and English TTS fails closed without it.
-- **Seven room types**, single property: Family Chalet (4), Basic Room Single (2), Wooden Cabana
+- **Seven room types**, single property: Family Chalet (4), Basic Room Single (2, fan only), Wooden Cabana
   (2, fan only — no A/C), Lagoon View Steel Cabana (2), Double Lagoon or Garden View (3), Triple
   Garden View (3), Family Cottage (5). The names live in **four** places that must match
   byte-for-byte: `yanolja_service.ROOM_TYPES_BY_PROPERTY`, `tools.ROOM_TYPES_BY_PROPERTY`,
@@ -64,9 +64,10 @@ instance**, and grounds answers in a ChromaDB RAG knowledge base
 - **Prompt facts** (`_build_system_prompt`): lagoon/Batticaloa persona; seven-room section with
   capacities and the no-A/C warning for the Wooden Cabana; rates section rewritten for
   room-only LKR + meal plans + foreign-guest referral; ACTIVITIES rule (kayaking, cycling, lagoon
-  cruise, singing fish ride — prices confirmed by the resort); STAY BASICS and DEPOSIT /
-  CANCELLATION say "reservations will confirm" because the client has not supplied those terms
-  yet — **never invent check-in times, deposits or cancellation percentages.**
+  cruise, singing fish ride — prices confirmed by the resort); STAY BASICS (check-in 2 pm,
+  check-out 12 noon, late-departure ladder) and DEPOSIT / CANCELLATION (one-night deposit,
+  48-hour cancellation, accepted cards) state the fact-sheet terms — **never invent a figure
+  that is not in the KB or prompt** (extra-bed supplements, activity prices, foreign rates).
 - **Deploy script isolation:** `scripts/deploy_smartpbx_image.sh` checks only
   `SMARTPBX_ISOLATION_NEIGHBOURS` (default `riviera-voice-agent`) before/after a recreate, so a
   Riviera deploy never depends on Kavya's or Flico's container being healthy.
@@ -117,9 +118,12 @@ Full Voice agent/
 ├── tools.py                   # Tool definitions (Anthropic + OpenAI + Gemini formats) + dispatch
 ├── knowledge_base.py          # ChromaDB RAG — chunk, embed, query knowledge docs
 ├── knowledge_docs/            # Source documents for RAG
-│   └── hotel_info.txt         # Hotel info (rooms, rates, policies, activities)
+│   └── riviera_info.txt       # Resort info (rooms, rates, policies, dining, activities, Batticaloa)
 ├── chroma_db/                 # ChromaDB vector store (auto-generated, gitignored)
-├── ezee_api.py                # LEGACY — direct eZee API (not imported, kept for reference)
+├── rate_catalog.py            # Deterministic LKR rate resolution by room × residency × season
+├── smartpbx_*.py              # Dialog SmartPBX gateway / protocol / transport / session / MCP / handover
+├── ops/riviera-pms/           # Dedicated PMS seed SQL, runbook, live verifier
+├── scripts/                   # Guarded SmartPBX deploy + language-menu asset generator
 ├── test_voice_elevenlabs.py   # Local demo — typed input → LLM → ElevenLabs TTS playback
 ├── test_voice.py              # Local demo — typed input → LLM → Azure TTS playback (backup)
 ├── Dockerfile                 # Production image (python:3.11-slim), runs server:app
@@ -506,7 +510,7 @@ Built dynamically by `_build_system_prompt(lang)` with today's date injected and
 1. **Persona**: Riya, reservations agent for Riviera Resort (seven room types, reservations number, today's date)
 2. **Language rules**: Language-specific (determined by IVR selection), native script for Sinhala/Tamil, Sinhala room-name hints for the Riviera rooms
 3. **Voice rules**: Short sentences, no markdown/bullets/URLs, numbers as words, one question at a time
-4. **Room types / rates / data security / booking rules**: KB is the source of truth for room facts; room-only LKR rates by season with meal plans separate; foreign guests referred to reservations; single-call availability rule; spoken-number capture contract; stay basics and cancellation deferred to reservations
+4. **Room types / rates / data security / booking rules**: KB is the source of truth for room facts; room-only LKR rates by season with meal plans separate; foreign guests referred to reservations; single-call availability rule; spoken-number capture contract; fact-sheet stay basics and deposit / cancellation terms
 
 ## Operational Details
 
@@ -514,18 +518,13 @@ Built dynamically by `_build_system_prompt(lang)` with today's date injected and
 
 - **Deployment**: Dockerfile (`python:3.11-slim`), `docker-compose.yml`, `nginx.conf` (SSL + WSS + rate limiting), `requirements-prod.txt`, `deploy.sh`. Target: DigitalOcean VPS at `67.207.90.109` (`riviera.taskforceai.tech`). Docker CMD runs `server:app`. Docker port `127.0.0.1:8060` (nginx-only). Single uvicorn worker (sentence-transformers uses ~400MB-1GB RAM).
 - **Deployment DNS**: Cloudflare proxy OFF / DNS only for direct SSL. Call routing (to be set up): resort line → Twilio number → Riya, and/or Dialog Client Connect → `smartpbx-riviera`.
-- **Room type IDs** (full eZee IDs as used in `booking_api.py` `ROOM_TYPE_NAMES`):
-  - `3020000000000000003` = Mount Monarch
-  - `3020000000000000004` = Mount Luxe
-  - `3020000000000000005` = Sunrise Vista
-  - `3020000000000000006` = Eco Harmony
-  - `3020000000000000007` = Forest Escape Suite
+- **Room types are matched by NAME, not id**: the live `booking_api.py` / `yanolja_service.py` path has no id map; `room_types.name` in the PMS must equal the seven catalogue names byte-for-byte (see `ops/riviera-pms/`). PMS codes `RV-FCH`, `RV-BRS`, `RV-WCB`, `RV-SCB`, `RV-DBL`, `RV-TRP`, `RV-FCT` are documentation only.
 - **ConversationRelay WebSocket protocol**: Send `{"type": "text", "token": "<token>"}` per LLM token. Send `{"type": "text", "token": "", "last": true}` to signal end-of-utterance. Filler messages sent with `last: true` before tool execution.
 - **Media Streams WebSocket protocol**: Receive `{"event": "media", "media": {"payload": "<base64 mulaw>"}}`. Send audio back as `{"event": "media", "streamSid": "...", "media": {"payload": "<base64 mulaw>"}}`. Barge-in: send `{"event": "clear", "streamSid": "..."}`. TTS completion: send `{"event": "mark", ...}`.
 - **Media Streams STT**: Google Cloud Speech-to-Text streaming runs in a daemon thread (sync gRPC client). Accepts mulaw 8kHz directly. Language-specific primary: `si-LK` for Sinhala, `ta-IN` for Tamil. Alternatives: `en-US` + the other regional language. `interim_results=True` — endpointing driven by interims, not finals. Callbacks into async event loop via `asyncio.run_coroutine_threadsafe`.
 - **Media Streams TTS routing**: `_speak()` routes by language: Tamil/Arabic → `_tts_elevenlabs()` (ElevenLabs `eleven_multilingual_v2`, `ulaw_8000`), Sinhala → `_tts_openai()` (OpenAI `gpt-4o-mini-tts`, `response_format=pcm` 24 kHz → 8 kHz μ-law via `audioop.ratecv`/`lin2ulaw`, flushed in 640-byte frames). The legacy `_tts_azure()` (Azure REST, `raw-8khz-8bit-mono-mulaw`, SSML) is wired but unused. `_speak_lock` serializes TTS calls. `_ws_lock` serializes WebSocket writes.
 - **Error handling**: LLM streaming failure sends language-appropriate fallback message. Missing LLM client closes WebSocket with code 1011.
-- **Legacy**: `ezee_api.py` kept but not imported. `media_stream_server.py` uses Anthropic Claude directly — kept as reference.
+- **Legacy**: `media_stream_server.py` uses Anthropic Claude directly — kept as reference; `legacy_pms/` was not cloned.
 - **Twilio/SmartPBX env loading asymmetry:** `riviera` uses `env_file: .env`; `riviera-smartpbx` uses an explicit allowlist under `environment:` and should not use `env_file` in compose. This is a deliberate trap-prevention design: any var only present in `.env.smartpbx` is ignored unless copied into the `riviera-smartpbx` allowlist.
 - **How to verify the allowlist trap:** from repo root: `cd Riviera && docker compose config | rg -n "riviera-smartpbx:|env_file|STT_ENDPOINTING_SILENCE_SECONDS|DTMF_INTERDIGIT_TIMEOUT_SECONDS|BARGEIN_MIN_CHARS"` . `riviera-smartpbx` must show values from `environment`, and no `env_file` stanza.
 - **Compose/dockerfile safety:** `Dockerfile` uses explicit module `COPY` manifest and a build-time `RUN python -c "import server"` guard. `Riviera/tests/test_dockerfile_manifest.py` enforces closure coverage and the presence of the import guard so missing modules fail fast at build-time or pre-build CI.
