@@ -11,4 +11,4 @@ The client speaks the server contract directly:
 
 Mutations use same-origin credentials and the `X-Factory-Console-CSRF` header. Failed requests do not mutate the client job or timeline. Provisioning, DNS, provider setup, and deployment are not API operations and remain disabled in the UI.
 
-Run `npm run typecheck` and `npm run contract-check` for static validation. `npm run build` requires the host environment to allow Next's CSS build worker to bind its internal port.
+Run `npm run typecheck`, `npm run contract-check`, and `npm run build` for static validation. The build script uses Next's Webpack path, which is the supported reproducible build path for this standalone UI.

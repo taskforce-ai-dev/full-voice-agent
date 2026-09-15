@@ -5,6 +5,7 @@ import test from "node:test";
 const source = await readFile(new URL("../components/factory-api.ts", import.meta.url), "utf8");
 const consoleSource = await readFile(new URL("../components/FactoryConsole.tsx", import.meta.url), "utf8");
 const nextConfig = await readFile(new URL("../next.config.js", import.meta.url), "utf8");
+const packageManifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
 test("standalone console is a Next client component", () => {
   assert.match(consoleSource, /^"use client";/);
@@ -12,6 +13,10 @@ test("standalone console is a Next client component", () => {
 
 test("standalone console emits static files for the loopback-only Nginx origin", () => {
   assert.match(nextConfig, /output:\s*"export"/);
+});
+
+test("standalone console builds through the reproducible Webpack path", () => {
+  assert.equal(packageManifest.scripts.build, "next build --webpack");
 });
 
 test("factory client uses the owner facade v1 jobs contract", () => {
