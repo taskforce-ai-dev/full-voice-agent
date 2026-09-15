@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hmac
+from http.cookies import CookieError, SimpleCookie
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Protocol
 
@@ -14,9 +16,11 @@ _MAX_BODY_BYTES = 16 * 1024
 
 
 class CSRFTokenVerifier(Protocol):
-    """Server-side validator for an owner-, method-, and path-bound CSRF token."""
+    """Server-side validator for an owner-bound token in the fixed write scope."""
 
     def verify(self, *, token: str, owner_identity: str, method: str, path: str) -> bool: ...
+
+    def issue(self, *, owner_identity: str) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -27,7 +31,7 @@ class CSRFConfig:
     def validate_for_production(self) -> None:
         if not isinstance(self.expected_origin, str) or not self.expected_origin.startswith("https://"):
             raise ValueError("an HTTPS console origin is required")
-        if self.token_verifier is None or not callable(getattr(self.token_verifier, "verify", None)):
+        if self.token_verifier is None or not callable(getattr(self.token_verifier, "verify", None)) or not callable(getattr(self.token_verifier, "issue", None)):
             raise ValueError("a server-side CSRF token verifier is required")
 
 
@@ -44,6 +48,16 @@ class CSRFProtection:
         if headers.get("Origin") != self._config.expected_origin:
             raise AccessDenied("request origin or CSRF token rejected")
         token = headers.get("X-Factory-Console-CSRF", "")
+        if not isinstance(token, str) or not token.isascii() or len(token) > 2048:
+            raise AccessDenied("request origin or CSRF token rejected")
+        cookie = SimpleCookie()
+        try:
+            cookie.load(headers.get("Cookie", ""))
+        except (CookieError, ValueError):
+            raise AccessDenied("request origin or CSRF token rejected")
+        cookie_token = cookie.get("factory_csrf")
+        if cookie_token is None or not cookie_token.value.isascii() or not hmac.compare_digest(token, cookie_token.value):
+            raise AccessDenied("request origin or CSRF token rejected")
         try:
             valid = self._config.token_verifier.verify(
                 token=token, owner_identity=identity.subject, method=method, path=path
@@ -52,6 +66,14 @@ class CSRFProtection:
             raise AccessDenied("request origin or CSRF token rejected") from error
         if valid is not True:
             raise AccessDenied("request origin or CSRF token rejected")
+
+    def issue_response(self, identity: AccessIdentity, headers: Mapping[str, str]) -> tuple[str, str]:
+        if headers.get("Origin") != self._config.expected_origin or headers.get("X-Factory-Console-CSRF-Bootstrap") != "1":
+            raise AccessDenied("request origin or CSRF token rejected")
+        token = self._config.token_verifier.issue(owner_identity=identity.subject)
+        if not isinstance(token, str) or not token:
+            raise AccessDenied("request origin or CSRF token rejected")
+        return token, "factory_csrf=" + token + "; Path=/; Secure; SameSite=Strict; Max-Age=300"
 
 
 class FactoryConsoleWSGIApp:
@@ -77,6 +99,14 @@ class FactoryConsoleWSGIApp:
             except AccessDenied:
                 return self._respond(start_response, "403 Forbidden", {"error": "request origin or CSRF token rejected"})
         try:
+            if method == "GET" and path == "/v1/csrf":
+                _, cookie = self._csrf.issue_response(identity, self._headers(environ))
+                return self._respond(
+                    start_response,
+                    "200 OK",
+                    {"scope": "factory-review-writes"},
+                    headers=[("Set-Cookie", cookie), ("Cache-Control", "no-store")],
+                )
             if method == "POST" and path == "/v1/jobs":
                 return self._respond(start_response, "201 Created", self._view(self._jobs.create(self._body(environ))))
             if method == "GET" and path.startswith("/v1/jobs/") and path.count("/") == 3:
@@ -106,6 +136,10 @@ class FactoryConsoleWSGIApp:
             headers["Origin"] = environ["HTTP_ORIGIN"]
         if isinstance(environ.get("HTTP_X_FACTORY_CONSOLE_CSRF"), str):
             headers["X-Factory-Console-CSRF"] = environ["HTTP_X_FACTORY_CONSOLE_CSRF"]
+        if isinstance(environ.get("HTTP_X_FACTORY_CONSOLE_CSRF_BOOTSTRAP"), str):
+            headers["X-Factory-Console-CSRF-Bootstrap"] = environ["HTTP_X_FACTORY_CONSOLE_CSRF_BOOTSTRAP"]
+        if isinstance(environ.get("HTTP_COOKIE"), str):
+            headers["Cookie"] = environ["HTTP_COOKIE"]
         return headers
 
     @staticmethod
@@ -180,7 +214,9 @@ class FactoryConsoleWSGIApp:
         return None
 
     @staticmethod
-    def _respond(start_response: Callable, status: str, payload: Mapping[str, object]) -> list[bytes]:
+    def _respond(
+        start_response: Callable, status: str, payload: Mapping[str, object], *, headers: list[tuple[str, str]] | None = None
+    ) -> list[bytes]:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        start_response(status, [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+        start_response(status, [("Content-Type", "application/json"), ("Content-Length", str(len(body)))] + (headers or []))
         return [body]

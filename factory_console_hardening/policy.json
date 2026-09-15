@@ -28,5 +28,13 @@
     "include_request_content": false,
     "include_authorization_headers": false,
     "include_token_claims": false
+  },
+  "runtime": {
+    "ui_origin": "https://<FACTORY-CONSOLE-DOMAIN>",
+    "csrf_ttl_seconds": 300,
+    "jwt_clock_skew_seconds": 60,
+    "jwks_cache_seconds": 300,
+    "jwks_timeout_seconds": 5,
+    "max_cached_jwks": 16
   }
 }

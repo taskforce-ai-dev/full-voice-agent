@@ -20,10 +20,10 @@ owner browser -> Cloudflare Access -> authenticated cloudflared tunnel
 ```
 
 Cloudflared validates the configured Access application before forwarding a
-request. The console must still validate the signed
+request. The console independently validates the signed
 `Cf-Access-Jwt-Assertion` itself, using the issuer JWKS and exact issuer,
 single configured audience, `type=app`, time claims, exact `sub`, and exact
-verified `email`. It must fail closed on a missing, invalid, duplicate, or
+`email` claim when the Access application supplies it. It must fail closed on a missing, invalid, duplicate, or
 unverifiable assertion. It must never use client-supplied identity headers or
 the cookie as an authentication substitute.
 
@@ -54,17 +54,19 @@ not validate a live Cloudflare account, tunnel, identity provider, process, or
 production service.
 
 The standalone UI is built as static files (`factory-console/out`) and served
-only by the loopback Nginx origin. The service template deliberately runs the
-future runtime's `verify-access-config` preflight before `serve`; no reviewed
-runtime implements that command in this bundle, so activation remains blocked
-until one cryptographically verifies the configured Cloudflare Access identity.
+only by the loopback Nginx origin. The service template runs the implemented
+`python -m factory_console verify-access-config` preflight, then the pinned
+Gunicorn WSGI server on `127.0.0.1:8401`. It loads only root-owned files named
+by `/etc/factory-console/runtime.json`; it does not read environment settings.
+See [RUNBOOK.md](RUNBOOK.md) for the exact host-local files and the mandatory
+Access-claim prerequisite.
 
 ## References
 
 - Cloudflare documents that origins receive `Cf-Access-Jwt-Assertion` and
   should validate its signature, issuer, and application AUD:
   <https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/>.
-- Cloudflare documents the identity `sub`, verified `email`, time claims, and
+- Cloudflare documents the application-token identity fields, time claims, and
   `type=app` application token shape:
   <https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/application-token/>.
 - Cloudflare documents authenticated ingress and a terminating 404 rule for

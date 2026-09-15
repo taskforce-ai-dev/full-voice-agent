@@ -14,6 +14,7 @@ _REQUIRED_TOP_LEVEL = {
     "requests",
     "operations",
     "audit",
+    "runtime",
 }
 _FORBIDDEN_ACTIONS = frozenset({"deploy", "provision"})
 _SUPPORTED_ACTIONS = frozenset(
@@ -168,5 +169,33 @@ def validate_policy(raw: object) -> tuple[str, ...]:
         for name in ("include_request_content", "include_authorization_headers", "include_token_claims"):
             if audit.get(name) is not False:
                 errors.append(f"audit.{name} must be false")
+
+    runtime = _mapping(policy.get("runtime"), "runtime", errors)
+    if runtime is not None:
+        _exact_keys(
+            runtime,
+            "runtime",
+            {
+                "ui_origin",
+                "csrf_ttl_seconds",
+                "jwt_clock_skew_seconds",
+                "jwks_cache_seconds",
+                "jwks_timeout_seconds",
+                "max_cached_jwks",
+            },
+            errors,
+        )
+        _absolute_https_url(runtime.get("ui_origin"), "runtime.ui_origin", errors)
+        bounded_values = {
+            "csrf_ttl_seconds": (60, 900),
+            "jwt_clock_skew_seconds": (0, 120),
+            "jwks_cache_seconds": (60, 900),
+            "jwks_timeout_seconds": (1, 10),
+            "max_cached_jwks": (1, 16),
+        }
+        for name, (minimum, maximum) in bounded_values.items():
+            value = runtime.get(name)
+            if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+                errors.append(f"runtime.{name} must be between {minimum} and {maximum}")
 
     return tuple(errors)

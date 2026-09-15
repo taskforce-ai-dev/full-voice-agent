@@ -21,6 +21,13 @@ test("factory client uses the owner facade v1 jobs contract", () => {
   assert.doesNotMatch(source, /\/api\/factory\//);
 });
 
+test("factory client bootstraps a same-origin CSRF token before a mutation", () => {
+  assert.match(source, /fetch\("\/v1\/csrf"/);
+  assert.match(source, /await ensureCsrf\(\)/);
+  assert.match(source, /credentials:\s*"include"/);
+  assert.match(source, /X-Factory-Console-CSRF/);
+});
+
 test("review approvals are digest payloads, never client-created artifacts", () => {
   assert.match(source, /JSON\.stringify\(\{ digest \}\)/);
   assert.doesNotMatch(source, /sha256:[0-9a-f…]+/);

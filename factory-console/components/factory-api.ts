@@ -46,6 +46,24 @@ function csrfToken() {
   return cookie ? decodeURIComponent(cookie.slice("factory_csrf=".length)) : "";
 }
 
+let csrfBootstrap: Promise<void> | undefined;
+
+async function ensureCsrf() {
+  if (csrfToken()) return;
+  if (!csrfBootstrap) {
+    csrfBootstrap = fetch("/v1/csrf", {
+      credentials: "include",
+      headers: { "X-Factory-Console-CSRF-Bootstrap": "1" },
+    }).then((response) => {
+      if (!response.ok || !csrfToken()) throw new FactoryApiError(response.status, "Factory CSRF bootstrap failed");
+    }).catch((error) => {
+      csrfBootstrap = undefined;
+      throw error;
+    });
+  }
+  await csrfBootstrap;
+}
+
 export class FactoryApiError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
@@ -56,6 +74,7 @@ export class FactoryApiError extends Error {
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  if (init.method && !["GET", "HEAD", "OPTIONS"].includes(init.method)) await ensureCsrf();
   const response = await fetch(path, {
     ...init,
     credentials: "include",

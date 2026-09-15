@@ -81,8 +81,37 @@ class _BlockingFactory(_Factory):
 
 
 class _CSRF:
+    def issue(self, *, owner_identity):
+        return "csrf-valid"
+
     def verify(self, *, token, owner_identity, method, path):
         return token == "csrf-valid" and owner_identity == "owner-subject" and method == "POST" and path.startswith("/v1/jobs")
+
+
+class _SigningKey:
+    key = object()
+
+
+class _JWKS:
+    def get_signing_key_from_jwt(self, token):
+        if token == "unknown-kid":
+            raise ValueError("unknown key")
+        return _SigningKey()
+
+
+def _claims(**overrides):
+    claims = {
+        "iss": "https://access.example",
+        "aud": "factory-console",
+        "sub": "owner-subject",
+        "email": "owner@example.com",
+        "type": "app",
+        "exp": 4_000_000_000,
+        "iat": 1_000_000_000,
+        "nbf": 1_000_000_000,
+    }
+    claims.update(overrides)
+    return claims
 
 
 class CloudflareAccessTests(unittest.TestCase):
@@ -105,6 +134,8 @@ class CloudflareAccessTests(unittest.TestCase):
             verifier.require_owner({"Authorization": "Bearer valid"})
         with self.assertRaises(AccessDenied):
             verifier.require_owner({"Cf-Access-Jwt-Assertion": "wrong-email"})
+        with self.assertRaises(AccessDenied):
+            verifier.require_owner({"Cf-Access-Jwt-Assertion": "valid,second"})
 
     def test_accepts_a_verified_cloudflare_access_assertion(self) -> None:
         from factory_console.auth import CloudflareAccessConfig, CloudflareAccessVerifier
@@ -141,6 +172,171 @@ class CloudflareAccessTests(unittest.TestCase):
                 owner_email="owner@example.com",
                 jwt_verifier=_Verifier(),
             ).validate_for_production()
+
+    def test_pyjwt_verifier_rejects_bad_signature_at_the_verifier_seam(self) -> None:
+        from factory_console.auth import (
+            AccessDenied,
+            CloudflareAccessConfig,
+            CloudflareAccessVerifier,
+            PyJWTAccessJWTVerifier,
+        )
+
+        def rejected_signature(*args, **kwargs):
+            raise ValueError("signature rejected")
+
+        verifier = CloudflareAccessVerifier(CloudflareAccessConfig(
+            expected_audience="factory-console",
+            expected_issuer="https://access.example",
+            owner_subject="owner-subject",
+            owner_email="owner@example.com",
+            jwt_verifier=PyJWTAccessJWTVerifier(
+                jwks_url="https://access.example/cdn-cgi/access/certs",
+                expected_issuer="https://access.example",
+                expected_audience="factory-console",
+                jwks_client=_JWKS(),
+                decoder=rejected_signature,
+            ),
+        ))
+
+        with self.assertRaises(AccessDenied):
+            verifier.require_owner({"Cf-Access-Jwt-Assertion": "bad-signature"})
+
+    def test_pyjwt_verifier_requires_exact_claims_and_application_type(self) -> None:
+        from factory_console.auth import (
+            AccessDenied,
+            CloudflareAccessConfig,
+            CloudflareAccessVerifier,
+            PyJWTAccessJWTVerifier,
+        )
+
+        for invalid in (
+            _claims(iss="https://other.example"),
+            _claims(aud="different-audience"),
+            _claims(aud=["factory-console"]),
+            _claims(sub="other-subject"),
+            _claims(email="other@example.com"),
+            _claims(email=None),
+            _claims(type="org"),
+        ):
+            verifier = CloudflareAccessVerifier(CloudflareAccessConfig(
+                expected_audience="factory-console",
+                expected_issuer="https://access.example",
+                owner_subject="owner-subject",
+                owner_email="owner@example.com",
+                jwt_verifier=PyJWTAccessJWTVerifier(
+                    jwks_url="https://access.example/cdn-cgi/access/certs",
+                    expected_issuer="https://access.example",
+                    expected_audience="factory-console",
+                    jwks_client=_JWKS(),
+                    decoder=lambda *args, result=invalid, **kwargs: result,
+                ),
+            ))
+            with self.assertRaises(AccessDenied):
+                verifier.require_owner({"Cf-Access-Jwt-Assertion": "valid"})
+
+
+class CSRFTokenTests(unittest.TestCase):
+    def test_expired_signed_token_is_rejected(self) -> None:
+        from factory_console.csrf import HMACCSRFTokenVerifier
+
+        verifier = HMACCSRFTokenVerifier(b"a" * 32, ttl_seconds=60, now=lambda: 1_000)
+        token = verifier.issue(owner_identity="owner-subject")
+
+        expired = HMACCSRFTokenVerifier(b"a" * 32, ttl_seconds=60, now=lambda: 1_061)
+        self.assertFalse(expired.verify(
+            token=token,
+            owner_identity="owner-subject",
+            method="POST",
+            path="/v1/jobs",
+        ))
+
+    def test_bootstrap_is_authenticated_and_only_issues_the_fixed_write_scope(self) -> None:
+        from factory_console.api import CSRFConfig, CSRFProtection, FactoryConsoleWSGIApp
+        from factory_console.auth import CloudflareAccessConfig, CloudflareAccessVerifier
+        from factory_console.csrf import HMACCSRFTokenVerifier
+        from factory_console.domain import ConsoleJobService
+
+        app = FactoryConsoleWSGIApp(
+            ConsoleJobService(_Factory()),
+            CloudflareAccessVerifier(CloudflareAccessConfig(
+                expected_audience="factory-console",
+                expected_issuer="https://access.example",
+                owner_subject="owner-subject",
+                owner_email="owner@example.com",
+                jwt_verifier=_Verifier(),
+            )),
+            CSRFProtection(CSRFConfig(
+                expected_origin="https://console.example",
+                token_verifier=HMACCSRFTokenVerifier(b"a" * 32, ttl_seconds=60),
+            )),
+        )
+
+        status: list[str] = []
+        headers: list[tuple[str, str]] = []
+        body = b"".join(app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/v1/csrf",
+            "HTTP_CF_ACCESS_JWT_ASSERTION": "valid",
+            "HTTP_ORIGIN": "https://console.example",
+            "HTTP_X_FACTORY_CONSOLE_CSRF_BOOTSTRAP": "1",
+        }, lambda value, response_headers: (status.append(value), headers.extend(response_headers))))
+
+        self.assertEqual(status[0], "200 OK")
+        self.assertEqual(json.loads(body)["scope"], "factory-review-writes")
+        cookie = dict(headers)["Set-Cookie"]
+        self.assertIn("Secure", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        self.assertIn("Path=/", cookie)
+        token = cookie.split(";", 1)[0].split("=", 1)[1]
+
+        status.clear()
+        body = json.dumps({
+            "company_name": "Example Hotel",
+            "industry": "hospitality",
+            "purpose": "answer booking questions",
+            "primary_contact": "owner@example.com",
+            "supported_languages": ["en"],
+        }).encode("utf-8")
+        response = b"".join(app({
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/v1/jobs",
+            "CONTENT_LENGTH": str(len(body)),
+            "wsgi.input": io.BytesIO(body),
+            "HTTP_CF_ACCESS_JWT_ASSERTION": "valid",
+            "HTTP_ORIGIN": "https://console.example",
+            "HTTP_X_FACTORY_CONSOLE_CSRF": token,
+            "HTTP_COOKIE": f"factory_csrf={token}",
+        }, lambda value, response_headers: status.append(value)))
+        self.assertEqual(status[0], "201 Created")
+        self.assertEqual(json.loads(response)["state"], "draft")
+
+        status.clear()
+        response = b"".join(app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/v1/csrf",
+            "HTTP_ORIGIN": "https://console.example",
+            "HTTP_X_FACTORY_CONSOLE_CSRF_BOOTSTRAP": "1",
+        }, lambda value, response_headers: status.append(value)))
+        self.assertEqual(status[0], "403 Forbidden")
+        self.assertEqual(json.loads(response), {"error": "owner authorization required"})
+
+        status.clear()
+        body = b"".join(app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/v1/csrf/POST/v1/jobs",
+            "HTTP_CF_ACCESS_JWT_ASSERTION": "valid",
+            "HTTP_ORIGIN": "https://console.example",
+        }, lambda value, response_headers: status.append(value)))
+        self.assertEqual(status[0], "404 Not Found")
+        self.assertEqual(json.loads(body), {"error": "not found"})
+
+
+class RuntimeConfigurationTests(unittest.TestCase):
+    def test_startup_refuses_missing_runtime_config(self) -> None:
+        from factory_console.runtime import RuntimeConfigurationError, load_runtime_config
+
+        with self.assertRaises(RuntimeConfigurationError):
+            load_runtime_config("/definitely/missing/factory-console.json")
 
 
 class JobLifecycleTests(unittest.TestCase):
@@ -268,6 +464,7 @@ class HttpSafetyTests(unittest.TestCase):
             "HTTP_CF_ACCESS_JWT_ASSERTION": "valid",
             "HTTP_ORIGIN": "https://console.example",
             "HTTP_X_FACTORY_CONSOLE_CSRF": "csrf-valid",
+            "HTTP_COOKIE": "factory_csrf=csrf-valid",
         }, lambda value, headers: status.append(value)))
 
         self.assertEqual(status[0], "404 Not Found")

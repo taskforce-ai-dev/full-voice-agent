@@ -1,0 +1,3 @@
+# Direct production runtime dependencies. Versions are intentionally pinned.
+PyJWT[crypto]==2.14.0
+gunicorn==26.2.0

@@ -83,14 +83,36 @@ class FactoryConsolePolicyTests(unittest.TestCase):
         self.assertIn("location ^~ /v1/", rendered)
         self.assertIn("proxy_pass http://127.0.0.1:8401", rendered)
         self.assertIn("try_files $uri $uri/ /index.html", rendered)
+        self.assertIn('proxy_set_header Cookie "factory_csrf=$cookie_factory_csrf"', rendered)
 
     def test_console_service_requires_access_verification_before_starting(self) -> None:
         console = (TEMPLATE_ROOT / "systemd" / "factory-console.service").read_text(encoding="utf-8")
 
         self.assertIn(
-            "ExecStartPre=/usr/local/libexec/factory-console verify-access-config --config /etc/factory-console/policy.json",
+            "ExecStartPre=/opt/factory-console/venv/bin/python -m factory_console verify-access-config --config /etc/factory-console/runtime.json",
             console,
         )
+        self.assertIn("ExecStart=/opt/factory-console/venv/bin/gunicorn", console)
+        self.assertIn("--bind 127.0.0.1:8401", console)
+        self.assertIn("factory_console.entrypoint:application", console)
+        self.assertNotIn("wsgiref", console)
+        self.assertNotIn("EnvironmentFile=", console)
+
+    def test_policy_declares_the_runtime_bounds_used_by_the_wsgi_entrypoint(self) -> None:
+        policy = load_policy()
+
+        self.assertEqual(policy["runtime"]["csrf_ttl_seconds"], 300)
+        self.assertEqual(policy["runtime"]["jwks_cache_seconds"], 300)
+        self.assertEqual(policy["runtime"]["max_cached_jwks"], 16)
+        self.assertEqual(validate_policy(policy), ())
+
+    def test_runtime_template_names_only_root_owned_host_local_inputs(self) -> None:
+        runtime = json.loads((TEMPLATE_ROOT / "runtime" / "factory-console.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(set(runtime), {"version", "policy_path", "factory_config_path", "csrf_secret_file", "manifests"})
+        self.assertEqual(runtime["version"], 1)
+        self.assertEqual(runtime["policy_path"], "/etc/factory-console/policy.json")
+        self.assertNotIn("secret", json.dumps(runtime["manifests"]).lower())
 
     def test_systemd_templates_use_dedicated_users_and_restrictive_sandboxes(self) -> None:
         console = (TEMPLATE_ROOT / "systemd" / "factory-console.service").read_text(encoding="utf-8")
