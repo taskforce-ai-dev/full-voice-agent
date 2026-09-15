@@ -19,7 +19,7 @@
     "uploads_enabled": false
   },
   "operations": {
-    "allowed_actions": ["inspect", "plan", "generate", "verify", "open-pr"],
+    "allowed_actions": ["inspect", "plan", "approve-knowledge", "approve-plan", "generate", "verify", "open-pr"],
     "approval_required_actions": ["generate", "open-pr"],
     "forbidden_actions": ["deploy", "provision"]
   },

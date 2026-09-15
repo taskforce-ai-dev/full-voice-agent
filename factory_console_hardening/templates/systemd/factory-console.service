@@ -9,6 +9,7 @@ User=factory-console
 Group=factory-console
 WorkingDirectory=/var/lib/factory-console
 EnvironmentFile=/etc/factory-console/console.env
+ExecStartPre=/usr/local/libexec/factory-console verify-access-config --config /etc/factory-console/policy.json
 ExecStart=/usr/local/libexec/factory-console serve --config /etc/factory-console/policy.json
 Restart=on-failure
 RestartSec=5s

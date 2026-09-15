@@ -15,7 +15,8 @@ place them in process arguments, environment files, logs, tickets, or reviews.
 
 ```
 owner browser -> Cloudflare Access -> authenticated cloudflared tunnel
-              -> Nginx 127.0.0.1:8400 -> console 127.0.0.1:8401
+              -> Nginx 127.0.0.1:8400 -> static standalone console
+                                          /v1 -> console 127.0.0.1:8401
 ```
 
 Cloudflared validates the configured Access application before forwarding a
@@ -32,7 +33,8 @@ the cookie as an authentication substitute.
 - the Cloudflare Access assertion header, issuer/JWKS relationship, audience,
   and exact owner subject/email configuration;
 - a 16 KiB maximum body, with uploads disabled;
-- explicit approval for both `generate` and `open-pr`;
+- the complete review lifecycle, including digest-bound `approve-knowledge`
+  and `approve-plan`, plus explicit approval for `generate` and `open-pr`;
 - an exact deny list for `deploy` and `provision`; and
 - journal audit metadata with no body, authorization header, or JWT claim
   capture.
@@ -50,6 +52,12 @@ python3 -m unittest factory_console_hardening.tests.test_policy -v
 The test suite validates the policy and static hardening invariants. It does
 not validate a live Cloudflare account, tunnel, identity provider, process, or
 production service.
+
+The standalone UI is built as static files (`factory-console/out`) and served
+only by the loopback Nginx origin. The service template deliberately runs the
+future runtime's `verify-access-config` preflight before `serve`; no reviewed
+runtime implements that command in this bundle, so activation remains blocked
+until one cryptographically verifies the configured Cloudflare Access identity.
 
 ## References
 

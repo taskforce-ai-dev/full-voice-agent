@@ -16,7 +16,9 @@ _REQUIRED_TOP_LEVEL = {
     "audit",
 }
 _FORBIDDEN_ACTIONS = frozenset({"deploy", "provision"})
-_SUPPORTED_ACTIONS = frozenset({"inspect", "plan", "generate", "verify", "open-pr"})
+_SUPPORTED_ACTIONS = frozenset(
+    {"inspect", "plan", "approve-knowledge", "approve-plan", "generate", "verify", "open-pr"}
+)
 
 
 def _mapping(value: object, label: str, errors: list[str]) -> Mapping[str, object] | None:

@@ -4,9 +4,9 @@
 
 This runbook describes a private, owner-only **review console** for the
 existing SmartPBX Factory. It can expose only the review lifecycle actions
-listed in `policy.json`: `inspect`, `plan`, `generate`, `verify`, and
-`open-pr`. The factory's own existing approval and readiness gates remain
-authoritative.
+listed in `policy.json`: `inspect`, `plan`, `approve-knowledge`,
+`approve-plan`, `generate`, `verify`, and `open-pr`. The factory's own existing
+approval and readiness gates remain authoritative.
 
 The console must not create infrastructure, DNS records, tunnels, production
 services, or client connections. It has no `deploy` or `provision` endpoint;
@@ -19,10 +19,13 @@ PR remains review material, not a production release.
    It must bind only to `127.0.0.1:8401` (or a separately approved `::1`
    equivalent). Do not publish this port through a firewall, Docker, or a load
    balancer.
-2. Install the Nginx template as a dedicated server that binds only to
-   `127.0.0.1:8400`. It is the only local HTTP origin configured for this
-   console. Its access log deliberately records only timestamp, status, method,
-   path without query string, byte count, and duration.
+2. Build the standalone UI to `factory-console/out`, then stage those static
+   files at `/var/lib/factory-console/ui`. Install the Nginx template as a
+   dedicated server that binds only to `127.0.0.1:8400`; it serves that static
+   UI and proxies only `/v1/` to the console facade on `127.0.0.1:8401`. It is
+   the only local HTTP origin configured for this console. Its access log
+   deliberately records only timestamp, status, method, path without query
+   string, byte count, and duration.
 3. Run the dedicated Cloudflared unit as its own unprivileged account. It makes
    outbound tunnel connections; no public inbound listener is required or
    permitted for the console origin. Its one named hostname maps to
@@ -70,6 +73,13 @@ must be copied into a root-owned host-local policy only after an operator
 independently verifies them in the Access application. Do not place the real
 identifiers in this repository.
 
+The supplied console systemd template invokes
+`verify-access-config --config /etc/factory-console/policy.json` before it
+invokes `serve`. This repository intentionally does not provide that production
+runtime or verifier. Until a separately reviewed runtime verifies the Access
+JWT signature and the exact configured issuer, audience, subject, and email,
+the preflight must fail and the console must not start.
+
 ## Approval-bound review actions
 
 The UI must require a fresh, explicit owner approval before `generate` and
@@ -105,6 +115,8 @@ copy the exposed value into this runbook, an issue, or an incident report.
   accounts and their service files use the supplied restrictive settings.
 - Verify policy and tunnel credential file ownership/modes, and that no secret
   appears in an environment file, process argument, unit file, or log.
+- Verify the reviewed runtime's `verify-access-config` preflight rejects missing
+  or placeholder Access identity fields before enabling its service.
 - Verify `ss -ltnp` shows only loopback listeners for ports 8400 and 8401.
 - Run `nginx -t` against the host configuration and the documented
   `cloudflared tunnel ingress validate` against the substituted private file.

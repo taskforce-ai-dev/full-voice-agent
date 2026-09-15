@@ -37,6 +37,13 @@ class FactoryConsolePolicyTests(unittest.TestCase):
             validate_policy(policy),
         )
 
+    def test_policy_permits_the_two_digest_review_actions_exposed_by_the_facade(self) -> None:
+        policy = load_policy()
+
+        self.assertIn("approve-knowledge", policy["operations"]["allowed_actions"])
+        self.assertIn("approve-plan", policy["operations"]["allowed_actions"])
+        self.assertEqual(validate_policy(policy), ())
+
     def test_deploy_and_provision_can_never_be_allowed(self) -> None:
         policy = load_policy()
         policy["operations"]["allowed_actions"].append("deploy")
@@ -68,6 +75,22 @@ class FactoryConsolePolicyTests(unittest.TestCase):
         self.assertIn("client_max_body_size 16k", rendered)
         self.assertIn("Content-Security-Policy", rendered)
         self.assertIn("deploy|provision", rendered)
+
+    def test_nginx_template_serves_the_standalone_ui_and_proxies_only_v1_to_the_facade(self) -> None:
+        rendered = (TEMPLATE_ROOT / "nginx" / "factory-console.conf").read_text(encoding="utf-8")
+
+        self.assertIn("root /var/lib/factory-console/ui", rendered)
+        self.assertIn("location ^~ /v1/", rendered)
+        self.assertIn("proxy_pass http://127.0.0.1:8401", rendered)
+        self.assertIn("try_files $uri $uri/ /index.html", rendered)
+
+    def test_console_service_requires_access_verification_before_starting(self) -> None:
+        console = (TEMPLATE_ROOT / "systemd" / "factory-console.service").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "ExecStartPre=/usr/local/libexec/factory-console verify-access-config --config /etc/factory-console/policy.json",
+            console,
+        )
 
     def test_systemd_templates_use_dedicated_users_and_restrictive_sandboxes(self) -> None:
         console = (TEMPLATE_ROOT / "systemd" / "factory-console.service").read_text(encoding="utf-8")
