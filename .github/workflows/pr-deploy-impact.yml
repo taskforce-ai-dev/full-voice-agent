@@ -212,16 +212,29 @@ jobs:
                 echo 'file included) means a new build. Nothing compiles on the VPS.'
                 echo
               fi
-              if [ "$KAVYA" = "true" ] || [ "$RIVIERA" = "true" ]; then
-                echo '> Merging this PR does not deploy Kavya or Riviera. They remain excluded from'
-                echo '> generic deployment and require the reviewed SmartPBX probe -> publisher -> runbook route.'
+              if [ "$KAVYA" = "true" ]; then
+                echo '> Merging this PR does not deploy Kavya. It remains excluded from'
+                echo '> generic deployment and requires the reviewed SmartPBX probe -> publisher -> runbook route.'
+                echo
+              fi
+              if [ "$RIVIERA" = "true" ]; then
+                echo '> Merging this PR does not deploy Riviera. It remains excluded from'
+                echo '> generic deployment and requires the reviewed SmartPBX probe -> publisher -> runbook route.'
                 echo
               fi
             elif [ "$KAVYA" = "true" ] || [ "$RIVIERA" = "true" ]; then
-              echo '> Merging this PR does not deploy Kavya or Riviera.'
-              echo '> Both are excluded from generic deployment; use the reviewed SmartPBX'
-              echo '> probe -> publisher -> runbook route only.'
-              echo
+              if [ "$KAVYA" = "true" ]; then
+                echo '> Merging this PR does not deploy Kavya.'
+                echo '> Kavya is excluded from generic deployment; use the reviewed SmartPBX'
+                echo '> probe -> publisher -> runbook route only.'
+                echo
+              fi
+              if [ "$RIVIERA" = "true" ]; then
+                echo '> Merging this PR does not deploy Riviera.'
+                echo '> Riviera is excluded from generic deployment; use the reviewed SmartPBX'
+                echo '> probe -> publisher -> runbook route only.'
+                echo
+              fi
               echo '| Agent | Folder | Mode | Effect on merge | Files |'
               echo '|---|---|---|---|---|'
               cat rows.md

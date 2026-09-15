@@ -953,7 +953,7 @@ def test_pr_impact_keeps_riviera_out_of_generic_deploy_and_gives_its_real_rollba
 
     assert "riviera=$riviera" in workflow
     assert 'RIVIERA: ${{ steps.detect.outputs.riviera }}' in workflow
-    assert "Merging this PR does not deploy Kavya or Riviera." in workflow
+    assert "Merging this PR does not deploy Riviera." in workflow
     assert "**Riviera SmartPBX rollback:**" in workflow
     assert "`Riviera/SMARTPBX_RUNBOOK.md`" in workflow
     assert "/opt/riviera/scripts/deploy_smartpbx_image.sh" in workflow
@@ -2447,13 +2447,13 @@ def test_deploy_workflow_rejects_riviera_for_every_mode_before_any_publisher_or_
     document = yaml.load(text, Loader=yaml.BaseLoader)
     steps = document["jobs"]["deploy"]["steps"]
 
-    guard = workflow_step(steps, "Reject Kavya / Riviera generic deployment")
+    guard = workflow_step(steps, "Reject Riviera generic deployment")
     guard_run = guard["run"]
     # The condition must reject every mode, not just `image` — it must not
     # reference $MODE at all.
     assert '"$AGENT" == "riviera"' in guard_run
     assert "$MODE" not in guard_run
-    assert "is excluded from generic deploy.yml for every mode" in guard_run
+    assert "Riviera is excluded from generic deploy.yml for every mode" in guard_run
     assert "deploy_smartpbx_image.sh" in guard_run
     assert "exit 1" in guard_run
     for later_name in (
