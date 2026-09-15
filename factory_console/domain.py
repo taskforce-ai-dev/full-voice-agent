@@ -65,6 +65,7 @@ class CompanyIntake:
 class JobState(str, Enum):
     DRAFT = "draft"
     INSPECTED = "inspected"
+    KNOWLEDGE_REVIEW_REQUIRED = "knowledge_review_required"
     PLAN_REVIEW_REQUIRED = "plan_review_required"
     APPROVED_FOR_GENERATION = "approved_for_generation"
     GENERATED = "generated"
@@ -76,7 +77,8 @@ class JobState(str, Enum):
 class ConsoleOperation(str, Enum):
     INSPECT = "inspect"
     PLAN = "plan"
-    APPROVE_FOR_GENERATION = "approve_for_generation"
+    APPROVE_KNOWLEDGE = "approve_knowledge"
+    APPROVE_PLAN = "approve_plan"
     GENERATE = "generate"
     VERIFY = "verify"
     OPEN_PR = "open_pr"
@@ -97,6 +99,8 @@ class FactoryConsoleJob:
             return JobState.BLOCKED
         if self.generation is None:
             return JobState.INSPECTED if self.inspected else JobState.DRAFT
+        if self.generation.stage is Stage.KNOWLEDGE_REVIEW_REQUIRED:
+            return JobState.KNOWLEDGE_REVIEW_REQUIRED
         if self.generation.stage is Stage.PLAN_REVIEW_REQUIRED:
             return JobState.PLAN_REVIEW_REQUIRED
         if self.generation.stage is Stage.GENERATED:
@@ -113,7 +117,8 @@ class FactoryOperations(Protocol):
 
     def inspect(self, job: FactoryConsoleJob) -> None: ...
     def plan(self, job: FactoryConsoleJob) -> GenerationState: ...
-    def approve_plan(self, job: FactoryConsoleJob, generation: GenerationState) -> GenerationState: ...
+    def approve_knowledge(self, job: FactoryConsoleJob, generation: GenerationState, digest: str) -> GenerationState: ...
+    def approve_plan(self, job: FactoryConsoleJob, generation: GenerationState, digest: str) -> GenerationState: ...
     def generate(self, job: FactoryConsoleJob, generation: GenerationState) -> GenerationState: ...
     def verify(self, job: FactoryConsoleJob, generation: GenerationState) -> GenerationState: ...
     def open_pr(self, job: FactoryConsoleJob, generation: GenerationState) -> GenerationState: ...
@@ -153,10 +158,21 @@ class ConsoleJobService:
         except FactoryOperationBlocked:
             return self._block(job)
 
-    def approve_for_generation(self, job_id: str) -> FactoryConsoleJob:
-        job = self._require(job_id, JobState.PLAN_REVIEW_REQUIRED)
+    def approve_knowledge(self, job_id: str, digest: str) -> FactoryConsoleJob:
+        job = self._require(job_id, JobState.KNOWLEDGE_REVIEW_REQUIRED)
+        generation = self._generation(job)
+        self._require_digest(generation.knowledge_review_digest, digest, "knowledge")
         try:
-            return self._with_generation(job, self._factory.approve_plan(job, self._generation(job)))
+            return self._with_generation(job, self._factory.approve_knowledge(job, generation, digest))
+        except FactoryOperationBlocked:
+            return self._block(job)
+
+    def approve_plan(self, job_id: str, digest: str) -> FactoryConsoleJob:
+        job = self._require(job_id, JobState.PLAN_REVIEW_REQUIRED)
+        generation = self._generation(job)
+        self._require_digest(generation.plan_digest, digest, "plan")
+        try:
+            return self._with_generation(job, self._factory.approve_plan(job, generation, digest))
         except FactoryOperationBlocked:
             return self._block(job)
 
@@ -193,6 +209,11 @@ class ConsoleJobService:
         if job.generation is None:
             raise InvalidStateTransition("factory generation is required")
         return job.generation
+
+    @staticmethod
+    def _require_digest(expected: str | None, actual: str, label: str) -> None:
+        if not isinstance(actual, str) or not expected or actual != expected:
+            raise InvalidStateTransition(f"explicit {label} digest confirmation is required")
 
     def _with_generation(self, job: FactoryConsoleJob, generation: GenerationState, *, dispatched: bool = False) -> FactoryConsoleJob:
         if not isinstance(generation, GenerationState):

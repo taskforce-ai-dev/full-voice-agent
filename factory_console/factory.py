@@ -45,23 +45,29 @@ class SmartPBXFactoryAdapter:
             )
             if state.stage is not Stage.KNOWLEDGE_REVIEW_REQUIRED or not state.knowledge_review_digest:
                 raise FactoryOperationBlocked("factory knowledge review is not ready")
-            state = orchestrator.resume(
-                report.generation_id,
-                knowledge_approval=state.knowledge_review_digest,
-                secret_provider=self._bootstrap.secret_provider(),
+            return state
+        except (GenerationBlockedError, OSError, ValueError) as error:
+            raise FactoryOperationBlocked("factory plan is blocked") from error
+
+    def approve_knowledge(self, job: FactoryConsoleJob, generation: GenerationState, digest: str) -> GenerationState:
+        try:
+            if generation.stage is not Stage.KNOWLEDGE_REVIEW_REQUIRED or digest != generation.knowledge_review_digest:
+                raise FactoryOperationBlocked("factory knowledge approval is unavailable")
+            state = self._bootstrap.orchestrator().resume(
+                generation.generation_id, knowledge_approval=digest
             )
             if state.stage is not Stage.PLAN_REVIEW_REQUIRED:
                 raise FactoryOperationBlocked("factory plan review is not ready")
             return state
         except (GenerationBlockedError, OSError, ValueError) as error:
-            raise FactoryOperationBlocked("factory plan is blocked") from error
+            raise FactoryOperationBlocked("factory knowledge approval is blocked") from error
 
-    def approve_plan(self, job: FactoryConsoleJob, generation: GenerationState) -> GenerationState:
+    def approve_plan(self, job: FactoryConsoleJob, generation: GenerationState, digest: str) -> GenerationState:
         try:
-            if generation.stage is not Stage.PLAN_REVIEW_REQUIRED or not generation.plan_digest:
+            if generation.stage is not Stage.PLAN_REVIEW_REQUIRED or digest != generation.plan_digest:
                 raise FactoryOperationBlocked("factory plan approval is unavailable")
             return self._bootstrap.orchestrator().resume(
-                generation.generation_id, plan_approval=generation.plan_digest
+                generation.generation_id, plan_approval=digest
             )
         except (GenerationBlockedError, OSError, ValueError) as error:
             raise FactoryOperationBlocked("factory plan approval is blocked") from error
