@@ -134,8 +134,9 @@ port.
 ## CSRF lifecycle
 
 The static UI requests `GET /v1/csrf` before its first mutation. This narrow
-endpoint requires the already-validated Access assertion, exact UI Origin, and
-`X-Factory-Console-CSRF-Bootstrap: 1`; it is not a general signing oracle. It
+endpoint requires the already-validated Access assertion, `X-Factory-Console-CSRF-Bootstrap: 1`,
+and either the exact UI Origin or an exact same-origin HTTPS Referer without
+userinfo, query, or fragment; it is not a general signing oracle. It
 sets `factory_csrf` with `Secure`, `SameSite=Strict`, `Path=/`, and a bounded
 expiry. The UI copies that value into `X-Factory-Console-CSRF` for a write; the
 origin accepts it only when the forwarded `factory_csrf` cookie matches in

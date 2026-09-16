@@ -7,6 +7,7 @@ import hmac
 from http.cookies import CookieError, SimpleCookie
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Protocol
+from urllib.parse import urlsplit
 
 from .auth import AccessDenied, AccessIdentity, CloudflareAccessVerifier
 from .domain import ConsoleJobService, FactoryConsoleJob, IntakeValidationError, InvalidStateTransition
@@ -68,12 +69,34 @@ class CSRFProtection:
             raise AccessDenied("request origin or CSRF token rejected")
 
     def issue_response(self, identity: AccessIdentity, headers: Mapping[str, str]) -> tuple[str, str]:
-        if headers.get("Origin") != self._config.expected_origin or headers.get("X-Factory-Console-CSRF-Bootstrap") != "1":
+        if not self._bootstrap_origin_allowed(headers) or headers.get("X-Factory-Console-CSRF-Bootstrap") != "1":
             raise AccessDenied("request origin or CSRF token rejected")
         token = self._config.token_verifier.issue(owner_identity=identity.subject)
         if not isinstance(token, str) or not token:
             raise AccessDenied("request origin or CSRF token rejected")
         return token, "factory_csrf=" + token + "; Path=/; Secure; SameSite=Strict; Max-Age=300"
+
+    def _bootstrap_origin_allowed(self, headers: Mapping[str, str]) -> bool:
+        if headers.get("Origin") == self._config.expected_origin:
+            return True
+        referer = headers.get("Referer")
+        if not isinstance(referer, str) or not referer:
+            return False
+        try:
+            expected = urlsplit(self._config.expected_origin)
+            parsed = urlsplit(referer)
+            return (
+                expected.scheme == parsed.scheme == "https"
+                and expected.hostname is not None
+                and parsed.hostname == expected.hostname
+                and expected.port == parsed.port
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.query == ""
+                and parsed.fragment == ""
+            )
+        except ValueError:
+            return False
 
 
 class FactoryConsoleWSGIApp:
@@ -102,7 +125,10 @@ class FactoryConsoleWSGIApp:
                 return self._respond(start_response, "403 Forbidden", {"error": "request origin or CSRF token rejected"})
         try:
             if method == "GET" and path == "/v1/csrf":
-                _, cookie = self._csrf.issue_response(identity, self._headers(environ))
+                try:
+                    _, cookie = self._csrf.issue_response(identity, self._headers(environ))
+                except AccessDenied:
+                    return self._respond(start_response, "403 Forbidden", {"error": "request origin or CSRF token rejected"})
                 return self._respond(
                     start_response,
                     "200 OK",
@@ -136,6 +162,8 @@ class FactoryConsoleWSGIApp:
             headers["Cf-Access-Jwt-Assertion"] = environ["HTTP_CF_ACCESS_JWT_ASSERTION"]
         if isinstance(environ.get("HTTP_ORIGIN"), str):
             headers["Origin"] = environ["HTTP_ORIGIN"]
+        if isinstance(environ.get("HTTP_REFERER"), str):
+            headers["Referer"] = environ["HTTP_REFERER"]
         if isinstance(environ.get("HTTP_X_FACTORY_CONSOLE_CSRF"), str):
             headers["X-Factory-Console-CSRF"] = environ["HTTP_X_FACTORY_CONSOLE_CSRF"]
         if isinstance(environ.get("HTTP_X_FACTORY_CONSOLE_CSRF_BOOTSTRAP"), str):
