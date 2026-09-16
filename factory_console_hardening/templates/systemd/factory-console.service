@@ -1,0 +1,51 @@
+[Unit]
+Description=SmartPBX Factory Console (review-only private origin)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=factory-console
+Group=factory-console
+# /etc/factory-console is root:factory-console 0750; runtime files and the
+# CSRF signing secret are root:factory-console 0640 so this process can read,
+# but not modify, them.
+WorkingDirectory=/opt/factory-console/app
+ExecStartPre=/opt/factory-console/venv/bin/python -m factory_console verify-access-config --config /etc/factory-console/runtime.json
+ExecStart=/opt/factory-console/venv/bin/gunicorn --bind 127.0.0.1:8401 --workers 1 --worker-tmp-dir /run/factory-console --access-logfile - --error-logfile - --log-level warning factory_console.entrypoint:application
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+UMask=0077
+
+RuntimeDirectory=factory-console
+RuntimeDirectoryMode=0750
+StateDirectory=factory-console
+StateDirectoryMode=0750
+LogsDirectory=factory-console
+LogsDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=no
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/factory-console /var/log/factory-console
+
+[Install]
+WantedBy=multi-user.target

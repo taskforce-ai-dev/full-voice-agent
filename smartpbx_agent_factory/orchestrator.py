@@ -250,6 +250,10 @@ class GenerationOrchestrator:
         }
         return {"ok": all(value == "ready" for value in checks.values()), "checks": checks}
 
+    def generation_state(self, generation_id: str) -> GenerationState:
+        """Return validated persisted state for an internal review-only adapter."""
+        return self._load_verified(generation_id).state
+
     def plan(self, manifest_path: Path) -> PlanReport:
         manifest_path = self._manifest_path(manifest_path)
         approved_source_roots = self._roots_for_plan(manifest_path)

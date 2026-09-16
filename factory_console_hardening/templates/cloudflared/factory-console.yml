@@ -1,0 +1,15 @@
+# REVIEW-ONLY template. Replace placeholders only in host-local root-owned files.
+# This tunnel publishes one private console and rejects every unmatched request.
+tunnel: <TUNNEL-ID>
+credentials-file: /etc/cloudflared/credentials/<TUNNEL-ID>.json
+
+ingress:
+  - hostname: <FACTORY-CONSOLE-DOMAIN>
+    service: http://127.0.0.1:8400
+    originRequest:
+      access:
+        required: true
+        teamName: <TEAM-NAME>
+        audTag:
+          - REPLACE_WITH_ACCESS_APPLICATION_AUDIENCE
+  - service: http_status:404

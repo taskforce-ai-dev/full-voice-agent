@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "policy_path": "/etc/factory-console/policy.json",
+  "factory_config_path": "/etc/smartpbx-agent-factory/factory.json",
+  "csrf_secret_file": "/etc/factory-console/csrf-signing.key",
+  "manifests": {
+    "REPLACE_WITH_COMPANY_NAME": "/srv/smartpbx-agent-factory/manifests/REPLACE_WITH_COMPANY_NAME.json"
+  }
+}
