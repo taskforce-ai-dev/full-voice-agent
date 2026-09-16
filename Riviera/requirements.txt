@@ -1,0 +1,42 @@
+# Core server
+fastapi>=0.141.1
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+
+# AI / LLM
+anthropic>=0.40.0
+
+# Telephony
+twilio>=9.10.9
+
+# Azure Speech (TTS/STT — production and local testing)
+azure-cognitiveservices-speech>=1.35.0
+
+# Google Cloud Speech-to-Text (required for Media Streams STT)
+google-cloud-speech>=2.0.0
+
+# Google Cloud TTS (optional, legacy local testing)
+# google-cloud-texttospeech>=2.14.0
+
+# Knowledge base / RAG
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
+
+# Utilities
+python-dotenv>=1.0.0
+aiohttp>=3.14.3
+httpx>=0.25.0
+
+# PDF support for knowledge base (optional)
+pypdf>=6.16.2
+
+# Local testing audio playback
+pyaudio>=0.2.14
+
+# Error tracking (optional; activated by SENTRY_DSN)
+sentry-sdk>=2,<3
+
+# Offline unit tests (tests/) — pytest-asyncio is needed for the async
+# yanolja_service availability/booking tests.
+pytest>=9.1.1
+pytest-asyncio>=1.4.0

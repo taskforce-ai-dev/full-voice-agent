@@ -30,7 +30,7 @@ on:
         description: "Which agent to deploy"
         required: true
         type: choice
-        options: [bsl, flico, hatton, slic, sofia, kavya, kitchened, wor, horizon]
+        options: [bsl, flico, hatton, slic, sofia, kavya, kitchened, wor, horizon, riviera]
       ref:
         description: "Git ref / tag / commit to deploy"
         required: true
@@ -83,6 +83,15 @@ jobs:
             exit 1
           fi
 
+      # Riviera is a Kavya clone with the same protected immutable-image route.
+      - name: Reject Riviera generic deployment
+        run: |
+          set -euo pipefail
+          if [[ "$AGENT" == "riviera" ]]; then
+            echo "Riviera is excluded from generic deploy.yml for every mode (image, fast, build); use the build-only Riviera image publisher (build-riviera-image.yml) and the guarded runbook script (Riviera/scripts/deploy_smartpbx_image.sh)." >&2
+            exit 1
+          fi
+
       - name: Resolve agent -> source dir / VPS path / container
         id: map
         run: |
@@ -96,6 +105,7 @@ jobs:
             kitchened) SRC="Kitchened";            OPT="/opt/kitchened";            CON="kitchened-voice-agent" ;;
             wor)       SRC="WorldOfRefrigerators"; OPT="/opt/worldofrefrigerators"; CON="wor-voice-agent" ;;
             horizon)   SRC="Horizon Agent";        OPT="/opt/horizon";              CON="horizon-voice-agent" ;;
+            riviera)   SRC="Riviera";              OPT="/opt/riviera";              CON="riviera-voice-agent" ;;
             *) echo "Unknown agent id: $AGENT" >&2; exit 1 ;;
           esac
           { echo "src=$SRC"; echo "opt=$OPT"; echo "con=$CON"; } >> "$GITHUB_OUTPUT"
@@ -177,11 +187,11 @@ jobs:
           # Kavya is rejected above for every mode, so this branch never runs
           # for it today. These extra excludes are defence in depth only: if
           # the reject step above is ever loosened or removed by mistake, a
-          # kavya rsync still cannot overwrite the host-side control plane
-          # (compose env allowlist, nginx vhosts, the guarded deploy scripts,
-          # the runbook). Other agents are unaffected.
+          # kavya (or riviera, its clone) rsync still cannot overwrite the
+          # host-side control plane (compose env allowlist, nginx vhosts, the
+          # guarded deploy scripts, the runbook). Other agents are unaffected.
           extra_excludes=()
-          if [[ "$AGENT" == "kavya" ]]; then
+          if [[ "$AGENT" == "kavya" ]] || [[ "$AGENT" == "riviera" ]]; then
             extra_excludes=(
               --exclude='scripts/' --exclude='docker-compose.yml'
               --exclude='nginx-smartpbx*.conf' --exclude='SMARTPBX_RUNBOOK.md'

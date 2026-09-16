@@ -203,6 +203,7 @@ jobs:
           - "Kavya"
           - "HattonHills"
           - "Horizon Agent"
+          - "Riviera"
     steps:
       - uses: actions/checkout@v7
 
@@ -287,7 +288,7 @@ jobs:
           # 90s, now cut further by the F2 timing-hygiene fixes) but short
           # enough to fail fast and name the offending test instead of
           # riding out this job's 45-minute ceiling.
-          if [ "${{ matrix.agent }}" = "Kavya" ]; then
+          if [ "${{ matrix.agent }}" = "Kavya" ] || [ "${{ matrix.agent }}" = "Riviera" ]; then
             pytest tests --timeout=300
           else
             pytest tests
@@ -298,6 +299,16 @@ jobs:
         working-directory: Kavya
         run: |
           image="kavya-english-voice-profile-ci"
+          docker build -t "$image" .
+          docker run --rm --entrypoint python "$image" -c "import english_voice_profile; import server"
+
+      # Riviera is a Kavya clone with the same COPY-manifest Dockerfile, so it
+      # gets the same non-deploying build + import gate.
+      - name: Build and import Riviera image
+        if: matrix.agent == 'Riviera'
+        working-directory: Riviera
+        run: |
+          image="riviera-english-voice-profile-ci"
           docker build -t "$image" .
           docker run --rm --entrypoint python "$image" -c "import english_voice_profile; import server"
 
