@@ -41,9 +41,10 @@ logger = logging.getLogger(__name__)
 # contact details to the fleet's shared automation host by default.
 N8N_BASE_URL: str = (os.getenv("N8N_BASE_URL") or "").strip().rstrip("/")
 
-N8N_HANDOVER_WEBHOOK: str = os.getenv(
-    "N8N_HANDOVER_WEBHOOK", "/webhook/riviera-handover"
-)
+# Fail closed: no default path either. Both the host AND the path of Riviera's
+# own handover workflow (e.g. /webhook/riviera-handover on Riviera's n8n) must
+# be set explicitly before a single handover payload is POSTed.
+N8N_HANDOVER_WEBHOOK: str = (os.getenv("N8N_HANDOVER_WEBHOOK") or "").strip()
 
 # Sri Lanka. Callers give local numbers ("077...", "77...") far more often than
 # international ones, so we default to the property's own country code.
@@ -51,8 +52,8 @@ DEFAULT_COUNTRY_CODE: str = os.getenv("WHATSAPP_COUNTRY_CODE", "94").strip()
 
 
 def is_handover_webhook_configured() -> bool:
-    """True only when a handover webhook destination has been explicitly set."""
-    return bool(N8N_BASE_URL) and bool(N8N_HANDOVER_WEBHOOK)
+    """True only when BOTH the handover webhook host and path are explicitly set."""
+    return bool(N8N_BASE_URL.strip()) and bool(N8N_HANDOVER_WEBHOOK.strip())
 
 # National significant number length for the default country (94 + 9 digits).
 # A Sri Lankan NSN is exactly 9 digits (e.g. 77 123 4567). This is the check
@@ -557,8 +558,8 @@ async def send_handover_notification(
             logger.warning("smartpbx_handover event=failed outcome=unconfigured")
             return {"ok": False, "error": "handover_webhook_not_configured"}
         logger.error(
-            "[handover] refusing to notify -- N8N_BASE_URL is blank, no handover "
-            "webhook destination configured (call_sid=%s)", call_sid,
+            "[handover] refusing to notify -- N8N_BASE_URL / N8N_HANDOVER_WEBHOOK "
+            "blank, no handover webhook destination configured (call_sid=%s)", call_sid,
         )
         return {"ok": False, "error": "handover_webhook_not_configured", "payload": payload}
 

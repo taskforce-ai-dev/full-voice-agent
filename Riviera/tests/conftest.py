@@ -33,3 +33,4 @@ def explicit_test_n8n_destination(monkeypatch):
     monkeypatch.setattr(handover, "N8N_BASE_URL", TEST_N8N_BASE_URL)
     monkeypatch.setattr(post_call, "N8N_BASE_URL", TEST_N8N_BASE_URL)
     monkeypatch.setattr(post_call, "N8N_POSTCALL_WEBHOOK", "/webhook/post-call-data")
+    monkeypatch.setattr(handover, "N8N_HANDOVER_WEBHOOK", "/webhook/riviera-handover")

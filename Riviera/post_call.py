@@ -45,7 +45,7 @@ N8N_POSTCALL_WEBHOOK: str = (os.getenv("N8N_POSTCALL_WEBHOOK") or "").strip()
 
 def is_post_call_dispatch_configured() -> bool:
     """True only when BOTH the webhook host and path have been explicitly set."""
-    return bool(N8N_BASE_URL) and bool(N8N_POSTCALL_WEBHOOK)
+    return bool(N8N_BASE_URL.strip()) and bool(N8N_POSTCALL_WEBHOOK.strip())
 
 EXTRACTION_MAX_TOKENS: int = 2000
 

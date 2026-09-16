@@ -75,9 +75,10 @@ instance**, and grounds answers in a ChromaDB RAG knowledge base
   `ops/riviera-pms/` has the seed SQL, runbook and live verifier. Until it exists, availability
   returns zero room types (by design: `_property_of` filters unknown names).
 - **External endpoints fail closed (PR #329 review):** `YANOLJA_BASE_URL` (PMS),
-  `N8N_BASE_URL` (post-call call log + handover notify) and `N8N_POSTCALL_WEBHOOK` (post-call
-  path) have **no default** in `yanolja_client.py`, `post_call.py`, `handover.py`,
-  `docker-compose.yml`, `.env.example` or the runbook env template.
+  `N8N_BASE_URL` (post-call call log + handover notify), `N8N_POSTCALL_WEBHOOK` (post-call
+  path) and `N8N_HANDOVER_WEBHOOK` (handover path) have **no default** in `yanolja_client.py`,
+  `post_call.py`, `handover.py`, `docker-compose.yml` (the `riviera-smartpbx` allowlist passes
+  all four through), `.env.example` or the runbook env template.
   Blank/missing means unconfigured: `is_configured()` is False so no booking tools are offered,
   `_post_to_n8n` and `send_handover_notification` return without any outbound request, and
   the PMS client raises `YanoljaError` before touching a session — even when the PMS
@@ -255,6 +256,10 @@ explicit environment allowlist and must not receive Twilio credentials or
   host/workflows, never the fleet's shared automation host (isolation: transcripts must not
   land in another property's sheet). Same rule for `YANOLJA_BASE_URL` (see PMS section)
   — enforced by `tests/test_external_endpoints_fail_closed.py`.
+- `N8N_POSTCALL_WEBHOOK` / `N8N_HANDOVER_WEBHOOK` — webhook paths of Riviera's own post-call and
+  handover workflows on `N8N_BASE_URL` (e.g. `/webhook/post-call-data`,
+  `/webhook/riviera-handover`). **No default**: host AND path must both be set or that
+  integration makes no request.
 - `N8N_POLL_INTERVAL`, `N8N_POLL_TIMEOUT` — Polling tuning (default: 2s interval, 60s timeout)
 
 ## Architecture
@@ -572,11 +577,12 @@ Riviera at its own n8n workflow / Google Sheet before go-live so its call log do
 Kavya's.
 
 ### r0.2 — External endpoints fail closed (Sep 2026, PR #329 review)
-Removed the inherited shared defaults: `YANOLJA_BASE_URL`, `N8N_BASE_URL` and
-`N8N_POSTCALL_WEBHOOK` are blank unless set (code, compose passthroughs, `.env.example`, runbook
-env template); PMS calls, post-call dispatch and the handover notification make no outbound
-request while unconfigured. Regression contract in
-`tests/test_external_endpoints_fail_closed.py`.
+Removed the inherited shared defaults: `YANOLJA_BASE_URL`, `N8N_BASE_URL`,
+`N8N_POSTCALL_WEBHOOK` and `N8N_HANDOVER_WEBHOOK` are blank unless set (code, compose
+passthroughs, `.env.example`, runbook env template); PMS calls, post-call dispatch and the
+handover notification make no outbound request while unconfigured — host and path both required.
+Regression contract in `tests/test_external_endpoints_fail_closed.py`. Direct SmartPBX Tamil
+(digit `3`) activation contract in `tests/test_smartpbx_tamil_ivr.py`.
 
 The four inherited contracts below are kept here because they are load-bearing for any edit to
 `server.py` / `smartpbx_session.py`:

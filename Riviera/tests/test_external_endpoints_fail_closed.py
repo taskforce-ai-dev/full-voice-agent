@@ -40,7 +40,9 @@ def _import_attr(module: str, attr: str, env_overrides: dict[str, str]) -> str:
     """Import `module` fresh in a subprocess with `env_overrides` and return repr(attr)."""
     env = {
         k: v for k, v in os.environ.items()
-        if k not in ("YANOLJA_BASE_URL", "N8N_BASE_URL", "N8N_POSTCALL_WEBHOOK")
+        if k not in (
+            "YANOLJA_BASE_URL", "N8N_BASE_URL", "N8N_POSTCALL_WEBHOOK", "N8N_HANDOVER_WEBHOOK",
+        )
     }
     env.update(env_overrides)
     result = subprocess.run(
@@ -84,6 +86,20 @@ def test_post_call_webhook_path_has_no_default(env):
 @pytest.mark.parametrize("env", [{}, {"N8N_BASE_URL": ""}, {"N8N_BASE_URL": "   "}])
 def test_handover_n8n_base_url_has_no_default(env):
     assert _import_attr("handover", "N8N_BASE_URL", env) == ""
+
+
+@pytest.mark.parametrize(
+    "env", [{}, {"N8N_HANDOVER_WEBHOOK": ""}, {"N8N_HANDOVER_WEBHOOK": "   "}]
+)
+def test_handover_webhook_path_has_no_default(env):
+    """The handover path is explicit too -- no hard-coded /webhook/... fallback."""
+    assert _import_attr("handover", "N8N_HANDOVER_WEBHOOK", env) == ""
+
+
+def test_explicit_handover_webhook_path_is_honoured():
+    assert _import_attr(
+        "handover", "N8N_HANDOVER_WEBHOOK", {"N8N_HANDOVER_WEBHOOK": " /webhook/riviera-handover "}
+    ) == "/webhook/riviera-handover"
 
 
 def test_explicit_riviera_endpoints_are_honoured():
@@ -256,6 +272,27 @@ async def test_handover_notification_refuses_without_n8n_base_url(monkeypatch, p
         assert "payload" not in result
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["", "   "])
+async def test_handover_notification_refuses_when_only_the_path_is_missing(monkeypatch, path):
+    """A configured host with a blank handover path must not POST to the host root."""
+    monkeypatch.setattr(handover, "N8N_BASE_URL", "https://n8n.riviera.example")
+    monkeypatch.setattr(handover, "N8N_HANDOVER_WEBHOOK", path)
+    assert handover.is_handover_webhook_configured() is False
+
+    with patch.object(booking_api, "get_session", _session_must_not_be_used):
+        result = await handover.send_handover_notification(
+            call_sid="CA998",
+            customer_name="Chanya",
+            customer_whatsapp="0771234567",
+            call_summary="Wanted a group discount.",
+            human_agent_whatsapp="+94711754668",
+        )
+
+    assert result["ok"] is False
+    assert result["error"] == "handover_webhook_not_configured"
+
+
 # ---------------------------------------------------------------------------
 # Deployment surface: compose / env template carry no shared-host fallback
 # ---------------------------------------------------------------------------
@@ -271,8 +308,15 @@ def test_compose_env_passthroughs_have_no_shared_host_defaults():
             assert env["N8N_BASE_URL"] == "${N8N_BASE_URL:-}", service_name
         if "N8N_POSTCALL_WEBHOOK" in env:
             assert env["N8N_POSTCALL_WEBHOOK"] == "${N8N_POSTCALL_WEBHOOK:-}", service_name
+        if "N8N_HANDOVER_WEBHOOK" in env:
+            assert env["N8N_HANDOVER_WEBHOOK"] == "${N8N_HANDOVER_WEBHOOK:-}", service_name
     for host in SHARED_HOSTS:
         assert host not in compose_text
+    # The SmartPBX service uses an explicit allowlist (no env_file); every
+    # fail-closed destination must be passed through or it can never be set.
+    smartpbx_env = compose["services"]["riviera-smartpbx"]["environment"]
+    for key in ("YANOLJA_BASE_URL", "N8N_BASE_URL", "N8N_POSTCALL_WEBHOOK", "N8N_HANDOVER_WEBHOOK"):
+        assert key in smartpbx_env, f"{key} missing from the riviera-smartpbx allowlist"
 
 
 def test_env_example_leaves_external_destinations_blank():
@@ -285,11 +329,12 @@ def test_env_example_leaves_external_destinations_blank():
     assert values.get("YANOLJA_BASE_URL", "") == ""
     assert values.get("N8N_BASE_URL", "") == ""
     assert values.get("N8N_POSTCALL_WEBHOOK", "") == ""
+    assert values.get("N8N_HANDOVER_WEBHOOK", "") == ""
 
 
 def test_runbook_env_template_leaves_external_destinations_blank():
     runbook = (PROJECT_ROOT / "SMARTPBX_RUNBOOK.md").read_text()
-    for key in ("YANOLJA_BASE_URL", "N8N_BASE_URL", "N8N_POSTCALL_WEBHOOK"):
+    for key in ("YANOLJA_BASE_URL", "N8N_BASE_URL", "N8N_POSTCALL_WEBHOOK", "N8N_HANDOVER_WEBHOOK"):
         assert f"\n{key}=\n" in runbook, f"{key} must be blank in the runbook env template"
 
 
