@@ -44,6 +44,23 @@ class FactoryConsolePolicyTests(unittest.TestCase):
         self.assertIn("approve-plan", policy["operations"]["allowed_actions"])
         self.assertEqual(validate_policy(policy), ())
 
+    def test_reviewer_identities_are_empty_by_default_and_require_exact_distinct_pairs(self) -> None:
+        policy = load_policy()
+
+        self.assertEqual(policy["cloudflare_access"]["reviewer_identities"], [])
+        policy["cloudflare_access"]["reviewer_identities"] = [
+            {"subject": "REPLACE_WITH_OWNER_IDENTITY_SUBJECT", "email": "reviewer@example.com"},
+            {"subject": "reviewer-subject", "email": "reviewer@example.com", "role": "reviewer"},
+        ]
+
+        errors = validate_policy(policy)
+
+        self.assertIn("cloudflare_access.reviewer identities must be distinct from the owner", errors)
+        self.assertIn(
+            "cloudflare_access.reviewer_identities must contain exact subject and email pairs",
+            errors,
+        )
+
     def test_deploy_and_provision_can_never_be_allowed(self) -> None:
         policy = load_policy()
         policy["operations"]["allowed_actions"].append("deploy")

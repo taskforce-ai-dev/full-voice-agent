@@ -92,6 +92,7 @@ def validate_policy(raw: object) -> tuple[str, ...]:
                 "audience",
                 "owner_subject",
                 "owner_email",
+                "reviewer_identities",
                 "require_application_token",
                 "require_exact_owner_match",
             },
@@ -109,6 +110,27 @@ def validate_policy(raw: object) -> tuple[str, ...]:
             value = _nonempty_text(access.get(name), f"cloudflare_access.{name}", errors)
             if value is not None and "*" in value:
                 errors.append(f"cloudflare_access.{name} must not contain a wildcard")
+        reviewers = access.get("reviewer_identities")
+        if not isinstance(reviewers, list) or len(reviewers) > 16:
+            errors.append("cloudflare_access.reviewer_identities must be a bounded list")
+        else:
+            configured_pairs: set[tuple[str, str]] = set()
+            for reviewer in reviewers:
+                if not isinstance(reviewer, Mapping) or set(reviewer) != {"subject", "email"}:
+                    errors.append("cloudflare_access.reviewer_identities must contain exact subject and email pairs")
+                    continue
+                subject = _nonempty_text(reviewer.get("subject"), "cloudflare_access.reviewer.subject", errors)
+                email = _nonempty_text(reviewer.get("email"), "cloudflare_access.reviewer.email", errors)
+                if subject is None or email is None:
+                    continue
+                if "*" in subject or "*" in email:
+                    errors.append("cloudflare_access.reviewer identities must not contain a wildcard")
+                if subject == access.get("owner_subject") or email == access.get("owner_email"):
+                    errors.append("cloudflare_access.reviewer identities must be distinct from the owner")
+                pair = (subject, email)
+                if pair in configured_pairs:
+                    errors.append("cloudflare_access.reviewer identities must be distinct")
+                configured_pairs.add(pair)
         if access.get("require_application_token") is not True:
             errors.append("cloudflare_access.require_application_token must be true")
         if access.get("require_exact_owner_match") is not True:

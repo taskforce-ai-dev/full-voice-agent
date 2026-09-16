@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hmac
 from typing import Callable, Mapping, Protocol
 
 
@@ -20,6 +21,15 @@ class AccessIdentity:
     email: str
     audience: str
     issuer: str
+    role: str = "unclassified"
+
+
+@dataclass(frozen=True)
+class ReviewerIdentity:
+    """One non-secret Cloudflare Access identity allowed to review test intake."""
+
+    subject: str
+    email: str
 
 
 class AccessJWTVerifier(Protocol):
@@ -113,35 +123,61 @@ class PyJWTAccessJWTVerifier:
 
 @dataclass(frozen=True)
 class CloudflareAccessConfig:
-    """Non-secret configuration for a single factory-console owner."""
+    """Non-secret configuration for the owner and optional bounded reviewers."""
 
     expected_audience: str
     expected_issuer: str
     owner_subject: str
     owner_email: str
     jwt_verifier: AccessJWTVerifier | None
+    reviewers: tuple[ReviewerIdentity, ...] = ()
 
     def validate_for_production(self) -> None:
         if not isinstance(self.expected_audience, str) or not self.expected_audience.strip():
             raise AccessConfigurationError("Cloudflare Access audience is required")
         if not isinstance(self.expected_issuer, str) or not self.expected_issuer.strip():
             raise AccessConfigurationError("Cloudflare Access issuer is required")
-        if not isinstance(self.owner_subject, str) or not self.owner_subject.strip():
+        if not _valid_identity_text(self.owner_subject):
             raise AccessConfigurationError("factory owner subject is required")
-        if not isinstance(self.owner_email, str) or not self.owner_email.strip():
+        if not _valid_identity_text(self.owner_email):
             raise AccessConfigurationError("factory owner email is required")
         if self.jwt_verifier is None or not callable(getattr(self.jwt_verifier, "verify", None)):
             raise AccessConfigurationError("Cloudflare Access JWT verifier is required")
+        if not isinstance(self.reviewers, tuple) or len(self.reviewers) > 16:
+            raise AccessConfigurationError("factory reviewer identities are invalid")
+        pairs: set[tuple[str, str]] = set()
+        for reviewer in self.reviewers:
+            if not isinstance(reviewer, ReviewerIdentity) or not (
+                _valid_identity_text(reviewer.subject) and _valid_identity_text(reviewer.email)
+            ):
+                raise AccessConfigurationError("factory reviewer identities are invalid")
+            if reviewer.subject == self.owner_subject or reviewer.email == self.owner_email:
+                raise AccessConfigurationError("factory reviewer identities must be distinct from the owner")
+            pair = (reviewer.subject, reviewer.email)
+            if pair in pairs:
+                raise AccessConfigurationError("factory reviewer identities must be distinct")
+            pairs.add(pair)
+
+
+def _valid_identity_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and "\x00" not in value
+        and "*" not in value
+        and len(value) <= 512
+    )
 
 
 class CloudflareAccessVerifier:
-    """Accept only a validated JWT for the configured Cloudflare Access owner."""
+    """Classify only a signed Access owner or configured exact reviewer pair."""
 
     def __init__(self, config: CloudflareAccessConfig) -> None:
         config.validate_for_production()
         self._config = config
 
-    def require_owner(self, headers: Mapping[str, str]) -> AccessIdentity:
+    def require_identity(self, headers: Mapping[str, str]) -> AccessIdentity:
         access_assertion = next(
             (value for name, value in headers.items() if name.lower() == "cf-access-jwt-assertion"), ""
         )
@@ -162,9 +198,30 @@ class CloudflareAccessVerifier:
             raise AccessDenied("Cloudflare Access issuer is invalid")
         if identity.audience != self._config.expected_audience:
             raise AccessDenied("Cloudflare Access audience is invalid")
-        if identity.subject != self._config.owner_subject or identity.email != self._config.owner_email:
-            raise AccessDenied("Cloudflare Access identity is not the factory owner")
+        if _matches_pair(identity.subject, identity.email, self._config.owner_subject, self._config.owner_email):
+            role = "owner"
+        elif any(
+            _matches_pair(identity.subject, identity.email, reviewer.subject, reviewer.email)
+            for reviewer in self._config.reviewers
+        ):
+            role = "reviewer"
+        else:
+            raise AccessDenied("Cloudflare Access identity is not authorized for the factory console")
         return AccessIdentity(
             subject=identity.subject, email=identity.email,
-            audience=identity.audience, issuer=identity.issuer,
+            audience=identity.audience, issuer=identity.issuer, role=role,
         )
+
+    def require_owner(self, headers: Mapping[str, str]) -> AccessIdentity:
+        """Compatibility boundary for owner-only callers and tests."""
+        identity = self.require_identity(headers)
+        if identity.role != "owner":
+            raise AccessDenied("Cloudflare Access identity is not the factory owner")
+        return identity
+
+
+def _matches_pair(subject: str, email: str, expected_subject: str, expected_email: str) -> bool:
+    return (
+        hmac.compare_digest(subject.encode("utf-8"), expected_subject.encode("utf-8"))
+        and hmac.compare_digest(email.encode("utf-8"), expected_email.encode("utf-8"))
+    )

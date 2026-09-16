@@ -14,7 +14,7 @@ place them in process arguments, environment files, logs, tickets, or reviews.
 ## Security boundary
 
 ```
-owner browser -> Cloudflare Access -> authenticated cloudflared tunnel
+owner or configured reviewer -> Cloudflare Access -> authenticated cloudflared tunnel
               -> Nginx 127.0.0.1:8400 -> static standalone console
                                           /v1 -> console 127.0.0.1:8401
 ```
@@ -31,7 +31,8 @@ the cookie as an authentication substitute.
 
 - only an IP-literal loopback application origin;
 - the Cloudflare Access assertion header, issuer/JWKS relationship, audience,
-  and exact owner subject/email configuration;
+  exact owner subject/email configuration, and an empty-by-default bounded list
+  of exact reviewer subject/email pairs;
 - a 16 KiB maximum body, with uploads disabled;
 - the complete review lifecycle, including digest-bound `approve-knowledge`
   and `approve-plan`, plus explicit approval for `generate` and `open-pr`;
@@ -40,6 +41,10 @@ the cookie as an authentication substitute.
   capture.
 
 See [RUNBOOK.md](RUNBOOK.md) for the operator process.
+
+Configured reviewers retain the same signed issuer/audience checks as the
+owner, but can only submit intake, inspect it, and prepare a plan. They cannot
+approve a digest, generate, verify, or open a PR.
 
 ## Validation
 

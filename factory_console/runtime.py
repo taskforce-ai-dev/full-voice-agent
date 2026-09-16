@@ -15,7 +15,7 @@ from factory_console_hardening.policy import validate_policy
 from smartpbx_agent_factory.bootstrap import FactoryBootstrap, FactoryConfig, FactoryConfigError, inspect_config
 
 from .api import CSRFConfig, CSRFProtection, FactoryConsoleWSGIApp
-from .auth import CloudflareAccessConfig, CloudflareAccessVerifier, PyJWTAccessJWTVerifier
+from .auth import CloudflareAccessConfig, CloudflareAccessVerifier, PyJWTAccessJWTVerifier, ReviewerIdentity
 from .csrf import HMACCSRFTokenVerifier
 from .domain import CompanyIntake, ConsoleJobService, FactoryOperationBlocked
 from .factory import InternalManifestResolver, SmartPBXFactoryAdapter
@@ -129,6 +129,13 @@ def _load_valid_policy(config: RuntimeConfig) -> Mapping[str, object]:
     assert isinstance(access, Mapping) and isinstance(runtime, Mapping)
     if not all(_concrete_text(access[name]) for name in ("issuer", "jwks_url", "audience", "owner_subject", "owner_email")):
         raise RuntimeConfigurationError("factory console Access policy still has placeholders")
+    reviewer_identities = access["reviewer_identities"]
+    if not isinstance(reviewer_identities, list) or any(
+        not isinstance(reviewer, Mapping)
+        or not all(_concrete_text(reviewer.get(name)) for name in ("subject", "email"))
+        for reviewer in reviewer_identities
+    ):
+        raise RuntimeConfigurationError("factory console reviewer identities are invalid")
     if not _concrete_text(runtime["ui_origin"]):
         raise RuntimeConfigurationError("factory console UI origin is invalid")
     parsed_origin = urlsplit(str(runtime["ui_origin"]))
@@ -206,6 +213,10 @@ def build_application(path: str | Path = _RUNTIME_CONFIG_PATH) -> FactoryConsole
             owner_subject=str(access["owner_subject"]),
             owner_email=str(access["owner_email"]),
             jwt_verifier=jwt_verifier,
+            reviewers=tuple(
+                ReviewerIdentity(str(reviewer["subject"]), str(reviewer["email"]))
+                for reviewer in access["reviewer_identities"]
+            ),
         )),
         CSRFProtection(CSRFConfig(expected_origin=str(runtime["ui_origin"]).rstrip("/"), token_verifier=csrf)),
     )
