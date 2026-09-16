@@ -21,7 +21,8 @@ verify, or open a PR. Errors do not contain token values or claims.
 Every mutating request additionally requires the exact configured HTTPS Origin
 and a server-signed, expiring CSRF double-submit token bound to the verified
 identity subject and fixed review-write scope. `GET /v1/csrf` is the only issuance
-endpoint: it still requires Cloudflare Access, exact Origin, and the
+endpoint: it still requires Cloudflare Access, the exact Origin or an exact
+same-origin HTTPS Referer without userinfo, query, or fragment, and the
 bootstrap header. It sets a `Secure; SameSite=Strict` cookie; the static UI
 obtains it before its first mutation. No caller can request a token for an
 arbitrary method or path.

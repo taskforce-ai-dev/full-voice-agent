@@ -400,6 +400,90 @@ class CSRFTokenTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"error": "not found"})
 
 
+class CSRFRefererBootstrapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from factory_console.api import CSRFConfig, CSRFProtection, FactoryConsoleWSGIApp
+        from factory_console.auth import CloudflareAccessConfig, CloudflareAccessVerifier, ReviewerIdentity
+        from factory_console.csrf import HMACCSRFTokenVerifier
+        from factory_console.domain import ConsoleJobService
+
+        self.app = FactoryConsoleWSGIApp(
+            ConsoleJobService(_Factory()),
+            CloudflareAccessVerifier(CloudflareAccessConfig(
+                expected_audience="factory-console",
+                expected_issuer="https://access.example",
+                owner_subject="owner-subject",
+                owner_email="owner@example.com",
+                reviewers=(ReviewerIdentity("reviewer-subject", "reviewer@example.com"),),
+                jwt_verifier=_Verifier(),
+            )),
+            CSRFProtection(CSRFConfig(
+                expected_origin="https://console.example",
+                token_verifier=HMACCSRFTokenVerifier(b"a" * 32, ttl_seconds=60),
+            )),
+        )
+
+    def _request(self, *, method: str, path: str, **headers: str) -> tuple[str, dict[str, object]]:
+        status: list[str] = []
+        body = b""
+        environ: dict[str, object] = {
+            "REQUEST_METHOD": method,
+            "PATH_INFO": path,
+            "HTTP_CF_ACCESS_JWT_ASSERTION": "reviewer",
+            "HTTP_X_FACTORY_CONSOLE_CSRF_BOOTSTRAP": "1",
+        }
+        for name, value in headers.items():
+            environ["HTTP_" + name.upper().replace("-", "_")] = value
+        if method == "POST":
+            body = json.dumps({
+                "company_name": "Review Hotel",
+                "industry": "hospitality",
+                "purpose": "review an intake",
+                "primary_contact": "owner@example.com",
+                "supported_languages": ["en"],
+            }).encode("utf-8")
+            environ["CONTENT_LENGTH"] = str(len(body))
+            environ["wsgi.input"] = io.BytesIO(body)
+        response = b"".join(self.app(environ, lambda value, response_headers: status.append(value)))
+        return status[0], json.loads(response)
+
+    def test_browser_bootstrap_accepts_exact_same_origin_referer_without_origin(self) -> None:
+        status, body = self._request(
+            method="GET",
+            path="/v1/csrf",
+            REFERER="https://console.example/factory",
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body, {"scope": "factory-review-writes"})
+
+    def test_bootstrap_without_origin_or_referer_fails(self) -> None:
+        status, _ = self._request(method="GET", path="/v1/csrf")
+        self.assertEqual(status, "403 Forbidden")
+
+    def test_bootstrap_rejects_attacker_referer(self) -> None:
+        for referer in (
+            "https://attacker.example/factory",
+            "https://console.example@attacker.example/factory",
+            "https://console.example/factory?next=attacker",
+            "https://console.example/factory#attacker",
+            "not-a-url",
+        ):
+            with self.subTest(referer=referer):
+                status, _ = self._request(method="GET", path="/v1/csrf", REFERER=referer)
+                self.assertEqual(status, "403 Forbidden")
+
+    def test_mutation_without_exact_origin_still_fails_with_same_origin_referer(self) -> None:
+        status, body = self._request(
+            method="POST",
+            path="/v1/jobs",
+            REFERER="https://console.example/factory",
+            X_FACTORY_CONSOLE_CSRF="reviewer-csrf",
+            COOKIE="factory_csrf=reviewer-csrf",
+        )
+        self.assertEqual(status, "403 Forbidden")
+        self.assertEqual(body, {"error": "request origin or CSRF token rejected"})
+
+
 class RuntimeConfigurationTests(unittest.TestCase):
     def test_startup_refuses_missing_runtime_config(self) -> None:
         from factory_console.runtime import RuntimeConfigurationError, load_runtime_config
