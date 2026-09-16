@@ -23,6 +23,8 @@ class _Verifier:
     def verify(self, token: str) -> _Identity:
         if token == "valid":
             return _Identity(subject="owner-subject", email="owner@example.com", audience="factory-console", issuer="https://access.example")
+        if token == "reviewer":
+            return _Identity(subject="reviewer-subject", email="reviewer@example.com", audience="factory-console", issuer="https://access.example")
         if token == "wrong-email":
             return _Identity(subject="owner-subject", email="other@example.com", audience="factory-console", issuer="https://access.example")
         return _Identity(subject="other-subject", email="owner@example.com", audience="factory-console", issuer="https://access.example")
@@ -91,6 +93,14 @@ class _CSRF:
         return token == "csrf-valid" and owner_identity == "owner-subject" and method == "POST" and path.startswith("/v1/jobs")
 
 
+class _ReviewerCSRF:
+    def issue(self, *, owner_identity):
+        return "reviewer-csrf"
+
+    def verify(self, *, token, owner_identity, method, path):
+        return token == "reviewer-csrf" and owner_identity == "reviewer-subject" and method == "POST" and path.startswith("/v1/jobs")
+
+
 class _SigningKey:
     key = object()
 
@@ -118,6 +128,32 @@ def _claims(**overrides):
 
 
 class CloudflareAccessTests(unittest.TestCase):
+    def test_configured_reviewer_requires_an_exact_verified_identity_pair(self) -> None:
+        from factory_console.auth import (
+            AccessDenied,
+            CloudflareAccessConfig,
+            CloudflareAccessVerifier,
+            ReviewerIdentity,
+        )
+
+        verifier = CloudflareAccessVerifier(CloudflareAccessConfig(
+            expected_audience="factory-console",
+            expected_issuer="https://access.example",
+            owner_subject="owner-subject",
+            owner_email="owner@example.com",
+            reviewers=(ReviewerIdentity("reviewer-subject", "reviewer@example.com"),),
+            jwt_verifier=_Verifier(),
+        ))
+
+        identity = verifier.require_identity({"Cf-Access-Jwt-Assertion": "reviewer"})
+
+        self.assertEqual(identity.role, "reviewer")
+        self.assertEqual(identity.subject, "reviewer-subject")
+        with self.assertRaises(AccessDenied):
+            verifier.require_owner({"Cf-Access-Jwt-Assertion": "reviewer"})
+        with self.assertRaises(AccessDenied):
+            verifier.require_identity({"Cf-Access-Jwt-Assertion": "wrong-email"})
+
     def test_rejects_missing_or_non_owner_identity(self) -> None:
         from factory_console.auth import AccessDenied, CloudflareAccessConfig, CloudflareAccessVerifier
 
@@ -576,3 +612,128 @@ class HttpSafetyTests(unittest.TestCase):
 
         self.assertEqual(status[0], "403 Forbidden")
         self.assertEqual(json.loads(body), {"error": "request origin or CSRF token rejected"})
+
+
+class ReviewerRoleTests(unittest.TestCase):
+    def test_reviewer_can_only_intake_inspect_and_plan(self) -> None:
+        from factory_console.api import CSRFConfig, CSRFProtection, FactoryConsoleWSGIApp
+        from factory_console.auth import CloudflareAccessConfig, CloudflareAccessVerifier, ReviewerIdentity
+        from factory_console.domain import ConsoleJobService
+
+        factory = _Factory()
+        app = FactoryConsoleWSGIApp(
+            ConsoleJobService(factory),
+            CloudflareAccessVerifier(CloudflareAccessConfig(
+                expected_audience="factory-console",
+                expected_issuer="https://access.example",
+                owner_subject="owner-subject",
+                owner_email="owner@example.com",
+                reviewers=(ReviewerIdentity("reviewer-subject", "reviewer@example.com"),),
+                jwt_verifier=_Verifier(),
+            )),
+            CSRFProtection(CSRFConfig(expected_origin="https://console.example", token_verifier=_ReviewerCSRF())),
+        )
+
+        def request(path: str, payload: dict[str, object]) -> tuple[str, dict[str, object]]:
+            body = json.dumps(payload).encode("utf-8")
+            status: list[str] = []
+            response = b"".join(app({
+                "REQUEST_METHOD": "POST",
+                "PATH_INFO": path,
+                "CONTENT_LENGTH": str(len(body)),
+                "wsgi.input": io.BytesIO(body),
+                "HTTP_CF_ACCESS_JWT_ASSERTION": "reviewer",
+                "HTTP_ORIGIN": "https://console.example",
+                "HTTP_X_FACTORY_CONSOLE_CSRF": "reviewer-csrf",
+                "HTTP_COOKIE": "factory_csrf=reviewer-csrf",
+            }, lambda value, headers: status.append(value)))
+            return status[0], json.loads(response)
+
+        status, created = request("/v1/jobs", {
+            "company_name": "Review Hotel",
+            "industry": "hospitality",
+            "purpose": "review an intake",
+            "primary_contact": "owner@example.com",
+            "supported_languages": ["en"],
+        })
+        self.assertEqual(status, "201 Created")
+        job_id = created["job_id"]
+        self.assertEqual(request(f"/v1/jobs/{job_id}/inspect", {})[0], "200 OK")
+        self.assertEqual(request(f"/v1/jobs/{job_id}/plan", {})[0], "200 OK")
+
+        read_status: list[str] = []
+        b"".join(app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": f"/v1/jobs/{job_id}",
+            "HTTP_CF_ACCESS_JWT_ASSERTION": "reviewer",
+        }, lambda value, headers: read_status.append(value)))
+        self.assertEqual(read_status[0], "403 Forbidden")
+
+        for operation in ("approve-knowledge", "approve-plan", "generate", "verify", "open-pr"):
+            self.assertEqual(request(f"/v1/jobs/{job_id}/{operation}", {"digest": "c" * 64})[0], "403 Forbidden")
+        self.assertEqual(factory.operations, ["inspect", "plan"])
+
+
+class ReviewerBootstrapTests(unittest.TestCase):
+    def test_reviewer_bootstraps_csrf_then_creates_test_intake(self) -> None:
+        from factory_console.api import CSRFConfig, CSRFProtection, FactoryConsoleWSGIApp
+        from factory_console.auth import CloudflareAccessConfig, CloudflareAccessVerifier, ReviewerIdentity
+        from factory_console.csrf import HMACCSRFTokenVerifier
+        from factory_console.domain import ConsoleJobService
+
+        app = FactoryConsoleWSGIApp(
+            ConsoleJobService(_Factory()),
+            CloudflareAccessVerifier(CloudflareAccessConfig(
+                expected_audience="factory-console",
+                expected_issuer="https://access.example",
+                owner_subject="owner-subject",
+                owner_email="owner@example.com",
+                reviewers=(ReviewerIdentity("reviewer-subject", "reviewer@example.com"),),
+                jwt_verifier=_Verifier(),
+            )),
+            CSRFProtection(CSRFConfig(
+                expected_origin="https://console.example",
+                token_verifier=HMACCSRFTokenVerifier(b"a" * 32, ttl_seconds=60, now=lambda: 1_000),
+            )),
+        )
+
+        bootstrap_status: list[str] = []
+        bootstrap_headers: list[tuple[str, str]] = []
+        bootstrap_body = b"".join(app({
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/v1/csrf",
+            "HTTP_CF_ACCESS_JWT_ASSERTION": "reviewer",
+            "HTTP_ORIGIN": "https://console.example",
+            "HTTP_X_FACTORY_CONSOLE_CSRF_BOOTSTRAP": "1",
+        }, lambda value, headers: (bootstrap_status.append(value), bootstrap_headers.extend(headers))))
+
+        self.assertEqual(bootstrap_status[0], "200 OK")
+        self.assertEqual(json.loads(bootstrap_body), {"scope": "factory-review-writes"})
+        cookie = dict(bootstrap_headers)["Set-Cookie"]
+        self.assertIn("Secure", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        self.assertIn("Path=/", cookie)
+        self.assertIn("Max-Age=300", cookie)
+        token = cookie.split(";", 1)[0].split("=", 1)[1]
+
+        intake = json.dumps({
+            "company_name": "Review Hotel",
+            "industry": "hospitality",
+            "purpose": "review an intake",
+            "primary_contact": "owner@example.com",
+            "supported_languages": ["en"],
+        }).encode("utf-8")
+        create_status: list[str] = []
+        create_body = b"".join(app({
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/v1/jobs",
+            "CONTENT_LENGTH": str(len(intake)),
+            "wsgi.input": io.BytesIO(intake),
+            "HTTP_CF_ACCESS_JWT_ASSERTION": "reviewer",
+            "HTTP_ORIGIN": "https://console.example",
+            "HTTP_X_FACTORY_CONSOLE_CSRF": token,
+            "HTTP_COOKIE": f"factory_csrf={token}",
+        }, lambda value, headers: create_status.append(value)))
+
+        self.assertEqual(create_status[0], "201 Created")
+        self.assertEqual(json.loads(create_body)["state"], "draft")

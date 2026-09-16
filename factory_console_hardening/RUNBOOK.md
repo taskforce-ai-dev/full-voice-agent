@@ -2,11 +2,13 @@
 
 ## Scope and invariant
 
-This runbook describes a private, owner-only **review console** for the
-existing SmartPBX Factory. It can expose only the review lifecycle actions
+This runbook describes a private, owner-default **review console** for the
+existing SmartPBX Factory. The owner can use the review lifecycle actions
 listed in `policy.json`: `inspect`, `plan`, `approve-knowledge`,
 `approve-plan`, `generate`, `verify`, and `open-pr`. The factory's own existing
-approval and readiness gates remain authoritative.
+approval and readiness gates remain authoritative. The optional reviewer list
+is empty by default; a configured reviewer can only submit intake, inspect,
+and prepare a plan.
 
 The console must not create infrastructure, DNS records, tunnels, production
 services, or client connections. It has no `deploy` or `provision` endpoint;
@@ -56,9 +58,11 @@ check, not production authorization.
 ## Cloudflare Access and application authorization
 
 Configure one Access application for exactly one private console hostname.
-Its Access policy must allow the single owner identity and deny every other
-identity. Do not use an email-domain, group, wildcard, service-token, bypass,
-or public policy as a substitute for this owner-only rule.
+Its Access policy must allow the owner and, only when a temporary test review
+is necessary, a named tester identity. The application policy is an upstream
+gate, not a substitute for the origin allowlist. Do not use an email-domain,
+group, wildcard, service-token, bypass, or public policy as a substitute for
+exact identity pairs.
 
 Set the per-origin Cloudflared Access gate to `required: true` with the exact
 application AUD tag. The console then performs an independent, fail-closed
@@ -76,7 +80,10 @@ verification for every request:
    AUD as its canonical identity value; it never treats the raw list as a
    second identity selector.
    Validate `exp`, `nbf`, and `iat` with a small documented clock-skew bound.
-   Do not case-fold, wildcard-match, or use a prefix for the owner fields.
+   Do not case-fold, wildcard-match, or use a prefix for the owner or reviewer
+   fields. Classify a reviewer only when both signed `sub` and `email` exactly
+   match one configured pair; never combine a subject from one entry with an
+   email from another.
 4. Fail closed if the JWKS cannot be refreshed. A bounded cache may continue
    only until its documented expiry; it must not turn a key-fetch failure into
    anonymous or stale authorization.
@@ -92,10 +99,13 @@ with that Access application and must remain disabled. Access policy must also
 allow only the owner email; the signed subject remains the durable origin
 identity check.
 
-The configured owner subject and email are identifiers, not credentials. They
-must be copied into a root-owned host-local policy only after an operator
-independently verifies them in the Access application. Do not place the real
-identifiers in this repository.
+The configured owner subject and email, and optional reviewer identity pairs,
+are identifiers rather than credentials. `reviewer_identities` defaults to an
+empty list. Add a temporary reviewer only as one object with exactly `subject`
+and `email`, remove it when the test closes, and never reuse the owner subject
+or email. Copy real identifiers into a root-owned host-local policy only after
+an operator independently verifies them in the Access application. Do not
+place them in this repository.
 
 The supplied console systemd template invokes
 `python -m factory_console verify-access-config --config
@@ -129,7 +139,7 @@ endpoint requires the already-validated Access assertion, exact UI Origin, and
 sets `factory_csrf` with `Secure`, `SameSite=Strict`, `Path=/`, and a bounded
 expiry. The UI copies that value into `X-Factory-Console-CSRF` for a write; the
 origin accepts it only when the forwarded `factory_csrf` cookie matches in
-constant time and the owner-bound HMAC token is unexpired and in the fixed
+constant time and the identity-bound HMAC token is unexpired and in the fixed
 review-write scope. Nginx forwards only this CSRF cookie, never the Access
 cookie. The CSRF cookie is deliberately not an authentication credential:
 every request still requires Cloudflare Access.
@@ -137,7 +147,9 @@ every request still requires Cloudflare Access.
 ## Approval-bound review actions
 
 The UI must require a fresh, explicit owner approval before `generate` and
-again before `open-pr`. An approval record must bind all of: action,
+again before `open-pr`. A reviewer is denied `approve-knowledge`,
+`approve-plan`, `generate`, `verify`, and `open-pr` before factory state is
+read or changed. An approval record must bind all of: action,
 generation ID, manifest digest, knowledge-review digest, plan digest, issuing
 owner subject, issued timestamp, expiry, and a single-use nonce. A redirect,
 page load, checkbox retained from an older plan, or approval for a different

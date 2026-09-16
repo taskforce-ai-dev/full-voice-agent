@@ -86,13 +86,15 @@ class FactoryConsoleWSGIApp:
 
     def __call__(self, environ: Mapping[str, object], start_response: Callable) -> Iterable[bytes]:
         try:
-            identity = self._access.require_owner(self._headers(environ))
+            identity = self._access.require_identity(self._headers(environ))
         except AccessDenied:
             return self._respond(start_response, "403 Forbidden", {"error": "owner authorization required"})
         method = environ.get("REQUEST_METHOD")
         path = environ.get("PATH_INFO")
         if not isinstance(method, str) or not isinstance(path, str):
             return self._respond(start_response, "400 Bad Request", {"error": "invalid request"})
+        if not self._role_allows(identity, method, path):
+            return self._respond(start_response, "403 Forbidden", {"error": "reviewer operation is not permitted"})
         if method not in {"GET", "HEAD", "OPTIONS"}:
             try:
                 self._csrf.require_request(identity, method, path, self._headers(environ))
@@ -160,6 +162,19 @@ class FactoryConsoleWSGIApp:
         }
         operation = operations.get(parts[4])
         return (parts[3], operation) if operation else None
+
+    @classmethod
+    def _role_allows(cls, identity: AccessIdentity, method: str, path: str) -> bool:
+        if identity.role == "owner":
+            return True
+        if identity.role != "reviewer":
+            return False
+        if method == "GET" and path == "/v1/csrf":
+            return True
+        if method == "POST" and path == "/v1/jobs":
+            return True
+        action = cls._action(path, method)
+        return action is not None and action[1] in {"inspect", "prepare_plan"}
 
     @staticmethod
     def _body(environ: Mapping[str, object]) -> Mapping[str, object]:
