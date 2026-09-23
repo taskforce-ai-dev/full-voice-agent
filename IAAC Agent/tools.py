@@ -617,51 +617,23 @@ def get_handover_tools(fmt: str = "claude") -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def get_tools() -> list[dict[str, Any]]:
-    """Return tool definitions (Anthropic format) if the booking API (n8n) is configured."""
-    if is_configured():
-        return TOOL_DEFINITIONS
-    logger.warning("Booking API (n8n) is not configured — no tools will be available.")
+    """Return no tools: IAAC is an inquiry-only agent by product contract.
+
+    This is deliberately independent of inherited environment variables.  A
+    stray PMS credential must never turn Vidya into a transactional hotel
+    agent.
+    """
     return []
 
 
 def get_tools_openai() -> list[dict[str, Any]]:
-    """Return tool definitions in OpenAI function-calling format."""
-    if not is_configured():
-        logger.warning("Booking API (n8n) is not configured — no tools will be available.")
-        return []
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool["name"],
-                "description": tool["description"],
-                "parameters": tool["input_schema"],
-            },
-        }
-        for tool in TOOL_DEFINITIONS
-    ]
+    """Return no tools in OpenAI format; IAAC is inquiry-only."""
+    return []
 
 
 def get_tools_gemini() -> list[dict[str, Any]]:
-    """Return tool definitions in Google Gemini native format.
-
-    Returns a list with a single Tool dict containing all function declarations.
-    """
-    if not is_configured():
-        logger.warning("Booking API (n8n) is not configured — no tools will be available.")
-        return []
-    return [
-        {
-            "function_declarations": [
-                {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["input_schema"],
-                }
-                for tool in TOOL_DEFINITIONS
-            ]
-        }
-    ]
+    """Return no tools in Gemini format; IAAC is inquiry-only."""
+    return []
 
 
 async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:

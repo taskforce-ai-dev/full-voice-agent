@@ -5264,7 +5264,7 @@ async def lifespan(app: FastAPI):
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Hatton Hills Voice Agent (Kavya)",
+    title="IAAC Voice Agent (Vidya)",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -14980,7 +14980,7 @@ def build_service_app(
     registry = SmartPBXSessionRegistry(settings.max_calls)
     gateway = SmartPBXGateway(settings, registry)
     smartpbx_app = FastAPI(
-        title="Hatton Hills Voice Agent (Kavya) — SmartPBX",
+        title="IAAC Voice Agent (Vidya) — SmartPBX",
         version="1.0.0",
         lifespan=lifespan,
         docs_url=None,

@@ -26,7 +26,7 @@ from smartpbx_transport import SmartPBXMediaTransport
 
 logger = logging.getLogger(__name__)
 
-SMARTPBX_PROTOCOL_VERSION = "smartpbx-ai-provider-v06"
+SMARTPBX_PROTOCOL_VERSION = "smartpbx-ai-provider-v07"
 _MAX_COUNTER = (1 << 63) - 1
 # Session-internal terminal failures (audit #10) -- when the "raw is None"
 # branch below reads one of these back off the session, the call closes

@@ -17,16 +17,17 @@ Vidya is a **pure inquiry / KB agent — nothing transactional**:
 - **NO dashboard** — no post-call push.
 - **NO post-call automation** of any kind.
 
-She is a clone of the **Kavya** Dialog stack with all of the above dropped **by
-configuration, not by deleting code**. The cloned Kavya modules (`yanolja_*`,
+She is a clone of the **Kavya** Dialog stack with all of the above locked out at
+both the **code and configuration boundaries**. The cloned Kavya modules (`yanolja_*`,
 `booking_api.py`, `smartpbx_mcp.py`, `smartpbx_handover.py`, `handover.py`,
 `post_call.py`, `dashboard_client.py`, `rate_catalog.py`) are still present for
 fleet consistency and low-risk cloning, but are **inert**: with no Yanolja
-credentials `get_tools()` returns `[]`, so the model has no booking or transfer
-tool to call; with `SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` and no MCP creds
+credentials or inherited environment, every provider tool factory returns
+`[]`, so the model has no booking or transfer tool to call; with
+`SMARTPBX_TRANSFER_DESTINATIONS_JSON={}` and no MCP creds
 live transfer is disabled; and with no n8n/dashboard creds those paths never
-fire. Inquiry-only is thus enforced by the deploy-time env allowlist, not just
-by the system prompt. This mirrors how Hutch keeps its inert Twilio path.
+fire. Inquiry-only is enforced by code, the deploy-time env allowlist, and the
+system prompt. This mirrors how Hutch keeps its inert Twilio path.
 
 **SmartPBX-only.** IAAC connects via **Dialog SmartPBX ("Client Connect")
 ONLY** — there is no Twilio number provisioned for this agent. The Twilio /
@@ -77,8 +78,8 @@ IAAC Agent/
 ├── smartpbx_session.py        # Adapter binding one Dialog call into MediaStreamSession (+ language menu)
 ├── smartpbx_dtmf.py           # DTMF keypad capture helpers
 ├── smartpbx_diagnostics.py    # Seven-field diagnostic log vocabulary
-├── smartpbx_language_menu.ulaw # Pre-rendered g711_ulaw language-menu prompt (MUST be re-recorded for IAAC — see below)
-├── tools.py                   # Tool definitions + dispatch (INERT: no tools without Yanolja creds)
+├── smartpbx_language_menu.ulaw # IAAC-branded, pre-rendered g711_ulaw language menu
+├── tools.py                   # Inherited dispatch code; all provider tool factories hard-return []
 ├── yanolja_service.py         # INERT clone (no PMS creds -> no booking/availability)
 ├── yanolja_client.py          # INERT clone
 ├── booking_api.py             # INERT clone
@@ -113,7 +114,8 @@ IAAC Agent/
 (`docs_url`/`redoc_url`/`openapi_url` all disabled) exposing exactly:
 - `GET /health` — `{"status": "ok", "service_mode": "smartpbx"}` (unauthenticated liveness)
 - `GET /smartpbx/status` — session counters, `enabled`, `configured`,
-  `protocol_version`. Requires the `X-IAAC-SmartPBX-Token` header (constant-time compare).
+  `protocol_version` (`smartpbx-ai-provider-v07`). Requires the
+  `X-IAAC-SmartPBX-Token` header (constant-time compare).
 - `WS /ws/v1/smartpbx/media` — the Dialog media socket, gated by the same
   `X-IAAC-SmartPBX-Token` header, checked before `websocket.accept()`.
 
@@ -137,17 +139,17 @@ Dialog SmartPBX call
 ```
 
 The session class is still named `KavyaSmartPBXSession` (clone). No PMS/booking
-tool binding, no transfer coordinator, no post-call pipeline is active in the
-inquiry-only configuration.
+tool binding, no transfer coordinator, no post-call pipeline is active under
+the inquiry-only contract.
 
 ### Language menu audio
 
 `smartpbx_session._load_smartpbx_language_menu_audio()` loads and validates
 `smartpbx_language_menu.ulaw` at session start. It is a **strict-format
 `g711_ulaw` (8 kHz, mono) asset** — the loader validates it, so a wrong-format
-or corrupt file fails the session. **The cloned file currently plays the
-Kavya / Hatton Hills prompt and MUST be re-recorded for IAAC before go-live**
-(see Pending operator setup).
+or corrupt file fails the session. The committed asset is IAAC-branded, differs
+from Kavya's menu, includes the required 300 ms digital-silence pre-roll, and
+fits inside the 512-frame transport ceiling.
 
 ## Environment Setup
 
@@ -160,59 +162,38 @@ committed). `.env.example` documents the full inquiry-only allowlist. The
 
 ## Deployment
 
-### First deploy — MANUAL (once), on the VPS
+IAAC uses a **manual, immutable-image-only** deployment. Production never builds
+the image and fast hot-swaps are rejected.
 
-IAAC builds **on the VPS** (like Hutch), not from a pre-built immutable image
-(unlike Kavya). The first deploy is done by hand:
-
-1. Clone/checkout the repo to `/opt/iaac` on `67.207.90.109` (repo root), so the
-   agent dir is `/opt/iaac/IAAC Agent`.
-2. Create `/opt/iaac/.env.smartpbx` (chmod 600, root-owned) with the real
-   secrets — see `.env.example` and Pending operator setup.
-3. Bring the container up:
+1. Review and merge the IAAC PR.
+2. Run `.github/workflows/deploy.yml` manually with `agent=iaac`,
+   `mode=image`, and the exact reviewed commit SHA as `ref`.
+3. GitHub Actions builds and publishes
+   `ghcr.io/taskforce-ai-dev/iaac:<short-sha>`, syncs the reviewed control
+   files to `/opt/iaac`, and recreates only `iaac-smartpbx`.
+4. The VPS pulls that immutable tag with:
 
 ```bash
-cd "/opt/iaac/IAAC Agent"
-docker compose --env-file .env.smartpbx --profile smartpbx up -d --build iaac-smartpbx
-docker compose --env-file .env.smartpbx --profile smartpbx logs -f iaac-smartpbx
+SMARTPBX_IMAGE_TAG=<reviewed-sha> docker compose --env-file .env.smartpbx \
+  --profile smartpbx pull iaac-smartpbx
+SMARTPBX_IMAGE_TAG=<reviewed-sha> docker compose --env-file .env.smartpbx \
+  --profile smartpbx up -d --force-recreate iaac-smartpbx
 ```
 
-> **`--env-file .env.smartpbx` is MANDATORY on EVERY compose command for this
-> service.** The service has no `env_file:` stanza and an explicit allowlist, so
-> without `--env-file` the `${...}` substitutions resolve empty and the
-> container comes up mis-configured (no API keys, no token). This is the same
-> hard requirement Hutch documents — do not drop the flag, ever.
+`--env-file .env.smartpbx` is mandatory on every compose command. The service
+has no `env_file:` stanza and only receives the explicit allowlist in
+`docker-compose.yml`. Real secrets remain in root-owned mode-600
+`/opt/iaac/.env.smartpbx`.
 
-- Container name: **`iaac-smartpbx`**. Compose profile: **`smartpbx`**.
-  Loopback port: **`127.0.0.1:8042`** (kavya-smartpbx=8006, hutch-smartpbx=8041
-  are taken). Public TLS terminates at the `smartpbx-iaac.taskforceai.tech`
-  Nginx vhost in front of that port.
+- Container: `iaac-smartpbx`
+- Compose profile: `smartpbx`
+- Loopback: `127.0.0.1:8042`
+- Public TLS host: `smartpbx-iaac.taskforceai.tech`
+- Auth header: `X-IAAC-SmartPBX-Token`
+- Media path: `/ws/v1/smartpbx/media`
 
-### After the first deploy — AUTO-DEPLOY ON PUSH
-
-Pushing to `main` with changes under `IAAC Agent/**` auto-deploys to the live
-`iaac-smartpbx` container via `.github/workflows/deploy-iaac.yml` — a dedicated
-workflow, **not** part of the shared `deploy-on-push.yml`/`deploy.yml` matrix
-(same reasoning as Hutch/Kavya). No approval gate — the human gate is the review
-before the merge.
-
-- **fast** (code / `knowledge_docs` only): rsync to `/opt/iaac/IAAC Agent` +
-  `docker cp` the changed `.py` into the running container + `docker restart
-  iaac-smartpbx`. Seconds, no rebuild.
-- **build** (`requirements*.txt` / `Dockerfile` / `docker-compose.yml` changed):
-  rsync + `docker builder prune -f` + `docker compose --env-file .env.smartpbx
-  --profile smartpbx build iaac-smartpbx` + `up -d --force-recreate`.
-- A `py_compile` syntax gate on changed `.py` files blocks a broken push.
-- `.env.smartpbx`, `chroma_db_iaac_smartpbx/`, and `smartpbx_phrase_cache_iaac/`
-  are never touched by the rsync (excluded; no `--delete`).
-- The rsync uses `rsync -az -s` (`--protect-args`) so the **space in
-  "IAAC Agent"** survives — do NOT hand-escape the space (Hutch lost two deploys
-  to exactly that bug).
-- Manual redeploy: `workflow_dispatch` on "Auto-Deploy IAAC" from the Actions
-  tab, choosing `mode: fast` or `mode: build`.
-- **Verifying a deploy landed:** `docker exec iaac-smartpbx grep -n "<a string
-  unique to the change>" server.py`. A `docker restart` does not change the
-  image `Created` timestamp, so an old time is normal for fast mode.
+Merging IAAC code does **not** auto-deploy it. This preserves an explicit human
+gate for the first canary and prevents an unreviewed production-host build.
 
 ## Pending operator setup
 
@@ -235,13 +216,6 @@ Before this agent can go live, the operator still needs to:
 4. **DNS + TLS** for `smartpbx-iaac.taskforceai.tech` — point DNS at the VPS,
    bootstrap the cert with `nginx-smartpbx-acme.conf` (HTTP-01 on port 80) +
    certbot, then install `nginx-smartpbx.conf` (the TLS vhost → `127.0.0.1:8042`).
-5. **Re-record the language-menu audio `smartpbx_language_menu.ulaw` for IAAC.**
-   The cloned file currently speaks the Kavya / Hatton Hills prompt. It MUST be
-   replaced with an IAAC-branded English + Sinhala "press 1 for English, press 2
-   for Sinhala" prompt. It is a **strict-format `g711_ulaw` (8 kHz mono)** asset
-   validated by `smartpbx_session._load_smartpbx_language_menu_audio` — an
-   MP3/WAV or wrong-rate file will fail the session, so render it to raw 8 kHz
-   mono µ-law.
 
 ## graphify — GRAPH-FIRST, ALWAYS
 

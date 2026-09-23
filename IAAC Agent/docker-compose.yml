@@ -7,16 +7,17 @@
 # Dialog line (press 1 English, press 2 Sinhala).
 #
 # INQUIRY-ONLY: no PMS/booking, no live transfer, no post-call automation.
-# Cloned from Kavya's Dialog stack, with all of that dropped by config:
-#   * no YANOLJA_* -> get_tools() returns [] -> booking + transfer tools gone
+# Cloned from Kavya's Dialog stack, with transactional paths hard-disabled:
+#   * provider tool factories always return [] -> booking tools are unavailable
 #   * no SMARTPBX_MCP_*/TRANSFER -> no live transfer
 #   * no N8N_/DASHBOARD_ -> no post-call webhook or dashboard push
 #
-# Deploy model mirrors Hutch (build on the VPS, auto-deploy on push to main),
-# NOT Kavya's immutable-image pipeline.
+# Deployment is manual and image-only. CI builds the reviewed commit on a
+# GitHub runner; production only pulls the immutable SHA tag.
 #
 # Usage:
-#   docker compose --env-file .env.smartpbx --profile smartpbx up -d --build iaac-smartpbx
+#   SMARTPBX_IMAGE_TAG=<reviewed-sha> docker compose --env-file .env.smartpbx --profile smartpbx pull iaac-smartpbx
+#   SMARTPBX_IMAGE_TAG=<reviewed-sha> docker compose --env-file .env.smartpbx --profile smartpbx up -d iaac-smartpbx
 #   docker compose --env-file .env.smartpbx --profile smartpbx logs -f iaac-smartpbx
 # ============================================================
 
@@ -25,7 +26,7 @@ services:
   # This profile is off unless explicitly selected.
   iaac-smartpbx:
     profiles: ["smartpbx"]
-    build: .
+    image: ghcr.io/taskforce-ai-dev/iaac:${SMARTPBX_IMAGE_TAG:-disabled}
     container_name: iaac-smartpbx
 
     # Host Nginx is the public TLS boundary; keep the application loopback-only.

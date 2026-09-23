@@ -30,7 +30,7 @@ on:
         description: "Which agent to deploy"
         required: true
         type: choice
-        options: [bsl, flico, hatton, slic, sofia, kavya, kitchened, wor, horizon, riviera]
+        options: [bsl, flico, hatton, slic, sofia, kavya, kitchened, wor, horizon, riviera, iaac]
       ref:
         description: "Git ref / tag / commit to deploy"
         required: true
@@ -92,6 +92,14 @@ jobs:
             exit 1
           fi
 
+      - name: Reject non-image IAAC deployment
+        run: |
+          set -euo pipefail
+          if [[ "$AGENT" == "iaac" && "$MODE" != "image" ]]; then
+            echo "IAAC is image-only; production must pull a reviewed CI-built SHA and must never build or hot-swap on the VPS." >&2
+            exit 1
+          fi
+
       - name: Resolve agent -> source dir / VPS path / container
         id: map
         run: |
@@ -106,6 +114,7 @@ jobs:
             wor)       SRC="WorldOfRefrigerators"; OPT="/opt/worldofrefrigerators"; CON="wor-voice-agent" ;;
             horizon)   SRC="Horizon Agent";        OPT="/opt/horizon";              CON="horizon-voice-agent" ;;
             riviera)   SRC="Riviera";              OPT="/opt/riviera";              CON="riviera-voice-agent" ;;
+            iaac)      SRC="IAAC Agent";          OPT="/opt/iaac";                 CON="iaac-smartpbx" ;;
             *) echo "Unknown agent id: $AGENT" >&2; exit 1 ;;
           esac
           { echo "src=$SRC"; echo "opt=$OPT"; echo "con=$CON"; } >> "$GITHUB_OUTPUT"
@@ -191,7 +200,7 @@ jobs:
           # host-side control plane (compose env allowlist, nginx vhosts, the
           # guarded deploy scripts, the runbook). Other agents are unaffected.
           extra_excludes=()
-          if [[ "$AGENT" == "kavya" ]] || [[ "$AGENT" == "riviera" ]]; then
+          if [[ "$AGENT" == "kavya" ]] || [[ "$AGENT" == "riviera" ]] || [[ "$AGENT" == "iaac" ]]; then
             extra_excludes=(
               --exclude='scripts/' --exclude='docker-compose.yml'
               --exclude='nginx-smartpbx*.conf' --exclude='SMARTPBX_RUNBOOK.md'
@@ -258,12 +267,21 @@ jobs:
           set -euo pipefail
           printf '%s' '$GH_TOKEN' | docker login ghcr.io -u '$GH_ACTOR' --password-stdin
           cd "$OPT"
-          # compose resolves \${IMAGE_TAG} in the image: line. Shell env beats the
-          # .env file, so this pins the deploy to one immutable SHA tag.
-          export IMAGE_TAG='$IMG_SHA'
-          docker compose pull
-          docker compose up -d
-          docker compose ps
+          if [[ "$AGENT" == "iaac" ]]; then
+            # IAAC is SmartPBX-only and its service is behind an opt-in profile.
+            # The dedicated env file supplies compose substitutions through an
+            # explicit service allowlist; it is never sourced into this shell.
+            SMARTPBX_IMAGE_TAG='$IMG_SHA' docker compose --env-file .env.smartpbx --profile smartpbx pull iaac-smartpbx
+            SMARTPBX_IMAGE_TAG='$IMG_SHA' docker compose --env-file .env.smartpbx --profile smartpbx up -d --force-recreate iaac-smartpbx
+            SMARTPBX_IMAGE_TAG='$IMG_SHA' docker compose --env-file .env.smartpbx --profile smartpbx ps iaac-smartpbx
+          else
+            # compose resolves \${IMAGE_TAG} in the image: line. Shell env beats
+            # the .env file, pinning the deploy to one immutable SHA tag.
+            export IMAGE_TAG='$IMG_SHA'
+            docker compose pull
+            docker compose up -d
+            docker compose ps
+          fi
           docker logout ghcr.io >/dev/null 2>&1 || true
           # Reclaim the image this deploy replaced. This box has a history of
           # disk exhaustion — see the CPU-only-torch note in the Dockerfiles —

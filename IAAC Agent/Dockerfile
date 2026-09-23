@@ -1,9 +1,8 @@
 # =============================================================================
-# Dockerfile — Kavya Voice Agent (Mosvold Boutique Hotels)
+# Dockerfile — IAAC Voice Agent (Vidya)
 # =============================================================================
 # Production image for the FastAPI voice agent.
-# Build:  docker build -t kavya-voice-agent .
-# Run:    docker run --env-file .env -p 8000:8000 kavya-voice-agent
+# Built on a GitHub runner and deployed by immutable SHA; never built on prod.
 # =============================================================================
 
 # --- Base image --------------------------------------------------------------

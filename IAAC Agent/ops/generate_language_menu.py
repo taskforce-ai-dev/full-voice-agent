@@ -3,8 +3,8 @@
 
 `smartpbx_session._load_smartpbx_language_menu_audio()` loads and STRICTLY
 validates `smartpbx_language_menu.ulaw` at the start of every Dialog call. The
-cloned file still speaks the Kavya / Hatton Hills prompt, so it MUST be replaced
-with an IAAC-branded English + Sinhala menu before go-live, e.g.:
+committed asset is IAAC-branded. Use this script whenever that English +
+Sinhala menu needs to be regenerated, e.g.:
 
     "Welcome to IAAC, the International Airline and Aviation College.
      For English, press one.  සිංහල සඳහා, දෙක ඔබන්න."   (press 2 for Sinhala)
