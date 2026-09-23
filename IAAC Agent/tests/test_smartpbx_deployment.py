@@ -74,6 +74,21 @@ def test_iaac_deploy_is_manual_image_only_and_never_builds_on_production():
     assert not (REPO_ROOT / ".github/workflows/deploy-iaac.yml").exists()
 
 
+def test_first_iaac_deploy_syncs_its_reviewed_compose_control_plane():
+    workflow = (REPO_ROOT / ".github/workflows/deploy.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'if [[ "$AGENT" == "kavya" ]] || [[ "$AGENT" == "riviera" ]]; then'
+        in workflow
+    )
+    assert (
+        '[[ "$AGENT" == "riviera" ]] || [[ "$AGENT" == "iaac" ]]'
+        not in workflow
+    )
+
+
 def test_language_menu_is_iaac_specific_and_wire_valid():
     audio = (PROJECT_ROOT / "smartpbx_language_menu.ulaw").read_bytes()
     kavya_audio = (REPO_ROOT / "Kavya/smartpbx_language_menu.ulaw").read_bytes()

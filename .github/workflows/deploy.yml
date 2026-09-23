@@ -198,9 +198,12 @@ jobs:
           # the reject step above is ever loosened or removed by mistake, a
           # kavya (or riviera, its clone) rsync still cannot overwrite the
           # host-side control plane (compose env allowlist, nginx vhosts, the
-          # guarded deploy scripts, the runbook). Other agents are unaffected.
+          # guarded deploy scripts, the runbook). IAAC is intentionally not in
+          # this guard: its image-only first deployment must install the
+          # reviewed compose file before production can pull/start the image.
+          # Other agents are unaffected.
           extra_excludes=()
-          if [[ "$AGENT" == "kavya" ]] || [[ "$AGENT" == "riviera" ]] || [[ "$AGENT" == "iaac" ]]; then
+          if [[ "$AGENT" == "kavya" ]] || [[ "$AGENT" == "riviera" ]]; then
             extra_excludes=(
               --exclude='scripts/' --exclude='docker-compose.yml'
               --exclude='nginx-smartpbx*.conf' --exclude='SMARTPBX_RUNBOOK.md'
