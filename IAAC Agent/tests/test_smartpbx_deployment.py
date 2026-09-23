@@ -51,3 +51,15 @@ def test_language_menu_is_iaac_specific_and_wire_valid():
     assert len(audio) <= 512 * 160
     assert audio[:2400] == b"\xff" * 2400
     assert audio[2400:2560] != b"\xff" * 160
+
+
+def test_docker_build_context_excludes_runtime_secrets():
+    patterns = {
+        line.strip()
+        for line in (PROJECT_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    assert ".env" in patterns
+    assert ".env.*" in patterns
+    assert "full-voice-agent-*.json" in patterns

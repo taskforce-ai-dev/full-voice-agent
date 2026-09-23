@@ -11,6 +11,8 @@ chroma_db/
 
 # Secrets (passed via docker-compose environment)
 .env
+.env.*
+full-voice-agent-*.json
 
 # Version control
 .git/
