@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import tools
 
 
@@ -12,4 +17,3 @@ def test_no_provider_can_expose_transactional_tools(monkeypatch):
     assert tools.get_tools() == []
     assert tools.get_tools_openai() == []
     assert tools.get_tools_gemini() == []
-
