@@ -45,6 +45,7 @@ on:
     paths:
       - 'Kavya/requirements*'
       - 'Riviera/requirements*'
+      - 'IAAC Agent/requirements*'
   workflow_dispatch:
   schedule:
     # Weekly, Mondays at 06:00 UTC.
@@ -65,7 +66,7 @@ jobs:
     # findings yet. Tighten another agent later by adding it to this
     # exclusion the same way, once its existing pinned advisories are
     # resolved.
-    continue-on-error: ${{ matrix.dir != 'Kavya' && matrix.dir != 'Riviera' }}
+    continue-on-error: ${{ matrix.dir != 'Kavya' && matrix.dir != 'Riviera' && matrix.dir != 'IAAC Agent' }}
     strategy:
       # Audit every agent dir independently; one vulnerable agent does not
       # short-circuit the others.
@@ -75,7 +76,7 @@ jobs:
         # On pull_request only Kavya runs (its trigger is scoped to Kavya's
         # requirements files and it is the only blocking row); the weekly and
         # manual runs audit every agent.
-        dir: ${{ github.event_name == 'pull_request' && fromJSON('["Kavya","Riviera"]') || fromJSON('["BSL Agent","Flico Agent","HattonHills","Kavya","Kitchened","Riviera","SLIC Agent","Sofia Agent","WorldOfRefrigerators"]') }}
+        dir: ${{ github.event_name == 'pull_request' && fromJSON('["Kavya","Riviera","IAAC Agent"]') || fromJSON('["BSL Agent","Flico Agent","HattonHills","Kavya","Kitchened","Riviera","IAAC Agent","SLIC Agent","Sofia Agent","WorldOfRefrigerators"]') }}
 
     steps:
       - name: Checkout
@@ -105,7 +106,7 @@ jobs:
         run: |
           dir="${{ matrix.dir }}"
 
-          if [ "$dir" = "Kavya" ] || [ "$dir" = "Riviera" ]; then
+          if [ "$dir" = "Kavya" ] || [ "$dir" = "Riviera" ] || [ "$dir" = "IAAC Agent" ]; then
             req="$dir/requirements-prod.lock.txt"
             if [ ! -f "$req" ]; then
               echo "::error::$dir requires a pinned lock file at $req" >&2
